@@ -21,10 +21,10 @@ internal static class WorkspaceService
     private static readonly Timer s_evictionTimer;
 
     /// <summary>
-    /// Indicates whether a Visual Studio or Build Tools MSBuild instance was registered.
-    /// When <c>true</c>, legacy-format .csproj files (non-SDK-style) are supported.
+    /// Indicates whether legacy .NET Framework projects (non-SDK-style .csproj) are supported.
+    /// True when MSBuild is registered and .NET Framework targeting packs are available.
     /// </summary>
-    public static bool IsVisualStudioMSBuildRegistered { get; private set; }
+    public static bool IsLegacyProjectSupported { get; private set; }
 
     private static Dictionary<string, string> CreateDefaultProperties() => new()
     {
@@ -63,9 +63,17 @@ internal static class WorkspaceService
                 return;
 
             MSBuildLocator.RegisterInstance(instance);
-            IsVisualStudioMSBuildRegistered = true;
+
+            // Legacy .NET Framework projects require targeting packs (Windows only)
+            var refAssembliesPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                "Reference Assemblies", "Microsoft", "Framework", ".NETFramework");
+
+            IsLegacyProjectSupported = Directory.Exists(refAssembliesPath);
+
             Console.Error.WriteLine(
-                $"[WorkspaceService] Registered MSBuild from '{instance.Name}' v{instance.Version} at '{instance.MSBuildPath}'.");
+                $"[WorkspaceService] Registered MSBuild from '{instance.Name}' v{instance.Version} at '{instance.MSBuildPath}'."
+                + (IsLegacyProjectSupported ? " Legacy .NET Framework projects supported." : ""));
         }
         catch (Exception ex)
         {

@@ -11,5 +11,5 @@ internal static class TestEnvironment
     /// Returns <c>true</c> when Visual Studio or Build Tools MSBuild was registered
     /// by <see cref="WorkspaceService"/>, enabling legacy .csproj support.
     /// </summary>
-    public static bool HasVisualStudioMSBuild => WorkspaceService.IsVisualStudioMSBuildRegistered;
+    public static bool HasVisualStudioMSBuild => WorkspaceService.IsLegacyProjectSupported;
 }

@@ -46,7 +46,7 @@ public static class RunTestsTool
             if (!string.IsNullOrWhiteSpace(filter))
             {
                 args.Append(" --filter \"");
-                args.Append(filter);
+                args.Append(filter.Replace("\"", "\\\""));
                 args.Append('"');
             }
 

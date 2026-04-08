@@ -243,7 +243,11 @@ public static class RenameSymbolTool
             return changes;
 
         string oldFullName = namedType.ToDisplayString();
-        string newFullName = oldFullName.Replace(oldName, newName);
+        // Only replace the type name (last segment) to avoid mangling the namespace
+        int lastDot = oldFullName.LastIndexOf('.');
+        string newFullName = lastDot >= 0
+            ? oldFullName[..(lastDot + 1)] + newName
+            : newName;
 
         string[] aspxExtensions = ["*.aspx", "*.ascx", "*.master", "*.asmx", "*.ashx", "*.asax"];
 

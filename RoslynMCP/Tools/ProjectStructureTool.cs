@@ -22,6 +22,8 @@ public static class ProjectStructureTool
         [Description("Path to the .csproj file or any file in the project.")] string projectOrFilePath,
         [Description("Include system assemblies (System.*, Microsoft.*) in the assembly references list. Default: false.")]
         bool includeSystemAssemblies = false,
+        [Description("Maximum number of files to list individually per folder. Folders with more files show a count instead. Default: 20. Set to 0 for counts only.")]
+        int maxFilesPerFolder = 20,
         CancellationToken cancellationToken = default)
     {
         try
@@ -49,7 +51,7 @@ public static class ProjectStructureTool
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
                 projectPath, cancellationToken: cancellationToken);
 
-            return await FormatProjectStructureAsync(project, projectPath, includeSystemAssemblies, cancellationToken);
+            return await FormatProjectStructureAsync(project, projectPath, includeSystemAssemblies, maxFilesPerFolder, cancellationToken);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -63,6 +65,7 @@ public static class ProjectStructureTool
         Project project,
         string projectPath,
         bool includeSystemAssemblies,
+        int maxFilesPerFolder,
         CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
@@ -104,7 +107,14 @@ public static class ProjectStructureTool
         {
             string folder = group.Key == "." ? "(root)" : group.Key;
             var files = group.OrderBy(d => d.Name).Select(d => d.Name).ToList();
-            sb.AppendLine($"- {folder}/: {string.Join(", ", files)}");
+            if (maxFilesPerFolder > 0 && files.Count <= maxFilesPerFolder)
+            {
+                sb.AppendLine($"- {folder}/: {string.Join(", ", files)}");
+            }
+            else
+            {
+                sb.AppendLine($"- {folder}/: ({files.Count} files)");
+            }
         }
         sb.AppendLine();
 
@@ -123,9 +133,19 @@ public static class ProjectStructureTool
             {
                 sb.AppendLine($"## Types ({types.Count})");
                 sb.AppendLine();
-                sb.AppendLine("```");
-                AppendNamespaceTree(sb, types);
-                sb.AppendLine("```");
+
+                // For large projects, show a compact namespace summary
+                const int compactThreshold = 200;
+                if (types.Count > compactThreshold)
+                {
+                    AppendNamespaceSummary(sb, types);
+                }
+                else
+                {
+                    sb.AppendLine("```");
+                    AppendNamespaceTree(sb, types);
+                    sb.AppendLine("```");
+                }
                 sb.AppendLine();
             }
         }
@@ -260,6 +280,39 @@ public static class ProjectStructureTool
             return ".NET Framework";
 
         return null;
+    }
+
+    /// <summary>
+    /// Builds a compact namespace summary showing type counts per namespace.
+    /// </summary>
+    private static void AppendNamespaceSummary(StringBuilder sb, List<INamedTypeSymbol> types)
+    {
+        var byNamespace = types
+            .GroupBy(t =>
+            {
+                if (t.ContainingNamespace is null || t.ContainingNamespace.IsGlobalNamespace)
+                    return "(global)";
+                return t.ContainingNamespace.ToDisplayString();
+            })
+            .OrderBy(g => g.Key);
+
+        sb.AppendLine("| Namespace | Classes | Interfaces | Enums | Structs | Other |");
+        sb.AppendLine("|-----------|---------|------------|-------|---------|-------|");
+
+        foreach (var nsGroup in byNamespace)
+        {
+            int classes = nsGroup.Count(t => t.TypeKind == TypeKind.Class);
+            int interfaces = nsGroup.Count(t => t.TypeKind == TypeKind.Interface);
+            int enums = nsGroup.Count(t => t.TypeKind == TypeKind.Enum);
+            int structs = nsGroup.Count(t => t.TypeKind == TypeKind.Struct);
+            int other = nsGroup.Count() - classes - interfaces - enums - structs;
+
+            sb.Append($"| {nsGroup.Key} | {classes}");
+            sb.Append($" | {interfaces}");
+            sb.Append($" | {enums}");
+            sb.Append($" | {structs}");
+            sb.AppendLine($" | {other} |");
+        }
     }
 
     /// <summary>

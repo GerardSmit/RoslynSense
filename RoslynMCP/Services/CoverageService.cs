@@ -51,7 +51,7 @@ public static class CoverageService
             args.Append(" --nologo");
             if (!string.IsNullOrWhiteSpace(filter))
             {
-                args.Append($" --filter \"{filter}\"");
+                args.Append($" --filter \"{filter.Replace("\"", "\\\"")}\"");
             }
             // Include test assembly in coverage (for projects with code and tests together)
             args.Append(" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeTestAssembly=true");

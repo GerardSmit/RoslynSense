@@ -31,7 +31,18 @@ internal static class ToolHelper
             return null;
         }
 
-        string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
+        // When a .csproj is passed directly, use it as the project path
+        // (many tool descriptions say "path to .csproj or any source file")
+        string? projectPath;
+        if (systemPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            projectPath = systemPath;
+        }
+        else
+        {
+            projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
+        }
+
         if (string.IsNullOrEmpty(projectPath))
         {
             errors?.Append("Error: Couldn't find a project containing this file.");

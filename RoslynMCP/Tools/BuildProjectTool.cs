@@ -15,8 +15,8 @@ public static class BuildProjectTool
     public static async Task<string> BuildProject(
         [Description("Path to the .csproj, .sln file, or a source file in the project.")]
         string projectPath,
-        [Description("Build configuration. Default: 'Release'.")]
-        string configuration = "Release",
+        [Description("Build configuration. Default: 'Debug'.")]
+        string configuration = "Debug",
         CancellationToken cancellationToken = default)
     {
         try
@@ -30,7 +30,7 @@ public static class BuildProjectTool
             args.Append('"');
             args.Append(resolved);
             args.Append('"');
-            args.Append($" --configuration {configuration}");
+            args.Append($" --configuration \"{SanitizeConfiguration(configuration)}\"");
             args.Append(" --nologo");
 
             using var process = new Process
@@ -190,5 +190,20 @@ public static class BuildProjectTool
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Strips any characters that aren't alphanumeric, dash, underscore, or dot
+    /// to prevent argument injection via the configuration parameter.
+    /// </summary>
+    private static string SanitizeConfiguration(string configuration)
+    {
+        var sanitized = new StringBuilder(configuration.Length);
+        foreach (var c in configuration)
+        {
+            if (char.IsLetterOrDigit(c) || c is '-' or '_' or '.')
+                sanitized.Append(c);
+        }
+        return sanitized.Length > 0 ? sanitized.ToString() : "Debug";
     }
 }

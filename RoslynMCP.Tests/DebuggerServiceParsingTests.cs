@@ -248,11 +248,11 @@ public class DebuggerServiceParsingTests
     public async Task ProcessMiOutput_TokenPrefixedDoneCompletesWaiter()
     {
         using var service = new DebuggerService();
-        // Simulate a response waiter
+        // Simulate a response waiter with matching expected token
         var tcs = new TaskCompletionSource<string>();
-        typeof(DebuggerService)
-            .GetField("_responseWaiter", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-            .SetValue(service, tcs);
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        typeof(DebuggerService).GetField("_responseWaiter", flags)!.SetValue(service, tcs);
+        typeof(DebuggerService).GetField("_expectedToken", flags)!.SetValue(service, 5);
 
         service.ProcessMiOutput(@"5^done,value=""42""");
 
@@ -265,9 +265,9 @@ public class DebuggerServiceParsingTests
     {
         using var service = new DebuggerService();
         var tcs = new TaskCompletionSource<string>();
-        typeof(DebuggerService)
-            .GetField("_responseWaiter", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-            .SetValue(service, tcs);
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        typeof(DebuggerService).GetField("_responseWaiter", flags)!.SetValue(service, tcs);
+        typeof(DebuggerService).GetField("_expectedToken", flags)!.SetValue(service, 12);
 
         service.ProcessMiOutput(@"12^error,msg=""No symbol""");
 
@@ -288,6 +288,21 @@ public class DebuggerServiceParsingTests
 
         Assert.True(tcs.Task.IsCompleted);
         Assert.Equal("^done,locals=[]", await tcs.Task);
+    }
+
+    [Fact]
+    public void ProcessMiOutput_MismatchedTokenDoesNotResolveWaiter()
+    {
+        using var service = new DebuggerService();
+        var tcs = new TaskCompletionSource<string>();
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        typeof(DebuggerService).GetField("_responseWaiter", flags)!.SetValue(service, tcs);
+        typeof(DebuggerService).GetField("_expectedToken", flags)!.SetValue(service, 10);
+
+        // Send response with token 5 when expecting token 10
+        service.ProcessMiOutput(@"5^done,value=""stale""");
+
+        Assert.False(tcs.Task.IsCompleted);
     }
 
     [Fact]
@@ -325,12 +340,11 @@ public class DebuggerServiceParsingTests
 
         service.ProcessMiOutput(@"~""Hello from test\n""");
 
-        // Console output is stored internally — verify via raw output buffer
-        // The raw buffer at least should contain the line
-        var rawField = typeof(DebuggerService)
-            .GetField("_rawOutputBuffer", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        var raw = rawField.GetValue(service)!.ToString()!;
-        Assert.Contains("Hello from test", raw);
+        // Console output is stored in _consoleOutput list
+        var consoleField = typeof(DebuggerService)
+            .GetField("_consoleOutput", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var console = (List<string>)consoleField.GetValue(service)!;
+        Assert.Contains(console, c => c.Contains("Hello from test"));
     }
 
     [Fact]

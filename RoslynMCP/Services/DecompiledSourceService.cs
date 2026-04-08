@@ -114,42 +114,49 @@ internal static class DecompiledSourceService
                 manifest.SourceFilePath);
 
         var workspace = new AdhocWorkspace();
-        string projectName = BuildProjectName(manifest);
-        var projectId = ProjectId.CreateNewId(projectName);
+        try
+        {
+            string projectName = BuildProjectName(manifest);
+            var projectId = ProjectId.CreateNewId(projectName);
 
-        var solution = workspace.CurrentSolution
-            .AddProject(projectId, projectName, projectName, LanguageNames.CSharp)
-            .WithProjectCompilationOptions(
-                projectId,
-                new CSharpCompilationOptions(
-                    OutputKind.DynamicallyLinkedLibrary,
-                    allowUnsafe: true,
-                    nullableContextOptions: NullableContextOptions.Enable))
-            .WithProjectParseOptions(
-                projectId,
-                new CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview))
-            .AddMetadataReferences(projectId, CreateMetadataReferences(manifest.AssemblyPath));
+            var solution = workspace.CurrentSolution
+                .AddProject(projectId, projectName, projectName, LanguageNames.CSharp)
+                .WithProjectCompilationOptions(
+                    projectId,
+                    new CSharpCompilationOptions(
+                        OutputKind.DynamicallyLinkedLibrary,
+                        allowUnsafe: true,
+                        nullableContextOptions: NullableContextOptions.Enable))
+                .WithProjectParseOptions(
+                    projectId,
+                    new CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview))
+                .AddMetadataReferences(projectId, CreateMetadataReferences(manifest.AssemblyPath));
 
-        string sourceText = await File.ReadAllTextAsync(manifest.SourceFilePath, cancellationToken);
-        var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(manifest.SourceFilePath));
-        solution = solution.AddDocument(
-            documentId,
-            Path.GetFileName(manifest.SourceFilePath),
-            SourceText.From(sourceText, s_utf8NoBom),
-            filePath: manifest.SourceFilePath);
+            string sourceText = await File.ReadAllTextAsync(manifest.SourceFilePath, cancellationToken);
+            var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(manifest.SourceFilePath));
+            solution = solution.AddDocument(
+                documentId,
+                Path.GetFileName(manifest.SourceFilePath),
+                SourceText.From(sourceText, s_utf8NoBom),
+                filePath: manifest.SourceFilePath);
 
-        if (!workspace.TryApplyChanges(solution))
+            if (!workspace.TryApplyChanges(solution))
+            {
+                throw new InvalidOperationException(
+                    $"Failed to create AdhocWorkspace project for decompiled source '{manifest.SourceFilePath}'.");
+            }
+
+            var project = workspace.CurrentSolution.GetProject(projectId)
+                ?? throw new InvalidOperationException(
+                    $"Generated decompiled project '{projectName}' was not found after creation.");
+
+            return (workspace, project);
+        }
+        catch
         {
             workspace.Dispose();
-            throw new InvalidOperationException(
-                $"Failed to create AdhocWorkspace project for decompiled source '{manifest.SourceFilePath}'.");
+            throw;
         }
-
-        var project = workspace.CurrentSolution.GetProject(projectId)
-            ?? throw new InvalidOperationException(
-                $"Generated decompiled project '{projectName}' was not found after creation.");
-
-        return (workspace, project);
     }
 
     private static string DecompileType(

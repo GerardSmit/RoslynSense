@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -17,6 +19,7 @@ internal static class WorkspaceService
     private static readonly TimeSpan EvictionInterval = TimeSpan.FromMinutes(1);
 
     private static readonly Dictionary<string, CachedWorkspaceEntry> s_cache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, Task<(Workspace, Project)>> s_inflight = new(StringComparer.OrdinalIgnoreCase);
     private static readonly SemaphoreSlim s_cacheLock = new(1, 1);
     private static readonly Timer s_evictionTimer;
 
@@ -113,65 +116,173 @@ internal static class WorkspaceService
         CancellationToken cancellationToken = default)
     {
         string normalizedPath = Path.GetFullPath(projectPath);
+        TaskCompletionSource<(Workspace, Project)>? ourTcs = null;
 
-        CachedWorkspaceEntry? cachedEntry;
-        await s_cacheLock.WaitAsync(cancellationToken);
-        try
+        while (true)
         {
-            if (TryGetValidCachedEntryLocked(normalizedPath, out cachedEntry))
-                return CreateProjectSnapshot(cachedEntry!, targetFilePath);
+            Task<(Workspace, Project)>? inflightTask = null;
+
+            await s_cacheLock.WaitAsync(cancellationToken);
+            try
+            {
+                if (TryGetValidCachedEntryLocked(normalizedPath, out var cachedEntry))
+                    return CreateProjectSnapshot(cachedEntry!, targetFilePath);
+
+                if (s_inflight.TryGetValue(normalizedPath, out inflightTask))
+                {
+                    // Another caller is loading this project — wait for it outside the lock
+                }
+                else
+                {
+                    // We are the loader — register ourselves and break out to do the load
+                    ourTcs = new TaskCompletionSource<(Workspace, Project)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    s_inflight[normalizedPath] = ourTcs.Task;
+                    break;
+                }
+            }
+            finally
+            {
+                s_cacheLock.Release();
+            }
+
+            // Wait for the in-flight load to complete, then loop back to check cache.
+            // Use WaitAsync so the caller's cancellation token is respected — without
+            // it, a waiter would be stuck until the (potentially minutes-long) load
+            // finishes even after its own token is cancelled.
+            try
+            {
+                await inflightTask!.WaitAsync(cancellationToken);
+            }
+            catch
+            {
+                // In-flight load failed or our token was cancelled;
+                // loop back to try again (we may become the loader,
+                // or the next WaitAsync on the semaphore will throw
+                // OperationCanceledException and we'll exit cleanly).
+            }
         }
-        finally
-        {
-            s_cacheLock.Release();
-        }
+
+        // At this point we are the designated loader with ourTcs registered in s_inflight.
+        // The s_cacheLock is NOT held.
 
         Workspace workspace;
         Project openedProject;
 
-        if (DecompiledSourceService.IsGeneratedProjectPath(normalizedPath))
-        {
-            (workspace, openedProject) = await DecompiledSourceService.OpenProjectAsync(
-                normalizedPath,
-                cancellationToken);
-        }
-        else
-        {
-            var msbuildWorkspace = CreateWorkspace(diagnosticWriter);
-
-            try
-            {
-                openedProject = await msbuildWorkspace.OpenProjectAsync(
-                    normalizedPath,
-                    cancellationToken: cancellationToken);
-                workspace = msbuildWorkspace;
-            }
-            catch
-            {
-                msbuildWorkspace.Dispose();
-                throw;
-            }
-        }
-
-        await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
-            if (TryGetValidCachedEntryLocked(normalizedPath, out cachedEntry))
+            if (DecompiledSourceService.IsGeneratedProjectPath(normalizedPath))
+            {
+                (workspace, openedProject) = await DecompiledSourceService.OpenProjectAsync(
+                    normalizedPath,
+                    cancellationToken);
+            }
+            else
+            {
+                var msbuildWorkspace = CreateWorkspace(diagnosticWriter);
+
+                try
+                {
+                    await EnsureRestoredAsync(normalizedPath, cancellationToken);
+
+                    openedProject = await msbuildWorkspace.OpenProjectAsync(
+                        normalizedPath,
+                        cancellationToken: cancellationToken);
+
+                    var solution = StripUnresolvedAnalyzerReferences(msbuildWorkspace.CurrentSolution);
+                    if (solution != msbuildWorkspace.CurrentSolution)
+                    {
+                        msbuildWorkspace.TryApplyChanges(solution);
+                        openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedProject.Id)!;
+                    }
+
+                    solution = await InjectMissingFrameworkReferencesAsync(msbuildWorkspace.CurrentSolution, cancellationToken);
+                    if (solution != msbuildWorkspace.CurrentSolution)
+                    {
+                        msbuildWorkspace.TryApplyChanges(solution);
+                        openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedProject.Id)!;
+                    }
+
+                    workspace = msbuildWorkspace;
+                }
+                catch
+                {
+                    msbuildWorkspace.Dispose();
+                    throw;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            await RemoveInflightAndSignal(normalizedPath, ourTcs!, ex);
+            throw;
+        }
+
+        // Cache the result and signal waiters.
+        // TCS is signaled AFTER releasing the lock to avoid holding the lock
+        // while continuations run (even with RunContinuationsAsynchronously).
+        (Workspace, Project) result;
+        try
+        {
+            await s_cacheLock.WaitAsync(cancellationToken);
+        }
+        catch
+        {
+            workspace.Dispose();
+            await RemoveInflightAndSignal(normalizedPath, ourTcs!);
+            throw;
+        }
+
+        try
+        {
+            s_inflight.Remove(normalizedPath);
+
+            if (TryGetValidCachedEntryLocked(normalizedPath, out var cachedEntry))
             {
                 workspace.Dispose();
-                return CreateProjectSnapshot(cachedEntry!, targetFilePath);
+                result = CreateProjectSnapshot(cachedEntry!, targetFilePath);
             }
+            else
+            {
+                var newEntry = new CachedWorkspaceEntry(workspace, openedProject.Id);
+                s_cache[normalizedPath] = newEntry;
+                Console.Error.WriteLine($"[WorkspaceService] Cached workspace for '{normalizedPath}'.");
 
-            var newEntry = new CachedWorkspaceEntry(workspace, openedProject.Id);
-            s_cache[normalizedPath] = newEntry;
-            Console.Error.WriteLine($"[WorkspaceService] Cached workspace for '{normalizedPath}'.");
-
-            return CreateProjectSnapshot(newEntry, targetFilePath);
+                result = CreateProjectSnapshot(newEntry, targetFilePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            // CreateProjectSnapshot failed — signal waiters so they don't hang
+            ourTcs!.TrySetException(ex);
+            throw;
         }
         finally
         {
             s_cacheLock.Release();
         }
+
+        ourTcs!.TrySetResult(result);
+        return result;
+    }
+
+    /// <summary>
+    /// Removes the in-flight entry for <paramref name="normalizedPath"/> under the
+    /// cache lock and then signals the TCS so waiters can retry or propagate the error.
+    /// When <paramref name="ex"/> is <c>null</c> the TCS is cancelled; otherwise it is faulted.
+    /// </summary>
+    private static async Task RemoveInflightAndSignal(
+        string normalizedPath, TaskCompletionSource<(Workspace, Project)> tcs, Exception? ex = null)
+    {
+        await s_cacheLock.WaitAsync(CancellationToken.None);
+        try { s_inflight.Remove(normalizedPath); }
+        finally { s_cacheLock.Release(); }
+
+        if (ex is OperationCanceledException oce)
+            tcs.TrySetCanceled(oce.CancellationToken);
+        else if (ex is not null)
+            tcs.TrySetException(ex);
+        else
+            tcs.TrySetCanceled();
     }
 
     /// <summary>
@@ -410,6 +521,254 @@ internal static class WorkspaceService
         {
             s_cacheLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Removes UnresolvedAnalyzerReference instances from all projects in the solution.
+    /// These cause Roslyn's SymbolFinder APIs to crash with switch expression failures.
+    /// </summary>
+    private static Solution StripUnresolvedAnalyzerReferences(Solution solution)
+    {
+        foreach (var project in solution.Projects)
+        {
+            foreach (var analyzerRef in project.AnalyzerReferences)
+            {
+                if (analyzerRef.GetType().Name == "UnresolvedAnalyzerReference")
+                {
+                    solution = solution.RemoveAnalyzerReference(project.Id, analyzerRef);
+                }
+            }
+        }
+        return solution;
+    }
+
+    /// <summary>
+    /// Runs <c>dotnet restore</c> if the project's <c>project.assets.json</c> is missing,
+    /// so that MSBuildWorkspace can properly resolve NuGet packages and framework references.
+    /// </summary>
+    private static async Task EnsureRestoredAsync(string projectPath, CancellationToken cancellationToken)
+    {
+        string? projectDir = Path.GetDirectoryName(projectPath);
+        if (projectDir is null) return;
+
+        string assetsFile = Path.Combine(projectDir, "obj", "project.assets.json");
+        if (File.Exists(assetsFile)) return;
+
+        Console.Error.WriteLine($"[WorkspaceService] project.assets.json missing for '{Path.GetFileName(projectPath)}', running dotnet restore...");
+
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = $"restore \"{projectPath}\" --verbosity quiet",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = projectDir
+            }
+        };
+
+        process.StartInfo.Environment["MSBUILDTERMINALLOGGER"] = "off";
+
+        try
+        {
+            process.Start();
+
+            // Drain stdout/stderr in parallel to prevent pipe deadlock
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+
+            await process.WaitForExitAsync(cancellationToken);
+
+            // Await both tasks to ensure pipes are fully consumed before disposal
+            await Task.WhenAll(stdoutTask, stderrTask);
+
+            if (process.ExitCode == 0)
+                Console.Error.WriteLine("[WorkspaceService] Restore completed successfully.");
+            else
+            {
+                var stderr = await stderrTask;
+                Console.Error.WriteLine($"[WorkspaceService] Restore failed (exit {process.ExitCode}): {stderr.Trim()}");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Kill the process tree to prevent orphaned dotnet restore processes
+            try { process.Kill(entireProcessTree: true); } catch { }
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WorkspaceService] Restore failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Detects projects missing core framework references (System.Object, System.Int32, etc.)
+    /// and injects the appropriate references based on target framework.
+    /// </summary>
+    private static async Task<Solution> InjectMissingFrameworkReferencesAsync(Solution solution, CancellationToken cancellationToken)
+    {
+        foreach (var project in solution.Projects)
+        {
+            var compilation = await project.GetCompilationAsync(cancellationToken);
+            if (compilation is null) continue;
+
+            // Check if System.Object is resolvable — if not, framework references are broken
+            var objectType = compilation.GetSpecialType(SpecialType.System_Object);
+            if (objectType.TypeKind != TypeKind.Error) continue;
+
+            var refsToAdd = GetFrameworkReferences(project);
+            if (refsToAdd.Count == 0) continue;
+
+            // Filter out duplicates
+            var existingPaths = new HashSet<string>(
+                project.MetadataReferences
+                    .Select(r => r.Display ?? "")
+                    .Where(d => !string.IsNullOrEmpty(d)),
+                StringComparer.OrdinalIgnoreCase);
+
+            var filtered = refsToAdd.Where(r => !existingPaths.Contains(r.Display ?? "")).ToList();
+            if (filtered.Count == 0) continue;
+
+            string framework = InferTargetFrameworkKind(project);
+            Console.Error.WriteLine($"[WorkspaceService] Project '{project.Name}' ({framework}) missing framework references, injecting {filtered.Count} assemblies.");
+
+            solution = solution.WithProjectMetadataReferences(
+                project.Id,
+                project.MetadataReferences.Concat(filtered));
+        }
+
+        return solution;
+    }
+
+    /// <summary>
+    /// Returns the correct framework reference assemblies for the project's target framework.
+    /// </summary>
+    private static List<MetadataReference> GetFrameworkReferences(Project project)
+    {
+        var refs = new List<MetadataReference>();
+        string kind = InferTargetFrameworkKind(project);
+
+        if (kind == "netfx")
+        {
+            // .NET Framework — use reference assemblies from the targeting pack
+            var refAssembliesBase = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                "Reference Assemblies", "Microsoft", "Framework", ".NETFramework");
+
+            // Try common versions in order of preference
+            string[] versions = ["v4.8.1", "v4.8", "v4.7.2", "v4.7.1", "v4.7", "v4.6.2", "v4.6.1", "v4.6", "v4.5.2", "v4.5.1", "v4.5"];
+            string? refDir = null;
+            foreach (var ver in versions)
+            {
+                var candidate = Path.Combine(refAssembliesBase, ver);
+                if (Directory.Exists(candidate))
+                {
+                    refDir = candidate;
+                    break;
+                }
+            }
+
+            if (refDir is null)
+            {
+                Console.Error.WriteLine("[WorkspaceService] No .NET Framework reference assemblies found. Install the .NET Framework Developer Pack.");
+                return refs;
+            }
+
+            string[] netfxAssemblies =
+            [
+                "mscorlib.dll", "System.dll", "System.Core.dll", "System.Data.dll",
+                "System.Drawing.dll", "System.Web.dll", "System.Xml.dll", "System.Xml.Linq.dll",
+                "System.Configuration.dll", "System.Runtime.Serialization.dll",
+                "System.ServiceModel.dll", "System.Net.Http.dll", "System.ComponentModel.DataAnnotations.dll",
+            ];
+
+            foreach (var asm in netfxAssemblies)
+            {
+                var path = Path.Combine(refDir, asm);
+                if (File.Exists(path))
+                    refs.Add(MetadataReference.CreateFromFile(path));
+            }
+
+            // Also check Facades directory for netstandard.dll and type-forwarded assemblies
+            var facadesDir = Path.Combine(refDir, "Facades");
+            if (Directory.Exists(facadesDir))
+            {
+                foreach (var facadeDll in Directory.GetFiles(facadesDir, "*.dll"))
+                    refs.Add(MetadataReference.CreateFromFile(facadeDll));
+            }
+        }
+        else
+        {
+            // .NET Standard / .NET Core / .NET 5+ — use current runtime assemblies
+            string runtimeDir = RuntimeEnvironment.GetRuntimeDirectory();
+
+            string[] essentialAssemblies =
+            [
+                "netstandard.dll",
+                "System.Runtime.dll",
+                "mscorlib.dll",
+                "System.dll",
+                "System.Core.dll",
+                "System.Collections.dll",
+                "System.Linq.dll",
+                "System.Threading.dll",
+                "System.Threading.Tasks.dll",
+                "System.IO.dll",
+                "System.Text.RegularExpressions.dll",
+                "System.ComponentModel.dll",
+                "System.ComponentModel.Primitives.dll",
+                "System.ObjectModel.dll",
+                "System.Runtime.Extensions.dll",
+                "System.Runtime.InteropServices.dll",
+                "System.Collections.Concurrent.dll",
+                "System.Diagnostics.Debug.dll",
+            ];
+
+            foreach (var asm in essentialAssemblies)
+            {
+                var path = Path.Combine(runtimeDir, asm);
+                if (File.Exists(path))
+                    refs.Add(MetadataReference.CreateFromFile(path));
+            }
+        }
+
+        return refs;
+    }
+
+    /// <summary>
+    /// Determines if the project targets .NET Framework, .NET Standard, or modern .NET.
+    /// </summary>
+    private static string InferTargetFrameworkKind(Project project)
+    {
+        if (project.ParseOptions is CSharpParseOptions parseOptions)
+        {
+            var symbols = parseOptions.PreprocessorSymbolNames;
+            foreach (var sym in symbols)
+            {
+                // NET48, NET472, etc. — .NET Framework
+                if (sym.StartsWith("NET4", StringComparison.OrdinalIgnoreCase) &&
+                    !sym.StartsWith("NET40_OR_GREATER", StringComparison.OrdinalIgnoreCase))
+                    return "netfx";
+
+                if (sym.StartsWith("NET35", StringComparison.OrdinalIgnoreCase) ||
+                    sym.StartsWith("NET20", StringComparison.OrdinalIgnoreCase))
+                    return "netfx";
+
+                // NETFRAMEWORK is the definitive symbol
+                if (sym.Equals("NETFRAMEWORK", StringComparison.OrdinalIgnoreCase))
+                    return "netfx";
+
+                if (sym.Equals("NETSTANDARD", StringComparison.OrdinalIgnoreCase) ||
+                    sym.StartsWith("NETSTANDARD", StringComparison.OrdinalIgnoreCase))
+                    return "netstandard";
+            }
+        }
+
+        return "modern";
     }
 
     private sealed class CachedWorkspaceEntry : IDisposable

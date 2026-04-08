@@ -18,6 +18,24 @@ internal static class ProjectIndexCacheService
         [".razor", ".cshtml"];
 
     /// <summary>
+    /// Disposes all cached entries (including their FileSystemWatchers).
+    /// </summary>
+    public static void DisposeAll()
+    {
+        s_lock.Wait();
+        try
+        {
+            foreach (var entry in s_cache.Values)
+                entry.Dispose();
+            s_cache.Clear();
+        }
+        finally
+        {
+            s_lock.Release();
+        }
+    }
+
+    /// <summary>
     /// Returns a cached or freshly-built ASPX project index.
     /// </summary>
     public static async Task<AspxProjectIndex> GetAspxIndexAsync(
@@ -28,13 +46,22 @@ internal static class ProjectIndexCacheService
         if (entry.AspxIndex is { } cached && !entry.AspxDirty)
             return cached;
 
+        // Capture generation before building; if it changes during the build,
+        // we know a file changed and must leave the dirty flag set
+        int genBefore;
+        await s_lock.WaitAsync(cancellationToken);
+        try { genBefore = entry.AspxGeneration; }
+        finally { s_lock.Release(); }
+
         var index = await AspxSourceMappingService.BuildProjectIndexAsync(project, cancellationToken);
 
         await s_lock.WaitAsync(cancellationToken);
         try
         {
             entry.AspxIndex = index;
-            entry.AspxDirty = false;
+            // Only clear dirty if no file changed during the build
+            if (entry.AspxGeneration == genBefore)
+                entry.AspxDirty = false;
         }
         finally
         {
@@ -55,13 +82,19 @@ internal static class ProjectIndexCacheService
         if (entry.RazorSourceMap is { } cached && !entry.RazorDirty)
             return cached;
 
+        int genBefore;
+        await s_lock.WaitAsync(cancellationToken);
+        try { genBefore = entry.RazorGeneration; }
+        finally { s_lock.Release(); }
+
         var sourceMap = await RazorSourceMappingService.BuildSourceMapAsync(project, cancellationToken);
 
         await s_lock.WaitAsync(cancellationToken);
         try
         {
             entry.RazorSourceMap = sourceMap;
-            entry.RazorDirty = false;
+            if (entry.RazorGeneration == genBefore)
+                entry.RazorDirty = false;
         }
         finally
         {
@@ -155,6 +188,7 @@ internal static class ProjectIndexCacheService
         if (fileName.Equals("web.config", StringComparison.OrdinalIgnoreCase))
         {
             entry.AspxDirty = true;
+            Interlocked.Increment(ref entry.AspxGeneration);
             return;
         }
 
@@ -172,18 +206,32 @@ internal static class ProjectIndexCacheService
         bool isCSharp = ext.Equals(".cs", StringComparison.OrdinalIgnoreCase);
 
         if (isAspx || isCSharp)
+        {
             entry.AspxDirty = true;
+            Interlocked.Increment(ref entry.AspxGeneration);
+        }
 
         if (isRazor || isCSharp)
+        {
             entry.RazorDirty = true;
+            Interlocked.Increment(ref entry.RazorGeneration);
+        }
     }
 
-    private sealed class CachedProjectEntry
+    private sealed class CachedProjectEntry : IDisposable
     {
         public AspxProjectIndex? AspxIndex { get; set; }
         public RazorSourceMap? RazorSourceMap { get; set; }
         public volatile bool AspxDirty = true;
         public volatile bool RazorDirty = true;
+        public int AspxGeneration;
+        public int RazorGeneration;
         public FileSystemWatcher? Watcher { get; set; }
+
+        public void Dispose()
+        {
+            Watcher?.Dispose();
+            Watcher = null;
+        }
     }
 }

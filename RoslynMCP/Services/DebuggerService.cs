@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -26,17 +25,18 @@ internal sealed partial class DebuggerService : IDisposable
     private Process? _testHostProcess;
     private readonly SemaphoreSlim _commandLock = new(1, 1);
     private int _tokenCounter;
+    private CancellationTokenSource? _sessionCts;
 
-    private DebugState _state = DebugState.NotStarted;
+    private volatile DebugState _state = DebugState.NotStarted;
     private StoppedFrame? _currentFrame;
     private readonly ConcurrentDictionary<int, BreakpointInfo> _breakpoints = new();
     private readonly List<string> _consoleOutput = [];
-    private readonly StringBuilder _rawOutputBuffer = new();
     private readonly object _outputLock = new();
+    private int _expectedToken;
     private TaskCompletionSource<string>? _responseWaiter;
 
     public DebugState State => _state;
-    public StoppedFrame? CurrentFrame => _currentFrame;
+    public StoppedFrame? CurrentFrame { get { lock (_outputLock) return _currentFrame; } }
     public IReadOnlyDictionary<int, BreakpointInfo> Breakpoints => _breakpoints;
 
     /// <summary>
@@ -76,7 +76,7 @@ internal sealed partial class DebuggerService : IDisposable
         // Start dotnet test with VSTEST_HOST_DEBUG
         var testArgs = new StringBuilder($"test \"{csprojPath}\" -c Debug --no-build");
         if (!string.IsNullOrWhiteSpace(filter))
-            testArgs.Append($" --filter \"{filter}\"");
+            testArgs.Append($" --filter \"{filter.Replace("\"", "\\\"")}\"");
 
         _testHostProcess = new Process
         {
@@ -240,18 +240,21 @@ internal sealed partial class DebuggerService : IDisposable
 
         foreach (var proc in Process.GetProcesses())
         {
-            try
+            using (proc)
             {
-                var name = proc.ProcessName;
-                if (name.Contains("dotnet", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("testhost", StringComparison.OrdinalIgnoreCase))
+                try
                 {
-                    sb.AppendLine($"{proc.Id,-6} | {name,-20} | (use --attach {proc.Id})");
+                    var name = proc.ProcessName;
+                    if (name.Contains("dotnet", StringComparison.OrdinalIgnoreCase) ||
+                        name.Contains("testhost", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sb.AppendLine($"{proc.Id,-6} | {name,-20} | (use --attach {proc.Id})");
+                    }
                 }
-            }
-            catch
-            {
-                // Ignore inaccessible processes
+                catch
+                {
+                    // Ignore inaccessible processes
+                }
             }
         }
 
@@ -338,7 +341,7 @@ internal sealed partial class DebuggerService : IDisposable
             return "Error: No active debug session.";
 
         _state = DebugState.Running;
-        _currentFrame = null;
+        lock (_outputLock) _currentFrame = null;
 
         await SendCommandAsync("-exec-continue", cancellationToken);
 
@@ -382,21 +385,27 @@ internal sealed partial class DebuggerService : IDisposable
         if (_state != DebugState.Stopped)
             return "Error: Debugger is not stopped. Cannot evaluate.";
 
-        // netcoredbg uses -var-create instead of -data-evaluate-expression
-        var varName = $"eval{_tokenCounter}";
-        var response = await SendCommandAsync($"-var-create {varName} * \"{EscapeMiString(expression)}\"", cancellationToken);
+        // Use unique variable name via Interlocked to avoid races
+        var varName = $"eval{Interlocked.Increment(ref _tokenCounter)}";
+        try
+        {
+            var response = await SendCommandAsync($"-var-create {varName} * \"{EscapeMiString(expression)}\"", cancellationToken);
 
-        // Clean up the variable after reading the value
-        _ = SendCommandAsync($"-var-delete {varName}", cancellationToken);
+            var value = ExtractMiField(response, "value");
+            if (value is not null)
+                return UnescapeMiString(value);
 
-        var value = ExtractMiField(response, "value");
-        if (value is not null)
-            return UnescapeMiString(value);
+            if (response.Contains("^error", StringComparison.Ordinal))
+                return $"Error: {ExtractError(response)}";
 
-        if (response.Contains("^error", StringComparison.Ordinal))
-            return $"Error: {ExtractError(response)}";
-
-        return response;
+            return response;
+        }
+        finally
+        {
+            // Always clean up the variable, even if cancelled
+            try { await SendCommandAsync($"-var-delete {varName}", CancellationToken.None); }
+            catch { /* best effort cleanup */ }
+        }
     }
 
     public async Task<string> GetLocalsAsync(CancellationToken cancellationToken = default)
@@ -436,10 +445,12 @@ internal sealed partial class DebuggerService : IDisposable
             }
         }
 
-        if (_currentFrame is not null)
+        StoppedFrame? frame;
+        lock (_outputLock) frame = _currentFrame;
+        if (frame is not null)
         {
             sb.AppendLine();
-            sb.Append(FormatCurrentPosition(_currentFrame));
+            sb.Append(FormatCurrentPosition(frame));
         }
 
         return sb.ToString();
@@ -447,15 +458,18 @@ internal sealed partial class DebuggerService : IDisposable
 
     public string Stop()
     {
+        _sessionCts?.Cancel();
         CleanupProcesses();
         _breakpoints.Clear();
-        _currentFrame = null;
+        lock (_outputLock) _currentFrame = null;
         _state = DebugState.NotStarted;
         return "Debug session stopped.";
     }
 
     public void Dispose()
     {
+        _sessionCts?.Cancel();
+        _sessionCts?.Dispose();
         CleanupProcesses();
         _commandLock.Dispose();
     }
@@ -615,8 +629,16 @@ internal sealed partial class DebuggerService : IDisposable
             await _netcoredbgProcess.StandardInput.FlushAsync(cancellationToken);
         }
 
-        // Start reading output asynchronously
-        _ = Task.Run(() => ReadOutputLoop(cancellationToken), cancellationToken);
+        // Use a session-scoped CTS so the output loop survives individual request cancellations
+        _sessionCts?.Cancel();
+        _sessionCts?.Dispose();
+        _sessionCts = new CancellationTokenSource();
+
+        // Start reading stdout asynchronously (session-scoped)
+        _ = Task.Run(() => ReadOutputLoop(_sessionCts.Token));
+
+        // Drain stderr in the background to prevent pipe buffer deadlock
+        _ = Task.Run(() => DrainStderrAsync(_sessionCts.Token));
 
         // Wait for initial response
         await Task.Delay(500, cancellationToken);
@@ -651,17 +673,39 @@ internal sealed partial class DebuggerService : IDisposable
         catch (IOException) { }
     }
 
+    private async Task DrainStderrAsync(CancellationToken cancellationToken)
+    {
+        if (_netcoredbgProcess?.StandardError is null) return;
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested &&
+                   _netcoredbgProcess is { HasExited: false })
+            {
+                // Read and discard stderr to prevent pipe buffer from filling
+                var line = await _netcoredbgProcess.StandardError.ReadLineAsync(cancellationToken);
+                if (line is null) break;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (IOException) { }
+    }
+
     internal void ProcessMiOutput(string line)
     {
         lock (_outputLock)
         {
-            _rawOutputBuffer.AppendLine(line);
-
-            // Strip leading numeric token prefix (e.g. "5^done" → "^done")
+            // Parse leading numeric token prefix (e.g. "5^done" → token=5, parseLine="^done")
             var parseLine = line;
+            int responseToken = -1;
             var i = 0;
             while (i < parseLine.Length && char.IsDigit(parseLine[i])) i++;
-            if (i > 0) parseLine = parseLine[i..];
+            if (i > 0)
+            {
+                int.TryParse(parseLine.AsSpan(0, i), out responseToken);
+                parseLine = parseLine[i..];
+            }
 
             if (parseLine.StartsWith('~'))
             {
@@ -678,6 +722,7 @@ internal sealed partial class DebuggerService : IDisposable
                 _state = reason is "exited" or "exited-normally" or "exited-signalled"
                     ? DebugState.Exited
                     : DebugState.Stopped;
+                // *stopped is an async event (no token) — always resolve
                 _responseWaiter?.TrySetResult(parseLine);
             }
             else if (parseLine.StartsWith("*running", StringComparison.Ordinal))
@@ -717,7 +762,10 @@ internal sealed partial class DebuggerService : IDisposable
                     }
                 }
 
-                _responseWaiter?.TrySetResult(parseLine);
+                // Only resolve if the response token matches the expected command token,
+                // preventing late responses from timed-out commands from resolving a new command's TCS
+                if (responseToken < 0 || responseToken == _expectedToken)
+                    _responseWaiter?.TrySetResult(parseLine);
             }
 
             if (parseLine == "(gdb)")
@@ -736,7 +784,11 @@ internal sealed partial class DebuggerService : IDisposable
         try
         {
             var token = Interlocked.Increment(ref _tokenCounter);
-            _responseWaiter = new TaskCompletionSource<string>();
+            lock (_outputLock)
+            {
+                _expectedToken = token;
+                _responseWaiter = new TaskCompletionSource<string>();
+            }
 
             await _netcoredbgProcess.StandardInput.WriteLineAsync(
                 $"{token}{command}".AsMemory(), cancellationToken);
@@ -778,15 +830,18 @@ internal sealed partial class DebuggerService : IDisposable
         }
 
         // Wait for the test to hit a breakpoint or exit (timeout after 10s)
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(TimeSpan.FromSeconds(10));
 
         try
         {
             while (!cts.Token.IsCancellationRequested)
             {
-                if (_state == DebugState.Stopped && _currentFrame is not null)
-                    return FormatCurrentPosition(_currentFrame);
+                StoppedFrame? frame;
+                lock (_outputLock) { frame = _currentFrame; }
+
+                if (_state == DebugState.Stopped && frame is not null)
+                    return FormatCurrentPosition(frame);
 
                 if (_state == DebugState.Exited)
                     return "⏹ Test execution completed without hitting a breakpoint.";
@@ -812,8 +867,12 @@ internal sealed partial class DebuggerService : IDisposable
         }
 
         // If we timed out but state is stopped with a frame, report it
-        if (_state == DebugState.Stopped && _currentFrame is not null)
-            return FormatCurrentPosition(_currentFrame);
+        {
+            StoppedFrame? frame;
+            lock (_outputLock) { frame = _currentFrame; }
+            if (_state == DebugState.Stopped && frame is not null)
+                return FormatCurrentPosition(frame);
+        }
 
         // Otherwise, set state to stopped so the user can interact
         _state = DebugState.Stopped;
@@ -823,7 +882,7 @@ internal sealed partial class DebuggerService : IDisposable
     private async Task<string> WaitForStopAsync(CancellationToken cancellationToken)
     {
         // Wait for either a *stopped event or process exit
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(TimeSpan.FromMinutes(5));
 
         try
@@ -850,8 +909,10 @@ internal sealed partial class DebuggerService : IDisposable
             return "⏳ Timed out waiting for breakpoint. Use 'status' to check state.";
         }
 
-        if (_state == DebugState.Stopped && _currentFrame is not null)
-            return FormatCurrentPosition(_currentFrame);
+        StoppedFrame? frame;
+        lock (_outputLock) frame = _currentFrame;
+        if (_state == DebugState.Stopped && frame is not null)
+            return FormatCurrentPosition(frame);
 
         if (_state == DebugState.Exited)
             return "⏹ Program has exited.";
@@ -1055,7 +1116,27 @@ internal sealed partial class DebuggerService : IDisposable
 
     internal static string UnescapeMiString(string value)
     {
-        return value.Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("\\n", "\n");
+        var sb = new StringBuilder(value.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            if (value[i] == '\\' && i + 1 < value.Length)
+            {
+                switch (value[i + 1])
+                {
+                    case '\\': sb.Append('\\'); i++; break;
+                    case '"': sb.Append('"'); i++; break;
+                    case 'n': sb.Append('\n'); i++; break;
+                    case 't': sb.Append('\t'); i++; break;
+                    case 'r': sb.Append('\r'); i++; break;
+                    default: sb.Append(value[i]); break;
+                }
+            }
+            else
+            {
+                sb.Append(value[i]);
+            }
+        }
+        return sb.ToString();
     }
 
     private static async Task<(int exitCode, string output)> RunProcessAsync(

@@ -46,8 +46,8 @@ jobs:
             | grep -oP '"browser_download_url":\s*"\K[^"]*netcoredbg-linux-amd64\.tar\.gz' \
             | head -1 \
             | xargs curl -sSL -o /tmp/netcoredbg.tar.gz
-          mkdir -p /usr/local/netcoredbg
-          tar xzf /tmp/netcoredbg.tar.gz -C /usr/local
+          sudo mkdir -p /usr/local/netcoredbg
+          sudo tar xzf /tmp/netcoredbg.tar.gz -C /usr/local
           echo "/usr/local/netcoredbg" >> $GITHUB_PATH
 
       - name: Install netcoredbg (Windows)

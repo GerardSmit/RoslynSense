@@ -24,6 +24,27 @@ internal static class FixturePaths
     public static string BrokenSyntaxFile => Path.Combine(BrokenProjectDir, "BrokenSyntax.cs");
     public static string BrokenSemanticFile => Path.Combine(BrokenProjectDir, "BrokenSemantic.cs");
 
+    public static string LegacyProjectDir => Path.Combine(s_fixturesRoot, "LegacyProject");
+    public static string LegacyProjectFile => Path.Combine(LegacyProjectDir, "LegacyProject.csproj");
+    public static string LegacyCalculatorFile => Path.Combine(LegacyProjectDir, "Calculator.cs");
+    public static string LegacyCustomerFile => Path.Combine(LegacyProjectDir, "Models", "Customer.cs");
+
+    public static string AspxProjectDir => Path.Combine(s_fixturesRoot, "AspxProject");
+    public static string AspxProjectFile => Path.Combine(AspxProjectDir, "AspxProject.csproj");
+    public static string DefaultAspxFile => Path.Combine(AspxProjectDir, "Default.aspx");
+    public static string HeaderControlFile => Path.Combine(AspxProjectDir, "Controls", "HeaderControl.ascx");
+    public static string SiteMasterFile => Path.Combine(AspxProjectDir, "Site.master");
+    public static string DataServiceFile => Path.Combine(AspxProjectDir, "DataService.asmx");
+    public static string ImageHandlerFile => Path.Combine(AspxProjectDir, "ImageHandler.ashx");
+    public static string AspxPageHelperFile => Path.Combine(AspxProjectDir, "PageHelper.cs");
+    public static string AspxWebConfigFile => Path.Combine(AspxProjectDir, "web.config");
+
+    public static string BlazorProjectDir => Path.Combine(s_fixturesRoot, "BlazorProject");
+    public static string BlazorProjectFile => Path.Combine(BlazorProjectDir, "BlazorProject.csproj");
+    public static string BlazorAppHelperFile => Path.Combine(BlazorProjectDir, "AppHelper.cs");
+    public static string CounterRazorFile => Path.Combine(BlazorProjectDir, "Counter.razor");
+    public static string WeatherRazorFile => Path.Combine(BlazorProjectDir, "Weather.razor");
+
     /// <summary>
     /// Walks up from the test assembly location to find the Fixtures directory.
     /// Prefer the source-tree fixtures so Roslyn can open the nested sample project

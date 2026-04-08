@@ -9,6 +9,10 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <PackageReference Include="coverlet.collector" Version="6.0.4">
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+          <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.4.0" />
         <PackageReference Include="xunit" Version="2.9.3" />
         <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
@@ -28,21 +32,15 @@
     </ItemGroup>
 
     <ItemGroup>
-        <None Include="Fixtures\**\*"
-              Exclude="Fixtures\**\obj\**\*;Fixtures\**\bin\**\*"
-              CopyToOutputDirectory="PreserveNewest" />
+        <None Include="Fixtures\**\*" Exclude="Fixtures\**\obj\**\*;Fixtures\**\bin\**\*" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
     <Target Name="PrepareFixtureProjects" BeforeTargets="BeforeBuild">
-        <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj"
-                 Targets="Restore"
-                 Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj"
-                 Targets="Restore;Build"
-                 Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\SampleProject\SampleProject.csproj"
-                 Targets="Restore;Build"
-                 Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\SampleProject\SampleProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\BlazorProject\BlazorProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\AspxProject\AspxProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
     </Target>
 
 </Project>

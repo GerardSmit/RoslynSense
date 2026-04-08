@@ -127,6 +127,82 @@ public class GoToDefinitionToolTests
         Assert.Contains("```csharp", nestedDefinition);
     }
 
+    [Fact]
+    public async Task WhenConstructorTargetedThenReturnsContainingTypeName()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            markupSnippet: "return [|new|] Result(Add(a, b), Subtract(a, b));");
+
+        Assert.Contains("Definition: Result", result);
+    }
+
+    [Fact]
+    public async Task WhenNamespacedTypeTargetedThenNamespaceAppearsInResult()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.FrameworkReferencesFile,
+            markupSnippet: "new [|StringBuilder|]();");
+
+        Assert.Contains("Namespace", result);
+        Assert.Contains("System.Text", result);
+    }
+
+    [Fact]
+    public async Task WhenFrameworkMethodTargetedThenShowsAssemblyPath()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.FrameworkReferencesFile,
+            markupSnippet: "builder.[|Append|](value);");
+
+        Assert.Contains("Assembly", result, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("StringBuilder", result);
+    }
+
+    [Fact]
+    public async Task WhenPropertyTargetedThenReturnsPropertyDefinition()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.OutlineShowcaseFile,
+            markupSnippet: "public string [|Name|] { get;");
+
+        Assert.Contains("Definition: Name", result);
+        Assert.Contains("Property", result);
+    }
+
+    [Fact]
+    public async Task WhenEventTargetedThenReturnsEventDefinition()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.OutlineShowcaseFile,
+            markupSnippet: "[|Changed|]?.Invoke(this");
+
+        Assert.Contains("Definition: Changed", result);
+        Assert.Contains("Event", result);
+    }
+
+    [Fact]
+    public async Task WhenIndexerTargetedThenReturnsIndexerDefinition()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.OutlineShowcaseFile,
+            markupSnippet: "public int [|this|][int index]");
+
+        // Indexers show as "this[]" or "Item" depending on the symbol
+        Assert.Contains("Definition:", result);
+        Assert.Contains("Source Location", result);
+    }
+
+    [Fact]
+    public async Task WhenInterfaceMethodTargetedThenReturnsDefinition()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.ServicesFile,
+            markupSnippet: "string [|FormatDisplayValue|](int value);");
+
+        Assert.Contains("Definition: FormatDisplayValue", result);
+    }
+
     private static string ExtractDefinitionFilePath(string result)
     {
         const string prefix = "**File**: ";
@@ -136,5 +212,40 @@ public class GoToDefinitionToolTests
 
         Assert.False(string.IsNullOrWhiteSpace(line));
         return line![prefix.Length..];
+    }
+
+    [Fact]
+    public async Task WhenSymbolHasXmlDocsThenShowsSummary()
+    {
+        // StatisticsCalculator.ComputeAverageSum has XML docs
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.ServicesFile,
+            markupSnippet: "public double [|ComputeAverageSum|]()");
+
+        Assert.Contains("Summary", result);
+        Assert.Contains("average sum", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenSymbolHasParamDocsThenShowsSummary()
+    {
+        // StatisticsCalculator.AddResult has XML docs with summary
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.ServicesFile,
+            markupSnippet: "public void [|AddResult|](Result result)");
+
+        Assert.Contains("Summary", result);
+        Assert.Contains("calculation result", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenInterfaceHasXmlDocsThenShowsSummary()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.ServicesFile,
+            markupSnippet: "public interface [|IStringFormatter|]");
+
+        Assert.Contains("Summary", result);
+        Assert.Contains("formatting", result, StringComparison.OrdinalIgnoreCase);
     }
 }

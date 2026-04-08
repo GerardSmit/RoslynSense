@@ -22,7 +22,7 @@ public static class GoToDefinitionTool
         "Go to the definition of a symbol. Provide a code snippet from the file with " +
         "[| |] delimiters around the target symbol, e.g. 'var x = [|Foo|].Bar();'. " +
         "Returns source file context when available, or auto-decompiled source " +
-        "for referenced assembly symbols.")]
+        "for referenced assembly symbols. Works with C# files.")]
     public static async Task<string> GoToDefinition(
         [Description("Path to the file containing the symbol reference.")] string filePath,
         [Description(
@@ -33,46 +33,15 @@ public static class GoToDefinitionTool
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return "Error: File path cannot be empty.";
+            var errors = new StringBuilder();
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            if (ctx is null)
+                return errors.ToString();
 
-            if (string.IsNullOrWhiteSpace(markupSnippet))
-                return "Error: markupSnippet cannot be empty.";
+            if (!ctx.IsResolved)
+                return ToolHelper.FormatResolutionError(ctx.Resolution);
 
-            string systemPath = PathHelper.NormalizePath(filePath);
-
-            if (!File.Exists(systemPath))
-                return $"Error: File {systemPath} does not exist.";
-
-            if (!MarkupString.TryParse(markupSnippet, out var markup, out string? parseError))
-                return $"Error: Invalid markup snippet. {parseError}";
-
-            string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-            if (string.IsNullOrEmpty(projectPath))
-                return "Error: Couldn't find a project containing this file.";
-
-            var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
-            var document = WorkspaceService.FindDocumentInProject(project, systemPath);
-
-            if (document == null)
-                return "Error: File not found in project.";
-
-            var resolution = await MarkupSymbolResolver.ResolveAsync(
-                document, workspace, markup!, cancellationToken);
-
-            return resolution.Kind switch
-            {
-                MarkupResolutionResult.ResultKind.Resolved =>
-                    await FormatDefinitionAsync(resolution.Symbol!, project, cancellationToken),
-                MarkupResolutionResult.ResultKind.NoSymbol =>
-                    $"No symbol found at markup target. {resolution.Message}",
-                MarkupResolutionResult.ResultKind.Ambiguous =>
-                    $"Ambiguous markup match. {resolution.Message}",
-                MarkupResolutionResult.ResultKind.NoMatch =>
-                    $"Snippet not found in file. {resolution.Message}",
-                _ => $"Error: {resolution.Message}",
-            };
+            return await FormatDefinitionAsync(ctx.Symbol!, ctx.Project, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -106,6 +75,8 @@ public static class GoToDefinitionTool
 
         if (symbol.ContainingNamespace is { IsGlobalNamespace: false })
             sb.AppendLine($"- **Namespace**: {symbol.ContainingNamespace.ToDisplayString()}");
+
+        SymbolFormatter.AppendXmlDocs(sb, symbol);
 
         sb.AppendLine();
 

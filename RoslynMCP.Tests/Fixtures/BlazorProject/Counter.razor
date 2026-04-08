@@ -1,0 +1,20 @@
+<h1>Counter</h1>
+
+<p>Current count: @currentCount</p>
+<p>Formatted: @AppHelper.FormatTitle("Counter")</p>
+
+<button @onclick="IncrementCount">Click me</button>
+
+@code {
+    private int currentCount = 0;
+
+    private void IncrementCount()
+    {
+        currentCount = AppHelper.DoubleValue(currentCount + 1);
+    }
+
+    public string GetCountMessage()
+    {
+        return $"Count is {currentCount}";
+    }
+}

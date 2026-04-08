@@ -114,4 +114,46 @@ public class AnalyzerInfrastructureTests
         Assert.Empty(diagnostics);
         Assert.Contains("No analyzer references found", writer.ToString());
     }
+
+    [Fact]
+    public void WhenAnalyzerHostDisposedTwiceThenDoesNotThrow()
+    {
+        var host = new AnalyzerHost();
+        host.Dispose();
+        host.Dispose(); // Second dispose should be a no-op
+    }
+
+    [Fact]
+    public void WhenAnalyzerHostDisposedThenGetOrLoadThrowsObjectDisposed()
+    {
+        var host = new AnalyzerHost();
+        host.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(
+            () => host.GetOrLoadAnalyzers("test", ["dummy.dll"]));
+    }
+
+    [Fact]
+    public async Task WhenUnloadAllCalledMultipleTimesThenIdempotent()
+    {
+        var project = await RoslynTestHelpers.OpenProjectAsync(
+            FixturePaths.SampleProjectFile,
+            FixturePaths.WarningsFile);
+        var analyzerPaths = AnalyzerService.DiscoverAnalyzerPathsFromProject(project);
+
+        using var host = new AnalyzerHost();
+        host.GetOrLoadAnalyzers(project.FilePath!, analyzerPaths);
+
+        host.UnloadAll();
+        host.UnloadAll(); // Should not throw
+    }
+
+    [Fact]
+    public async Task WhenEvictForNonExistentProjectThenNoException()
+    {
+        using var host = new AnalyzerHost();
+
+        // Evicting a non-existent project should not throw
+        host.EvictForProject("nonexistent-project");
+    }
 }

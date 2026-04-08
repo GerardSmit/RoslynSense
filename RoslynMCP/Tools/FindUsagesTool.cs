@@ -19,6 +19,7 @@ public static class FindUsagesTool
     [McpServerTool, Description(
         "Find all references to a symbol. Provide a code snippet from the file with " +
         "[| |] delimiters around the target symbol, e.g. 'var x = [|Foo|].Bar();'. " +
+        "Also searches Razor source-generated files and ASPX inline code. " +
         "Whitespace differences between the snippet and the file are tolerated.")]
     public static async Task<string> FindUsages(
         [Description("Path to the file.")] string filePath,
@@ -30,36 +31,29 @@ public static class FindUsagesTool
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return "Error: File path cannot be empty.";
+            var errors = new StringBuilder();
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            if (ctx is null)
+                return errors.ToString();
 
-            if (string.IsNullOrWhiteSpace(markupSnippet))
-                return "Error: markupSnippet cannot be empty.";
+            if (!ctx.IsResolved)
+                return ToolHelper.FormatResolutionError(ctx.Resolution);
 
-            string systemPath = PathHelper.NormalizePath(filePath);
-
-            if (!File.Exists(systemPath))
-                return $"Error: File {systemPath} does not exist.";
-
-            string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-            if (string.IsNullOrEmpty(projectPath))
-                return "Error: Couldn't find a project containing this file.";
-
-            var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
-            var document = WorkspaceService.FindDocumentInProject(project, systemPath);
-
-            if (document == null) return "Error: File not found in project.";
-
-            var (symbol, searchSummary, error) = await ResolveViaMarkupAsync(
-                document, workspace, markupSnippet, cancellationToken);
-            if (error != null) return error;
+            var symbol = ctx.Symbol!;
 
             var references = await SymbolFinder.FindReferencesAsync(
-                symbol!, project.Solution, cancellationToken);
+                symbol, ctx.Workspace.CurrentSolution, cancellationToken);
 
+            // Build Razor source map for mapping generated references
+            var razorSourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(ctx.Project, cancellationToken);
+
+            // Build ASPX index for searching inline code references
+            var aspxIndex = await ProjectIndexCacheService.GetAspxIndexAsync(ctx.Project, cancellationToken);
+
+            string searchSummary = $"Markup target: `{ctx.Markup.MarkedText}`";
             return await FormatResultsAsync(
-                symbol!, references, systemPath, searchSummary!, projectPath, cancellationToken);
+                symbol, references, ctx.SystemPath, searchSummary, ctx.Project.FilePath!,
+                razorSourceMap, aspxIndex, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -73,37 +67,6 @@ public static class FindUsagesTool
     }
 
     /// <summary>
-    /// Resolves a symbol via the markup snippet path using <see cref="MarkupSymbolResolver"/>.
-    /// </summary>
-    private static async Task<(ISymbol? Symbol, string? Description, string? Error)> ResolveViaMarkupAsync(
-        Document document, Workspace workspace, string markupSnippet,
-        CancellationToken cancellationToken)
-    {
-        if (!MarkupString.TryParse(markupSnippet, out var markup, out string? parseError))
-            return (null, null, $"Error: Invalid markup snippet. {parseError}");
-
-        var result = await MarkupSymbolResolver.ResolveAsync(
-            document, workspace, markup!, cancellationToken);
-
-        return result.Kind switch
-        {
-            MarkupResolutionResult.ResultKind.Resolved =>
-                (result.Symbol, $"Markup target: `{markup!.MarkedText}`", null),
-
-            MarkupResolutionResult.ResultKind.NoSymbol =>
-                (null, null, $"No symbol found at markup target. {result.Message}"),
-
-            MarkupResolutionResult.ResultKind.Ambiguous =>
-                (null, null, $"Ambiguous markup match. {result.Message}"),
-
-            MarkupResolutionResult.ResultKind.NoMatch =>
-                (null, null, $"Snippet not found in file. {result.Message}"),
-
-            _ => (null, null, $"Error: {result.Message}"),
-        };
-    }
-
-    /// <summary>
     /// Formats the symbol and reference data into the markdown report returned to the caller.
     /// </summary>
     private static async Task<string> FormatResultsAsync(
@@ -112,6 +75,8 @@ public static class FindUsagesTool
         string filePath,
         string searchSummary,
         string projectPath,
+        RazorSourceMap razorSourceMap,
+        AspxProjectIndex aspxIndex,
         CancellationToken cancellationToken)
     {
         var refList = references.ToList();
@@ -141,11 +106,15 @@ public static class FindUsagesTool
 
             foreach (var location in reference.Locations)
             {
+                // Check if this reference is in a Razor source-generated file
+                var mappedRazor = TryMapRazorReference(location, razorSourceMap);
+
                 await AppendReferenceLocationAsync(
                     results,
                     location,
                     referenceCount,
                     includeCodeContext: referenceCount <= MaxCodeContextReferences,
+                    mappedRazor,
                     cancellationToken);
                 referenceCount++;
             }
@@ -159,12 +128,65 @@ public static class FindUsagesTool
             results.AppendLine();
         }
 
+        // Append ASPX references
+        var aspxRefs = AspxSourceMappingService.FindSymbolReferences(aspxIndex, symbol.Name);
+        if (aspxRefs.Count > 0)
+        {
+            results.AppendLine("## ASPX References");
+            results.AppendLine(
+                $"Found {aspxRefs.Count} potential references in ASPX/ASCX files.");
+            results.AppendLine();
+
+            foreach (var aspxRef in aspxRefs)
+            {
+                var locType = aspxRef.LocationType == AspxCodeLocationType.Expression
+                    ? "Expression" : "Code Block";
+                results.AppendLine(
+                    $"- **{Path.GetFileName(aspxRef.FilePath)}**:{aspxRef.Line} ({locType})");
+                var snippet = aspxRef.CodeSnippet.Length > 80
+                    ? aspxRef.CodeSnippet[..77] + "..."
+                    : aspxRef.CodeSnippet;
+                results.AppendLine($"  `{snippet}`");
+            }
+
+            results.AppendLine();
+        }
+
         results.AppendLine("## Summary");
+        int aspxCount = aspxRefs.Count;
+        var summaryParts = new List<string>
+        {
+            $"{totalLocations} C# references across {refList.Count} locations"
+        };
+        if (aspxCount > 0)
+            summaryParts.Add($"{aspxCount} ASPX references");
+
         results.AppendLine(
-            $"Symbol `{symbol.Name}` of type `{symbol.Kind}` has " +
-            $"{totalLocations} references across {refList.Count} locations.");
+            $"Symbol `{symbol.Name}` of type `{symbol.Kind}` has {string.Join(", ", summaryParts)}.");
 
         return results.ToString();
+    }
+
+    /// <summary>
+    /// Attempts to map a reference location from Razor-generated code back to the original .razor file.
+    /// </summary>
+    private static RazorMappedLocation? TryMapRazorReference(
+        ReferenceLocation location, RazorSourceMap sourceMap)
+    {
+        var docPath = location.Document.FilePath;
+        if (string.IsNullOrEmpty(docPath))
+            return null;
+
+        // Check if this is a source-generated Razor document
+        var docName = Path.GetFileName(docPath);
+        if (!docName.EndsWith(".razor.g.cs", StringComparison.OrdinalIgnoreCase) &&
+            !docName.EndsWith(".cshtml.g.cs", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var lineSpan = location.Location.GetLineSpan();
+        int generatedLine = lineSpan.StartLinePosition.Line + 1; // Convert to 1-indexed
+
+        return RazorSourceMappingService.MapGeneratedToRazor(sourceMap, docPath, generatedLine);
     }
 
     private static void AppendSymbolDetails(StringBuilder results, ISymbol symbol)
@@ -218,6 +240,7 @@ public static class FindUsagesTool
     private static async Task AppendReferenceLocationAsync(
         StringBuilder results, ReferenceLocation location, int referenceCount,
         bool includeCodeContext,
+        RazorMappedLocation? razorMapping,
         CancellationToken cancellationToken)
     {
         var linePosition = location.Location.GetLineSpan();
@@ -227,6 +250,12 @@ public static class FindUsagesTool
         string formattedLocation = $"{locationPath}:{refLine}:{refColumn}";
 
         results.AppendLine($"#### Reference {referenceCount}: {formattedLocation}");
+
+        if (razorMapping is not null)
+        {
+            results.AppendLine(
+                $"  ↳ **Razor source**: {razorMapping.RazorFilePath}:{razorMapping.Line}");
+        }
 
         if (!includeCodeContext)
         {

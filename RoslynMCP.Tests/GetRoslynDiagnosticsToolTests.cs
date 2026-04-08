@@ -116,4 +116,39 @@ public class GetRoslynDiagnosticsToolTests
         Assert.Contains("Warning", result);
         Assert.Contains("CA", result);
     }
+
+    [Fact]
+    public async Task WhenErrorFilterAppliedThenOnlyErrorsReturned()
+    {
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+            filePath: FixturePaths.BrokenSyntaxFile,
+            severityFilter: "error",
+            runAnalyzers: false);
+
+        Assert.Contains("Error", result);
+        Assert.Contains("CS", result);
+    }
+
+    [Fact]
+    public async Task WhenInfoFilterAppliedThenReturnsStructuredOutput()
+    {
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+            filePath: FixturePaths.CalculatorFile,
+            severityFilter: "info",
+            runAnalyzers: false);
+
+        Assert.Contains("# Diagnostics:", result);
+    }
+
+    [Fact]
+    public async Task WhenWarningFilterAppliedThenReturnsStructuredOutput()
+    {
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+            filePath: FixturePaths.WarningsFile,
+            severityFilter: "warning",
+            runAnalyzers: false);
+
+        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("Warning", result);
+    }
 }

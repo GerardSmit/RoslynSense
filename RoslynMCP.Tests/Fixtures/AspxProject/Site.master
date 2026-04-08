@@ -1,0 +1,24 @@
+<%@ Master Language="C#" %>
+<!DOCTYPE html>
+<html>
+<head runat="server">
+    <title>
+        <asp:ContentPlaceHolder ID="TitleContent" runat="server">Default Title</asp:ContentPlaceHolder>
+    </title>
+</head>
+<body>
+    <form id="form1" runat="server">
+        <header>
+            <%= DateTime.Now.Year.ToString() %>
+        </header>
+        <main>
+            <asp:ContentPlaceHolder ID="MainContent" runat="server" />
+        </main>
+        <footer>
+            <% if (Request.IsAuthenticated) { %>
+                <span>Logged in</span>
+            <% } %>
+        </footer>
+    </form>
+</body>
+</html>

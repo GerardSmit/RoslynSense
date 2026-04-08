@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -19,6 +20,12 @@ internal static class WorkspaceService
     private static readonly SemaphoreSlim s_cacheLock = new(1, 1);
     private static readonly Timer s_evictionTimer;
 
+    /// <summary>
+    /// Indicates whether a Visual Studio or Build Tools MSBuild instance was registered.
+    /// When <c>true</c>, legacy-format .csproj files (non-SDK-style) are supported.
+    /// </summary>
+    public static bool IsVisualStudioMSBuildRegistered { get; private set; }
+
     private static Dictionary<string, string> CreateDefaultProperties() => new()
     {
         { "AlwaysUseNETSdkDefaults", "true" },
@@ -26,14 +33,45 @@ internal static class WorkspaceService
     };
 
     /// <summary>
-    /// One-time static initializer that ensures the C# Roslyn assembly is loaded
-    /// so MSBuildWorkspace can resolve C# language services, and starts the idle
+    /// One-time static initializer that registers a Visual Studio MSBuild instance
+    /// (if available), ensures the C# Roslyn assembly is loaded, and starts the idle
     /// eviction timer.
     /// </summary>
     static WorkspaceService()
     {
+        TryRegisterVisualStudioMSBuild();
         RuntimeHelpers.RunClassConstructor(typeof(CSharpSyntaxTree).TypeHandle);
         s_evictionTimer = new Timer(EvictExpiredEntries, null, EvictionInterval, EvictionInterval);
+    }
+
+    /// <summary>
+    /// Attempts to find and register a Visual Studio or Build Tools MSBuild instance.
+    /// Falls back silently to the SDK-bundled MSBuild when none is found.
+    /// </summary>
+    private static void TryRegisterVisualStudioMSBuild()
+    {
+        try
+        {
+            if (!MSBuildLocator.CanRegister)
+                return;
+
+            var instance = MSBuildLocator.QueryVisualStudioInstances()
+                .OrderByDescending(i => i.Version)
+                .FirstOrDefault();
+
+            if (instance is null)
+                return;
+
+            MSBuildLocator.RegisterInstance(instance);
+            IsVisualStudioMSBuildRegistered = true;
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Registered MSBuild from '{instance.Name}' v{instance.Version} at '{instance.MSBuildPath}'.");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[WorkspaceService] MSBuild Locator failed, using SDK-bundled MSBuild: {ex.Message}");
+        }
     }
 
     /// <summary>

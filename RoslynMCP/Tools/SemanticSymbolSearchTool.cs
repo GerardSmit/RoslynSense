@@ -76,25 +76,17 @@ public static class SemanticSymbolSearchTool
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return "Error: File path cannot be empty.";
-
             if (string.IsNullOrWhiteSpace(query))
                 return "Error: query cannot be empty.";
 
-            string systemPath = PathHelper.NormalizePath(filePath);
-            if (!File.Exists(systemPath))
-                return $"Error: File {systemPath} does not exist.";
-
-            string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-            if (string.IsNullOrEmpty(projectPath))
-                return "Error: Couldn't find a project containing this file.";
+            var errors = new StringBuilder();
+            var fileCtx = await ToolHelper.ResolveFileAsync(filePath, errors, cancellationToken);
+            if (fileCtx is null)
+                return errors.ToString();
 
             maxResults = Math.Clamp(maxResults <= 0 ? DefaultMaxResults : maxResults, 1, MaxAllowedResults);
 
-            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
-
+            var project = fileCtx.Project;
             var searchQuery = SearchQuery.Create(query);
             var scored = await SearchAsync(project, searchQuery, includeReferencedAssemblies, cancellationToken);
 

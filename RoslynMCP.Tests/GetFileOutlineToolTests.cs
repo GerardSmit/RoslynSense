@@ -109,4 +109,92 @@ public class GetFileOutlineToolTests
         Assert.Contains("public static OutlineShowcase operator +(OutlineShowcase left, OutlineShowcase right)", result);
         Assert.Contains("public static implicit operator int(OutlineShowcase value)", result);
     }
+
+    [Fact]
+    public async Task WhenAspxFileProvidedThenReturnsAspxOutline()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile);
+
+        Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
+        Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
+    }
+
+    [Fact]
+    public async Task WhenAscxFileProvidedThenReturnsAspxOutline()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.HeaderControlFile);
+
+        Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
+        Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
+    }
+
+    [Fact]
+    public async Task WhenMasterPageProvidedThenReturnsAspxOutline()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.SiteMasterFile);
+
+        Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
+        Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
+    }
+
+    [Fact]
+    public async Task WhenAspxOutlineProvidedThenContainsExpressions()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile);
+
+        Assert.Contains("Expression", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenAspxOutlineProvidedThenContainsCodeBlocks()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile);
+
+        // Default.aspx contains <% if (IsPostBack) { %> code blocks
+        Assert.Contains("Code Block", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenServicesFileProvidedThenShowsInterfaceAndEnum()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.ServicesFile);
+
+        Assert.Contains("IStringFormatter", result);
+        Assert.Contains("ProcessingStatus", result);
+        Assert.Contains("StatisticsCalculator", result);
+    }
+
+    [Fact]
+    public async Task WhenTextUtilitiesFileProvidedThenShowsMethods()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.TextUtilitiesFile);
+
+        Assert.Contains("UppercaseFirstCharacter", result);
+        Assert.Contains("NormalizeLabel", result);
+    }
+
+    [Fact]
+    public async Task WhenBrokenSyntaxFileProvidedThenStillProducesOutline()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.BrokenSyntaxFile);
+
+        // Should still produce some outline even for broken syntax
+        Assert.Contains("# Outline:", result);
+    }
+
+    [Fact]
+    public async Task WhenAsmxFileProvidedThenReturnsOutline()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DataServiceFile);
+
+        Assert.Contains("ASPX File", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenAshxFileProvidedThenReturnsOutline()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.ImageHandlerFile);
+
+        Assert.Contains("ASPX File", result, StringComparison.OrdinalIgnoreCase);
+    }
 }

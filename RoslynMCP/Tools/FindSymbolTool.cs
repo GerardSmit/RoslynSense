@@ -29,28 +29,18 @@ public static class FindSymbolTool
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return "Error: File path cannot be empty.";
-
             if (string.IsNullOrWhiteSpace(symbolName))
                 return "Error: symbolName cannot be empty.";
 
-            string systemPath = PathHelper.NormalizePath(filePath);
-
-            if (!File.Exists(systemPath))
-                return $"Error: File {systemPath} does not exist.";
-
-            string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-            if (string.IsNullOrEmpty(projectPath))
-                return "Error: Couldn't find a project containing this file.";
-
-            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
+            var errors = new StringBuilder();
+            var fileCtx = await ToolHelper.ResolveFileAsync(filePath, errors, cancellationToken);
+            if (fileCtx is null)
+                return errors.ToString();
 
             var symbols = (await SymbolFinder.FindSourceDeclarationsWithPatternAsync(
-                project, symbolName, SymbolFilter.All, cancellationToken)).ToList();
+                fileCtx.Project, symbolName, SymbolFilter.All, cancellationToken)).ToList();
 
-            return FormatResults(symbols, symbolName, project.Name);
+            return FormatResults(symbols, symbolName, fileCtx.Project.Name);
         }
         catch (OperationCanceledException)
         {

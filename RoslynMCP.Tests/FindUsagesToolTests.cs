@@ -114,6 +114,53 @@ public class FindUsagesToolTests
         Assert.Contains("omitted for the remaining", result, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task WhenPropertyUsagesQueriedThenReturnsPropertyDetails()
+    {
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.OutlineShowcaseFile,
+            markupSnippet: "public string [|Name|] { get;");
+
+        Assert.Contains("Symbol Usage Analysis", result);
+        Assert.Contains("Name", result);
+        Assert.Contains("Property", result);
+    }
+
+    [Fact]
+    public async Task WhenEventUsagesQueriedThenReturnsEventDetails()
+    {
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.OutlineShowcaseFile,
+            markupSnippet: "public event EventHandler? [|Changed|];");
+
+        Assert.Contains("Symbol Usage Analysis", result);
+        Assert.Contains("Changed", result);
+        Assert.Contains("Event", result);
+    }
+
+    [Fact]
+    public async Task WhenFieldUsagesQueriedThenReturnsFieldDetails()
+    {
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.OutlineShowcaseFile,
+            markupSnippet: "private readonly List<int> [|_values|] = [];");
+
+        Assert.Contains("Symbol Usage Analysis", result);
+        Assert.Contains("_values", result);
+        Assert.Contains("Field", result);
+    }
+
+    [Fact]
+    public async Task WhenInterfaceUsagesQueriedThenReturnsUsages()
+    {
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.ServicesFile,
+            markupSnippet: "public interface [|IStringFormatter|]");
+
+        Assert.Contains("Symbol Usage Analysis", result);
+        Assert.Contains("IStringFormatter", result);
+    }
+
     private static int CountOccurrences(string text, string value)
     {
         int count = 0;

@@ -21,11 +21,11 @@ public static class GetFileOutlineTool
     /// and member signatures with line numbers.
     /// </summary>
     [McpServerTool, Description(
-        "Get a compact outline of a C# file showing namespaces, types, and member " +
-        "signatures with line numbers. Useful for understanding file structure without " +
-        "reading the full source.")]
+        "Get a compact outline of a C# or ASPX file showing namespaces, types, and member " +
+        "signatures with line numbers. For ASPX files, shows directives, controls, expressions, " +
+        "and code blocks. Useful for understanding file structure without reading the full source.")]
     public static async Task<string> GetFileOutline(
-        [Description("Path to the C# file.")] string filePath,
+        [Description("Path to the C# or ASPX file.")] string filePath,
         CancellationToken cancellationToken = default)
     {
         try
@@ -38,24 +38,25 @@ public static class GetFileOutlineTool
             if (!File.Exists(systemPath))
                 return $"Error: File {systemPath} does not exist.";
 
-            string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-            if (string.IsNullOrEmpty(projectPath))
-                return "Error: Couldn't find a project containing this file.";
+            // ASPX files: parse and show directive/control/expression outline
+            if (AspxSourceMappingService.IsAspxFile(systemPath))
+                return await GetAspxOutlineAsync(systemPath, cancellationToken);
 
-            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
-            var document = WorkspaceService.FindDocumentInProject(project, systemPath);
+            var errors = new StringBuilder();
+            var fileCtx = await ToolHelper.ResolveFileAsync(filePath, errors, cancellationToken);
+            if (fileCtx is null)
+                return errors.ToString();
 
-            if (document == null)
+            if (fileCtx.Document is null)
                 return "Error: File not found in project.";
 
-            var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
+            var syntaxTree = await fileCtx.Document.GetSyntaxTreeAsync(cancellationToken);
             if (syntaxTree is null)
                 return "Error: Unable to obtain syntax tree.";
 
             var root = await syntaxTree.GetRootAsync(cancellationToken);
             var sb = new StringBuilder();
-            sb.AppendLine($"# Outline: {Path.GetFileName(systemPath)}");
+            sb.AppendLine($"# Outline: {Path.GetFileName(fileCtx.SystemPath)}");
             sb.AppendLine();
             sb.AppendLine("```");
             AppendOutline(sb, root, depth: 0);
@@ -289,5 +290,46 @@ public static class GetFileOutlineTool
         return accessors.Count > 0
             ? " { " + string.Join("; ", accessors) + "; }"
             : "";
+    }
+
+    private static async Task<string> GetAspxOutlineAsync(string filePath, CancellationToken cancellationToken)
+    {
+        string? projectPath = await WorkspaceService.FindContainingProjectAsync(filePath, cancellationToken);
+
+        // ASPX files aren't Roslyn Documents; walk up to find the nearest .csproj
+        if (string.IsNullOrEmpty(projectPath))
+        {
+            var dir = new DirectoryInfo(Path.GetDirectoryName(filePath)!);
+            while (dir is not null)
+            {
+                var csproj = dir.GetFiles("*.csproj").FirstOrDefault();
+                if (csproj is not null)
+                {
+                    projectPath = csproj.FullName;
+                    break;
+                }
+                dir = dir.Parent;
+            }
+        }
+
+        if (string.IsNullOrEmpty(projectPath))
+            return "Error: Couldn't find a project containing this ASPX file.";
+
+        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+            projectPath, cancellationToken: cancellationToken);
+        var compilation = await project.GetCompilationAsync(cancellationToken);
+        if (compilation is null)
+            return "Error: Unable to produce compilation for project.";
+
+        var projectDir = Path.GetDirectoryName(projectPath);
+        var webConfigNamespaces = projectDir is not null
+            ? AspxSourceMappingService.LoadWebConfigNamespaces(projectDir)
+            : default;
+
+        var text = await File.ReadAllTextAsync(filePath, cancellationToken);
+        var result = AspxSourceMappingService.Parse(filePath, text, compilation,
+            namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
+            rootDirectory: projectDir);
+        return AspxSourceMappingService.FormatOutline(result);
     }
 }

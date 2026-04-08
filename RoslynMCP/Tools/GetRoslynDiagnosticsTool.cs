@@ -19,7 +19,8 @@ public static class GetRoslynDiagnosticsTool
     /// </summary>
     [McpServerTool, Description(
         "Get Roslyn diagnostics (errors, warnings, info) for a C# file in a compact " +
-        "markdown table. More structured and token-efficient than ValidateFile. " +
+        "markdown table. For ASPX or Razor files, use ValidateFile instead. " +
+        "More structured and token-efficient than ValidateFile. " +
         "Accepts a severity filter to narrow results.")]
     public static async Task<string> GetRoslynDiagnostics(
         [Description("Path to the C# file to diagnose.")] string filePath,
@@ -29,35 +30,24 @@ public static class GetRoslynDiagnosticsTool
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return "Error: File path cannot be empty.";
-
-            string systemPath = PathHelper.NormalizePath(filePath);
-
-            if (!File.Exists(systemPath))
-                return $"Error: File {systemPath} does not exist.";
-
             if (!TryParseSeverityFilter(severityFilter, out DiagnosticSeverity? filter))
                 return $"Error: Invalid severity filter '{severityFilter}'. Use: error, warning, info, hidden, or all.";
 
-            string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-            if (string.IsNullOrEmpty(projectPath))
-                return "Error: Couldn't find a project containing this file.";
+            var errors = new StringBuilder();
+            var fileCtx = await ToolHelper.ResolveFileAsync(filePath, errors, cancellationToken);
+            if (fileCtx is null)
+                return errors.ToString();
 
-            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
-            var document = WorkspaceService.FindDocumentInProject(project, systemPath);
-
-            if (document == null)
+            if (fileCtx.Document is null)
                 return "Error: File not found in project.";
 
             var diagnostics = await CollectDiagnosticsAsync(
-                document, project, systemPath, runAnalyzers, cancellationToken);
+                fileCtx.Document, fileCtx.Project, fileCtx.SystemPath, runAnalyzers, cancellationToken);
 
             if (filter is not null)
                 diagnostics = diagnostics.Where(d => d.Severity == filter.Value).ToList();
 
-            return FormatDiagnostics(diagnostics, systemPath, projectPath);
+            return FormatDiagnostics(diagnostics, fileCtx.SystemPath, fileCtx.Project.FilePath!);
         }
         catch (OperationCanceledException)
         {

@@ -1,0 +1,47 @@
+@page "/weather"
+
+<h1>@AppHelper.FormatTitle("Weather")</h1>
+
+@if (forecasts == null)
+{
+    <p><em>Loading...</em></p>
+}
+else
+{
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Summary</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var forecast in forecasts)
+            {
+                <tr>
+                    <td>@forecast.Date.ToShortDateString()</td>
+                    <td>@forecast.Summary</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private WeatherForecast[]? forecasts;
+
+    protected override void OnInitialized()
+    {
+        forecasts = new[]
+        {
+            new WeatherForecast { Date = DateTime.Now, Summary = "Warm" },
+            new WeatherForecast { Date = DateTime.Now.AddDays(1), Summary = "Cool" }
+        };
+    }
+
+    public class WeatherForecast
+    {
+        public DateTime Date { get; set; }
+        public string? Summary { get; set; }
+    }
+}

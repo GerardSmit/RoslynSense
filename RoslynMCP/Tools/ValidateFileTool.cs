@@ -8,9 +8,9 @@ namespace RoslynMCP.Tools;
 [McpServerToolType]
 public static class ValidateFileTool
 {
-    [McpServerTool, Description("Validates a C# file using Roslyn and runs code analyzers. Accepts either a relative or absolute file path.")]
+    [McpServerTool, Description("Validates a C# file using Roslyn and runs code analyzers. Also supports ASPX/ASCX and Razor (.razor/.cshtml) files. Accepts either a relative or absolute file path.")]
     public static async Task<string> ValidateFile(
-        [Description("The path to the C# file to validate")] string filePath,
+        [Description("The path to the C#, ASPX, or Razor file to validate")] string filePath,
         [Description("Run analyzers (default: true)")] bool runAnalyzers = true,
         CancellationToken cancellationToken = default)
     {
@@ -23,6 +23,14 @@ public static class ValidateFileTool
 
             if (!File.Exists(systemPath))
                 return $"Error: File {systemPath} does not exist.";
+
+            // ASPX files: parse with WebFormsCore.Parser and show outline + diagnostics
+            if (AspxSourceMappingService.IsAspxFile(systemPath))
+                return await ValidateAspxFileAsync(systemPath, cancellationToken);
+
+            // Razor files: find the project, build source map, report mapped diagnostics
+            if (RazorSourceMappingService.IsRazorFile(systemPath))
+                return await ValidateRazorFileAsync(systemPath, cancellationToken);
 
             string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
             if (string.IsNullOrEmpty(projectPath))
@@ -181,5 +189,131 @@ public static class ValidateFileTool
                 writer.WriteLine($"Inner exception: {ex.InnerException.Message}");
             }
         }
+    }
+
+    /// <summary>
+    /// Validates an ASPX/ASCX file by parsing it with WebFormsCore.Parser and reporting
+    /// an outline of directives, controls, expressions, and any parse errors.
+    /// Reads web.config for globally registered tag prefixes.
+    /// </summary>
+    private static async Task<string> ValidateAspxFileAsync(
+        string filePath, CancellationToken cancellationToken)
+    {
+        string? projectPath = await FindProjectForNonCSharpFileAsync(filePath, cancellationToken);
+        if (string.IsNullOrEmpty(projectPath))
+            return "Error: Couldn't find a project containing this ASPX file.";
+
+        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+            projectPath, cancellationToken: cancellationToken);
+        var compilation = await project.GetCompilationAsync(cancellationToken);
+        if (compilation is null)
+            return "Error: Unable to produce compilation for project.";
+
+        var projectDir = Path.GetDirectoryName(projectPath);
+        var webConfigNamespaces = projectDir is not null
+            ? AspxSourceMappingService.LoadWebConfigNamespaces(projectDir)
+            : default;
+
+        var text = await File.ReadAllTextAsync(filePath, cancellationToken);
+        var result = AspxSourceMappingService.Parse(filePath, text, compilation,
+            namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
+            rootDirectory: projectDir);
+        return AspxSourceMappingService.FormatOutline(result);
+    }
+
+    /// <summary>
+    /// Validates a Razor file by finding its source-generated counterpart and reporting
+    /// diagnostics mapped back to the original .razor/.cshtml source.
+    /// </summary>
+    private static async Task<string> ValidateRazorFileAsync(
+        string filePath, CancellationToken cancellationToken)
+    {
+        string? projectPath = await FindProjectForNonCSharpFileAsync(filePath, cancellationToken);
+        if (string.IsNullOrEmpty(projectPath))
+            return "Error: Couldn't find a project containing this Razor file.";
+
+        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+            projectPath, cancellationToken: cancellationToken);
+
+        var sourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(project, cancellationToken);
+
+        var compilation = await project.GetCompilationAsync(cancellationToken);
+        if (compilation is null)
+            return "Error: Unable to produce compilation for project.";
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"# Razor Validation: {Path.GetFileName(filePath)}");
+        sb.AppendLine();
+
+        var allDiagnostics = compilation.GetDiagnostics();
+        var mappedDiags = new List<RazorMappedDiagnostic>();
+
+        foreach (var diag in allDiagnostics)
+        {
+            var mapped = RazorSourceMappingService.MapDiagnostic(sourceMap, diag);
+            if (mapped.MappedLocation is not null &&
+                string.Equals(
+                    Path.GetFullPath(mapped.MappedLocation.RazorFilePath),
+                    Path.GetFullPath(filePath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                mappedDiags.Add(mapped);
+            }
+        }
+
+        if (mappedDiags.Count == 0)
+        {
+            sb.AppendLine("No diagnostics found for this Razor file.");
+        }
+        else
+        {
+            int errors = mappedDiags.Count(d => d.Diagnostic.Severity == DiagnosticSeverity.Error);
+            int warnings = mappedDiags.Count(d => d.Diagnostic.Severity == DiagnosticSeverity.Warning);
+            sb.AppendLine($"**Errors**: {errors} | **Warnings**: {warnings}");
+            sb.AppendLine();
+            sb.AppendLine("| Severity | ID | Razor Line | Message |");
+            sb.AppendLine("|----------|------|------------|---------|");
+
+            foreach (var mapped in mappedDiags.OrderBy(d => d.MappedLocation!.Line))
+            {
+                var d = mapped.Diagnostic;
+                string severity = d.Severity switch
+                {
+                    DiagnosticSeverity.Error => "Error",
+                    DiagnosticSeverity.Warning => "Warning",
+                    DiagnosticSeverity.Info => "Info",
+                    _ => d.Severity.ToString(),
+                };
+                sb.AppendLine(
+                    $"| {severity} | {d.Id} | {mapped.MappedLocation!.Line} | {MarkdownHelper.EscapeTableCell(d.GetMessage())} |");
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Finds the .csproj that contains a non-C# file (ASPX, Razor, etc.) by first
+    /// trying the standard document lookup, then walking up the directory tree.
+    /// </summary>
+    private static async Task<string?> FindProjectForNonCSharpFileAsync(
+        string filePath, CancellationToken cancellationToken)
+    {
+        // Try the standard lookup first (works when a project is already loaded)
+        string? projectPath = await WorkspaceService.FindContainingProjectAsync(filePath, cancellationToken);
+        if (!string.IsNullOrEmpty(projectPath))
+            return projectPath;
+
+        // Walk up the directory tree to find the nearest .csproj
+        var dir = new DirectoryInfo(Path.GetDirectoryName(filePath)!);
+        while (dir is not null)
+        {
+            var csproj = dir.GetFiles("*.csproj").FirstOrDefault();
+            if (csproj is not null)
+                return csproj.FullName;
+            dir = dir.Parent;
+        }
+
+        return null;
     }
 }

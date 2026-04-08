@@ -113,7 +113,7 @@ public static class ProjectStructureTool
                 .GetMembers()
                 .SelectMany(GetAllTypes)
                 .Where(t => t.DeclaredAccessibility is Accessibility.Public or Accessibility.Internal)
-                .Where(t => !t.Name.StartsWith("<"))
+                .Where(t => !t.Name.StartsWith('<'))
                 .ToList();
 
             if (types.Count > 0)

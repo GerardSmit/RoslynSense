@@ -45,6 +45,11 @@ internal static class FixturePaths
     public static string CounterRazorFile => Path.Combine(BlazorProjectDir, "Counter.razor");
     public static string WeatherRazorFile => Path.Combine(BlazorProjectDir, "Weather.razor");
 
+    public static string DebugTestProjectDir => Path.Combine(s_fixturesRoot, "DebugTestProject");
+    public static string DebugTestProjectFile => Path.Combine(DebugTestProjectDir, "DebugTestProject.csproj");
+    public static string DebugCalculatorFile => Path.Combine(DebugTestProjectDir, "Calculator.cs");
+    public static string DebugCalculatorTestsFile => Path.Combine(DebugTestProjectDir, "CalculatorTests.cs");
+
     /// <summary>
     /// Walks up from the test assembly location to find the Fixtures directory.
     /// Prefer the source-tree fixtures so Roslyn can open the nested sample project

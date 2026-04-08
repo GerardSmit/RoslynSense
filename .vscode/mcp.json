@@ -6,6 +6,8 @@
             "command": "dotnet",
             "args": [
                 "run",
+                "-c",
+                "Release",
                 "--project",
                 "D:/Sources/roslyn-mcp/RoslynMCP/RoslynMCP.csproj"
             ]

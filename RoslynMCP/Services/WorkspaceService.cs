@@ -228,6 +228,74 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// Finds .csproj files that contain a <c>&lt;ProjectReference&gt;</c> to
+    /// <paramref name="referencedProjectPath"/>. Scans the ancestor directories of
+    /// the referenced project up to the repository root (detected by <c>.git</c> folder)
+    /// or at most 5 levels up.
+    /// </summary>
+    public static List<string> FindReferencingProjects(string referencedProjectPath)
+    {
+        var normalizedTarget = Path.GetFullPath(referencedProjectPath);
+        var targetFileName = Path.GetFileName(normalizedTarget);
+        var results = new List<string>();
+
+        // Walk up to repo root or 5 levels
+        var searchRoot = new FileInfo(normalizedTarget).Directory;
+        for (int i = 0; i < 5 && searchRoot?.Parent != null; i++)
+        {
+            searchRoot = searchRoot.Parent;
+            if (Directory.Exists(Path.Combine(searchRoot.FullName, ".git")))
+                break;
+        }
+
+        if (searchRoot is null)
+            return results;
+
+        foreach (var csprojFile in searchRoot.EnumerateFiles("*.csproj", SearchOption.AllDirectories))
+        {
+            if (string.Equals(csprojFile.FullName, normalizedTarget, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                var content = File.ReadAllText(csprojFile.FullName);
+                // Check if this project references the target by file name
+                if (content.Contains(targetFileName, StringComparison.OrdinalIgnoreCase) &&
+                    content.Contains("ProjectReference", StringComparison.Ordinal))
+                {
+                    // Verify by resolving the actual ProjectReference path
+                    var dir = csprojFile.DirectoryName!;
+                    foreach (var line in content.Split('\n'))
+                    {
+                        if (!line.Contains("ProjectReference", StringComparison.Ordinal))
+                            continue;
+
+                        var includeStart = line.IndexOf("Include=\"", StringComparison.Ordinal);
+                        if (includeStart < 0) continue;
+                        includeStart += 9;
+                        var includeEnd = line.IndexOf('"', includeStart);
+                        if (includeEnd < 0) continue;
+
+                        var refPath = line[includeStart..includeEnd];
+                        var resolvedPath = Path.GetFullPath(Path.Combine(dir, refPath));
+                        if (string.Equals(resolvedPath, normalizedTarget, StringComparison.OrdinalIgnoreCase))
+                        {
+                            results.Add(csprojFile.FullName);
+                            break;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore unreadable files
+            }
+        }
+
+        return results;
+    }
+
+    /// <summary>
     /// Evicts all cached workspace entries immediately.
     /// </summary>
     public static async Task EvictAllAsync(CancellationToken cancellationToken = default)

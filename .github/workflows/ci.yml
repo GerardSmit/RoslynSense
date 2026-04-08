@@ -3,6 +3,17 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
 
 jobs:
   build-test:
@@ -14,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -26,5 +39,124 @@ jobs:
       - name: Build
         run: dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo
 
+      - name: Install netcoredbg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSL https://api.github.com/repos/Samsung/netcoredbg/releases/latest \
+            | grep -oP '"browser_download_url":\s*"\K[^"]*netcoredbg-linux-amd64\.tar\.gz' \
+            | head -1 \
+            | xargs curl -sSL -o /tmp/netcoredbg.tar.gz
+          mkdir -p /usr/local/netcoredbg
+          tar xzf /tmp/netcoredbg.tar.gz -C /usr/local
+          echo "/usr/local/netcoredbg" >> $GITHUB_PATH
+
+      - name: Install netcoredbg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod https://api.github.com/repos/Samsung/netcoredbg/releases/latest
+          $asset = $release.assets | Where-Object { $_.name -like '*win64.zip' } | Select-Object -First 1
+          $zipPath = "$env:TEMP\netcoredbg.zip"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath "C:\netcoredbg" -Force
+          echo "C:\netcoredbg\netcoredbg" | Out-File -Append -FilePath $env:GITHUB_PATH
+
       - name: Test
         run: dotnet test RoslynMCP.sln --configuration Release --no-build --nologo -p:UseAppHost=false
+
+  release:
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || github.event_name == 'workflow_dispatch'
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            bump="${{ github.event.inputs.bump }}"
+            latest_tag=$(git tag -l 'v*' --sort=-v:refname | head -1 || true)
+
+            if [[ -n "$latest_tag" ]]; then
+              base="${latest_tag#v}"
+            else
+              base=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' RoslynMCP/RoslynMCP.csproj)
+            fi
+
+            IFS='.' read -r major minor patch <<< "$base"
+            case "$bump" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              patch) version="$major.$minor.$((patch + 1))" ;;
+            esac
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing version $version"
+
+      - name: Create tag (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Pack
+        run: >
+          dotnet restore RoslynMCP.sln &&
+          dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo &&
+          dotnet pack RoslynMCP/RoslynMCP.csproj
+          -c Release -o artifacts --no-build --nologo
+          /p:ContinuousIntegrationBuild=true
+          /p:Version=${{ steps.version.outputs.version }}
+          /p:PackageVersion=${{ steps.version.outputs.version }}
+
+      - name: Publish to NuGet
+        run: >
+          dotnet nuget push "artifacts/RoslynSense.*.nupkg"
+          --source https://api.nuget.org/v3/index.json
+          --api-key "${{ secrets.NUGET_API_KEY }}"
+          --skip-duplicate
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          previous_tag=$(git tag -l 'v*' --sort=-v:refname | grep -v "^${{ steps.version.outputs.tag }}$" | head -1 || true)
+          if [[ -n "$previous_tag" ]]; then
+            log=$(git log --pretty=format:"- %s (%h)" "$previous_tag..${{ steps.version.outputs.tag }}" --no-merges)
+          else
+            log=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          fi
+
+          echo "$log" > release_notes.md
+          echo "" >> release_notes.md
+          echo "**NuGet:** [RoslynSense ${{ steps.version.outputs.version }}](https://www.nuget.org/packages/RoslynSense/${{ steps.version.outputs.version }})" >> release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: RoslynSense v${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          files: artifacts/*.nupkg
+          generate_release_notes: false

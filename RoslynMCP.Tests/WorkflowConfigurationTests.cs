@@ -17,11 +17,10 @@ public class WorkflowConfigurationTests
     [Fact]
     public void ReleaseWorkflowExistsWithTagDrivenVersioning()
     {
-        string content = File.ReadAllText(GetRepoPath(".github", "workflows", "publish.yml"));
+        string content = File.ReadAllText(GetRepoPath(".github", "workflows", "ci.yml"));
 
-        // Tag-driven trigger
-        Assert.Contains("tags:", content, StringComparison.Ordinal);
-        Assert.Contains("\"v*\"", content, StringComparison.Ordinal);
+        // Release job gate
+        Assert.Contains("refs/tags/v", content, StringComparison.Ordinal);
         // Workflow dispatch with bump input
         Assert.Contains("workflow_dispatch:", content, StringComparison.Ordinal);
         Assert.Contains("bump:", content, StringComparison.Ordinal);

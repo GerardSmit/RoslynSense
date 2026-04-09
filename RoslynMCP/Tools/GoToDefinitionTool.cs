@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Text;
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.FindSymbols;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
 
@@ -31,15 +30,22 @@ public static class GoToDefinitionTool
         string markupSnippet,
         [Description("Number of lines of context to show around the definition. Default: 5.")]
         int contextLines = 5,
+        IEnumerable<IGoToDefinitionHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             string systemPath = PathHelper.NormalizePath(filePath);
 
-            // ASPX files: parse with WebFormsCore and resolve from the parse tree
-            if (AspxSourceMappingService.IsAspxFile(systemPath))
-                return await GoToDefinitionAspxAsync(systemPath, markupSnippet, contextLines, cancellationToken);
+            // Delegate to registered handlers for non-C# file types
+            if (handlers is not null)
+            {
+                foreach (var handler in handlers)
+                {
+                    if (handler.CanHandle(systemPath))
+                        return await handler.ResolveAsync(systemPath, markupSnippet, contextLines, cancellationToken);
+                }
+            }
 
             var errors = new StringBuilder();
             var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
@@ -62,46 +68,7 @@ public static class GoToDefinitionTool
         }
     }
 
-    private static async Task<string> GoToDefinitionAspxAsync(
-        string systemPath, string markupSnippet, int contextLines, CancellationToken cancellationToken)
-    {
-        if (!MarkupString.TryParse(markupSnippet, out var markup, out string? parseError))
-            return $"Error: Invalid markup snippet. {parseError}";
-
-        if (!File.Exists(systemPath))
-            return $"Error: File {systemPath} does not exist.";
-
-        string? projectPath = await WorkspaceService.FindContainingProjectAsync(systemPath, cancellationToken);
-        if (string.IsNullOrEmpty(projectPath))
-            return "Error: Couldn't find a project containing this file.";
-
-        var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
-
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation is null)
-            return "Error: Unable to get compilation for the project.";
-
-        string fileText = await File.ReadAllTextAsync(systemPath, cancellationToken);
-        string? projectDir = Path.GetDirectoryName(projectPath);
-
-        var webConfigNamespaces = projectDir is not null
-            ? AspxSourceMappingService.LoadWebConfigNamespaces(projectDir)
-            : default;
-
-        var parseResult = AspxSourceMappingService.Parse(
-            systemPath, fileText, compilation,
-            namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
-            rootDirectory: projectDir);
-
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(parseResult, fileText, markup!);
-        if (symbol is null)
-            return $"No symbol found for '{markup!.MarkedText}' in ASPX file.";
-
-        return await FormatDefinitionAsync(symbol, project, contextLines, cancellationToken);
-    }
-
-    private static async Task<string> FormatDefinitionAsync(
+    internal static async Task<string> FormatDefinitionAsync(
         ISymbol symbol, Project project, int contextLines, CancellationToken cancellationToken)
     {
         // For constructors, use the containing type name as the display header

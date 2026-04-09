@@ -27,6 +27,7 @@ public static class GetRoslynDiagnosticsTool
         [Description("Severity filter: error, warning, info, hidden, or all (default: all).")] string severityFilter = "all",
         [Description("Run analyzers (default: true).")] bool runAnalyzers = true,
         [Description("Maximum number of diagnostics to return. Default: 50.")] int maxResults = 50,
+        IEnumerable<IDiagnosticsHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -37,7 +38,7 @@ public static class GetRoslynDiagnosticsTool
             var paths = filePath.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
             if (paths.Length == 1)
-                return await GetSingleFileDiagnostics(paths[0], severityFilter, runAnalyzers, maxResults, cancellationToken);
+                return await GetSingleFileDiagnostics(paths[0], severityFilter, runAnalyzers, maxResults, handlers, cancellationToken);
 
             // Multi-file mode
             var sb = new StringBuilder();
@@ -46,7 +47,7 @@ public static class GetRoslynDiagnosticsTool
                 if (sb.Length > 0)
                     sb.AppendLine();
 
-                sb.Append(await GetSingleFileDiagnostics(path, severityFilter, runAnalyzers, maxResults, cancellationToken));
+                sb.Append(await GetSingleFileDiagnostics(path, severityFilter, runAnalyzers, maxResults, handlers, cancellationToken));
             }
             return sb.ToString();
         }
@@ -60,17 +61,19 @@ public static class GetRoslynDiagnosticsTool
 
     private static async Task<string> GetSingleFileDiagnostics(
         string filePath, string severityFilter, bool runAnalyzers, int maxResults,
-        CancellationToken cancellationToken)
+        IEnumerable<IDiagnosticsHandler>? handlers, CancellationToken cancellationToken)
     {
         string systemPath = PathHelper.NormalizePath(filePath);
 
-        // ASPX/ASCX files
-        if (AspxSourceMappingService.IsAspxFile(systemPath))
-            return await ValidateAspxFileAsync(systemPath, cancellationToken);
-
-        // Razor files
-        if (RazorSourceMappingService.IsRazorFile(systemPath))
-            return await ValidateRazorFileAsync(systemPath, cancellationToken);
+        // Delegate to registered handlers for non-C# file types
+        if (handlers is not null)
+        {
+            foreach (var handler in handlers)
+            {
+                if (handler.CanHandle(systemPath))
+                    return await handler.ValidateAsync(systemPath, cancellationToken);
+            }
+        }
 
         // Project-wide diagnostics (.csproj path)
         if (systemPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
@@ -279,7 +282,7 @@ public static class GetRoslynDiagnosticsTool
         return sb.ToString();
     }
 
-    private static string FormatSeverity(DiagnosticSeverity severity) => severity switch
+    internal static string FormatSeverity(DiagnosticSeverity severity) => severity switch
     {
         DiagnosticSeverity.Error => "Error",
         DiagnosticSeverity.Warning => "Warning",
@@ -287,117 +290,4 @@ public static class GetRoslynDiagnosticsTool
         DiagnosticSeverity.Hidden => "Hidden",
         _ => severity.ToString(),
     };
-
-    // --- ASPX / Razor validation (moved from ValidateFileTool) ---
-
-    private static async Task<string> ValidateAspxFileAsync(
-        string filePath, CancellationToken cancellationToken)
-    {
-        if (!File.Exists(filePath))
-            return $"Error: File {filePath} does not exist.";
-
-        string? projectPath = await FindProjectForNonCSharpFileAsync(filePath, cancellationToken);
-        if (string.IsNullOrEmpty(projectPath))
-            return "Error: Couldn't find a project containing this ASPX file.";
-
-        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, cancellationToken: cancellationToken);
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation is null)
-            return "Error: Unable to produce compilation for project.";
-
-        var projectDir = Path.GetDirectoryName(projectPath);
-        var webConfigNamespaces = projectDir is not null
-            ? AspxSourceMappingService.LoadWebConfigNamespaces(projectDir)
-            : default;
-
-        var text = await File.ReadAllTextAsync(filePath, cancellationToken);
-        var result = AspxSourceMappingService.Parse(filePath, text, compilation,
-            namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
-            rootDirectory: projectDir);
-        return AspxSourceMappingService.FormatOutline(result);
-    }
-
-    private static async Task<string> ValidateRazorFileAsync(
-        string filePath, CancellationToken cancellationToken)
-    {
-        if (!File.Exists(filePath))
-            return $"Error: File {filePath} does not exist.";
-
-        string? projectPath = await FindProjectForNonCSharpFileAsync(filePath, cancellationToken);
-        if (string.IsNullOrEmpty(projectPath))
-            return "Error: Couldn't find a project containing this Razor file.";
-
-        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, cancellationToken: cancellationToken);
-
-        var sourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(project, cancellationToken);
-
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation is null)
-            return "Error: Unable to produce compilation for project.";
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"# Razor Validation: {Path.GetFileName(filePath)}");
-        sb.AppendLine();
-
-        var allDiagnostics = compilation.GetDiagnostics();
-        var mappedDiags = new List<RazorMappedDiagnostic>();
-
-        foreach (var diag in allDiagnostics)
-        {
-            var mapped = RazorSourceMappingService.MapDiagnostic(sourceMap, diag);
-            if (mapped.MappedLocation is not null &&
-                string.Equals(
-                    Path.GetFullPath(mapped.MappedLocation.RazorFilePath),
-                    Path.GetFullPath(filePath),
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                mappedDiags.Add(mapped);
-            }
-        }
-
-        if (mappedDiags.Count == 0)
-        {
-            sb.AppendLine("No diagnostics found for this Razor file.");
-        }
-        else
-        {
-            int errors = mappedDiags.Count(d => d.Diagnostic.Severity == DiagnosticSeverity.Error);
-            int warnings = mappedDiags.Count(d => d.Diagnostic.Severity == DiagnosticSeverity.Warning);
-            sb.AppendLine($"**Errors**: {errors} | **Warnings**: {warnings}");
-            sb.AppendLine();
-            sb.AppendLine("| Severity | ID | Razor Line | Message |");
-            sb.AppendLine("|----------|------|------------|---------|");
-
-            foreach (var mapped in mappedDiags.OrderBy(d => d.MappedLocation!.Line))
-            {
-                var d = mapped.Diagnostic;
-                string severity = FormatSeverity(d.Severity);
-                sb.AppendLine(
-                    $"| {severity} | {d.Id} | {mapped.MappedLocation!.Line} | {MarkdownHelper.EscapeTableCell(d.GetMessage())} |");
-            }
-        }
-
-        return sb.ToString();
-    }
-
-    private static async Task<string?> FindProjectForNonCSharpFileAsync(
-        string filePath, CancellationToken cancellationToken)
-    {
-        string? projectPath = await WorkspaceService.FindContainingProjectAsync(filePath, cancellationToken);
-        if (!string.IsNullOrEmpty(projectPath))
-            return projectPath;
-
-        var dir = new DirectoryInfo(Path.GetDirectoryName(filePath)!);
-        while (dir is not null)
-        {
-            var csproj = dir.GetFiles("*.csproj").FirstOrDefault();
-            if (csproj is not null)
-                return csproj.FullName;
-            dir = dir.Parent;
-        }
-
-        return null;
-    }
 }

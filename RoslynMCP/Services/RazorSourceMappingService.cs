@@ -99,6 +99,44 @@ internal static partial class RazorSourceMappingService
     }
 
     /// <summary>
+    /// Maps a 1-indexed line in a Razor source file to a location in generated C#.
+    /// Returns the generated document and 1-indexed line number, or <c>null</c> if no mapping exists.
+    /// </summary>
+    public static RazorGeneratedLocation? MapRazorToGenerated(
+        RazorSourceMap sourceMap, string razorFilePath, int razorLine)
+    {
+        RazorLineMapping? bestMapping = null;
+
+        foreach (var mapping in sourceMap.Mappings)
+        {
+            if (!string.Equals(mapping.RazorFilePath, razorFilePath, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Check if the razor line falls within this mapping's razor range
+            int mappingRazorEndLine = mapping.RazorLine +
+                (mapping.GeneratedEndLine.HasValue
+                    ? mapping.GeneratedEndLine.Value - mapping.GeneratedStartLine
+                    : 0);
+
+            if (razorLine < mapping.RazorLine || razorLine > mappingRazorEndLine)
+                continue;
+
+            // Prefer the most specific (narrowest range) mapping
+            if (bestMapping is null ||
+                mapping.GeneratedStartLine > bestMapping.GeneratedStartLine)
+                bestMapping = mapping;
+        }
+
+        if (bestMapping is null)
+            return null;
+
+        int offset = razorLine - bestMapping.RazorLine;
+        int generatedLine = bestMapping.GeneratedStartLine + offset;
+
+        return new RazorGeneratedLocation(bestMapping.GeneratedFilePath, generatedLine);
+    }
+
+    /// <summary>
     /// Maps a diagnostic's location back to Razor source if applicable.
     /// </summary>
     public static RazorMappedDiagnostic MapDiagnostic(
@@ -261,3 +299,8 @@ internal record RazorMappedLocation(string RazorFilePath, int Line);
 /// A diagnostic with optional Razor source mapping.
 /// </summary>
 internal record RazorMappedDiagnostic(Diagnostic Diagnostic, RazorMappedLocation? MappedLocation);
+
+/// <summary>
+/// A location mapped from Razor source to generated C#.
+/// </summary>
+internal record RazorGeneratedLocation(string GeneratedFilePath, int GeneratedLine);

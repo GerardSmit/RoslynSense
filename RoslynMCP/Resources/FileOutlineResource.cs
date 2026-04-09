@@ -26,6 +26,6 @@ public static class FileOutlineResource
         string filePath,
         CancellationToken cancellationToken = default)
     {
-        return await GetFileOutlineTool.GetFileOutline(filePath, cancellationToken);
+        return await GetFileOutlineTool.GetFileOutline(filePath, handlers: null, cancellationToken);
     }
 }

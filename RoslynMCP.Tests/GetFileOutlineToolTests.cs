@@ -113,7 +113,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenAspxFileProvidedThenReturnsAspxOutline()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile, handlers: TestHandlers.Outline);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -122,7 +122,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenAscxFileProvidedThenReturnsAspxOutline()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.HeaderControlFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.HeaderControlFile, handlers: TestHandlers.Outline);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -131,7 +131,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenMasterPageProvidedThenReturnsAspxOutline()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.SiteMasterFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.SiteMasterFile, handlers: TestHandlers.Outline);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -140,7 +140,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenAspxOutlineProvidedThenContainsExpressions()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile, handlers: TestHandlers.Outline);
 
         Assert.Contains("Expression", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -148,7 +148,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenAspxOutlineProvidedThenContainsCodeBlocks()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DefaultAspxFile, handlers: TestHandlers.Outline);
 
         // Default.aspx contains <% if (IsPostBack) { %> code blocks
         Assert.Contains("Code Block", result, StringComparison.OrdinalIgnoreCase);
@@ -185,7 +185,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenAsmxFileProvidedThenReturnsOutline()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DataServiceFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.DataServiceFile, handlers: TestHandlers.Outline);
 
         Assert.Contains("ASPX File", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -193,7 +193,7 @@ public class GetFileOutlineToolTests
     [Fact]
     public async Task WhenAshxFileProvidedThenReturnsOutline()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.ImageHandlerFile);
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.ImageHandlerFile, handlers: TestHandlers.Outline);
 
         Assert.Contains("ASPX File", result, StringComparison.OrdinalIgnoreCase);
     }

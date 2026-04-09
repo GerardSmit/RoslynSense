@@ -95,7 +95,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.DefaultAspxFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -106,7 +107,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.HeaderControlFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -117,7 +119,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.SiteMasterFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -128,7 +131,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.CounterRazorFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("Razor Validation", result);
         Assert.Contains("Counter.razor", result);
@@ -139,7 +143,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.CounterRazorFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("No diagnostics found", result);
     }
@@ -149,7 +154,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.DataServiceFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("Directives", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -160,7 +166,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.ImageHandlerFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("ASPX File", result, StringComparison.OrdinalIgnoreCase);
         Assert.False(result.StartsWith("Error:"), "Unexpected tool-level error: " + result[..Math.Min(200, result.Length)]);
@@ -171,7 +178,8 @@ public class ValidateFileToolTests
     {
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
             filePath: FixturePaths.WeatherRazorFile,
-            runAnalyzers: false);
+            runAnalyzers: false,
+            handlers: TestHandlers.Diagnostics);
 
         Assert.Contains("Razor Validation", result);
         Assert.Contains("Weather.razor", result);

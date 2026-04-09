@@ -23,10 +23,12 @@ public static class GetFileOutlineTool
     [McpServerTool, Description(
         "Get a compact outline of a C# or ASPX file showing namespaces, types, and member " +
         "signatures with line numbers. For ASPX files, shows directives, controls, expressions, " +
-        "and code blocks. Useful for understanding file structure without reading the full source. " +
+        "and code blocks. For Razor files, shows directives, @code block members, and component structure. " +
+        "Useful for understanding file structure without reading the full source. " +
         "Supports multiple files separated by semicolons.")]
     public static async Task<string> GetFileOutline(
         [Description("Path to the C# or ASPX file. Separate multiple paths with semicolons.")] string filePath,
+        IEnumerable<IOutlineHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -37,7 +39,7 @@ public static class GetFileOutlineTool
             var paths = filePath.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
             if (paths.Length == 1)
-                return await GetSingleFileOutline(paths[0], cancellationToken);
+                return await GetSingleFileOutline(paths[0], handlers, cancellationToken);
 
             // Multi-file mode: concatenate outlines
             var sb = new StringBuilder();
@@ -46,7 +48,7 @@ public static class GetFileOutlineTool
                 if (sb.Length > 0)
                     sb.AppendLine();
 
-                sb.Append(await GetSingleFileOutline(path, cancellationToken));
+                sb.Append(await GetSingleFileOutline(path, handlers, cancellationToken));
             }
             return sb.ToString();
         }
@@ -61,16 +63,23 @@ public static class GetFileOutlineTool
         }
     }
 
-    private static async Task<string> GetSingleFileOutline(string filePath, CancellationToken cancellationToken)
+    private static async Task<string> GetSingleFileOutline(
+        string filePath, IEnumerable<IOutlineHandler>? handlers, CancellationToken cancellationToken)
     {
         string systemPath = PathHelper.NormalizePath(filePath);
 
         if (!File.Exists(systemPath))
             return $"Error: File {systemPath} does not exist.";
 
-        // ASPX files: parse and show directive/control/expression outline
-        if (AspxSourceMappingService.IsAspxFile(systemPath))
-            return await GetAspxOutlineAsync(systemPath, cancellationToken);
+        // Delegate to registered handlers for non-C# file types
+        if (handlers is not null)
+        {
+            foreach (var handler in handlers)
+            {
+                if (handler.CanHandle(systemPath))
+                    return await handler.GetOutlineAsync(systemPath, cancellationToken);
+            }
+        }
 
         var errors = new StringBuilder();
         var fileCtx = await ToolHelper.ResolveFileAsync(filePath, errors, cancellationToken);
@@ -233,7 +242,7 @@ public static class GetFileOutlineTool
         return sb.ToString();
     }
 
-    private static string FormatMethod(MethodDeclarationSyntax method)
+    internal static string FormatMethod(MethodDeclarationSyntax method)
     {
         var sb = new StringBuilder();
         sb.Append(FormatModifiers(method.Modifiers));
@@ -254,7 +263,7 @@ public static class GetFileOutlineTool
         return sb.ToString();
     }
 
-    private static string FormatProperty(PropertyDeclarationSyntax prop)
+    internal static string FormatProperty(PropertyDeclarationSyntax prop)
     {
         var sb = new StringBuilder();
         sb.Append(FormatModifiers(prop.Modifiers));
@@ -292,7 +301,7 @@ public static class GetFileOutlineTool
             AppendEntry(sb, depth, $"{modifiers}event {type} {variable.Identifier.Text}", eventField);
     }
 
-    private static string FormatModifiers(SyntaxTokenList modifiers)
+    internal static string FormatModifiers(SyntaxTokenList modifiers)
     {
         string text = modifiers.ToString();
         return text.Length > 0 ? text + " " : "";
@@ -312,44 +321,4 @@ public static class GetFileOutlineTool
             : "";
     }
 
-    private static async Task<string> GetAspxOutlineAsync(string filePath, CancellationToken cancellationToken)
-    {
-        string? projectPath = await WorkspaceService.FindContainingProjectAsync(filePath, cancellationToken);
-
-        // ASPX files aren't Roslyn Documents; walk up to find the nearest .csproj
-        if (string.IsNullOrEmpty(projectPath))
-        {
-            var dir = new DirectoryInfo(Path.GetDirectoryName(filePath)!);
-            while (dir is not null)
-            {
-                var csproj = dir.GetFiles("*.csproj").FirstOrDefault();
-                if (csproj is not null)
-                {
-                    projectPath = csproj.FullName;
-                    break;
-                }
-                dir = dir.Parent;
-            }
-        }
-
-        if (string.IsNullOrEmpty(projectPath))
-            return "Error: Couldn't find a project containing this ASPX file.";
-
-        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, cancellationToken: cancellationToken);
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation is null)
-            return "Error: Unable to produce compilation for project.";
-
-        var projectDir = Path.GetDirectoryName(projectPath);
-        var webConfigNamespaces = projectDir is not null
-            ? AspxSourceMappingService.LoadWebConfigNamespaces(projectDir)
-            : default;
-
-        var text = await File.ReadAllTextAsync(filePath, cancellationToken);
-        var result = AspxSourceMappingService.Parse(filePath, text, compilation,
-            namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
-            rootDirectory: projectDir);
-        return AspxSourceMappingService.FormatOutline(result);
-    }
 }

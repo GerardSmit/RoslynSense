@@ -1,7 +1,5 @@
-using System.Collections.Immutable;
 using System.ComponentModel;
 using System.Text;
-using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Rename;
 using ModelContextProtocol.Server;
@@ -22,7 +20,7 @@ public static class RenameSymbolTool
     [McpServerTool, Description(
         "Rename a symbol and all its references across the project. Provide a code snippet " +
         "with [| |] delimiters around the symbol to rename, e.g. 'var x = [|OldName|]();'. " +
-        "All references in the project are updated, including ASPX/ASCX files. " +
+        "All references in the project are updated, including ASPX/ASCX and Razor files. " +
         "When renaming a type whose name matches its file name, the file is also renamed. " +
         "Returns a summary of changed files.")]
     public static async Task<string> RenameSymbol(
@@ -36,6 +34,7 @@ public static class RenameSymbolTool
         bool dryRun = false,
         [Description("If true, also rename overloaded methods with the same name. Default: false.")]
         bool renameOverloads = false,
+        IEnumerable<IRenameHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -75,7 +74,7 @@ public static class RenameSymbolTool
                 solution, symbol, renameOptions, newName, cancellationToken);
 
             // Collect changed C# documents
-            var changedDocs = new List<ChangedFile>();
+            var changedDocs = new List<RenameChangedFile>();
 
             foreach (var projectId in newSolution.ProjectIds)
             {
@@ -94,7 +93,7 @@ public static class RenameSymbolTool
 
                     if (!oldText.ContentEquals(newText))
                     {
-                        changedDocs.Add(new ChangedFile(
+                        changedDocs.Add(new RenameChangedFile(
                             oldDoc.FilePath ?? oldDoc.Name,
                             oldText.ToString(),
                             newText.ToString()));
@@ -102,12 +101,16 @@ public static class RenameSymbolTool
                 }
             }
 
-            // Update ASPX/ASCX files if renaming a type
-            var aspxChanges = new List<ChangedFile>();
-            if (symbol is INamedTypeSymbol namedType)
+            // Update non-C# files via registered handlers (ASPX, Razor, etc.)
+            var nonCSharpChanges = new List<RenameChangedFile>();
+            if (handlers is not null)
             {
-                aspxChanges = await UpdateAspxReferencesAsync(
-                    ctx.Project.FilePath!, namedType, oldName, newName, cancellationToken);
+                foreach (var handler in handlers)
+                {
+                    var changes = await handler.UpdateReferencesAsync(
+                        ctx.Project, solution, symbol, oldName, newName, cancellationToken);
+                    nonCSharpChanges.AddRange(changes);
+                }
             }
 
             // Determine file renames (type name matches file name)
@@ -131,7 +134,7 @@ public static class RenameSymbolTool
                 }
             }
 
-            int totalChanges = changedDocs.Count + aspxChanges.Count;
+            int totalChanges = changedDocs.Count + nonCSharpChanges.Count;
             if (totalChanges == 0 && fileRenames.Count == 0)
                 return $"No changes were produced when renaming '{oldName}' to '{newName}'.";
 
@@ -141,8 +144,8 @@ public static class RenameSymbolTool
             sb.AppendLine($"- **Symbol**: {symbol.ToDisplayString()}");
             sb.AppendLine($"- **Kind**: {symbol.Kind}");
             sb.AppendLine($"- **C# files changed**: {changedDocs.Count}");
-            if (aspxChanges.Count > 0)
-                sb.AppendLine($"- **ASPX/ASCX files changed**: {aspxChanges.Count}");
+            if (nonCSharpChanges.Count > 0)
+                sb.AppendLine($"- **Non-C# files changed**: {nonCSharpChanges.Count}");
             if (fileRenames.Count > 0)
                 sb.AppendLine($"- **Files renamed**: {fileRenames.Count}");
             sb.AppendLine($"- **Mode**: {(dryRun ? "Preview (no changes written)" : "Applied")}");
@@ -157,8 +160,8 @@ public static class RenameSymbolTool
                         await File.WriteAllTextAsync(change.FilePath, change.NewText, cancellationToken);
                 }
 
-                // Write ASPX changes
-                foreach (var change in aspxChanges)
+                // Write non-C# changes
+                foreach (var change in nonCSharpChanges)
                 {
                     if (!string.IsNullOrEmpty(change.FilePath) && File.Exists(change.FilePath))
                         await File.WriteAllTextAsync(change.FilePath, change.NewText, cancellationToken);
@@ -187,17 +190,18 @@ public static class RenameSymbolTool
                 string displayPath = projectDir is not null
                     ? Path.GetRelativePath(projectDir, change.FilePath)
                     : change.FilePath;
-                int changeCount = CountOccurrences(change.NewText, newName) - CountOccurrences(change.OldText, newName);
+                int changeCount = RenameHelper.CountOccurrences(change.NewText, newName) - RenameHelper.CountOccurrences(change.OldText, newName);
                 sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(displayPath)} | C# | {changeCount} occurrence(s) |");
             }
 
-            foreach (var change in aspxChanges)
+            foreach (var change in nonCSharpChanges)
             {
                 string displayPath = projectDir is not null
                     ? Path.GetRelativePath(projectDir, change.FilePath)
                     : change.FilePath;
-                int changeCount = CountOccurrences(change.NewText, newName) - CountOccurrences(change.OldText, newName);
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(displayPath)} | ASPX | {changeCount} occurrence(s) |");
+                int changeCount = RenameHelper.CountOccurrences(change.NewText, newName) - RenameHelper.CountOccurrences(change.OldText, newName);
+                string ext = Path.GetExtension(change.FilePath).TrimStart('.').ToUpperInvariant();
+                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(displayPath)} | {ext} | {changeCount} occurrence(s) |");
             }
 
             if (fileRenames.Count > 0)
@@ -226,112 +230,6 @@ public static class RenameSymbolTool
         }
     }
 
-    /// <summary>
-    /// Scans ASPX/ASCX/Master/ASMX/ASHX files in the project directory for references
-    /// to the renamed type in directives (Inherits, CodeBehind) and inline code blocks.
-    /// </summary>
-    private static async Task<List<ChangedFile>> UpdateAspxReferencesAsync(
-        string projectPath,
-        INamedTypeSymbol namedType,
-        string oldName,
-        string newName,
-        CancellationToken cancellationToken)
-    {
-        var changes = new List<ChangedFile>();
-        var projectDir = Path.GetDirectoryName(projectPath);
-        if (projectDir is null || !Directory.Exists(projectDir))
-            return changes;
-
-        string oldFullName = namedType.ToDisplayString();
-        // Only replace the type name (last segment) to avoid mangling the namespace
-        int lastDot = oldFullName.LastIndexOf('.');
-        string newFullName = lastDot >= 0
-            ? oldFullName[..(lastDot + 1)] + newName
-            : newName;
-
-        string[] aspxExtensions = ["*.aspx", "*.ascx", "*.master", "*.asmx", "*.ashx", "*.asax"];
-
-        foreach (var pattern in aspxExtensions)
-        {
-            foreach (var file in Directory.EnumerateFiles(projectDir, pattern, SearchOption.AllDirectories))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // Skip obj/bin
-                var relativePath = Path.GetRelativePath(projectDir, file);
-                var firstSegment = relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
-                if (firstSegment.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
-                    firstSegment.Equals("bin", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var text = await File.ReadAllTextAsync(file, cancellationToken);
-                var newText = text;
-
-                // Replace fully-qualified type name in Inherits="..." attributes
-                newText = ReplaceDirectiveAttribute(newText, "Inherits", oldFullName, newFullName);
-
-                // Replace short name in Inherits if used without namespace
-                if (!oldFullName.Equals(oldName))
-                    newText = ReplaceDirectiveAttribute(newText, "Inherits", oldName, newName);
-
-                // Replace in CodeBehind/CodeFile attributes (file name part)
-                newText = ReplaceCodeBehindFileName(newText, oldName, newName);
-
-                // Replace in inline code blocks (<% %>, <%= %>, <%# %>)
-                newText = ReplaceInCodeBlocks(newText, oldName, newName);
-
-                if (newText != text)
-                {
-                    changes.Add(new ChangedFile(file, text, newText));
-                }
-            }
-        }
-
-        return changes;
-    }
-
-    /// <summary>
-    /// Replaces an attribute value in ASPX directives.
-    /// E.g., Inherits="OldName" → Inherits="NewName"
-    /// </summary>
-    internal static string ReplaceDirectiveAttribute(
-        string text, string attributeName, string oldValue, string newValue)
-    {
-        // Match attributeName="...oldValue..."
-        var pattern = $@"({Regex.Escape(attributeName)}\s*=\s*"")([^""]*{Regex.Escape(oldValue)}[^""]*)("")";
-        return Regex.Replace(text, pattern, m =>
-        {
-            var attrValue = m.Groups[2].Value;
-            var replaced = attrValue.Replace(oldValue, newValue);
-            return m.Groups[1].Value + replaced + m.Groups[3].Value;
-        }, RegexOptions.IgnoreCase);
-    }
-
-    /// <summary>
-    /// Replaces the file name portion of CodeBehind/CodeFile attributes.
-    /// E.g., CodeBehind="OldName.aspx.cs" → CodeBehind="NewName.aspx.cs"
-    /// </summary>
-    internal static string ReplaceCodeBehindFileName(string text, string oldName, string newName)
-    {
-        var pattern = $@"((?:CodeBehind|CodeFile)\s*=\s*"")({Regex.Escape(oldName)})(\.[\w.]+)("")";
-        return Regex.Replace(text, pattern, $"${{1}}{newName}$3$4", RegexOptions.IgnoreCase);
-    }
-
-    /// <summary>
-    /// Replaces symbol references within ASPX code blocks (&lt;% %&gt;, &lt;%= %&gt;, &lt;%# %&gt;).
-    /// Uses word-boundary matching to avoid partial replacements.
-    /// </summary>
-    internal static string ReplaceInCodeBlocks(string text, string oldName, string newName)
-    {
-        // Match <% ... %> blocks and replace whole-word occurrences of oldName
-        return Regex.Replace(text, @"(<%[=#:]?\s*)(.*?)(\s*%>)", m =>
-        {
-            var code = m.Groups[2].Value;
-            var replaced = Regex.Replace(code, $@"\b{Regex.Escape(oldName)}\b", newName);
-            return m.Groups[1].Value + replaced + m.Groups[3].Value;
-        }, RegexOptions.Singleline);
-    }
-
     private static bool IsValidIdentifier(string name)
     {
         if (string.IsNullOrEmpty(name))
@@ -352,18 +250,4 @@ public static class RenameSymbolTool
 
         return true;
     }
-
-    private static int CountOccurrences(string text, string search)
-    {
-        int count = 0;
-        int index = 0;
-        while ((index = text.IndexOf(search, index, StringComparison.Ordinal)) != -1)
-        {
-            count++;
-            index += search.Length;
-        }
-        return count;
-    }
-
-    private sealed record ChangedFile(string FilePath, string OldText, string NewText);
 }

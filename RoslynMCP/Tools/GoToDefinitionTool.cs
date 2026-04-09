@@ -30,6 +30,8 @@ public static class GoToDefinitionTool
         string markupSnippet,
         [Description("Number of lines of context to show around the definition. Default: 5.")]
         int contextLines = 5,
+        [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
+        int? hintLine = null,
         IEnumerable<IGoToDefinitionHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
@@ -48,7 +50,7 @@ public static class GoToDefinitionTool
             }
 
             var errors = new StringBuilder();
-            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken, hintLine);
             if (ctx is null)
                 return errors.ToString();
 

@@ -28,12 +28,14 @@ public static class CallHierarchyTool
         string markupSnippet,
         [Description("Direction: 'callers' (who calls this?), 'callees' (what does this call?), or 'both'. Default: 'both'.")]
         string direction = "both",
+        [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
+        int? hintLine = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var errors = new StringBuilder();
-            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken, hintLine);
             if (ctx is null)
                 return errors.ToString();
 

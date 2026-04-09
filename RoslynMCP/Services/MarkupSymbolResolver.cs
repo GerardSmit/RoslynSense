@@ -111,7 +111,8 @@ internal static class MarkupSymbolResolver
     /// locates the snippet, and resolves the symbol.
     /// </summary>
     public static async Task<MarkupResolutionResult> ResolveFromFileAsync(
-        string filePath, MarkupString markup, CancellationToken cancellationToken = default)
+        string filePath, MarkupString markup, CancellationToken cancellationToken = default,
+        int? hintLine = null)
     {
         string systemPath = PathHelper.NormalizePath(filePath);
 
@@ -129,7 +130,7 @@ internal static class MarkupSymbolResolver
         if (document == null)
             return MarkupResolutionResult.Error("File not found in project documents.");
 
-        return await ResolveAsync(document, workspace, markup, cancellationToken);
+        return await ResolveAsync(document, workspace, markup, cancellationToken, hintLine);
     }
 
     /// <summary>
@@ -138,7 +139,7 @@ internal static class MarkupSymbolResolver
     /// </summary>
     public static async Task<MarkupResolutionResult> ResolveAsync(
         Document document, Workspace workspace, MarkupString markup,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, int? hintLine = null)
     {
         var sourceText = await document.GetTextAsync(cancellationToken);
         string fileText = sourceText.ToString();
@@ -149,16 +150,28 @@ internal static class MarkupSymbolResolver
         if (matches.Count == 0)
             return MarkupResolutionResult.NoMatch(markup.PlainText);
 
+        SnippetMatch match;
         if (matches.Count > 1)
         {
-            var lineNumbers = matches
-                .Select(m => sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1)
-                .ToList();
-            return MarkupResolutionResult.Ambiguous(lineNumbers);
+            if (hintLine.HasValue)
+            {
+                // Pick the match closest to hintLine (1-based)
+                match = matches.OrderBy(m =>
+                    Math.Abs(sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1 - hintLine.Value))
+                    .First();
+            }
+            else
+            {
+                var lineNumbers = matches
+                    .Select(m => sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1)
+                    .ToList();
+                return MarkupResolutionResult.Ambiguous(lineNumbers);
+            }
         }
-
-        // Exactly one match — map the marked span to the real document position
-        var match = matches[0];
+        else
+        {
+            match = matches[0];
+        }
         int markedStartInFile = MapSnippetOffsetToFile(fileText, match, markup.PlainText, markup.SpanStart);
         int markedEndInFile = MapSnippetOffsetToFile(fileText, match, markup.PlainText, markup.SpanStart + markup.SpanLength);
         var mappedSpan = new TextSpan(markedStartInFile, markedEndInFile - markedStartInFile);

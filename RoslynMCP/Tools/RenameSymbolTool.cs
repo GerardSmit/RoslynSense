@@ -34,6 +34,8 @@ public static class RenameSymbolTool
         bool dryRun = false,
         [Description("If true, also rename overloaded methods with the same name. Default: false.")]
         bool renameOverloads = false,
+        [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
+        int? hintLine = null,
         IEnumerable<IRenameHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
@@ -46,7 +48,7 @@ public static class RenameSymbolTool
                 return $"Error: '{newName}' is not a valid C# identifier.";
 
             var errors = new StringBuilder();
-            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken, hintLine);
             if (ctx is null)
                 return errors.ToString();
 

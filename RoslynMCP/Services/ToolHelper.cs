@@ -65,7 +65,8 @@ internal static class ToolHelper
         string? filePath,
         string? markupSnippet,
         StringBuilder errors,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int? hintLine = null)
     {
         if (string.IsNullOrWhiteSpace(markupSnippet))
         {
@@ -90,7 +91,7 @@ internal static class ToolHelper
         }
 
         var resolution = await MarkupSymbolResolver.ResolveAsync(
-            fileCtx.Document, fileCtx.Workspace, markup!, cancellationToken);
+            fileCtx.Document, fileCtx.Workspace, markup!, cancellationToken, hintLine);
 
         return new ToolSymbolContext(fileCtx, markup!, resolution);
     }

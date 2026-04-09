@@ -29,6 +29,8 @@ public static class CodeActionsTool
         string markupSnippet,
         [Description("Optional: 1-based index of the code action to apply. If omitted, only lists available actions.")]
         int? applyIndex = null,
+        [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
+        int? hintLine = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -55,15 +57,28 @@ public static class CodeActionsTool
             var matches = MarkupSymbolResolver.FindAllOccurrences(fileContent, markup!.PlainText);
             if (matches.Count == 0)
                 return "Snippet not found in file.";
+
+            MarkupSymbolResolver.SnippetMatch match;
             if (matches.Count > 1)
             {
-                var lineNumbers = matches
-                    .Select(m => sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1)
-                    .ToList();
-                return $"Snippet matched {lineNumbers.Count} locations (lines {string.Join(", ", lineNumbers)}). Add surrounding context to disambiguate.";
+                if (hintLine.HasValue)
+                {
+                    match = matches.OrderBy(m =>
+                        Math.Abs(sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1 - hintLine.Value))
+                        .First();
+                }
+                else
+                {
+                    var lineNumbers = matches
+                        .Select(m => sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1)
+                        .ToList();
+                    return $"Snippet matched {lineNumbers.Count} locations (lines {string.Join(", ", lineNumbers)}). Add surrounding context to disambiguate.";
+                }
             }
-
-            var match = matches[0];
+            else
+            {
+                match = matches[0];
+            }
             int markedStart = MarkupSymbolResolver.MapSnippetOffsetToFile(fileContent, match, markup.PlainText, markup.SpanStart);
             int markedEnd = MarkupSymbolResolver.MapSnippetOffsetToFile(fileContent, match, markup.PlainText, markup.SpanStart + markup.SpanLength);
             var markedSpan = new TextSpan(markedStart, markedEnd - markedStart);

@@ -25,12 +25,14 @@ public static class FindImplementationsTool
             "Code snippet with [| |] markers around the target, " +
             "e.g. 'public interface [|IService|]' or 'virtual void [|Execute|]()'.")]
         string markupSnippet,
+        [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
+        int? hintLine = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var errors = new StringBuilder();
-            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken, hintLine);
             if (ctx is null)
                 return errors.ToString();
 

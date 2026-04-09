@@ -29,12 +29,14 @@ public static class FindUsagesTool
         string markupSnippet,
         [Description("Maximum number of references to return. Default: 100.")]
         int maxResults = 100,
+        [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
+        int? hintLine = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var errors = new StringBuilder();
-            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken);
+            var ctx = await ToolHelper.ResolveSymbolAsync(filePath, markupSnippet, errors, cancellationToken, hintLine);
             if (ctx is null)
                 return errors.ToString();
 

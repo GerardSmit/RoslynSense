@@ -16,14 +16,12 @@ public static class ProjectStructureTool
 {
     [McpServerTool, Description(
         "Get an overview of a C# project's structure. Shows target framework, references, " +
-        "source files, and types organized by namespace. " +
+        "and types organized by namespace. " +
         "Useful for understanding the project layout before navigating code.")]
     public static async Task<string> GetProjectStructure(
         [Description("Path to the .csproj file or any file in the project.")] string projectOrFilePath,
         [Description("Include system assemblies (System.*, Microsoft.*) in the assembly references list. Default: false.")]
         bool includeSystemAssemblies = false,
-        [Description("Maximum number of files to list individually per folder. Folders with more files show a count instead. Default: 20. Set to 0 for counts only.")]
-        int maxFilesPerFolder = 20,
         CancellationToken cancellationToken = default)
     {
         try
@@ -51,7 +49,7 @@ public static class ProjectStructureTool
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
                 projectPath, cancellationToken: cancellationToken);
 
-            return await FormatProjectStructureAsync(project, projectPath, includeSystemAssemblies, maxFilesPerFolder, cancellationToken);
+            return await FormatProjectStructureAsync(project, projectPath, includeSystemAssemblies, cancellationToken);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -65,11 +63,9 @@ public static class ProjectStructureTool
         Project project,
         string projectPath,
         bool includeSystemAssemblies,
-        int maxFilesPerFolder,
         CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
-        string? projectDir = Path.GetDirectoryName(projectPath);
 
         sb.AppendLine($"# Project: {project.Name}");
         sb.AppendLine();
@@ -79,43 +75,32 @@ public static class ProjectStructureTool
         sb.AppendLine();
         sb.AppendLine($"- **Path**: {projectPath}");
         if (project.CompilationOptions is not null)
-            sb.AppendLine($"- **Output**: {project.CompilationOptions.OutputKind}");
+        {
+            sb.AppendLine($"- **Output**: {FormatOutputKind(project.CompilationOptions.OutputKind)}");
+            sb.AppendLine($"- **Nullable**: {project.CompilationOptions.NullableContextOptions}");
+        }
 
         // Target framework from preprocessor symbols
         string? targetFramework = InferTargetFramework(project);
         if (targetFramework is not null)
             sb.AppendLine($"- **Framework**: {targetFramework}");
-        sb.AppendLine();
 
-        // Source files grouped by folder
-        var documents = project.Documents.ToList();
-        sb.AppendLine($"## Files ({documents.Count})");
-        sb.AppendLine();
-
-        var byFolder = documents
-            .Where(d => d.FilePath is not null)
-            .GroupBy(d =>
-            {
-                string dir = Path.GetDirectoryName(d.FilePath!)!;
-                return projectDir is not null
-                    ? Path.GetRelativePath(projectDir, dir)
-                    : dir;
-            })
-            .OrderBy(g => g.Key);
-
-        foreach (var group in byFolder)
+        // C# language version
+        if (project.ParseOptions is CSharpParseOptions csharpOptions)
         {
-            string folder = group.Key == "." ? "(root)" : group.Key;
-            var files = group.OrderBy(d => d.Name).Select(d => d.Name).ToList();
-            if (maxFilesPerFolder > 0 && files.Count <= maxFilesPerFolder)
-            {
-                sb.AppendLine($"- {folder}/: {string.Join(", ", files)}");
-            }
-            else
-            {
-                sb.AppendLine($"- {folder}/: ({files.Count} files)");
-            }
+            sb.AppendLine($"- **C# Version**: {csharpOptions.LanguageVersion}");
         }
+
+        // App/framework type detection
+        var appTypes = DetectAppType(project, projectPath);
+        if (appTypes.Count > 0)
+            sb.AppendLine($"- **App Type**: {string.Join(", ", appTypes)}");
+
+        // Test framework detection
+        string? testFramework = DetectTestFramework(project);
+        if (testFramework is not null)
+            sb.AppendLine($"- **Test Framework**: {testFramework}");
+
         sb.AppendLine();
 
         // Types organized by namespace as a tree
@@ -377,5 +362,216 @@ public static class ProjectStructureTool
             foreach (var member in ns.GetMembers().SelectMany(GetAllTypes))
                 yield return member;
         }
+    }
+
+    internal static string FormatOutputKind(OutputKind outputKind)
+    {
+        return outputKind switch
+        {
+            OutputKind.ConsoleApplication => "Console Application",
+            OutputKind.WindowsApplication => "Windows Application",
+            OutputKind.DynamicallyLinkedLibrary => "Library (DLL)",
+            OutputKind.NetModule => "Module",
+            OutputKind.WindowsRuntimeMetadata => "WinRT Metadata",
+            OutputKind.WindowsRuntimeApplication => "WinRT Application",
+            _ => outputKind.ToString(),
+        };
+    }
+
+    /// <summary>
+    /// Detects the app/framework type from SDK, assembly references, and project properties.
+    /// </summary>
+    internal static List<string> DetectAppType(Project project, string projectPath)
+    {
+        var assemblyNames = project.MetadataReferences
+            .Select(r => Path.GetFileNameWithoutExtension(r.Display ?? ""))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        string? sdkType = ReadProjectSdk(projectPath);
+
+        // Check for WebForms files (.aspx, .ascx, .master) in the project directory
+        bool hasWebFormFiles = false;
+        string? projectDir = Path.GetDirectoryName(projectPath);
+        if (projectDir is not null && Directory.Exists(projectDir))
+        {
+            hasWebFormFiles = Directory.EnumerateFiles(projectDir, "*.*", SearchOption.AllDirectories)
+                .Any(f => f.EndsWith(".aspx", StringComparison.OrdinalIgnoreCase)
+                    || f.EndsWith(".ascx", StringComparison.OrdinalIgnoreCase)
+                    || f.EndsWith(".master", StringComparison.OrdinalIgnoreCase));
+        }
+
+        return DetectAppType(assemblyNames, sdkType, hasWebFormFiles);
+    }
+
+    /// <summary>
+    /// Core detection logic, testable with explicit assembly names and SDK type.
+    /// </summary>
+    internal static List<string> DetectAppType(IReadOnlySet<string> assemblyNames, string? sdkType, bool hasWebFormFiles = false)
+    {
+        var result = new List<string>();
+
+        // --- Desktop frameworks ---
+        if (assemblyNames.Contains("Avalonia") || assemblyNames.Contains("Avalonia.Base"))
+            result.Add("Avalonia");
+        if (assemblyNames.Contains("Microsoft.Maui") || assemblyNames.Contains("Microsoft.Maui.Controls"))
+            result.Add(".NET MAUI");
+        if (assemblyNames.Contains("Microsoft.WinUI") || assemblyNames.Contains("Microsoft.UI.Xaml"))
+            result.Add("WinUI");
+        if (assemblyNames.Contains("PresentationFramework") || assemblyNames.Contains("PresentationCore"))
+            result.Add("WPF");
+        if (assemblyNames.Contains("System.Windows.Forms"))
+            result.Add("WinForms");
+        if (assemblyNames.Contains("Uno.UI") || assemblyNames.Contains("Uno.Foundation"))
+            result.Add("Uno Platform");
+
+        // --- Web frameworks ---
+        bool isBlazorWasm = assemblyNames.Contains("Microsoft.AspNetCore.Components.WebAssembly")
+            || string.Equals(sdkType, "Microsoft.NET.Sdk.BlazorWebAssembly", StringComparison.OrdinalIgnoreCase);
+        bool isBlazorServer = assemblyNames.Contains("Microsoft.AspNetCore.Components.Server");
+        bool isBlazor = assemblyNames.Contains("Microsoft.AspNetCore.Components")
+            || assemblyNames.Contains("Microsoft.AspNetCore.Components.Web");
+
+        if (isBlazorWasm)
+            result.Add("Blazor WebAssembly");
+        else if (isBlazorServer)
+            result.Add("Blazor Server");
+        else if (isBlazor)
+            result.Add("Blazor");
+
+        if (assemblyNames.Contains("Microsoft.AspNetCore.Mvc") || assemblyNames.Contains("Microsoft.AspNetCore.Mvc.Core"))
+        {
+            if (!result.Any(r => r.StartsWith("Blazor")))
+                result.Add("ASP.NET Core MVC");
+        }
+
+        bool isWebSdk = string.Equals(sdkType, "Microsoft.NET.Sdk.Web", StringComparison.OrdinalIgnoreCase);
+        if (isWebSdk && result.Count == 0)
+        {
+            if (assemblyNames.Contains("Microsoft.AspNetCore"))
+                result.Add("ASP.NET Core");
+            else
+                result.Add("ASP.NET Core (Web SDK)");
+        }
+
+        if (string.Equals(sdkType, "Microsoft.NET.Sdk.Worker", StringComparison.OrdinalIgnoreCase))
+            result.Add("Worker Service");
+
+        if (string.Equals(sdkType, "Microsoft.NET.Sdk.Razor", StringComparison.OrdinalIgnoreCase)
+            && !result.Any(r => r.StartsWith("Blazor")))
+            result.Add("Razor Class Library");
+
+        // Classic ASP.NET / WebForms — detect by actual .aspx/.ascx/.master files,
+        // not just System.Web (which is a shim in modern .NET for HttpUtility).
+        if (hasWebFormFiles)
+            result.Add("ASP.NET (WebForms)");
+
+        // --- Cloud / serverless ---
+        if (assemblyNames.Contains("Microsoft.Azure.Functions.Worker")
+            || assemblyNames.Contains("Microsoft.Azure.WebJobs"))
+            result.Add("Azure Functions");
+
+        if (assemblyNames.Contains("Aspire.Hosting"))
+            result.Add(".NET Aspire (AppHost)");
+        else if (assemblyNames.Contains("Microsoft.Extensions.ServiceDiscovery")
+            || assemblyNames.Contains("Aspire.Dashboard"))
+            result.Add(".NET Aspire");
+
+        // --- Popular libraries (as secondary tags) ---
+        if (assemblyNames.Contains("Microsoft.EntityFrameworkCore"))
+            result.Add("EF Core");
+        if (assemblyNames.Contains("Grpc.AspNetCore") || assemblyNames.Contains("Grpc.Net.Client"))
+            result.Add("gRPC");
+        if (assemblyNames.Contains("HotChocolate.AspNetCore") || assemblyNames.Contains("HotChocolate"))
+            result.Add("GraphQL (HotChocolate)");
+        else if (assemblyNames.Contains("GraphQL") || assemblyNames.Contains("GraphQL.Server.Core"))
+            result.Add("GraphQL");
+        if (assemblyNames.Contains("Microsoft.AspNetCore.SignalR") || assemblyNames.Contains("Microsoft.AspNetCore.SignalR.Core"))
+            result.Add("SignalR");
+        if (assemblyNames.Contains("MediatR"))
+            result.Add("MediatR");
+
+        return result;
+    }
+
+    /// <summary>
+    /// Reads the SDK attribute from a .csproj file (e.g., "Microsoft.NET.Sdk.Web").
+    /// </summary>
+    private static string? ReadProjectSdk(string projectPath)
+    {
+        if (!projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        try
+        {
+            // Quick read: just look for Sdk= in the <Project> element
+            using var reader = new StreamReader(projectPath);
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                line = line.TrimStart();
+                if (line.StartsWith("<Project", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(
+                        line, """Sdk\s*=\s*["']([^"']+)["']""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (match.Success)
+                        return match.Groups[1].Value;
+                    break;
+                }
+
+                // Also check for <Sdk Name="..."/> import style
+                if (line.StartsWith("<Sdk", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(
+                        line, """Name\s*=\s*["']([^"']+)["']""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (match.Success)
+                        return match.Groups[1].Value;
+                }
+            }
+        }
+        catch
+        {
+            // Don't fail if we can't read the project file
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Detects the test framework from project references.
+    /// </summary>
+    internal static string? DetectTestFramework(Project project)
+    {
+        var assemblyNames = project.MetadataReferences
+            .Select(r => Path.GetFileNameWithoutExtension(r.Display ?? ""))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var frameworks = new List<string>();
+
+        if (assemblyNames.Contains("xunit.core") || assemblyNames.Contains("xunit.v3.core") || assemblyNames.Contains("xunit.assert"))
+            frameworks.Add("xUnit");
+        if (assemblyNames.Contains("nunit.framework"))
+            frameworks.Add("NUnit");
+        if (assemblyNames.Contains("Microsoft.VisualStudio.TestPlatform.TestFramework"))
+            frameworks.Add("MSTest");
+
+        // Also check for common assertion/mocking libraries
+        var extras = new List<string>();
+        if (assemblyNames.Contains("NSubstitute"))
+            extras.Add("NSubstitute");
+        if (assemblyNames.Contains("Moq"))
+            extras.Add("Moq");
+        if (assemblyNames.Contains("FluentAssertions"))
+            extras.Add("FluentAssertions");
+        if (assemblyNames.Contains("Shouldly"))
+            extras.Add("Shouldly");
+        if (assemblyNames.Contains("Verify.Xunit") || assemblyNames.Contains("Verify.NUnit") || assemblyNames.Contains("Verify.MSTest"))
+            extras.Add("Verify");
+
+        if (frameworks.Count == 0)
+            return null;
+
+        string result = string.Join(" + ", frameworks);
+        if (extras.Count > 0)
+            result += $" (with {string.Join(", ", extras)})";
+        return result;
     }
 }

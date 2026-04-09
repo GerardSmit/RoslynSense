@@ -248,4 +248,17 @@ public class GoToDefinitionToolTests
         Assert.Contains("Summary", result);
         Assert.Contains("formatting", result, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task WhenHintLineProvidedThenDisambiguatesMultipleMatches()
+    {
+        // "[|Add|]" alone is ambiguous (lines 5 and 11), but hintLine=5 picks the declaration
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            markupSnippet: "[|Add|]",
+            hintLine: 5);
+
+        Assert.Contains("Definition: Add", result);
+        Assert.DoesNotContain("Ambiguous", result, StringComparison.OrdinalIgnoreCase);
+    }
 }

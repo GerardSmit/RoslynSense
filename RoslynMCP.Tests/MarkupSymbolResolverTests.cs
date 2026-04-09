@@ -42,6 +42,48 @@ public class MarkupSymbolResolverTests
     }
 
     [Fact]
+    public async Task WhenHintLineProvidedForAmbiguousSnippetThenResolvesToNearestMatch()
+    {
+        // "Add" appears at line 5 (declaration) and line 11 (usage)
+        // hintLine=5 should resolve to the declaration
+        var result = await MarkupSymbolResolver.ResolveFromFileAsync(
+            FixturePaths.CalculatorFile,
+            MarkupString.Parse("[|Add|]"),
+            hintLine: 5);
+
+        Assert.Equal(MarkupResolutionResult.ResultKind.Resolved, result.Kind);
+        Assert.Equal("Add", result.Symbol?.Name);
+        Assert.Equal(SymbolKind.Method, result.Symbol?.Kind);
+    }
+
+    [Fact]
+    public async Task WhenHintLineCloserToSecondMatchThenResolvesToSecondMatch()
+    {
+        // "Add" appears at line 5 (declaration) and line 11 (usage)
+        // hintLine=11 should resolve to the usage at line 11
+        var result = await MarkupSymbolResolver.ResolveFromFileAsync(
+            FixturePaths.CalculatorFile,
+            MarkupString.Parse("[|Add|]"),
+            hintLine: 11);
+
+        Assert.Equal(MarkupResolutionResult.ResultKind.Resolved, result.Kind);
+        Assert.Equal("Add", result.Symbol?.Name);
+    }
+
+    [Fact]
+    public async Task WhenHintLineProvidedButOnlyOneMatchThenResolvesNormally()
+    {
+        // Unique snippet — hintLine should be ignored
+        var result = await MarkupSymbolResolver.ResolveFromFileAsync(
+            FixturePaths.CalculatorFile,
+            MarkupString.Parse("public int [|Add|](int a, int b)"),
+            hintLine: 999);
+
+        Assert.Equal(MarkupResolutionResult.ResultKind.Resolved, result.Kind);
+        Assert.Equal("Add", result.Symbol?.Name);
+    }
+
+    [Fact]
     public async Task WhenSnippetDoesNotAppearInDocumentThenResolverReturnsNoMatch()
     {
         var result = await MarkupSymbolResolver.ResolveFromFileAsync(

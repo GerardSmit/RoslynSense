@@ -14,17 +14,22 @@ public static class RunTestsTool
     /// Runs tests in a .NET test project.
     /// </summary>
     [McpServerTool, Description(
-        "Run tests in a .NET test project. Provide the project path and optional filter.")]
+        "Run tests in a .NET test project. Set background=true to run in the background " +
+        "and continue working — check results later with GetBackgroundTaskResult.")]
     public static async Task<string> RunTests(
         [Description("Path to the test project (.csproj) or a source file in the test project.")]
         string projectPath,
         IOutputFormatter fmt,
+        BackgroundTaskStore taskStore,
         [Description("Optional test filter expression (e.g. 'ClassName.MethodName', " +
                      "'FullyQualifiedName~MyTest', 'Category=Unit'). " +
                      "If empty, all tests in the project are run.")]
         string? filter = null,
         [Description("Whether to build before running tests. Default is true.")]
         bool build = true,
+        [Description("Set to true to run tests in the background. Returns a task ID immediately " +
+                     "so you can continue working. Use GetBackgroundTaskResult to check results later.")]
+        bool background = false,
         [Description("Timeout in seconds for the test run. Default is 300 (5 minutes). Set to 0 for no timeout.")]
         int timeoutSeconds = 300,
         CancellationToken cancellationToken = default)
@@ -34,6 +39,10 @@ public static class RunTestsTool
             var csprojPath = ResolveCsprojPath(projectPath);
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
+
+            if (background)
+                return BackgroundTaskHelper.StartTestsBackground(
+                    csprojPath, filter, build, timeoutSeconds, taskStore);
 
             var trxPath = Path.Combine(Path.GetTempPath(), $"roslyn-mcp-{Guid.NewGuid():N}.trx");
 

@@ -11,14 +11,14 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenRunCoverageWithEmptyPathThenReturnsError()
     {
-        var result = await RunCoverageTool.RunCoverage("");
+        var result = await RunCoverageTool.RunCoverage("", new BackgroundTaskStore());
         Assert.Contains("Error", result);
     }
 
     [Fact]
     public async Task WhenRunCoverageWithNonexistentPathThenReturnsError()
     {
-        var result = await RunCoverageTool.RunCoverage("/nonexistent/path/Test.csproj");
+        var result = await RunCoverageTool.RunCoverage("/nonexistent/path/Test.csproj", new BackgroundTaskStore());
         Assert.Contains("Error", result);
     }
 
@@ -279,7 +279,7 @@ public class CoverageToolTests
     public async Task WhenGetCoverageToolUsedAfterRunCoverageThenReturnsFormattedOutput()
     {
         // Run coverage via the tool
-        var runResult = await RunCoverageTool.RunCoverage(FixturePaths.DebugTestProjectFile);
+        var runResult = await RunCoverageTool.RunCoverage(FixturePaths.DebugTestProjectFile, new BackgroundTaskStore());
         Assert.Contains("Coverage Report", runResult);
 
         // Query via the tool

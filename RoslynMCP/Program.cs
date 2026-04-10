@@ -28,6 +28,7 @@ class Program
         bool useToon = args.Contains("--toon", StringComparer.OrdinalIgnoreCase);
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
         builder.Services.AddSingleton<ProfilingSessionStore>();
+        builder.Services.AddSingleton<BackgroundTaskStore>();
 
         // Register non-C# file type handlers conditionally
         if (!noWebForms)

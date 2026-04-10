@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 using Xunit;
 
@@ -8,7 +9,7 @@ public class BuildProjectToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await BuildProjectTool.BuildProject(projectPath: "");
+        var result = await BuildProjectTool.BuildProject(projectPath: "", new BackgroundTaskStore());
 
         Assert.Contains("Error", result);
     }
@@ -17,7 +18,7 @@ public class BuildProjectToolTests
     public async Task WhenValidProjectBuiltThenReportsSuccess()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.SampleProjectFile);
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore());
 
         Assert.Contains("succeeded", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -26,7 +27,7 @@ public class BuildProjectToolTests
     public async Task WhenSourceFileProvidedThenResolvesToProject()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.CalculatorFile);
+            projectPath: FixturePaths.CalculatorFile, new BackgroundTaskStore());
 
         Assert.Contains("succeeded", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -35,7 +36,7 @@ public class BuildProjectToolTests
     public async Task WhenNonExistentProjectProvidedThenReturnsError()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: @"C:\NonExistent\Project.csproj");
+            projectPath: @"C:\NonExistent\Project.csproj", new BackgroundTaskStore());
 
         Assert.Contains("Error", result);
     }
@@ -44,7 +45,7 @@ public class BuildProjectToolTests
     public async Task WhenConfigurationProvidedThenUsesIt()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.SampleProjectFile,
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(),
             configuration: "Release");
 
         Assert.Contains("succeeded", result, StringComparison.OrdinalIgnoreCase);
@@ -55,7 +56,7 @@ public class BuildProjectToolTests
     {
         // Configuration with injection attempt should be sanitized
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.SampleProjectFile,
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(),
             configuration: "Debug; rm -rf /");
 
         // Should either succeed with sanitized config or fail safely

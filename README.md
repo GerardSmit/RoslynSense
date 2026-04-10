@@ -65,10 +65,9 @@ Example configuration with Razor disabled:
 
 | Tool | Description |
 |------|-------------|
-| **GoToDefinition** | Navigate to a symbol's definition with code context, or auto-decompile referenced assembly symbols. Works with C#, ASPX, and Razor files. |
+| **GoToDefinition** | Navigate to a symbol's definition with code context, or auto-decompile referenced assembly symbols. For type definitions, shows a members table. Works with C#, ASPX, and Razor files. |
 | **FindUsages** | Find all references to a symbol across a project. Also searches Razor source-generated files and ASPX inline code. |
-| **FindSymbol** | Search for symbol declarations by name pattern (exact, prefix, substring, camelCase). |
-| **SemanticSymbolSearch** | Ranked symbol search combining name, signature, docs, and source cues. Supports phrase-style queries. |
+| **SemanticSymbolSearch** | Ranked symbol search combining name, signature, docs, and source cues. Supports phrase-style queries (e.g. "calculate tax", "user repository"). |
 | **FindImplementations** | Find all implementations of an interface, abstract class, or virtual/abstract member. |
 | **GetCallHierarchy** | Show callers and/or callees of a method or property. |
 | **GetTypeHierarchy** | Show the full type hierarchy (base classes, interfaces, derived types). |
@@ -85,7 +84,7 @@ Example configuration with Razor disabled:
 
 | Tool | Description |
 |------|-------------|
-| **BuildProject** | Build a .NET project or solution and return structured errors and warnings. |
+| **BuildProject** | Build a .NET project or solution and return structured errors and warnings. Set `background: true` to build in the background. |
 
 ### Refactoring
 
@@ -97,10 +96,10 @@ Example configuration with Razor disabled:
 
 | Tool | Description |
 |------|-------------|
-| **RunTests** | Run tests in a .NET test project with optional filter expression and timeout. |
+| **RunTests** | Run tests in a .NET test project with optional filter expression and timeout. Set `background: true` to run in the background (builds first, then tests). |
 | **DiscoverTests** | Discover all test methods in a project using static Roslyn analysis. Returns test names, frameworks, file paths, and line numbers. |
 | **FindTests** | Find test methods that reference a symbol. Optionally uses coverage data for runtime-accurate results. |
-| **RunCoverage** | Collect code coverage for a test project using coverlet. Caches results for querying. |
+| **RunCoverage** | Collect code coverage for a test project using coverlet. Caches results for querying. Set `background: true` for background collection. |
 | **GetCoverage** | Query coverage by project, file, class, or method. Shows line and branch coverage with uncovered lines. |
 
 ### Debugging
@@ -118,6 +117,27 @@ Debugging uses [netcoredbg](https://github.com/Samsung/netcoredbg), which is aut
 | **DebugEvaluate** | Evaluate expressions in the current debug context. Supports batch evaluation with semicolons. |
 | **DebugStatus** | Get debugger status, breakpoints, and current pause position with optional locals and stack trace. |
 | **DebugStop** | Stop the debug session and clean up. |
+
+### Profiling
+
+Profiling uses [dotnet-trace](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-trace) with CPU sampling, auto-provisioned on first use.
+
+| Tool | Description |
+|------|-------------|
+| **ProfileTests** | Profile a test project to find CPU hotspots. Returns top methods ranked by self-time. |
+| **ProfileApp** | Profile a .NET application for a specified duration. |
+| **ListProfilingSessions** | List recent profiling sessions with IDs for investigation. |
+| **ProfileSearchMethods** | Search profiled methods by name pattern. |
+| **ProfileCallers** | Show which methods called a given method and how much time was spent. |
+| **ProfileCallees** | Show which methods a given method calls and how much time was spent. |
+| **ProfileHotPaths** | Show the hottest call paths through a method. |
+
+### Background Tasks
+
+| Tool | Description |
+|------|-------------|
+| **GetBackgroundTaskResult** | Check status and results of a background task by task ID. |
+| **ListBackgroundTasks** | List all background tasks with their statuses. |
 
 ## Resources
 

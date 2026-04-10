@@ -194,7 +194,7 @@ public static class ProjectStructureTool
         }
         fmt.AppendHints(sb,
             "Use GetFileOutline to see detailed structure of a file",
-            "Use FindSymbol to search for specific types or members");
+            "Use SemanticSymbolSearch to search for specific types or members");
 
         return sb.ToString();
     }

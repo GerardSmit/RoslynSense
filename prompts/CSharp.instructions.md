@@ -204,11 +204,12 @@ Use these tools to trace code flows and understand relationships:
   - `filter: "FullyQualifiedName~MyTest"` — substring match
   - `filter: "Category=Unit"` — by category
   - No filter runs all tests in the project.
+  - Set `background: true` to run tests in the background and continue working. Check results later with **GetBackgroundTaskResult**.
 - Work on one failing test at a time until it passes, then run the full suite.
 
 ### Code coverage
 
-1. **RunCoverage** — collect coverage data. Must be called before GetCoverage.
+1. **RunCoverage** — collect coverage data. Must be called before GetCoverage. Set `background: true` for background collection.
 2. **GetCoverage** — query results by file, class, or method. Shows line and branch coverage with uncovered lines.
 - Re-run RunCoverage after code changes that affect coverage.
 
@@ -271,6 +272,25 @@ After profiling, use the session ID to drill into the results:
 - Use **ProfileCallees** to trace downward to find *where* time is actually spent.
 - Combine with **GoToDefinition** to navigate to a hot method's source code.
 
+## Workflow: Background Tasks
+
+For long-running operations (tests, builds, coverage), set `background: true` to stay productive:
+
+### Starting background tasks
+- **RunTests** with `background: true` — builds then runs tests in the background. Returns a task ID immediately.
+- **BuildProject** with `background: true` — builds in the background. Returns a task ID immediately.
+- **RunCoverage** with `background: true` — runs coverage in the background. Returns a task ID immediately. Once done, results are cached for **GetCoverage**.
+
+### Monitoring
+- **GetBackgroundTaskResult** — check status (running/completed/failed) and get results for a specific task ID.
+- **ListBackgroundTasks** — list all background tasks with their statuses.
+
+### Background task tips
+- Start tests/coverage in the background while doing code analysis, refactoring, or writing new code.
+- After making changes, start a background test run and continue working.
+- Check results periodically with **GetBackgroundTaskResult**.
+- Background coverage results are cached — use **GetCoverage** to query them after the task completes.
+
 ## Tool Selection Guide
 
 | Task | Preferred Tool | Avoid |
@@ -280,10 +300,13 @@ After profiling, use the session ID to drill into the results:
 | Check for compile errors | **GetRoslynDiagnostics** or **BuildProject** | `dotnet build` (use BuildProject instead) |
 | Rename a symbol | **RenameSymbol** | Find-and-replace (misses cross-file refs) |
 | Understand a class hierarchy | **GetTypeHierarchy** | Manual file inspection |
-| Find a symbol by partial name | **FindSymbol** or **SemanticSymbolSearch** | grep (doesn't understand C# syntax) |
+| Find a symbol by partial name | **SemanticSymbolSearch** | grep (doesn't understand C# syntax) |
 | Apply a code fix | **GetCodeActions** with `applyIndex` | Manual editing |
 | Run a specific test | **RunTests** with `filter` | `dotnet test --filter` (use RunTests instead) |
 | Check test coverage | **RunCoverage** then **GetCoverage** | Manual inspection |
 | Debug a failing test | **DebugStartTest** | Adding Console.WriteLine |
 | Profile CPU hotspots | **ProfileTests** or **ProfileApp** | Manual dotnet-trace |
 | Investigate hot methods | **ProfileCallers** / **ProfileCallees** | Guessing without data |
+| Run tests while doing other work | **RunTests** with `background: true` + **GetBackgroundTaskResult** | — |
+| Build while doing other work | **BuildProject** with `background: true` + **GetBackgroundTaskResult** | — |
+| Collect coverage in background | **RunCoverage** with `background: true` + **GetBackgroundTaskResult** | — |

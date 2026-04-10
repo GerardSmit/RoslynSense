@@ -9,7 +9,7 @@ public class RunTestsToolTests
     [Fact]
     public async Task WhenProjectPathIsEmptyThenReturnsError()
     {
-        var result = await RunTestsTool.RunTests("", new MarkdownFormatter());
+        var result = await RunTestsTool.RunTests("", new MarkdownFormatter(), new BackgroundTaskStore());
 
         Assert.Contains("Error", result);
     }
@@ -17,7 +17,7 @@ public class RunTestsToolTests
     [Fact]
     public async Task WhenProjectDoesNotExistThenReturnsError()
     {
-        var result = await RunTestsTool.RunTests("/nonexistent/path/Test.csproj", new MarkdownFormatter());
+        var result = await RunTestsTool.RunTests("/nonexistent/path/Test.csproj", new MarkdownFormatter(), new BackgroundTaskStore());
 
         Assert.Contains("Error", result);
     }
@@ -26,7 +26,7 @@ public class RunTestsToolTests
     public async Task WhenRunningNonTestProjectThenDotnetTestHandlesError()
     {
         // dotnet test will report its own error for non-test projects
-        var result = await RunTestsTool.RunTests(FixturePaths.SampleProjectFile, new MarkdownFormatter());
+        var result = await RunTestsTool.RunTests(FixturePaths.SampleProjectFile, new MarkdownFormatter(), new BackgroundTaskStore());
 
         // Should get an error from dotnet test, not from our validation
         Assert.NotNull(result);
@@ -46,6 +46,7 @@ public class RunTestsToolTests
         var result = await RunTestsTool.RunTests(
             testProjectPath,
             new MarkdownFormatter(),
+            new BackgroundTaskStore(),
             "FullyQualifiedName=RoslynMCP.Tests.RunTestsToolTests.WhenProjectPathIsEmptyThenReturnsError");
 
         Assert.Contains("Passed", result);
@@ -60,6 +61,7 @@ public class RunTestsToolTests
         var result = await RunTestsTool.RunTests(
             testProjectPath,
             new MarkdownFormatter(),
+            new BackgroundTaskStore(),
             "FullyQualifiedName=NonExistent.Test.Method");
 
         // Should run but find no tests

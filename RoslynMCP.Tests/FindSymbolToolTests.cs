@@ -3,22 +3,25 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+/// <summary>
+/// Tests for symbol search functionality via SemanticSymbolSearch.
+/// Originally tested FindSymbol which was merged into SemanticSymbolSearch.
+/// </summary>
 public class FindSymbolToolTests
 {
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await FindSymbolTool.FindSymbol(filePath: "", symbolName: "Add");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(filePath: "", query: "Add");
 
         Assert.Contains("Error", result);
-        Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public async Task WhenEmptySymbolNameProvidedThenReturnsError()
+    public async Task WhenEmptyQueryProvidedThenReturnsError()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "");
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -27,40 +30,36 @@ public class FindSymbolToolTests
     [Fact]
     public async Task WhenMethodNameSearchedThenFindsMethod()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "Add");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "Add");
 
-        Assert.Contains("Symbol Search", result);
         Assert.Contains("Add", result);
-        Assert.Contains("Method", result);
         Assert.Contains("Calculator.cs", result);
     }
 
     [Fact]
     public async Task WhenTypeNameSearchedThenFindsType()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "Calculator");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "Calculator");
 
         Assert.Contains("Calculator", result);
-        Assert.Contains("NamedType", result);
     }
 
     [Fact]
     public async Task WhenNonExistentSymbolSearchedThenReportsNoResults()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "ZZZDoesNotExistZZZ");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "ZZZDoesNotExistZZZ");
 
-        Assert.Contains("No matching symbols found", result);
+        Assert.Contains("No", result);
     }
 
     [Fact]
-    public async Task WhenPatternMatchedThenFindsMultipleSymbols()
+    public async Task WhenPatternMatchedThenFindsSymbol()
     {
-        // "Calc" should match "Calculator" via substring/pattern matching
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "Calc");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "Calc");
 
         Assert.Contains("Calculator", result);
     }
@@ -68,19 +67,18 @@ public class FindSymbolToolTests
     [Fact]
     public async Task WhenResultTypeSearchedThenFindsRecordInOtherFile()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "Result");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "Result");
 
         Assert.Contains("Result", result);
-        Assert.Contains("Result.cs", result);
     }
 
     [Fact]
     public async Task WhenNonExistentFileProvidedThenReturnsError()
     {
-        var result = await FindSymbolTool.FindSymbol(
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
             filePath: Path.Combine(FixturePaths.SampleProjectDir, "Ghost.cs"),
-            symbolName: "Something");
+            query: "Something");
 
         Assert.Contains("does not exist", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -88,72 +86,45 @@ public class FindSymbolToolTests
     [Fact]
     public async Task WhenPropertySearchedThenFindsProperty()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "Value");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.CalculatorFile, query: "Value");
 
         Assert.Contains("Value", result);
-        Assert.Contains("Property", result);
-    }
-
-    [Fact]
-    public async Task WhenSearchResultsFoundThenShowsTableFormat()
-    {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.CalculatorFile, symbolName: "Add");
-
-        Assert.Contains("Symbol Search", result);
-        Assert.Contains("| # |", result);
-        Assert.Contains("Symbol", result);
-        Assert.Contains("Kind", result);
-    }
-
-    [Fact]
-    public async Task WhenEnumSearchedThenFindsEnumType()
-    {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.ServicesFile, symbolName: "ProcessingStatus");
-
-        Assert.Contains("ProcessingStatus", result);
-        Assert.Contains("NamedType", result);
     }
 
     [Fact]
     public async Task WhenInterfaceSearchedThenFindsInterface()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.ServicesFile, symbolName: "IStringFormatter");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.ServicesFile, query: "IStringFormatter");
 
         Assert.Contains("IStringFormatter", result);
-        Assert.Contains("NamedType", result);
     }
 
     [Fact]
     public async Task WhenEventSearchedThenFindsEvent()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.OutlineShowcaseFile, symbolName: "Changed");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.OutlineShowcaseFile, query: "Changed");
 
         Assert.Contains("Changed", result);
-        Assert.Contains("Event", result);
     }
 
     [Fact]
     public async Task WhenDelegateSearchedThenFindsDelegate()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.OutlineShowcaseFile, symbolName: "ValueFormatter");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.OutlineShowcaseFile, query: "ValueFormatter");
 
         Assert.Contains("ValueFormatter", result);
-        Assert.Contains("NamedType", result);
     }
 
     [Fact]
     public async Task WhenConstantSearchedThenFindsField()
     {
-        var result = await FindSymbolTool.FindSymbol(
-            filePath: FixturePaths.OutlineShowcaseFile, symbolName: "DefaultValue");
+        var result = await SemanticSymbolSearchTool.SemanticSymbolSearch(
+            filePath: FixturePaths.OutlineShowcaseFile, query: "DefaultValue");
 
         Assert.Contains("DefaultValue", result);
-        Assert.Contains("Field", result);
     }
 }

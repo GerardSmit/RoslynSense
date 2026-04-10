@@ -10,13 +10,17 @@ namespace RoslynMCP.Tools;
 public static class BuildProjectTool
 {
     [McpServerTool, Description(
-        "Build a .NET project or solution. Returns build output including errors and warnings. " +
-        "Use this to check for compilation issues without running tests.")]
+        "Build a .NET project or solution. Set background=true to build in the background " +
+        "and continue working — check results later with GetBackgroundTaskResult.")]
     public static async Task<string> BuildProject(
         [Description("Path to the .csproj, .sln file, or a source file in the project.")]
         string projectPath,
+        BackgroundTaskStore taskStore,
         [Description("Build configuration. Default: 'Debug'.")]
         string configuration = "Debug",
+        [Description("Set to true to build in the background. Returns a task ID immediately " +
+                     "so you can continue working. Use GetBackgroundTaskResult to check results later.")]
+        bool background = false,
         CancellationToken cancellationToken = default)
     {
         try
@@ -24,6 +28,10 @@ public static class BuildProjectTool
             string resolved = ResolveBuildTarget(projectPath);
             if (resolved.StartsWith("Error:", StringComparison.Ordinal))
                 return resolved;
+
+            if (background)
+                return BackgroundTaskHelper.StartBuildBackground(
+                    resolved, configuration, taskStore);
 
             var args = new StringBuilder();
             args.Append("build ");

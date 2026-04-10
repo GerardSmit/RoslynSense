@@ -31,7 +31,7 @@ public static class InvestigateSymbolPrompt
 
             Please investigate it step by step:
 
-            1. **Find the symbol** — Call `FindSymbol` with `filePath={{filePath}}` and `symbolName={{symbolName}}` to locate declarations matching this name.
+            1. **Find the symbol** — Call `SemanticSymbolSearch` with `filePath={{filePath}}` and `query={{symbolName}}` to locate declarations matching this name.
 
             2. **Go to definition** — For each match found (especially if there is a primary/most relevant one), call `GoToDefinition` with an appropriate markup snippet to see its source code and context.
 

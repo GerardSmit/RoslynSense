@@ -47,13 +47,13 @@ public class InvestigateSymbolPromptTests
     }
 
     [Fact]
-    public void WhenParametersProvidedThenPromptMentionsFindSymbol()
+    public void WhenParametersProvidedThenPromptMentionsSemanticSymbolSearch()
     {
         var prompt = InvestigateSymbolPrompt.InvestigateSymbol(
             filePath: "C:/src/MyFile.cs",
             symbolName: "Foo");
 
-        Assert.Contains("FindSymbol", prompt);
+        Assert.Contains("SemanticSymbolSearch", prompt);
     }
 
     [Fact]

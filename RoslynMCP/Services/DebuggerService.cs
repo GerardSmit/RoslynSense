@@ -261,7 +261,7 @@ internal sealed partial class DebuggerService : IDisposable
         return sb.ToString();
     }
 
-    private static async Task<string?> FindOrProvisionDotnetTraceAsync(CancellationToken cancellationToken)
+    internal static async Task<string?> FindOrProvisionDotnetTraceAsync(CancellationToken cancellationToken)
     {
         // Check if dotnet-trace is on PATH
         var (exitCode, _) = await RunProcessAsync("dotnet-trace", "--version", cancellationToken);

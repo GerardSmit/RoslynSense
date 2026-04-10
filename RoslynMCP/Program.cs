@@ -27,6 +27,7 @@ class Program
         // Register output formatter (markdown default, TOON via --toon)
         bool useToon = args.Contains("--toon", StringComparer.OrdinalIgnoreCase);
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
+        builder.Services.AddSingleton<ProfilingSessionStore>();
 
         // Register non-C# file type handlers conditionally
         if (!noWebForms)

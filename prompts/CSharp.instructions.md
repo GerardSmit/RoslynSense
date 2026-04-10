@@ -241,6 +241,36 @@ Debugging uses [netcoredbg](https://github.com/Samsung/netcoredbg), which is aut
 - Evaluate expressions to inspect state without modifying code.
 - If a test is failing and the cause isn't clear from the error message, debug it rather than guessing.
 
+## Workflow: Performance Profiling
+
+Profiling uses [dotnet-trace](https://learn.microsoft.com/dotnet/core/diagnostics/dotnet-trace) with CPU sampling, which is auto-provisioned on first use.
+
+### Collecting a profile
+
+- **ProfileTests** — profile a test project's execution. Use `filter` to target specific tests. Returns the hottest methods by self-time and a **session ID** for follow-up investigation.
+- **ProfileApp** — profile an application's execution. Returns the same hot methods table and session ID.
+
+Both tools use `--no-build`, so build the project first if needed.
+
+### Investigating profile results
+
+After profiling, use the session ID to drill into the results:
+
+1. **ListProfilingSessions** — list active profiling sessions (retained for 30 minutes).
+2. **ProfileSearchMethods** — search for methods by name pattern (substring or regex) in a session.
+3. **ProfileCallers** — show who calls a hot method and how much CPU time flows through each caller.
+4. **ProfileCallees** — show what a hot method calls and where time is spent.
+5. **ProfileHotPaths** — show the hottest execution paths through a method (call chains).
+
+### Profiling tips
+
+- Profile with a focused test filter first to reduce noise.
+- Methods with high **Self%** spend time in their own code — these are the optimization targets.
+- Methods with high **Total%** but low **Self%** are on hot call paths — optimize their callees instead.
+- Use **ProfileCallers** to trace upward from a hot method to understand *why* it's being called.
+- Use **ProfileCallees** to trace downward to find *where* time is actually spent.
+- Combine with **GoToDefinition** to navigate to a hot method's source code.
+
 ## Tool Selection Guide
 
 | Task | Preferred Tool | Avoid |
@@ -255,3 +285,5 @@ Debugging uses [netcoredbg](https://github.com/Samsung/netcoredbg), which is aut
 | Run a specific test | **RunTests** with `filter` | `dotnet test --filter` (use RunTests instead) |
 | Check test coverage | **RunCoverage** then **GetCoverage** | Manual inspection |
 | Debug a failing test | **DebugStartTest** | Adding Console.WriteLine |
+| Profile CPU hotspots | **ProfileTests** or **ProfileApp** | Manual dotnet-trace |
+| Investigate hot methods | **ProfileCallers** / **ProfileCallees** | Guessing without data |

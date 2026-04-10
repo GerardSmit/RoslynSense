@@ -111,4 +111,43 @@ internal static partial class SymbolFormatter
 
     [GeneratedRegex(@"<param\s+name=""([^""]+)"">(.*?)</param>", RegexOptions.Singleline)]
     private static partial Regex ParamDocRegex();
+
+    /// <summary>
+    /// Determines whether a type member should be displayed in outlines and member tables.
+    /// Filters out compiler-generated, backing fields, accessor methods, nested types, etc.
+    /// </summary>
+    public static bool ShouldDisplayMember(ISymbol member)
+    {
+        if (member.IsImplicitlyDeclared)
+            return false;
+
+        if (member is IFieldSymbol { AssociatedSymbol: not null })
+            return false;
+
+        if (member is IMethodSymbol method)
+        {
+            if (method.AssociatedSymbol is not null)
+                return false;
+            if (method.MethodKind is MethodKind.StaticConstructor or MethodKind.Destructor)
+                return false;
+        }
+
+        if (member is INamedTypeSymbol)
+            return false;
+
+        return member is IMethodSymbol or IPropertySymbol or IFieldSymbol or IEventSymbol;
+    }
+
+    /// <summary>
+    /// Returns a sort order value for grouping members by kind (ctors first, then fields, properties, events, methods).
+    /// </summary>
+    public static int MemberSortOrder(ISymbol member) => member switch
+    {
+        IMethodSymbol { MethodKind: MethodKind.Constructor } => 0,
+        IFieldSymbol => 1,
+        IPropertySymbol => 2,
+        IEventSymbol => 3,
+        IMethodSymbol => 4,
+        _ => 5
+    };
 }

@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -47,7 +48,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenEmptyFilePathThenReturnsError()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            "", "var x = [|Add|](1, 2);", "Sum");
+            "", "var x = [|Add|](1, 2);", "Sum", new MarkdownFormatter());
         Assert.StartsWith("Error: File path cannot be empty", result);
     }
 
@@ -55,7 +56,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenEmptyMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "", "Sum");
+            _calculatorFile, "", "Sum", new MarkdownFormatter());
         Assert.StartsWith("Error: markupSnippet cannot be empty", result);
     }
 
@@ -63,7 +64,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenEmptyNewNameThenReturnsError()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "var x = [|Add|](1, 2);", "");
+            _calculatorFile, "var x = [|Add|](1, 2);", "", new MarkdownFormatter());
         Assert.StartsWith("Error: newName cannot be empty", result);
     }
 
@@ -71,7 +72,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenInvalidIdentifierThenReturnsError()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "var x = [|Add|](1, 2);", "123invalid");
+            _calculatorFile, "var x = [|Add|](1, 2);", "123invalid", new MarkdownFormatter());
         Assert.Contains("not a valid C# identifier", result);
     }
 
@@ -79,7 +80,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenFileNotFoundThenReturnsError()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            @"C:\nonexistent\file.cs", "var x = [|Add|](1, 2);", "Sum");
+            @"C:\nonexistent\file.cs", "var x = [|Add|](1, 2);", "Sum", new MarkdownFormatter());
         Assert.Contains("does not exist", result);
     }
 
@@ -87,7 +88,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenInvalidMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "no markers here", "Sum");
+            _calculatorFile, "no markers here", "Sum", new MarkdownFormatter());
         Assert.Contains("Invalid markup", result);
     }
 
@@ -97,7 +98,7 @@ public class RenameSymbolToolTests : IDisposable
         string originalContent = await File.ReadAllTextAsync(_calculatorFile);
 
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "public int [|Add|](int a, int b)", "Sum", dryRun: true);
+            _calculatorFile, "public int [|Add|](int a, int b)", "Sum", new MarkdownFormatter(), dryRun: true);
 
         Assert.Contains("Rename:", result);
         Assert.Contains("Preview", result);
@@ -110,7 +111,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenRenamingMethodThenUpdatesFileOnDisk()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "public int [|Add|](int a, int b)", "Sum");
+            _calculatorFile, "public int [|Add|](int a, int b)", "Sum", new MarkdownFormatter());
 
         Assert.Contains("Rename:", result);
         Assert.Contains("Sum", result);
@@ -125,7 +126,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenSameNameThenReturnsAlreadyHasName()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "public int [|Add|](int a, int b)", "Add");
+            _calculatorFile, "public int [|Add|](int a, int b)", "Add", new MarkdownFormatter());
 
         Assert.Contains("already has the requested name", result);
     }
@@ -134,7 +135,7 @@ public class RenameSymbolToolTests : IDisposable
     public async Task WhenVerbatimIdentifierThenAccepted()
     {
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "public int [|Add|](int a, int b)", "@Sum", dryRun: true);
+            _calculatorFile, "public int [|Add|](int a, int b)", "@Sum", new MarkdownFormatter(), dryRun: true);
 
         Assert.Contains("Rename:", result);
     }
@@ -228,7 +229,7 @@ public class RenameSymbolToolTests : IDisposable
             var csFile = Path.Combine(tempDir, "PageHelper.cs");
 
             var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-                csFile, "public class [|PageHelper|]", "PageUtility", dryRun: true,
+                csFile, "public class [|PageHelper|]", "PageUtility", new MarkdownFormatter(), dryRun: true,
                 handlers: TestHandlers.Rename);
 
             Assert.Contains("Rename:", result);
@@ -252,7 +253,7 @@ public class RenameSymbolToolTests : IDisposable
             var calcFile = Path.Combine(tempDir, "Calculator.cs");
 
             var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-                calcFile, "public class [|Calculator|]", "MathHelper");
+                calcFile, "public class [|Calculator|]", "MathHelper", new MarkdownFormatter());
 
             Assert.Contains("Rename:", result);
             Assert.Contains("MathHelper", result);
@@ -273,7 +274,7 @@ public class RenameSymbolToolTests : IDisposable
     {
         // Renaming a method should not trigger file rename
         var result = await RoslynMCP.Tools.RenameSymbolTool.RenameSymbol(
-            _calculatorFile, "public int [|Add|](int a, int b)", "Sum", dryRun: true);
+            _calculatorFile, "public int [|Add|](int a, int b)", "Sum", new MarkdownFormatter(), dryRun: true);
 
         Assert.Contains("Rename:", result);
         Assert.DoesNotContain("Renamed Files", result);

@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 using Xunit;
 
@@ -8,7 +9,7 @@ public class RunTestsToolTests
     [Fact]
     public async Task WhenProjectPathIsEmptyThenReturnsError()
     {
-        var result = await RunTestsTool.RunTests("");
+        var result = await RunTestsTool.RunTests("", new MarkdownFormatter());
 
         Assert.Contains("Error", result);
     }
@@ -16,7 +17,7 @@ public class RunTestsToolTests
     [Fact]
     public async Task WhenProjectDoesNotExistThenReturnsError()
     {
-        var result = await RunTestsTool.RunTests("/nonexistent/path/Test.csproj");
+        var result = await RunTestsTool.RunTests("/nonexistent/path/Test.csproj", new MarkdownFormatter());
 
         Assert.Contains("Error", result);
     }
@@ -25,7 +26,7 @@ public class RunTestsToolTests
     public async Task WhenRunningNonTestProjectThenDotnetTestHandlesError()
     {
         // dotnet test will report its own error for non-test projects
-        var result = await RunTestsTool.RunTests(FixturePaths.SampleProjectFile);
+        var result = await RunTestsTool.RunTests(FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         // Should get an error from dotnet test, not from our validation
         Assert.NotNull(result);
@@ -44,6 +45,7 @@ public class RunTestsToolTests
 
         var result = await RunTestsTool.RunTests(
             testProjectPath,
+            new MarkdownFormatter(),
             "FullyQualifiedName=RoslynMCP.Tests.RunTestsToolTests.WhenProjectPathIsEmptyThenReturnsError");
 
         Assert.Contains("Passed", result);
@@ -57,6 +59,7 @@ public class RunTestsToolTests
 
         var result = await RunTestsTool.RunTests(
             testProjectPath,
+            new MarkdownFormatter(),
             "FullyQualifiedName=NonExistent.Test.Method");
 
         // Should run but find no tests
@@ -106,7 +109,7 @@ public class RunTestsToolTests
              Total time: 1.234 Seconds
             """;
 
-        var result = RunTestsTool.FormatTestOutput(stdout, "", 1);
+        var result = RunTestsTool.FormatTestOutput(stdout, "", 1, new MarkdownFormatter());
 
         Assert.Contains("Tests Failed", result);
         Assert.Contains("WhenDoingXThenYHappens", result);
@@ -140,7 +143,7 @@ public class RunTestsToolTests
                  Failed: 2
             """;
 
-        var result = RunTestsTool.FormatTestOutput(stdout, "", 1);
+        var result = RunTestsTool.FormatTestOutput(stdout, "", 1, new MarkdownFormatter());
 
         Assert.Contains("TestOne", result);
         Assert.Contains("TestTwo", result);
@@ -165,7 +168,7 @@ public class RunTestsToolTests
                  Passed: 5
             """;
 
-        var result = RunTestsTool.FormatTestOutput(stdout, "", 0);
+        var result = RunTestsTool.FormatTestOutput(stdout, "", 0, new MarkdownFormatter());
 
         Assert.Contains("Tests Passed", result);
         Assert.Contains("Total tests: 5", result);
@@ -180,7 +183,7 @@ public class RunTestsToolTests
             /src/MyClass.cs(10,5): error CS1002: ; expected
             """;
 
-        var result = RunTestsTool.FormatTestOutput(stdout, "", 1);
+        var result = RunTestsTool.FormatTestOutput(stdout, "", 1, new MarkdownFormatter());
 
         Assert.Contains("Tests Failed", result);
         Assert.Contains("error CS1002", result);
@@ -204,12 +207,12 @@ public class RunTestsToolTests
         try
         {
             File.WriteAllText(trxPath, trxContent);
-            var result = RunTestsTool.FormatTrxOutput(trxPath, 0);
+            var result = RunTestsTool.FormatTrxOutput(trxPath, 0, new MarkdownFormatter());
 
             Assert.Contains("Tests Passed", result);
-            Assert.Contains("Total tests: 2", result);
-            Assert.Contains("Passed: 2", result);
-            Assert.DoesNotContain("Failed:", result);
+            Assert.Contains("**Total tests**: 2", result);
+            Assert.Contains("**Passed**: 2", result);
+            Assert.DoesNotContain("**Failed**:", result);
         }
         finally
         {
@@ -243,12 +246,12 @@ public class RunTestsToolTests
         try
         {
             File.WriteAllText(trxPath, trxContent);
-            var result = RunTestsTool.FormatTrxOutput(trxPath, 1);
+            var result = RunTestsTool.FormatTrxOutput(trxPath, 1, new MarkdownFormatter());
 
             Assert.Contains("Tests Failed", result);
-            Assert.Contains("Total tests: 2", result);
-            Assert.Contains("Passed: 1", result);
-            Assert.Contains("Failed: 1", result);
+            Assert.Contains("**Total tests**: 2", result);
+            Assert.Contains("**Passed**: 1", result);
+            Assert.Contains("**Failed**: 1", result);
             Assert.Contains("FailingTest", result);
             Assert.Contains("Assert.Equal() Failure", result);
             Assert.Contains("Stack trace", result);

@@ -135,11 +135,11 @@ public static class FindImplementationsTool
                     ? Path.GetRelativePath(projectDir, filePath)
                     : filePath;
                 int line = lineSpan.StartLinePosition.Line + 1;
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(typeName)} | {MarkdownHelper.EscapeTableCell(displayPath)} | {line} |");
+                sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(typeName)} | {MarkdownFormatter.EscapeTableCell(displayPath)} | {line} |");
             }
             else
             {
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(typeName)} | (external) | - |");
+                sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(typeName)} | (external) | - |");
             }
         }
 
@@ -246,11 +246,11 @@ public static class FindImplementationsTool
                     ? Path.GetRelativePath(projectDir, filePath)
                     : filePath;
                 int line = lineSpan.StartLinePosition.Line + 1;
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(implDisplay)} | {MarkdownHelper.EscapeTableCell(containingType)} | {MarkdownHelper.EscapeTableCell(displayPath)} | {line} |");
+                sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(implDisplay)} | {MarkdownFormatter.EscapeTableCell(containingType)} | {MarkdownFormatter.EscapeTableCell(displayPath)} | {line} |");
             }
             else
             {
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(implDisplay)} | {MarkdownHelper.EscapeTableCell(containingType)} | (external) | - |");
+                sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(implDisplay)} | {MarkdownFormatter.EscapeTableCell(containingType)} | (external) | - |");
             }
         }
 

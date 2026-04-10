@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -7,7 +8,7 @@ public class ProjectStructureToolTests
     [Fact]
     public async Task WhenEmptyPathThenReturnsError()
     {
-        var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure("");
+        var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure("", new MarkdownFormatter());
         Assert.StartsWith("Error: Path cannot be empty", result);
     }
 
@@ -15,7 +16,7 @@ public class ProjectStructureToolTests
     public async Task WhenFileNotFoundThenReturnsError()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            @"C:\nonexistent\project.csproj");
+            @"C:\nonexistent\project.csproj", new MarkdownFormatter());
         Assert.Contains("does not exist", result);
     }
 
@@ -23,7 +24,7 @@ public class ProjectStructureToolTests
     public async Task WhenCsprojProvidedThenShowsProjectStructure()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("# Project: SampleProject", result);
         Assert.Contains("Framework", result);
@@ -34,7 +35,7 @@ public class ProjectStructureToolTests
     public async Task WhenSourceFileProvidedThenFindsProjectAndShowsStructure()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.CalculatorFile);
+            FixturePaths.CalculatorFile, new MarkdownFormatter());
 
         Assert.Contains("# Project: SampleProject", result);
         Assert.Contains("Calculator", result);
@@ -44,7 +45,7 @@ public class ProjectStructureToolTests
     public async Task WhenProjectHasTypesThenShowsNamespaceTree()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("Types", result);
         Assert.Contains("Calculator", result);
@@ -59,7 +60,7 @@ public class ProjectStructureToolTests
     public async Task WhenProjectHasReferenceThenShowsAssemblyReferences()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("Assembly References", result);
     }
@@ -69,7 +70,7 @@ public class ProjectStructureToolTests
     {
         // SampleProject targets net10.0
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("net10.0", result);
     }
@@ -135,7 +136,7 @@ public class ProjectStructureToolTests
     {
         // SampleProject has <Nullable>enable</Nullable>
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("**Nullable**: Enable", result);
     }
@@ -148,7 +149,7 @@ public class ProjectStructureToolTests
     public async Task WhenProjectIsLibraryThenShowsLibraryDLL()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("Library (DLL)", result);
     }
@@ -161,7 +162,7 @@ public class ProjectStructureToolTests
     public async Task WhenProjectUsesNet10ThenShowsCSharpVersion()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.Contains("**C# Version**", result);
     }
@@ -175,7 +176,7 @@ public class ProjectStructureToolTests
     {
         // DebugTestProject references xunit
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.DebugTestProjectFile);
+            FixturePaths.DebugTestProjectFile, new MarkdownFormatter());
 
         Assert.Contains("**Test Framework**: xUnit", result);
     }
@@ -185,7 +186,7 @@ public class ProjectStructureToolTests
     {
         // SampleProject is not a test project
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.DoesNotContain("Test Framework", result);
     }
@@ -268,7 +269,7 @@ public class ProjectStructureToolTests
     {
         // SampleProject is a plain library with no framework references
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.SampleProjectFile);
+            FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
         Assert.DoesNotContain("App Type", result);
     }
@@ -277,7 +278,7 @@ public class ProjectStructureToolTests
     public async Task WhenBlazorProjectThenShowsBlazor()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.BlazorProjectFile);
+            FixturePaths.BlazorProjectFile, new MarkdownFormatter());
 
         Assert.Contains("**App Type**:", result);
         Assert.Contains("Blazor", result);
@@ -287,7 +288,7 @@ public class ProjectStructureToolTests
     public async Task WhenAspxProjectThenShowsWebForms()
     {
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
-            FixturePaths.AspxProjectFile);
+            FixturePaths.AspxProjectFile, new MarkdownFormatter());
 
         Assert.Contains("**App Type**:", result);
         Assert.Contains("ASP.NET (WebForms)", result);

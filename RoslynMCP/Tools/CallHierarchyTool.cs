@@ -123,11 +123,11 @@ public static class CallHierarchyTool
                     ? Path.GetRelativePath(projectDir, lineSpan.Path)
                     : lineSpan.Path;
                 int line = lineSpan.StartLinePosition.Line + 1;
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(callerName)} | {containingType} | {MarkdownHelper.EscapeTableCell(displayPath)} | {line} |");
+                sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(callerName)} | {containingType} | {MarkdownFormatter.EscapeTableCell(displayPath)} | {line} |");
             }
             else
             {
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(callerName)} | {containingType} | (external) | - |");
+                sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(callerName)} | {containingType} | (external) | - |");
             }
         }
 
@@ -215,7 +215,7 @@ public static class CallHierarchyTool
             string calleeName = callee.ToDisplayString();
             string kind = callee.Kind.ToString();
             string containingType = callee.ContainingType?.ToDisplayString() ?? "-";
-            sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(calleeName)} | {kind} | {MarkdownHelper.EscapeTableCell(containingType)} |");
+            sb.AppendLine($"| {MarkdownFormatter.EscapeTableCell(calleeName)} | {kind} | {MarkdownFormatter.EscapeTableCell(containingType)} |");
         }
 
         sb.AppendLine();

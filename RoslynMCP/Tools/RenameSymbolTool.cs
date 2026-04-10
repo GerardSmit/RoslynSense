@@ -30,6 +30,7 @@ public static class RenameSymbolTool
             "e.g. 'void [|OldName|](int x)'.")]
         string markupSnippet,
         [Description("The new name for the symbol.")] string newName,
+        IOutputFormatter fmt,
         [Description("If true, show a preview of changes without applying them. Default: false.")]
         bool dryRun = false,
         [Description("If true, also rename overloaded methods with the same name. Default: false.")]
@@ -139,19 +140,17 @@ public static class RenameSymbolTool
             int totalChanges = changedDocs.Count + nonCSharpChanges.Count;
             if (totalChanges == 0 && fileRenames.Count == 0)
                 return $"No changes were produced when renaming '{oldName}' to '{newName}'.";
-
             var sb = new StringBuilder();
-            sb.AppendLine($"# Rename: {oldName} → {newName}");
-            sb.AppendLine();
-            sb.AppendLine($"- **Symbol**: {symbol.ToDisplayString()}");
-            sb.AppendLine($"- **Kind**: {symbol.Kind}");
-            sb.AppendLine($"- **C# files changed**: {changedDocs.Count}");
+            fmt.AppendHeader(sb, $"Rename: {oldName} → {newName}");
+            fmt.AppendField(sb, "Symbol", symbol.ToDisplayString());
+            fmt.AppendField(sb, "Kind", symbol.Kind);
+            fmt.AppendField(sb, "C# files changed", changedDocs.Count);
             if (nonCSharpChanges.Count > 0)
-                sb.AppendLine($"- **Non-C# files changed**: {nonCSharpChanges.Count}");
+                fmt.AppendField(sb, "Non-C# files changed", nonCSharpChanges.Count);
             if (fileRenames.Count > 0)
-                sb.AppendLine($"- **Files renamed**: {fileRenames.Count}");
-            sb.AppendLine($"- **Mode**: {(dryRun ? "Preview (no changes written)" : "Applied")}");
-            sb.AppendLine();
+                fmt.AppendField(sb, "Files renamed", fileRenames.Count);
+            fmt.AppendField(sb, "Mode", dryRun ? "Preview (no changes written)" : "Applied");
+            fmt.AppendSeparator(sb);
 
             if (!dryRun)
             {
@@ -180,12 +179,10 @@ public static class RenameSymbolTool
             }
 
             // Summary table
-            sb.AppendLine("## Changed Files");
-            sb.AppendLine();
-            sb.AppendLine("| File | Type | Changes |");
-            sb.AppendLine("|------|------|---------|");
-
             string? projectDir = ctx.ProjectDir;
+
+            var columns = new[] { "File", "Type", "Changes" };
+            var rows = new List<string[]>();
 
             foreach (var change in changedDocs)
             {
@@ -193,7 +190,7 @@ public static class RenameSymbolTool
                     ? Path.GetRelativePath(projectDir, change.FilePath)
                     : change.FilePath;
                 int changeCount = RenameHelper.CountOccurrences(change.NewText, newName) - RenameHelper.CountOccurrences(change.OldText, newName);
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(displayPath)} | C# | {changeCount} occurrence(s) |");
+                rows.Add([fmt.Escape(displayPath), "C#", $"{changeCount} occurrence(s)"]);
             }
 
             foreach (var change in nonCSharpChanges)
@@ -203,21 +200,26 @@ public static class RenameSymbolTool
                     : change.FilePath;
                 int changeCount = RenameHelper.CountOccurrences(change.NewText, newName) - RenameHelper.CountOccurrences(change.OldText, newName);
                 string ext = Path.GetExtension(change.FilePath).TrimStart('.').ToUpperInvariant();
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(displayPath)} | {ext} | {changeCount} occurrence(s) |");
+                rows.Add([fmt.Escape(displayPath), ext, $"{changeCount} occurrence(s)"]);
             }
+
+            fmt.AppendTable(sb, "Changed Files", columns, rows);
 
             if (fileRenames.Count > 0)
             {
-                sb.AppendLine();
-                sb.AppendLine("## Renamed Files");
-                sb.AppendLine();
+                fmt.AppendHeader(sb, "Renamed Files", 2);
+                var renameColumns = new[] { "Old Path", "New Path" };
+                var renameRows = new List<string[]>();
                 foreach (var (oldPath, newPath) in fileRenames)
                 {
                     string oldDisplay = projectDir is not null ? Path.GetRelativePath(projectDir, oldPath) : oldPath;
                     string newDisplay = projectDir is not null ? Path.GetRelativePath(projectDir, newPath) : newPath;
-                    sb.AppendLine($"- {oldDisplay} → {newDisplay}");
+                    renameRows.Add([fmt.Escape(oldDisplay), fmt.Escape(newDisplay)]);
                 }
+                fmt.AppendTable(sb, "Renamed Files", renameColumns, renameRows);
             }
+
+            fmt.AppendHints(sb, "Use GetRoslynDiagnostics to verify no issues after rename");
 
             return sb.ToString();
         }

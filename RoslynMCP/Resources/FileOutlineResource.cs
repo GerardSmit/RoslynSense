@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using ModelContextProtocol.Server;
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 
 namespace RoslynMCP.Resources;
@@ -24,8 +25,9 @@ public static class FileOutlineResource
         "of a C# file. Same data as the GetFileOutline tool, available as attachable context.")]
     public static async Task<string> GetFileOutlineAsync(
         string filePath,
+        IOutputFormatter fmt,
         CancellationToken cancellationToken = default)
     {
-        return await GetFileOutlineTool.GetFileOutline(filePath, handlers: null, cancellationToken);
+        return await GetFileOutlineTool.GetFileOutline(filePath, fmt, handlers: null, cancellationToken: cancellationToken);
     }
 }

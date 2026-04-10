@@ -9,7 +9,7 @@ namespace RoslynMCP.Tools.Razor;
 /// Resolves symbols in Razor files by mapping marked positions to generated C#
 /// documents via the Razor source map.
 /// </summary>
-internal class RazorGoToDefinition : IGoToDefinitionHandler
+internal class RazorGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandler
 {
     public bool CanHandle(string filePath) => RazorSourceMappingService.IsRazorFile(filePath);
 
@@ -133,6 +133,6 @@ internal class RazorGoToDefinition : IGoToDefinitionHandler
         if (symbol is null)
             return $"No symbol found for '{markup.MarkedText}' in Razor file.";
 
-        return await GoToDefinitionTool.FormatDefinitionAsync(symbol, project, contextLines, cancellationToken);
+        return await GoToDefinitionTool.FormatDefinitionAsync(symbol, project, contextLines, fmt, cancellationToken);
     }
 }

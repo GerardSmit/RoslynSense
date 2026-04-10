@@ -207,7 +207,7 @@ public static class GetRoslynDiagnosticsTool
             int line = span.StartLinePosition.Line + 1;
             int col = span.StartLinePosition.Character + 1;
             string severity = FormatSeverity(d.Severity);
-            sb.AppendLine($"| {severity} | {d.Id} | {line}:{col} | {MarkdownHelper.EscapeTableCell(d.GetMessage())} |");
+            sb.AppendLine($"| {severity} | {d.Id} | {line}:{col} | {MarkdownFormatter.EscapeTableCell(d.GetMessage())} |");
         }
 
         if (diagnostics.Count > maxResults)
@@ -270,7 +270,7 @@ public static class GetRoslynDiagnosticsTool
                 : Path.GetFileName(span.Path);
 
             sb.AppendLine(
-                $"| {severity} | {d.Id} | {MarkdownHelper.EscapeTableCell(file)} | {line} | {MarkdownHelper.EscapeTableCell(d.GetMessage())} |");
+                $"| {severity} | {d.Id} | {MarkdownFormatter.EscapeTableCell(file)} | {line} | {MarkdownFormatter.EscapeTableCell(d.GetMessage())} |");
         }
 
         if (diagnostics.Count > maxResults)

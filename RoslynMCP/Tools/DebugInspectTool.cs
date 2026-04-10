@@ -20,6 +20,7 @@ public static class DebugInspectTool
         [Description("Expression to evaluate (e.g. 'myVar.Count', 'x + y', 'obj.ToString()'). " +
                      "Separate multiple expressions with semicolons for batch evaluation.")]
         string expression,
+        IOutputFormatter fmt,
         CancellationToken cancellationToken = default)
     {
         try
@@ -34,7 +35,14 @@ public static class DebugInspectTool
                 return "Error: No expressions provided.";
 
             if (parts.Length == 1)
-                return await session.EvaluateAsync(parts[0], cancellationToken);
+            {
+                var singleResult = await session.EvaluateAsync(parts[0], cancellationToken);
+                var sbSingle = new StringBuilder(singleResult);
+                fmt.AppendHints(sbSingle,
+                    "Use DebugContinue to resume execution",
+                    "Use DebugSetBreakpoint to add more breakpoints");
+                return sbSingle.ToString();
+            }
 
             // Batch mode: return table
             var sb = new StringBuilder();
@@ -52,8 +60,11 @@ public static class DebugInspectTool
                 {
                     value = $"Error: {ex.Message}";
                 }
-                sb.AppendLine($"| {MarkdownHelper.EscapeTableCell(expr)} | {MarkdownHelper.EscapeTableCell(value)} |");
+                sb.AppendLine($"| {fmt.Escape(expr)} | {fmt.Escape(value)} |");
             }
+            fmt.AppendHints(sb,
+                "Use DebugContinue to resume execution",
+                "Use DebugSetBreakpoint to add more breakpoints");
 
             return sb.ToString();
         }
@@ -71,6 +82,7 @@ public static class DebugInspectTool
         "and current pause position with code context. " +
         "The debugger must be paused at a breakpoint or after stepping.")]
     public static async Task<string> DebugStatus(
+        IOutputFormatter fmt,
         [Description("Include local variables in the output. Default: false.")]
         bool includeLocals = false,
         [Description("Include call stack in the output. Default: false.")]
@@ -115,6 +127,9 @@ public static class DebugInspectTool
                 sb.AppendLine($"Error getting stack trace: {ex.Message}");
             }
         }
+        fmt.AppendHints(sb,
+            "Use DebugContinue to resume execution",
+            "Use DebugSetBreakpoint to add more breakpoints");
 
         return sb.ToString();
     }

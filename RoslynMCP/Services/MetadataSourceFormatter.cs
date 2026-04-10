@@ -138,12 +138,13 @@ internal static class MetadataSourceFormatter
         out bool truncated)
     {
         var members = type.GetMembers()
-            .Where(member => ShouldDisplayMember(member) ||
+            .Where(member => (SymbolFormatter.ShouldDisplayMember(member) &&
+                              member.DeclaredAccessibility != Accessibility.Private) ||
                              (focusedMember is not null &&
                               SymbolEqualityComparer.Default.Equals(member, focusedMember)))
             .OrderByDescending(member => focusedMember is not null &&
                                          SymbolEqualityComparer.Default.Equals(member, focusedMember))
-            .ThenBy(MemberSortOrder)
+            .ThenBy(SymbolFormatter.MemberSortOrder)
             .ThenBy(member => member.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -160,42 +161,6 @@ internal static class MetadataSourceFormatter
 
         return selected;
     }
-
-    private static bool ShouldDisplayMember(ISymbol member)
-    {
-        if (member.IsImplicitlyDeclared)
-            return false;
-
-        if (member.DeclaredAccessibility == Accessibility.Private)
-            return false;
-
-        if (member is INamedTypeSymbol)
-            return false;
-
-        if (member is IFieldSymbol { AssociatedSymbol: not null })
-            return false;
-
-        if (member is IMethodSymbol method)
-        {
-            if (method.AssociatedSymbol is not null)
-                return false;
-
-            if (method.MethodKind is MethodKind.StaticConstructor or MethodKind.Destructor)
-                return false;
-        }
-
-        return member is IMethodSymbol or IPropertySymbol or IFieldSymbol or IEventSymbol;
-    }
-
-    private static int MemberSortOrder(ISymbol member) => member switch
-    {
-        IMethodSymbol { MethodKind: MethodKind.Constructor } => 0,
-        IFieldSymbol => 1,
-        IPropertySymbol => 2,
-        IEventSymbol => 3,
-        IMethodSymbol => 4,
-        _ => 5
-    };
 
     private static string BuildTypeDeclaration(INamedTypeSymbol type)
     {

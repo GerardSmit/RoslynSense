@@ -27,11 +27,11 @@ public static class FindUsagesTool
             "Code snippet with [| |] markers around the target symbol, " +
             "e.g. 'var x = [|Foo|].Bar();'.")]
         string markupSnippet,
+        IOutputFormatter fmt,
         [Description("Maximum number of references to return. Default: 100.")]
         int maxResults = 100,
         [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
         int? hintLine = null,
-        TableFormatter? fmt = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -140,10 +140,9 @@ public static class FindUsagesTool
         AspxProjectIndex aspxIndex,
         List<(string ProjectName, List<ReferenceLocation> Locations)> crossProjectRefs,
         int maxResults,
-        TableFormatter? fmt,
+        IOutputFormatter fmt,
         CancellationToken cancellationToken)
     {
-        fmt ??= new TableFormatter();
         var refList = references.ToList();
         var results = new StringBuilder();
 
@@ -292,7 +291,7 @@ public static class FindUsagesTool
         return RazorSourceMappingService.MapGeneratedToRazor(sourceMap, docPath, generatedLine);
     }
 
-    private static void AppendSymbolDetails(StringBuilder results, ISymbol symbol, TableFormatter fmt)
+    private static void AppendSymbolDetails(StringBuilder results, ISymbol symbol, IOutputFormatter fmt)
     {
         fmt.AppendHeader(results, "Symbol Details", level: 2);
         fmt.AppendField(results, "Name", symbol.Name);
@@ -344,7 +343,7 @@ public static class FindUsagesTool
         StringBuilder results, ReferenceLocation location, int referenceCount,
         bool includeCodeContext,
         RazorMappedLocation? razorMapping,
-        TableFormatter fmt,
+        IOutputFormatter fmt,
         CancellationToken cancellationToken)
     {
         var linePosition = location.Location.GetLineSpan();

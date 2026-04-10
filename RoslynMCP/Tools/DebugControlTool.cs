@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
 
@@ -15,6 +16,7 @@ public static class DebugControlTool
         "Runs until the next breakpoint is hit or the program exits. " +
         "Returns the current pause location with code context.")]
     public static async Task<string> DebugContinue(
+        IOutputFormatter fmt,
         [Description("Action to perform: 'continue' (default), 'step_in', 'step_over', or 'step_out'.")]
         string action = "continue",
         CancellationToken cancellationToken = default)
@@ -25,14 +27,22 @@ public static class DebugControlTool
             if (session is null)
                 return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
 
-            return action.ToLowerInvariant() switch
+            var result = action.ToLowerInvariant() switch
             {
                 "continue" => await session.ContinueAsync(cancellationToken),
                 "step_in" => await session.StepInAsync(cancellationToken),
                 "step_over" => await session.StepOverAsync(cancellationToken),
                 "step_out" => await session.StepOutAsync(cancellationToken),
-                _ => $"Error: Unknown action '{action}'. Use: continue, step_in, step_over, step_out."
+                _ => (string?)null
             };
+
+            if (result is null)
+                return $"Error: Unknown action '{action}'. Use: continue, step_in, step_over, step_out.";
+            var sb = new StringBuilder(result);
+            fmt.AppendHints(sb,
+                "Use DebugEvaluate to inspect variables",
+                "Use DebugStatus to see current position");
+            return sb.ToString();
         }
         catch (Exception ex)
         {
@@ -69,6 +79,7 @@ public static class DebugControlTool
     public static async Task<string> DebugRunUntil(
         [Description("Path to the source file.")] string filePath,
         [Description("Line number to run until.")] int line,
+        IOutputFormatter fmt,
         [Description("Optional condition expression. Only stop when this evaluates to true (e.g. 'i == 42').")]
         string? condition = null,
         CancellationToken cancellationToken = default)
@@ -98,13 +109,22 @@ public static class DebugControlTool
                 // Auto-remove the temporary breakpoint
                 try { await session.RemoveBreakpointAsync(bpId.Value, cancellationToken); }
                 catch { /* Best-effort removal */ }
-
-                return continueResult;
+                var sbHit = new StringBuilder(continueResult);
+                fmt.AppendHints(sbHit,
+                    "Use DebugEvaluate to inspect variables",
+                    "Use DebugStatus to see current position");
+                return sbHit.ToString();
             }
 
             // A different breakpoint was hit — keep the temp breakpoint active
-            return continueResult + $"\n\n_Note: Stopped at a different breakpoint. " +
-                   $"Temporary breakpoint #{bpId.Value} at {Path.GetFileName(filePath)}:{line} is still active._";
+            {
+                var sbOther = new StringBuilder(continueResult + $"\n\n_Note: Stopped at a different breakpoint. " +
+                    $"Temporary breakpoint #{bpId.Value} at {Path.GetFileName(filePath)}:{line} is still active._");
+                fmt.AppendHints(sbOther,
+                    "Use DebugEvaluate to inspect variables",
+                    "Use DebugStatus to see current position");
+                return sbOther.ToString();
+            }
         }
         catch (Exception ex)
         {

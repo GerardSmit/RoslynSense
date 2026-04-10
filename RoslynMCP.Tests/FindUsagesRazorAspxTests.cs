@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 using Xunit;
 
@@ -11,7 +12,8 @@ public class FindUsagesRazorAspxTests
         // AppHelper.FormatTitle is used in Counter.razor and Weather.razor
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.BlazorAppHelperFile,
-            markupSnippet: "public static string [|FormatTitle|](string title)");
+            markupSnippet: "public static string [|FormatTitle|](string title)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("FormatTitle", result);
@@ -27,7 +29,8 @@ public class FindUsagesRazorAspxTests
         // AppHelper.DoubleValue is used in Counter.razor @code block
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.BlazorAppHelperFile,
-            markupSnippet: "public static int [|DoubleValue|](int value)");
+            markupSnippet: "public static int [|DoubleValue|](int value)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("DoubleValue", result);
@@ -40,7 +43,8 @@ public class FindUsagesRazorAspxTests
         // SampleProject has no ASPX files — ASPX References section should not appear
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "public int [|Add|](int a, int b)");
+            markupSnippet: "public int [|Add|](int a, int b)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("Add", result);
@@ -52,7 +56,8 @@ public class FindUsagesRazorAspxTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.BlazorAppHelperFile,
-            markupSnippet: "public static string [|FormatTitle|](string title)");
+            markupSnippet: "public static string [|FormatTitle|](string title)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Summary", result);
         Assert.Contains("C# reference", result);
@@ -64,7 +69,8 @@ public class FindUsagesRazorAspxTests
         // PageHelper.IsPostBack is a property name — "IsPostBack" appears in ASPX code blocks
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.AspxPageHelperFile,
-            markupSnippet: "public static bool [|IsPostBack|] { get; set; }");
+            markupSnippet: "public static bool [|IsPostBack|] { get; set; }",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
 
@@ -78,7 +84,8 @@ public class FindUsagesRazorAspxTests
         // "DateTime" appears in Default.aspx expression and PageHelper.cs
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.AspxPageHelperFile,
-            markupSnippet: "public static string FormatDate([|DateTime|] date)");
+            markupSnippet: "public static string FormatDate([|DateTime|] date)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         // DateTime is in ASPX expressions
@@ -92,7 +99,8 @@ public class FindUsagesRazorAspxTests
         // FormatTitle is used in both Counter.razor and Weather.razor — check mapping output
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.BlazorAppHelperFile,
-            markupSnippet: "public static string [|FormatTitle|](string title)");
+            markupSnippet: "public static string [|FormatTitle|](string title)",
+            fmt: new MarkdownFormatter());
 
         // References in generated .razor.g.cs files should be mapped back
         // If mapping works, we should see "Razor source:" annotations

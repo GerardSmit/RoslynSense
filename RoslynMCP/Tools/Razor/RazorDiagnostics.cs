@@ -69,7 +69,7 @@ internal class RazorDiagnostics : IDiagnosticsHandler
                 var d = mapped.Diagnostic;
                 string severity = GetRoslynDiagnosticsTool.FormatSeverity(d.Severity);
                 sb.AppendLine(
-                    $"| {severity} | {d.Id} | {mapped.MappedLocation!.Line} | {MarkdownHelper.EscapeTableCell(d.GetMessage())} |");
+                    $"| {severity} | {d.Id} | {mapped.MappedLocation!.Line} | {MarkdownFormatter.EscapeTableCell(d.GetMessage())} |");
             }
         }
 

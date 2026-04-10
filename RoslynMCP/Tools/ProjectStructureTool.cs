@@ -20,6 +20,7 @@ public static class ProjectStructureTool
         "Useful for understanding the project layout before navigating code.")]
     public static async Task<string> GetProjectStructure(
         [Description("Path to the .csproj file or any file in the project.")] string projectOrFilePath,
+        IOutputFormatter fmt,
         [Description("Include system assemblies (System.*, Microsoft.*) in the assembly references list. Default: false.")]
         bool includeSystemAssemblies = false,
         CancellationToken cancellationToken = default)
@@ -49,7 +50,7 @@ public static class ProjectStructureTool
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
                 projectPath, cancellationToken: cancellationToken);
 
-            return await FormatProjectStructureAsync(project, projectPath, includeSystemAssemblies, cancellationToken);
+            return await FormatProjectStructureAsync(project, projectPath, includeSystemAssemblies, fmt, cancellationToken);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -63,6 +64,7 @@ public static class ProjectStructureTool
         Project project,
         string projectPath,
         bool includeSystemAssemblies,
+        IOutputFormatter fmt,
         CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
@@ -190,6 +192,9 @@ public static class ProjectStructureTool
                 sb.AppendLine("_(only system assemblies)_");
             }
         }
+        fmt.AppendHints(sb,
+            "Use GetFileOutline to see detailed structure of a file",
+            "Use FindSymbol to search for specific types or members");
 
         return sb.ToString();
     }

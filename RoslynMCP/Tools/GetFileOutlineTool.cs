@@ -28,6 +28,7 @@ public static class GetFileOutlineTool
         "Supports multiple files separated by semicolons.")]
     public static async Task<string> GetFileOutline(
         [Description("Path to the C# or ASPX file. Separate multiple paths with semicolons.")] string filePath,
+        IOutputFormatter fmt,
         IEnumerable<IOutlineHandler>? handlers = null,
         CancellationToken cancellationToken = default)
     {
@@ -39,7 +40,14 @@ public static class GetFileOutlineTool
             var paths = filePath.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
             if (paths.Length == 1)
-                return await GetSingleFileOutline(paths[0], handlers, cancellationToken);
+            {
+                var singleResult = await GetSingleFileOutline(paths[0], handlers, cancellationToken);
+                var sbSingle = new StringBuilder(singleResult);
+                fmt.AppendHints(sbSingle,
+                    "Use GoToDefinition to navigate to a specific member",
+                    "Use FindUsages to find references to a symbol");
+                return sbSingle.ToString();
+            }
 
             // Multi-file mode: concatenate outlines
             var sb = new StringBuilder();
@@ -50,6 +58,10 @@ public static class GetFileOutlineTool
 
                 sb.Append(await GetSingleFileOutline(path, handlers, cancellationToken));
             }
+            fmt.AppendHints(sb,
+                "Use GoToDefinition to navigate to a specific member",
+                "Use FindUsages to find references to a symbol");
+
             return sb.ToString();
         }
         catch (OperationCanceledException)

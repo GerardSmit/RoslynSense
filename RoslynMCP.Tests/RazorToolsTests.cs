@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 using Xunit;
 
@@ -18,6 +19,7 @@ public class RazorToolsTests
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CounterRazorFile,
             markupSnippet: "@AppHelper.[|FormatTitle|](\"Counter\")",
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.GoToDefinition);
 
         Assert.Contains("FormatTitle", result);
@@ -33,6 +35,7 @@ public class RazorToolsTests
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CounterRazorFile,
             markupSnippet: "currentCount = AppHelper.[|DoubleValue|](currentCount + 1)",
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.GoToDefinition);
 
         Assert.Contains("DoubleValue", result);
@@ -47,6 +50,7 @@ public class RazorToolsTests
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CounterRazorFile,
             markupSnippet: "Current count: @[|currentCount|]",
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.GoToDefinition);
 
         Assert.Contains("currentCount", result);
@@ -60,6 +64,7 @@ public class RazorToolsTests
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.WeatherRazorFile,
             markupSnippet: "@AppHelper.[|FormatTitle|](\"Weather\")",
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.GoToDefinition);
 
         Assert.Contains("FormatTitle", result);
@@ -73,6 +78,7 @@ public class RazorToolsTests
     {
         var result = await GetFileOutlineTool.GetFileOutline(
             filePath: FixturePaths.CounterRazorFile,
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.Outline);
 
         Assert.Contains("Razor File: Counter.razor", result);
@@ -87,6 +93,7 @@ public class RazorToolsTests
     {
         var result = await GetFileOutlineTool.GetFileOutline(
             filePath: FixturePaths.WeatherRazorFile,
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.Outline);
 
         Assert.Contains("Razor File: Weather.razor", result);
@@ -103,6 +110,7 @@ public class RazorToolsTests
     {
         var result = await GetFileOutlineTool.GetFileOutline(
             filePath: FixturePaths.CounterRazorFile,
+            fmt: new MarkdownFormatter(),
             handlers: TestHandlers.Outline);
 
         Assert.Contains("Inline Expressions", result);

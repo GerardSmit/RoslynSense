@@ -24,6 +24,10 @@ class Program
         });
         builder.Services.AddHostedService<InfrastructureCleanupHostedService>();
 
+        // Register output formatter (markdown default, TOON via --toon)
+        bool useToon = args.Contains("--toon", StringComparer.OrdinalIgnoreCase);
+        builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
+
         // Register non-C# file type handlers conditionally
         if (!noWebForms)
         {

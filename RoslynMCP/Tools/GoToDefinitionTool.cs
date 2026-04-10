@@ -28,6 +28,7 @@ public static class GoToDefinitionTool
             "Code snippet with [| |] markers around the target symbol, " +
             "e.g. 'var x = [|Foo|].Bar();'.")]
         string markupSnippet,
+        IOutputFormatter fmt,
         [Description("Number of lines of context to show around the definition. Default: 5.")]
         int contextLines = 5,
         [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
@@ -57,7 +58,7 @@ public static class GoToDefinitionTool
             if (!ctx.IsResolved)
                 return ToolHelper.FormatResolutionError(ctx.Resolution);
 
-            return await FormatDefinitionAsync(ctx.Symbol!, ctx.Project, contextLines, cancellationToken);
+            return await FormatDefinitionAsync(ctx.Symbol!, ctx.Project, contextLines, fmt, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -71,7 +72,7 @@ public static class GoToDefinitionTool
     }
 
     internal static async Task<string> FormatDefinitionAsync(
-        ISymbol symbol, Project project, int contextLines, CancellationToken cancellationToken)
+        ISymbol symbol, Project project, int contextLines, IOutputFormatter fmt, CancellationToken cancellationToken = default)
     {
         // For constructors, use the containing type name as the display header
         string displayName = symbol is IMethodSymbol { MethodKind: Microsoft.CodeAnalysis.MethodKind.Constructor }
@@ -98,9 +99,11 @@ public static class GoToDefinitionTool
 
         var sourceLocations = symbol.Locations.Where(l => l.IsInSource).ToList();
         var metadataLocations = symbol.Locations.Where(l => l.IsInMetadata).ToList();
+        bool isNamedType = symbol is INamedTypeSymbol;
 
         if (sourceLocations.Count > 0)
         {
+            // For named types, skip the code context — the members table is more useful
             await AppendLocationsAsync(
                 sb,
                 sourceLocations,
@@ -108,6 +111,7 @@ public static class GoToDefinitionTool
                 "Source Location",
                 provenance: null,
                 assemblyPath: null,
+                includeCodeContext: !isNamedType,
                 contextLines,
                 cancellationToken);
         }
@@ -130,6 +134,7 @@ public static class GoToDefinitionTool
                         "Decompiled Source",
                         provenance: "auto-decompiled",
                         assemblyPath: decompiled.AssemblyPath,
+                        includeCodeContext: true,
                         contextLines,
                         cancellationToken);
                 }
@@ -148,6 +153,15 @@ public static class GoToDefinitionTool
             sb.AppendLine("No definition location available.");
         }
 
+        // For source-defined named types, append a compact member outline.
+        // Metadata types already show members via MetadataSourceFormatter or decompiled source.
+        if (isNamedType && sourceLocations.Count > 0)
+            AppendMemberOutline(sb, (INamedTypeSymbol)symbol, fmt);
+
+        fmt.AppendHints(sb,
+            "Use FindUsages to find all references to this symbol",
+            "Use GetCallHierarchy to see callers and callees");
+
         return sb.ToString();
     }
 
@@ -158,6 +172,7 @@ public static class GoToDefinitionTool
         string sectionTitle,
         string? provenance,
         string? assemblyPath,
+        bool includeCodeContext,
         int contextLines,
         CancellationToken cancellationToken)
     {
@@ -184,7 +199,8 @@ public static class GoToDefinitionTool
             sb.AppendLine($"**Line**: {line}");
             sb.AppendLine();
 
-            await AppendCodeContextAsync(sb, location, solution, contextLines, cancellationToken);
+            if (includeCodeContext)
+                await AppendCodeContextAsync(sb, location, solution, contextLines, cancellationToken);
         }
     }
 
@@ -218,5 +234,57 @@ public static class GoToDefinitionTool
         }
         sb.AppendLine("```");
         sb.AppendLine();
+    }
+
+    private const int MaxMembers = 30;
+
+    private static void AppendMemberOutline(StringBuilder sb, INamedTypeSymbol type, IOutputFormatter fmt)
+    {
+        var members = type.GetMembers()
+            .Where(SymbolFormatter.ShouldDisplayMember)
+            .OrderBy(SymbolFormatter.MemberSortOrder)
+            .ThenBy(m => m.Locations.FirstOrDefault()?.GetLineSpan().StartLinePosition.Line ?? int.MaxValue)
+            .ToList();
+
+        if (members.Count == 0)
+            return;
+
+        sb.AppendLine();
+        sb.AppendLine("## Members");
+        sb.AppendLine();
+
+        bool truncated = members.Count > MaxMembers;
+        var displayed = truncated ? members.Take(MaxMembers).ToList() : members;
+
+        var columns = new[] { "Kind", "Signature", "Line" };
+        var rows = new List<string[]>();
+
+        foreach (var member in displayed)
+        {
+            string kind = member switch
+            {
+                IMethodSymbol { MethodKind: MethodKind.Constructor } => "ctor",
+                IMethodSymbol => "method",
+                IPropertySymbol => "property",
+                IFieldSymbol { IsConst: true } => "const",
+                IFieldSymbol => "field",
+                IEventSymbol => "event",
+                _ => member.Kind.ToString().ToLowerInvariant()
+            };
+
+            string signature = member.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+
+            var loc = member.Locations.FirstOrDefault(l => l.IsInSource);
+            string line = loc is not null
+                ? (loc.GetLineSpan().StartLinePosition.Line + 1).ToString()
+                : "-";
+
+            rows.Add([kind, signature, line]);
+        }
+
+        fmt.AppendTable(sb, "Members", columns, rows, members.Count);
+
+        if (truncated)
+            fmt.AppendTruncation(sb, MaxMembers, members.Count);
     }
 }

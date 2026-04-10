@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -8,7 +9,7 @@ public class TypeHierarchyToolTests
     public async Task WhenEmptyFilePathThenReturnsError()
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
-            "", "class [|Foo|]");
+            "", "class [|Foo|]", new MarkdownFormatter());
         Assert.StartsWith("Error: File path cannot be empty", result);
     }
 
@@ -16,7 +17,7 @@ public class TypeHierarchyToolTests
     public async Task WhenEmptyMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
-            FixturePaths.ServicesFile, "");
+            FixturePaths.ServicesFile, "", new MarkdownFormatter());
         Assert.StartsWith("Error: markupSnippet cannot be empty", result);
     }
 
@@ -24,7 +25,7 @@ public class TypeHierarchyToolTests
     public async Task WhenFileNotFoundThenReturnsError()
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
-            @"C:\nonexistent\file.cs", "class [|Foo|]");
+            @"C:\nonexistent\file.cs", "class [|Foo|]", new MarkdownFormatter());
         Assert.Contains("does not exist", result);
     }
 
@@ -32,7 +33,7 @@ public class TypeHierarchyToolTests
     public async Task WhenInvalidMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
-            FixturePaths.ServicesFile, "no markers here");
+            FixturePaths.ServicesFile, "no markers here", new MarkdownFormatter());
         Assert.Contains("Invalid markup", result);
     }
 
@@ -41,7 +42,8 @@ public class TypeHierarchyToolTests
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
             FixturePaths.ServicesFile,
-            "public class [|StatisticsCalculator|] : IStringFormatter");
+            "public class [|StatisticsCalculator|] : IStringFormatter",
+            new MarkdownFormatter());
 
         Assert.Contains("Type Hierarchy", result);
         Assert.Contains("StatisticsCalculator", result);
@@ -56,7 +58,8 @@ public class TypeHierarchyToolTests
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
             FixturePaths.ServicesFile,
-            "public interface [|IStringFormatter|]");
+            "public interface [|IStringFormatter|]",
+            new MarkdownFormatter());
 
         Assert.Contains("Type Hierarchy", result);
         Assert.Contains("IStringFormatter", result);
@@ -69,7 +72,8 @@ public class TypeHierarchyToolTests
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
             FixturePaths.ServicesFile,
-            "public enum [|ProcessingStatus|]");
+            "public enum [|ProcessingStatus|]",
+            new MarkdownFormatter());
 
         Assert.Contains("Type Hierarchy", result);
         Assert.Contains("ProcessingStatus", result);
@@ -80,7 +84,8 @@ public class TypeHierarchyToolTests
     {
         var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
             FixturePaths.ServicesFile,
-            "public void [|AddResult|](Result result)");
+            "public void [|AddResult|](Result result)",
+            new MarkdownFormatter());
 
         // AddResult is a method, not a type
         Assert.Contains("not a type", result, StringComparison.OrdinalIgnoreCase);

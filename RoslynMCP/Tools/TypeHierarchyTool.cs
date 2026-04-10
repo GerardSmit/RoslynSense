@@ -24,6 +24,7 @@ public static class TypeHierarchyTool
             "Code snippet with [| |] markers around the type, " +
             "e.g. 'class [|MyService|] : IService'.")]
         string markupSnippet,
+        IOutputFormatter fmt,
         [Description("Approximate line number near the target snippet. Used to pick the closest match when the snippet appears multiple times.")]
         int? hintLine = null,
         CancellationToken cancellationToken = default)
@@ -41,7 +42,7 @@ public static class TypeHierarchyTool
             if (ctx.Symbol is not INamedTypeSymbol typeSymbol)
                 return $"'{ctx.Symbol!.Name}' is not a type. This tool works with classes, interfaces, structs, and enums.";
 
-            return await FormatHierarchyAsync(typeSymbol, ctx.Workspace.CurrentSolution, ctx.Project, cancellationToken);
+            return await FormatHierarchyAsync(typeSymbol, ctx.Workspace.CurrentSolution, ctx.Project, fmt, cancellationToken);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -55,6 +56,7 @@ public static class TypeHierarchyTool
         INamedTypeSymbol typeSymbol,
         Solution solution,
         Project project,
+        IOutputFormatter fmt,
         CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
@@ -153,6 +155,9 @@ public static class TypeHierarchyTool
                 }
             }
         }
+        fmt.AppendHints(sb,
+            "Use FindImplementations to see method implementations in derived types",
+            "Use GoToDefinition to navigate to a type");
 
         return sb.ToString();
     }

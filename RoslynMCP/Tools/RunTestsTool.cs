@@ -18,6 +18,7 @@ public static class RunTestsTool
     public static async Task<string> RunTests(
         [Description("Path to the test project (.csproj) or a source file in the test project.")]
         string projectPath,
+        IOutputFormatter fmt,
         [Description("Optional test filter expression (e.g. 'ClassName.MethodName', " +
                      "'FullyQualifiedName~MyTest', 'Category=Unit'). " +
                      "If empty, all tests in the project are run.")]
@@ -115,11 +116,11 @@ public static class RunTestsTool
             {
                 try
                 {
-                    result = FormatTrxOutput(trxPath, process.ExitCode);
+                    result = FormatTrxOutput(trxPath, process.ExitCode, fmt);
                 }
                 catch
                 {
-                    result = FormatTestOutput(stdout.ToString(), stderr.ToString(), process.ExitCode);
+                    result = FormatTestOutput(stdout.ToString(), stderr.ToString(), process.ExitCode, fmt);
                 }
                 finally
                 {
@@ -128,7 +129,7 @@ public static class RunTestsTool
             }
             else
             {
-                result = FormatTestOutput(stdout.ToString(), stderr.ToString(), process.ExitCode);
+                result = FormatTestOutput(stdout.ToString(), stderr.ToString(), process.ExitCode, fmt);
             }
 
             return result;
@@ -142,20 +143,14 @@ public static class RunTestsTool
     internal static string? ResolveCsprojPath(string projectPath) =>
         PathHelper.ResolveCsprojPath(projectPath);
 
-    internal static string FormatTestOutput(string stdout, string stderr, int exitCode)
+    internal static string FormatTestOutput(string stdout, string stderr, int exitCode, IOutputFormatter fmt)
     {
         var sb = new StringBuilder();
 
         if (exitCode == 0)
-        {
-            sb.AppendLine("✅ **Tests Passed**");
-        }
+            fmt.AppendHeader(sb, "✅ Tests Passed");
         else
-        {
-            sb.AppendLine("❌ **Tests Failed**");
-        }
-
-        sb.AppendLine();
+            fmt.AppendHeader(sb, "❌ Tests Failed");
 
         var lines = stdout.Split('\n');
         var failedTests = new List<string>();
@@ -222,8 +217,8 @@ public static class RunTestsTool
 
         if (failedTests.Count > 0)
         {
-            sb.AppendLine();
-            sb.AppendLine("**Failed Tests:**");
+            fmt.AppendSeparator(sb);
+            fmt.AppendHeader(sb, "Failed Tests", 2);
             foreach (var failure in failedTests)
             {
                 sb.AppendLine("```");
@@ -239,7 +234,7 @@ public static class RunTestsTool
             var rawOutput = stdout.Trim();
             if (!string.IsNullOrEmpty(rawOutput))
             {
-                sb.AppendLine("**Output:**");
+                fmt.AppendHeader(sb, "Output", 2);
                 sb.AppendLine("```");
                 sb.AppendLine(rawOutput);
                 sb.AppendLine("```");
@@ -251,18 +246,23 @@ public static class RunTestsTool
             var filtered = FilterStderr(stderr);
             if (!string.IsNullOrWhiteSpace(filtered))
             {
-                sb.AppendLine();
-                sb.AppendLine("**Errors:**");
+                fmt.AppendSeparator(sb);
+                fmt.AppendHeader(sb, "Errors", 2);
                 sb.AppendLine("```");
                 sb.AppendLine(filtered.TrimEnd());
                 sb.AppendLine("```");
             }
         }
 
+        if (exitCode == 0)
+            fmt.AppendHints(sb, "Use GetCoverage to see code coverage");
+        else
+            fmt.AppendHints(sb, "Use GetRoslynDiagnostics to check for compilation errors");
+
         return sb.ToString();
     }
 
-    internal static string FormatTrxOutput(string trxPath, int exitCode)
+    internal static string FormatTrxOutput(string trxPath, int exitCode, IOutputFormatter fmt)
     {
         var sb = new StringBuilder();
         XNamespace ns = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
@@ -275,22 +275,21 @@ public static class RunTestsTool
         int total = results.Count;
 
         if (exitCode == 0)
-            sb.AppendLine("✅ **Tests Passed**");
+            fmt.AppendHeader(sb, "✅ Tests Passed");
         else
-            sb.AppendLine("❌ **Tests Failed**");
+            fmt.AppendHeader(sb, "❌ Tests Failed");
 
-        sb.AppendLine();
-        sb.AppendLine($"Total tests: {total}");
-        sb.AppendLine($"     Passed: {passed}");
-        if (failed > 0) sb.AppendLine($"     Failed: {failed}");
-        if (skipped > 0) sb.AppendLine($"    Skipped: {skipped}");
+        fmt.AppendField(sb, "Total tests", total);
+        fmt.AppendField(sb, "Passed", passed);
+        if (failed > 0) fmt.AppendField(sb, "Failed", failed);
+        if (skipped > 0) fmt.AppendField(sb, "Skipped", skipped);
 
         // Show failed tests with details
         var failedResults = results.Where(r => r.Attribute("outcome")?.Value == "Failed").ToList();
         if (failedResults.Count > 0)
         {
-            sb.AppendLine();
-            sb.AppendLine("**Failed Tests:**");
+            fmt.AppendSeparator(sb);
+            fmt.AppendHeader(sb, "Failed Tests", 2);
             foreach (var result in failedResults)
             {
                 var testName = result.Attribute("testName")?.Value ?? "Unknown";
@@ -300,9 +299,8 @@ public static class RunTestsTool
                 var message = errorInfo?.Element(ns + "Message")?.Value;
                 var stackTrace = errorInfo?.Element(ns + "StackTrace")?.Value;
 
-                sb.AppendLine();
-                sb.AppendLine($"### {MarkdownHelper.EscapeTableCell(testName)}");
-                if (duration is not null) sb.AppendLine($"Duration: {duration}");
+                fmt.AppendHeader(sb, fmt.Escape(testName), 3);
+                if (duration is not null) fmt.AppendField(sb, "Duration", duration);
                 if (!string.IsNullOrWhiteSpace(message))
                 {
                     sb.AppendLine("```");
@@ -320,6 +318,11 @@ public static class RunTestsTool
                 }
             }
         }
+
+        if (exitCode == 0)
+            fmt.AppendHints(sb, "Use GetCoverage to see code coverage");
+        else
+            fmt.AppendHints(sb, "Use GetRoslynDiagnostics to check for compilation errors");
 
         return sb.ToString();
     }

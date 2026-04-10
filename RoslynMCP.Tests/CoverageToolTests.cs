@@ -29,6 +29,7 @@ public class CoverageToolTests
     {
         // Clear any cached data by querying before running
         var result = await GetCoverageTool.GetCoverage(
+            new MarkdownFormatter(),
             filePath: "SomeFile.cs",
             methodName: "SomeMethod");
 
@@ -43,6 +44,7 @@ public class CoverageToolTests
         // If coverage data is cached from another test, this should return "not found"
         // If no coverage data, it should return the "run RunCoverage first" error
         var result = await GetCoverageTool.GetCoverage(
+            new MarkdownFormatter(),
             filePath: "",
             methodName: "CompletelyNonexistentMethodXYZ12345");
 
@@ -282,6 +284,7 @@ public class CoverageToolTests
 
         // Query via the tool
         var getCoverageResult = await GetCoverageTool.GetCoverage(
+            new MarkdownFormatter(),
             filePath: FixturePaths.DebugCalculatorFile);
 
         // Should return file coverage (not the "run RunCoverage first" error)
@@ -296,7 +299,7 @@ public class CoverageToolTests
         Assert.True(runResult.Success, $"Coverage failed: {runResult.Message}");
 
         // Query project-wide coverage (no filters)
-        var result = await GetCoverageTool.GetCoverage();
+        var result = await GetCoverageTool.GetCoverage(new MarkdownFormatter());
 
         Assert.Contains("Coverage:", result);
         Assert.Contains("Summary", result);

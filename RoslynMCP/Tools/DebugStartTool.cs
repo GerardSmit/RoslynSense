@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
 
@@ -17,6 +18,7 @@ public static class DebugStartTool
     public static async Task<string> DebugStartTest(
         [Description("Path to the test project (.csproj) or a source file in the test project.")]
         string projectPath,
+        IOutputFormatter fmt,
         [Description("Optional test filter expression (e.g. 'ClassName.MethodName', 'FullyQualifiedName~MyTest').")]
         string? filter = null,
         [Description("Optional initial breakpoints as 'file:line' pairs, semicolon-separated " +
@@ -36,7 +38,12 @@ public static class DebugStartTool
             DebugSessionManager.DisposeSession();
             var session = DebugSessionManager.CreateSession();
             var breakpoints = ParseBreakpoints(initialBreakpoints);
-            return await session.StartTestSessionAsync(csprojPath, filter, breakpoints, cancellationToken);
+            var result = await session.StartTestSessionAsync(csprojPath, filter, breakpoints, cancellationToken);
+            var sb = new StringBuilder(result);
+            fmt.AppendHints(sb,
+                "Use DebugSetBreakpoint to add breakpoints",
+                "Use DebugContinue to start execution");
+            return sb.ToString();
         }
         catch (Exception ex)
         {
@@ -53,6 +60,7 @@ public static class DebugStartTool
         "Omit the PID to list available .NET processes. " +
         "Requires netcoredbg to be installed and on PATH.")]
     public static async Task<string> DebugAttach(
+        IOutputFormatter fmt,
         [Description("Process ID to attach to. Omit to list available .NET processes.")]
         int pid = 0,
         [Description("Optional initial breakpoints as 'file:line' pairs, semicolon-separated.")]
@@ -67,7 +75,12 @@ public static class DebugStartTool
             DebugSessionManager.DisposeSession();
             var session = DebugSessionManager.CreateSession();
             var breakpoints = ParseBreakpoints(initialBreakpoints);
-            return await session.AttachToProcessAsync(pid, breakpoints, cancellationToken);
+            var result = await session.AttachToProcessAsync(pid, breakpoints, cancellationToken);
+            var sb = new StringBuilder(result);
+            fmt.AppendHints(sb,
+                "Use DebugSetBreakpoint to add breakpoints",
+                "Use DebugContinue to start execution");
+            return sb.ToString();
         }
         catch (Exception ex)
         {

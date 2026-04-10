@@ -96,8 +96,8 @@ public static class FindSymbolTool
             }
 
             sb.AppendLine(
-                $"| {index} | {MarkdownHelper.EscapeTableCell(symbol.ToDisplayString())} | " +
-                $"{symbol.Kind} | {MarkdownHelper.EscapeTableCell(file)} | {line} |");
+                $"| {index} | {MarkdownFormatter.EscapeTableCell(symbol.ToDisplayString())} | " +
+                $"{symbol.Kind} | {MarkdownFormatter.EscapeTableCell(file)} | {line} |");
             index++;
         }
 

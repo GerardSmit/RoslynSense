@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 using Xunit;
 
@@ -8,7 +9,7 @@ public class GoToDefinitionToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await GoToDefinitionTool.GoToDefinition(filePath: "", markupSnippet: "[|Add|]");
+        var result = await GoToDefinitionTool.GoToDefinition(filePath: "", markupSnippet: "[|Add|]", fmt: new MarkdownFormatter());
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -18,7 +19,7 @@ public class GoToDefinitionToolTests
     public async Task WhenEmptyMarkupProvidedThenReturnsError()
     {
         var result = await GoToDefinitionTool.GoToDefinition(
-            filePath: FixturePaths.CalculatorFile, markupSnippet: "");
+            filePath: FixturePaths.CalculatorFile, markupSnippet: "", fmt: new MarkdownFormatter());
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -28,7 +29,7 @@ public class GoToDefinitionToolTests
     public async Task WhenInvalidMarkupProvidedThenReturnsError()
     {
         var result = await GoToDefinitionTool.GoToDefinition(
-            filePath: FixturePaths.CalculatorFile, markupSnippet: "no markers here");
+            filePath: FixturePaths.CalculatorFile, markupSnippet: "no markers here", fmt: new MarkdownFormatter());
 
         Assert.Contains("Error", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -38,7 +39,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "return new Result([|Add|](a, b), Subtract(a, b));");
+            markupSnippet: "return new Result([|Add|](a, b), Subtract(a, b));",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: Add", result);
         Assert.Contains("Method", result);
@@ -50,7 +52,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "new [|Result|](");
+            markupSnippet: "new [|Result|](",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: Result", result);
         Assert.Contains("Result.cs", result);
@@ -61,7 +64,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "public int [|Add|](int a, int b)");
+            markupSnippet: "public int [|Add|](int a, int b)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Source Location", result);
         Assert.Contains("```csharp", result);
@@ -72,7 +76,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "void [|DoesNotExist|]()");
+            markupSnippet: "void [|DoesNotExist|]()",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("not found", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -82,7 +87,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.FrameworkReferencesFile,
-            markupSnippet: "Console.[|WriteLine|](value);");
+            markupSnippet: "Console.[|WriteLine|](value);",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Decompiled Source", result);
         Assert.Contains("auto-decompiled", result, StringComparison.OrdinalIgnoreCase);
@@ -96,7 +102,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.FrameworkReferencesFile,
-            markupSnippet: "new [|StringBuilder|]();");
+            markupSnippet: "new [|StringBuilder|]();",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Decompiled Source", result);
         Assert.Contains("StringBuilder", result);
@@ -109,7 +116,8 @@ public class GoToDefinitionToolTests
     {
         var externalDefinition = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.ExternalReferencesFile,
-            markupSnippet: "return math.[|AddTen|](value);");
+            markupSnippet: "return math.[|AddTen|](value);",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: AddTen", externalDefinition);
         Assert.Contains("Decompiled Source", externalDefinition);
@@ -119,7 +127,8 @@ public class GoToDefinitionToolTests
 
         var nestedDefinition = await GoToDefinitionTool.GoToDefinition(
             filePath: decompiledFilePath,
-            markupSnippet: "return [|ApplyOffset|](value, 10);");
+            markupSnippet: "return [|ApplyOffset|](value, 10);",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: ApplyOffset", nestedDefinition);
         Assert.Contains("Source Location", nestedDefinition);
@@ -132,7 +141,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "return [|new|] Result(Add(a, b), Subtract(a, b));");
+            markupSnippet: "return [|new|] Result(Add(a, b), Subtract(a, b));",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: Result", result);
     }
@@ -142,7 +152,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.FrameworkReferencesFile,
-            markupSnippet: "new [|StringBuilder|]();");
+            markupSnippet: "new [|StringBuilder|]();",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Namespace", result);
         Assert.Contains("System.Text", result);
@@ -153,7 +164,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.FrameworkReferencesFile,
-            markupSnippet: "builder.[|Append|](value);");
+            markupSnippet: "builder.[|Append|](value);",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Assembly", result, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("StringBuilder", result);
@@ -164,7 +176,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.OutlineShowcaseFile,
-            markupSnippet: "public string [|Name|] { get;");
+            markupSnippet: "public string [|Name|] { get;",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: Name", result);
         Assert.Contains("Property", result);
@@ -175,7 +188,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.OutlineShowcaseFile,
-            markupSnippet: "[|Changed|]?.Invoke(this");
+            markupSnippet: "[|Changed|]?.Invoke(this",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: Changed", result);
         Assert.Contains("Event", result);
@@ -186,7 +200,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.OutlineShowcaseFile,
-            markupSnippet: "public int [|this|][int index]");
+            markupSnippet: "public int [|this|][int index]",
+            fmt: new MarkdownFormatter());
 
         // Indexers show as "this[]" or "Item" depending on the symbol
         Assert.Contains("Definition:", result);
@@ -198,7 +213,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.ServicesFile,
-            markupSnippet: "string [|FormatDisplayValue|](int value);");
+            markupSnippet: "string [|FormatDisplayValue|](int value);",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Definition: FormatDisplayValue", result);
     }
@@ -220,7 +236,8 @@ public class GoToDefinitionToolTests
         // StatisticsCalculator.ComputeAverageSum has XML docs
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.ServicesFile,
-            markupSnippet: "public double [|ComputeAverageSum|]()");
+            markupSnippet: "public double [|ComputeAverageSum|]()",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Summary", result);
         Assert.Contains("average sum", result, StringComparison.OrdinalIgnoreCase);
@@ -232,7 +249,8 @@ public class GoToDefinitionToolTests
         // StatisticsCalculator.AddResult has XML docs with summary
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.ServicesFile,
-            markupSnippet: "public void [|AddResult|](Result result)");
+            markupSnippet: "public void [|AddResult|](Result result)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Summary", result);
         Assert.Contains("calculation result", result, StringComparison.OrdinalIgnoreCase);
@@ -243,7 +261,8 @@ public class GoToDefinitionToolTests
     {
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.ServicesFile,
-            markupSnippet: "public interface [|IStringFormatter|]");
+            markupSnippet: "public interface [|IStringFormatter|]",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Summary", result);
         Assert.Contains("formatting", result, StringComparison.OrdinalIgnoreCase);
@@ -256,9 +275,25 @@ public class GoToDefinitionToolTests
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
             markupSnippet: "[|Add|]",
+            fmt: new MarkdownFormatter(),
             hintLine: 5);
 
         Assert.Contains("Definition: Add", result);
         Assert.DoesNotContain("Ambiguous", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenClassTargetedThenShowsMembersTable()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            markupSnippet: "public class [|Calculator|]",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("## Members", result);
+        Assert.Contains("Add", result);
+        Assert.Contains("Subtract", result);
+        Assert.Contains("Compute", result);
+        Assert.Contains("method", result);
     }
 }

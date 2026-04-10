@@ -13,6 +13,7 @@ public static class GetCoverageTool
         "Filter by method, class, or file for detailed views. " +
         "Requires RunCoverage to have been called first.")]
     public static Task<string> GetCoverage(
+        IOutputFormatter fmt,
         [Description("Path to the source file to get coverage for. Leave empty for project overview.")]
         string? filePath = null,
         [Description("Optional method name to filter results (partial match).")]
@@ -33,23 +34,23 @@ public static class GetCoverageTool
             // If a specific method is requested
             if (!string.IsNullOrWhiteSpace(methodName))
             {
-                return Task.FromResult(FormatMethodCoverage(methodName, showUncoveredLines, cachedAt));
+                return Task.FromResult(FormatMethodCoverage(methodName, showUncoveredLines, cachedAt, fmt));
             }
 
             // If a specific class is requested
             if (!string.IsNullOrWhiteSpace(className))
             {
-                return Task.FromResult(FormatClassCoverage(className, showUncoveredLines, cachedAt));
+                return Task.FromResult(FormatClassCoverage(className, showUncoveredLines, cachedAt, fmt));
             }
 
             // File-level coverage
             if (!string.IsNullOrWhiteSpace(filePath))
             {
-                return Task.FromResult(FormatFileCoverage(filePath, showUncoveredLines, cachedAt));
+                return Task.FromResult(FormatFileCoverage(filePath, showUncoveredLines, cachedAt, fmt));
             }
 
             // Project-wide overview
-            return Task.FromResult(FormatProjectCoverage(data, projectPath, cachedAt));
+            return Task.FromResult(FormatProjectCoverage(data, projectPath, cachedAt, fmt));
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -58,7 +59,7 @@ public static class GetCoverageTool
         }
     }
 
-    private static string FormatMethodCoverage(string methodName, bool showUncoveredLines, DateTime cachedAt)
+    private static string FormatMethodCoverage(string methodName, bool showUncoveredLines, DateTime cachedAt, IOutputFormatter fmt)
     {
         var methods = CoverageService.FindMethodCoverage(methodName);
         if (methods.Count == 0)
@@ -66,18 +67,18 @@ public static class GetCoverageTool
                    "The method may not be covered by any test, or run `RunCoverage` to update data.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Method Coverage: {methodName}");
-        sb.AppendLine($"_Coverage data from {cachedAt:yyyy-MM-dd HH:mm:ss} UTC_");
-        sb.AppendLine();
+        fmt.AppendHeader(sb, $"Method Coverage: {methodName}");
+        fmt.AppendField(sb, "Coverage data from", $"{cachedAt:yyyy-MM-dd HH:mm:ss} UTC");
+        fmt.AppendSeparator(sb);
 
         foreach (var method in methods)
         {
-            sb.AppendLine($"## {method.FullName}");
-            sb.AppendLine($"**File**: {Path.GetFileName(method.FilePath)}");
-            sb.AppendLine($"**Line Coverage**: {method.LineCoverageRate:P1} ({method.CoveredLines}/{method.TotalLines})");
+            fmt.AppendHeader(sb, method.FullName, 2);
+            fmt.AppendField(sb, "File", Path.GetFileName(method.FilePath));
+            fmt.AppendField(sb, "Line Coverage", $"{method.LineCoverageRate:P1} ({method.CoveredLines}/{method.TotalLines})");
             if (method.TotalBranches > 0)
-                sb.AppendLine($"**Branch Coverage**: {method.BranchCoverageRate:P1} ({method.CoveredBranches}/{method.TotalBranches})");
-            sb.AppendLine();
+                fmt.AppendField(sb, "Branch Coverage", $"{method.BranchCoverageRate:P1} ({method.CoveredBranches}/{method.TotalBranches})");
+            fmt.AppendSeparator(sb);
 
             if (showUncoveredLines && method.Lines.Count > 0)
             {
@@ -87,7 +88,7 @@ public static class GetCoverageTool
                     .ToList();
                 if (partialBranches.Count > 0)
                 {
-                    sb.AppendLine("**Partial branches** (not all paths tested):");
+                    fmt.AppendField(sb, "Partial branches", "not all paths tested");
                     foreach (var line in partialBranches)
                     {
                         sb.AppendLine($"  - Line {line.LineNumber}: {line.ConditionCoverage}");
@@ -98,7 +99,7 @@ public static class GetCoverageTool
                 var uncovered = method.Lines.Where(l => l.Hits == 0).ToList();
                 if (uncovered.Count > 0)
                 {
-                    sb.AppendLine("**Uncovered lines:**");
+                    fmt.AppendField(sb, "Uncovered lines", uncovered.Count);
                     foreach (var line in uncovered)
                     {
                         sb.AppendLine($"  - Line {line.LineNumber}");
@@ -113,10 +114,14 @@ public static class GetCoverageTool
             }
         }
 
+        fmt.AppendHints(sb,
+            "Use FindTests to find tests covering specific code",
+            "Use RunCoverage to refresh coverage data");
+
         return sb.ToString();
     }
 
-    private static string FormatClassCoverage(string className, bool showUncoveredLines, DateTime cachedAt)
+    private static string FormatClassCoverage(string className, bool showUncoveredLines, DateTime cachedAt, IOutputFormatter fmt)
     {
         var classes = CoverageService.FindClassCoverage(className);
         if (classes.Count == 0)
@@ -124,22 +129,22 @@ public static class GetCoverageTool
                    "Run `RunCoverage` to update data.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Class Coverage: {className}");
-        sb.AppendLine($"_Coverage data from {cachedAt:yyyy-MM-dd HH:mm:ss} UTC_");
-        sb.AppendLine();
+        fmt.AppendHeader(sb, $"Class Coverage: {className}");
+        fmt.AppendField(sb, "Coverage data from", $"{cachedAt:yyyy-MM-dd HH:mm:ss} UTC");
+        fmt.AppendSeparator(sb);
 
         foreach (var cls in classes)
         {
-            sb.AppendLine($"## {cls.FullName}");
-            sb.AppendLine($"**File**: {Path.GetFileName(cls.FilePath)}");
-            sb.AppendLine($"**Line Coverage**: {cls.LineCoverageRate:P1}");
-            sb.AppendLine($"**Branch Coverage**: {cls.BranchCoverageRate:P1}");
-            sb.AppendLine();
+            fmt.AppendHeader(sb, cls.FullName, 2);
+            fmt.AppendField(sb, "File", Path.GetFileName(cls.FilePath));
+            fmt.AppendField(sb, "Line Coverage", $"{cls.LineCoverageRate:P1}");
+            fmt.AppendField(sb, "Branch Coverage", $"{cls.BranchCoverageRate:P1}");
+            fmt.AppendSeparator(sb);
 
             if (cls.Methods.Count > 0)
             {
-                sb.AppendLine("| Method | Lines | Branches |");
-                sb.AppendLine("|--------|-------|----------|");
+                var columns = new[] { "Method", "Lines", "Branches" };
+                var rows = new List<string[]>();
                 foreach (var method in cls.Methods)
                 {
                     string lineIcon = method.LineCoverageRate >= 1.0 ? "✅" :
@@ -147,9 +152,13 @@ public static class GetCoverageTool
                     string branchCol = method.TotalBranches > 0
                         ? $"{method.BranchCoverageRate:P0} ({method.CoveredBranches}/{method.TotalBranches})"
                         : "—";
-                    sb.AppendLine(
-                        $"| {lineIcon} {method.Name} | {method.LineCoverageRate:P0} ({method.CoveredLines}/{method.TotalLines}) | {branchCol} |");
+                    rows.Add([
+                        $"{lineIcon} {fmt.Escape(method.Name)}",
+                        $"{method.LineCoverageRate:P0} ({method.CoveredLines}/{method.TotalLines})",
+                        branchCol
+                    ]);
                 }
+                fmt.AppendTable(sb, "methods", columns, rows);
                 sb.AppendLine();
             }
 
@@ -158,7 +167,7 @@ public static class GetCoverageTool
                 var uncovered = cls.Lines.Where(l => l.Hits == 0).ToList();
                 if (uncovered.Count > 0)
                 {
-                    sb.AppendLine($"**Uncovered lines** ({uncovered.Count}):");
+                    fmt.AppendField(sb, "Uncovered lines", uncovered.Count);
                     foreach (var line in uncovered.Take(20))
                     {
                         sb.AppendLine($"  - Line {line.LineNumber}");
@@ -170,10 +179,14 @@ public static class GetCoverageTool
             }
         }
 
+        fmt.AppendHints(sb,
+            "Use FindTests to find tests covering specific code",
+            "Use RunCoverage to refresh coverage data");
+
         return sb.ToString();
     }
 
-    private static string FormatFileCoverage(string filePath, bool showUncoveredLines, DateTime cachedAt)
+    private static string FormatFileCoverage(string filePath, bool showUncoveredLines, DateTime cachedAt, IOutputFormatter fmt)
     {
         string normalized = PathHelper.NormalizePath(filePath);
         var fileCov = CoverageService.GetFileCoverage(normalized);
@@ -182,9 +195,9 @@ public static class GetCoverageTool
                    "The file may not be covered by any test, or run `RunCoverage` to update data.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# File Coverage: {Path.GetFileName(filePath)}");
-        sb.AppendLine($"_Coverage data from {cachedAt:yyyy-MM-dd HH:mm:ss} UTC_");
-        sb.AppendLine();
+        fmt.AppendHeader(sb, $"File Coverage: {Path.GetFileName(filePath)}");
+        fmt.AppendField(sb, "Coverage data from", $"{cachedAt:yyyy-MM-dd HH:mm:ss} UTC");
+        fmt.AppendSeparator(sb);
 
         int totalLines = fileCov.Lines.Count;
         int coveredLines = fileCov.Lines.Count(kv => kv.Value.Hits > 0);
@@ -192,21 +205,21 @@ public static class GetCoverageTool
         int totalBranches = fileCov.Methods.Sum(m => m.TotalBranches);
         int coveredBranches = fileCov.Methods.Sum(m => m.CoveredBranches);
 
-        sb.AppendLine($"**Line Coverage**: {rate:P1} ({coveredLines}/{totalLines})");
+        fmt.AppendField(sb, "Line Coverage", $"{rate:P1} ({coveredLines}/{totalLines})");
         if (totalBranches > 0)
         {
             double branchRate = (double)coveredBranches / totalBranches;
-            sb.AppendLine($"**Branch Coverage**: {branchRate:P1} ({coveredBranches}/{totalBranches})");
+            fmt.AppendField(sb, "Branch Coverage", $"{branchRate:P1} ({coveredBranches}/{totalBranches})");
         }
-        sb.AppendLine($"**Classes**: {fileCov.Classes.Count} | **Methods**: {fileCov.Methods.Count}");
-        sb.AppendLine();
+        fmt.AppendField(sb, "Classes", $"{fileCov.Classes.Count} | Methods: {fileCov.Methods.Count}");
+        fmt.AppendSeparator(sb);
 
         if (fileCov.Methods.Count > 0)
         {
-            sb.AppendLine("## Methods");
-            sb.AppendLine();
-            sb.AppendLine("| Method | Lines | Branches |");
-            sb.AppendLine("|--------|-------|----------|");
+            fmt.AppendHeader(sb, "Methods", 2);
+
+            var columns = new[] { "Method", "Lines", "Branches" };
+            var rows = new List<string[]>();
 
             foreach (var method in fileCov.Methods.OrderBy(m => m.LineCoverageRate))
             {
@@ -215,9 +228,13 @@ public static class GetCoverageTool
                 string branchCol = method.TotalBranches > 0
                     ? $"{method.BranchCoverageRate:P0} ({method.CoveredBranches}/{method.TotalBranches})"
                     : "—";
-                sb.AppendLine(
-                    $"| {icon} {method.Name} | {method.LineCoverageRate:P0} ({method.CoveredLines}/{method.TotalLines}) | {branchCol} |");
+                rows.Add([
+                    $"{icon} {fmt.Escape(method.Name)}",
+                    $"{method.LineCoverageRate:P0} ({method.CoveredLines}/{method.TotalLines})",
+                    branchCol
+                ]);
             }
+            fmt.AppendTable(sb, "methods", columns, rows);
             sb.AppendLine();
         }
 
@@ -230,8 +247,7 @@ public static class GetCoverageTool
                 .ToList();
             if (partialBranches.Count > 0)
             {
-                sb.AppendLine("## Partial Branches");
-                sb.AppendLine();
+                fmt.AppendHeader(sb, "Partial Branches", 2);
                 foreach (var line in partialBranches.Take(20))
                 {
                     sb.AppendLine($"  - Line {line.LineNumber}: {line.ConditionCoverage}");
@@ -248,8 +264,7 @@ public static class GetCoverageTool
 
             if (uncovered.Count > 0)
             {
-                sb.AppendLine($"## Uncovered Lines ({uncovered.Count})");
-                sb.AppendLine();
+                fmt.AppendHeader(sb, $"Uncovered Lines ({uncovered.Count})", 2);
 
                 // Group consecutive lines into ranges for readability
                 var ranges = GetLineRanges(uncovered.Select(kv => kv.Key).ToList());
@@ -265,6 +280,10 @@ public static class GetCoverageTool
                     sb.AppendLine($"  _... and more uncovered ranges_");
             }
         }
+
+        fmt.AppendHints(sb,
+            "Use FindTests to find tests covering specific code",
+            "Use RunCoverage to refresh coverage data");
 
         return sb.ToString();
     }
@@ -294,25 +313,24 @@ public static class GetCoverageTool
         return ranges;
     }
 
-    private static string FormatProjectCoverage(CoverageData data, string? projectPath, DateTime cachedAt)
+    private static string FormatProjectCoverage(CoverageData data, string? projectPath, DateTime cachedAt, IOutputFormatter fmt)
     {
         var sb = new StringBuilder();
         string projectName = projectPath is not null ? Path.GetFileNameWithoutExtension(projectPath) : "Project";
-        sb.AppendLine($"# Coverage: {projectName}");
-        sb.AppendLine($"_Coverage data from {cachedAt:yyyy-MM-dd HH:mm:ss} UTC_");
-        sb.AppendLine();
+        fmt.AppendHeader(sb, $"Coverage: {projectName}");
+        fmt.AppendField(sb, "Coverage data from", $"{cachedAt:yyyy-MM-dd HH:mm:ss} UTC");
+        fmt.AppendSeparator(sb);
 
         // Overall summary
-        sb.AppendLine("## Summary");
-        sb.AppendLine();
-        sb.AppendLine($"**Line Coverage**: {data.LineCoverageRate:P1} ({data.LinesCovered}/{data.LinesValid})");
-        sb.AppendLine($"**Branch Coverage**: {data.BranchCoverageRate:P1} ({data.BranchesCovered}/{data.BranchesValid})");
-        sb.AppendLine($"**Files**: {data.Files.Count}");
+        fmt.AppendHeader(sb, "Summary", 2);
+        fmt.AppendField(sb, "Line Coverage", $"{data.LineCoverageRate:P1} ({data.LinesCovered}/{data.LinesValid})");
+        fmt.AppendField(sb, "Branch Coverage", $"{data.BranchCoverageRate:P1} ({data.BranchesCovered}/{data.BranchesValid})");
+        fmt.AppendField(sb, "Files", data.Files.Count);
 
         int totalClasses = data.Files.Values.Sum(f => f.Classes.Count);
         int totalMethods = data.Files.Values.Sum(f => f.Methods.Count);
-        sb.AppendLine($"**Classes**: {totalClasses} | **Methods**: {totalMethods}");
-        sb.AppendLine();
+        fmt.AppendField(sb, "Classes", $"{totalClasses} | Methods: {totalMethods}");
+        fmt.AppendSeparator(sb);
 
         // Per-class coverage table, sorted by coverage (worst first)
         var allClasses = data.Files.Values
@@ -322,10 +340,10 @@ public static class GetCoverageTool
 
         if (allClasses.Count > 0)
         {
-            sb.AppendLine("## Coverage by Type");
-            sb.AppendLine();
-            sb.AppendLine("| Type | Lines | Branches | Methods |");
-            sb.AppendLine("|------|-------|----------|---------|");
+            fmt.AppendHeader(sb, "Coverage by Type", 2);
+
+            var columns = new[] { "Type", "Lines", "Branches", "Methods" };
+            var rows = new List<string[]>();
 
             foreach (var cls in allClasses)
             {
@@ -347,8 +365,14 @@ public static class GetCoverageTool
                 int coveredMethods = cls.Methods.Count(m => m.LineCoverageRate >= 1.0);
                 string methodCol = $"{coveredMethods}/{cls.Methods.Count}";
 
-                sb.AppendLine($"| {icon} {cls.FullName} | {lineCol} | {branchCol} | {methodCol} |");
+                rows.Add([
+                    $"{icon} {fmt.Escape(cls.FullName)}",
+                    lineCol,
+                    branchCol,
+                    methodCol
+                ]);
             }
+            fmt.AppendTable(sb, "types", columns, rows);
             sb.AppendLine();
         }
 
@@ -362,21 +386,30 @@ public static class GetCoverageTool
 
         if (lowCoverageMethods.Count > 0)
         {
-            sb.AppendLine("## Lowest Coverage Methods");
-            sb.AppendLine();
-            sb.AppendLine("| Method | Lines | Branches | File |");
-            sb.AppendLine("|--------|-------|----------|------|");
+            fmt.AppendHeader(sb, "Lowest Coverage Methods", 2);
+
+            var columns = new[] { "Method", "Lines", "Branches", "File" };
+            var rows = new List<string[]>();
 
             foreach (var method in lowCoverageMethods)
             {
                 string branchCol = method.TotalBranches > 0
                     ? $"{method.BranchCoverageRate:P0} ({method.CoveredBranches}/{method.TotalBranches})"
                     : "—";
-                sb.AppendLine(
-                    $"| ❌ {method.FullName} | {method.LineCoverageRate:P0} ({method.CoveredLines}/{method.TotalLines}) | {branchCol} | {Path.GetFileName(method.FilePath)} |");
+                rows.Add([
+                    $"❌ {fmt.Escape(method.FullName)}",
+                    $"{method.LineCoverageRate:P0} ({method.CoveredLines}/{method.TotalLines})",
+                    branchCol,
+                    Path.GetFileName(method.FilePath)
+                ]);
             }
+            fmt.AppendTable(sb, "low-coverage", columns, rows);
             sb.AppendLine();
         }
+
+        fmt.AppendHints(sb,
+            "Use FindTests to find tests covering specific code",
+            "Use RunCoverage to refresh coverage data");
 
         return sb.ToString();
     }

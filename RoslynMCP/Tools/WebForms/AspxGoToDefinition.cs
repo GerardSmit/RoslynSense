@@ -8,7 +8,7 @@ namespace RoslynMCP.Tools.WebForms;
 /// Resolves symbols in ASPX files by parsing the WebForms markup tree and matching
 /// the marked text to controls, properties, and events.
 /// </summary>
-internal class AspxGoToDefinition : IGoToDefinitionHandler
+internal class AspxGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandler
 {
     public bool CanHandle(string filePath) => AspxSourceMappingService.IsAspxFile(filePath);
 
@@ -48,6 +48,6 @@ internal class AspxGoToDefinition : IGoToDefinitionHandler
         if (symbol is null)
             return $"No symbol found for '{markup!.MarkedText}' in ASPX file.";
 
-        return await GoToDefinitionTool.FormatDefinitionAsync(symbol, project, contextLines, cancellationToken);
+        return await GoToDefinitionTool.FormatDefinitionAsync(symbol, project, contextLines, fmt, cancellationToken);
     }
 }

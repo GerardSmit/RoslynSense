@@ -118,7 +118,7 @@ public static class DiscoverTestsTool
                     var relPath = projectDir is not null
                         ? Path.GetRelativePath(projectDir, test.FilePath)
                         : test.FilePath;
-                    sb.AppendLine($"| {i++} | {MarkdownHelper.EscapeTableCell(test.MethodName)} | {relPath} | {test.Line} |");
+                    sb.AppendLine($"| {i++} | {MarkdownFormatter.EscapeTableCell(test.MethodName)} | {relPath} | {test.Line} |");
                 }
                 sb.AppendLine();
             }

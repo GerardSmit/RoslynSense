@@ -1,3 +1,4 @@
+using RoslynMCP.Services;
 using RoslynMCP.Tools;
 using Xunit;
 
@@ -8,7 +9,7 @@ public class FindUsagesToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await FindUsagesTool.FindUsages(filePath: "", markupSnippet: "[|Add|]");
+        var result = await FindUsagesTool.FindUsages(filePath: "", markupSnippet: "[|Add|]", fmt: new MarkdownFormatter());
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -19,7 +20,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: Path.Combine(FixturePaths.SampleProjectDir, "Ghost.cs"),
-            markupSnippet: "[|Add|]");
+            markupSnippet: "[|Add|]",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("does not exist", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -29,7 +31,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "");
+            markupSnippet: "",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -40,7 +43,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "public int [|Add|](int a, int b)");
+            markupSnippet: "public int [|Add|](int a, int b)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("Add", result);
@@ -51,7 +55,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "new [|Result|](");
+            markupSnippet: "new [|Result|](",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("Result", result);
@@ -62,7 +67,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "no markers here");
+            markupSnippet: "no markers here",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Error", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -72,7 +78,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "void [|DoesNotExist|]()");
+            markupSnippet: "void [|DoesNotExist|]()",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("not found", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -82,7 +89,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.FrameworkReferencesFile,
-            markupSnippet: "Console.[|WriteLine|](value);");
+            markupSnippet: "Console.[|WriteLine|](value);",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Console.WriteLine", result, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("FrameworkReferences.cs", result);
@@ -94,7 +102,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "public int [|Add|](int a, int b)");
+            markupSnippet: "public int [|Add|](int a, int b)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains($"{FixturePaths.CalculatorFile}:11:", result, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("- **Line**:", result, StringComparison.Ordinal);
@@ -106,7 +115,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.CalculatorFile,
-            markupSnippet: "public int [|Add|](int a, int b)");
+            markupSnippet: "public int [|Add|](int a, int b)",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains(FixturePaths.ManyUsagesFile, result, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(3, CountOccurrences(result, "```csharp"));
@@ -119,7 +129,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.OutlineShowcaseFile,
-            markupSnippet: "public string [|Name|] { get;");
+            markupSnippet: "public string [|Name|] { get;",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("Name", result);
@@ -131,7 +142,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.OutlineShowcaseFile,
-            markupSnippet: "public event EventHandler? [|Changed|];");
+            markupSnippet: "public event EventHandler? [|Changed|];",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("Changed", result);
@@ -143,7 +155,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.OutlineShowcaseFile,
-            markupSnippet: "private readonly List<int> [|_values|] = [];");
+            markupSnippet: "private readonly List<int> [|_values|] = [];",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("_values", result);
@@ -155,7 +168,8 @@ public class FindUsagesToolTests
     {
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.ServicesFile,
-            markupSnippet: "public interface [|IStringFormatter|]");
+            markupSnippet: "public interface [|IStringFormatter|]",
+            fmt: new MarkdownFormatter());
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("IStringFormatter", result);

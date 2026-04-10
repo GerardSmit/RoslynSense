@@ -603,7 +603,7 @@ public static class SemanticSymbolSearchTool
         int totalBeforeCap)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Semantic Symbol Search: \"{MarkdownHelper.EscapeTableCell(query)}\"");
+        sb.AppendLine($"# Semantic Symbol Search: \"{MarkdownFormatter.EscapeTableCell(query)}\"");
         sb.AppendLine();
         sb.Append($"Searched **{projectCount}** loaded C# source project(s)");
         if (searchedReferences)
@@ -631,11 +631,11 @@ public static class SemanticSymbolSearchTool
             var item = ranked[index];
             sb.AppendLine(
                 $"| {index + 1} " +
-                $"| {MarkdownHelper.EscapeTableCell(item.Symbol.ToDisplayString(s_symbolDisplayFormat))} " +
-                $"| {MarkdownHelper.EscapeTableCell(GetKindDisplay(item.Symbol))} " +
-                $"| {MarkdownHelper.EscapeTableCell(item.Origin)} " +
-                $"| {MarkdownHelper.EscapeTableCell(FormatLocation(item))} " +
-                $"| {MarkdownHelper.EscapeTableCell(item.MatchReason)} |");
+                $"| {MarkdownFormatter.EscapeTableCell(item.Symbol.ToDisplayString(s_symbolDisplayFormat))} " +
+                $"| {MarkdownFormatter.EscapeTableCell(GetKindDisplay(item.Symbol))} " +
+                $"| {MarkdownFormatter.EscapeTableCell(item.Origin)} " +
+                $"| {MarkdownFormatter.EscapeTableCell(FormatLocation(item))} " +
+                $"| {MarkdownFormatter.EscapeTableCell(item.MatchReason)} |");
         }
 
         sb.AppendLine();

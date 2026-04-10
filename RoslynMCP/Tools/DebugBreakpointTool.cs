@@ -18,6 +18,7 @@ public static class DebugBreakpointTool
         "(e.g. 'MyService.cs:42;MyTest.cs:10').")]
     public static async Task<string> DebugSetBreakpoint(
         [Description("Path to the source file, or semicolon-separated 'file:line' pairs for batch mode.")] string filePath,
+        IOutputFormatter fmt,
         [Description("Line number for the breakpoint (ignored in batch mode).")] int line = 0,
         [Description("Optional condition expression. Breakpoint only triggers when expression is true (e.g. 'x > 5').")]
         string? condition = null,
@@ -46,10 +47,20 @@ public static class DebugBreakpointTool
                     var (msg, _) = await session.SetBreakpointAsync(bpFile, bpLine, condition, cancellationToken);
                     sb.AppendLine(msg);
                 }
+                fmt.AppendHints(sb,
+                    "Use DebugContinue to run to the breakpoint",
+                    "Use DebugStatus to see all breakpoints");
                 return sb.ToString().TrimEnd();
             }
 
-            return (await session.SetBreakpointAsync(filePath, line, condition, cancellationToken)).Message;
+            {
+                var singleResult = (await session.SetBreakpointAsync(filePath, line, condition, cancellationToken)).Message;
+                var sbSingle = new StringBuilder(singleResult);
+                fmt.AppendHints(sbSingle,
+                    "Use DebugContinue to run to the breakpoint",
+                    "Use DebugStatus to see all breakpoints");
+                return sbSingle.ToString();
+            }
         }
         catch (Exception ex)
         {
@@ -66,6 +77,7 @@ public static class DebugBreakpointTool
         "Supports multiple IDs separated by semicolons (e.g. '1;3;5').")]
     public static async Task<string> DebugRemoveBreakpoint(
         [Description("Breakpoint ID to remove, or semicolon-separated IDs for batch removal.")] int breakpointId,
+        IOutputFormatter fmt,
         [Description("Alternative: semicolon-separated breakpoint IDs as text (e.g. '1;3;5'). " +
                      "Use this when removing multiple breakpoints at once.")]
         string? breakpointIds = null,
@@ -92,10 +104,20 @@ public static class DebugBreakpointTool
                     var result = await session.RemoveBreakpointAsync(id, cancellationToken);
                     sb.AppendLine(result);
                 }
+                fmt.AppendHints(sb,
+                    "Use DebugContinue to run to the breakpoint",
+                    "Use DebugStatus to see all breakpoints");
                 return sb.ToString().TrimEnd();
             }
 
-            return await session.RemoveBreakpointAsync(breakpointId, cancellationToken);
+            {
+                var singleResult = await session.RemoveBreakpointAsync(breakpointId, cancellationToken);
+                var sbSingle = new StringBuilder(singleResult);
+                fmt.AppendHints(sbSingle,
+                    "Use DebugContinue to run to the breakpoint",
+                    "Use DebugStatus to see all breakpoints");
+                return sbSingle.ToString();
+            }
         }
         catch (Exception ex)
         {

@@ -256,7 +256,7 @@ public static class GetFileOutlineTool
         sb.Append(' ');
         sb.Append(del.Identifier.Text);
         sb.Append(del.TypeParameterList?.ToString() ?? "");
-        sb.Append(del.ParameterList);
+        sb.Append(NormalizeParamList(del.ParameterList));
         return sb.ToString();
     }
 
@@ -268,7 +268,7 @@ public static class GetFileOutlineTool
         sb.Append(' ');
         sb.Append(method.Identifier.Text);
         sb.Append(method.TypeParameterList?.ToString() ?? "");
-        sb.Append(method.ParameterList);
+        sb.Append(NormalizeParamList(method.ParameterList));
         return sb.ToString();
     }
 
@@ -277,7 +277,7 @@ public static class GetFileOutlineTool
         var sb = new StringBuilder();
         sb.Append(FormatModifiers(ctor.Modifiers));
         sb.Append(ctor.Identifier.Text);
-        sb.Append(ctor.ParameterList);
+        sb.Append(NormalizeParamList(ctor.ParameterList));
         return sb.ToString();
     }
 
@@ -298,7 +298,7 @@ public static class GetFileOutlineTool
         sb.Append(FormatModifiers(indexer.Modifiers));
         sb.Append(indexer.Type);
         sb.Append(" this");
-        sb.Append(indexer.ParameterList);
+        sb.Append(NormalizeParamList(indexer.ParameterList));
         sb.Append(FormatAccessors(indexer.AccessorList));
         return sb.ToString();
     }
@@ -317,6 +317,13 @@ public static class GetFileOutlineTool
         string type = eventField.Declaration.Type.ToString();
         foreach (var variable in eventField.Declaration.Variables)
             AppendEntry(sb, depth, $"{modifiers}event {type} {variable.Identifier.Text}", eventField);
+    }
+
+    private static string NormalizeParamList(BaseParameterListSyntax paramList)
+    {
+        // Collapse any whitespace (including newlines from multi-line param lists) to single spaces
+        string raw = paramList.ToString();
+        return System.Text.RegularExpressions.Regex.Replace(raw, @"\s+", " ");
     }
 
     internal static string FormatModifiers(SyntaxTokenList modifiers)

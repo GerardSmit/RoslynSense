@@ -296,4 +296,30 @@ public class GoToDefinitionToolTests
         Assert.Contains("Compute", result);
         Assert.Contains("method", result);
     }
+
+    [Fact]
+    public async Task WhenMultilineMethodTargetedThenOutputShowsLineRange()
+    {
+        // Calculator.Compute spans multiple lines (lines 9-12)
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            markupSnippet: "public Result [|Compute|](int a, int b)",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("**Lines**:", result);
+        Assert.Matches(@"\*\*Lines\*\*: \d+–\d+", result);
+    }
+
+    [Fact]
+    public async Task WhenSingleLineMethodTargetedThenOutputShowsLineNotLines()
+    {
+        // Calculator.Add is a single-line expression-bodied method
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            markupSnippet: "public int [|Add|](int a, int b)",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("**Line**:", result);
+        Assert.DoesNotContain("**Lines**:", result);
+    }
 }

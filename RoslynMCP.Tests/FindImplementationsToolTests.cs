@@ -93,4 +93,16 @@ public class FindImplementationsToolTests
         // Enums are INamedTypeSymbol but have no implementations/derived types
         Assert.Contains("Implementations:", result);
     }
+
+    [Fact]
+    public async Task WhenInterfaceTargetedThenImplementingTypesShowLineRanges()
+    {
+        // StatisticsCalculator implements IStringFormatter and spans multiple lines
+        var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
+            FixturePaths.ServicesFile,
+            "public interface [|IStringFormatter|]");
+
+        // The Lines column in the table should show a range like "28–48"
+        Assert.Matches(@"\d+–\d+", result);
+    }
 }

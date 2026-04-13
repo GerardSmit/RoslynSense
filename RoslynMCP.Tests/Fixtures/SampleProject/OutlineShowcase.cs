@@ -48,4 +48,11 @@ public class OutlineShowcase
     public static OutlineShowcase operator +(OutlineShowcase left, OutlineShowcase right) => left;
 
     public static implicit operator int(OutlineShowcase value) => value._values.Count;
+
+    public void MultilineParams(
+        int firstParam,
+        string secondParam,
+        bool thirdParam)
+    {
+    }
 }

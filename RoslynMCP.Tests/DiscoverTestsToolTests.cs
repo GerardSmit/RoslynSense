@@ -65,6 +65,19 @@ public class DiscoverTestsToolTests
         Assert.Contains("No test methods found", result);
     }
 
+    [Fact]
+    public async Task WhenTestsDiscoveredThenOutputShowsLineRanges()
+    {
+        var testProjectPath = FindTestProjectPath();
+        if (testProjectPath is null) return;
+
+        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(
+            testProjectPath, className: "DiscoverTestsToolTests");
+
+        // Test methods span multiple lines (attribute + body), so should show X–Y ranges
+        Assert.Matches(@"\d+–\d+", result);
+    }
+
     private static string? FindTestProjectPath()
     {
         var dir = AppDomain.CurrentDomain.BaseDirectory;

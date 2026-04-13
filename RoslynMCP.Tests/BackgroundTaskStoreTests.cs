@@ -158,4 +158,60 @@ public sealed class BackgroundTaskStoreTests
         Assert.StartsWith("bg-coverage-", coverageId);
         Assert.StartsWith("bg-profile-", profileId);
     }
+
+    [Fact]
+    public async Task WaitForCompletionAsync_WhenTaskAlreadyCompleted_ReturnsImmediately()
+    {
+        var store = new BackgroundTaskStore();
+        var id = store.CreateTask(TaskKind.Tests, "test run");
+        store.Complete(id, "All tests passed", 0);
+
+        var result = await store.WaitForCompletionAsync(id, TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(result);
+        Assert.Equal(BackgroundTaskStore.TaskStatus.Completed, result.Status);
+    }
+
+    [Fact]
+    public async Task WaitForCompletionAsync_WhenTaskCompletesBeforeTimeout_ReturnsCompleted()
+    {
+        var store = new BackgroundTaskStore();
+        var id = store.CreateTask(TaskKind.Tests, "test run");
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(150);
+            store.Complete(id, "Passed", 0);
+        });
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await store.WaitForCompletionAsync(id, TimeSpan.FromSeconds(5));
+        sw.Stop();
+
+        Assert.NotNull(result);
+        Assert.Equal(BackgroundTaskStore.TaskStatus.Completed, result.Status);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"Expected early return, took {sw.Elapsed.TotalSeconds:F1}s");
+    }
+
+    [Fact]
+    public async Task WaitForCompletionAsync_WhenTimeoutExpires_ReturnsRunningTask()
+    {
+        var store = new BackgroundTaskStore();
+        var id = store.CreateTask(TaskKind.Build, "long build");
+
+        var result = await store.WaitForCompletionAsync(id, TimeSpan.FromMilliseconds(300));
+
+        Assert.NotNull(result);
+        Assert.Equal(BackgroundTaskStore.TaskStatus.Running, result.Status);
+    }
+
+    [Fact]
+    public async Task WaitForCompletionAsync_WhenTaskDoesNotExist_ReturnsNull()
+    {
+        var store = new BackgroundTaskStore();
+
+        var result = await store.WaitForCompletionAsync("nonexistent-id", TimeSpan.FromSeconds(1));
+
+        Assert.Null(result);
+    }
 }

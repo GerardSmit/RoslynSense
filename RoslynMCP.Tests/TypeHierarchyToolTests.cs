@@ -90,4 +90,17 @@ public class TypeHierarchyToolTests
         // AddResult is a method, not a type
         Assert.Contains("not a type", result, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task WhenInterfaceTargetedThenDerivedTypesShowLineRanges()
+    {
+        // IStringFormatter is implemented by StatisticsCalculator, which spans multiple lines
+        var result = await RoslynMCP.Tools.TypeHierarchyTool.GetTypeHierarchy(
+            FixturePaths.ServicesFile,
+            "public interface [|IStringFormatter|]",
+            new MarkdownFormatter());
+
+        // StatisticsCalculator's location should appear as a range like "Services.cs:28–48"
+        Assert.Matches(@"\d+–\d+", result);
+    }
 }

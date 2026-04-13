@@ -208,4 +208,16 @@ public class GetFileOutlineToolTests
         Assert.Contains("Calculator.cs", result);
         Assert.Contains("Warnings.cs", result);
     }
+
+    [Fact]
+    public async Task WhenMethodHasMultilineParametersThenOutlineShowsSingleLine()
+    {
+        var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.OutlineShowcaseFile, fmt: new MarkdownFormatter());
+
+        // The method "MultilineParams" has parameters declared across multiple lines in source.
+        // After normalization, the outline should show it all on one line.
+        Assert.Contains("MultilineParams(", result);
+        Assert.DoesNotMatch(@"MultilineParams\(\s*\n", result);
+        Assert.Contains("MultilineParams( int firstParam, string secondParam, bool thirdParam)", result);
+    }
 }

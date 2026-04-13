@@ -15,13 +15,19 @@ public static class BackgroundTaskTool
     [McpServerTool, Description(
         "Check the status and results of a background task. " +
         "Returns status (running/completed/failed/cancelled) and the result if finished.")]
-    public static string GetBackgroundTaskResult(
+    public static async Task<string> GetBackgroundTaskResult(
         [Description("Task ID returned when starting a task with background=true.")]
         string taskId,
+        [Description("Seconds to wait for the task to complete before returning. Default (0) waits up to 5 seconds. Pass -1 to return immediately without waiting.")]
+        int waitTimeoutSeconds,
         IOutputFormatter fmt,
-        BackgroundTaskStore taskStore)
+        BackgroundTaskStore taskStore,
+        CancellationToken cancellationToken)
     {
-        var task = taskStore.Get(taskId);
+        int effectiveTimeout = waitTimeoutSeconds < 0 ? 0 : waitTimeoutSeconds == 0 ? 5 : waitTimeoutSeconds;
+        var task = effectiveTimeout > 0
+            ? await taskStore.WaitForCompletionAsync(taskId, TimeSpan.FromSeconds(effectiveTimeout), cancellationToken).ConfigureAwait(false)
+            : taskStore.Get(taskId);
         if (task is null)
             return $"Error: Task '{taskId}' not found. Use ListBackgroundTasks to see available tasks.";
 

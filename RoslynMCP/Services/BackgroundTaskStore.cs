@@ -64,6 +64,24 @@ public sealed class BackgroundTaskStore
     /// <summary>Gets a task by ID.</summary>
     public BackgroundTask? Get(string taskId) => _tasks.GetValueOrDefault(taskId);
 
+    /// <summary>Waits until the task completes or the timeout expires, then returns the task.</summary>
+    public async Task<BackgroundTask?> WaitForCompletionAsync(string taskId, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var task = Get(taskId);
+        if (task is null || task.Status != TaskStatus.Running)
+            return task;
+
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
+        {
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            task = Get(taskId);
+            if (task is null || task.Status != TaskStatus.Running)
+                break;
+        }
+        return task;
+    }
+
     /// <summary>Lists all tasks, optionally filtered by status.</summary>
     public IReadOnlyList<BackgroundTask> ListTasks(TaskStatus? statusFilter = null)
     {

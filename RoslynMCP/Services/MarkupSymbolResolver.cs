@@ -49,6 +49,12 @@ internal sealed class MarkupResolutionResult
     /// </summary>
     public IReadOnlyList<int>? AmbiguousLineNumbers { get; }
 
+    /// <summary>
+    /// When <see cref="Kind"/> is <see cref="ResultKind.Ambiguous"/>, contains the source line text
+    /// at each match location (parallel to <see cref="AmbiguousLineNumbers"/>).
+    /// </summary>
+    public IReadOnlyList<string>? AmbiguousContextLines { get; }
+
     // --- Diagnostic ---
 
     /// <summary>Human-readable explanation suitable for returning to an LLM caller.</summary>
@@ -57,7 +63,8 @@ internal sealed class MarkupResolutionResult
     private MarkupResolutionResult(ResultKind kind, string message,
         ISymbol? symbol = null, Document? document = null,
         int? position = null, TextSpan? mappedSpan = null,
-        IReadOnlyList<int>? ambiguousLineNumbers = null)
+        IReadOnlyList<int>? ambiguousLineNumbers = null,
+        IReadOnlyList<string>? ambiguousContextLines = null)
     {
         Kind = kind;
         Message = message;
@@ -66,6 +73,7 @@ internal sealed class MarkupResolutionResult
         Position = position;
         MappedSpan = mappedSpan;
         AmbiguousLineNumbers = ambiguousLineNumbers;
+        AmbiguousContextLines = ambiguousContextLines;
     }
 
     public static MarkupResolutionResult Resolved(ISymbol symbol, Document document, int position, TextSpan mappedSpan) =>
@@ -78,11 +86,12 @@ internal sealed class MarkupResolutionResult
             $"No Roslyn symbol found at position {position} in '{document.FilePath}'.",
             document: document, position: position, mappedSpan: mappedSpan);
 
-    public static MarkupResolutionResult Ambiguous(IReadOnlyList<int> lineNumbers) =>
+    public static MarkupResolutionResult Ambiguous(IReadOnlyList<int> lineNumbers, IReadOnlyList<string>? contextLines = null) =>
         new(ResultKind.Ambiguous,
             $"Snippet matched {lineNumbers.Count} locations (lines {string.Join(", ", lineNumbers)}). " +
             "Add surrounding context to the snippet to disambiguate.",
-            ambiguousLineNumbers: lineNumbers);
+            ambiguousLineNumbers: lineNumbers,
+            ambiguousContextLines: contextLines);
 
     public static MarkupResolutionResult NoMatch(string snippetPreview) =>
         new(ResultKind.NoMatch,
@@ -162,10 +171,15 @@ internal static class MarkupSymbolResolver
             }
             else
             {
-                var lineNumbers = matches
-                    .Select(m => sourceText.Lines.GetLineFromPosition(m.FileOffset).LineNumber + 1)
-                    .ToList();
-                return MarkupResolutionResult.Ambiguous(lineNumbers);
+                var lineNumbers = new List<int>();
+                var contextLines = new List<string>();
+                foreach (var m in matches)
+                {
+                    var line = sourceText.Lines.GetLineFromPosition(m.FileOffset);
+                    lineNumbers.Add(line.LineNumber + 1);
+                    contextLines.Add(line.ToString().Trim());
+                }
+                return MarkupResolutionResult.Ambiguous(lineNumbers, contextLines);
             }
         }
         else

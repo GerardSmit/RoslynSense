@@ -39,6 +39,9 @@ public class MarkupSymbolResolverTests
         Assert.Equal(MarkupResolutionResult.ResultKind.Ambiguous, result.Kind);
         Assert.NotNull(result.AmbiguousLineNumbers);
         Assert.True(result.AmbiguousLineNumbers!.Count > 1);
+        Assert.NotNull(result.AmbiguousContextLines);
+        Assert.Equal(result.AmbiguousLineNumbers.Count, result.AmbiguousContextLines!.Count);
+        Assert.All(result.AmbiguousContextLines, ctx => Assert.Contains("Add", ctx));
     }
 
     [Fact]

@@ -106,11 +106,34 @@ internal static class ToolHelper
             MarkupResolutionResult.ResultKind.NoSymbol =>
                 $"No symbol found at markup target. {resolution.Message}",
             MarkupResolutionResult.ResultKind.Ambiguous =>
-                $"Ambiguous markup match. {resolution.Message}",
+                FormatAmbiguousError(resolution),
             MarkupResolutionResult.ResultKind.NoMatch =>
                 $"Snippet not found in file. {resolution.Message}",
             _ => $"Error: {resolution.Message}",
         };
+    }
+
+    private static string FormatAmbiguousError(MarkupResolutionResult resolution)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Ambiguous markup match. {resolution.Message}");
+        sb.AppendLine();
+
+        var lines = resolution.AmbiguousLineNumbers;
+        var contexts = resolution.AmbiguousContextLines;
+        if (lines is not null)
+        {
+            for (int i = 0; i < lines.Count; i++)
+            {
+                var context = contexts is not null && i < contexts.Count
+                    ? $"  {contexts[i]}" : "";
+                sb.AppendLine($"  Line {lines[i]}:{context}");
+            }
+            sb.AppendLine();
+            sb.AppendLine("Add `hintLine` or include more surrounding context in the snippet to disambiguate.");
+        }
+
+        return sb.ToString().TrimEnd();
     }
 }
 

@@ -35,6 +35,10 @@ public static class DebugStartTool
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
 
+            if (PathHelper.RequiresMsBuild(csprojPath))
+                return "Error: Debugging is not supported for legacy .NET Framework projects. " +
+                       "netcoredbg only supports .NET Core 3.0+ and .NET 5+ projects.";
+
             DebugSessionManager.DisposeSession();
             var session = DebugSessionManager.CreateSession();
             var breakpoints = ParseBreakpoints(initialBreakpoints);

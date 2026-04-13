@@ -35,6 +35,9 @@ public static class CoverageService
             csprojPath = found;
         }
 
+        if (PathHelper.RequiresMsBuild(csprojPath))
+            return await RunLegacyCoverageAsync(csprojPath, filter, cancellationToken);
+
         // Create a temp directory for results to avoid conflicts
         string resultsDir = Path.Combine(Path.GetTempPath(), "roslyn-mcp-coverage", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(resultsDir);
@@ -130,6 +133,186 @@ public static class CoverageService
             // Clean up temp directory
             try { Directory.Delete(resultsDir, recursive: true); } catch { }
         }
+    }
+
+    /// <summary>
+    /// Runs coverage collection for a legacy .NET Framework test project using
+    /// MSBuild + dotnet vstest + dotnet-coverage.
+    /// </summary>
+    private static async Task<CoverageResult> RunLegacyCoverageAsync(
+        string csprojPath, string? filter, CancellationToken cancellationToken)
+    {
+        var msbuild = MsBuildLocator.FindMsBuild();
+        if (msbuild is null)
+            return new CoverageResult(false,
+                "Error: Legacy .NET Framework project requires MSBuild but it could not be found. " +
+                "Install Visual Studio or Build Tools for Visual Studio.", null);
+
+        var workingDirectory = Path.GetDirectoryName(csprojPath)!;
+
+        // Build the project
+        var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal";
+        using (var buildProcess = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = msbuild,
+                Arguments = buildArgs,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = workingDirectory
+            }
+        })
+        {
+            var buildOut = new StringBuilder();
+            var buildErr = new StringBuilder();
+            buildProcess.OutputDataReceived += (_, e) => { if (e.Data is not null) buildOut.AppendLine(e.Data); };
+            buildProcess.ErrorDataReceived += (_, e) => { if (e.Data is not null) buildErr.AppendLine(e.Data); };
+            buildProcess.Start();
+            buildProcess.BeginOutputReadLine();
+            buildProcess.BeginErrorReadLine();
+            try { await buildProcess.WaitForExitAsync(cancellationToken); }
+            catch (OperationCanceledException)
+            {
+                try { buildProcess.Kill(entireProcessTree: true); } catch { }
+                return new CoverageResult(false, "Coverage collection was cancelled.", null);
+            }
+            if (buildProcess.ExitCode != 0)
+                return new CoverageResult(false,
+                    $"Build failed (exit code {buildProcess.ExitCode}).\n{buildOut}{buildErr}", null);
+        }
+
+        var targetPath = MsBuildLocator.GetTargetPath(csprojPath);
+        if (targetPath is null || !File.Exists(targetPath))
+            return new CoverageResult(false,
+                "Error: Could not determine test assembly path. " +
+                "Ensure the project built successfully.", null);
+
+        var dotnetCoverage = await FindOrProvisionDotnetCoverageAsync(cancellationToken);
+        if (dotnetCoverage is null)
+            return new CoverageResult(false,
+                "Error: dotnet-coverage is required for legacy .NET Framework coverage. " +
+                "Install it with: dotnet tool install -g dotnet-coverage", null);
+
+        var outputPath = Path.Combine(Path.GetTempPath(), $"roslyn-mcp-coverage-{Guid.NewGuid():N}.xml");
+        try
+        {
+            var vstestArgs = new StringBuilder($"vstest \"{targetPath}\"");
+            if (!string.IsNullOrWhiteSpace(filter))
+                vstestArgs.Append($" /TestCaseFilter:\"{filter!.Replace("\"", "\\\"")}\"");
+
+            var coverageArgs = $"collect --output \"{outputPath}\" --output-format cobertura -- dotnet {vstestArgs}";
+
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = dotnetCoverage,
+                    Arguments = coverageArgs,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = workingDirectory
+                }
+            };
+
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+            process.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
+            process.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            try { await process.WaitForExitAsync(cancellationToken); }
+            catch (OperationCanceledException)
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                return new CoverageResult(false, "Coverage collection was cancelled.", null);
+            }
+
+            if (!File.Exists(outputPath))
+                return new CoverageResult(false,
+                    $"Coverage file not found. Ensure dotnet-coverage supports your .NET Framework version.\n{stdout}{stderr}", null);
+
+            var data = ParseCoberturaXml(outputPath);
+            lock (Lock)
+            {
+                _cachedData = data;
+                _cachedProjectPath = csprojPath;
+                _cachedAt = DateTime.UtcNow;
+            }
+            return new CoverageResult(true, FormatSummary(data, csprojPath), data);
+        }
+        finally
+        {
+            try { File.Delete(outputPath); } catch { }
+        }
+    }
+
+    private static async Task<string?> FindOrProvisionDotnetCoverageAsync(CancellationToken cancellationToken)
+    {
+        // Check if dotnet-coverage is on PATH
+        try
+        {
+            using var probe = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "dotnet-coverage",
+                    Arguments = "--version",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+            probe.Start();
+            await probe.WaitForExitAsync(cancellationToken);
+            if (probe.ExitCode == 0) return "dotnet-coverage";
+        }
+        catch { }
+
+        // Try installing as a global tool
+        try
+        {
+            using var install = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "dotnet",
+                    Arguments = "tool install -g dotnet-coverage",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+            install.Start();
+            await install.WaitForExitAsync(cancellationToken);
+
+            // Verify it's now available
+            using var verify = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "dotnet-coverage",
+                    Arguments = "--version",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+            verify.Start();
+            await verify.WaitForExitAsync(cancellationToken);
+            if (verify.ExitCode == 0) return "dotnet-coverage";
+        }
+        catch { }
+
+        return null;
     }
 
     /// <summary>

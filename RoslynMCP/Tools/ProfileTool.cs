@@ -41,6 +41,10 @@ public static class ProfileTool
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
 
+            if (PathHelper.RequiresMsBuild(csprojPath))
+                return "Error: Profiling is not supported for legacy .NET Framework projects. " +
+                       "dotnet-trace only supports .NET Core 3.0+ processes.";
+
             var testArgs = new StringBuilder();
             testArgs.Append("test \"");
             testArgs.Append(csprojPath);
@@ -100,6 +104,10 @@ public static class ProfileTool
             var csprojPath = PathHelper.ResolveCsprojPath(projectPath);
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
+
+            if (PathHelper.RequiresMsBuild(csprojPath))
+                return "Error: Profiling is not supported for legacy .NET Framework projects. " +
+                       "dotnet-trace only supports .NET Core 3.0+ processes.";
 
             var runArgs = new StringBuilder();
             runArgs.Append("run --project \"");

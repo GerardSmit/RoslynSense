@@ -34,19 +34,38 @@ internal static class BackgroundTaskHelper
         string resolvedPath, string configuration,
         BackgroundTaskStore taskStore)
     {
-        var description = $"dotnet build {Path.GetFileName(resolvedPath)}";
-        var taskId = taskStore.CreateTask(BackgroundTaskStore.TaskKind.Build, description);
+        if (PathHelper.RequiresMsBuild(resolvedPath))
+        {
+            var msbuild = MsBuildLocator.FindMsBuild();
+            if (msbuild is null)
+                return "Error: This project requires MSBuild (legacy .NET Framework project) but " +
+                       "MSBuild could not be found. Install Visual Studio or Build Tools for Visual Studio.";
 
-        var args = $"build \"{resolvedPath}\" --verbosity quiet";
-        if (!string.IsNullOrWhiteSpace(configuration))
-            args += $" -c {configuration}";
+            var description = $"msbuild {Path.GetFileName(resolvedPath)}";
+            var taskId = taskStore.CreateTask(BackgroundTaskStore.TaskKind.Build, description);
+            var args = $"\"{resolvedPath}\" /p:Configuration={configuration} /nologo /v:minimal";
+            _ = RunInBackgroundAsync(taskId, msbuild, args,
+                Path.GetDirectoryName(resolvedPath)!, 300, taskStore);
 
-        _ = RunInBackgroundAsync(taskId, "dotnet", args,
-            Path.GetDirectoryName(resolvedPath)!, 300, taskStore);
+            return $"Build started in background.\n**Task ID:** `{taskId}`\n\n" +
+                   $"You can continue working on other tasks. " +
+                   $"Check results later with `GetBackgroundTaskResult(\"{taskId}\")`.";
+        }
+        else
+        {
+            var description = $"dotnet build {Path.GetFileName(resolvedPath)}";
+            var taskId = taskStore.CreateTask(BackgroundTaskStore.TaskKind.Build, description);
+            var args = $"build \"{resolvedPath}\" --verbosity quiet";
+            if (!string.IsNullOrWhiteSpace(configuration))
+                args += $" -c {configuration}";
 
-        return $"Build started in background.\n**Task ID:** `{taskId}`\n\n" +
-               $"You can continue working on other tasks. " +
-               $"Check results later with `GetBackgroundTaskResult(\"{taskId}\")`.";
+            _ = RunInBackgroundAsync(taskId, "dotnet", args,
+                Path.GetDirectoryName(resolvedPath)!, 300, taskStore);
+
+            return $"Build started in background.\n**Task ID:** `{taskId}`\n\n" +
+                   $"You can continue working on other tasks. " +
+                   $"Check results later with `GetBackgroundTaskResult(\"{taskId}\")`.";
+        }
     }
 
     /// <summary>Starts coverage collection in the background and returns a task ID.</summary>

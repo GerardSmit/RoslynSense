@@ -8,6 +8,106 @@ namespace RoslynMCP.Services;
 internal static class PathHelper
 {
     /// <summary>
+    /// Reads the SDK attribute from a .csproj file (e.g., "Microsoft.NET.Sdk.Web").
+    /// Returns null if the file is legacy (non-SDK-style) or cannot be read.
+    /// </summary>
+    public static string? ReadProjectSdk(string projectPath)
+    {
+        if (!projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        try
+        {
+            using var reader = new StreamReader(projectPath);
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                line = line.TrimStart();
+                if (line.StartsWith("<Project", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(
+                        line, """Sdk\s*=\s*["']([^"']+)["']""",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (match.Success)
+                        return match.Groups[1].Value;
+                    break;
+                }
+
+                // Also check for <Sdk Name="..."/> import style
+                if (line.StartsWith("<Sdk", StringComparison.OrdinalIgnoreCase))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(
+                        line, """Name\s*=\s*["']([^"']+)["']""",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (match.Success)
+                        return match.Groups[1].Value;
+                }
+            }
+        }
+        catch
+        {
+            // Don't fail if we can't read the project file
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns true if a .csproj is a legacy (non-SDK-style) project.
+    /// </summary>
+    public static bool IsLegacyProject(string csprojPath) =>
+        ReadProjectSdk(csprojPath) is null;
+
+    /// <summary>
+    /// Returns true if a .sln contains at least one legacy .csproj.
+    /// </summary>
+    public static bool IsLegacySolution(string slnPath)
+    {
+        if (!slnPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) || !File.Exists(slnPath))
+            return false;
+
+        var slnDir = Path.GetDirectoryName(slnPath)!;
+        try
+        {
+            // Parse Project("{type}") = "Name", "relative\path.csproj", "{GUID}" lines
+            var projectLineRegex = new System.Text.RegularExpressions.Regex(
+                @"Project\(""[^""]*""\)\s*=\s*""[^""]*""\s*,\s*""([^""]+\.(?:csproj|vbproj|fsproj))""",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            foreach (var line in File.ReadLines(slnPath))
+            {
+                var match = projectLineRegex.Match(line);
+                if (!match.Success) continue;
+
+                var relativePath = match.Groups[1].Value.Replace('/', Path.DirectorySeparatorChar);
+                var fullPath = Path.GetFullPath(Path.Combine(slnDir, relativePath));
+                if (File.Exists(fullPath) && IsLegacyProject(fullPath))
+                    return true;
+            }
+        }
+        catch
+        {
+            // Don't fail if we can't read the .sln
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns true if the build target (a .csproj or .sln) requires MSBuild
+    /// rather than the dotnet CLI.
+    /// </summary>
+    public static bool RequiresMsBuild(string buildTarget)
+    {
+        if (buildTarget.EndsWith(".sln", StringComparison.OrdinalIgnoreCase))
+            return IsLegacySolution(buildTarget);
+        if (buildTarget.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+            return IsLegacyProject(buildTarget);
+        return false;
+    }
+
+
+    /// <summary>
     /// Normalizes a file path by resolving it to a full absolute path.
     /// </summary>
     public static string NormalizePath(string filePath) =>

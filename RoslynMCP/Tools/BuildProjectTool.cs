@@ -33,20 +33,31 @@ public static class BuildProjectTool
                 return BackgroundTaskHelper.StartBuildBackground(
                     resolved, configuration, taskStore);
 
-            var args = new StringBuilder();
-            args.Append("build ");
-            args.Append('"');
-            args.Append(resolved);
-            args.Append('"');
-            args.Append($" --configuration \"{SanitizeConfiguration(configuration)}\"");
-            args.Append(" --nologo");
+            string fileName;
+            string arguments;
+
+            if (PathHelper.RequiresMsBuild(resolved))
+            {
+                var msbuild = MsBuildLocator.FindMsBuild();
+                if (msbuild is null)
+                    return "Error: This project requires MSBuild (legacy .NET Framework project) but " +
+                           "MSBuild could not be found. Install Visual Studio or Build Tools for Visual Studio.";
+
+                fileName = msbuild;
+                arguments = BuildMsBuildArgs(resolved, SanitizeConfiguration(configuration));
+            }
+            else
+            {
+                fileName = "dotnet";
+                arguments = BuildDotnetArgs(resolved, SanitizeConfiguration(configuration));
+            }
 
             using var process = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
-                    FileName = "dotnet",
-                    Arguments = args.ToString(),
+                    FileName = fileName,
+                    Arguments = arguments,
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -199,6 +210,12 @@ public static class BuildProjectTool
 
         return sb.ToString();
     }
+
+    private static string BuildDotnetArgs(string resolved, string configuration) =>
+        $"build \"{resolved}\" --configuration \"{configuration}\" --nologo";
+
+    private static string BuildMsBuildArgs(string resolved, string configuration) =>
+        $"\"{resolved}\" /p:Configuration=\"{configuration}\" /nologo /v:minimal";
 
     /// <summary>
     /// Strips any characters that aren't alphanumeric, dash, underscore, or dot

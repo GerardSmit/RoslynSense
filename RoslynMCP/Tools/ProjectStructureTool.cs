@@ -501,44 +501,8 @@ public static class ProjectStructureTool
     /// <summary>
     /// Reads the SDK attribute from a .csproj file (e.g., "Microsoft.NET.Sdk.Web").
     /// </summary>
-    private static string? ReadProjectSdk(string projectPath)
-    {
-        if (!projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        try
-        {
-            // Quick read: just look for Sdk= in the <Project> element
-            using var reader = new StreamReader(projectPath);
-            string? line;
-            while ((line = reader.ReadLine()) is not null)
-            {
-                line = line.TrimStart();
-                if (line.StartsWith("<Project", StringComparison.OrdinalIgnoreCase))
-                {
-                    var match = System.Text.RegularExpressions.Regex.Match(
-                        line, """Sdk\s*=\s*["']([^"']+)["']""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                    if (match.Success)
-                        return match.Groups[1].Value;
-                    break;
-                }
-
-                // Also check for <Sdk Name="..."/> import style
-                if (line.StartsWith("<Sdk", StringComparison.OrdinalIgnoreCase))
-                {
-                    var match = System.Text.RegularExpressions.Regex.Match(
-                        line, """Name\s*=\s*["']([^"']+)["']""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                    if (match.Success)
-                        return match.Groups[1].Value;
-                }
-            }
-        }
-        catch
-        {
-            // Don't fail if we can't read the project file
-        }
-        return null;
-    }
+    private static string? ReadProjectSdk(string projectPath) =>
+        PathHelper.ReadProjectSdk(projectPath);
 
     /// <summary>
     /// Detects the test framework from project references.

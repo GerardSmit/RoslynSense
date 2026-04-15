@@ -421,4 +421,109 @@ public class AspxSourceMappingServiceTests
 
         Assert.Null(symbol);
     }
+
+    [Fact]
+    public void ResolveAspxSymbol_ControlIdValue_ReturnsCodeBehindField()
+    {
+        // Clicking on the value of ID="btnSubmit" should return the IFieldSymbol on DefaultPage
+        var (result, text) = ParseDefaultAspxWithSystemWeb();
+        var markup = MarkupString.Parse("ID=\"[|btnSubmit|]\"");
+
+        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
+
+        Assert.NotNull(symbol);
+        Assert.IsAssignableFrom<IFieldSymbol>(symbol);
+        Assert.Equal("btnSubmit", symbol.Name);
+    }
+
+    [Fact]
+    public void ResolveAspxSymbol_ControlIdValue_LabelField_ReturnsCodeBehindField()
+    {
+        var (result, text) = ParseDefaultAspxWithSystemWeb();
+        var markup = MarkupString.Parse("ID=\"[|lblTitle|]\"");
+
+        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
+
+        Assert.NotNull(symbol);
+        Assert.IsAssignableFrom<IFieldSymbol>(symbol);
+        Assert.Equal("lblTitle", symbol.Name);
+    }
+
+    [Fact]
+    public void ResolveAspxSymbol_TemplateNestedControlId_ReturnsNull()
+    {
+        // Controls inside a Repeater template have no code-behind field
+        var (result, text) = ParseRepeaterAspxWithSystemWeb();
+        var markup = MarkupString.Parse("ID=\"[|btnAction|]\"");
+
+        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
+
+        Assert.Null(symbol);
+    }
+
+    [Fact]
+    public void FindControlNodeAtCursor_TemplateControl_ReturnsControlNode()
+    {
+        var (result, text) = ParseRepeaterAspxWithSystemWeb();
+        var markup = MarkupString.Parse("ID=\"[|btnAction|]\"");
+
+        var controlNode = AspxSourceMappingService.FindControlNodeAtCursor(result, text, markup);
+
+        Assert.NotNull(controlNode);
+        Assert.Equal("btnAction", controlNode.Id);
+    }
+
+    [Fact]
+    public void IsControlInTemplate_TopLevelControl_ReturnsFalse()
+    {
+        var (result, _) = ParseRepeaterAspxWithSystemWeb();
+
+        // rptItems is top-level (directly in the page, not inside any template)
+        var rptItems = result.ParseTree!.AllChildren
+            .OfType<WebFormsCore.Nodes.ControlNode>()
+            .FirstOrDefault(c => string.Equals(c.Id, "rptItems", StringComparison.OrdinalIgnoreCase));
+
+        Assert.NotNull(rptItems);
+        Assert.False(AspxSourceMappingService.IsControlInTemplate(rptItems));
+    }
+
+    [Fact]
+    public void IsControlInTemplate_InsideItemTemplate_ReturnsTrue()
+    {
+        var (result, _) = ParseRepeaterAspxWithSystemWeb();
+
+        // btnAction is inside <ItemTemplate> — stored in TemplateNode.Children, not AllChildren
+        var btnAction = result.ParseTree!.Templates
+            .SelectMany(t => t.AllChildren)
+            .OfType<WebFormsCore.Nodes.ControlNode>()
+            .FirstOrDefault(c => string.Equals(c.Id, "btnAction", StringComparison.OrdinalIgnoreCase));
+
+        Assert.NotNull(btnAction);
+        Assert.True(AspxSourceMappingService.IsControlInTemplate(btnAction));
+    }
+
+    private static Compilation CreateRepeaterCompilation()
+    {
+        var stubsText = File.ReadAllText(Path.Combine(FixturePaths.AspxProjectDir, "SystemWebStubs.cs"));
+        var codeBehindText = File.ReadAllText(FixturePaths.RepeaterCodeBehindFile);
+        var runtimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
+        return CSharpCompilation.Create("TestWithRepeater",
+            [CSharpSyntaxTree.ParseText(stubsText), CSharpSyntaxTree.ParseText(codeBehindText)],
+            [
+                MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+                MetadataReference.CreateFromFile(Path.Combine(runtimeDir, "System.Runtime.dll")),
+            ],
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
+                assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default));
+    }
+
+    private static (AspxParseResult result, string text) ParseRepeaterAspxWithSystemWeb()
+    {
+        var text = File.ReadAllText(FixturePaths.RepeaterAspxFile);
+        var compilation = CreateRepeaterCompilation();
+        var result = AspxSourceMappingService.Parse(
+            FixturePaths.RepeaterAspxFile, text, compilation,
+            rootDirectory: FixturePaths.AspxProjectDir);
+        return (result, text);
+    }
 }

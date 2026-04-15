@@ -107,4 +107,85 @@ public class FindUsagesRazorAspxTests
         // Even if not, the reference should appear
         Assert.Contains("FormatTitle", result);
     }
+
+    // --- Control ID resolution tests ---
+
+    [Fact]
+    public async Task WhenFindUsagesOnTopLevelControlIdThenFindsCSharpFieldReferences()
+    {
+        // btnSubmit has a code-behind field — FindUsages should include C# field references
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.DefaultAspxFile,
+            markupSnippet: "ID=\"[|btnSubmit|]\"",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Symbol Usage Analysis", result);
+        Assert.Contains("btnSubmit", result);
+        // The field reference in the code-behind should appear
+        Assert.Contains("Reference", result);
+    }
+
+    [Fact]
+    public async Task WhenGoToDefinitionOnTopLevelControlIdThenReturnsField()
+    {
+        // Clicking ID="btnSubmit" in the ASPX should navigate to the code-behind field
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.DefaultAspxFile,
+            markupSnippet: "ID=\"[|btnSubmit|]\"",
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.GoToDefinition);
+
+        Assert.Contains("btnSubmit", result);
+        // Definition should point to a field in DefaultPage
+        Assert.Contains("DefaultPage", result);
+    }
+
+    [Fact]
+    public async Task WhenFindUsagesOnTemplateNestedControlIdThenFindsFindControlCalls()
+    {
+        // btnAction is inside <ItemTemplate> — no code-behind field
+        // FindUsages should discover FindControl("btnAction") calls in the code-behind
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.RepeaterAspxFile,
+            markupSnippet: "ID=\"[|btnAction|]\"",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Control ID References", result);
+        Assert.Contains("btnAction", result);
+        Assert.Contains("FindControl", result);
+        // The direct FindControl("btnAction") call in InitItem should be listed
+        Assert.Contains("FindControl References", result);
+    }
+
+    [Fact]
+    public async Task WhenFindUsagesOnTemplateControlThenIncludesTemplateNote()
+    {
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.RepeaterAspxFile,
+            markupSnippet: "ID=\"[|lblName|]\"",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Control ID References", result);
+        Assert.Contains("lblName", result);
+        // Should note that control is template-nested
+        Assert.Contains("template", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenSetTextWrapperUsedThenWrapperCallSiteIsFound()
+    {
+        // e.Item.SetText("btnAction", ...) calls FindControl("btnAction") via a wrapper.
+        // The wrapper auto-detection should pick up SetText and surface its call site.
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.RepeaterAspxFile,
+            markupSnippet: "ID=\"[|btnAction|]\"",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("FindControl References", result);
+        // Both direct FindControl call (in InitItem) and SetText wrapper call should appear
+        Assert.Contains("FindControl", result);
+        // At least 2 references: direct FindControl in InitItem + SetText in rpt_OnItemDataBound
+        var found = System.Text.RegularExpressions.Regex.Matches(result, @"Repeater\.aspx\.cs").Count;
+        Assert.True(found >= 2, $"Expected at least 2 references in Repeater.aspx.cs, got {found}. Result:\n{result}");
+    }
 }

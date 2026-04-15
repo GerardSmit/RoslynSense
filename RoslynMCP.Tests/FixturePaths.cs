@@ -38,6 +38,8 @@ internal static class FixturePaths
     public static string ImageHandlerFile => Path.Combine(AspxProjectDir, "ImageHandler.ashx");
     public static string AspxPageHelperFile => Path.Combine(AspxProjectDir, "PageHelper.cs");
     public static string AspxWebConfigFile => Path.Combine(AspxProjectDir, "web.config");
+    public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");
+    public static string RepeaterCodeBehindFile => Path.Combine(AspxProjectDir, "Repeater.aspx.cs");
 
     public static string BlazorProjectDir => Path.Combine(s_fixturesRoot, "BlazorProject");
     public static string BlazorProjectFile => Path.Combine(BlazorProjectDir, "BlazorProject.csproj");

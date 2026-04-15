@@ -6,7 +6,20 @@
 
 namespace System.Web.UI
 {
-    public class Control { }
+    public interface ITemplate { }
+
+    [AttributeUsage(AttributeTargets.Class, AllowMultiple = false)]
+    public sealed class ParseChildrenAttribute : Attribute
+    {
+        public ParseChildrenAttribute(bool childrenAsProperties) { }
+        public bool ChildrenAsProperties { get; set; }
+    }
+
+    public class Control
+    {
+        public string ID { get; set; } = "";
+        public Control FindControl(string id) => null!;
+    }
 
     public class Page : Control
     {
@@ -50,6 +63,25 @@ namespace System.Web.UI
             public event EventHandler? Click;
             public string PostBackUrl { get; set; } = "";
         }
+
+        [System.Web.UI.ParseChildren(true)]
+        public class Repeater : WebControl
+        {
+            public System.Web.UI.ITemplate? ItemTemplate { get; set; }
+            public System.Web.UI.ITemplate? AlternatingItemTemplate { get; set; }
+            public System.Web.UI.ITemplate? HeaderTemplate { get; set; }
+            public System.Web.UI.ITemplate? FooterTemplate { get; set; }
+            public System.Web.UI.ITemplate? SeparatorTemplate { get; set; }
+            public event EventHandler<RepeaterItemEventArgs>? ItemDataBound;
+            public event EventHandler<RepeaterItemEventArgs>? ItemCreated;
+        }
+
+        public class RepeaterItem : Control { }
+
+        public class RepeaterItemEventArgs : EventArgs
+        {
+            public RepeaterItem Item { get; } = null!;
+        }
     }
 }
 
@@ -57,6 +89,9 @@ namespace AspxProject
 {
     public class DefaultPage : System.Web.UI.Page
     {
+        protected System.Web.UI.WebControls.Label lblTitle = null!;
+        protected System.Web.UI.WebControls.Button btnSubmit = null!;
+
         protected void BtnSubmit_Click(object sender, EventArgs e) { }
     }
 }

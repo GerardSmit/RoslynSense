@@ -1,5 +1,7 @@
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using WebFormsCore;
 using WebFormsCore.Models;
 using WebFormsCore.Nodes;
@@ -223,11 +225,9 @@ internal static class AspxSourceMappingService
             fileText, match, markup.PlainText, markup.SpanStart + markup.SpanLength);
         string markedText = markup.MarkedText;
 
-        // Walk all control nodes looking for a match
-        foreach (var node in parseResult.ParseTree.AllChildren)
+        // Walk all control nodes looking for a match (including template-nested controls)
+        foreach (var control in GetAllControlNodesDeep(parseResult))
         {
-            if (node is not ControlNode control)
-                continue;
 
             // Check if the marked text falls within the control's tag name
             var tagRange = control.StartTag.ElementRange;
@@ -272,6 +272,14 @@ internal static class AspxSourceMappingService
                     if (member != null)
                         return member.Symbol;
                 }
+                else if (key.Value.Equals("ID", StringComparison.OrdinalIgnoreCase)
+                         && RangeContainsOffset(value.Range, markedStart, markedEnd))
+                {
+                    // Cursor is on the ID attribute value — resolve to code-behind field
+                    var member = parseResult.ParseTree.Inherits?.GetMemberDeep(value.Value);
+                    if (member?.Symbol is { } sym) return sym;
+                    return null; // no code-behind field (template-nested or field not declared)
+                }
             }
 
             // Semantic fallback: match marked text against event/property names
@@ -302,6 +310,15 @@ internal static class AspxSourceMappingService
             var memberResult = control.ControlType?.GetMemberDeep(markedText);
             if (memberResult != null)
                 return memberResult.Symbol;
+
+            // Fallback: match as control ID value (when ID attr is not in Attributes dict)
+            if (control.Id is not null
+                && string.Equals(markedText, control.Id, StringComparison.OrdinalIgnoreCase))
+            {
+                var member = parseResult.ParseTree.Inherits?.GetMemberDeep(control.Id);
+                if (member?.Symbol is { } sym) return sym;
+                return null; // no code-behind field (template-nested or field not declared)
+            }
         }
 
         // Check if marked text matches the page base type (Inherits directive)
@@ -315,9 +332,223 @@ internal static class AspxSourceMappingService
         return null;
     }
 
+    /// <summary>
+    /// Enumerates all <see cref="ControlNode"/> instances in the parse tree, including those
+    /// nested inside <see cref="TemplateNode"/>s (which are not reachable via <see cref="ContainerNode.AllChildren"/>
+    /// because templates are stored in <see cref="ControlNode.Templates"/>, not in <see cref="ContainerNode.Children"/>).
+    /// </summary>
+    private static IEnumerable<ControlNode> GetAllControlNodesDeep(AspxParseResult parseResult)
+    {
+        if (parseResult.ParseTree is null) yield break;
+
+        foreach (var node in parseResult.ParseTree.AllChildren)
+            if (node is ControlNode c) yield return c;
+
+        // TemplateNode objects are stored in ControlNode.Templates (added to Root.Templates)
+        // and are NOT part of the Children hierarchy, so AllChildren above misses them.
+        foreach (var template in parseResult.ParseTree.Templates)
+            foreach (var node in template.AllChildren)
+                if (node is ControlNode c) yield return c;
+    }
+
     private static bool RangeContainsOffset(TokenRange range, int startOffset, int endOffset)
     {
         return range.Start.Offset <= startOffset && range.End.Offset >= endOffset;
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> when <paramref name="control"/> is nested inside a <see cref="TemplateNode"/>,
+    /// meaning it has no direct code-behind field and must be accessed via <c>FindControl</c>.
+    /// </summary>
+    internal static bool IsControlInTemplate(ControlNode control)
+    {
+        var parent = control.Parent;
+        while (parent != null)
+        {
+            if (parent is TemplateNode) return true;
+            parent = parent.Parent;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Finds the <see cref="ControlNode"/> whose <c>ID</c> attribute value is at the cursor position
+    /// indicated by the markup snippet. Returns <c>null</c> if no such control is found.
+    /// </summary>
+    internal static ControlNode? FindControlNodeAtCursor(
+        AspxParseResult parseResult, string fileText, MarkupString markup)
+    {
+        if (parseResult.ParseTree is null) return null;
+
+        var matches = MarkupSymbolResolver.FindAllOccurrences(fileText, markup.PlainText);
+        if (matches.Count != 1) return null;
+
+        var match = matches[0];
+        int markedStart = MarkupSymbolResolver.MapSnippetOffsetToFile(
+            fileText, match, markup.PlainText, markup.SpanStart);
+        int markedEnd = MarkupSymbolResolver.MapSnippetOffsetToFile(
+            fileText, match, markup.PlainText, markup.SpanStart + markup.SpanLength);
+        string markedText = markup.MarkedText;
+
+        foreach (var control in GetAllControlNodesDeep(parseResult))
+        {
+            if (control.Id is null) continue;
+            if (!string.Equals(markedText, control.Id, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var fullTagRange = control.StartTag.Range;
+            if (RangeContainsOffset(fullTagRange, markedStart, markedEnd))
+                return control;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Scans all C# documents in the project for methods that pass one of their string parameters
+    /// directly to <c>FindControl</c>. Returns a list of <c>(MethodName, ParameterIndex)</c> pairs
+    /// that can be used as wrapper methods when searching for control ID references.
+    /// </summary>
+    internal static async Task<List<(string MethodName, int ParamIndex, bool IsExtension)>> FindControlAccessorMethodsAsync(
+        Project project, CancellationToken ct)
+    {
+        var wrappers = new List<(string MethodName, int ParamIndex, bool IsExtension)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var document in project.Documents)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var root = await document.GetSyntaxRootAsync(ct);
+            var model = await document.GetSemanticModelAsync(ct);
+            if (root is null || model is null) continue;
+
+            foreach (var inv in root.DescendantNodes()
+                         .OfType<InvocationExpressionSyntax>())
+            {
+                if (!IsInvocationNamed(inv, "FindControl")) continue;
+
+                var args = inv.ArgumentList.Arguments;
+                if (args.Count == 0) continue;
+
+                var argExpr = args[0].Expression;
+                if (argExpr is not IdentifierNameSyntax ident) continue;
+
+                if (model.GetSymbolInfo(ident, ct).Symbol is not IParameterSymbol param) continue;
+
+                var methodDecl = inv.AncestorsAndSelf()
+                    .OfType<MethodDeclarationSyntax>()
+                    .FirstOrDefault();
+                if (methodDecl is null) continue;
+
+                if (model.GetDeclaredSymbol(methodDecl, ct) is not IMethodSymbol methodSymbol) continue;
+
+                var paramIndex = methodSymbol.Parameters.IndexOf(param);
+                if (paramIndex < 0) continue;
+
+                var key = $"{methodSymbol.Name}:{paramIndex}";
+                if (seen.Add(key))
+                    wrappers.Add((methodSymbol.Name, paramIndex, methodSymbol.IsExtensionMethod));
+            }
+        }
+
+        return wrappers;
+    }
+
+    /// <summary>
+    /// Searches all C# documents in the project for <c>FindControl("id")</c> calls and calls to
+    /// discovered wrapper methods (e.g. <c>item.SetText("id", ...)</c>) that pass the control ID
+    /// as a string literal. Extension methods called in member-access style (receiver.Method(...))
+    /// are handled by adjusting the argument index.
+    /// </summary>
+    internal static async Task<List<AspxSymbolReference>> FindControlByIdAsync(
+        Project project,
+        string controlId,
+        IReadOnlyList<(string MethodName, int ParamIndex, bool IsExtension)>? wrappers,
+        CancellationToken ct)
+    {
+        var references = new List<AspxSymbolReference>();
+
+        foreach (var document in project.Documents)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var root = await document.GetSyntaxRootAsync(ct);
+            if (root is null) continue;
+
+            var filePath = document.FilePath;
+            if (string.IsNullOrEmpty(filePath)) continue;
+
+            foreach (var inv in root.DescendantNodes()
+                         .OfType<InvocationExpressionSyntax>())
+            {
+                var memberName = GetInvocationMemberName(inv);
+                var args = inv.ArgumentList.Arguments;
+
+                // Direct: FindControl("id")
+                if (string.Equals(memberName, "FindControl", StringComparison.Ordinal)
+                    && args.Count >= 1
+                    && IsStringLiteralWithValue(args[0].Expression, controlId))
+                {
+                    AddFindControlRef(references, filePath, inv);
+                    continue;
+                }
+
+                // Wrappers: e.g. item.SetText("id", value)
+                if (wrappers is null) continue;
+                foreach (var (wrapperName, paramIdx, isExtension) in wrappers)
+                {
+                    if (!string.Equals(memberName, wrapperName, StringComparison.Ordinal)) continue;
+
+                    // Extension methods called as receiver.Method(...) don't include 'this' in args,
+                    // so adjust the index down by 1 for member-access call style.
+                    int effectiveIdx = (isExtension && inv.Expression is MemberAccessExpressionSyntax)
+                        ? paramIdx - 1
+                        : paramIdx;
+
+                    if (effectiveIdx < 0 || args.Count <= effectiveIdx) continue;
+                    if (!IsStringLiteralWithValue(args[effectiveIdx].Expression, controlId)) continue;
+
+                    AddFindControlRef(references, filePath, inv);
+                    break;
+                }
+            }
+        }
+
+        return references;
+    }
+
+    private static bool IsInvocationNamed(
+        InvocationExpressionSyntax inv, string name)
+        => GetInvocationMemberName(inv) is { } n && string.Equals(n, name, StringComparison.Ordinal);
+
+    private static string? GetInvocationMemberName(
+        InvocationExpressionSyntax inv)
+        => inv.Expression switch
+        {
+            MemberAccessExpressionSyntax m => m.Name.Identifier.Text,
+            IdentifierNameSyntax i => i.Identifier.Text,
+            _ => null
+        };
+
+    private static bool IsStringLiteralWithValue(ExpressionSyntax expr, string expected)
+    {
+        if (expr is LiteralExpressionSyntax lit
+            && lit.Token.IsKind(SyntaxKind.StringLiteralToken))
+            return string.Equals(lit.Token.ValueText, expected, StringComparison.Ordinal);
+        return false;
+    }
+
+    private static void AddFindControlRef(
+        List<AspxSymbolReference> list, string filePath,
+        InvocationExpressionSyntax inv)
+    {
+        var loc = inv.GetLocation().GetLineSpan();
+        list.Add(new AspxSymbolReference(
+            filePath,
+            loc.StartLinePosition.Line + 1,
+            loc.StartLinePosition.Character + 1,
+            inv.ToString(),
+            AspxCodeLocationType.FindControlCall));
     }
 
     private static void CollectDirectives(RootNode root, List<AspxDirectiveInfo> directives)
@@ -568,7 +799,7 @@ internal record AspxCodeBlockInfo(string Code, int Line, int Column, int EndLine
 internal record AspxCodeLocation(string Code, int Line, int Column, AspxCodeLocationType Type);
 
 internal enum AspxExpressionKind { Output, Encoded, DataBinding }
-internal enum AspxCodeLocationType { Expression, CodeBlock }
+internal enum AspxCodeLocationType { Expression, CodeBlock, FindControlCall }
 
 /// <summary>All parsed ASPX files in a project.</summary>
 internal record AspxProjectIndex(List<AspxParseResult> Files);

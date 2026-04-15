@@ -418,6 +418,12 @@ internal static class AspxSourceMappingService
         {
             ct.ThrowIfCancellationRequested();
 
+            // Fast path: skip documents that don't contain "FindControl" at all.
+            // This avoids the expensive GetSemanticModelAsync call for the vast majority of files.
+            var docText = await document.GetTextAsync(ct);
+            if (!docText.ToString().Contains("FindControl", StringComparison.Ordinal))
+                continue;
+
             var root = await document.GetSyntaxRootAsync(ct);
             var model = await document.GetSemanticModelAsync(ct);
             if (root is null || model is null) continue;
@@ -472,11 +478,20 @@ internal static class AspxSourceMappingService
         {
             ct.ThrowIfCancellationRequested();
 
-            var root = await document.GetSyntaxRootAsync(ct);
-            if (root is null) continue;
-
             var filePath = document.FilePath;
             if (string.IsNullOrEmpty(filePath)) continue;
+
+            // Fast path: skip documents that contain neither "FindControl" nor any wrapper name.
+            var docText = await document.GetTextAsync(ct);
+            var docStr = docText.ToString();
+            bool hasDirectCall = docStr.Contains("FindControl", StringComparison.Ordinal);
+            bool hasWrapperCall = wrappers is not null
+                && wrappers.Any(w => docStr.Contains(w.MethodName, StringComparison.Ordinal));
+            if (!hasDirectCall && !hasWrapperCall)
+                continue;
+
+            var root = await document.GetSyntaxRootAsync(ct);
+            if (root is null) continue;
 
             foreach (var inv in root.DescendantNodes()
                          .OfType<InvocationExpressionSyntax>())

@@ -105,6 +105,38 @@ internal static class ProjectIndexCacheService
     }
 
     /// <summary>
+    /// Returns a cached or freshly-discovered list of wrapper methods that delegate
+    /// a string parameter to <c>FindControl</c> (e.g. <c>SetText(control, id, value)</c>).
+    /// The result is cached per-project and invalidated whenever a <c>.cs</c> file changes.
+    /// </summary>
+    public static async Task<IReadOnlyList<(string MethodName, int ParamIndex, bool IsExtension)>> GetFindControlWrappersAsync(
+        Project project, CancellationToken cancellationToken = default)
+    {
+        var entry = await GetOrCreateEntryAsync(project, cancellationToken);
+
+        if (entry.FindControlWrappers is { } cached && !entry.WrappersDirty)
+            return cached;
+
+        int genBefore;
+        await s_lock.WaitAsync(cancellationToken);
+        try { genBefore = entry.WrappersGeneration; }
+        finally { s_lock.Release(); }
+
+        var wrappers = await AspxSourceMappingService.FindControlAccessorMethodsAsync(project, cancellationToken);
+
+        await s_lock.WaitAsync(cancellationToken);
+        try
+        {
+            entry.FindControlWrappers = wrappers;
+            if (entry.WrappersGeneration == genBefore)
+                entry.WrappersDirty = false;
+        }
+        finally { s_lock.Release(); }
+
+        return wrappers;
+    }
+
+    /// <summary>
     /// Explicitly invalidates all cached data for a project.
     /// </summary>
     public static void InvalidateProject(string projectPath)
@@ -117,6 +149,7 @@ internal static class ProjectIndexCacheService
             {
                 entry.AspxDirty = true;
                 entry.RazorDirty = true;
+                entry.WrappersDirty = true;
             }
         }
         finally
@@ -216,16 +249,25 @@ internal static class ProjectIndexCacheService
             entry.RazorDirty = true;
             Interlocked.Increment(ref entry.RazorGeneration);
         }
+
+        if (isCSharp)
+        {
+            entry.WrappersDirty = true;
+            Interlocked.Increment(ref entry.WrappersGeneration);
+        }
     }
 
     private sealed class CachedProjectEntry : IDisposable
     {
         public AspxProjectIndex? AspxIndex { get; set; }
         public RazorSourceMap? RazorSourceMap { get; set; }
+        public IReadOnlyList<(string MethodName, int ParamIndex, bool IsExtension)>? FindControlWrappers { get; set; }
         public volatile bool AspxDirty = true;
         public volatile bool RazorDirty = true;
+        public volatile bool WrappersDirty = true;
         public int AspxGeneration;
         public int RazorGeneration;
+        public int WrappersGeneration;
         public FileSystemWatcher? Watcher { get; set; }
 
         public void Dispose()

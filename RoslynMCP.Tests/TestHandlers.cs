@@ -13,6 +13,9 @@ internal static class TestHandlers
     public static IGoToDefinitionHandler[] GoToDefinition { get; } =
         [new AspxGoToDefinition(new MarkdownFormatter()), new RazorGoToDefinition(new MarkdownFormatter())];
 
+    public static IFindUsagesHandler[] FindUsages { get; } =
+        [new AspxFindUsages(new MarkdownFormatter())];
+
     public static IOutlineHandler[] Outline { get; } =
         [new AspxOutline(), new RazorOutline()];
 

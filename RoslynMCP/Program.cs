@@ -34,6 +34,7 @@ class Program
         if (!noWebForms)
         {
             builder.Services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
+            builder.Services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
             builder.Services.AddSingleton<IOutlineHandler, AspxOutline>();
             builder.Services.AddSingleton<IRenameHandler, AspxRename>();
             builder.Services.AddSingleton<IDiagnosticsHandler, AspxDiagnostics>();

@@ -117,7 +117,8 @@ public class FindUsagesRazorAspxTests
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.DefaultAspxFile,
             markupSnippet: "ID=\"[|btnSubmit|]\"",
-            fmt: new MarkdownFormatter());
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
 
         Assert.Contains("Symbol Usage Analysis", result);
         Assert.Contains("btnSubmit", result);
@@ -148,7 +149,8 @@ public class FindUsagesRazorAspxTests
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.RepeaterAspxFile,
             markupSnippet: "ID=\"[|btnAction|]\"",
-            fmt: new MarkdownFormatter());
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
 
         Assert.Contains("Control ID References", result);
         Assert.Contains("btnAction", result);
@@ -163,7 +165,8 @@ public class FindUsagesRazorAspxTests
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.RepeaterAspxFile,
             markupSnippet: "ID=\"[|lblName|]\"",
-            fmt: new MarkdownFormatter());
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
 
         Assert.Contains("Control ID References", result);
         Assert.Contains("lblName", result);
@@ -179,7 +182,8 @@ public class FindUsagesRazorAspxTests
         var result = await FindUsagesTool.FindUsages(
             filePath: FixturePaths.RepeaterAspxFile,
             markupSnippet: "ID=\"[|btnAction|]\"",
-            fmt: new MarkdownFormatter());
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
 
         Assert.Contains("FindControl References", result);
         // Both direct FindControl call (in InitItem) and SetText wrapper call should appear

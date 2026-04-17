@@ -9,7 +9,7 @@ public class BuildProjectToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await BuildProjectTool.BuildProject(projectPath: "", new BackgroundTaskStore());
+        var result = await BuildProjectTool.BuildProject(projectPath: "", new BackgroundTaskStore(), new BuildWarningsStore());
 
         Assert.Contains("Error", result);
     }
@@ -18,7 +18,7 @@ public class BuildProjectToolTests
     public async Task WhenValidProjectBuiltThenReportsSuccess()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore());
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(), new BuildWarningsStore());
 
         Assert.Contains("succeeded", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -27,7 +27,7 @@ public class BuildProjectToolTests
     public async Task WhenSourceFileProvidedThenResolvesToProject()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.CalculatorFile, new BackgroundTaskStore());
+            projectPath: FixturePaths.CalculatorFile, new BackgroundTaskStore(), new BuildWarningsStore());
 
         Assert.Contains("succeeded", result, StringComparison.OrdinalIgnoreCase);
     }
@@ -36,7 +36,7 @@ public class BuildProjectToolTests
     public async Task WhenNonExistentProjectProvidedThenReturnsError()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: @"C:\NonExistent\Project.csproj", new BackgroundTaskStore());
+            projectPath: @"C:\NonExistent\Project.csproj", new BackgroundTaskStore(), new BuildWarningsStore());
 
         Assert.Contains("Error", result);
     }
@@ -45,7 +45,7 @@ public class BuildProjectToolTests
     public async Task WhenConfigurationProvidedThenUsesIt()
     {
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(),
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(), new BuildWarningsStore(),
             configuration: "Release");
 
         Assert.Contains("succeeded", result, StringComparison.OrdinalIgnoreCase);
@@ -56,7 +56,7 @@ public class BuildProjectToolTests
     {
         // Configuration with injection attempt should be sanitized
         var result = await BuildProjectTool.BuildProject(
-            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(),
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(), new BuildWarningsStore(),
             configuration: "Debug; rm -rf /");
 
         // Should either succeed with sanitized config or fail safely

@@ -16,6 +16,7 @@ public static class BuildProjectTool
         [Description("Path to the .csproj, .sln file, or a source file in the project.")]
         string projectPath,
         BackgroundTaskStore taskStore,
+        BuildWarningsStore warningsStore,
         [Description("Build configuration. Default: 'Debug'.")]
         string configuration = "Debug",
         [Description("Set to true to build in the background. Returns a task ID immediately " +
@@ -95,7 +96,7 @@ public static class BuildProjectTool
                 return "Build was cancelled.";
             }
 
-            return FormatBuildOutput(stdout.ToString(), stderr.ToString(), process.ExitCode, resolved);
+            return FormatBuildOutput(stdout.ToString(), stderr.ToString(), process.ExitCode, resolved, warningsStore);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -104,7 +105,7 @@ public static class BuildProjectTool
         }
     }
 
-    private static string ResolveBuildTarget(string path)
+    internal static string ResolveBuildTarget(string path)
     {
         var normalized = PathHelper.NormalizePath(path);
 
@@ -131,26 +132,23 @@ public static class BuildProjectTool
         return $"Error: Could not find a buildable target for '{path}'.";
     }
 
-    private static string FormatBuildOutput(string stdout, string stderr, int exitCode, string target)
+    private static string FormatBuildOutput(
+        string stdout, string stderr, int exitCode, string target,
+        BuildWarningsStore warningsStore)
     {
         var sb = new StringBuilder();
 
         if (exitCode == 0)
-        {
             sb.AppendLine("✅ **Build Succeeded**");
-        }
         else
-        {
             sb.AppendLine("❌ **Build Failed**");
-        }
 
         sb.AppendLine();
         sb.AppendLine($"**Target**: {Path.GetFileName(target)}");
         sb.AppendLine();
 
-        // Extract errors and warnings from build output
         var errors = new List<string>();
-        var warnings = new List<string>();
+        var warningLines = new List<string>();
 
         foreach (var rawLine in stdout.Split('\n'))
         {
@@ -160,8 +158,11 @@ public static class BuildProjectTool
             if (line.Contains(": error ", StringComparison.Ordinal))
                 errors.Add(line);
             else if (line.Contains(": warning ", StringComparison.Ordinal))
-                warnings.Add(line);
+                warningLines.Add(line);
         }
+
+        // Store warnings for later retrieval via GetBuildWarnings
+        warningsStore.Store(target, warningLines);
 
         if (errors.Count > 0)
         {
@@ -173,13 +174,25 @@ public static class BuildProjectTool
             sb.AppendLine();
         }
 
-        if (warnings.Count > 0)
+        if (warningLines.Count > 0)
         {
-            sb.AppendLine($"**Warnings ({warnings.Count}):**");
+            var grouped = warningsStore.GetAll(target)!;
+            var sorted = grouped.OrderByDescending(kv => kv.Value.Count).ToList();
+            int uniqueCodes = sorted.Count;
+
+            sb.AppendLine($"**Warnings ({warningLines.Count} total, {uniqueCodes} unique code{(uniqueCodes == 1 ? "" : "s")}):**");
             sb.AppendLine("```");
-            foreach (var warning in warnings)
-                sb.AppendLine(warning);
+            foreach (var (code, lines) in sorted)
+            {
+                var firstMessage = BuildWarningsStore.ExtractMessage(lines[0]);
+                // Truncate long messages for readability
+                if (firstMessage.Length > 100)
+                    firstMessage = firstMessage[..97] + "...";
+                sb.AppendLine($"{lines.Count,5}x  {code}  — {firstMessage}");
+            }
             sb.AppendLine("```");
+            sb.AppendLine();
+            sb.AppendLine($"> Use `GetBuildWarnings` with the project path and a warning code (e.g. `CS0414`) to see all occurrences.");
             sb.AppendLine();
         }
 

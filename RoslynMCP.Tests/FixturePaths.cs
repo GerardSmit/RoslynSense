@@ -33,6 +33,7 @@ internal static class FixturePaths
     public static string AspxProjectFile => Path.Combine(AspxProjectDir, "AspxProject.csproj");
     public static string DefaultAspxFile => Path.Combine(AspxProjectDir, "Default.aspx");
     public static string HeaderControlFile => Path.Combine(AspxProjectDir, "Controls", "HeaderControl.ascx");
+    public static string OrderItemsAscxFile => Path.Combine(AspxProjectDir, "Controls", "OrderItems.ascx");
     public static string SiteMasterFile => Path.Combine(AspxProjectDir, "Site.master");
     public static string DataServiceFile => Path.Combine(AspxProjectDir, "DataService.asmx");
     public static string ImageHandlerFile => Path.Combine(AspxProjectDir, "ImageHandler.ashx");

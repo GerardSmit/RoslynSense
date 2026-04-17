@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Services;
 
@@ -27,8 +28,20 @@ internal class AspxFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
         if (string.IsNullOrEmpty(projectPath))
             return "Error: Couldn't find a project containing this file.";
 
-        var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
+        // Workspace loading can fail in environments without .NET Framework CLR (clr.dll),
+        // or when VS Build Tools aren't installed for legacy projects. Fall back to a pure
+        // text search so callers still get FindControl reference locations.
+        Workspace workspace;
+        Project project;
+        try
+        {
+            (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
+                projectPath, targetFilePath: systemPath, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return await TextSearchFallbackAsync(systemPath, projectPath, markup!, ex, fmt, cancellationToken);
+        }
 
         var compilation = await project.GetCompilationAsync(cancellationToken);
         if (compilation is null)
@@ -72,7 +85,7 @@ internal class AspxFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
         if (symbol is null && controlId is null)
             return $"No symbol found for '{markup!.MarkedText}' in ASPX file.";
 
-        var aspxIndex = await ProjectIndexCacheService.GetAspxIndexAsync(project, cancellationToken);
+        var aspxIndex = await ProjectIndexCacheService.GetAspxIndexAsync(project, cancellationToken, compilation);
 
         // Template-nested control: no code-behind field, only FindControl search
         if (symbol is null)
@@ -166,5 +179,119 @@ internal class AspxFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
         fmt.AppendHints(results, "Use get_call_hierarchy on a FindControl call site to trace the full caller chain");
 
         return results.ToString();
+    }
+
+    /// <summary>
+    /// Pure filesystem text search used when the Roslyn workspace cannot be loaded
+    /// (e.g. missing .NET Framework CLR for legacy projects, or no VS Build Tools).
+    /// Scans all .cs files for FindControl("id") string literals and reports matches.
+    /// </summary>
+    private static async Task<string> TextSearchFallbackAsync(
+        string filePath, string projectPath, MarkupString markup,
+        Exception workspaceError, IOutputFormatter fmt, CancellationToken ct)
+    {
+        var controlId = markup.MarkedText;
+        var projectDir = Path.GetDirectoryName(projectPath) ?? ".";
+        var findControlRefs = await TextSearchFindControlAsync(projectDir, controlId, ct);
+
+        var results = new StringBuilder();
+        fmt.AppendHeader(results, "Control ID References (Text Search)");
+
+        fmt.AppendHeader(results, "Search Information", level: 2);
+        fmt.AppendField(results, "File", filePath);
+        fmt.AppendField(results, "Control ID", controlId);
+        fmt.AppendField(results, "Project", Path.GetFileName(projectPath));
+        fmt.AppendField(results, "Warning",
+            $"Roslyn workspace could not be loaded ({workspaceError.GetType().Name}: {workspaceError.Message}). " +
+            "Results are from a plain text search — wrapper methods and Roslyn symbol analysis are skipped.");
+        fmt.AppendSeparator(results);
+
+        if (findControlRefs.Count > 0)
+        {
+            fmt.AppendHeader(results, "FindControl References", level: 2);
+            fmt.AppendField(results, "Found", $"{findControlRefs.Count} FindControl(\"{controlId}\") call(s)");
+            fmt.AppendSeparator(results);
+
+            var rows = findControlRefs
+                .Select(r =>
+                {
+                    var snippet = r.CodeSnippet.Length > 80 ? r.CodeSnippet[..77] + "..." : r.CodeSnippet;
+                    return new string[] { r.FilePath, $"{r.Line}", snippet };
+                })
+                .ToList();
+            fmt.AppendTable(results, "FindControl Calls", ["File", "Line", "Snippet"], rows);
+        }
+        else
+        {
+            fmt.AppendHeader(results, "FindControl References", level: 2);
+            fmt.AppendField(results, "Found", "None");
+            fmt.AppendSeparator(results);
+        }
+
+        fmt.AppendHeader(results, "Summary", level: 2);
+        fmt.AppendField(results, "Control ID", $"`{controlId}`");
+        fmt.AppendField(results, "FindControl calls (text)", findControlRefs.Count);
+        fmt.AppendSeparator(results);
+        fmt.AppendHints(results,
+            "Install .NET Framework 4.7.2+ and Visual Studio Build Tools, then restart the MCP server for full Roslyn analysis");
+
+        return results.ToString();
+    }
+
+    /// <summary>
+    /// Scans <paramref name="projectDir"/> for <c>*.cs</c> files containing
+    /// <c>FindControl("controlId")</c> as a plain text match (no Roslyn required).
+    /// </summary>
+    private static async Task<List<AspxSymbolReference>> TextSearchFindControlAsync(
+        string projectDir, string controlId, CancellationToken ct)
+    {
+        var pattern = $"FindControl(\"{controlId}\")";
+        var bag = new System.Collections.Concurrent.ConcurrentBag<AspxSymbolReference>();
+
+        List<string> files;
+        try
+        {
+            files = [.. Directory.EnumerateFiles(projectDir, "*.cs", SearchOption.AllDirectories)
+                .Where(f => !IsInObjOrBin(f, projectDir))];
+        }
+        catch { return []; }
+
+        await Parallel.ForEachAsync(
+            files,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount, CancellationToken = ct },
+            async (file, fileCt) =>
+            {
+                string text;
+                try { text = await File.ReadAllTextAsync(file, fileCt); }
+                catch { return; }
+
+                if (!text.Contains(pattern, StringComparison.Ordinal)) return;
+
+                int lineNum = 1;
+                int start = 0;
+                while (start < text.Length)
+                {
+                    int end = text.IndexOf('\n', start);
+                    if (end < 0) end = text.Length;
+                    var line = text[start..end];
+                    if (line.Contains(pattern, StringComparison.Ordinal))
+                    {
+                        bag.Add(new AspxSymbolReference(
+                            file, lineNum, 1, line.Trim(), AspxCodeLocationType.FindControlCall));
+                    }
+                    start = end + 1;
+                    lineNum++;
+                }
+            });
+
+        return [.. bag.OrderBy(r => r.FilePath).ThenBy(r => r.Line)];
+    }
+
+    private static bool IsInObjOrBin(string filePath, string projectDir)
+    {
+        var rel = Path.GetRelativePath(projectDir, filePath);
+        var seg = rel.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
+        return seg.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+               seg.Equals("bin", StringComparison.OrdinalIgnoreCase);
     }
 }

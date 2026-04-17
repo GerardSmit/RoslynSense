@@ -37,9 +37,12 @@ internal static class ProjectIndexCacheService
 
     /// <summary>
     /// Returns a cached or freshly-built ASPX project index.
+    /// Pass <paramref name="compilation"/> when the caller has already obtained the compilation
+    /// to avoid a redundant <c>GetCompilationAsync</c> call inside the builder.
     /// </summary>
     public static async Task<AspxProjectIndex> GetAspxIndexAsync(
-        Project project, CancellationToken cancellationToken = default)
+        Project project, CancellationToken cancellationToken = default,
+        Compilation? compilation = null)
     {
         var entry = await GetOrCreateEntryAsync(project, cancellationToken);
 
@@ -53,7 +56,7 @@ internal static class ProjectIndexCacheService
         try { genBefore = entry.AspxGeneration; }
         finally { s_lock.Release(); }
 
-        var index = await AspxSourceMappingService.BuildProjectIndexAsync(project, cancellationToken);
+        var index = await AspxSourceMappingService.BuildProjectIndexAsync(project, cancellationToken, compilation);
 
         await s_lock.WaitAsync(cancellationToken);
         try

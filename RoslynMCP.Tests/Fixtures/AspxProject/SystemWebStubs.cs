@@ -26,6 +26,8 @@ namespace System.Web.UI
         public bool IsPostBack { get; }
     }
 
+    public class UserControl : Control { }
+
     namespace HtmlControls
     {
         public class HtmlGenericControl : Control { }
@@ -39,6 +41,11 @@ namespace System.Web.UI
     namespace WebControls
     {
         public class WebControl : Control { }
+
+        public class Literal : WebControl
+        {
+            public string Text { get; set; } = "";
+        }
 
         public class Label : WebControl
         {

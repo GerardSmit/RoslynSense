@@ -419,14 +419,12 @@ internal static class AspxSourceMappingService
             ct.ThrowIfCancellationRequested();
 
             // Fast path: skip documents that don't contain "FindControl" at all.
-            // This avoids the expensive GetSemanticModelAsync call for the vast majority of files.
             var docText = await document.GetTextAsync(ct);
             if (!docText.ToString().Contains("FindControl", StringComparison.Ordinal))
                 continue;
 
             var root = await document.GetSyntaxRootAsync(ct);
-            var model = await document.GetSemanticModelAsync(ct);
-            if (root is null || model is null) continue;
+            if (root is null) continue;
 
             foreach (var inv in root.DescendantNodes()
                          .OfType<InvocationExpressionSyntax>())
@@ -436,24 +434,35 @@ internal static class AspxSourceMappingService
                 var args = inv.ArgumentList.Arguments;
                 if (args.Count == 0) continue;
 
+                // The argument must be a plain identifier (i.e. a forwarded parameter, not a literal).
                 var argExpr = args[0].Expression;
                 if (argExpr is not IdentifierNameSyntax ident) continue;
-
-                if (model.GetSymbolInfo(ident, ct).Symbol is not IParameterSymbol param) continue;
 
                 var methodDecl = inv.AncestorsAndSelf()
                     .OfType<MethodDeclarationSyntax>()
                     .FirstOrDefault();
                 if (methodDecl is null) continue;
 
-                if (model.GetDeclaredSymbol(methodDecl, ct) is not IMethodSymbol methodSymbol) continue;
-
-                var paramIndex = methodSymbol.Parameters.IndexOf(param);
+                // Find which parameter index corresponds to the identifier — syntax-only, no semantic model needed.
+                var paramList = methodDecl.ParameterList.Parameters;
+                int paramIndex = -1;
+                for (int i = 0; i < paramList.Count; i++)
+                {
+                    if (paramList[i].Identifier.Text == ident.Identifier.Text)
+                    {
+                        paramIndex = i;
+                        break;
+                    }
+                }
                 if (paramIndex < 0) continue;
 
-                var key = $"{methodSymbol.Name}:{paramIndex}";
+                bool isExtension = paramList.Count > 0
+                    && paramList[0].Modifiers.Any(m => m.IsKind(SyntaxKind.ThisKeyword));
+
+                string methodName = methodDecl.Identifier.Text;
+                var key = $"{methodName}:{paramIndex}";
                 if (seen.Add(key))
-                    wrappers.Add((methodSymbol.Name, paramIndex, methodSymbol.IsExtensionMethod));
+                    wrappers.Add((methodName, paramIndex, isExtension));
             }
         }
 
@@ -706,36 +715,50 @@ internal static class AspxSourceMappingService
     /// Skips obj/bin directories.
     /// </summary>
     public static async Task<AspxProjectIndex> BuildProjectIndexAsync(
-        Project project, CancellationToken cancellationToken = default)
+        Project project, CancellationToken cancellationToken = default,
+        Compilation? compilation = null)
     {
         var projectDir = Path.GetDirectoryName(project.FilePath);
         if (projectDir is null || !Directory.Exists(projectDir))
             return new AspxProjectIndex([]);
 
-        var compilation = await project.GetCompilationAsync(cancellationToken);
+        compilation ??= await project.GetCompilationAsync(cancellationToken);
         if (compilation is null)
             return new AspxProjectIndex([]);
 
         // Load globally registered tag prefixes from web.config
         var webConfigNamespaces = LoadWebConfigNamespaces(projectDir);
 
-        var results = new List<AspxParseResult>();
-
+        // Collect all ASPX-family files up front (excluding obj/bin)
+        var allFiles = new List<string>();
         foreach (var ext in s_aspxExtensions)
         {
             foreach (var file in Directory.EnumerateFiles(projectDir, $"*{ext}", SearchOption.AllDirectories))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-
                 var relativePath = Path.GetRelativePath(projectDir, file);
                 var firstSegment = relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
                 if (firstSegment.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
                     firstSegment.Equals("bin", StringComparison.OrdinalIgnoreCase))
                     continue;
+                allFiles.Add(file);
+            }
+        }
 
+        // Parse all files in parallel — RootNode.Parse and Compilation are both thread-safe.
+        var results = new System.Collections.Concurrent.ConcurrentBag<AspxParseResult>();
+        await Parallel.ForEachAsync(
+            allFiles,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = cancellationToken
+            },
+            async (file, ct) =>
+            {
                 try
                 {
-                    var text = await File.ReadAllTextAsync(file, cancellationToken);
+                    var text = await File.ReadAllTextAsync(file, ct);
                     var result = Parse(file, text, compilation,
                         namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
                         rootDirectory: projectDir);
@@ -745,10 +768,9 @@ internal static class AspxSourceMappingService
                 {
                     Console.Error.WriteLine($"[AspxIndex] Error parsing '{file}': {ex.Message}");
                 }
-            }
-        }
+            });
 
-        return new AspxProjectIndex(results);
+        return new AspxProjectIndex([.. results]);
     }
 
     /// <summary>

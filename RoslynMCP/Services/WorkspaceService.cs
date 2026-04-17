@@ -353,6 +353,16 @@ internal static class WorkspaceService
                 }
             }
         }
+        catch (DllNotFoundException dllEx)
+        {
+            // clr.dll (or another native DLL) could not be loaded. This typically means
+            // .NET Framework is not installed, or the VS Setup COM component is broken.
+            await RemoveInflightAndSignal(normalizedPath, ourTcs!, dllEx);
+            throw new PlatformNotSupportedException(
+                $"Opening '{Path.GetFileName(normalizedPath)}' requires a native DLL that could not be loaded " +
+                $"({dllEx.Message}). For legacy .NET Framework projects, ensure .NET Framework 4.7.2 or later " +
+                "is installed and Visual Studio Build Tools are present.", dllEx);
+        }
         catch (Exception ex)
         {
             await RemoveInflightAndSignal(normalizedPath, ourTcs!, ex);

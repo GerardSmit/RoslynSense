@@ -11,8 +11,13 @@ using RoslynMCP.Tools.WebForms;
 [ExcludeFromCodeCoverage]
 class Program
 {
-    static async Task Main(string[] args)
+    static async Task<int> Main(string[] args)
     {
+        // CLI mode: roslyn-sense --cli [tool] [options]
+        // Runs a single tool and prints the result, without starting the MCP server.
+        if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
+            return await RoslynMCP.CliRunner.RunAsync(args[1..]);
+
         bool noWebForms = args.Contains("--no-webforms", StringComparer.OrdinalIgnoreCase);
         bool noRazor = args.Contains("--no-razor", StringComparer.OrdinalIgnoreCase);
 
@@ -29,6 +34,7 @@ class Program
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
         builder.Services.AddSingleton<ProfilingSessionStore>();
         builder.Services.AddSingleton<BackgroundTaskStore>();
+        builder.Services.AddSingleton<BuildWarningsStore>();
 
         // Register non-C# file type handlers conditionally
         if (!noWebForms)
@@ -55,5 +61,6 @@ class Program
             .WithResourcesFromAssembly()
             .WithPromptsFromAssembly();
         await builder.Build().RunAsync();
+        return 0;
     }
 }

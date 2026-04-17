@@ -175,6 +175,25 @@ public class FindUsagesRazorAspxTests
     }
 
     [Fact]
+    public async Task WhenFindUsagesOnLiteralInAscxTemplateThenFindsFindControlCalls()
+    {
+        // litSizeRemark is a Literal inside <ItemTemplate> in an .ascx file — no code-behind field.
+        // This mirrors the real-world pattern that exposed the perf issue (double GetCompilationAsync,
+        // sequential ASPX parsing, GetSemanticModelAsync in wrapper discovery).
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.OrderItemsAscxFile,
+            markupSnippet: "ID=\"[|litSizeRemark|]\"",
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
+
+        Assert.Contains("Control ID References", result);
+        Assert.Contains("litSizeRemark", result);
+        // The FindControl("litSizeRemark") call in the code-behind should be surfaced
+        Assert.Contains("FindControl", result);
+        Assert.Contains("FindControl References", result);
+    }
+
+    [Fact]
     public async Task WhenSetTextWrapperUsedThenWrapperCallSiteIsFound()
     {
         // e.Item.SetText("btnAction", ...) calls FindControl("btnAction") via a wrapper.

@@ -229,7 +229,7 @@ Example with Razor disabled:
 | Tool | Description |
 |------|-------------|
 | **RenameSymbol** | Rename a symbol and all references across the project, including ASPX/ASCX and Razor files. Supports dry-run preview and file renames. |
-| **ExpandVarTypes** | Return a method's source with all `var` declarations replaced by their resolved explicit types. Read-only; uses Roslyn's semantic model. Supports `hintLine` to disambiguate overloads. |
+| **ExpandVarTypes** | Return a method's source with all `var` declarations replaced by their resolved explicit types. Use as a first step to understand what types a method works with — reveals return types, collection element types, and destructured results without chasing each call individually. Read-only; supports `hintLine` for overload disambiguation. |
 
 ### Testing & Coverage
 

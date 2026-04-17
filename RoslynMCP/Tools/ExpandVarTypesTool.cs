@@ -17,9 +17,13 @@ public static class ExpandVarTypesTool
 {
     [McpServerTool, Description(
         "Return the source of a specific method with all 'var' declarations replaced by their " +
-        "resolved explicit types (e.g. 'var x = Method()' → 'int x = Method()'). " +
-        "Use this to inspect return types of all method calls in a method body at once, " +
-        "instead of looking up each method's return type individually.")]
+        "resolved explicit types (e.g. 'var x = Method()' → 'Customer x = Method()'). " +
+        "Use this as your first step when you need to understand what types a method works with: " +
+        "it reveals the return type of every local call, the element type of every collection, " +
+        "and the type of every destructured result — all in one read. " +
+        "This avoids chasing each method individually with GoToDefinition or SemanticSymbolSearch. " +
+        "Especially useful before editing a method, fixing a type error, or explaining logic that " +
+        "relies on inferred types.")]
     public static async Task<string> ExpandVarTypes(
         [Description("Path to the C# source file.")]
         string filePath,

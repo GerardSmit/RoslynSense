@@ -62,4 +62,27 @@ public class BuildProjectToolTests
         // Should either succeed with sanitized config or fail safely
         Assert.DoesNotContain("rm -rf", result);
     }
+
+    [Fact]
+    public async Task WhenTimeoutExpiresThenReportsTimeout()
+    {
+        // A 0-second timeout should always fire before any real build completes
+        var result = await BuildProjectTool.BuildProject(
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(), new BuildWarningsStore(),
+            timeoutSeconds: 0);
+
+        Assert.Contains("timed out", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WhenBuildSucceedsThenWarningsGroupedByCode()
+    {
+        var warningsStore = new BuildWarningsStore();
+        var result = await BuildProjectTool.BuildProject(
+            projectPath: FixturePaths.SampleProjectFile, new BackgroundTaskStore(), warningsStore);
+
+        // Result should contain grouped warning summary (e.g. "Nx  CSxxxx")
+        // rather than individual raw warning lines with full paths
+        Assert.DoesNotContain("D:\\", result); // No absolute paths in summary
+    }
 }

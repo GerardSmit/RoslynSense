@@ -22,6 +22,8 @@ public static class BuildProjectTool
         [Description("Set to true to build in the background. Returns a task ID immediately " +
                      "so you can continue working. Use GetBackgroundTaskResult to check results later.")]
         bool background = false,
+        [Description("Timeout in seconds before the build is forcibly killed. Default: 180.")]
+        int timeoutSeconds = 180,
         CancellationToken cancellationToken = default)
     {
         try
@@ -86,13 +88,21 @@ public static class BuildProjectTool
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, timeoutCts.Token);
+
             try
             {
-                await process.WaitForExitAsync(cancellationToken);
+                await process.WaitForExitAsync(linkedCts.Token);
             }
             catch (OperationCanceledException)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
+
+                if (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                    return $"Build timed out after {timeoutSeconds} seconds and was forcibly terminated.";
+
                 return "Build was cancelled.";
             }
 
@@ -166,10 +176,21 @@ public static class BuildProjectTool
 
         if (errors.Count > 0)
         {
-            sb.AppendLine($"**Errors ({errors.Count}):**");
+            // Group errors by the project name in the trailing [...] bracket
+            var byProject = GroupDiagnosticsByProject(errors);
+            int projectCount = byProject.Count;
+
+            sb.AppendLine(projectCount > 1
+                ? $"**Errors ({errors.Count} in {projectCount} projects):**"
+                : $"**Errors ({errors.Count}):**");
             sb.AppendLine("```");
-            foreach (var error in errors)
-                sb.AppendLine(error);
+            foreach (var (projectLabel, projectErrors) in byProject)
+            {
+                if (projectCount > 1)
+                    sb.AppendLine($"{projectLabel}:");
+                foreach (var err in projectErrors)
+                    sb.AppendLine(err);
+            }
             sb.AppendLine("```");
             sb.AppendLine();
         }
@@ -222,6 +243,85 @@ public static class BuildProjectTool
         }
 
         return sb.ToString();
+    }
+
+    // Regex: captures the trailing [project.csproj] bracket from a diagnostic line
+    private static readonly System.Text.RegularExpressions.Regex DiagnosticProjectRegex =
+        new(@"\[([^\[\]]+\.(?:csproj|vbproj|fsproj))\]\s*$",
+            System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    // Regex: matches "path(line,col): severity code: message [project]"
+    // Group 1 = file path, Group 2 = rest (line/col/message)
+    private static readonly System.Text.RegularExpressions.Regex DiagnosticLineRegex =
+        new(@"^(.+?)\((\d+,\d+)\):\s*(.+)$",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>
+    /// Groups diagnostic lines by their project (from the trailing [project.csproj] bracket)
+    /// and rewrites each line to use a path relative to its project directory.
+    /// </summary>
+    private static List<(string ProjectLabel, List<string> Lines)> GroupDiagnosticsByProject(
+        IEnumerable<string> diagnostics)
+    {
+        // Preserve insertion order; key = project file path (normalized), value = label + lines
+        var order = new List<string>();
+        var groups = new Dictionary<string, (string Label, List<string> Lines)>(
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var line in diagnostics)
+        {
+            var projMatch = DiagnosticProjectRegex.Match(line);
+            string projectKey;
+            string projectLabel;
+
+            if (projMatch.Success)
+            {
+                projectKey = projMatch.Groups[1].Value;
+                projectLabel = Path.GetFileName(projectKey);
+            }
+            else
+            {
+                projectKey = "__general__";
+                projectLabel = "General";
+            }
+
+            if (!groups.ContainsKey(projectKey))
+            {
+                groups[projectKey] = (projectLabel, []);
+                order.Add(projectKey);
+            }
+
+            // Rewrite the file path to be relative to the project directory
+            string formatted = line;
+            if (projMatch.Success)
+            {
+                var projectDir = Path.GetDirectoryName(projMatch.Groups[1].Value);
+                var lineMatch = DiagnosticLineRegex.Match(line);
+                if (lineMatch.Success && projectDir is not null)
+                {
+                    var filePath = lineMatch.Groups[1].Value;
+                    try
+                    {
+                        var relative = Path.GetRelativePath(projectDir, filePath);
+                        // Strip trailing [project] bracket and rewrite path as relative
+                        var rest = lineMatch.Groups[3].Value;
+                        var bracketIdx = rest.LastIndexOf('[');
+                        var restWithoutBracket = bracketIdx >= 0
+                            ? rest[..bracketIdx].TrimEnd()
+                            : rest;
+                        formatted = $"{relative}({lineMatch.Groups[2].Value}): {restWithoutBracket}";
+                    }
+                    catch
+                    {
+                        formatted = line;
+                    }
+                }
+            }
+
+            groups[projectKey].Lines.Add(formatted);
+        }
+
+        return order.Select(k => (groups[k].Label, groups[k].Lines)).ToList();
     }
 
     private static string BuildDotnetArgs(string resolved, string configuration) =>

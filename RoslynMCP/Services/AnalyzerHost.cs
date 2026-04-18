@@ -17,6 +17,13 @@ namespace RoslynMCP.Services;
 /// Idle entries are automatically evicted after <see cref="IdleTimeout"/>, mirroring
 /// the workspace cache eviction lifecycle in <see cref="WorkspaceService"/>.
 /// </para>
+/// <para>
+/// Non-NuGet analyzer DLLs (e.g.&nbsp;project-referenced analyzers) are shadow-copied
+/// to a temporary directory via <see cref="ShadowCopyManager"/> so that the original
+/// files remain unlocked and can be overwritten by MSBuild during builds. A
+/// <see cref="FileSystemWatcher"/> on the source directory automatically evicts the
+/// cached entry when the analyzer is rebuilt.
+/// </para>
 /// </summary>
 internal sealed class AnalyzerHost : IDisposable
 {
@@ -26,10 +33,21 @@ internal sealed class AnalyzerHost : IDisposable
     private readonly Lock _lock = new();
     private readonly Dictionary<string, AnalyzerCacheEntry> _entries = new(StringComparer.Ordinal);
     private readonly Timer _evictionTimer;
+    private readonly ShadowCopyManager _shadowCopy;
+
+    /// <summary>
+    /// Reverse mapping: source directory → set of cache keys whose analyzer DLLs
+    /// came from that directory. Used to evict the correct entries when a
+    /// <see cref="FileSystemWatcher"/> detects a rebuild.
+    /// </summary>
+    private readonly Dictionary<string, HashSet<string>> _dirToKeys = new(StringComparer.OrdinalIgnoreCase);
+
     private bool _disposed;
 
     public AnalyzerHost()
     {
+        _shadowCopy = new ShadowCopyManager();
+        _shadowCopy.AnalyzerDirectoryChanged += OnAnalyzerDirectoryChanged;
         _evictionTimer = new Timer(EvictExpiredEntries, null, EvictionInterval, EvictionInterval);
     }
 
@@ -60,6 +78,23 @@ internal sealed class AnalyzerHost : IDisposable
 
             var entry = LoadIsolated(analyzerPaths);
             _entries[key] = entry;
+
+            // Track which source directories contribute to this cache entry
+            // so we can auto-evict when a FileSystemWatcher detects a rebuild.
+            foreach (var path in analyzerPaths)
+            {
+                if (_shadowCopy.NeedsShadowCopy(path))
+                {
+                    string dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
+                    if (!_dirToKeys.TryGetValue(dir, out var keys))
+                    {
+                        keys = new HashSet<string>(StringComparer.Ordinal);
+                        _dirToKeys[dir] = keys;
+                    }
+                    keys.Add(key);
+                }
+            }
+
             Console.Error.WriteLine(
                 $"[AnalyzerHost] Loaded {entry.Analyzers.Length} analyzer(s) from {analyzerPaths.Count} DLL(s) for project '{Path.GetFileName(projectKey)}'.");
             return entry.Analyzers;
@@ -82,13 +117,9 @@ internal sealed class AnalyzerHost : IDisposable
 
             foreach (var key in toRemove)
             {
-                if (_entries.TryGetValue(key, out var entry))
-                {
-                    _entries.Remove(key);
-                    entry.Dispose();
-                    Console.Error.WriteLine(
-                        $"[AnalyzerHost] Evicted analyzer context for project '{Path.GetFileName(projectKey)}'.");
-                }
+                RemoveEntryUnderLock(key);
+                Console.Error.WriteLine(
+                    $"[AnalyzerHost] Evicted analyzer context for project '{Path.GetFileName(projectKey)}'.");
             }
         }
     }
@@ -104,6 +135,7 @@ internal sealed class AnalyzerHost : IDisposable
             foreach (var entry in _entries.Values)
                 entry.Dispose();
             _entries.Clear();
+            _dirToKeys.Clear();
             Console.Error.WriteLine("[AnalyzerHost] All analyzer contexts unloaded.");
         }
     }
@@ -113,15 +145,20 @@ internal sealed class AnalyzerHost : IDisposable
         if (_disposed) return;
         _disposed = true;
         _evictionTimer.Dispose();
+        _shadowCopy.AnalyzerDirectoryChanged -= OnAnalyzerDirectoryChanged;
         UnloadAll();
+        _shadowCopy.Dispose();
     }
 
-    private static AnalyzerCacheEntry LoadIsolated(IReadOnlyList<string> analyzerPaths)
+    private AnalyzerCacheEntry LoadIsolated(IReadOnlyList<string> analyzerPaths)
     {
-        var context = new AnalyzerLoadContext(analyzerPaths[0]);
+        // Shadow-copy non-NuGet paths so the originals remain unlocked for MSBuild.
+        var loadPaths = analyzerPaths.Select(p => _shadowCopy.GetLoadPath(p)).ToList();
+
+        var context = new AnalyzerLoadContext(loadPaths[0]);
         var analyzers = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
 
-        foreach (var path in analyzerPaths)
+        foreach (var path in loadPaths)
         {
             try
             {
@@ -212,18 +249,62 @@ internal sealed class AnalyzerHost : IDisposable
 
             foreach (var key in expired)
             {
-                if (_entries.TryGetValue(key, out var entry))
-                {
-                    _entries.Remove(key);
-                    entry.Dispose();
-                    Console.Error.WriteLine($"[AnalyzerHost] Evicted idle analyzer context.");
-                }
+                RemoveEntryUnderLock(key);
+                Console.Error.WriteLine($"[AnalyzerHost] Evicted idle analyzer context.");
             }
         }
         finally
         {
             _lock.Exit();
         }
+    }
+
+    /// <summary>
+    /// Called by <see cref="ShadowCopyManager"/> when a <see cref="FileSystemWatcher"/>
+    /// detects that analyzer DLLs in a source directory have been modified (rebuilt).
+    /// Evicts all cache entries that loaded analyzers from that directory so that the
+    /// next call to <see cref="GetOrLoadAnalyzers"/> picks up the new binaries.
+    /// </summary>
+    private void OnAnalyzerDirectoryChanged(string directory)
+    {
+        lock (_lock)
+        {
+            if (!_dirToKeys.TryGetValue(directory, out var keys))
+                return;
+
+            foreach (var key in keys.ToList())
+            {
+                RemoveEntryUnderLock(key);
+                Console.Error.WriteLine(
+                    $"[AnalyzerHost] Auto-evicted analyzer context due to rebuild in '{directory}'.");
+            }
+
+            _dirToKeys.Remove(directory);
+        }
+    }
+
+    /// <summary>
+    /// Removes a single cache entry and cleans up its <see cref="_dirToKeys"/> reverse mappings.
+    /// Must be called under <see cref="_lock"/>.
+    /// </summary>
+    private void RemoveEntryUnderLock(string key)
+    {
+        if (!_entries.TryGetValue(key, out var entry))
+            return;
+
+        _entries.Remove(key);
+        entry.Dispose();
+
+        // Remove this key from all dir→key sets
+        var emptyDirs = new List<string>();
+        foreach (var (dir, keys) in _dirToKeys)
+        {
+            keys.Remove(key);
+            if (keys.Count == 0)
+                emptyDirs.Add(dir);
+        }
+        foreach (var dir in emptyDirs)
+            _dirToKeys.Remove(dir);
     }
 
     private sealed class AnalyzerCacheEntry : IDisposable

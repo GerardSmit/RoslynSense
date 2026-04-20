@@ -216,6 +216,8 @@ Example with Razor disabled:
 | **GetProjectStructure** | Get an overview of a project: target framework, references, source files, and types by namespace. |
 | **GetFileOutline** | Get a compact outline of a C#, ASPX, or Razor file with namespaces, types, members, and line ranges (start-end for multi-line members). Supports multiple files separated by semicolons. |
 | **ListProjects** | Discover all projects loaded in the workspace. |
+| **ListSourceGeneratedFiles** | List all source-generated files in a project, grouped by generator. |
+| **GetSourceGeneratedFileContent** | View the content of a specific source-generated file by hint name. |
 
 ### Build
 

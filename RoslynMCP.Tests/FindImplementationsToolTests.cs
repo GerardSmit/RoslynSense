@@ -8,7 +8,7 @@ public class FindImplementationsToolTests
     public async Task WhenEmptyFilePathThenReturnsError()
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
-            "", "interface [|IFoo|]");
+            "", "interface [|IFoo|]", new RoslynMCP.Services.MarkdownFormatter());
         Assert.StartsWith("Error: File path cannot be empty", result);
     }
 
@@ -16,7 +16,7 @@ public class FindImplementationsToolTests
     public async Task WhenEmptyMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
-            FixturePaths.ServicesFile, "");
+            FixturePaths.ServicesFile, "", new RoslynMCP.Services.MarkdownFormatter());
         Assert.StartsWith("Error: markupSnippet cannot be empty", result);
     }
 
@@ -24,7 +24,7 @@ public class FindImplementationsToolTests
     public async Task WhenFileNotFoundThenReturnsError()
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
-            @"C:\nonexistent\file.cs", "interface [|IFoo|]");
+            @"C:\nonexistent\file.cs", "interface [|IFoo|]", new RoslynMCP.Services.MarkdownFormatter());
         Assert.Contains("does not exist", result);
     }
 
@@ -32,7 +32,7 @@ public class FindImplementationsToolTests
     public async Task WhenInvalidMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
-            FixturePaths.ServicesFile, "no markers here");
+            FixturePaths.ServicesFile, "no markers here", new RoslynMCP.Services.MarkdownFormatter());
         Assert.Contains("Invalid markup", result);
     }
 
@@ -41,7 +41,8 @@ public class FindImplementationsToolTests
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
             FixturePaths.ServicesFile,
-            "public interface [|IStringFormatter|]");
+            "public interface [|IStringFormatter|]",
+            new RoslynMCP.Services.MarkdownFormatter());
 
         Assert.Contains("Implementations:", result);
         Assert.Contains("IStringFormatter", result);
@@ -55,7 +56,8 @@ public class FindImplementationsToolTests
         // Use a more specific snippet to avoid ambiguity between declaration and implementation
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
             FixturePaths.ServicesFile,
-            "[|FormatDisplayValue|](int value);");
+            "[|FormatDisplayValue|](int value);",
+            new RoslynMCP.Services.MarkdownFormatter());
 
         Assert.Contains("Implementations:", result);
         Assert.Contains("FormatDisplayValue", result);
@@ -67,7 +69,8 @@ public class FindImplementationsToolTests
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
             FixturePaths.CalculatorFile,
-            "public class [|Calculator|]");
+            "public class [|Calculator|]",
+            new RoslynMCP.Services.MarkdownFormatter());
 
         Assert.Contains("No derived classes found", result);
     }
@@ -78,7 +81,8 @@ public class FindImplementationsToolTests
         // Parameters/locals can't have implementations
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
             FixturePaths.CalculatorFile,
-            "public int Add(int [|a|], int b)");
+            "public int Add(int [|a|], int b)",
+            new RoslynMCP.Services.MarkdownFormatter());
 
         Assert.Contains("Cannot find implementations", result);
     }
@@ -88,7 +92,8 @@ public class FindImplementationsToolTests
     {
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
             FixturePaths.ServicesFile,
-            "public enum [|ProcessingStatus|]");
+            "public enum [|ProcessingStatus|]",
+            new RoslynMCP.Services.MarkdownFormatter());
 
         // Enums are INamedTypeSymbol but have no implementations/derived types
         Assert.Contains("Implementations:", result);
@@ -100,7 +105,8 @@ public class FindImplementationsToolTests
         // StatisticsCalculator implements IStringFormatter and spans multiple lines
         var result = await RoslynMCP.Tools.FindImplementationsTool.FindImplementations(
             FixturePaths.ServicesFile,
-            "public interface [|IStringFormatter|]");
+            "public interface [|IStringFormatter|]",
+            new RoslynMCP.Services.MarkdownFormatter());
 
         // The Lines column in the table should show a range like "28–48"
         Assert.Matches(@"\d+–\d+", result);

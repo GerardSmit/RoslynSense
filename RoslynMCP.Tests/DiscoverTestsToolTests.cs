@@ -7,14 +7,14 @@ public class DiscoverTestsToolTests
     [Fact]
     public async Task WhenProjectPathIsEmptyThenReturnsError()
     {
-        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests("");
+        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests("", fmt: new RoslynMCP.Services.MarkdownFormatter());
         Assert.Contains("Error", result);
     }
 
     [Fact]
     public async Task WhenProjectDoesNotExistThenReturnsError()
     {
-        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(@"C:\nonexistent\project.csproj");
+        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(@"C:\nonexistent\project.csproj", fmt: new RoslynMCP.Services.MarkdownFormatter());
         Assert.Contains("Error", result);
     }
 
@@ -24,7 +24,7 @@ public class DiscoverTestsToolTests
         var testProjectPath = FindTestProjectPath();
         if (testProjectPath is null) return;
 
-        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(testProjectPath);
+        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(testProjectPath, fmt: new RoslynMCP.Services.MarkdownFormatter());
 
         Assert.Contains("Test Discovery", result);
         Assert.Contains("test method(s)", result);
@@ -38,7 +38,7 @@ public class DiscoverTestsToolTests
         if (testProjectPath is null) return;
 
         var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(
-            testProjectPath, className: "DiscoverTestsToolTests");
+            testProjectPath, fmt: new RoslynMCP.Services.MarkdownFormatter(), className: "DiscoverTestsToolTests");
 
         Assert.Contains("DiscoverTestsToolTests", result);
         // Should find at least the tests in this class
@@ -52,7 +52,7 @@ public class DiscoverTestsToolTests
         if (testProjectPath is null) return;
 
         var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(
-            testProjectPath, className: "NonExistentClassName12345");
+            testProjectPath, fmt: new RoslynMCP.Services.MarkdownFormatter(), className: "NonExistentClassName12345");
 
         Assert.Contains("No test methods found", result);
     }
@@ -60,7 +60,7 @@ public class DiscoverTestsToolTests
     [Fact]
     public async Task WhenDiscoveringNonTestProjectThenReturnsNoTests()
     {
-        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(FixturePaths.SampleProjectFile);
+        var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(FixturePaths.SampleProjectFile, fmt: new RoslynMCP.Services.MarkdownFormatter());
 
         Assert.Contains("No test methods found", result);
     }
@@ -72,7 +72,7 @@ public class DiscoverTestsToolTests
         if (testProjectPath is null) return;
 
         var result = await RoslynMCP.Tools.DiscoverTestsTool.DiscoverTests(
-            testProjectPath, className: "DiscoverTestsToolTests");
+            testProjectPath, fmt: new RoslynMCP.Services.MarkdownFormatter(), className: "DiscoverTestsToolTests");
 
         // Test methods span multiple lines (attribute + body), so should show X–Y ranges
         Assert.Matches(@"\d+–\d+", result);

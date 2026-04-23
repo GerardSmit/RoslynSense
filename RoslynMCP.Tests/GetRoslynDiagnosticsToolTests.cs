@@ -8,7 +8,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(filePath: "", runAnalyzers: false);
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),filePath: "", runAnalyzers: false);
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -17,7 +17,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenNonExistentFileProvidedThenReturnsError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: "Z:/nonexistent/file.cs", runAnalyzers: false);
 
         Assert.Contains("Error", result);
@@ -27,7 +27,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenValidFileProvidedThenReturnsStructuredOutput()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile, runAnalyzers: false);
 
         Assert.Contains("# Diagnostics:", result);
@@ -38,7 +38,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenValidFileProvidedThenIncludesSeverityCounts()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile, runAnalyzers: false);
 
         Assert.Contains("**Errors**:", result);
@@ -49,7 +49,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenInvalidSeverityFilterProvidedThenReturnsError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile, severityFilter: "bogus", runAnalyzers: false);
 
         Assert.Contains("Error", result);
@@ -59,7 +59,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenWarningsFileProvidedThenReturnsStructuredOutput()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.WarningsFile, runAnalyzers: false);
 
         Assert.Contains("# Diagnostics:", result);
@@ -69,9 +69,9 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenSeverityFilterAppliedThenFiltersDiagnostics()
     {
-        var allResult = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var allResult = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile, severityFilter: "all", runAnalyzers: false);
-        var hiddenResult = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var hiddenResult = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile, severityFilter: "hidden", runAnalyzers: false);
 
         // Hidden-only results should differ from all results (or both be empty)
@@ -82,7 +82,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenBrokenSyntaxFileProvidedThenStructuredErrorsAreReturned()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.BrokenSyntaxFile,
             runAnalyzers: false);
 
@@ -95,7 +95,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenBrokenSemanticFileProvidedThenSemanticErrorsAreReturned()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.BrokenSemanticFile,
             runAnalyzers: false);
 
@@ -108,7 +108,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenAnalyzersEnabledThenAnalyzerWarningsAppearInStructuredOutput()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.WarningsFile,
             severityFilter: "warning",
             runAnalyzers: true);
@@ -120,7 +120,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenErrorFilterAppliedThenOnlyErrorsReturned()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.BrokenSyntaxFile,
             severityFilter: "error",
             runAnalyzers: false);
@@ -132,7 +132,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenInfoFilterAppliedThenReturnsStructuredOutput()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile,
             severityFilter: "info",
             runAnalyzers: false);
@@ -143,7 +143,7 @@ public class GetRoslynDiagnosticsToolTests
     [Fact]
     public async Task WhenWarningFilterAppliedThenReturnsStructuredOutput()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.WarningsFile,
             severityFilter: "warning",
             runAnalyzers: false);

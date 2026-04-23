@@ -12,7 +12,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(filePath: "", runAnalyzers: false);
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),filePath: "", runAnalyzers: false);
 
         Assert.Contains("Error", result);
         Assert.Contains("empty", result, StringComparison.OrdinalIgnoreCase);
@@ -21,7 +21,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenWhitespacePathProvidedThenReturnsError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(filePath: "   ", runAnalyzers: false);
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),filePath: "   ", runAnalyzers: false);
 
         Assert.Contains("Error", result);
     }
@@ -29,7 +29,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenNonExistentFileProvidedThenReturnsFileNotFoundError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: Path.Combine(FixturePaths.SampleProjectDir, "DoesNotExist.cs"),
             runAnalyzers: false);
 
@@ -39,7 +39,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenValidFileProvidedThenReportsDiagnosticsHeader()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile,
             runAnalyzers: false);
 
@@ -50,7 +50,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenValidFileProvidedThenReportsZeroErrors()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile,
             runAnalyzers: false);
 
@@ -60,7 +60,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenBrokenSyntaxFileProvidedThenReportsErrors()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.BrokenSyntaxFile,
             runAnalyzers: false);
 
@@ -71,7 +71,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenBrokenSemanticFileProvidedThenReportsErrors()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.BrokenSemanticFile,
             runAnalyzers: false);
 
@@ -82,7 +82,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenAnalyzersEnabledThenIncludesAnalyzerDiagnostics()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.WarningsFile,
             runAnalyzers: true);
 
@@ -93,7 +93,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenAspxFileProvidedThenReturnsOutlineWithDirectives()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.DefaultAspxFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -105,7 +105,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenAscxFileProvidedThenReturnsOutline()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.HeaderControlFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -117,7 +117,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenMasterPageProvidedThenReturnsOutline()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.SiteMasterFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -129,7 +129,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenRazorFileProvidedThenReturnsDiagnosticsReport()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CounterRazorFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -141,7 +141,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenRazorFileWithNoDiagnosticsThenReportsNoDiagnostics()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CounterRazorFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -152,7 +152,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenAsmxFileProvidedThenReturnsOutline()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.DataServiceFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -164,7 +164,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenAshxFileProvidedThenReturnsOutline()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.ImageHandlerFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);
@@ -176,7 +176,7 @@ public class ValidateFileToolTests
     [Fact]
     public async Task WhenWeatherRazorFileProvidedThenReturnsValidationReport()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.WeatherRazorFile,
             runAnalyzers: false,
             handlers: TestHandlers.Diagnostics);

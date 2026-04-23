@@ -8,7 +8,7 @@ public class CallHierarchyToolTests
     public async Task WhenEmptyFilePathThenReturnsError()
     {
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
-            "", "void [|Foo|]()");
+            "", "void [|Foo|]()", new RoslynMCP.Services.MarkdownFormatter());
         Assert.StartsWith("Error: File path cannot be empty", result);
     }
 
@@ -16,7 +16,7 @@ public class CallHierarchyToolTests
     public async Task WhenEmptyMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
-            FixturePaths.CalculatorFile, "");
+            FixturePaths.CalculatorFile, "", new RoslynMCP.Services.MarkdownFormatter());
         Assert.StartsWith("Error: markupSnippet cannot be empty", result);
     }
 
@@ -24,7 +24,7 @@ public class CallHierarchyToolTests
     public async Task WhenFileNotFoundThenReturnsError()
     {
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
-            @"C:\nonexistent\file.cs", "void [|Foo|]()");
+            @"C:\nonexistent\file.cs", "void [|Foo|]()", new RoslynMCP.Services.MarkdownFormatter());
         Assert.Contains("does not exist", result);
     }
 
@@ -32,7 +32,7 @@ public class CallHierarchyToolTests
     public async Task WhenInvalidMarkupThenReturnsError()
     {
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
-            FixturePaths.CalculatorFile, "no markers here");
+            FixturePaths.CalculatorFile, "no markers here", new RoslynMCP.Services.MarkdownFormatter());
         Assert.Contains("Invalid markup", result);
     }
 
@@ -43,6 +43,7 @@ public class CallHierarchyToolTests
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
             FixturePaths.CalculatorFile,
             "public int [|Add|](int a, int b)",
+            new RoslynMCP.Services.MarkdownFormatter(),
             direction: "callers");
 
         Assert.Contains("Call Hierarchy", result);
@@ -58,6 +59,7 @@ public class CallHierarchyToolTests
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
             FixturePaths.CalculatorFile,
             "public Result [|Compute|](int a, int b)",
+            new RoslynMCP.Services.MarkdownFormatter(),
             direction: "callees");
 
         Assert.Contains("Callees", result);
@@ -71,6 +73,7 @@ public class CallHierarchyToolTests
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
             FixturePaths.CalculatorFile,
             "public int [|Add|](int a, int b)",
+            new RoslynMCP.Services.MarkdownFormatter(),
             direction: "both");
 
         Assert.Contains("Callers", result);
@@ -84,6 +87,7 @@ public class CallHierarchyToolTests
         var result = await RoslynMCP.Tools.CallHierarchyTool.GetCallHierarchy(
             FixturePaths.CalculatorFile,
             "public Result [|Compute|](int a, int b)",
+            new RoslynMCP.Services.MarkdownFormatter(),
             direction: "callers");
 
         Assert.Contains("Callers", result);

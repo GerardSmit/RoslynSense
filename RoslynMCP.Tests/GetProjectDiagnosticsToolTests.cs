@@ -12,7 +12,7 @@ public class GetProjectDiagnosticsToolTests
     [Fact]
     public async Task WhenValidProjectProvidedThenReturnsDiagnostics()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.SampleProjectFile,
             severityFilter: "warning",
             runAnalyzers: false);
@@ -24,7 +24,7 @@ public class GetProjectDiagnosticsToolTests
     [Fact]
     public async Task WhenErrorFilterUsedOnCleanProjectThenReturnsNoDiagnostics()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.SampleProjectFile,
             severityFilter: "error",
             runAnalyzers: false);
@@ -36,7 +36,7 @@ public class GetProjectDiagnosticsToolTests
     [Fact]
     public async Task WhenInvalidSeverityFilterProvidedThenReturnsError()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.SampleProjectFile,
             severityFilter: "bogus",
             runAnalyzers: false);
@@ -47,7 +47,7 @@ public class GetProjectDiagnosticsToolTests
     [Fact]
     public async Task WhenMaxResultsLimitedThenRespectsLimit()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.SampleProjectFile,
             severityFilter: "all",
             maxResults: 2,
@@ -59,7 +59,7 @@ public class GetProjectDiagnosticsToolTests
     [Fact]
     public async Task WhenBrokenProjectProvidedThenReportsErrors()
     {
-        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(
+        var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.BrokenProjectFile,
             severityFilter: "error",
             runAnalyzers: false);

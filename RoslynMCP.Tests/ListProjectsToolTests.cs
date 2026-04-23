@@ -8,7 +8,7 @@ public class ListProjectsToolTests
     [Fact]
     public async Task WhenEmptyPathProvidedThenReturnsError()
     {
-        var result = await ListProjectsTool.ListProjects(path: "");
+        var result = await ListProjectsTool.ListProjects(fmt: new RoslynMCP.Services.MarkdownFormatter(),path: "");
 
         Assert.Contains("Error", result);
     }
@@ -23,7 +23,7 @@ public class ListProjectsToolTests
         if (!File.Exists(solutionPath))
             return; // Skip if not found
 
-        var result = await ListProjectsTool.ListProjects(path: solutionPath);
+        var result = await ListProjectsTool.ListProjects(fmt: new RoslynMCP.Services.MarkdownFormatter(),path: solutionPath);
 
         Assert.Contains("Solution", result);
         Assert.Contains("project", result, StringComparison.OrdinalIgnoreCase);
@@ -32,7 +32,7 @@ public class ListProjectsToolTests
     [Fact]
     public async Task WhenDirectoryProvidedThenFindsProjects()
     {
-        var result = await ListProjectsTool.ListProjects(path: FixturePaths.SampleProjectDir);
+        var result = await ListProjectsTool.ListProjects(fmt: new RoslynMCP.Services.MarkdownFormatter(),path: FixturePaths.SampleProjectDir);
 
         // Should find SampleProject.csproj in the directory
         Assert.Contains("SampleProject", result);
@@ -41,7 +41,7 @@ public class ListProjectsToolTests
     [Fact]
     public async Task WhenSourceFileProvidedThenResolvesToDirectory()
     {
-        var result = await ListProjectsTool.ListProjects(path: FixturePaths.CalculatorFile);
+        var result = await ListProjectsTool.ListProjects(fmt: new RoslynMCP.Services.MarkdownFormatter(),path: FixturePaths.CalculatorFile);
 
         // Should resolve from Calculator.cs to SampleProject dir
         Assert.DoesNotContain("does not exist", result);
@@ -50,7 +50,7 @@ public class ListProjectsToolTests
     [Fact]
     public async Task WhenNonExistentPathProvidedThenReturnsError()
     {
-        var result = await ListProjectsTool.ListProjects(
+        var result = await ListProjectsTool.ListProjects(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             path: @"C:\NonExistent\Path\That\Does\Not\Exist");
 
         Assert.Contains("Error", result);
@@ -61,7 +61,7 @@ public class ListProjectsToolTests
     {
         // Fixtures directory contains multiple projects
         var fixturesDir = Path.GetDirectoryName(FixturePaths.SampleProjectDir)!;
-        var result = await ListProjectsTool.ListProjects(path: fixturesDir);
+        var result = await ListProjectsTool.ListProjects(fmt: new RoslynMCP.Services.MarkdownFormatter(),path: fixturesDir);
 
         // Should find multiple projects
         Assert.Contains("project", result, StringComparison.OrdinalIgnoreCase);

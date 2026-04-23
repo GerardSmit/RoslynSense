@@ -34,7 +34,7 @@ public static class BuildProjectTool
 
             if (background)
                 return BackgroundTaskHelper.StartBuildBackground(
-                    resolved, configuration, taskStore);
+                    resolved, configuration, taskStore, warningsStore);
 
             string fileName;
             string arguments;
@@ -119,7 +119,7 @@ public static class BuildProjectTool
     {
         var normalized = PathHelper.NormalizePath(path);
 
-        if (normalized.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) && File.Exists(normalized))
+        if (PathHelper.IsSolutionFile(normalized) && File.Exists(normalized))
             return normalized;
 
         if (normalized.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) && File.Exists(normalized))
@@ -129,10 +129,10 @@ public static class BuildProjectTool
         var csproj = RunTestsTool.ResolveCsprojPath(normalized);
         if (csproj is not null) return csproj;
 
-        // If it's a directory, look for .sln or .csproj
+        // If it's a directory, look for .sln/.slnx or .csproj
         if (Directory.Exists(normalized))
         {
-            var slnFiles = Directory.GetFiles(normalized, "*.sln", SearchOption.TopDirectoryOnly);
+            var slnFiles = PathHelper.FindSolutionFiles(normalized);
             if (slnFiles.Length > 0) return slnFiles[0];
 
             var csprojFiles = Directory.GetFiles(normalized, "*.csproj", SearchOption.TopDirectoryOnly);
@@ -142,7 +142,7 @@ public static class BuildProjectTool
         return $"Error: Could not find a buildable target for '{path}'.";
     }
 
-    private static string FormatBuildOutput(
+    internal static string FormatBuildOutput(
         string stdout, string stderr, int exitCode, string target,
         BuildWarningsStore warningsStore)
     {

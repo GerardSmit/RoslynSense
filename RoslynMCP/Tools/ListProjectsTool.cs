@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text;
+using System.Xml.Linq;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
 
@@ -9,11 +10,11 @@ namespace RoslynMCP.Tools;
 public static class ListProjectsTool
 {
     [McpServerTool, Description(
-        "List all projects in a solution or directory. Discovers .sln files and enumerates " +
+        "List all projects in a solution or directory. Discovers .sln/.slnx files and enumerates " +
         "their projects, or searches a directory for .csproj files.")]
     public static async Task<string> ListProjects(
         [Description(
-            "Path to a .sln file, .csproj file, any source file, or a directory to search for projects.")]
+            "Path to a .sln/.slnx file, .csproj file, any source file, or a directory to search for projects.")]
         string path,
         CancellationToken cancellationToken = default)
     {
@@ -24,24 +25,36 @@ public static class ListProjectsTool
 
             string systemPath = PathHelper.NormalizePath(path);
 
-            // If it's a .sln file, parse it for project entries
-            if (systemPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) && File.Exists(systemPath))
+            // If it's a solution file, parse it for project entries
+            if (PathHelper.IsSolutionFile(systemPath) && File.Exists(systemPath))
+            {
+                if (systemPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+                    return FormatSlnxProjects(systemPath);
                 return await FormatSolutionProjectsAsync(systemPath, cancellationToken);
+            }
 
-            // If it's a file, find the nearest .sln or list .csproj files in the directory tree
-            if (File.Exists(systemPath))
-                systemPath = Path.GetDirectoryName(systemPath)!;
+            // If it's a file or directory, walk up to find the nearest .sln or .csproj
+            if (File.Exists(systemPath) || Directory.Exists(systemPath))
+            {
+                // Try to find a .sln by walking up the directory tree
+                var slnPath = PathHelper.FindNearestSolution(systemPath);
+                if (slnPath is not null)
+                    return await FormatSolutionProjectsAsync(slnPath, cancellationToken);
 
-            if (!Directory.Exists(systemPath))
-                return $"Error: Path '{path}' does not exist.";
+                // No .sln found — try to find a .csproj by walking up
+                var csprojPath = PathHelper.ResolveCsprojPath(systemPath);
+                if (csprojPath is not null)
+                {
+                    var projectDir = Path.GetDirectoryName(csprojPath)!;
+                    return FormatDiscoveredProjects(projectDir);
+                }
 
-            // Search for .sln files in the directory
-            var slnFiles = Directory.GetFiles(systemPath, "*.sln", SearchOption.TopDirectoryOnly);
-            if (slnFiles.Length > 0)
-                return await FormatSolutionProjectsAsync(slnFiles[0], cancellationToken);
+                // Fallback: list .csproj files under the given path (if directory)
+                var searchDir = File.Exists(systemPath) ? Path.GetDirectoryName(systemPath)! : systemPath;
+                return FormatDiscoveredProjects(searchDir);
+            }
 
-            // No .sln found — list all .csproj files
-            return FormatDiscoveredProjects(systemPath);
+            return $"Error: Path '{path}' does not exist.";
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -140,6 +153,53 @@ public static class ListProjectsTool
             string name = Path.GetFileNameWithoutExtension(file);
             string relativePath = Path.GetRelativePath(directory, file).Replace('\\', '/');
             string type = DetectProjectType(file);
+            sb.AppendLine($"| {index} | {name} | {relativePath} | {type} |");
+            index++;
+        }
+
+        return sb.ToString();
+    }
+
+    private static string FormatSlnxProjects(string slnxPath)
+    {
+        var sb = new StringBuilder();
+        var slnDir = Path.GetDirectoryName(slnxPath)!;
+        sb.AppendLine($"# Solution: {Path.GetFileName(slnxPath)}");
+        sb.AppendLine();
+
+        var doc = XDocument.Load(slnxPath);
+        var projects = new List<(string Name, string RelativePath, string Type)>();
+
+        foreach (var elem in doc.Descendants("Project"))
+        {
+            var pathAttr = elem.Attribute("Path")?.Value;
+            if (string.IsNullOrEmpty(pathAttr)) continue;
+
+            if (!pathAttr.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) &&
+                !pathAttr.EndsWith(".vbproj", StringComparison.OrdinalIgnoreCase) &&
+                !pathAttr.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string fullPath = Path.GetFullPath(Path.Combine(slnDir, pathAttr.Replace('/', Path.DirectorySeparatorChar)));
+            string name = Path.GetFileNameWithoutExtension(pathAttr);
+            string type = DetectProjectType(fullPath);
+            projects.Add((name, pathAttr.Replace('\\', '/'), type));
+        }
+
+        if (projects.Count == 0)
+        {
+            sb.AppendLine("No projects found in the solution.");
+            return sb.ToString();
+        }
+
+        sb.AppendLine($"Found **{projects.Count}** project(s):");
+        sb.AppendLine();
+        sb.AppendLine("| # | Project | Path | Type |");
+        sb.AppendLine("|---|---------|------|------|");
+
+        int index = 1;
+        foreach (var (name, relativePath, type) in projects)
+        {
             sb.AppendLine($"| {index} | {name} | {relativePath} | {type} |");
             index++;
         }

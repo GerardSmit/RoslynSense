@@ -45,6 +45,7 @@ public static class DiscoverTestsTool
             if (string.IsNullOrWhiteSpace(projectPath))
                 return "Error: projectPath cannot be empty.";
 
+            var normalizedInput = PathHelper.NormalizePath(projectPath);
             var csprojPath = PathHelper.ResolveCsprojPath(projectPath);
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
@@ -54,9 +55,15 @@ public static class DiscoverTestsTool
 
             var tests = new List<TestInfo>();
 
+            var sourceFileFilter = PathHelper.IsSourceFile(normalizedInput) ? normalizedInput : null;
+
             foreach (var document in project.Documents)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                if (sourceFileFilter is not null && document.FilePath is not null &&
+                    !string.Equals(document.FilePath, sourceFileFilter, StringComparison.OrdinalIgnoreCase))
+                    continue;
 
                 var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
                 var semanticModel = await document.GetSemanticModelAsync(cancellationToken);

@@ -63,12 +63,16 @@ internal static class PathHelper
     /// </summary>
     public static bool IsLegacySolution(string slnPath)
     {
-        if (!slnPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) || !File.Exists(slnPath))
+        if (!IsSolutionFile(slnPath) || !File.Exists(slnPath))
             return false;
 
         var slnDir = Path.GetDirectoryName(slnPath)!;
+
         try
         {
+            if (slnPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+                return IsLegacySolutionXml(slnPath, slnDir);
+
             // Parse Project("{type}") = "Name", "relative\path.csproj", "{GUID}" lines
             var projectLineRegex = new System.Text.RegularExpressions.Regex(
                 @"Project\(""[^""]*""\)\s*=\s*""[^""]*""\s*,\s*""([^""]+\.(?:csproj|vbproj|fsproj))""",
@@ -87,7 +91,29 @@ internal static class PathHelper
         }
         catch
         {
-            // Don't fail if we can't read the .sln
+            // Don't fail if we can't read the solution
+        }
+
+        return false;
+    }
+
+    private static bool IsLegacySolutionXml(string slnxPath, string slnDir)
+    {
+        var doc = System.Xml.Linq.XDocument.Load(slnxPath);
+        var projectElements = doc.Descendants("Project");
+
+        foreach (var proj in projectElements)
+        {
+            var pathAttr = proj.Attribute("Path")?.Value;
+            if (string.IsNullOrEmpty(pathAttr)) continue;
+            if (!pathAttr.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) &&
+                !pathAttr.EndsWith(".vbproj", StringComparison.OrdinalIgnoreCase) &&
+                !pathAttr.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var fullPath = Path.GetFullPath(Path.Combine(slnDir, pathAttr.Replace('/', Path.DirectorySeparatorChar)));
+            if (File.Exists(fullPath) && IsLegacyProject(fullPath))
+                return true;
         }
 
         return false;
@@ -99,7 +125,7 @@ internal static class PathHelper
     /// </summary>
     public static bool RequiresMsBuild(string buildTarget)
     {
-        if (buildTarget.EndsWith(".sln", StringComparison.OrdinalIgnoreCase))
+        if (IsSolutionFile(buildTarget))
             return IsLegacySolution(buildTarget);
         if (buildTarget.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
             return IsLegacyProject(buildTarget);
@@ -112,6 +138,44 @@ internal static class PathHelper
     /// </summary>
     public static string NormalizePath(string filePath) =>
         Path.GetFullPath(filePath);
+
+    /// <summary>
+    /// Returns true if the path ends with .sln or .slnx.
+    /// </summary>
+    public static bool IsSolutionFile(string path) =>
+        path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) ||
+        path.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Finds all solution files (.sln and .slnx) in a directory (non-recursive).
+    /// </summary>
+    public static string[] FindSolutionFiles(string directory)
+    {
+        var sln = Directory.GetFiles(directory, "*.sln");
+        var slnx = Directory.GetFiles(directory, "*.slnx");
+        if (sln.Length == 0) return slnx;
+        if (slnx.Length == 0) return sln;
+        return [.. sln, .. slnx];
+    }
+
+    /// <summary>
+    /// Walks up from a file or directory looking for the nearest .sln.
+    /// Returns null if not found.
+    /// </summary>
+    public static string? FindNearestSolution(string path)
+    {
+        var normalized = NormalizePath(path);
+        var dir = File.Exists(normalized) ? Path.GetDirectoryName(normalized) : normalized;
+
+        while (dir is not null)
+        {
+            var slnFiles = FindSolutionFiles(dir);
+            if (slnFiles.Length >= 1) return slnFiles[0];
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Resolves a project path, file path, or directory to the containing .csproj file.
@@ -142,6 +206,82 @@ internal static class PathHelper
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Returns true if the path points to a C# source file (not a .csproj/.sln/directory).
+    /// </summary>
+    public static bool IsSourceFile(string path) =>
+        path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) &&
+        !path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Extracts top-level class/struct/record names from a .cs file using simple text scanning.
+    /// Returns empty list if the file cannot be read or has no type declarations.
+    /// </summary>
+    public static List<string> ExtractTypeNames(string csFilePath)
+    {
+        var results = new List<string>();
+        if (!File.Exists(csFilePath)) return results;
+
+        try
+        {
+            var regex = new System.Text.RegularExpressions.Regex(
+                @"(?:^|\s)(?:public|internal|private|protected|static|sealed|abstract|partial|\s)*\s*(?:class|struct|record)\s+(\w+)",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+
+            var content = File.ReadAllText(csFilePath);
+            foreach (System.Text.RegularExpressions.Match match in regex.Matches(content))
+            {
+                var name = match.Groups[1].Value;
+                if (!results.Contains(name))
+                    results.Add(name);
+            }
+        }
+        catch
+        {
+            // Don't fail if we can't read the file
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Builds a dotnet test filter expression scoping to the types in a source file.
+    /// Combines with an existing filter using &amp;. Returns the original filter if
+    /// type names cannot be extracted.
+    /// </summary>
+    public static string? BuildSourceFileFilter(string csFilePath, string? existingFilter)
+    {
+        var typeNames = ExtractTypeNames(csFilePath);
+        if (typeNames.Count == 0) return existingFilter;
+
+        var classFilter = typeNames.Count == 1
+            ? $"FullyQualifiedName~.{typeNames[0]}."
+            : $"({string.Join(" | ", typeNames.Select(t => $"FullyQualifiedName~.{t}."))})";
+
+        if (string.IsNullOrWhiteSpace(existingFilter))
+            return classFilter;
+
+        return $"({existingFilter}) & {classFilter}";
+    }
+
+    /// <summary>
+    /// Builds a VSTest /TestCaseFilter expression scoping to the types in a source file.
+    /// </summary>
+    public static string? BuildSourceFileVsTestFilter(string csFilePath, string? existingFilter)
+    {
+        var typeNames = ExtractTypeNames(csFilePath);
+        if (typeNames.Count == 0) return existingFilter;
+
+        var classFilter = typeNames.Count == 1
+            ? $"FullyQualifiedName~.{typeNames[0]}."
+            : $"({string.Join(" | ", typeNames.Select(t => $"FullyQualifiedName~.{t}."))})";
+
+        if (string.IsNullOrWhiteSpace(existingFilter))
+            return classFilter;
+
+        return $"({existingFilter}) & {classFilter}";
     }
 
     /// <summary>

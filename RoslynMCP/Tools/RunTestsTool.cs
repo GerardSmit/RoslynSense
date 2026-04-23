@@ -21,6 +21,7 @@ public static class RunTestsTool
         string projectPath,
         IOutputFormatter fmt,
         BackgroundTaskStore taskStore,
+        BuildWarningsStore warningsStore,
         [Description("Optional test filter expression (e.g. 'ClassName.MethodName', " +
                      "'FullyQualifiedName~MyTest', 'Category=Unit'). " +
                      "If empty, all tests in the project are run.")]
@@ -36,23 +37,27 @@ public static class RunTestsTool
     {
         try
         {
+            var normalizedInput = PathHelper.NormalizePath(projectPath);
             var csprojPath = ResolveCsprojPath(projectPath);
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
+
+            if (PathHelper.IsSourceFile(normalizedInput))
+                filter = PathHelper.BuildSourceFileFilter(normalizedInput, filter);
 
             if (PathHelper.RequiresMsBuild(csprojPath))
             {
                 if (background)
                     return BackgroundTaskHelper.StartLegacyTestsBackground(
-                        csprojPath, filter, build, timeoutSeconds, taskStore);
+                        csprojPath, filter, build, timeoutSeconds, taskStore, warningsStore);
 
                 return await RunLegacyTestsAsync(
-                    csprojPath, filter, build, timeoutSeconds, fmt, cancellationToken);
+                    csprojPath, filter, build, timeoutSeconds, fmt, warningsStore, cancellationToken);
             }
 
             if (background)
                 return BackgroundTaskHelper.StartTestsBackground(
-                    csprojPath, filter, build, timeoutSeconds, taskStore);
+                    csprojPath, filter, build, timeoutSeconds, taskStore, warningsStore);
 
             var trxPath = Path.Combine(Path.GetTempPath(), $"roslyn-mcp-{Guid.NewGuid():N}.trx");
 
@@ -164,7 +169,7 @@ public static class RunTestsTool
 
     private static async Task<string> RunLegacyTestsAsync(
         string csprojPath, string? filter, bool build, int timeoutSeconds,
-        IOutputFormatter fmt, CancellationToken cancellationToken)
+        IOutputFormatter fmt, BuildWarningsStore warningsStore, CancellationToken cancellationToken)
     {
         var msbuild = MsBuildLocator.FindMsBuild();
         if (msbuild is null)
@@ -180,14 +185,7 @@ public static class RunTestsTool
                 msbuild, buildArgs, workingDirectory, Math.Max(60, timeoutSeconds / 2));
 
             if (buildExitCode != 0)
-            {
-                var sb = new StringBuilder();
-                fmt.AppendHeader(sb, "❌ Build Failed");
-                sb.AppendLine("```");
-                sb.AppendLine((buildOut + buildErr).Trim());
-                sb.AppendLine("```");
-                return sb.ToString();
-            }
+                return BuildProjectTool.FormatBuildOutput(buildOut, buildErr, buildExitCode, csprojPath, warningsStore);
         }
 
         var targetPath = MsBuildLocator.GetTargetPath(csprojPath);

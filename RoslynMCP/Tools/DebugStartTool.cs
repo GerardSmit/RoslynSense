@@ -31,9 +31,13 @@ public static class DebugStartTool
             if (string.IsNullOrWhiteSpace(projectPath))
                 return "Error: 'projectPath' is required.";
 
+            var normalizedInput = PathHelper.NormalizePath(projectPath);
             var csprojPath = RunTestsTool.ResolveCsprojPath(projectPath);
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
+
+            if (PathHelper.IsSourceFile(normalizedInput))
+                filter = PathHelper.BuildSourceFileFilter(normalizedInput, filter);
 
             if (PathHelper.RequiresMsBuild(csprojPath))
                 return "Error: Debugging is not supported for legacy .NET Framework projects. " +

@@ -15,6 +15,7 @@ public static class RunCoverageTool
         [Description("Path to the test project (.csproj) or a source file in the test project.")]
         string projectPath,
         BackgroundTaskStore taskStore,
+        BuildWarningsStore warningsStore,
         [Description("Optional test filter expression (e.g. 'ClassName.MethodName', 'FullyQualifiedName~MyTest'). If empty, all tests are run.")]
         string? filter = null,
         [Description("Set to true to run coverage in the background. Returns a task ID immediately " +
@@ -31,16 +32,19 @@ public static class RunCoverageTool
 
             string systemPath = PathHelper.NormalizePath(projectPath);
 
+            if (PathHelper.IsSourceFile(systemPath))
+                filter = PathHelper.BuildSourceFileFilter(systemPath, filter);
+
             if (background)
             {
                 var csprojPath = PathHelper.ResolveCsprojPath(systemPath);
                 if (csprojPath is null)
                     return $"Error: Could not find a .csproj file for '{projectPath}'.";
                 return BackgroundTaskHelper.StartCoverageBackground(
-                    csprojPath, filter, taskStore);
+                    csprojPath, filter, taskStore, warningsStore);
             }
 
-            var result = await CoverageService.RunCoverageAsync(systemPath, filter, timeoutSeconds, cancellationToken);
+            var result = await CoverageService.RunCoverageAsync(systemPath, filter, timeoutSeconds, cancellationToken, warningsStore);
             return result.Message;
         }
         catch (OperationCanceledException) { throw; }

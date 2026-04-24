@@ -4,9 +4,9 @@ namespace RoslynMCP.Tests;
 
 internal static class DockerAvailability
 {
-    private static readonly Lazy<bool> s_isAvailable = new(Probe);
+    private static readonly Lazy<bool> s_supportsLinuxContainers = new(Probe);
 
-    public static bool IsAvailable => s_isAvailable.Value;
+    public static bool IsAvailable => s_supportsLinuxContainers.Value;
 
     private static bool Probe()
     {
@@ -15,7 +15,10 @@ internal static class DockerAvailability
             using var cfg = new DockerClientConfiguration();
             using var client = cfg.CreateClient();
             client.System.PingAsync().GetAwaiter().GetResult();
-            return true;
+            // Testcontainers' PostgreSQL/MSSQL images are Linux-only; a daemon in
+            // Windows-container mode will fail to pull them. Skip in that case.
+            var info = client.System.GetSystemInfoAsync().GetAwaiter().GetResult();
+            return !string.Equals(info.OSType, "windows", StringComparison.OrdinalIgnoreCase);
         }
         catch
         {

@@ -72,7 +72,7 @@ class Program
         builder.Services
             .AddMcpServer()
             .WithStdioServerTransport()
-            .WithTools(toolTypes)
+            .WithTools((IEnumerable<Type>)toolTypes)
             .WithResourcesFromAssembly()
             .WithPromptsFromAssembly();
         await builder.Build().RunAsync();

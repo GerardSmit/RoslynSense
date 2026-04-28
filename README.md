@@ -179,6 +179,7 @@ Use the following server configuration:
 | `--toon` | Use TOON (Token-Optimized Object Notation) output format instead of markdown. Reduces token usage. |
 | `--db <alias>=<provider>:<connstr>` | Register a database connection. Repeatable. Providers: `psql`, `mssql`, `sqlite`. See [Databases](#databases). |
 | `--no-db` | Disable all database tools. |
+| `--no-auto-db` | Disable auto-discovery of connection strings from `web.config` and `appsettings*.json`. See [Databases](#databases). |
 
 Example with Razor disabled:
 
@@ -356,6 +357,21 @@ Example committed to Git:
 ```
 
 Plain relative paths (no placeholder) resolve in this order: CWD → solutionRoot → gitRoot. First existing file wins. This lets a committed `.mcp.json` work on any contributor's machine regardless of where Claude was launched, without requiring a placeholder.
+
+#### Auto-discovery from project config files
+
+At startup the server scans the working directory tree for `web.config` and `appsettings*.json` files and registers any connection strings it finds. The alias is `ProjectName_ConnectionStringName` (project name comes from the nearest `*.csproj` walking up; non-alphanumerics are replaced with `_`). Environment-specific files like `appsettings.Development.json` override the base file. Aliases registered via explicit `--db` flags always win over auto-discovered ones with the same name.
+
+The provider for each connection string is resolved in this order — first match wins:
+
+1. `providerName` attribute on `<add>` (web.config) — e.g. `System.Data.SqlClient`, `Npgsql`, `System.Data.SQLite`.
+2. Connection-string content — `Host=`/`Port=` → `psql`; `:memory:` / `Filename=` / `Data Source=*.db` → `sqlite`; `Server=` / `Integrated Security=` → `mssql`.
+3. Connection-string name hint — anything containing `postgres`/`npgsql`/`psql` → `psql`; `sqlite` → `sqlite`; `sqlserver`/`mssql` → `mssql` (e.g. `SiteSqlServer`).
+4. Project's referenced NuGet packages — a single `Npgsql*`, `*.Sqlite`, or `*.SqlClient` / `*.SqlServer` package on the nearest `.csproj` resolves the provider.
+5. `web.config` default — `mssql`. (.NET Framework ships SqlClient in the BCL, so historically untyped `<connectionStrings>` entries meant SQL Server.)
+6. Otherwise the entry is skipped and a warning is logged on stderr.
+
+`bin`, `obj`, `node_modules`, `.git`, `.vs`, `.idea`, `packages`, `TestResults`, and other dotted directories are skipped. Disable the scan entirely with `--no-auto-db`, or disable the database tools altogether with `--no-db`.
 
 ## Resources
 

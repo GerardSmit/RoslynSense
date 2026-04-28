@@ -25,7 +25,31 @@ class Program
         bool noDebugger = args.Contains("--no-debugger", StringComparer.OrdinalIgnoreCase);
         bool noProfiling = args.Contains("--no-profiling", StringComparer.OrdinalIgnoreCase);
         bool noDb = args.Contains("--no-db", StringComparer.OrdinalIgnoreCase);
-        var dbProviders = noDb ? (IReadOnlyList<IDbProvider>)Array.Empty<IDbProvider>() : DbCliParser.Parse(args);
+        bool noAutoDb = args.Contains("--no-auto-db", StringComparer.OrdinalIgnoreCase);
+        IReadOnlyList<IDbProvider> dbProviders;
+        IReadOnlyList<AutoConnectionStringDiscovery.DiscoveryWarning> autoDbWarnings = Array.Empty<AutoConnectionStringDiscovery.DiscoveryWarning>();
+        if (noDb)
+        {
+            dbProviders = Array.Empty<IDbProvider>();
+        }
+        else
+        {
+            var explicitProviders = DbCliParser.Parse(args);
+            if (noAutoDb)
+            {
+                dbProviders = explicitProviders;
+            }
+            else
+            {
+                var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out autoDbWarnings);
+                var existing = new HashSet<string>(explicitProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
+                var merged = new List<IDbProvider>(explicitProviders);
+                foreach (var p in auto)
+                    if (existing.Add(p.Alias))
+                        merged.Add(p);
+                dbProviders = merged;
+            }
+        }
 
         var builder = Host.CreateApplicationBuilder(args);
         builder.Logging.AddConsole(consoleLogOptions =>
@@ -75,7 +99,18 @@ class Program
             .WithTools((IEnumerable<Type>)toolTypes)
             .WithResourcesFromAssembly()
             .WithPromptsFromAssembly();
-        await builder.Build().RunAsync();
+
+        var host = builder.Build();
+
+        if (autoDbWarnings.Count > 0)
+        {
+            var logger = host.Services.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("RoslynMCP.AutoDbDiscovery");
+            foreach (var w in autoDbWarnings)
+                logger.LogWarning("Auto-db: {File}: {Message}", w.File, w.Message);
+        }
+
+        await host.RunAsync();
         return 0;
     }
 }

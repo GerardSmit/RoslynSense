@@ -198,10 +198,8 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
     [InlineData("appsettings.sample.json")]
     [InlineData("appsettings.dist.json")]
     [InlineData("web.template.config")]
-    [InlineData("web.Debug.config")]
-    [InlineData("web.Release.config")]
-    [InlineData("app.Debug.config")]
-    public void TemplateAndTransformFilesAreSkipped(string fileName)
+    [InlineData("app.template.config")]
+    public void TemplateFilesAreSkipped(string fileName)
     {
         var dir = MakeProject("App");
         var content = fileName.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
@@ -215,6 +213,70 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
               </configuration>
               """;
         File.WriteAllText(Path.Combine(dir, fileName), content);
+
+        var providers = AutoConnectionStringDiscovery.Discover(_root);
+        Assert.Empty(providers);
+    }
+
+    [Fact]
+    public void WebDebugConfigIsParsed()
+    {
+        var dir = MakeProject("LegacyApp");
+        // Real-world pattern: web.config has placeholder/prod string, web.Debug.config
+        // overrides it with the local-dev string via XDT transform.
+        File.WriteAllText(Path.Combine(dir, "web.config"), """
+        <?xml version="1.0"?>
+        <configuration>
+            <connectionStrings>
+                <add name="Default" connectionString="${PROD_CONN}" providerName="System.Data.SqlClient" />
+            </connectionStrings>
+        </configuration>
+        """);
+        File.WriteAllText(Path.Combine(dir, "web.Debug.config"), """
+        <?xml version="1.0"?>
+        <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+            <connectionStrings>
+                <add name="Default"
+                     connectionString="Server=localhost;Database=DevDb;Integrated Security=true"
+                     providerName="System.Data.SqlClient"
+                     xdt:Transform="SetAttributes" xdt:Locator="Match(name)" />
+            </connectionStrings>
+        </configuration>
+        """);
+
+        var providers = AutoConnectionStringDiscovery.Discover(_root);
+        var p = Assert.Single(providers);
+        Assert.Equal("LegacyApp_Default", p.Alias);
+        Assert.Equal("mssql", p.ProviderName);
+    }
+
+    [Fact]
+    public void WebDebugConfigEntryWithRemoveTransformIsSkipped()
+    {
+        var dir = MakeProject("App");
+        File.WriteAllText(Path.Combine(dir, "web.Debug.config"), """
+        <?xml version="1.0"?>
+        <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+            <connectionStrings>
+                <add name="Old" xdt:Transform="Remove" xdt:Locator="Match(name)" />
+            </connectionStrings>
+        </configuration>
+        """);
+
+        var providers = AutoConnectionStringDiscovery.Discover(_root);
+        Assert.Empty(providers);
+    }
+
+    [Fact]
+    public void TransformFileSectionWithRemoveTransformIsSkipped()
+    {
+        var dir = MakeProject("App");
+        File.WriteAllText(Path.Combine(dir, "web.Release.config"), """
+        <?xml version="1.0"?>
+        <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+            <connectionStrings xdt:Transform="RemoveAll" />
+        </configuration>
+        """);
 
         var providers = AutoConnectionStringDiscovery.Discover(_root);
         Assert.Empty(providers);
@@ -258,8 +320,12 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
     [InlineData("Web.Config", true)]
     [InlineData("app.config", true)]
     [InlineData("App.config", true)]
-    [InlineData("web.Debug.config", false)]
+    [InlineData("web.Debug.config", true)]
+    [InlineData("web.Release.config", true)]
+    [InlineData("app.Debug.config", true)]
     [InlineData("web.template.config", false)]
+    [InlineData("web.example.config", false)]
+    [InlineData("webapp.config", false)]
     [InlineData("appsettings.json", true)]
     [InlineData("appsettings.Development.json", true)]
     [InlineData("appsettings.template.json", false)]

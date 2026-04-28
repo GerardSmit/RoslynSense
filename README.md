@@ -364,10 +364,12 @@ At startup the server scans the working directory tree for `web.config`, `app.co
 
 Files and entries that are **skipped** with a stderr warning:
 
-- `appsettings.template.json`, `appsettings.example.json`, `appsettings.sample.json`, `appsettings.dist.json` — non-runtime templates committed without secrets.
-- `web.<env>.config` / `app.<env>.config` (e.g. `web.Debug.config`, `web.Release.config`) — XDT transform fragments, not standalone configs.
+- `appsettings.{template,example,sample,dist}.json` and `web.{template,example,sample,dist}.config` — non-runtime templates committed without secrets.
 - `<connectionStrings configProtectionProvider="…">` — encrypted via `aspnet_regiis -pe`; the ciphertext is unusable at runtime.
+- `<add xdt:Transform="Remove"/>` and `<connectionStrings xdt:Transform="RemoveAll"/>` inside transform files.
 - Empty values and unfilled placeholders: `${VAR}`, `$(VAR)`, `{{VAR}}`, `#{VAR}`, `%VAR%`, `<your connection string>`.
+
+`web.<env>.config` / `app.<env>.config` (e.g. `web.Debug.config`) **are** parsed — these are XDT transforms but commonly carry the only real local-dev connection string. Connection strings declared there override the base file when both define the same name. Files are merged alphabetically (case-insensitive), so `web.Release.config` wins over `web.Debug.config` if both define the same connection.
 
 The provider for each connection string is resolved in this order — first match wins:
 

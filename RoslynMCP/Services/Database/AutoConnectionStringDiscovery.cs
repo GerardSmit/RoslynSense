@@ -147,10 +147,15 @@ public static class AutoConnectionStringDiscovery
 
     internal static bool IsConfigFile(string fileName)
     {
-        // Exact-match runtime configs (.NET Framework / desktop / console).
-        if (fileName.Equals("web.config", StringComparison.OrdinalIgnoreCase) ||
-            fileName.Equals("app.config", StringComparison.OrdinalIgnoreCase))
-            return true;
+        // .NET Framework / desktop / console runtime configs:
+        //   web.config, app.config, plus their XDT transform variants
+        //   (web.Debug.config, web.Release.config) which often carry the only
+        //   real connection string for local dev.
+        if (TryMatchDotNetFrameworkConfig(fileName, "web", out var fxEnv) ||
+            TryMatchDotNetFrameworkConfig(fileName, "app", out fxEnv))
+        {
+            return fxEnv is null || !s_templateInfixes.Contains(fxEnv);
+        }
 
         // .NET Core / 5+ runtime configs: `appsettings.json` or `appsettings.<env>.json`.
         if (fileName.StartsWith("appsettings", StringComparison.OrdinalIgnoreCase) &&
@@ -166,6 +171,21 @@ public static class AutoConnectionStringDiscovery
         }
 
         return false;
+    }
+
+    private static bool TryMatchDotNetFrameworkConfig(string fileName, string prefix, out string? env)
+    {
+        env = null;
+        const string suffix = ".config";
+        if (fileName.Length < prefix.Length + suffix.Length) return false;
+        if (!fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return false;
+        if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+
+        var middleLen = fileName.Length - prefix.Length - suffix.Length;
+        if (middleLen == 0) return true; // web.config / app.config
+        if (fileName[prefix.Length] != '.') return false; // e.g. "webapp.config" must not match "web"
+        env = fileName.Substring(prefix.Length + 1, middleLen - 1);
+        return env.Length > 0;
     }
 
     private static ProjectContext ResolveProjectContext(
@@ -244,18 +264,23 @@ public static class AutoConnectionStringDiscovery
         return new string(buffer);
     }
 
+    private const string XdtNamespace = "http://schemas.microsoft.com/XML-Document-Transform";
+
     private static IEnumerable<RawEntry> ParseWebConfig(string path)
     {
         var doc = new XmlDocument();
         doc.Load(path);
 
-        // Skip encrypted sections — `aspnet_regiis -pe` rewrites the element with a
-        // `configProtectionProvider` attribute and ciphertext children. We can't
-        // decrypt at runtime and the ciphertext is useless as a connection string.
         var section = doc.SelectSingleNode("/configuration/connectionStrings");
         if (section?.Attributes?["configProtectionProvider"] is not null)
             throw new InvalidOperationException(
                 "<connectionStrings> is encrypted (configProtectionProvider set); skipping.");
+
+        // XDT transform files (web.Debug.config) may declare the section with
+        // xdt:Transform="Remove"/"RemoveAll" — drop the whole section in that case.
+        var sectionTransform = section?.Attributes?["Transform", XdtNamespace]?.Value;
+        if (IsRemoveTransform(sectionTransform))
+            return Array.Empty<RawEntry>();
 
         var nodes = doc.SelectNodes("/configuration/connectionStrings/add");
         var list = new List<RawEntry>();
@@ -263,6 +288,10 @@ public static class AutoConnectionStringDiscovery
 
         foreach (XmlNode node in nodes)
         {
+            // Skip <add xdt:Transform="Remove"/> entries from transform files.
+            var transform = node.Attributes?["Transform", XdtNamespace]?.Value;
+            if (IsRemoveTransform(transform)) continue;
+
             var name = node.Attributes?["name"]?.Value;
             var connStr = node.Attributes?["connectionString"]?.Value;
             var providerName = node.Attributes?["providerName"]?.Value;
@@ -271,6 +300,10 @@ public static class AutoConnectionStringDiscovery
         }
         return list;
     }
+
+    private static bool IsRemoveTransform(string? transform) =>
+        string.Equals(transform, "Remove", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(transform, "RemoveAll", StringComparison.OrdinalIgnoreCase);
 
     private static IEnumerable<RawEntry> ParseAppSettingsJson(string path)
     {

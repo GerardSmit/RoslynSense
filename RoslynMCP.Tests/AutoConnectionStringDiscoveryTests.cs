@@ -125,7 +125,7 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
     }
 
     [Fact]
-    public void WebDebugConfigBeatsWebReleaseConfig()
+    public void WebDebugConfigOverridesBaseAndReleaseIsIgnored()
     {
         var dir = MakeProject("Legacy");
         File.WriteAllText(Path.Combine(dir, "web.config"), """
@@ -136,6 +136,7 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
             </connectionStrings>
         </configuration>
         """);
+        // web.Release.config injects prod credentials during `dotnet publish`; must be skipped.
         File.WriteAllText(Path.Combine(dir, "web.Release.config"), """
         <?xml version="1.0"?>
         <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
@@ -336,10 +337,27 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
     public void TransformFileSectionWithRemoveTransformIsSkipped()
     {
         var dir = MakeProject("App");
-        File.WriteAllText(Path.Combine(dir, "web.Release.config"), """
+        File.WriteAllText(Path.Combine(dir, "web.Custom.config"), """
         <?xml version="1.0"?>
         <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
             <connectionStrings xdt:Transform="RemoveAll" />
+        </configuration>
+        """);
+
+        var providers = AutoConnectionStringDiscovery.Discover(_root);
+        Assert.Empty(providers);
+    }
+
+    [Fact]
+    public void WebReleaseConfigIsSkipped()
+    {
+        var dir = MakeProject("Legacy");
+        File.WriteAllText(Path.Combine(dir, "web.Release.config"), """
+        <?xml version="1.0"?>
+        <configuration xmlns:xdt="http://schemas.microsoft.com/XML-Document-Transform">
+            <connectionStrings>
+                <add name="Default" connectionString="Server=prod;Database=Foo;Integrated Security=true" providerName="System.Data.SqlClient" xdt:Transform="SetAttributes" xdt:Locator="Match(name)" />
+            </connectionStrings>
         </configuration>
         """);
 
@@ -386,8 +404,9 @@ public class AutoConnectionStringDiscoveryTests : IDisposable
     [InlineData("app.config", true)]
     [InlineData("App.config", true)]
     [InlineData("web.Debug.config", true)]
-    [InlineData("web.Release.config", true)]
     [InlineData("app.Debug.config", true)]
+    [InlineData("web.Release.config", false)]
+    [InlineData("web.Production.config", false)]
     [InlineData("web.template.config", false)]
     [InlineData("web.example.config", false)]
     [InlineData("webapp.config", false)]

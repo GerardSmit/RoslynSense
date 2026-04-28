@@ -368,7 +368,7 @@ At startup the server scans the working directory tree for `web.config`, `app.co
 2. Other environment-specific files — override the base.
 3. Development-flavored files (`appsettings.Development.json`, `appsettings.Local.json`, `web.Debug.config`, `app.Debug.config`) — applied last, overriding everything else.
 
-Production-flavored env names are **not loaded at all**: `Production`, `Prod`, `Live`, `Staging`, `Stage`. If you really need to register prod credentials, do it explicitly with `--db`.
+Production-flavored env names are **not loaded at all**: `Production`, `Prod`, `Live`, `Staging`, `Stage`, `Release`, `Publish`. (`Release` is the MSBuild configuration name applied by `dotnet publish -c Release`, almost always to inject prod settings — same risk as `Production`.) If you really need to register prod credentials, do it explicitly with `--db`.
 
 `web.<env>.config` / `app.<env>.config` are XDT transform files but commonly carry the only real local-dev connection string, so they are parsed alongside the base. The `xdt:` namespace is ignored on attribute reads; `xdt:Transform="Remove"` / `RemoveAll` on either an `<add>` entry or the `<connectionStrings>` section is honored.
 

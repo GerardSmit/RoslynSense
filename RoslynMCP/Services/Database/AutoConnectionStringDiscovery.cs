@@ -39,7 +39,11 @@ public static class AutoConnectionStringDiscovery
     // trouble. Use --db explicitly if you really need prod access.
     private static readonly HashSet<string> s_prodEnvNames = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Production", "Prod", "Live", "Staging", "Stage"
+        "Production", "Prod", "Live", "Staging", "Stage",
+        // MSBuild Configuration names. `web.Release.config` is the XDT transform
+        // applied by `dotnet publish -c Release`, almost always to inject prod
+        // settings. Skip it for the same reason we skip Production.
+        "Release", "Publish"
     };
 
     // Development-flavored environment names. These have the highest priority

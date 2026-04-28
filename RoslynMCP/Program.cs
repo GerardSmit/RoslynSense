@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
+using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
 using RoslynMCP.Tools;
@@ -20,35 +21,34 @@ class Program
         if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
             return await RoslynMCP.CliRunner.RunAsync(args[1..]);
 
-        bool noWebForms = args.Contains("--no-webforms", StringComparer.OrdinalIgnoreCase);
-        bool noRazor = args.Contains("--no-razor", StringComparer.OrdinalIgnoreCase);
-        bool noDebugger = args.Contains("--no-debugger", StringComparer.OrdinalIgnoreCase);
-        bool noProfiling = args.Contains("--no-profiling", StringComparer.OrdinalIgnoreCase);
-        bool noDb = args.Contains("--no-db", StringComparer.OrdinalIgnoreCase);
-        bool noAutoDb = args.Contains("--no-auto-db", StringComparer.OrdinalIgnoreCase);
+        var startupWarnings = new List<string>();
+
+        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
+        if (configError is not null)
+            startupWarnings.Add($"roslynsense.json ({configPath}): {configError}");
+
+        var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
+        startupWarnings.AddRange(settingsWarnings);
+
         IReadOnlyList<IDbProvider> dbProviders;
         IReadOnlyList<AutoConnectionStringDiscovery.DiscoveryWarning> autoDbWarnings = Array.Empty<AutoConnectionStringDiscovery.DiscoveryWarning>();
-        if (noDb)
+        if (!settings.Database)
         {
             dbProviders = Array.Empty<IDbProvider>();
         }
+        else if (!settings.ShouldRunAutoDiscovery())
+        {
+            dbProviders = settings.ExplicitDbProviders;
+        }
         else
         {
-            var explicitProviders = DbCliParser.Parse(args);
-            if (noAutoDb)
-            {
-                dbProviders = explicitProviders;
-            }
-            else
-            {
-                var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out autoDbWarnings);
-                var existing = new HashSet<string>(explicitProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
-                var merged = new List<IDbProvider>(explicitProviders);
-                foreach (var p in auto)
-                    if (existing.Add(p.Alias))
-                        merged.Add(p);
-                dbProviders = merged;
-            }
+            var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out autoDbWarnings);
+            var existing = new HashSet<string>(settings.ExplicitDbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
+            var merged = new List<IDbProvider>(settings.ExplicitDbProviders);
+            foreach (var p in auto)
+                if (existing.Add(p.Alias))
+                    merged.Add(p);
+            dbProviders = merged;
         }
 
         var builder = Host.CreateApplicationBuilder(args);
@@ -59,8 +59,8 @@ class Program
         });
         builder.Services.AddHostedService<InfrastructureCleanupHostedService>();
 
-        // Register output formatter (markdown default, TOON via --toon)
-        bool useToon = args.Contains("--toon", StringComparer.OrdinalIgnoreCase);
+        // Register output formatter (markdown default, TOON via tableFormat=="toon")
+        bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
         builder.Services.AddSingleton<ProfilingSessionStore>();
         builder.Services.AddSingleton<BackgroundTaskStore>();
@@ -68,7 +68,7 @@ class Program
         builder.Services.AddSingleton(new DbConnectionRegistry(dbProviders));
 
         // Register non-C# file type handlers conditionally
-        if (!noWebForms)
+        if (settings.WebForms)
         {
             builder.Services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
             builder.Services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
@@ -77,7 +77,7 @@ class Program
             builder.Services.AddSingleton<IDiagnosticsHandler, AspxDiagnostics>();
         }
 
-        if (!noRazor)
+        if (settings.Razor)
         {
             builder.Services.AddSingleton<IGoToDefinitionHandler, RazorGoToDefinition>();
             builder.Services.AddSingleton<IOutlineHandler, RazorOutline>();
@@ -88,9 +88,9 @@ class Program
         var toolTypes = typeof(Program).Assembly
             .GetTypes()
             .Where(t => t.GetCustomAttribute<McpServerToolTypeAttribute>() is not null)
-            .Where(t => !(noDebugger && t.Name.StartsWith("Debug", StringComparison.Ordinal)))
-            .Where(t => !(noProfiling && t.Name.StartsWith("Profile", StringComparison.Ordinal)))
-            .Where(t => !(noDb && t.Name.StartsWith("Database", StringComparison.Ordinal)))
+            .Where(t => settings.Debugger || !t.Name.StartsWith("Debug", StringComparison.Ordinal))
+            .Where(t => settings.Profiling || !t.Name.StartsWith("Profile", StringComparison.Ordinal))
+            .Where(t => settings.Database || !t.Name.StartsWith("Database", StringComparison.Ordinal))
             .ToArray();
 
         builder.Services
@@ -102,12 +102,21 @@ class Program
 
         var host = builder.Build();
 
-        if (autoDbWarnings.Count > 0)
+        if (startupWarnings.Count > 0 || autoDbWarnings.Count > 0)
         {
             var logger = host.Services.GetRequiredService<ILoggerFactory>()
-                .CreateLogger("RoslynMCP.AutoDbDiscovery");
+                .CreateLogger("RoslynMCP.Startup");
+            foreach (var w in startupWarnings)
+                logger.LogWarning("{Message}", w);
             foreach (var w in autoDbWarnings)
                 logger.LogWarning("Auto-db: {File}: {Message}", w.File, w.Message);
+        }
+
+        if (configPath is not null && configError is null)
+        {
+            var logger = host.Services.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("RoslynMCP.Startup");
+            logger.LogInformation("Loaded roslynsense.json from {Path}", configPath);
         }
 
         await host.RunAsync();

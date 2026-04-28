@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using ModelContextProtocol.Server;
+using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
 using RoslynMCP.Tools; // IFindUsagesHandler, IGoToDefinitionHandler, etc.
@@ -73,10 +74,29 @@ internal static class CliRunner
 
         var parsed = ParseFlags(args[1..]);
 
-        bool useToon = parsed.ContainsKey("toon");
+        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
+        if (configError is not null)
+            Console.Error.WriteLine($"Warning: roslynsense.json ({configPath}): {configError}");
+
+        var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
+        foreach (var w in settingsWarnings)
+            Console.Error.WriteLine($"Warning: {w}");
+
+        bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         var fmt = useToon ? (IOutputFormatter)new ToonFormatter() : new MarkdownFormatter();
 
-        var dbRegistry = new DbConnectionRegistry(DbCliParser.Parse(args));
+        var dbProviders = settings.ExplicitDbProviders;
+        if (settings.Database && settings.ShouldRunAutoDiscovery())
+        {
+            var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out _);
+            var existing = new HashSet<string>(dbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
+            var merged = new List<IDbProvider>(dbProviders);
+            foreach (var p in auto)
+                if (existing.Add(p.Alias))
+                    merged.Add(p);
+            dbProviders = merged;
+        }
+        var dbRegistry = new DbConnectionRegistry(dbProviders);
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };

@@ -7,6 +7,11 @@ public sealed class RoslynSenseConfig
     public ToolsConfig Tools { get; init; } = new();
     public DatabaseConfig Database { get; init; } = new();
     public string? TableFormat { get; init; }
+    /// <summary>
+    /// Paths to preload on startup (solution or project files).
+    /// Null = auto-discover from CWD. Empty list = disabled.
+    /// </summary>
+    public IReadOnlyList<string>? Preload { get; init; }
 }
 
 public sealed class ToolsConfig

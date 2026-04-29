@@ -10,7 +10,8 @@ public sealed record EffectiveSettings(
     bool Database,
     bool? AutoDiscoverDb,
     string? TableFormat,
-    IReadOnlyList<IDbProvider> ExplicitDbProviders)
+    IReadOnlyList<IDbProvider> ExplicitDbProviders,
+    IReadOnlyList<string>? Preload)
 {
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
@@ -70,7 +71,8 @@ public sealed record EffectiveSettings(
 
         return new EffectiveSettings(
             webForms, razor, debugger, profiling, database,
-            autoDiscover, tableFormat, explicitProviders);
+            autoDiscover, tableFormat, explicitProviders,
+            config?.Preload);
     }
 
     public bool ShouldRunAutoDiscovery()

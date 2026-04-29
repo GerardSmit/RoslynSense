@@ -57,7 +57,9 @@ class Program
             // Configure all logs to go to stderr
             consoleLogOptions.LogToStandardErrorThreshold = LogLevel.Trace;
         });
+        builder.Services.AddSingleton(settings);
         builder.Services.AddHostedService<InfrastructureCleanupHostedService>();
+        builder.Services.AddHostedService<WorkspacePreloadHostedService>();
 
         // Register output formatter (markdown default, TOON via tableFormat=="toon")
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);

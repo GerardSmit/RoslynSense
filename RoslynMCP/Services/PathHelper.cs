@@ -1,3 +1,4 @@
+using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 
 namespace RoslynMCP.Services;
@@ -175,6 +176,43 @@ internal static class PathHelper
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Parses a .sln or .slnx file and returns the absolute paths of all .csproj projects it references.
+    /// Returns an empty list if the file cannot be read or contains no C# projects.
+    /// </summary>
+    public static List<string> GetProjectsFromSolution(string solutionPath)
+    {
+        var slnDir = Path.GetDirectoryName(solutionPath)!;
+        var result = new List<string>();
+        try
+        {
+            if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+            {
+                var doc = XDocument.Load(solutionPath);
+                foreach (var elem in doc.Descendants("Project"))
+                {
+                    var rel = elem.Attribute("Path")?.Value;
+                    if (!string.IsNullOrEmpty(rel) && rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                        result.Add(Path.GetFullPath(Path.Combine(slnDir, rel.Replace('/', Path.DirectorySeparatorChar))));
+                }
+            }
+            else
+            {
+                foreach (var line in File.ReadAllLines(solutionPath))
+                {
+                    if (!line.StartsWith("Project(", StringComparison.Ordinal)) continue;
+                    var parts = line.Split('"');
+                    if (parts.Length < 6) continue;
+                    var rel = parts[5];
+                    if (rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                        result.Add(Path.GetFullPath(Path.Combine(slnDir, rel.Replace('\\', Path.DirectorySeparatorChar))));
+                }
+            }
+        }
+        catch { }
+        return result;
     }
 
     /// <summary>

@@ -431,7 +431,7 @@ public class CoverageToolTests
         var result = await GetMethodCoverageTool.GetMethodCoverage(
             new MarkdownFormatter(), methodName: "Add");
 
-        Assert.DoesNotContain("RunCoverage", result);
+        Assert.DoesNotContain("Run `RunCoverage` first", result);
         Assert.DoesNotContain("No coverage data found", result);
         Assert.Contains("Add", result);
         Assert.Contains("hits", result);
@@ -444,7 +444,7 @@ public class CoverageToolTests
         Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
 
         var result = await GetMethodCoverageTool.GetMethodCoverage(
-            new MarkdownFormatter(), methodName: "Add");
+            new MarkdownFormatter(), methodName: "Add", className: "Calculator");
 
         Assert.DoesNotContain("File modified since coverage was collected", result);
     }
@@ -537,7 +537,7 @@ public class CoverageToolTests
         Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
 
         var result = await GetMethodCoverageTool.GetMethodCoverage(
-            new MarkdownFormatter(), methodName: "Add");
+            new MarkdownFormatter(), methodName: "Add", className: "Calculator");
 
         Assert.DoesNotContain("Method source has changed", result);
     }

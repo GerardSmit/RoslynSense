@@ -109,4 +109,83 @@ public class WorkspaceServiceTests
         Assert.NotNull(project);
         Assert.Contains("BrokenProject", project.Name, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task WhenSourceFileModifiedAfterCacheThenDocumentTextIsRefreshed()
+    {
+        await WorkspaceService.EvictAllAsync();
+
+        string originalContent = await File.ReadAllTextAsync(FixturePaths.CalculatorFile);
+        string modifiedContent = originalContent.Replace(
+            "public int Add(int a, int b) => a + b;",
+            "public int AddModified(int a, int b) => a + b;");
+
+        Assert.NotEqual(originalContent, modifiedContent); // guard: replacement actually happened
+
+        try
+        {
+            // Populate cache
+            await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.CalculatorFile);
+
+            // Write modified content and advance the file timestamp past cache time
+            await File.WriteAllTextAsync(FixturePaths.CalculatorFile, modifiedContent);
+            File.SetLastWriteTimeUtc(FixturePaths.CalculatorFile, DateTime.UtcNow.AddMinutes(5));
+
+            // Re-query with the changed file as targetFilePath
+            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.CalculatorFile);
+
+            var document = WorkspaceService.FindDocumentInProject(project, FixturePaths.CalculatorFile);
+            Assert.NotNull(document);
+
+            var text = (await document!.GetTextAsync()).ToString();
+            Assert.Contains("AddModified", text);
+            Assert.DoesNotContain("public int Add(int", text);
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(FixturePaths.CalculatorFile, originalContent);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    [Fact]
+    public async Task WhenUnrelatedFileModifiedThenCachedContentIsUsed()
+    {
+        await WorkspaceService.EvictAllAsync();
+
+        string originalServices = await File.ReadAllTextAsync(FixturePaths.ServicesFile);
+        string modifiedServices = originalServices + "\n// sentinel-change";
+
+        try
+        {
+            // Populate cache by loading Calculator.cs
+            await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.CalculatorFile);
+
+            // Modify Services.cs (not the targetFilePath) and advance its timestamp
+            await File.WriteAllTextAsync(FixturePaths.ServicesFile, modifiedServices);
+            File.SetLastWriteTimeUtc(FixturePaths.ServicesFile, DateTime.UtcNow.AddMinutes(5));
+
+            // Re-query with Calculator.cs as targetFilePath — Services.cs should NOT be refreshed
+            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.CalculatorFile);
+
+            var servicesDoc = WorkspaceService.FindDocumentInProject(project, FixturePaths.ServicesFile);
+            Assert.NotNull(servicesDoc);
+
+            var text = (await servicesDoc!.GetTextAsync()).ToString();
+            Assert.DoesNotContain("sentinel-change", text);
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(FixturePaths.ServicesFile, originalServices);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
 }

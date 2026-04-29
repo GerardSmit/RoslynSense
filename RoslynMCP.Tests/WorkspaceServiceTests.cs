@@ -115,10 +115,11 @@ public class WorkspaceServiceTests
     {
         await WorkspaceService.EvictAllAsync();
 
-        string originalContent = await File.ReadAllTextAsync(FixturePaths.CalculatorFile);
+        // Use dedicated file so other parallel tests aren't affected
+        string originalContent = await File.ReadAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile);
         string modifiedContent = originalContent.Replace(
-            "public int Add(int a, int b) => a + b;",
-            "public int AddModified(int a, int b) => a + b;");
+            "public int Compute(int x) => x * 2;",
+            "public int ComputeModified(int x) => x * 2;");
 
         Assert.NotEqual(originalContent, modifiedContent); // guard: replacement actually happened
 
@@ -127,27 +128,27 @@ public class WorkspaceServiceTests
             // Populate cache
             await WorkspaceService.GetOrOpenProjectAsync(
                 FixturePaths.SampleProjectFile,
-                targetFilePath: FixturePaths.CalculatorFile);
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
 
             // Write modified content and advance the file timestamp past cache time
-            await File.WriteAllTextAsync(FixturePaths.CalculatorFile, modifiedContent);
-            File.SetLastWriteTimeUtc(FixturePaths.CalculatorFile, DateTime.UtcNow.AddMinutes(5));
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, modifiedContent);
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
 
             // Re-query with the changed file as targetFilePath
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
                 FixturePaths.SampleProjectFile,
-                targetFilePath: FixturePaths.CalculatorFile);
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
 
-            var document = WorkspaceService.FindDocumentInProject(project, FixturePaths.CalculatorFile);
+            var document = WorkspaceService.FindDocumentInProject(project, FixturePaths.WorkspaceRefreshTargetFile);
             Assert.NotNull(document);
 
             var text = (await document!.GetTextAsync()).ToString();
-            Assert.Contains("AddModified", text);
-            Assert.DoesNotContain("public int Add(int", text);
+            Assert.Contains("ComputeModified", text);
+            Assert.DoesNotContain("public int Compute(int", text);
         }
         finally
         {
-            await File.WriteAllTextAsync(FixturePaths.CalculatorFile, originalContent);
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
             await WorkspaceService.EvictAllAsync();
         }
     }
@@ -157,34 +158,36 @@ public class WorkspaceServiceTests
     {
         await WorkspaceService.EvictAllAsync();
 
-        string originalServices = await File.ReadAllTextAsync(FixturePaths.ServicesFile);
-        string modifiedServices = originalServices + "\n// sentinel-change";
+        // Modify the dedicated file but query a different file as targetFilePath.
+        // The modified file should NOT be refreshed in the returned snapshot.
+        string originalContent = await File.ReadAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile);
+        string modifiedContent = originalContent + "\n// sentinel-change";
 
         try
         {
-            // Populate cache by loading Calculator.cs
+            // Populate cache via CalculatorFile (not the file we'll modify)
             await WorkspaceService.GetOrOpenProjectAsync(
                 FixturePaths.SampleProjectFile,
                 targetFilePath: FixturePaths.CalculatorFile);
 
-            // Modify Services.cs (not the targetFilePath) and advance its timestamp
-            await File.WriteAllTextAsync(FixturePaths.ServicesFile, modifiedServices);
-            File.SetLastWriteTimeUtc(FixturePaths.ServicesFile, DateTime.UtcNow.AddMinutes(5));
+            // Modify WorkspaceRefreshTargetFile and advance its timestamp
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, modifiedContent);
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
 
-            // Re-query with Calculator.cs as targetFilePath — Services.cs should NOT be refreshed
+            // Re-query with CalculatorFile as targetFilePath — WorkspaceRefreshTargetFile should NOT refresh
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
                 FixturePaths.SampleProjectFile,
                 targetFilePath: FixturePaths.CalculatorFile);
 
-            var servicesDoc = WorkspaceService.FindDocumentInProject(project, FixturePaths.ServicesFile);
-            Assert.NotNull(servicesDoc);
+            var doc = WorkspaceService.FindDocumentInProject(project, FixturePaths.WorkspaceRefreshTargetFile);
+            Assert.NotNull(doc);
 
-            var text = (await servicesDoc!.GetTextAsync()).ToString();
+            var text = (await doc!.GetTextAsync()).ToString();
             Assert.DoesNotContain("sentinel-change", text);
         }
         finally
         {
-            await File.WriteAllTextAsync(FixturePaths.ServicesFile, originalServices);
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
             await WorkspaceService.EvictAllAsync();
         }
     }

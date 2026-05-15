@@ -13,6 +13,11 @@ public sealed class MssqlDbProvider : DbProviderBase
     protected override DbCommand CreateCommand(string sql, DbConnection conn) =>
         new SqlCommand(sql, (SqlConnection)conn);
 
+    protected override string PrepareSqlForPlanCapture(string sql, bool capturePlan) =>
+        capturePlan ? "SET STATISTICS XML ON;\n" + sql : sql;
+
+    public override PlanFormat? PlanFormat => Services.Database.PlanFormat.Xml;
+
     public override Task<DbSchemaResult> GetTablesAsync(string? schema, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(schema))

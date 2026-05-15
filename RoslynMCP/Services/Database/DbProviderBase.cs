@@ -21,24 +21,55 @@ public abstract class DbProviderBase : IDbProvider
     protected abstract DbConnection CreateConnection();
     protected abstract DbCommand CreateCommand(string sql, DbConnection conn);
     protected virtual Task OnConnectionOpenedAsync(DbConnection conn, CancellationToken ct) => Task.CompletedTask;
+    protected virtual string PrepareSqlForPlanCapture(string sql, bool capturePlan) => sql;
+    protected virtual bool IsPlanResultColumn(string columnName) =>
+        columnName.Contains("Showplan", StringComparison.OrdinalIgnoreCase);
+    public virtual PlanFormat? PlanFormat => null;
 
     public abstract Task<DbSchemaResult> GetTablesAsync(string? schema, CancellationToken ct);
     public abstract Task<DbSchemaResult> DescribeTableAsync(string tableName, CancellationToken ct);
 
     public async Task<DbQueryResult> ExecuteQueryAsync(
-        string sql, Dictionary<string, object?>? parameters, int maxRows, CancellationToken ct)
+        string sql, Dictionary<string, object?>? parameters, int maxRows, bool capturePlan, CancellationToken ct)
     {
         if (maxRows < 1) maxRows = 1;
         var sw = Stopwatch.StartNew();
         await using var conn = CreateConnection();
         await conn.OpenAsync(ct).ConfigureAwait(false);
         await OnConnectionOpenedAsync(conn, ct).ConfigureAwait(false);
-        await using var cmd = CreateCommand(sql, conn);
+        var effectiveSql = PrepareSqlForPlanCapture(sql, capturePlan);
+        await using var cmd = CreateCommand(effectiveSql, conn);
         BindParameters(cmd, parameters);
         await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        var (columns, rows, truncated) = await ReadRowsAsync(reader, maxRows, ct).ConfigureAwait(false);
+
+        string[] columns = Array.Empty<string>();
+        List<string[]> rows = new();
+        bool truncated = false;
+        string? executionPlan = null;
+        bool dataCaptured = false;
+
+        do
+        {
+            if (reader.FieldCount == 0) continue;
+
+            if (capturePlan && executionPlan is null && reader.FieldCount == 1 &&
+                IsPlanResultColumn(reader.GetName(0)))
+            {
+                if (await reader.ReadAsync(ct).ConfigureAwait(false))
+                    executionPlan = reader.IsDBNull(0) ? null : reader.GetValue(0)?.ToString();
+                continue;
+            }
+
+            if (!dataCaptured)
+            {
+                (columns, rows, truncated) = await ReadRowsAsync(reader, maxRows, ct).ConfigureAwait(false);
+                dataCaptured = true;
+            }
+        }
+        while (await reader.NextResultAsync(ct).ConfigureAwait(false));
+
         sw.Stop();
-        return new DbQueryResult(columns, rows, truncated, sw.Elapsed);
+        return new DbQueryResult(columns, rows, truncated, sw.Elapsed, executionPlan);
     }
 
     public async Task<int> ExecuteNonQueryAsync(

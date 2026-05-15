@@ -68,6 +68,7 @@ class Program
         builder.Services.AddSingleton<BackgroundTaskStore>();
         builder.Services.AddSingleton<BuildWarningsStore>();
         builder.Services.AddSingleton(new DbConnectionRegistry(dbProviders));
+        builder.Services.AddSingleton<ExecutionPlanStore>();
 
         // Register non-C# file type handlers conditionally
         if (settings.WebForms)

@@ -8,6 +8,7 @@ namespace RoslynMCP.Tests;
 public sealed class DatabaseToolTests
 {
     private static readonly IOutputFormatter s_fmt = new MarkdownFormatter();
+    private static readonly ExecutionPlanStore s_planStore = new();
 
     // ---------------------------------------------------------------------
     // CLI parser
@@ -433,7 +434,7 @@ public sealed class DatabaseToolTests
         var reg = NewSqliteRegistry();
         await SeedAsync(reg);
 
-        var output = await DatabaseTool.DbQuery("mem", "SELECT name, val FROM t ORDER BY id", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("mem", "SELECT name, val FROM t ORDER BY id", reg, s_fmt, s_planStore);
 
         Assert.Contains("a", output);
         Assert.Contains("b", output);
@@ -446,7 +447,7 @@ public sealed class DatabaseToolTests
         var reg = NewSqliteRegistry();
         await SeedAsync(reg);
 
-        var output = await DatabaseTool.DbQuery("mem", "SELECT val FROM t WHERE name='c'", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("mem", "SELECT val FROM t WHERE name='c'", reg, s_fmt, s_planStore);
         Assert.Contains("(null)", output);
     }
 
@@ -456,7 +457,7 @@ public sealed class DatabaseToolTests
         var reg = NewSqliteRegistry();
         await SeedAsync(reg);
 
-        var output = await DatabaseTool.DbQuery("mem", "SELECT * FROM t", reg, s_fmt, maxRows: 2);
+        var output = await DatabaseTool.DbQuery("mem", "SELECT * FROM t", reg, s_fmt, s_planStore, maxRows: 2);
         Assert.Contains("maxRows", output);
     }
 
@@ -467,7 +468,7 @@ public sealed class DatabaseToolTests
         await SeedAsync(reg);
 
         var output = await DatabaseTool.DbQuery(
-            "mem", "SELECT name FROM t WHERE val = @v", reg, s_fmt, parameters: "{\"@v\": 2}");
+            "mem", "SELECT name FROM t WHERE val = @v", reg, s_fmt, s_planStore, parameters: "{\"@v\": 2}");
 
         Assert.Contains("b", output);
         Assert.DoesNotContain("| a |", output);
@@ -490,7 +491,7 @@ public sealed class DatabaseToolTests
     public async Task DbQuery_InvalidAlias_ReturnsError()
     {
         var reg = NewSqliteRegistry();
-        var output = await DatabaseTool.DbQuery("bogus", "SELECT 1", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("bogus", "SELECT 1", reg, s_fmt, s_planStore);
         Assert.StartsWith("Error:", output);
     }
 
@@ -500,7 +501,7 @@ public sealed class DatabaseToolTests
         var reg = NewSqliteRegistry();
         await SeedAsync(reg);
 
-        var output = await DatabaseTool.DbQuery("mem", "SELECT !bogus", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("mem", "SELECT !bogus", reg, s_fmt, s_planStore);
         Assert.StartsWith("SQL Error:", output);
     }
 
@@ -556,7 +557,7 @@ public sealed class DatabaseToolTests
     {
         var reg = NewSqliteRegistry();
         await SeedAsync(reg);
-        var output = await DatabaseTool.DbQuery("mem", "SELECT 1", reg, s_fmt, parameters: "{bad json");
+        var output = await DatabaseTool.DbQuery("mem", "SELECT 1", reg, s_fmt, s_planStore, parameters: "{bad json");
         Assert.StartsWith("Error:", output);
     }
 
@@ -677,6 +678,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
 {
     private readonly PostgresContainerFixture _fx;
     private static readonly IOutputFormatter s_fmt = new MarkdownFormatter();
+    private static readonly ExecutionPlanStore s_planStore = new();
 
     public PostgresIntegrationTests(PostgresContainerFixture fx) => _fx = fx;
 
@@ -684,7 +686,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
     public async Task Postgres_SelectOne_ReturnsRow()
     {
         var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
-        var output = await DatabaseTool.DbQuery("pg", "SELECT 1 AS n", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("pg", "SELECT 1 AS n", reg, s_fmt, s_planStore);
         Assert.Contains("1", output);
     }
 
@@ -694,8 +696,144 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
         var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
         await DatabaseTool.DbExecute("pg", "CREATE TABLE IF NOT EXISTS widgets(id serial primary key, name text)", reg, s_fmt);
         await DatabaseTool.DbExecute("pg", "INSERT INTO widgets(name) VALUES (@n)", reg, s_fmt, parameters: "{\"@n\": \"gizmo\"}");
-        var output = await DatabaseTool.DbQuery("pg", "SELECT name FROM widgets", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("pg", "SELECT name FROM widgets", reg, s_fmt, s_planStore);
         Assert.Contains("gizmo", output);
+    }
+
+    [RequiresPsqlFact]
+    public async Task Postgres_IncludeExecutionPlan_CapturesPlan()
+    {
+        await EnsurePlanFixture();
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        var output = await DatabaseTool.DbQuery(
+            "pg", "SELECT id, name FROM plan_widgets WHERE id < 100", reg, s_fmt, store, includeExecutionPlan: true);
+        Assert.Contains("Execution Plan ID", output);
+        Assert.Contains("plan-", output);
+    }
+
+    [RequiresPsqlFact]
+    public async Task Postgres_DbPlanSummary_ReturnsCost()
+    {
+        await EnsurePlanFixture();
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "pg", "SELECT id FROM plan_widgets", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var summary = DatabaseTool.DbPlanSummary(planId, store, s_fmt);
+        Assert.Contains("Total estimated cost", summary);
+        Assert.Contains("Operator count", summary);
+        Assert.Contains("Format", summary);
+        Assert.Contains("json", summary);
+    }
+
+    [RequiresPsqlFact]
+    public async Task Postgres_DbPlanOperators_ListsNodes()
+    {
+        await EnsurePlanFixture();
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "pg", "SELECT id FROM plan_widgets ORDER BY id", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var ops = DatabaseTool.DbPlanOperators(planId, store, s_fmt);
+        Assert.Contains("PhysicalOp", ops);
+        Assert.Contains("Scan", ops);
+    }
+
+    [RequiresPsqlFact]
+    public async Task Postgres_DbPlanQuery_JsonPath_FindsNodes()
+    {
+        await EnsurePlanFixture();
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "pg", "SELECT id FROM plan_widgets", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var result = DatabaseTool.DbPlanQuery(planId, "$..['Node Type']", store, s_fmt);
+        Assert.DoesNotContain("No nodes matched", result);
+    }
+
+    [RequiresPsqlFact]
+    public async Task Postgres_DbPlanSuggestIndexes_WithoutHypopg_ReturnsHeuristicAndHint()
+    {
+        await EnsurePlanFixture();
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        await EnsureHypopgAbsentAsync(reg);
+        var store = new ExecutionPlanStore();
+
+        await DatabaseTool.DbQuery(
+            "pg", "SELECT id FROM plan_widgets WHERE name = 'w42'",
+            reg, s_fmt, store, includeExecutionPlan: true);
+        var planId = store.List().First().Id;
+
+        var output = await DatabaseTool.DbPlanSuggestIndexes(planId, store, reg, s_fmt);
+        Assert.Contains("Heuristic candidates", output);
+        Assert.Contains("plan_widgets", output);
+        Assert.Contains("hypopg", output);
+        Assert.Contains("not installed", output);
+        Assert.Contains("CREATE EXTENSION hypopg", output);
+    }
+
+    [RequiresPsqlFact]
+    public async Task Postgres_DbPlanSuggestIndexes_WithHypopg_Validates()
+    {
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        if (!await EnsureHypopgInstalledAsync(reg))
+            return; // hypopg not available in container; skip
+
+        await EnsurePlanFixture();
+        var store = new ExecutionPlanStore();
+        await DatabaseTool.DbQuery(
+            "pg", "SELECT id FROM plan_widgets WHERE name = 'w42'",
+            reg, s_fmt, store, includeExecutionPlan: true);
+        var planId = store.List().First().Id;
+
+        var output = await DatabaseTool.DbPlanSuggestIndexes(planId, store, reg, s_fmt);
+        Assert.Contains("Heuristic candidates", output);
+        Assert.Contains("hypopg validated", output);
+    }
+
+    private async Task EnsureHypopgAbsentAsync(DbConnectionRegistry reg)
+    {
+        try
+        {
+            await DatabaseTool.DbExecute("pg", "DROP EXTENSION IF EXISTS hypopg", reg, s_fmt);
+        }
+        catch { }
+        ClearHypopgCache(reg);
+    }
+
+    private async Task<bool> EnsureHypopgInstalledAsync(DbConnectionRegistry reg)
+    {
+        var output = await DatabaseTool.DbExecute("pg", "CREATE EXTENSION IF NOT EXISTS hypopg", reg, s_fmt);
+        ClearHypopgCache(reg);
+        if (output.StartsWith("SQL Error", StringComparison.Ordinal))
+            return false;
+        var provider = (PostgresDbProvider)reg.Get("pg")!;
+        return await provider.IsHypopgInstalledAsync(default);
+    }
+
+    private static void ClearHypopgCache(DbConnectionRegistry reg)
+    {
+        var provider = reg.Get("pg");
+        var field = provider?.GetType().GetField("_hypopgInstalled",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        field?.SetValue(provider, null);
+    }
+
+    private async Task EnsurePlanFixture()
+    {
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        await DatabaseTool.DbExecute("pg",
+            "CREATE TABLE IF NOT EXISTS plan_widgets(id serial primary key, name text)", reg, s_fmt);
+        await DatabaseTool.DbExecute("pg",
+            "INSERT INTO plan_widgets(name) SELECT 'w'||g FROM generate_series(1,200) g " +
+            "ON CONFLICT DO NOTHING", reg, s_fmt);
     }
 
     [RequiresPsqlFact]
@@ -713,6 +851,7 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
 {
     private readonly MssqlContainerFixture _fx;
     private static readonly IOutputFormatter s_fmt = new MarkdownFormatter();
+    private static readonly ExecutionPlanStore s_planStore = new();
 
     public MssqlIntegrationTests(MssqlContainerFixture fx) => _fx = fx;
 
@@ -720,7 +859,7 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
     public async Task Mssql_SelectOne_ReturnsRow()
     {
         var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
-        var output = await DatabaseTool.DbQuery("sql", "SELECT 1 AS n", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("sql", "SELECT 1 AS n", reg, s_fmt, s_planStore);
         Assert.Contains("1", output);
     }
 
@@ -730,7 +869,7 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
         var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
         await DatabaseTool.DbExecute("sql", "CREATE TABLE widgets(id int identity primary key, name nvarchar(50))", reg, s_fmt);
         await DatabaseTool.DbExecute("sql", "INSERT INTO widgets(name) VALUES (@n)", reg, s_fmt, parameters: "{\"@n\": \"gizmo\"}");
-        var output = await DatabaseTool.DbQuery("sql", "SELECT name FROM widgets", reg, s_fmt);
+        var output = await DatabaseTool.DbQuery("sql", "SELECT name FROM widgets", reg, s_fmt, s_planStore);
         Assert.Contains("gizmo", output);
     }
 
@@ -741,5 +880,78 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
         await DatabaseTool.DbExecute("sql", "CREATE TABLE listed_widgets(id int)", reg, s_fmt);
         var output = await DatabaseTool.DbListTables("sql", reg, s_fmt, "dbo");
         Assert.Contains("listed_widgets", output);
+    }
+
+    [RequiresMssqlFact]
+    public async Task Mssql_DbQuery_WithIncludeExecutionPlan_ReturnsPlanId()
+    {
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
+        var output = await DatabaseTool.DbQuery(
+            "sql", "SELECT TOP 3 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
+        Assert.Contains("Execution Plan ID", output);
+        Assert.Contains("plan-", output);
+    }
+
+    [RequiresMssqlFact]
+    public async Task Mssql_DbPlanSummary_ReturnsCost()
+    {
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "sql", "SELECT TOP 5 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var summary = DatabaseTool.DbPlanSummary(planId, store, s_fmt);
+        Assert.Contains("Total estimated cost", summary);
+        Assert.Contains("Operator count", summary);
+    }
+
+    [RequiresMssqlFact]
+    public async Task Mssql_DbPlanOperators_ListsRelOps()
+    {
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "sql", "SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var ops = DatabaseTool.DbPlanOperators(planId, store, s_fmt);
+        Assert.Contains("PhysicalOp", ops);
+    }
+
+    [RequiresMssqlFact]
+    public async Task Mssql_DbPlanWarnings_OnSimpleQuery_NoWarnings()
+    {
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "sql", "SELECT TOP 1 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var w = DatabaseTool.DbPlanWarnings(planId, store, s_fmt);
+        Assert.Contains("No warnings", w);
+    }
+
+    [RequiresMssqlFact]
+    public async Task Mssql_DbPlanQuery_FindsRelOps()
+    {
+        var store = new ExecutionPlanStore();
+        var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
+        await DatabaseTool.DbQuery(
+            "sql", "SELECT TOP 5 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
+
+        var planId = store.List().First().Id;
+        var result = DatabaseTool.DbPlanQuery(planId, "//sp:RelOp", store, s_fmt);
+        Assert.DoesNotContain("No nodes matched", result);
+        Assert.Contains("RelOp", result);
+    }
+
+    [Fact]
+    public void Mssql_DbPlanSummary_UnknownId_ReturnsNotFound()
+    {
+        var store = new ExecutionPlanStore();
+        var output = DatabaseTool.DbPlanSummary("plan-nonexistent", store, s_fmt);
+        Assert.Contains("Plan not found", output);
     }
 }

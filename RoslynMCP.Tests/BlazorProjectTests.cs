@@ -44,7 +44,7 @@ public class BlazorProjectTests : IAsyncLifetime
             foreach (var a in _project.AnalyzerReferences)
             {
                 sb.AppendLine($"  [{a.GetType().Name}] {a.Display} :: {a.FullPath}");
-                if (a is Microsoft.CodeAnalysis.AnalyzerFileReference afr)
+                if (a is Microsoft.CodeAnalysis.Diagnostics.AnalyzerFileReference afr)
                 {
                     try
                     {

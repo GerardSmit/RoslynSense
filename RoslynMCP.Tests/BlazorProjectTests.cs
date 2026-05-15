@@ -53,7 +53,15 @@ public class BlazorProjectTests : IAsyncLifetime
             sb.AppendLine($"Documents count: {_project.Documents.Count()}");
             sb.AppendLine($"AnalyzerConfigDocuments count: {_project.AnalyzerConfigDocuments.Count()}");
             foreach (var ac in _project.AnalyzerConfigDocuments.Take(5))
+            {
                 sb.AppendLine($"  {ac.Name} :: {ac.FilePath}");
+                if (ac.Name.Contains("MSBuild") || (ac.FilePath?.Contains("MSBuild") ?? false))
+                {
+                    var t = await ac.GetTextAsync();
+                    foreach (var l in t.ToString().Split('\n').Take(80))
+                        sb.AppendLine($"      | {l.TrimEnd()}");
+                }
+            }
             var ps = _project.ParseOptions as Microsoft.CodeAnalysis.CSharp.CSharpParseOptions;
             sb.AppendLine($"LangVersion: {ps?.LanguageVersion}");
             sb.AppendLine($"Features: {(ps == null ? "" : string.Join(",", ps.Features.Keys))}");

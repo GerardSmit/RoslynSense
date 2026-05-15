@@ -36,8 +36,88 @@ public class BlazorProjectTests : IAsyncLifetime
         var sourceMap = await RazorSourceMappingService.BuildSourceMapAsync(_project!);
 
         Assert.NotNull(sourceMap);
-        Assert.True(sourceMap.Mappings.Count > 0,
-            "Should find Razor source-generated documents with #line directives");
+        if (sourceMap.Mappings.Count == 0)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Project: {_project!.FilePath}");
+            sb.AppendLine($"AnalyzerReferences count: {_project.AnalyzerReferences.Count}");
+            foreach (var a in _project.AnalyzerReferences)
+            {
+                sb.AppendLine($"  [{a.GetType().Name}] {a.Display} :: {a.FullPath}");
+                if (a is Microsoft.CodeAnalysis.Diagnostics.AnalyzerFileReference afr)
+                {
+                    var loadErrors = new List<string>();
+                    afr.AnalyzerLoadFailed += (sender, args) =>
+                        loadErrors.Add($"{args.ErrorCode}: {args.Message} (type={args.TypeName})");
+                    try
+                    {
+                        var analyzers = afr.GetAnalyzers(Microsoft.CodeAnalysis.LanguageNames.CSharp);
+                        var gens = afr.GetGenerators(Microsoft.CodeAnalysis.LanguageNames.CSharp);
+                        sb.AppendLine($"      analyzers={analyzers.Length}, generators={gens.Length}");
+                        foreach (var g in gens.Take(3))
+                            sb.AppendLine($"        gen: {g.GetType().FullName}");
+                        if (a.Display?.Contains("Razor") == true)
+                        {
+                            try
+                            {
+                                var asm = System.Reflection.Assembly.LoadFrom(a.FullPath!);
+                                sb.AppendLine($"      asm name: {asm.GetName()}");
+                                var refs = asm.GetReferencedAssemblies();
+                                foreach (var r in refs.Where(r => r.Name?.Contains("CodeAnalysis") == true || r.Name?.Contains("Roslyn") == true))
+                                    sb.AppendLine($"      refs: {r.FullName}");
+                                var genTypes = asm.GetTypes().Where(t =>
+                                    t.GetCustomAttributes(false).Any(att => att.GetType().Name == "GeneratorAttribute")).ToList();
+                                sb.AppendLine($"      asm gen types: {genTypes.Count}");
+                                foreach (var t in genTypes.Take(5))
+                                    sb.AppendLine($"        {t.FullName}");
+                            }
+                            catch (Exception ex)
+                            {
+                                sb.AppendLine($"      assembly probe error: {ex.GetType().Name}: {ex.Message}");
+                                if (ex is System.Reflection.ReflectionTypeLoadException rtle)
+                                {
+                                    foreach (var le in rtle.LoaderExceptions.Where(le => le is not null).Take(5))
+                                        sb.AppendLine($"        loader-ex: {le!.GetType().Name}: {le.Message}");
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        sb.AppendLine($"      load error: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    foreach (var le in loadErrors)
+                        sb.AppendLine($"      AnalyzerLoadFailed: {le}");
+                }
+            }
+            var genDocs = (await _project.GetSourceGeneratedDocumentsAsync()).ToList();
+            sb.AppendLine($"Generated docs: {genDocs.Count}");
+            foreach (var d in genDocs.Take(5))
+                sb.AppendLine($"  {d.HintName} :: {d.Name}");
+            sb.AppendLine($"AdditionalDocuments count: {_project.AdditionalDocuments.Count()}");
+            foreach (var ad in _project.AdditionalDocuments.Take(20))
+                sb.AppendLine($"  {ad.Name} :: {ad.FilePath}");
+            sb.AppendLine($"Documents count: {_project.Documents.Count()}");
+            sb.AppendLine($"AnalyzerConfigDocuments count: {_project.AnalyzerConfigDocuments.Count()}");
+            foreach (var ac in _project.AnalyzerConfigDocuments.Take(5))
+            {
+                sb.AppendLine($"  {ac.Name} :: {ac.FilePath}");
+                if (ac.Name.Contains("MSBuild") || (ac.FilePath?.Contains("MSBuild") ?? false))
+                {
+                    var t = await ac.GetTextAsync();
+                    foreach (var l in t.ToString().Split('\n').Take(80))
+                        sb.AppendLine($"      | {l.TrimEnd()}");
+                }
+            }
+            var ps = _project.ParseOptions as Microsoft.CodeAnalysis.CSharp.CSharpParseOptions;
+            sb.AppendLine($"LangVersion: {ps?.LanguageVersion}");
+            sb.AppendLine($"Features: {(ps == null ? "" : string.Join(",", ps.Features.Keys))}");
+            var compilation = await _project.GetCompilationAsync();
+            sb.AppendLine($"Compilation diagnostics: {compilation?.GetDiagnostics().Length ?? -1}");
+            foreach (var d in compilation?.GetDiagnostics().Take(20) ?? Enumerable.Empty<Microsoft.CodeAnalysis.Diagnostic>())
+                sb.AppendLine($"  {d.Severity}: [{d.Id}] {d.GetMessage()}");
+            throw new Xunit.Sdk.XunitException("Should find Razor source-generated documents with #line directives. Diagnostics:\n" + sb.ToString());
+        }
     }
 
     [Fact]

@@ -47,10 +47,20 @@ public class BlazorProjectTests : IAsyncLifetime
             sb.AppendLine($"Generated docs: {genDocs.Count}");
             foreach (var d in genDocs.Take(5))
                 sb.AppendLine($"  {d.HintName} :: {d.Name}");
+            sb.AppendLine($"AdditionalDocuments count: {_project.AdditionalDocuments.Count()}");
+            foreach (var ad in _project.AdditionalDocuments.Take(20))
+                sb.AppendLine($"  {ad.Name} :: {ad.FilePath}");
+            sb.AppendLine($"Documents count: {_project.Documents.Count()}");
+            sb.AppendLine($"AnalyzerConfigDocuments count: {_project.AnalyzerConfigDocuments.Count()}");
+            foreach (var ac in _project.AnalyzerConfigDocuments.Take(5))
+                sb.AppendLine($"  {ac.Name} :: {ac.FilePath}");
+            var ps = _project.ParseOptions as Microsoft.CodeAnalysis.CSharp.CSharpParseOptions;
+            sb.AppendLine($"LangVersion: {ps?.LanguageVersion}");
+            sb.AppendLine($"Features: {(ps == null ? "" : string.Join(",", ps.Features.Keys))}");
             var compilation = await _project.GetCompilationAsync();
             sb.AppendLine($"Compilation diagnostics: {compilation?.GetDiagnostics().Length ?? -1}");
-            foreach (var d in compilation?.GetDiagnostics().Where(x => x.Severity >= Microsoft.CodeAnalysis.DiagnosticSeverity.Warning).Take(10) ?? Enumerable.Empty<Microsoft.CodeAnalysis.Diagnostic>())
-                sb.AppendLine($"  {d.Severity}: {d.GetMessage()}");
+            foreach (var d in compilation?.GetDiagnostics().Take(20) ?? Enumerable.Empty<Microsoft.CodeAnalysis.Diagnostic>())
+                sb.AppendLine($"  {d.Severity}: [{d.Id}] {d.GetMessage()}");
             throw new Xunit.Sdk.XunitException("Should find Razor source-generated documents with #line directives. Diagnostics:\n" + sb.ToString());
         }
     }

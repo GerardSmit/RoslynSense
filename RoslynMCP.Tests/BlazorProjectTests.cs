@@ -36,8 +36,23 @@ public class BlazorProjectTests : IAsyncLifetime
         var sourceMap = await RazorSourceMappingService.BuildSourceMapAsync(_project!);
 
         Assert.NotNull(sourceMap);
-        Assert.True(sourceMap.Mappings.Count > 0,
-            "Should find Razor source-generated documents with #line directives");
+        if (sourceMap.Mappings.Count == 0)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Project: {_project!.FilePath}");
+            sb.AppendLine($"AnalyzerReferences count: {_project.AnalyzerReferences.Count}");
+            foreach (var a in _project.AnalyzerReferences)
+                sb.AppendLine($"  [{a.GetType().Name}] {a.Display} :: {a.FullPath}");
+            var genDocs = (await _project.GetSourceGeneratedDocumentsAsync()).ToList();
+            sb.AppendLine($"Generated docs: {genDocs.Count}");
+            foreach (var d in genDocs.Take(5))
+                sb.AppendLine($"  {d.HintName} :: {d.Name}");
+            var compilation = await _project.GetCompilationAsync();
+            sb.AppendLine($"Compilation diagnostics: {compilation?.GetDiagnostics().Length ?? -1}");
+            foreach (var d in compilation?.GetDiagnostics().Where(x => x.Severity >= Microsoft.CodeAnalysis.DiagnosticSeverity.Warning).Take(10) ?? Enumerable.Empty<Microsoft.CodeAnalysis.Diagnostic>())
+                sb.AppendLine($"  {d.Severity}: {d.GetMessage()}");
+            throw new Xunit.Sdk.XunitException("Should find Razor source-generated documents with #line directives. Diagnostics:\n" + sb.ToString());
+        }
     }
 
     [Fact]

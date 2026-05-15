@@ -12,6 +12,7 @@ public class BlazorProjectTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
+        WorkspaceService.EnsureRegistered();
         _workspace = MSBuildWorkspace.Create();
         _project = await _workspace.OpenProjectAsync(FixturePaths.BlazorProjectFile);
     }

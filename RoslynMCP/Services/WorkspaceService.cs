@@ -20,6 +20,17 @@ internal static class WorkspaceService
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan EvictionInterval = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// Hard ceiling on <see cref="MSBuildWorkspace.OpenProjectAsync"/>. Override via
+    /// <c>ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS</c> environment variable. Default 300s
+    /// is long enough for a cold WebForms project (BuildHost-net472 spin-up plus full
+    /// MSBuild evaluation) but short enough that a wedged BuildHost surfaces as an
+    /// error rather than an indefinite hang.
+    /// </summary>
+    private static readonly TimeSpan OpenProjectTimeout = TimeSpan.FromSeconds(
+        int.TryParse(Environment.GetEnvironmentVariable("ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS"), out var s) && s > 0
+            ? s : 300);
+
     private static readonly Dictionary<string, CachedWorkspaceEntry> s_cache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, Task<(Workspace, Project)>> s_inflight = new(StringComparer.OrdinalIgnoreCase);
     private static readonly SemaphoreSlim s_cacheLock = new(1, 1);
@@ -360,9 +371,31 @@ internal static class WorkspaceService
                 {
                     await EnsureRestoredAsync(normalizedPath, cancellationToken);
 
-                    openedProject = await msbuildWorkspace.OpenProjectAsync(
-                        normalizedPath,
-                        cancellationToken: cancellationToken);
+                    // Hard ceiling on OpenProjectAsync so a wedged BuildHost-net472 subprocess
+                    // (common with legacy WebForms + source generators) cannot freeze the
+                    // entire MCP server. The token is also passed to OpenProjectAsync so a
+                    // well-behaved load can short-circuit; WaitAsync is the belt-and-braces
+                    // backstop for native hangs that ignore the token.
+                    using var openCts = new CancellationTokenSource(OpenProjectTimeout);
+                    using var openLinked = CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellationToken, openCts.Token);
+
+                    try
+                    {
+                        openedProject = await msbuildWorkspace.OpenProjectAsync(
+                            normalizedPath,
+                            cancellationToken: openLinked.Token)
+                            .WaitAsync(OpenProjectTimeout, cancellationToken);
+                    }
+                    catch (TimeoutException tex)
+                    {
+                        throw new TimeoutException(
+                            $"Opening '{Path.GetFileName(normalizedPath)}' timed out after " +
+                            $"{OpenProjectTimeout.TotalSeconds:F0}s. The MSBuild BuildHost subprocess may be wedged " +
+                            "(legacy WebForms projects with source generators are a frequent cause). " +
+                            "Disposing the workspace will kill the BuildHost; the next attempt should succeed.",
+                            tex);
+                    }
 
                     var solution = StripUnresolvedAnalyzerReferences(msbuildWorkspace.CurrentSolution);
                     if (solution != msbuildWorkspace.CurrentSolution)

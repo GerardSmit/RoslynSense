@@ -240,6 +240,9 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
 | `database.connections` | object | `{}` | `--db` overrides matching alias |
 | `tableFormat` | string? | `null` | `--toon` forces `"toon"` |
 | `preload` | string[]? | `null` | `--no-preload` forces `[]` |
+| `sharedHost` | bool? | `true` | env `ROSLYNMCP_SHARED_HOST=0` forces off |
+| `hostIdleMinutes` | int? | `30` | env `ROSLYNMCP_HOST_IDLE_MINUTES` |
+| `maxWorkspaces` | int? | `4` | env `ROSLYNMCP_MAX_WORKSPACES` |
 
 **`preload` semantics:**
 
@@ -292,6 +295,31 @@ The connection-string portion accepts the same `xml:` / `json:` indirection and 
 - Per-connection parse failures (unknown provider, empty value) are logged as warnings and the entry is skipped.
 
 </details>
+
+### Shared host (across chats)
+
+Each MCP client (each chat) normally spawns its own `roslyn-sense` process, so N chats on the same solution load that solution N times. To avoid that, RoslynSense runs a **single shared host process per solution**: thin client processes forward tool calls and resource reads to it over a named pipe, so the solution is loaded once and shared.
+
+- **On by default.** Disable with `ROSLYNMCP_SHARED_HOST=0` (or `"sharedHost": false`), e.g. for debugging — clients then run everything in-process.
+- **Automatic fallback.** If the host can't be reached or an IPC call fails, the client transparently runs the call in-process; a host problem never breaks a chat.
+- **Scope.** Only applies when the working directory belongs to a multi-project solution; loose `.csproj` use stays in-process.
+- **Lifecycle.** The host shuts down after `ROSLYNMCP_HOST_IDLE_MINUTES` (default 30) with no connected clients, and respawns on the next call. Logs go to `%TEMP%/roslyn-mcp-daemon/<hash>/host.log`.
+
+In-process memory is also bounded independently of the host:
+
+- **One workspace per solution** (not per project): opening any project of a solution opens the whole solution once. `ROSLYNMCP_MAX_WORKSPACES` (default 4) caps cached solution workspaces (LRU), on top of the 10-minute idle eviction.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `ROSLYNMCP_SHARED_HOST` | `1` | `0`/`false`/`off` disables the shared host (pure in-process). |
+| `ROSLYNMCP_HOST_IDLE_MINUTES` | `30` | Idle minutes before a clientless host exits. |
+| `ROSLYNMCP_MAX_WORKSPACES` | `4` | Max cached solution workspaces (LRU bound). |
+| `ROSLYNMCP_INDEX_IDLE_TIMEOUT_SECONDS` | `600` | Idle eviction for ASPX/Razor project-index caches. |
+| `ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS` | `300` | Ceiling on a single project/solution open. |
+
+**Debugging is per-chat.** Debug tools are *not* forwarded to the shared host — they run in-process in each client, so every chat has its own independent debug session (`netcoredbg` subprocess). Multiple chats can debug the same solution at once without colliding. (Trade-off: a debug session loads its own workspace in the client process, but debugging is interactive and infrequent.)
+
+**Single host guarantee.** Exactly one host serves a solution at a time: a daemon acquires an exclusive lock file before it begins listening, so a daemon that loses a startup race exits without serving; the OS releases the lock on process death, so a crash self-heals and the next call respawns.
 
 ## Tools
 

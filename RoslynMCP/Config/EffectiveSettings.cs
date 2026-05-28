@@ -11,13 +11,30 @@ public sealed record EffectiveSettings(
     bool? AutoDiscoverDb,
     string? TableFormat,
     IReadOnlyList<IDbProvider> ExplicitDbProviders,
-    IReadOnlyList<string>? Preload)
+    IReadOnlyList<string>? Preload,
+    bool SharedHost,
+    int HostIdleMinutes,
+    int MaxWorkspaces)
 {
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
         warnings = new List<string>();
 
         bool HasFlag(string name) => args.Contains(name, StringComparer.OrdinalIgnoreCase);
+
+        static string? Env(string name) => Environment.GetEnvironmentVariable(name);
+        static int EnvInt(string name, int? configVal, int fallback) =>
+            int.TryParse(Env(name), out var v) && v > 0 ? v : (configVal is > 0 ? configVal.Value : fallback);
+
+        // Shared host: env wins (ROSLYNMCP_SHARED_HOST=0/1), then config, default on.
+        bool sharedHost = Env("ROSLYNMCP_SHARED_HOST") switch
+        {
+            "0" or "false" or "off" => false,
+            "1" or "true" or "on" => true,
+            _ => config?.SharedHost ?? true,
+        };
+        int hostIdleMinutes = EnvInt("ROSLYNMCP_HOST_IDLE_MINUTES", config?.HostIdleMinutes, 30);
+        int maxWorkspaces = EnvInt("ROSLYNMCP_MAX_WORKSPACES", config?.MaxWorkspaces, 4);
 
         var tools = config?.Tools ?? new ToolsConfig();
 
@@ -74,7 +91,7 @@ public sealed record EffectiveSettings(
         return new EffectiveSettings(
             webForms, razor, debugger, profiling, database,
             autoDiscover, tableFormat, explicitProviders,
-            preload);
+            preload, sharedHost, hostIdleMinutes, maxWorkspaces);
     }
 
     public bool ShouldRunAutoDiscovery()

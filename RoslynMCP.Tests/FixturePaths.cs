@@ -55,6 +55,11 @@ internal static class FixturePaths
     public static string DebugCalculatorFile => Path.Combine(DebugTestProjectDir, "Calculator.cs");
     public static string DebugCalculatorTestsFile => Path.Combine(DebugTestProjectDir, "CalculatorTests.cs");
 
+    public static string MultiSolutionDir => Path.Combine(s_fixturesRoot, "MultiSolution");
+    public static string MultiSolutionFile => Path.Combine(MultiSolutionDir, "MultiSolution.sln");
+    public static string MultiProjectAFile => Path.Combine(MultiSolutionDir, "ProjectA", "ProjectA.csproj");
+    public static string MultiProjectBFile => Path.Combine(MultiSolutionDir, "ProjectB", "ProjectB.csproj");
+
     public static string SourceGenFixtureDir => Path.Combine(s_fixturesRoot, "SourceGenFixture");
     public static string SourceGenGeneratorProjectFile => Path.Combine(SourceGenFixtureDir, "Generator", "Generator.csproj");
     public static string SourceGenGeneratorSourceFile => Path.Combine(SourceGenFixtureDir, "Generator", "HelloGenerator.cs");

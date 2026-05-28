@@ -91,6 +91,37 @@ internal sealed class ShadowCopyManager : IDisposable
     }
 
     /// <summary>
+    /// Maps an analyzer DLL path — either an <b>original</b> source path or a
+    /// <b>shadow-copy</b> path — to the source directory that the rebuild watcher fires
+    /// <see cref="AnalyzerDirectoryChanged"/> on. Returns <c>null</c> when the path is not
+    /// associated with any shadow-copied directory (e.g. NuGet packages, never watched).
+    /// <para>
+    /// Callers (e.g. <c>AnalyzerHost</c>) must key their rebuild-eviction maps on this
+    /// value rather than on <c>Path.GetDirectoryName(path)</c>: after the workspace rebind,
+    /// analyzer paths are already shadow paths, so their directory is a shadow temp dir —
+    /// never the source dir the watcher reports, so the two would never match.
+    /// </para>
+    /// </summary>
+    public string? TryGetSourceDirectory(string path)
+    {
+        string dir = Path.GetDirectoryName(Path.GetFullPath(path)) ?? path;
+        lock (_lock)
+        {
+            // Already an original source dir → it's a watcher key as-is.
+            if (_shadowDirectories.ContainsKey(dir))
+                return dir;
+
+            // A shadow dir → reverse-map to the source dir the watcher fires on.
+            foreach (var (source, shadow) in _shadowDirectories)
+            {
+                if (string.Equals(shadow, dir, StringComparison.OrdinalIgnoreCase))
+                    return source;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Invalidates (deletes) the shadow copy for <paramref name="sourceDir"/>.
     /// The next call to <see cref="GetLoadPath"/> will re-copy from the source.
     /// </summary>

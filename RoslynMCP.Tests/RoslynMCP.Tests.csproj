@@ -44,6 +44,8 @@
         <MSBuild Projects="Fixtures\BlazorProject\BlazorProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\AspxProject\AspxProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\SourceGenFixture\Consumer\Consumer.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\MultiSolution\ProjectB\ProjectB.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\DebugTestProject\DebugTestProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
     </Target>
 
 </Project>

@@ -81,15 +81,20 @@ internal sealed class AnalyzerHost : IDisposable
 
             // Track which source directories contribute to this cache entry
             // so we can auto-evict when a FileSystemWatcher detects a rebuild.
+            // analyzerPaths are typically already shadow paths (post-rebind), so we must
+            // map back to the *source* dir the watcher fires on — NeedsShadowCopy(shadowPath)
+            // is false and Path.GetDirectoryName(shadowPath) is a temp dir, so neither would
+            // ever match OnAnalyzerDirectoryChanged's source-dir argument. LoadIsolated ran
+            // above and called GetLoadPath, so the shadow mapping is populated by now.
             foreach (var path in analyzerPaths)
             {
-                if (_shadowCopy.NeedsShadowCopy(path))
+                string? sourceDir = _shadowCopy.TryGetSourceDirectory(path);
+                if (sourceDir is not null)
                 {
-                    string dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
-                    if (!_dirToKeys.TryGetValue(dir, out var keys))
+                    if (!_dirToKeys.TryGetValue(sourceDir, out var keys))
                     {
                         keys = new HashSet<string>(StringComparer.Ordinal);
-                        _dirToKeys[dir] = keys;
+                        _dirToKeys[sourceDir] = keys;
                     }
                     keys.Add(key);
                 }

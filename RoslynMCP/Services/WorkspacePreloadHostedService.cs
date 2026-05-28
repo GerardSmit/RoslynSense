@@ -38,9 +38,22 @@ internal sealed class WorkspacePreloadHostedService : IHostedService
 
         _logger.LogInformation("[Preload] Warming {Count} project(s) in background...", projects.Count);
 
+        // Projects of the same solution share one workspace, so warming the first member loads
+        // the whole solution; skip the rest to avoid redundant cache-hit churn.
+        var warmedSolutions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var projectPath in projects)
         {
             if (cancellationToken.IsCancellationRequested) break;
+
+            var owner = WorkspaceService.GetOwnerSolutionKey(projectPath);
+            if (owner is not null && !warmedSolutions.Add(owner))
+            {
+                _logger.LogInformation(
+                    "[Preload] Skipping '{Project}' (solution already warmed).", Path.GetFileName(projectPath));
+                continue;
+            }
+
             try
             {
                 _logger.LogInformation("[Preload] Loading '{Project}'...", Path.GetFileName(projectPath));

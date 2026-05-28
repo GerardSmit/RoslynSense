@@ -116,7 +116,7 @@ internal static class DecompiledSourceService
         return new DecompiledSourceResult(assemblyPath, manifestPath, sourceFilePath, workspace, project, locations);
     }
 
-    public static async Task<(Workspace Workspace, Project Project)> OpenProjectAsync(
+    public static async Task<(Workspace Workspace, Project Project, string? TempDir)> OpenProjectAsync(
         string manifestPath,
         CancellationToken cancellationToken = default)
     {
@@ -128,10 +128,14 @@ internal static class DecompiledSourceService
                 manifest.SourceFilePath);
 
         var workspace = new AdhocWorkspace();
+        string? tempDir = null;
         try
         {
             string projectName = BuildProjectName(manifest);
             var projectId = ProjectId.CreateNewId(projectName);
+
+            var (metadataReferences, createdTempDir) = CreateMetadataReferences(manifest.AssemblyPath);
+            tempDir = createdTempDir;
 
             var solution = workspace.CurrentSolution
                 .AddProject(projectId, projectName, projectName, LanguageNames.CSharp)
@@ -144,7 +148,7 @@ internal static class DecompiledSourceService
                 .WithProjectParseOptions(
                     projectId,
                     new CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview))
-                .AddMetadataReferences(projectId, CreateMetadataReferences(manifest.AssemblyPath));
+                .AddMetadataReferences(projectId, metadataReferences);
 
             string sourceText = await File.ReadAllTextAsync(manifest.SourceFilePath, cancellationToken);
             var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(manifest.SourceFilePath));
@@ -164,12 +168,48 @@ internal static class DecompiledSourceService
                 ?? throw new InvalidOperationException(
                     $"Generated decompiled project '{projectName}' was not found after creation.");
 
-            return (workspace, project);
+            return (workspace, project, tempDir);
         }
         catch
         {
             workspace.Dispose();
+            if (tempDir is not null)
+                TryDeleteTempDir(tempDir);
             throw;
+        }
+    }
+
+    /// <summary>Root for per-decompile temp copies of reference assemblies.</summary>
+    private static readonly string s_decompileTempRoot =
+        Path.Combine(Path.GetTempPath(), "RoslynMCP", "DecompileTemp");
+
+    /// <summary>
+    /// Deletes all orphaned decompile temp directories from previous runs. Called once at
+    /// startup; safe because the copies only live for the duration of a process's workspaces.
+    /// </summary>
+    public static void CleanupOrphanedTempDirs()
+    {
+        try
+        {
+            if (Directory.Exists(s_decompileTempRoot))
+                Directory.Delete(s_decompileTempRoot, recursive: true);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[DecompiledSourceService] Failed to clean temp root: {ex.Message}");
+        }
+    }
+
+    internal static void TryDeleteTempDir(string tempDir)
+    {
+        try
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[DecompiledSourceService] Failed to delete temp dir '{tempDir}': {ex.Message}");
         }
     }
 
@@ -614,12 +654,29 @@ internal static class DecompiledSourceService
         return $"RoslynMCP.Decompiled.{assemblyName}.{typeName}";
     }
 
-    private static IEnumerable<MetadataReference> CreateMetadataReferences(string assemblyPath)
+    /// <summary>
+    /// Builds the metadata references for a decompiled project. Returns the references plus
+    /// the temp directory (or <c>null</c>) the caller must delete when the workspace is evicted.
+    /// <para>
+    /// The target assembly and its co-located neighbours are frequently a project's <c>bin/</c>
+    /// output. <see cref="MetadataReference.CreateFromFile"/> memory-maps the DLL and would lock
+    /// it on disk for the cached workspace's lifetime, blocking the user's rebuild. So those are
+    /// COPIED to a temp dir and referenced from the copy: the original stays unlocked, and the
+    /// metadata stays OS-paged (cheap) rather than pinned as a managed byte array.
+    /// TRUSTED_PLATFORM_ASSEMBLIES are immutable runtime/framework files — never a build target —
+    /// so they are referenced directly from their original (memory-mapped) path.
+    /// </para>
+    /// </summary>
+    private static (List<MetadataReference> References, string? TempDir) CreateMetadataReferences(string assemblyPath)
     {
         var references = new List<MetadataReference>();
         var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? tempDir = null;
 
-        void AddReference(string path)
+        string EnsureTempDir() =>
+            tempDir ??= CreateTempDir();
+
+        void AddReference(string path, bool copyToTemp)
         {
             if (!File.Exists(path))
                 return;
@@ -630,6 +687,28 @@ internal static class DecompiledSourceService
 
             try
             {
+                if (copyToTemp)
+                {
+                    string dest = Path.Combine(EnsureTempDir(), Path.GetFileName(normalized));
+                    try
+                    {
+                        File.Copy(normalized, dest, overwrite: true);
+                        references.Add(MetadataReference.CreateFromFile(dest));
+                        return;
+                    }
+                    catch (Exception copyEx)
+                    {
+                        // Copy failed (e.g. a transient lock) — fall back to an in-memory image
+                        // so we still never hold a lock on the original.
+                        Console.Error.WriteLine(
+                            $"[DecompiledSourceService] Temp-copy failed for '{normalized}', using in-memory image: {copyEx.Message}");
+                        using var stream = new FileStream(
+                            normalized, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                        references.Add(MetadataReference.CreateFromStream(stream, filePath: normalized));
+                        return;
+                    }
+                }
+
                 references.Add(MetadataReference.CreateFromFile(normalized));
             }
             catch (Exception ex)
@@ -639,7 +718,7 @@ internal static class DecompiledSourceService
             }
         }
 
-        AddReference(assemblyPath);
+        AddReference(assemblyPath, copyToTemp: true);
 
         if (AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") is string trustedPlatformAssemblies)
         {
@@ -647,7 +726,7 @@ internal static class DecompiledSourceService
                          Path.PathSeparator,
                          StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                AddReference(path);
+                AddReference(path, copyToTemp: false);
             }
         }
 
@@ -655,13 +734,20 @@ internal static class DecompiledSourceService
         if (!string.IsNullOrEmpty(directory) && Directory.Exists(directory))
         {
             foreach (string path in Directory.EnumerateFiles(directory, "*.dll"))
-                AddReference(path);
+                AddReference(path, copyToTemp: true);
 
             foreach (string path in Directory.EnumerateFiles(directory, "*.exe"))
-                AddReference(path);
+                AddReference(path, copyToTemp: true);
         }
 
-        return references;
+        return (references, tempDir);
+    }
+
+    private static string CreateTempDir()
+    {
+        string dir = Path.Combine(s_decompileTempRoot, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
     }
 
     private static async Task<DecompiledSourceManifest> ReadManifestAsync(

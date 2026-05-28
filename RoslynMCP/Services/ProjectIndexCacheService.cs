@@ -12,6 +12,20 @@ internal static class ProjectIndexCacheService
     private static readonly SemaphoreSlim s_lock = new(1, 1);
     private static readonly Dictionary<string, CachedProjectEntry> s_cache = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Idle period after which a cached entry (and its FileSystemWatcher) is evicted.
+    /// Override via <c>ROSLYNMCP_INDEX_IDLE_TIMEOUT_SECONDS</c>. Mirrors WorkspaceService.</summary>
+    private static readonly TimeSpan IdleTimeout =
+        int.TryParse(Environment.GetEnvironmentVariable("ROSLYNMCP_INDEX_IDLE_TIMEOUT_SECONDS"), out var s) && s > 0
+            ? TimeSpan.FromSeconds(s) : TimeSpan.FromMinutes(10);
+
+    private static readonly TimeSpan EvictionInterval = TimeSpan.FromMinutes(1);
+    private static readonly Timer s_evictionTimer;
+
+    static ProjectIndexCacheService()
+    {
+        s_evictionTimer = new Timer(EvictExpiredEntries, null, EvictionInterval, EvictionInterval);
+    }
+
     private static readonly string[] s_aspxExtensions =
         [".aspx", ".ascx", ".asmx", ".asax", ".ashx", ".master"];
     private static readonly string[] s_razorExtensions =
@@ -28,6 +42,35 @@ internal static class ProjectIndexCacheService
             foreach (var entry in s_cache.Values)
                 entry.Dispose();
             s_cache.Clear();
+        }
+        finally
+        {
+            s_lock.Release();
+        }
+        s_evictionTimer.Dispose();
+    }
+
+    private static void EvictExpiredEntries(object? state)
+    {
+        if (!s_lock.Wait(0))
+            return; // Skip this cycle if another operation holds the lock
+
+        try
+        {
+            var now = DateTime.UtcNow;
+            var expired = s_cache
+                .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout)
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            foreach (var key in expired)
+            {
+                if (s_cache.Remove(key, out var entry))
+                {
+                    entry.Dispose();
+                    Console.Error.WriteLine($"[ProjectIndexCache] Evicted idle entry for '{Path.GetFileName(key)}'.");
+                }
+            }
         }
         finally
         {
@@ -170,7 +213,10 @@ internal static class ProjectIndexCacheService
         try
         {
             if (s_cache.TryGetValue(key, out var existing))
+            {
+                existing.LastAccessedUtc = DateTime.UtcNow;
                 return existing;
+            }
 
             var entry = new CachedProjectEntry();
             SetupFileWatcher(entry, project.FilePath!);
@@ -271,6 +317,7 @@ internal static class ProjectIndexCacheService
         public int AspxGeneration;
         public int RazorGeneration;
         public int WrappersGeneration;
+        public DateTime LastAccessedUtc { get; set; } = DateTime.UtcNow;
         public FileSystemWatcher? Watcher { get; set; }
 
         public void Dispose()

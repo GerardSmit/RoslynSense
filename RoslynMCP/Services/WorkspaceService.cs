@@ -45,6 +45,25 @@ internal static class WorkspaceService
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Reverse index: normalized project (.csproj) path — or a decompiled manifest path —
+    /// → the <see cref="s_cache"/> key of the workspace that can serve it. One solution
+    /// workspace serves all its member projects, so this maps every project in a loaded
+    /// solution's transitive closure to that single cache entry. This is what gives both
+    /// solution-wide dedup and reuse-by-membership for loose projects.
+    /// </summary>
+    private static readonly Dictionary<string, string> s_projectToCacheKey =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Maximum number of cached workspace entries. When the cache exceeds this after the
+    /// idle sweep, the least-recently-used entries are evicted. Each entry now holds a whole
+    /// solution, so a small cap suffices. Override via <c>ROSLYNMCP_MAX_WORKSPACES</c>.
+    /// </summary>
+    internal static int MaxCachedWorkspaces { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("ROSLYNMCP_MAX_WORKSPACES"), out var mw) && mw > 0
+            ? mw : 4;
+
+    /// <summary>
     /// Reflection handle for <c>Workspace.SetCurrentSolution(Solution)</c> (protected,
     /// instance, returns Solution). Used to atomically swap a workspace's current
     /// solution to the analyzer-ref-rebound copy WITHOUT going through
@@ -94,6 +113,7 @@ internal static class WorkspaceService
         RuntimeHelpers.RunClassConstructor(typeof(CSharpSyntaxTree).TypeHandle);
         s_evictionTimer = new Timer(EvictExpiredEntries, null, EvictionInterval, EvictionInterval);
         ShadowCopyService.Instance.AnalyzerDirectoryChanged += OnAnalyzerDirectoryChanged;
+        DecompiledSourceService.CleanupOrphanedTempDirs();
     }
 
     /// <summary>
@@ -297,6 +317,18 @@ internal static class WorkspaceService
         string normalizedPath = Path.GetFullPath(projectPath);
         TaskCompletionSource<(Workspace, Project)>? ourTcs = null;
 
+        bool isDecompile = DecompiledSourceService.IsGeneratedProjectPath(normalizedPath);
+
+        // Owning-solution resolution is disk I/O (dir walk + .sln parse), so it is deferred to
+        // the first cache MISS and memoized — cache hits never pay for it. When the project
+        // belongs to a multi-project solution we open the whole solution ONCE into a single
+        // workspace (keyed by the .sln path) instead of one workspace per .csproj. `loadKey`
+        // is both the s_inflight key (so sibling-project requests coalesce onto one load) and
+        // the s_cache key.
+        string? solutionPath = null;
+        string? loadKey = null;
+        bool ownerResolved = false;
+
         while (true)
         {
             Task<(Workspace, Project)>? inflightTask = null;
@@ -305,17 +337,26 @@ internal static class WorkspaceService
             try
             {
                 if (TryGetValidCachedEntryLocked(normalizedPath, out var cachedEntry))
-                    return CreateProjectSnapshot(cachedEntry!, targetFilePath);
+                    return CreateProjectSnapshot(cachedEntry!, normalizedPath, targetFilePath);
 
-                if (s_inflight.TryGetValue(normalizedPath, out inflightTask))
+                // Cache miss → resolve the owning solution once (brief I/O, miss-path only).
+                if (!ownerResolved)
                 {
-                    // Another caller is loading this project — wait for it outside the lock
+                    if (!isDecompile)
+                        solutionPath = TryFindOwnerSolutionKey(normalizedPath).slnKey;
+                    loadKey = solutionPath ?? normalizedPath;
+                    ownerResolved = true;
+                }
+
+                if (s_inflight.TryGetValue(loadKey!, out inflightTask))
+                {
+                    // Another caller is loading this solution/project — wait for it outside the lock
                 }
                 else
                 {
                     // We are the loader — register ourselves and break out to do the load
                     ourTcs = new TaskCompletionSource<(Workspace, Project)>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    s_inflight[normalizedPath] = ourTcs.Task;
+                    s_inflight[loadKey!] = ourTcs.Task;
                     break;
                 }
             }
@@ -348,18 +389,24 @@ internal static class WorkspaceService
         Project openedProject;
         ShadowCopyAnalyzerAssemblyLoader? shadowLoader = null;
         HashSet<string>? shadowDirs = null;
+        string? decompileTempDir = null;
+        // The s_cache key. Starts as loadKey (solution path when in solution-mode); may be
+        // demoted to the project path if a solution load can't produce the requested project.
+        // loadKey is non-null here: we only reach the loader after resolving it and breaking.
+        string cacheKey = loadKey!;
 
         try
         {
-            if (DecompiledSourceService.IsGeneratedProjectPath(normalizedPath))
+            if (isDecompile)
             {
-                (workspace, openedProject) = await DecompiledSourceService.OpenProjectAsync(
+                (workspace, openedProject, decompileTempDir) = await DecompiledSourceService.OpenProjectAsync(
                     normalizedPath,
                     cancellationToken);
             }
             else
             {
-                var isLegacy = PathHelper.RequiresMsBuild(normalizedPath);
+                var buildTarget = solutionPath ?? normalizedPath;
+                var isLegacy = PathHelper.RequiresMsBuild(buildTarget);
                 if (isLegacy && !IsLegacyProjectSupported)
                     throw new NotSupportedException(
                         "Legacy .NET Framework projects require a Visual Studio install with the MSBuild " +
@@ -382,15 +429,47 @@ internal static class WorkspaceService
 
                     try
                     {
-                        openedProject = await msbuildWorkspace.OpenProjectAsync(
-                            normalizedPath,
-                            cancellationToken: openLinked.Token)
-                            .WaitAsync(OpenProjectTimeout, cancellationToken);
+                        if (solutionPath is not null)
+                        {
+                            // Open the WHOLE solution once into this workspace. Project-to-project
+                            // references become shared compilation references (loaded once),
+                            // instead of one fully-loaded transitive graph per project.
+                            var loadedSolution = await msbuildWorkspace.OpenSolutionAsync(
+                                solutionPath, cancellationToken: openLinked.Token)
+                                .WaitAsync(OpenProjectTimeout, cancellationToken);
+
+                            openedProject = loadedSolution.Projects.FirstOrDefault(p =>
+                                !string.IsNullOrEmpty(p.FilePath) &&
+                                string.Equals(Path.GetFullPath(p.FilePath!), normalizedPath, StringComparison.OrdinalIgnoreCase))!;
+
+                            if (openedProject is null)
+                            {
+                                // The requested project didn't load inside the solution (the
+                                // WorkspaceFailed handler logged why). Demote to a clean
+                                // per-project load so the caller still gets a workspace.
+                                Console.Error.WriteLine(
+                                    $"[WorkspaceService] '{Path.GetFileName(normalizedPath)}' not found in solution load; falling back to per-project.");
+                                msbuildWorkspace.Dispose();
+                                solutionPath = null;
+                                cacheKey = normalizedPath;
+                                msbuildWorkspace = CreateWorkspace(diagnosticWriter, isLegacy);
+                                openedProject = await msbuildWorkspace.OpenProjectAsync(
+                                    normalizedPath, cancellationToken: openLinked.Token)
+                                    .WaitAsync(OpenProjectTimeout, cancellationToken);
+                            }
+                        }
+                        else
+                        {
+                            openedProject = await msbuildWorkspace.OpenProjectAsync(
+                                normalizedPath,
+                                cancellationToken: openLinked.Token)
+                                .WaitAsync(OpenProjectTimeout, cancellationToken);
+                        }
                     }
                     catch (TimeoutException tex)
                     {
                         throw new TimeoutException(
-                            $"Opening '{Path.GetFileName(normalizedPath)}' timed out after " +
+                            $"Opening '{Path.GetFileName(buildTarget)}' timed out after " +
                             $"{OpenProjectTimeout.TotalSeconds:F0}s. The MSBuild BuildHost subprocess may be wedged " +
                             "(legacy WebForms projects with source generators are a frequent cause). " +
                             "Disposing the workspace will kill the BuildHost; the next attempt should succeed.",
@@ -438,7 +517,8 @@ internal static class WorkspaceService
         {
             // clr.dll (or another native DLL) could not be loaded. This typically means
             // .NET Framework is not installed, or the VS Setup COM component is broken.
-            await RemoveInflightAndSignal(normalizedPath, ourTcs!, dllEx);
+            await RemoveInflightAndSignal(loadKey!, ourTcs!, dllEx);
+            if (decompileTempDir is not null) DecompiledSourceService.TryDeleteTempDir(decompileTempDir);
             throw new PlatformNotSupportedException(
                 $"Opening '{Path.GetFileName(normalizedPath)}' requires a native DLL that could not be loaded " +
                 $"({dllEx.Message}). For legacy .NET Framework projects, ensure .NET Framework 4.7.2 or later " +
@@ -446,7 +526,8 @@ internal static class WorkspaceService
         }
         catch (Exception ex)
         {
-            await RemoveInflightAndSignal(normalizedPath, ourTcs!, ex);
+            await RemoveInflightAndSignal(loadKey!, ourTcs!, ex);
+            if (decompileTempDir is not null) DecompiledSourceService.TryDeleteTempDir(decompileTempDir);
             throw;
         }
 
@@ -461,28 +542,35 @@ internal static class WorkspaceService
         catch
         {
             workspace.Dispose();
-            await RemoveInflightAndSignal(normalizedPath, ourTcs!);
+            if (decompileTempDir is not null) DecompiledSourceService.TryDeleteTempDir(decompileTempDir);
+            await RemoveInflightAndSignal(loadKey!, ourTcs!);
             throw;
         }
 
         try
         {
-            s_inflight.Remove(normalizedPath);
+            s_inflight.Remove(loadKey!);
 
             if (TryGetValidCachedEntryLocked(normalizedPath, out var cachedEntry))
             {
+                // A concurrent loader already cached a workspace that serves this project.
                 shadowLoader?.Dispose();
                 workspace.Dispose();
-                result = CreateProjectSnapshot(cachedEntry!, targetFilePath);
+                if (decompileTempDir is not null) DecompiledSourceService.TryDeleteTempDir(decompileTempDir);
+                result = CreateProjectSnapshot(cachedEntry!, normalizedPath, targetFilePath);
             }
             else
             {
-                var newEntry = new CachedWorkspaceEntry(workspace, openedProject.Id, shadowLoader, shadowDirs);
-                s_cache[normalizedPath] = newEntry;
-                RegisterShadowDirsLocked(normalizedPath, shadowDirs);
-                Console.Error.WriteLine($"[WorkspaceService] Cached workspace for '{normalizedPath}'.");
+                string[]? tempDirs = decompileTempDir is not null ? [decompileTempDir] : null;
+                var newEntry = new CachedWorkspaceEntry(
+                    cacheKey, workspace, openedProject.Id, shadowLoader, shadowDirs, tempDirs);
+                s_cache[cacheKey] = newEntry;
+                RegisterProjectMappingsLocked(cacheKey, normalizedPath, workspace);
+                RegisterShadowDirsLocked(cacheKey, shadowDirs);
+                Console.Error.WriteLine(
+                    $"[WorkspaceService] Cached workspace for '{cacheKey}' ({newEntry.ProjectIds.Count} project(s)).");
 
-                result = CreateProjectSnapshot(newEntry, targetFilePath);
+                result = CreateProjectSnapshot(newEntry, normalizedPath, targetFilePath);
             }
         }
         catch (Exception ex)
@@ -657,19 +745,50 @@ internal static class WorkspaceService
         await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
-            foreach (var entry in s_cache)
+            foreach (var entry in s_cache.Values)
             {
-                AnalyzerService.EvictAnalyzersForProject(entry.Key);
-                entry.Value.Dispose();
+                foreach (var projectPath in entry.ProjectIds.Keys)
+                    AnalyzerService.EvictAnalyzersForProject(projectPath);
+                entry.Dispose();
             }
             s_cache.Clear();
             s_dirToProjects.Clear();
+            s_projectToCacheKey.Clear();
             Console.Error.WriteLine("[WorkspaceService] All cached workspaces evicted.");
         }
         finally
         {
             s_cacheLock.Release();
         }
+    }
+
+    // ---- Test hooks (exposed via InternalsVisibleTo) ----
+
+    internal static int CachedEntryCount
+    {
+        get { s_cacheLock.Wait(); try { return s_cache.Count; } finally { s_cacheLock.Release(); } }
+    }
+
+    /// <summary>True when <paramref name="projectPath"/> resolves to a live cached workspace.</summary>
+    internal static bool IsProjectCachedForTests(string projectPath)
+    {
+        string key = Path.GetFullPath(projectPath);
+        s_cacheLock.Wait();
+        try { return s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.ContainsKey(ck); }
+        finally { s_cacheLock.Release(); }
+    }
+
+    /// <summary>Evicts only the single entry serving <paramref name="projectPath"/> (no global sweep).</summary>
+    internal static async Task EvictProjectForTests(string projectPath)
+    {
+        string key = Path.GetFullPath(projectPath);
+        await s_cacheLock.WaitAsync();
+        try
+        {
+            if (s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.TryGetValue(ck, out var entry))
+                EvictEntryLocked(ck, entry);
+        }
+        finally { s_cacheLock.Release(); }
     }
 
     /// <summary>
@@ -694,30 +813,66 @@ internal static class WorkspaceService
         return updatedSolution.GetProject(project.Id) ?? project;
     }
 
-    private static bool TryGetValidCachedEntryLocked(string normalizedPath, out CachedWorkspaceEntry? entry)
+    private static bool TryGetValidCachedEntryLocked(string normalizedProjectPath, out CachedWorkspaceEntry? entry)
     {
-        if (!s_cache.TryGetValue(normalizedPath, out entry))
+        entry = null;
+        if (!s_projectToCacheKey.TryGetValue(normalizedProjectPath, out var cacheKey))
             return false;
 
-        if (!IsProjectFileStale(normalizedPath, entry))
+        if (!s_cache.TryGetValue(cacheKey, out entry))
+        {
+            // Dangling reverse-index entry (entry was evicted) — drop it.
+            s_projectToCacheKey.Remove(normalizedProjectPath);
+            entry = null;
+            return false;
+        }
+
+        if (!IsEntryStale(cacheKey, normalizedProjectPath, entry))
             return true;
 
         Console.Error.WriteLine(
-            $"[WorkspaceService] Project file changed, evicting cache for '{normalizedPath}'.");
-        EvictEntryLocked(normalizedPath, entry);
+            $"[WorkspaceService] Project/solution file changed, evicting cache for '{cacheKey}'.");
+        EvictEntryLocked(cacheKey, entry);
         entry = null;
         return false;
     }
 
-    private static void EvictEntryLocked(string normalizedPath, CachedWorkspaceEntry entry)
+    private static void EvictEntryLocked(string cacheKey, CachedWorkspaceEntry entry)
     {
-        s_cache.Remove(normalizedPath);
-        UnregisterShadowDirsLocked(normalizedPath, entry.ShadowDirs);
+        s_cache.Remove(cacheKey);
+
+        // Remove every reverse-index mapping that points at this entry.
+        foreach (var p in s_projectToCacheKey
+                     .Where(kv => string.Equals(kv.Value, cacheKey, StringComparison.OrdinalIgnoreCase))
+                     .Select(kv => kv.Key).ToList())
+            s_projectToCacheKey.Remove(p);
+
+        UnregisterShadowDirsLocked(cacheKey, entry.ShadowDirs);
         entry.Dispose();
-        AnalyzerService.EvictAnalyzersForProject(normalizedPath);
+
+        // Analyzer host entries are keyed per project FilePath, so evict for every project
+        // this workspace served (a solution entry served many).
+        foreach (var projectPath in entry.ProjectIds.Keys)
+            AnalyzerService.EvictAnalyzersForProject(projectPath);
     }
 
-    private static void RegisterShadowDirsLocked(string normalizedPath, IReadOnlyCollection<string>? dirs)
+    /// <summary>
+    /// Records that the workspace cached under <paramref name="cacheKey"/> can serve the
+    /// requested project plus every project in its loaded solution's closure. This powers
+    /// both solution-wide dedup and reuse-by-membership.
+    /// </summary>
+    private static void RegisterProjectMappingsLocked(
+        string cacheKey, string requestedProjectPath, Workspace workspace)
+    {
+        s_projectToCacheKey[requestedProjectPath] = cacheKey;
+        foreach (var project in workspace.CurrentSolution.Projects)
+        {
+            if (!string.IsNullOrEmpty(project.FilePath))
+                s_projectToCacheKey[Path.GetFullPath(project.FilePath!)] = cacheKey;
+        }
+    }
+
+    private static void RegisterShadowDirsLocked(string cacheKey, IReadOnlyCollection<string>? dirs)
     {
         if (dirs is null || dirs.Count == 0)
             return;
@@ -729,11 +884,11 @@ internal static class WorkspaceService
                 set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 s_dirToProjects[dir] = set;
             }
-            set.Add(normalizedPath);
+            set.Add(cacheKey);
         }
     }
 
-    private static void UnregisterShadowDirsLocked(string normalizedPath, IReadOnlyCollection<string>? dirs)
+    private static void UnregisterShadowDirsLocked(string cacheKey, IReadOnlyCollection<string>? dirs)
     {
         if (dirs is null || dirs.Count == 0)
             return;
@@ -742,10 +897,50 @@ internal static class WorkspaceService
         {
             if (s_dirToProjects.TryGetValue(dir, out var set))
             {
-                set.Remove(normalizedPath);
+                set.Remove(cacheKey);
                 if (set.Count == 0)
                     s_dirToProjects.Remove(dir);
             }
+        }
+    }
+
+    /// <summary>
+    /// Returns the normalized owning-solution path for <paramref name="projectPath"/> (the key a
+    /// shared workspace is cached under), or <c>null</c> for loose / single-project solutions.
+    /// Used by preload to warm each solution once.
+    /// </summary>
+    internal static string? GetOwnerSolutionKey(string projectPath) =>
+        TryFindOwnerSolutionKey(Path.GetFullPath(projectPath)).slnKey;
+
+    /// <summary>
+    /// Walks up from the project to its nearest solution file and, if that solution lists
+    /// the project and contains more than one project, returns the normalized solution path
+    /// to use as the shared cache key. Returns <c>(null, false)</c> for loose / single-project
+    /// solutions, which fall back to per-project loading.
+    /// </summary>
+    private static (string? slnKey, bool isLegacy) TryFindOwnerSolutionKey(string normalizedProjectPath)
+    {
+        try
+        {
+            string? sln = PathHelper.FindNearestSolution(normalizedProjectPath);
+            if (string.IsNullOrEmpty(sln))
+                return (null, false);
+
+            var projects = PathHelper.GetProjectsFromSolution(sln);
+            if (projects.Count <= 1)
+                return (null, false);  // single-project solution gains nothing from sharing
+
+            bool contains = projects.Any(p =>
+                string.Equals(Path.GetFullPath(p), normalizedProjectPath, StringComparison.OrdinalIgnoreCase));
+            if (!contains)
+                return (null, false);
+
+            return (Path.GetFullPath(sln), PathHelper.RequiresMsBuild(sln));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WorkspaceService] Solution discovery failed for '{normalizedProjectPath}': {ex.Message}");
+            return (null, false);
         }
     }
 
@@ -777,31 +972,42 @@ internal static class WorkspaceService
 
     private static void EvictForDirLocked(string sourceDir)
     {
-        if (!s_dirToProjects.TryGetValue(sourceDir, out var projects))
+        if (!s_dirToProjects.TryGetValue(sourceDir, out var cacheKeys))
             return;
 
-        foreach (var projectPath in projects.ToList())
+        foreach (var cacheKey in cacheKeys.ToList())
         {
-            if (s_cache.TryGetValue(projectPath, out var entry))
+            if (s_cache.TryGetValue(cacheKey, out var entry))
             {
                 Console.Error.WriteLine(
-                    $"[WorkspaceService] Analyzer rebuild in '{sourceDir}', evicting workspace for '{projectPath}'.");
-                EvictEntryLocked(projectPath, entry);
+                    $"[WorkspaceService] Analyzer rebuild in '{sourceDir}', evicting workspace for '{cacheKey}'.");
+                EvictEntryLocked(cacheKey, entry);
             }
         }
     }
 
-    private static bool IsProjectFileStale(string normalizedPath, CachedWorkspaceEntry entry)
+    /// <summary>
+    /// An entry is stale when the requested project's <c>.csproj</c> OR the entry's own key
+    /// file (the <c>.sln</c> for a solution entry, or the same <c>.csproj</c> otherwise) was
+    /// modified after the entry was cached.
+    /// </summary>
+    private static bool IsEntryStale(string cacheKey, string normalizedProjectPath, CachedWorkspaceEntry entry)
     {
-        var projectInfo = new FileInfo(normalizedPath);
-        return projectInfo.Exists && projectInfo.LastWriteTimeUtc > entry.CachedAtUtc;
+        return IsFileNewerThan(normalizedProjectPath, entry.CachedAtUtc)
+            || IsFileNewerThan(cacheKey, entry.CachedAtUtc);
+    }
+
+    private static bool IsFileNewerThan(string path, DateTime cacheTime)
+    {
+        var info = new FileInfo(path);
+        return info.Exists && info.LastWriteTimeUtc > cacheTime;
     }
 
     private static (Workspace Workspace, Project Project) CreateProjectSnapshot(
-        CachedWorkspaceEntry entry, string? targetFilePath)
+        CachedWorkspaceEntry entry, string requestedProjectPath, string? targetFilePath)
     {
         entry.LastAccessedUtc = DateTime.UtcNow;
-        var project = entry.GetProject();
+        var project = entry.GetProject(requestedProjectPath);
 
         if (targetFilePath != null)
             project = RefreshDocumentIfStale(entry.Workspace, project, targetFilePath, entry.CachedAtUtc);
@@ -828,6 +1034,26 @@ internal static class WorkspaceService
                 {
                     EvictEntryLocked(key, entry);
                     Console.Error.WriteLine($"[WorkspaceService] Evicted idle workspace for '{key}'.");
+                }
+            }
+
+            // LRU cap: after the idle sweep, if still over the cap, evict the
+            // least-recently-used entries down to MaxCachedWorkspaces.
+            if (s_cache.Count > MaxCachedWorkspaces)
+            {
+                var overflow = s_cache
+                    .OrderBy(kvp => kvp.Value.LastAccessedUtc)
+                    .Take(s_cache.Count - MaxCachedWorkspaces)
+                    .Select(kvp => kvp.Key)
+                    .ToList();
+
+                foreach (var key in overflow)
+                {
+                    if (s_cache.TryGetValue(key, out var entry))
+                    {
+                        EvictEntryLocked(key, entry);
+                        Console.Error.WriteLine($"[WorkspaceService] Evicted LRU workspace for '{key}' (cap {MaxCachedWorkspaces}).");
+                    }
                 }
             }
         }
@@ -1179,35 +1405,87 @@ internal static class WorkspaceService
 
     private sealed class CachedWorkspaceEntry : IDisposable
     {
+        public string CacheKey { get; }
         public Workspace Workspace { get; }
-        public ProjectId ProjectId { get; }
+
+        /// <summary>The originally-requested project; the fallback when a path isn't mapped
+        /// (e.g. a decompiled project whose FilePath is null).</summary>
+        public ProjectId PrimaryProjectId { get; }
+
+        /// <summary>Normalized .csproj path → ProjectId, for every project this workspace
+        /// holds (the whole solution closure for a solution entry).</summary>
+        public Dictionary<string, ProjectId> ProjectIds { get; }
+
         public DateTime CachedAtUtc { get; }
         public DateTime LastAccessedUtc { get; set; }
         public ShadowCopyAnalyzerAssemblyLoader? ShadowLoader { get; }
         public IReadOnlyCollection<string>? ShadowDirs { get; }
 
+        /// <summary>Temp directories (decompile reference copies) to delete on disposal.</summary>
+        public IReadOnlyList<string>? TempDirs { get; }
+
         public CachedWorkspaceEntry(
+            string cacheKey,
             Workspace workspace,
-            ProjectId projectId,
+            ProjectId primaryProjectId,
             ShadowCopyAnalyzerAssemblyLoader? shadowLoader,
-            IReadOnlyCollection<string>? shadowDirs)
+            IReadOnlyCollection<string>? shadowDirs,
+            IReadOnlyList<string>? tempDirs = null)
         {
+            CacheKey = cacheKey;
             Workspace = workspace;
-            ProjectId = projectId;
+            PrimaryProjectId = primaryProjectId;
             CachedAtUtc = DateTime.UtcNow;
             LastAccessedUtc = DateTime.UtcNow;
             ShadowLoader = shadowLoader;
             ShadowDirs = shadowDirs;
+            TempDirs = tempDirs;
+
+            ProjectIds = new Dictionary<string, ProjectId>(StringComparer.OrdinalIgnoreCase);
+            foreach (var project in workspace.CurrentSolution.Projects)
+            {
+                if (!string.IsNullOrEmpty(project.FilePath))
+                    ProjectIds[Path.GetFullPath(project.FilePath!)] = project.Id;
+            }
         }
 
-        public Project GetProject() =>
-            Workspace.CurrentSolution.GetProject(ProjectId)
-            ?? throw new InvalidOperationException($"Cached project {ProjectId} no longer found in workspace.");
+        /// <summary>
+        /// Resolves the <see cref="Project"/> for the requested path, falling back to the
+        /// primary project when the path isn't a mapped .csproj (e.g. a decompiled manifest).
+        /// </summary>
+        public Project GetProject(string requestedProjectPath)
+        {
+            ProjectId id;
+            if (ProjectIds.TryGetValue(requestedProjectPath, out var mapped))
+            {
+                id = mapped;
+            }
+            else
+            {
+                // Expected only for entries whose project has no FilePath (a decompiled
+                // manifest). If a real .csproj is unexpectedly unmapped, returning the primary
+                // would be the WRONG project — warn so it's diagnosable rather than silent.
+                if (ProjectIds.Count > 0 &&
+                    requestedProjectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.Error.WriteLine(
+                        $"[WorkspaceService] '{requestedProjectPath}' not found in cached workspace '{CacheKey}'; " +
+                        "falling back to the primary project.");
+                }
+                id = PrimaryProjectId;
+            }
+
+            return Workspace.CurrentSolution.GetProject(id)
+                ?? throw new InvalidOperationException($"Cached project {id} no longer found in workspace.");
+        }
 
         public void Dispose()
         {
             Workspace.Dispose();
             ShadowLoader?.Dispose();
+            if (TempDirs is not null)
+                foreach (var dir in TempDirs)
+                    DecompiledSourceService.TryDeleteTempDir(dir);
         }
     }
 }

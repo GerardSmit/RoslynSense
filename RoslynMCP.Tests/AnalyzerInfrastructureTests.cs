@@ -156,4 +156,45 @@ public class AnalyzerInfrastructureTests
         // Evicting a non-existent project should not throw
         host.EvictForProject("nonexistent-project");
     }
+
+    [Fact]
+    public void WhenAnalyzerShadowCopiedThenTryGetSourceDirectoryMapsBothPathsToSource()
+    {
+        // Regression: AnalyzerHost keyed its rebuild-eviction map via NeedsShadowCopy +
+        // Path.GetDirectoryName(path). After the workspace rebind, analyzer paths are shadow
+        // paths, so NeedsShadowCopy is false and the dir is a temp dir — the auto-evict map
+        // never populated and rebuild events never matched. TryGetSourceDirectory fixes this
+        // by mapping either the original or the shadow path back to the watched source dir.
+        string sourceDir = Path.Combine(
+            Path.GetTempPath(), "rmcp-shadow-map-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(sourceDir);
+        try
+        {
+            string originalDll = Path.Combine(sourceDir, "Fake.Analyzer.dll");
+            File.Copy(typeof(AnalyzerInfrastructureTests).Assembly.Location, originalDll);
+
+            using var shadow = new ShadowCopyManager();
+
+            string shadowPath = shadow.GetLoadPath(originalDll);
+
+            // Sanity: a project-output DLL is shadow-copied to a different location...
+            Assert.NotEqual(
+                Path.GetFullPath(originalDll), Path.GetFullPath(shadowPath),
+                StringComparer.OrdinalIgnoreCase);
+            // ...and the shadow path itself reports NeedsShadowCopy=false — the old bug trigger.
+            Assert.False(shadow.NeedsShadowCopy(shadowPath));
+
+            string expected = Path.GetFullPath(sourceDir);
+            Assert.Equal(expected, shadow.TryGetSourceDirectory(originalDll), StringComparer.OrdinalIgnoreCase);
+            Assert.Equal(expected, shadow.TryGetSourceDirectory(shadowPath), StringComparer.OrdinalIgnoreCase);
+
+            // A path under a never-shadowed directory maps to nothing.
+            Assert.Null(shadow.TryGetSourceDirectory(
+                Path.Combine(Path.GetTempPath(), "rmcp-unwatched", "x.dll")));
+        }
+        finally
+        {
+            Directory.Delete(sourceDir, recursive: true);
+        }
+    }
 }

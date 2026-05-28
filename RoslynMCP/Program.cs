@@ -21,6 +21,15 @@ class Program
         if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
             return await RoslynMCP.CliRunner.RunAsync(args[1..]);
 
+        // Shared-host daemon mode: roslyn-sense --host <solution>
+        // Long-lived process that owns the Roslyn workspaces for one solution and serves tool
+        // calls forwarded by thin MCP-client processes over a named pipe.
+        if (args.Length > 0 && args[0].Equals("--host", StringComparison.OrdinalIgnoreCase))
+        {
+            string target = args.Length > 1 ? args[1] : Directory.GetCurrentDirectory();
+            return await RoslynMCP.Daemon.DaemonServer.RunHostAsync(target);
+        }
+
         var startupWarnings = new List<string>();
 
         var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
@@ -96,12 +105,39 @@ class Program
             .Where(t => settings.Database || !t.Name.StartsWith("Database", StringComparison.Ordinal))
             .ToArray();
 
-        builder.Services
+        // Cap cached workspaces (LRU) for this process.
+        WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
+
+        // Shared-host: when enabled and this working dir belongs to a solution, forward every
+        // tool call to a per-solution daemon shared across chats (with in-process fallback).
+        string? sharedHostSolution = settings.SharedHost
+            ? RoslynMCP.Daemon.HostPaths.ResolveSolutionKey(Directory.GetCurrentDirectory())
+            : null;
+
+        var mcpBuilder = builder.Services
             .AddMcpServer()
-            .WithStdioServerTransport()
-            .WithTools((IEnumerable<Type>)toolTypes)
-            .WithResourcesFromAssembly()
-            .WithPromptsFromAssembly();
+            .WithStdioServerTransport();
+
+        if (sharedHostSolution is not null)
+        {
+            var toolMethods = RoslynMCP.Daemon.ToolInvoker.AllTools
+                .Where(m => IsToolEnabled(m, settings))
+                .ToList();
+            var resourceMethods = RoslynMCP.Daemon.ToolInvoker.AllResources;
+            string format = useToon ? "toon" : "markdown";
+            // Forward both tool calls AND resource reads to the daemon; resources otherwise run
+            // in-process and would load a workspace here, defeating the shared host.
+            RoslynMCP.Daemon.DaemonClient.Configure(mcpBuilder, toolMethods, resourceMethods, sharedHostSolution, format);
+            startupWarnings.Add($"Shared host active for solution '{System.IO.Path.GetFileName(sharedHostSolution)}' (set ROSLYNMCP_SHARED_HOST=0 to disable).");
+        }
+        else
+        {
+            mcpBuilder
+                .WithTools((IEnumerable<Type>)toolTypes)
+                .WithResourcesFromAssembly();
+        }
+
+        mcpBuilder.WithPromptsFromAssembly();
 
         var host = builder.Build();
 
@@ -124,5 +160,16 @@ class Program
 
         await host.RunAsync();
         return 0;
+    }
+
+    /// <summary>Mirrors the feature-flag filtering applied to tool TYPES, at the method level,
+    /// so the shared-host client advertises exactly the enabled tools.</summary>
+    private static bool IsToolEnabled(MethodInfo method, RoslynMCP.Config.EffectiveSettings settings)
+    {
+        var typeName = method.DeclaringType?.Name ?? "";
+        if (!settings.Debugger && typeName.StartsWith("Debug", StringComparison.Ordinal)) return false;
+        if (!settings.Profiling && typeName.StartsWith("Profile", StringComparison.Ordinal)) return false;
+        if (!settings.Database && typeName.StartsWith("Database", StringComparison.Ordinal)) return false;
+        return true;
     }
 }

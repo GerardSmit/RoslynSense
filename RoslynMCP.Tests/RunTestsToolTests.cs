@@ -35,20 +35,19 @@ public class RunTestsToolTests
     [Fact]
     public async Task WhenRunningActualTestProjectWithFilterThenReturnsResults()
     {
-        // Run a single specific test from RoslynMCP.Tests
-        var testProjectPath = FindTestProjectPath();
-        if (testProjectPath is null)
-        {
-            // Skip if we can't find the test project
-            return;
-        }
+        // Run a single passing test from the standalone DebugTestProject fixture. Using a
+        // separate project (not RoslynMCP.Tests itself) avoids the self-nesting trap where
+        // `dotnet test` would try to rebuild the very assembly the running test host has
+        // loaded — which can't relink on Windows, making the nested build fail.
+        if (!File.Exists(FixturePaths.DebugTestProjectFile))
+            return; // fixture not present
 
         var result = await RunTestsTool.RunTests(
-            testProjectPath,
+            FixturePaths.DebugTestProjectFile,
             new MarkdownFormatter(),
             new BackgroundTaskStore(),
             new BuildWarningsStore(),
-            "FullyQualifiedName=RoslynMCP.Tests.RunTestsToolTests.WhenProjectPathIsEmptyThenReturnsError");
+            "FullyQualifiedName=DebugTestProject.CalculatorTests.Add_ReturnsSum");
 
         Assert.Contains("Passed", result);
     }

@@ -12,6 +12,18 @@ public sealed class RoslynSenseConfig
     /// Null = auto-discover from CWD. Empty list = disabled.
     /// </summary>
     public IReadOnlyList<string>? Preload { get; init; }
+
+    /// <summary>
+    /// Share one out-of-process host per solution across all MCP clients (chats), so the
+    /// solution is loaded once instead of once per chat. Null = default (enabled).
+    /// </summary>
+    public bool? SharedHost { get; init; }
+
+    /// <summary>Minutes the shared host stays alive after its last client disconnects. Null = 30.</summary>
+    public int? HostIdleMinutes { get; init; }
+
+    /// <summary>Max cached workspaces (LRU bound) per process. Null = 4.</summary>
+    public int? MaxWorkspaces { get; init; }
 }
 
 public sealed class ToolsConfig

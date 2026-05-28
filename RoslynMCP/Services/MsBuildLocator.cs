@@ -186,13 +186,28 @@ internal static class MsBuildLocator
     /// </summary>
     public static string? GetVsInstallDir(string msbuildPath)
     {
-        var dir = Path.GetDirectoryName(msbuildPath);
-        while (dir is not null)
+        // Parse both separators explicitly rather than via Path.* APIs: these are Windows VS
+        // paths (backslashes), but the parsing must also be correct when the host OS is Linux
+        // (CI), where Path treats '\' as an ordinary character.
+        char[] separators = ['\\', '/'];
+
+        int end = msbuildPath.Length;
+        while (end > 0 && (msbuildPath[end - 1] == '\\' || msbuildPath[end - 1] == '/'))
+            end--; // ignore trailing separators
+
+        while (end > 0)
         {
-            var dirName = Path.GetFileName(dir);
-            if (string.Equals(dirName, "MSBuild", StringComparison.OrdinalIgnoreCase))
-                return Path.GetDirectoryName(dir);
-            dir = Path.GetDirectoryName(dir);
+            int sep = msbuildPath.LastIndexOfAny(separators, end - 1);
+            string segment = msbuildPath[(sep + 1)..end];
+
+            // The first directory named exactly "MSBuild" (not the "MSBuild.exe" file) sits
+            // directly under the VS install dir, which is everything before it.
+            if (string.Equals(segment, "MSBuild", StringComparison.OrdinalIgnoreCase))
+                return sep > 0 ? msbuildPath[..sep] : null;
+
+            if (sep < 0)
+                break;
+            end = sep;
         }
 
         return null;

@@ -60,6 +60,11 @@ internal sealed class DaemonServer
         string pipeName = HostPaths.PipeName(solutionKey);
         Console.Error.WriteLine($"[Daemon] Host started for '{solutionKey}' (pipe '{pipeName}', idle {settings.HostIdleMinutes}m).");
 
+        // Warm the solution once, here, in the single shared process — the thin clients no longer
+        // preload (that would load the solution into every chat). Fire-and-forget so the pipe is
+        // accepting connections immediately; the first real call coalesces onto this load.
+        _ = WarmSolutionAsync(solutionKey, shutdownCts.Token);
+
         var server = new DaemonServer(services, lifecycle, pipeName);
         try
         {
@@ -95,6 +100,46 @@ internal sealed class DaemonServer
         catch
         {
             // Keep the default console on failure.
+        }
+    }
+
+    /// <summary>
+    /// Opens the solution's projects so the shared workspace is hot before the first client call.
+    /// Projects of one solution share a single workspace (see WorkspaceService dedup), so opening
+    /// the first member loads the whole solution; the rest are cheap cache hits but we open them
+    /// anyway to surface per-project load failures in the log.
+    /// </summary>
+    private static async Task WarmSolutionAsync(string solutionKey, CancellationToken ct)
+    {
+        try
+        {
+            var projects = PathHelper.GetProjectsFromSolution(solutionKey);
+            if (projects.Count == 0)
+                return;
+
+            Console.Error.WriteLine($"[Daemon] Warming {projects.Count} project(s)...");
+            foreach (var project in projects)
+            {
+                if (ct.IsCancellationRequested)
+                    break;
+                try
+                {
+                    await WorkspaceService.GetOrOpenProjectAsync(project, cancellationToken: ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Daemon] Warm failed for '{Path.GetFileName(project)}': {ex.Message}");
+                }
+            }
+            Console.Error.WriteLine("[Daemon] Warm-up done.");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Daemon] Warm-up error: {ex.Message}");
         }
     }
 

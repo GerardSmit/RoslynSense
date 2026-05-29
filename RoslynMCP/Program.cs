@@ -67,8 +67,25 @@ class Program
             consoleLogOptions.LogToStandardErrorThreshold = LogLevel.Trace;
         });
         builder.Services.AddSingleton(settings);
-        builder.Services.AddHostedService<InfrastructureCleanupHostedService>();
-        builder.Services.AddHostedService<WorkspacePreloadHostedService>();
+
+        // Shared-host: when enabled and this working dir belongs to a solution, forward every
+        // tool call to a per-solution daemon shared across chats (with in-process fallback).
+        // Resolved up-front because it gates the hosted services below.
+        string? sharedHostSolution = settings.SharedHost
+            ? RoslynMCP.Daemon.HostPaths.ResolveSolutionKey(Directory.GetCurrentDirectory())
+            : null;
+
+        // A shared-host client is a pure forwarder: it never opens a workspace (the daemon does),
+        // so it needs neither preload nor shutdown cleanup. Both touch WorkspaceService statically,
+        // whose static ctor registers MSBuild and loads its assemblies — work a thin client must
+        // avoid. (On the rare in-process fallback, process exit releases all OS resources and the
+        // next startup orphan-sweeps temp dirs, so skipping explicit cleanup is safe.) The daemon
+        // warms the solution and disposes its own workspaces on idle shutdown.
+        if (sharedHostSolution is null)
+        {
+            builder.Services.AddHostedService<InfrastructureCleanupHostedService>();
+            builder.Services.AddHostedService<WorkspacePreloadHostedService>();
+        }
 
         // Register output formatter (markdown default, TOON via tableFormat=="toon")
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
@@ -105,14 +122,12 @@ class Program
             .Where(t => settings.Database || !t.Name.StartsWith("Database", StringComparison.Ordinal))
             .ToArray();
 
-        // Cap cached workspaces (LRU) for this process.
-        WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
-
-        // Shared-host: when enabled and this working dir belongs to a solution, forward every
-        // tool call to a per-solution daemon shared across chats (with in-process fallback).
-        string? sharedHostSolution = settings.SharedHost
-            ? RoslynMCP.Daemon.HostPaths.ResolveSolutionKey(Directory.GetCurrentDirectory())
-            : null;
+        // Cap cached workspaces (LRU) for this process. Skipped in shared-host-client mode:
+        // touching WorkspaceService eagerly runs its static ctor (MSBuild + shadow-copy init),
+        // which a thin forwarding client never needs. If it ever falls back to in-process, the
+        // static ctor runs lazily then; the cap there is the default (the daemon sets its own).
+        if (sharedHostSolution is null)
+            WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
 
         var mcpBuilder = builder.Services
             .AddMcpServer()

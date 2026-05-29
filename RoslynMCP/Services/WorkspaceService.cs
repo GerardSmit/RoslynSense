@@ -328,10 +328,12 @@ internal static class WorkspaceService
         string? solutionPath = null;
         string? loadKey = null;
         bool ownerResolved = false;
+        bool incrementalAttempted = false;
 
         while (true)
         {
             Task<(Workspace, Project)>? inflightTask = null;
+            CachedWorkspaceEntry? incrementalEntry = null;
 
             await s_cacheLock.WaitAsync(cancellationToken);
             try
@@ -348,7 +350,17 @@ internal static class WorkspaceService
                     ownerResolved = true;
                 }
 
-                if (s_inflight.TryGetValue(loadKey!, out inflightTask))
+                if (!incrementalAttempted && solutionPath is not null
+                    && s_cache.TryGetValue(solutionPath, out var slnEntry)
+                    && slnEntry.Workspace is MSBuildWorkspace)
+                {
+                    // The owning-solution workspace is already cached but doesn't hold this
+                    // project yet — add it incrementally (reusing loaded references) rather than
+                    // opening a second workspace. Done outside the lock; we then loop back and the
+                    // next cache check returns the snapshot.
+                    incrementalEntry = slnEntry;
+                }
+                else if (s_inflight.TryGetValue(loadKey!, out inflightTask))
                 {
                     // Another caller is loading this solution/project — wait for it outside the lock
                 }
@@ -363,6 +375,37 @@ internal static class WorkspaceService
             finally
             {
                 s_cacheLock.Release();
+            }
+
+            if (incrementalEntry is not null)
+            {
+                incrementalAttempted = true;
+                try
+                {
+                    await EnsureProjectLoadedAsync(incrementalEntry, normalizedPath, cancellationToken);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        $"[WorkspaceService] Incremental load of '{Path.GetFileName(normalizedPath)}' into " +
+                        $"'{Path.GetFileName(solutionPath!)}' failed ({ex.Message}); falling back to a standalone workspace.");
+                }
+
+                // If the project still isn't resolvable (load failure, or it isn't actually a
+                // member of that solution), stop targeting the solution workspace and fall back
+                // to a standalone per-project load on the next iteration.
+                bool nowLoaded;
+                await s_cacheLock.WaitAsync(cancellationToken);
+                try { nowLoaded = TryGetValidCachedEntryLocked(normalizedPath, out _); }
+                finally { s_cacheLock.Release(); }
+
+                if (!nowLoaded)
+                {
+                    solutionPath = null;
+                    loadKey = normalizedPath;
+                }
+                continue;
             }
 
             // Wait for the in-flight load to complete, then loop back to check cache.
@@ -390,9 +433,10 @@ internal static class WorkspaceService
         ShadowCopyAnalyzerAssemblyLoader? shadowLoader = null;
         HashSet<string>? shadowDirs = null;
         string? decompileTempDir = null;
-        // The s_cache key. Starts as loadKey (solution path when in solution-mode); may be
-        // demoted to the project path if a solution load can't produce the requested project.
-        // loadKey is non-null here: we only reach the loader after resolving it and breaking.
+        // The s_cache key == loadKey: the .sln path in solution-mode (so siblings share and
+        // extend one workspace), or the .csproj path for a loose project or after an incremental
+        // add failed and the loop fell back to a standalone load. loadKey is non-null here: we
+        // only reach the loader after resolving it and breaking out.
         string cacheKey = loadKey!;
 
         try
@@ -405,8 +449,7 @@ internal static class WorkspaceService
             }
             else
             {
-                var buildTarget = solutionPath ?? normalizedPath;
-                var isLegacy = PathHelper.RequiresMsBuild(buildTarget);
+                var isLegacy = PathHelper.RequiresMsBuild(normalizedPath);
                 if (isLegacy && !IsLegacyProjectSupported)
                     throw new NotSupportedException(
                         "Legacy .NET Framework projects require a Visual Studio install with the MSBuild " +
@@ -429,79 +472,30 @@ internal static class WorkspaceService
 
                     try
                     {
-                        if (solutionPath is not null)
-                        {
-                            // Open the WHOLE solution once into this workspace. Project-to-project
-                            // references become shared compilation references (loaded once),
-                            // instead of one fully-loaded transitive graph per project.
-                            var loadedSolution = await msbuildWorkspace.OpenSolutionAsync(
-                                solutionPath, cancellationToken: openLinked.Token)
-                                .WaitAsync(OpenProjectTimeout, cancellationToken);
-
-                            openedProject = loadedSolution.Projects.FirstOrDefault(p =>
-                                !string.IsNullOrEmpty(p.FilePath) &&
-                                string.Equals(Path.GetFullPath(p.FilePath!), normalizedPath, StringComparison.OrdinalIgnoreCase))!;
-
-                            if (openedProject is null)
-                            {
-                                // The requested project didn't load inside the solution (the
-                                // WorkspaceFailed handler logged why). Demote to a clean
-                                // per-project load so the caller still gets a workspace.
-                                Console.Error.WriteLine(
-                                    $"[WorkspaceService] '{Path.GetFileName(normalizedPath)}' not found in solution load; falling back to per-project.");
-                                msbuildWorkspace.Dispose();
-                                solutionPath = null;
-                                cacheKey = normalizedPath;
-                                msbuildWorkspace = CreateWorkspace(diagnosticWriter, isLegacy);
-                                openedProject = await msbuildWorkspace.OpenProjectAsync(
-                                    normalizedPath, cancellationToken: openLinked.Token)
-                                    .WaitAsync(OpenProjectTimeout, cancellationToken);
-                            }
-                        }
-                        else
-                        {
-                            openedProject = await msbuildWorkspace.OpenProjectAsync(
-                                normalizedPath,
-                                cancellationToken: openLinked.Token)
-                                .WaitAsync(OpenProjectTimeout, cancellationToken);
-                        }
+                        // Open ONLY the requested project (Roslyn additionally pulls in its
+                        // transitive ProjectReferences). When the project belongs to a multi-
+                        // project solution, cacheKey is the .sln path, so sibling and referencing
+                        // projects requested later are added to THIS same workspace incrementally
+                        // (EnsureProjectLoadedAsync) — sharing already-loaded references — instead
+                        // of loading the entire solution up front.
+                        openedProject = await msbuildWorkspace.OpenProjectAsync(
+                            normalizedPath, cancellationToken: openLinked.Token)
+                            .WaitAsync(OpenProjectTimeout, cancellationToken);
                     }
                     catch (TimeoutException tex)
                     {
                         throw new TimeoutException(
-                            $"Opening '{Path.GetFileName(buildTarget)}' timed out after " +
+                            $"Opening '{Path.GetFileName(normalizedPath)}' timed out after " +
                             $"{OpenProjectTimeout.TotalSeconds:F0}s. The MSBuild BuildHost subprocess may be wedged " +
                             "(legacy WebForms projects with source generators are a frequent cause). " +
                             "Disposing the workspace will kill the BuildHost; the next attempt should succeed.",
                             tex);
                     }
 
-                    var solution = StripUnresolvedAnalyzerReferences(msbuildWorkspace.CurrentSolution);
-                    if (solution != msbuildWorkspace.CurrentSolution)
-                    {
-                        msbuildWorkspace.TryApplyChanges(solution);
-                        openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedProject.Id)!;
-                    }
-
-                    // Rebind to shadow-copied analyzer / source-generator paths BEFORE any
-                    // call to GetCompilationAsync (the framework-reference probe below does
-                    // exactly that). Roslyn's default analyzer loader opens the original DLL
-                    // via PEReader on first compilation access, locking it on disk — once
-                    // that's happened, our rebind is too late.
-                    (solution, shadowLoader, shadowDirs) =
-                        RebindAnalyzerReferencesToShadowLoader(msbuildWorkspace.CurrentSolution);
-                    if (shadowLoader is not null)
-                    {
-                        SwapCurrentSolutionInPlace(msbuildWorkspace, solution);
-                        openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedProject.Id)!;
-                    }
-
-                    solution = await InjectMissingFrameworkReferencesAsync(msbuildWorkspace.CurrentSolution, cancellationToken);
-                    if (solution != msbuildWorkspace.CurrentSolution)
-                    {
-                        msbuildWorkspace.TryApplyChanges(solution);
-                        openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedProject.Id)!;
-                    }
+                    var openedId = openedProject.Id;
+                    (shadowLoader, shadowDirs) = await ApplyPostOpenPipelineAsync(
+                        msbuildWorkspace, newProjects: null, existingLoader: null, cancellationToken);
+                    openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedId)!;
 
                     workspace = msbuildWorkspace;
                 }
@@ -606,6 +600,63 @@ internal static class WorkspaceService
             tcs.TrySetException(ex);
         else
             tcs.TrySetCanceled();
+    }
+
+    /// <summary>
+    /// Adds <paramref name="normalizedProjectPath"/> to an already-cached solution workspace via an
+    /// incremental <c>OpenProjectAsync</c> (Roslyn reuses any references already loaded), then runs
+    /// the post-open pipeline over only the newly-added projects and updates the cache mappings.
+    /// Serialized per entry by its <see cref="CachedWorkspaceEntry.LoadGate"/>; reads of the
+    /// workspace stay safe meanwhile via immutable solution snapshots. No-op when the project is
+    /// already loaded, nothing new was pulled in, or the entry isn't an MSBuild workspace.
+    /// </summary>
+    private static async Task EnsureProjectLoadedAsync(
+        CachedWorkspaceEntry entry, string normalizedProjectPath, CancellationToken cancellationToken)
+    {
+        if (entry.Workspace is not MSBuildWorkspace ws)
+            return;
+
+        await entry.LoadGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (entry.ProjectIds.ContainsKey(normalizedProjectPath))
+                return; // a concurrent caller already added it
+
+            var beforeIds = ws.CurrentSolution.ProjectIds.ToHashSet();
+
+            using var openCts = new CancellationTokenSource(OpenProjectTimeout);
+            using var openLinked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, openCts.Token);
+            await EnsureRestoredAsync(normalizedProjectPath, cancellationToken);
+            await ws.OpenProjectAsync(normalizedProjectPath, cancellationToken: openLinked.Token)
+                .WaitAsync(OpenProjectTimeout, cancellationToken);
+
+            var newIds = ws.CurrentSolution.ProjectIds.Where(id => !beforeIds.Contains(id)).ToHashSet();
+            if (newIds.Count == 0)
+                return; // already present transitively; mappings unchanged
+
+            var (loader, dirs) = await ApplyPostOpenPipelineAsync(ws, newIds, entry.ShadowLoader, cancellationToken);
+
+            await s_cacheLock.WaitAsync(cancellationToken);
+            try
+            {
+                entry.MergeShadow(loader, dirs);
+                entry.RefreshProjectIds();
+                RegisterProjectMappingsLocked(entry.CacheKey, normalizedProjectPath, ws);
+                if (dirs is { Count: > 0 })
+                    RegisterShadowDirsLocked(entry.CacheKey, dirs);
+                Console.Error.WriteLine(
+                    $"[WorkspaceService] Incrementally loaded '{Path.GetFileName(normalizedProjectPath)}' into " +
+                    $"'{Path.GetFileName(entry.CacheKey)}' (+{newIds.Count} project(s); {entry.ProjectIds.Count} loaded).");
+            }
+            finally
+            {
+                s_cacheLock.Release();
+            }
+        }
+        finally
+        {
+            entry.LoadGate.Release();
+        }
     }
 
     /// <summary>
@@ -775,6 +826,22 @@ internal static class WorkspaceService
         string key = Path.GetFullPath(projectPath);
         s_cacheLock.Wait();
         try { return s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.ContainsKey(ck); }
+        finally { s_cacheLock.Release(); }
+    }
+
+    /// <summary>Number of projects currently loaded in the workspace serving
+    /// <paramref name="projectPath"/>, or 0 if it isn't cached. Lets tests assert that opening
+    /// one project of a multi-project solution loads only it (+ forward refs), not the whole sln.</summary>
+    internal static int LoadedProjectCountForTests(string projectPath)
+    {
+        string key = Path.GetFullPath(projectPath);
+        s_cacheLock.Wait();
+        try
+        {
+            return s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.TryGetValue(ck, out var entry)
+                ? entry.ProjectIds.Count
+                : 0;
+        }
         finally { s_cacheLock.Release(); }
     }
 
@@ -1087,10 +1154,11 @@ internal static class WorkspaceService
     /// Removes UnresolvedAnalyzerReference instances from all projects in the solution.
     /// These cause Roslyn's SymbolFinder APIs to crash with switch expression failures.
     /// </summary>
-    private static Solution StripUnresolvedAnalyzerReferences(Solution solution)
+    private static Solution StripUnresolvedAnalyzerReferences(Solution solution, HashSet<ProjectId>? only = null)
     {
         foreach (var project in solution.Projects)
         {
+            if (only is not null && !only.Contains(project.Id)) continue;
             foreach (var analyzerRef in project.AnalyzerReferences)
             {
                 if (analyzerRef.GetType().Name == "UnresolvedAnalyzerReference")
@@ -1126,6 +1194,40 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// Runs the post-open normalization pipeline over the workspace's current solution: strip
+    /// unresolved analyzer references, rebind build-output analyzers/source-generators to shadow
+    /// copies (so the originals stay unlocked for <c>dotnet build</c>), and inject missing
+    /// framework references. <paramref name="newProjects"/> scopes the work to just those project
+    /// IDs (null = all) so an incremental add doesn't reprocess — and recompile — already-loaded
+    /// projects. Returns the shadow loader now in use and the NEW source directories it pinned on
+    /// this call (for the rebuild-eviction watcher).
+    /// </summary>
+    private static async Task<(ShadowCopyAnalyzerAssemblyLoader? Loader, HashSet<string>? Dirs)>
+        ApplyPostOpenPipelineAsync(
+            MSBuildWorkspace workspace, HashSet<ProjectId>? newProjects,
+            ShadowCopyAnalyzerAssemblyLoader? existingLoader, CancellationToken cancellationToken)
+    {
+        var stripped = StripUnresolvedAnalyzerReferences(workspace.CurrentSolution, newProjects);
+        if (stripped != workspace.CurrentSolution)
+            workspace.TryApplyChanges(stripped);
+
+        // Rebind BEFORE any GetCompilationAsync (the framework probe below triggers one): Roslyn's
+        // default loader opens the original analyzer DLL via PEReader on first compilation access,
+        // locking it on disk — a rebind after that is too late.
+        var (rebound, loader, dirs) =
+            RebindAnalyzerReferencesToShadowLoader(workspace.CurrentSolution, newProjects, existingLoader);
+        if (rebound != workspace.CurrentSolution)
+            SwapCurrentSolutionInPlace(workspace, rebound);
+
+        var injected = await InjectMissingFrameworkReferencesAsync(
+            workspace.CurrentSolution, newProjects, cancellationToken);
+        if (injected != workspace.CurrentSolution)
+            workspace.TryApplyChanges(injected);
+
+        return (loader, dirs);
+    }
+
+    /// <summary>
     /// Replaces every <see cref="AnalyzerFileReference"/> pointing at a non-NuGet path
     /// (typically a project-output source generator under <c>bin/</c>) with a new
     /// reference whose <c>FullPath</c> points at a shadow copy and whose loader is a
@@ -1144,14 +1246,20 @@ internal static class WorkspaceService
     /// </para>
     /// </summary>
     private static (Solution Solution, ShadowCopyAnalyzerAssemblyLoader? Loader, HashSet<string>? Dirs)
-        RebindAnalyzerReferencesToShadowLoader(Solution solution)
+        RebindAnalyzerReferencesToShadowLoader(
+            Solution solution,
+            HashSet<ProjectId>? only = null,
+            ShadowCopyAnalyzerAssemblyLoader? existingLoader = null)
     {
         var shadowCopy = ShadowCopyService.Instance;
-        ShadowCopyAnalyzerAssemblyLoader? loader = null;
+        // Reuse the entry's loader on incremental adds so all shadow copies for one workspace
+        // share a single ALC and one watched-directory set.
+        ShadowCopyAnalyzerAssemblyLoader? loader = existingLoader;
         HashSet<string>? dirs = null;
 
         foreach (var project in solution.Projects.ToList())
         {
+            if (only is not null && !only.Contains(project.Id)) continue;
             var oldRefs = project.AnalyzerReferences;
             if (oldRefs.Count == 0)
                 continue;
@@ -1261,10 +1369,12 @@ internal static class WorkspaceService
     /// Detects projects missing core framework references (System.Object, System.Int32, etc.)
     /// and injects the appropriate references based on target framework.
     /// </summary>
-    private static async Task<Solution> InjectMissingFrameworkReferencesAsync(Solution solution, CancellationToken cancellationToken)
+    private static async Task<Solution> InjectMissingFrameworkReferencesAsync(
+        Solution solution, HashSet<ProjectId>? only, CancellationToken cancellationToken)
     {
         foreach (var project in solution.Projects)
         {
+            if (only is not null && !only.Contains(project.Id)) continue;
             var compilation = await project.GetCompilationAsync(cancellationToken);
             if (compilation is null) continue;
 
@@ -1438,11 +1548,22 @@ internal static class WorkspaceService
 
         public DateTime CachedAtUtc { get; }
         public DateTime LastAccessedUtc { get; set; }
-        public ShadowCopyAnalyzerAssemblyLoader? ShadowLoader { get; }
-        public IReadOnlyCollection<string>? ShadowDirs { get; }
+
+        /// <summary>The shared shadow-copy loader for this workspace. Grows as projects are
+        /// added incrementally (a later project may be the first to need shadowing).</summary>
+        public ShadowCopyAnalyzerAssemblyLoader? ShadowLoader { get; private set; }
+
+        /// <summary>Original source-generator directories pinned by <see cref="ShadowLoader"/>;
+        /// the rebuild-eviction watcher keys on these. Accumulates across incremental adds.</summary>
+        public HashSet<string>? ShadowDirs { get; private set; }
 
         /// <summary>Temp directories (decompile reference copies) to delete on disposal.</summary>
         public IReadOnlyList<string>? TempDirs { get; }
+
+        /// <summary>Serializes incremental <c>OpenProjectAsync</c> mutations of this workspace
+        /// (MSBuildWorkspace is not safe for concurrent opens; reads stay safe via immutable
+        /// solution snapshots).</summary>
+        public SemaphoreSlim LoadGate { get; } = new(1, 1);
 
         public CachedWorkspaceEntry(
             string cacheKey,
@@ -1458,15 +1579,31 @@ internal static class WorkspaceService
             CachedAtUtc = DateTime.UtcNow;
             LastAccessedUtc = DateTime.UtcNow;
             ShadowLoader = shadowLoader;
-            ShadowDirs = shadowDirs;
+            ShadowDirs = shadowDirs is null ? null : new HashSet<string>(shadowDirs, StringComparer.OrdinalIgnoreCase);
             TempDirs = tempDirs;
 
             ProjectIds = new Dictionary<string, ProjectId>(StringComparer.OrdinalIgnoreCase);
-            foreach (var project in workspace.CurrentSolution.Projects)
+            RefreshProjectIds();
+        }
+
+        /// <summary>Re-syncs <see cref="ProjectIds"/> from the workspace's current solution after
+        /// an incremental add. Cheap: a handful of projects.</summary>
+        public void RefreshProjectIds()
+        {
+            foreach (var project in Workspace.CurrentSolution.Projects)
             {
                 if (!string.IsNullOrEmpty(project.FilePath))
                     ProjectIds[Path.GetFullPath(project.FilePath!)] = project.Id;
             }
+        }
+
+        /// <summary>Folds the loader/dirs produced by an incremental post-open pass into the
+        /// entry: adopts the loader if the entry had none, and unions the newly-pinned dirs.</summary>
+        public void MergeShadow(ShadowCopyAnalyzerAssemblyLoader? loader, HashSet<string>? newDirs)
+        {
+            ShadowLoader ??= loader;
+            if (newDirs is { Count: > 0 })
+                (ShadowDirs ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).UnionWith(newDirs);
         }
 
         /// <summary>
@@ -1503,6 +1640,7 @@ internal static class WorkspaceService
         {
             Workspace.Dispose();
             ShadowLoader?.Dispose();
+            LoadGate.Dispose();
             if (TempDirs is not null)
                 foreach (var dir in TempDirs)
                     DecompiledSourceService.TryDeleteTempDir(dir);

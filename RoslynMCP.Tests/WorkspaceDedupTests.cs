@@ -27,6 +27,29 @@ public class WorkspaceDedupTests
     }
 
     [Fact]
+    public async Task WhenOneProjectOpenedThenSolutionIsNotFullyLoaded()
+    {
+        await WorkspaceService.EvictProjectForTests(FixturePaths.MultiProjectAFile);
+        await WorkspaceService.EvictProjectForTests(FixturePaths.MultiProjectBFile);
+
+        // ProjectA has no project references; ProjectB references ProjectA. Opening ProjectA must
+        // load ONLY ProjectA — not the whole solution — so a 1000-project sln costs one project,
+        // not a thousand, when a tool touches a single file.
+        var (_, projectA) = await WorkspaceService.GetOrOpenProjectAsync(FixturePaths.MultiProjectAFile);
+        Assert.Equal("ProjectA", projectA.Name);
+        Assert.Equal(1, WorkspaceService.LoadedProjectCountForTests(FixturePaths.MultiProjectAFile));
+        Assert.False(WorkspaceService.IsProjectCachedForTests(FixturePaths.MultiProjectBFile));
+
+        // Opening ProjectB adds it incrementally to the SAME workspace, pulling its reference
+        // ProjectA (already loaded → reused). Two projects now, one shared workspace.
+        var (workspaceB, projectB) = await WorkspaceService.GetOrOpenProjectAsync(FixturePaths.MultiProjectBFile);
+        var (workspaceA, _) = await WorkspaceService.GetOrOpenProjectAsync(FixturePaths.MultiProjectAFile);
+        Assert.Equal("ProjectB", projectB.Name);
+        Assert.Same(workspaceA, workspaceB);
+        Assert.Equal(2, WorkspaceService.LoadedProjectCountForTests(FixturePaths.MultiProjectAFile));
+    }
+
+    [Fact]
     public async Task WhenSharedWorkspaceEvictedThenAllMemberProjectsAreUncached()
     {
         await WorkspaceService.GetOrOpenProjectAsync(FixturePaths.MultiProjectAFile);

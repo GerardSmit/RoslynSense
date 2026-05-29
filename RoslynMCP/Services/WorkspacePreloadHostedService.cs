@@ -76,29 +76,26 @@ internal sealed class WorkspacePreloadHostedService : IHostedService
 
     private List<string> ResolveProjects()
     {
-        // Explicit empty list = disabled
-        if (_configuredPaths is { Count: 0 })
+        // Preload is OPT-IN. With no explicit `preload` configured we warm nothing and let the
+        // workspace load projects lazily on first access (open file X -> load X + its references
+        // only, not the whole solution). Auto-warming the nearest solution used to eagerly load
+        // every project — exactly the memory cost we now avoid.
+        if (_configuredPaths is null || _configuredPaths.Count == 0)
             return [];
 
-        var paths = _configuredPaths ?? AutoDiscoverSolutions();
-
         var result = new List<string>();
-        foreach (var path in paths)
+        foreach (var path in _configuredPaths)
         {
             var normalized = PathHelper.NormalizePath(path);
             if (!File.Exists(normalized)) continue;
 
+            // An explicitly-configured solution still expands to all its projects (the user opted
+            // in); configure specific .csproj paths instead to warm only those.
             if (PathHelper.IsSolutionFile(normalized))
                 result.AddRange(PathHelper.GetProjectsFromSolution(normalized));
             else if (normalized.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
                 result.Add(normalized);
         }
         return result;
-    }
-
-    private static List<string> AutoDiscoverSolutions()
-    {
-        var solutions = PathHelper.FindSolutionFiles(Directory.GetCurrentDirectory());
-        return solutions.Length > 0 ? [solutions[0]] : [];
     }
 }

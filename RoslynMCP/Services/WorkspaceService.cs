@@ -1017,11 +1017,18 @@ internal static class WorkspaceService
 
     private static void EvictExpiredEntries(object? state)
     {
-        if (!s_cacheLock.Wait(0))
-            return; // Skip this cycle if another operation holds the lock
-
+        // This runs on a ThreadPool thread from a Timer: any exception that escapes here is
+        // unhandled and CRASHES THE PROCESS (observed as "Test host process crashed" during
+        // teardown, where Console/semaphore/workspace disposal can throw). So the whole body
+        // is wrapped, the lock acquire is guarded, and each eviction is isolated.
+        bool acquired = false;
         try
         {
+            try { acquired = s_cacheLock.Wait(0); }
+            catch (ObjectDisposedException) { return; } // shutting down
+            if (!acquired)
+                return; // another operation holds the lock — skip this cycle
+
             var now = DateTime.UtcNow;
             var expired = s_cache
                 .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout)
@@ -1029,13 +1036,7 @@ internal static class WorkspaceService
                 .ToList();
 
             foreach (var key in expired)
-            {
-                if (s_cache.TryGetValue(key, out var entry))
-                {
-                    EvictEntryLocked(key, entry);
-                    Console.Error.WriteLine($"[WorkspaceService] Evicted idle workspace for '{key}'.");
-                }
-            }
+                TryEvictLoggedLocked(key, "idle workspace");
 
             // LRU cap: after the idle sweep, if still over the cap, evict the
             // least-recently-used entries down to MaxCachedWorkspaces.
@@ -1048,18 +1049,37 @@ internal static class WorkspaceService
                     .ToList();
 
                 foreach (var key in overflow)
-                {
-                    if (s_cache.TryGetValue(key, out var entry))
-                    {
-                        EvictEntryLocked(key, entry);
-                        Console.Error.WriteLine($"[WorkspaceService] Evicted LRU workspace for '{key}' (cap {MaxCachedWorkspaces}).");
-                    }
-                }
+                    TryEvictLoggedLocked(key, $"LRU workspace (cap {MaxCachedWorkspaces})");
             }
+        }
+        catch
+        {
+            // Never let a background eviction take down the process.
         }
         finally
         {
-            s_cacheLock.Release();
+            if (acquired)
+            {
+                try { s_cacheLock.Release(); } catch (ObjectDisposedException) { }
+            }
+        }
+    }
+
+    /// <summary>Evicts one entry under the held lock, isolating failures so one bad disposal
+    /// neither aborts the sweep nor escapes to crash the process. Caller holds s_cacheLock.</summary>
+    private static void TryEvictLoggedLocked(string key, string label)
+    {
+        if (!s_cache.TryGetValue(key, out var entry))
+            return;
+        try
+        {
+            EvictEntryLocked(key, entry);
+            Console.Error.WriteLine($"[WorkspaceService] Evicted {label} for '{key}'.");
+        }
+        catch (Exception ex)
+        {
+            try { Console.Error.WriteLine($"[WorkspaceService] Eviction of '{key}' failed: {ex.Message}"); }
+            catch { /* console gone during teardown */ }
         }
     }
 

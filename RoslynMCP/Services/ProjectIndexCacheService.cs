@@ -52,11 +52,16 @@ internal static class ProjectIndexCacheService
 
     private static void EvictExpiredEntries(object? state)
     {
-        if (!s_lock.Wait(0))
-            return; // Skip this cycle if another operation holds the lock
-
+        // Runs on a Timer's ThreadPool thread: an escaping exception is unhandled and crashes
+        // the process. Guard the lock acquire (disposed at teardown), isolate each disposal.
+        bool acquired = false;
         try
         {
+            try { acquired = s_lock.Wait(0); }
+            catch (ObjectDisposedException) { return; } // shutting down
+            if (!acquired)
+                return; // another operation holds the lock — skip this cycle
+
             var now = DateTime.UtcNow;
             var expired = s_cache
                 .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout)
@@ -65,16 +70,30 @@ internal static class ProjectIndexCacheService
 
             foreach (var key in expired)
             {
-                if (s_cache.Remove(key, out var entry))
+                if (!s_cache.Remove(key, out var entry))
+                    continue;
+                try
                 {
                     entry.Dispose();
                     Console.Error.WriteLine($"[ProjectIndexCache] Evicted idle entry for '{Path.GetFileName(key)}'.");
                 }
+                catch (Exception ex)
+                {
+                    try { Console.Error.WriteLine($"[ProjectIndexCache] Eviction of '{Path.GetFileName(key)}' failed: {ex.Message}"); }
+                    catch { /* console gone during teardown */ }
+                }
             }
+        }
+        catch
+        {
+            // Never let a background eviction take down the process.
         }
         finally
         {
-            s_lock.Release();
+            if (acquired)
+            {
+                try { s_lock.Release(); } catch (ObjectDisposedException) { }
+            }
         }
     }
 

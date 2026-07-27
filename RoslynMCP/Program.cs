@@ -7,6 +7,8 @@ using ModelContextProtocol.Server;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
+using RoslynMCP.Services.Designers;
+using RoslynMCP.Services.Run;
 using RoslynMCP.Tools;
 using RoslynMCP.Tools.Razor;
 using RoslynMCP.Tools.WebForms;
@@ -87,6 +89,10 @@ class Program
             builder.Services.AddHostedService<WorkspacePreloadHostedService>();
         }
 
+        // Returns immediately: it only starts a background request when the cached answer has
+        // expired, so this costs nothing on a normal session.
+        UpdateCheckService.BeginCheck();
+
         // Register output formatter (markdown default, TOON via tableFormat=="toon")
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
@@ -96,9 +102,16 @@ class Program
         builder.Services.AddSingleton(new DbConnectionRegistry(dbProviders));
         builder.Services.AddSingleton<ExecutionPlanStore>();
 
+        builder.Services.AddSingleton<DesignerRegenerationService>();
+        builder.Services.AddSingleton<SolutionSessionService>();
+        builder.Services.AddSingleton<AppSessionStore>();
+        builder.Services.AddSingleton<AppRunService>();
+        builder.Services.AddSingleton<IDesignerGenerator, DbmlDesignerGenerator>();
+
         // Register non-C# file type handlers conditionally
         if (settings.WebForms)
         {
+            builder.Services.AddSingleton<IDesignerGenerator, AspxDesignerGenerator>();
             builder.Services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
             builder.Services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
             builder.Services.AddSingleton<IOutlineHandler, AspxOutline>();

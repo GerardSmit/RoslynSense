@@ -35,8 +35,71 @@
       <None Include="..\README.md" Pack="true" PackagePath="\" Link="README.md" />
     </ItemGroup>
 
+    <!--
+      ICorDebug cannot attach across x86/x64, so a target whose bitness differs from this host is
+      debugged through a worker of the target's bitness. The RID's apphost is what fixes a
+      worker's bitness, so each must be published separately and shipped beside the tool.
+
+      Framework-dependent on purpose: a self-contained x86 publish would add tens of megabytes to
+      the package. The cost is that debugging a 32-bit target needs the x86 .NET runtime installed,
+      which DebugEngineFactory reports plainly when the worker is missing.
+
+      Set BuildDebugWorkers=false to skip this (it slows inner-loop builds and is only needed when
+      actually debugging a cross-bitness target).
+    -->
+    <PropertyGroup>
+      <BuildDebugWorkers Condition="'$(BuildDebugWorkers)' == ''">false</BuildDebugWorkers>
+      <BuildDebugWorkers Condition="'$(Configuration)' == 'Release'">true</BuildDebugWorkers>
+    </PropertyGroup>
+
+    <PropertyGroup>
+      <DebugWorkerStagingDir>$(MSBuildThisFileDirectory)$(BaseIntermediateOutputPath)debugworkers\$(Configuration)\</DebugWorkerStagingDir>
+    </PropertyGroup>
+
+    <!-- Publishes both flavours once into a staging directory, shared by build and publish. -->
+    <Target Name="PublishDebugWorkers"
+            Condition="'$(BuildDebugWorkers)' == 'true' AND '$(OS)' == 'Windows_NT' AND '$(_RoslynMcpInnerWorkerBuild)' != 'true'">
+      <MSBuild Projects="..\RoslynMCP.DebugWorker\RoslynMCP.DebugWorker.csproj"
+               Targets="Publish"
+               Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=false;PublishDir=$(DebugWorkerStagingDir)x64\;_RoslynMcpInnerWorkerBuild=true" />
+      <MSBuild Projects="..\RoslynMCP.DebugWorker\RoslynMCP.DebugWorker.csproj"
+               Targets="Publish"
+               Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x86;SelfContained=false;PublishDir=$(DebugWorkerStagingDir)x86\;_RoslynMcpInnerWorkerBuild=true" />
+    </Target>
+
+    <!-- Beside the build output, so a locally built server and the tests can find the workers. -->
+    <Target Name="CopyDebugWorkersToOutput"
+            AfterTargets="Build"
+            DependsOnTargets="PublishDebugWorkers"
+            Condition="'$(BuildDebugWorkers)' == 'true' AND '$(OS)' == 'Windows_NT' AND '$(_RoslynMcpInnerWorkerBuild)' != 'true'">
+      <ItemGroup>
+        <_StagedDebugWorker Include="$(DebugWorkerStagingDir)**\*" />
+      </ItemGroup>
+      <Copy SourceFiles="@(_StagedDebugWorker)"
+            DestinationFiles="@(_StagedDebugWorker->'$(OutputPath)workers\%(RecursiveDir)%(Filename)%(Extension)')"
+            SkipUnchangedFiles="true" />
+    </Target>
+
+    <!--
+      Into the publish output, which is what `PackAsTool` actually packages — adding None items
+      with a tools\ PackagePath does not work for a tool package.
+    -->
+    <Target Name="AddDebugWorkersToPublish"
+            AfterTargets="ComputeFilesToPublish"
+            DependsOnTargets="PublishDebugWorkers"
+            Condition="'$(BuildDebugWorkers)' == 'true' AND '$(OS)' == 'Windows_NT' AND '$(_RoslynMcpInnerWorkerBuild)' != 'true'">
+      <ItemGroup>
+        <_StagedDebugWorker Include="$(DebugWorkerStagingDir)**\*" />
+        <ResolvedFileToPublish Include="@(_StagedDebugWorker)">
+          <RelativePath>workers\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+          <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </ResolvedFileToPublish>
+      </ItemGroup>
+    </Target>
+
     <ItemGroup>
       <ProjectReference Include="..\WebFormsCore.Parser\WebFormsCore.Parser.csproj" />
+      <ProjectReference Include="..\RoslynMCP.Debugger\RoslynMCP.Debugger.csproj" />
     </ItemGroup>
 
 </Project>

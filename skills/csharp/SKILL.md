@@ -1,7 +1,6 @@
 ---
-name: CSharp/.NET Coding Conventions
-applyTo: '**/*.{cs,csproj,sln}'
-description: C#/.NET coding conventions, best practices, and instructions for using RoslynSense MCP tools for code analysis, navigation, refactoring, testing, and debugging.
+name: csharp
+description: C#/.NET coding conventions plus how to drive the RoslynSense MCP tools for analysis, navigation, refactoring, building, running, testing, and debugging. Use when working in a C# project — any .cs, .csproj, .sln, .aspx/.ascx (WebForms) or .razor/.cshtml file, on modern .NET or .NET Framework.
 ---
 # C# prompt instructions
 You are an expert C#/.NET developer. You help with .NET tasks by giving clean, well-designed, error-free, fast, secure, readable, and maintainable code that follows .NET conventions. You also give insights, best practices, general software design tips, and testing best practices.
@@ -49,7 +48,8 @@ You are familiar with the currently released .NET and C# versions (up to .NET 10
 # .NET quick checklist
 
 ## Command line
-For build/test commands, follow these rules:
+
+Prefer **BuildProject** and **RunTests** over shell commands. When you do fall back to the CLI for something they do not cover, follow these rules:
 - Always add `-v q` for quiet output; only when absolutely necessary (e.g. seeing test exception), remove `-v` from the command.
   NEVER USE `-v n` OR `-v d`.
 - Always add `-tl:false` to disable interactive console.
@@ -58,10 +58,14 @@ For build/test commands, follow these rules:
 
 ## Build
 
-- .NET 5+: `dotnet build`, `dotnet publish`.
-- .NET Framework: May use `MSBuild` directly or require Visual Studio
-- Look for custom targets/scripts: `Directory.Build.targets`, `build.cmd/.sh`, `Build.ps1`.
-- Wait for build to finish; do not cancel the command immediately.
+**Use the RoslynSense tools, not the CLI.** They select the right driver themselves — the dotnet CLI for SDK-style projects, Visual Studio MSBuild for legacy .NET Framework ones, which the CLI cannot build at all — and return structured errors and warnings instead of raw log text.
+
+- **BuildProject** — build a project or solution. Set `background: true` for long builds.
+- **GetBuildWarnings** — pull every warning for a given code (e.g. `CS0414`) from the last build.
+- **OpenSolution** — reports up front whether the required toolchain (VS MSBuild, `Microsoft.WebApplication.targets`, IIS Express, SqlMetal) is actually installed, so a missing prerequisite surfaces as a clear message rather than an opaque build failure.
+- **RunProject** — build and start the application in one step.
+
+Reach for `dotnet build` / `dotnet publish` / `MSBuild` directly only for something the tools do not cover, such as `publish`, a custom target, or a repo script (`Directory.Build.targets`, `build.cmd/.sh`, `Build.ps1`). When you do, wait for it to finish; do not cancel it immediately.
 
 ## Good practice
 
@@ -125,16 +129,29 @@ For build/test commands, follow these rules:
 - Try to verify that the outputs (e.g. return values, exceptions) of the mock match the outputs of the dependency. You can write a test for this but leave it marked as skipped/explicit so that developers can verify it later.
 
 # Validate
-- Always run `dotnet build` and `dotnet test` before ending the session to ensure no errors or test failures.
+- Always run **BuildProject** and **RunTests** before ending the session to ensure no errors or test failures.
+- If you edited ASPX markup or a `.dbml`, run **RegenerateDesigner** first so the generated code matches.
 - If there are errors or test failures, fix them before ending the session. If you cannot fix them, explain the errors and failures in detail.
 
 ---
 
 # RoslynSense MCP Tools
 
-You have access to the **RoslynSense** MCP server, which provides C# code analysis, navigation, refactoring, testing, and debugging capabilities powered by the Roslyn compiler platform. It supports C# files, ASPX/ASCX (WebForms), and Razor (.razor/.cshtml) files.
+You have access to the **RoslynSense** MCP server, which provides C# code analysis, navigation, refactoring, testing, running, and debugging capabilities powered by the Roslyn compiler platform. It supports C# files, ASPX/ASCX (WebForms), and Razor (.razor/.cshtml) files, on both modern .NET and .NET Framework.
 
 **Always prefer RoslynSense tools over shell commands or text-based grep when working with C# code.** These tools provide compiler-accurate results — they understand types, overloads, generics, and cross-project references.
+
+## If the RoslynSense tools are missing
+
+Install it:
+
+```
+dotnet tool install --global RoslynSense
+```
+
+You can use it straight away from the shell — `roslyn-sense --cli <tool> --help` — but the MCP tools themselves only appear after the server reconnects, so tell the user to run `/mcp` or restart.
+
+Only run `dotnet tool update --global RoslynSense` when asked, or when told a newer version is available. If it fails because files are in use, ignore it — it applies next start.
 
 ## Markup Snippet Convention
 
@@ -148,15 +165,34 @@ void [|ProcessData|](int x)     // targets ProcessData
 
 Whitespace differences between your snippet and the file are tolerated, but the surrounding context must be present in the file.
 
+## Never hand-edit generated files
+
+Visual Studio maintains these through custom tools you do not have. Editing them directly is always wrong: the edit is silently discarded the moment the file is regenerated.
+
+| File | Generated from |
+|------|----------------|
+| `*.aspx.designer.cs`, `*.ascx.designer.cs`, `*.master.designer.cs` | the markup's server controls |
+| `*.designer.cs` beside a `*.dbml` | the LINQ to SQL model |
+
+**Edit the markup or the model, then run RegenerateDesigner.** If a code-behind fails to compile because a control field is missing, the fix is to regenerate — not to add the field by hand.
+
+- **RegenerateDesigner** — accepts a file, a `.csproj`, a `.sln`, or a directory. Use `dryRun: true` to preview.
+- With **OpenSolution** watching (the default), designer files regenerate on save and you usually need not call this at all.
+
+Adding a control field manually to a designer file, or to the code-behind to "work around" a missing one, will break the next regeneration. Don't.
+
 ## Workflow: Understanding a Codebase
 
 When starting work on an unfamiliar codebase, use these tools in order:
 
-1. **ListProjects** — discover all projects in a solution or directory.
-2. **GetProjectStructure** — get an overview of a project's target framework, references, source files, and types organized by namespace.
-3. **GetFileOutline** — get a compact outline of a file showing namespaces, types, and member signatures with line numbers. Supports multiple files (semicolon-separated paths).
+1. **OpenSolution** — load the solution, report each project's framework and run kind plus the .NET Framework toolchain (MSBuild, IIS Express, SqlMetal), and start watching markup so designer files stay current. Call this first in any legacy WebForms solution. Omit `solutionPath` to auto-discover.
+2. **ListProjects** — discover all projects in a solution or directory.
+3. **GetProjectStructure** — get an overview of a project's target framework, references, source files, and types organized by namespace.
+4. **GetFileOutline** — get a compact outline of a file showing namespaces, types, and member signatures with line numbers. Supports multiple files (semicolon-separated paths).
 
 Only after understanding the structure should you drill into specific code.
+
+**CloseSolution** stops the watcher; **GetSolutionStatus** reports what has been regenerated.
 
 ## Workflow: Navigating and Understanding Code
 
@@ -181,9 +217,10 @@ Use these tools to trace code flows and understand relationships:
 
 ### After editing
 
-1. **GetRoslynDiagnostics** — check for errors/warnings in the edited file(s). Pass multiple files separated by semicolons. Use `severityFilter: "error"` for a quick check.
-2. **BuildProject** — build the project or solution to catch cross-file issues.
-3. **GetCodeActions** — if diagnostics show errors, check for available quick fixes. Use `applyIndex` to apply a fix directly.
+1. **RegenerateDesigner** — if you edited `.aspx`/`.ascx`/`.master` markup or a `.dbml`, regenerate before checking diagnostics. Unnecessary when **OpenSolution** is watching.
+2. **GetRoslynDiagnostics** — check for errors/warnings in the edited file(s). Pass multiple files separated by semicolons. Use `severityFilter: "error"` for a quick check.
+3. **BuildProject** — build the project or solution to catch cross-file issues.
+4. **GetCodeActions** — if diagnostics show errors, check for available quick fixes. Use `applyIndex` to apply a fix directly.
 
 ### Refactoring
 
@@ -213,14 +250,38 @@ Use these tools to trace code flows and understand relationships:
 2. **GetCoverage** — query results by file, class, or method. Shows line and branch coverage with uncovered lines.
 - Re-run RunCoverage after code changes that affect coverage.
 
+## Workflow: Running an Application
+
+Use this to observe real behaviour rather than inferring it from source.
+
+- **RunProject** — build and run a project, leaving it running. ASP.NET Core and console apps (.NET and .NET Framework) launch directly; legacy ASP.NET sites launch under IIS Express on the port and virtual path from the project's `WebProjectProperties`. For web projects it waits until the port accepts connections, then returns the URL and PID. Builds first by default (like Visual Studio); pass `build: false` to launch existing output.
+- **StopProject** — stop by session ID, project path, or `all`. Kills the whole process tree.
+- **ListRunningProjects** — what is running, with state, PID, URL and uptime.
+- **GetProjectOutput** — the app's captured stdout/stderr.
+
+### Running tips
+
+- **RunProject builds first**, so a code change is picked up without a separate step. If the build fails it reports the errors and starts nothing.
+- If the process exits immediately, **GetProjectOutput** has the reason — read it before changing code.
+- Applications are per-chat and are stopped when the session ends, but **StopProject** when finished rather than leaving ports held.
+- To debug what you started, pass the PID from **RunProject** to **DebugAttach**.
+
 ## Workflow: Debugging
 
-Debugging uses [netcoredbg](https://github.com/Samsung/netcoredbg), which is auto-provisioned on first use.
+The debug engine is selected automatically from the target — never pick one:
+
+| Target | Engine |
+|--------|--------|
+| .NET / .NET Core | netcoredbg, auto-provisioned on first use |
+| .NET Framework | ICorDebug, built in |
+
+`DebugStartTest` decides from the project's target framework; `DebugAttach` decides from the CLR the target process actually loaded, which is how attaching to `iisexpress.exe` or `w3wp.exe` resolves to the .NET Framework engine. A target of a different bitness (a 32-bit app pool) is driven through a matching worker process automatically.
 
 ### Starting a debug session
 
-- **DebugStartTest** — debug a test project. Builds, launches the test host, and attaches the debugger. Use `filter` to target specific tests. Use `initialBreakpoints` to set breakpoints before execution starts (e.g., `"MyService.cs:42;MyTest.cs:10"`).
-- **DebugAttach** — attach to a running .NET process. Omit the PID to list available processes.
+- **DebugStartTest** — debug a test project. Builds, launches the test host, and attaches the debugger. Use `filter` to target specific tests. Use `initialBreakpoints` to set breakpoints before execution starts (e.g., `"MyService.cs:42;MyTest.cs:10"`). Not supported for .NET Framework test projects — run the tests, then **DebugAttach** to the test host.
+- **DebugAttach** — attach to a running .NET or .NET Framework process. Omit the PID to list available processes.
+- To debug a web app: **RunProject** to start it, then **DebugAttach** with the returned PID.
 
 ### Controlling execution
 
@@ -241,6 +302,7 @@ Debugging uses [netcoredbg](https://github.com/Samsung/netcoredbg), which is aut
 - Use conditional breakpoints to avoid stopping on every iteration of a loop.
 - Evaluate expressions to inspect state without modifying code.
 - If a test is failing and the cause isn't clear from the error message, debug it rather than guessing.
+- In .NET Framework code, breakpoints in ASPX inline code bind once the generated `App_Web_*` assembly loads — hit the page after setting the breakpoint rather than assuming it failed.
 
 ## Workflow: Performance Profiling
 
@@ -305,6 +367,11 @@ For long-running operations (tests, builds, coverage), set `background: true` to
 | Run a specific test | **RunTests** with `filter` | `dotnet test --filter` (use RunTests instead) |
 | Check test coverage | **RunCoverage** then **GetCoverage** | Manual inspection |
 | Debug a failing test | **DebugStartTest** | Adding Console.WriteLine |
+| Fix a missing control field in a code-behind | **RegenerateDesigner** | Editing the `.designer.cs`, or declaring the field by hand |
+| Update code after editing ASPX markup or a `.dbml` | **RegenerateDesigner** (or let **OpenSolution** watch) | Hand-writing the generated file |
+| Start a web app or console app | **RunProject** | `dotnet run` in a shell |
+| Debug a legacy ASP.NET site | **RunProject** then **DebugAttach** with the PID | Assuming .NET Framework cannot be debugged |
+| See why a launched app died | **GetProjectOutput** | Re-running it blind |
 | Profile CPU hotspots | **ProfileTests** or **ProfileApp** | Manual dotnet-trace |
 | Investigate hot methods | **ProfileCallers** / **ProfileCallees** | Guessing without data |
 | Run tests while doing other work | **RunTests** with `background: true` + **GetBackgroundTaskResult** | — |

@@ -200,76 +200,22 @@ public static class ProjectStructureTool
     }
 
     /// <summary>
-    /// Infers the target framework from Roslyn's preprocessor symbols.
-    /// MSBuild defines symbols like NET8_0, NET10_0, NETCOREAPP, NETSTANDARD2_0, etc.
+    /// Renders the project's target framework for display, preferring the precise moniker
+    /// (<c>net10.0</c>) and falling back to the family name when only a generic symbol is defined.
     /// </summary>
     internal static string? InferTargetFramework(Project project)
     {
-        if (project.ParseOptions is not CSharpParseOptions parseOptions)
-            return null;
+        var classification = ProjectClassifier.Classify(project);
+        if (classification.TargetFramework is { } moniker)
+            return moniker;
 
-        var symbols = parseOptions.PreprocessorSymbolNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        // Check for specific .NET version symbols (newest first)
-        string[] netVersions =
-        [
-            "NET10_0", "NET9_0", "NET8_0", "NET7_0", "NET6_0", "NET5_0"
-        ];
-
-        foreach (var version in netVersions)
+        return classification.Runtime switch
         {
-            if (symbols.Contains(version))
-                return version.ToLowerInvariant().Replace('_', '.');
-        }
-
-        // Check for .NET Core
-        string[] coreVersions =
-        [
-            "NETCOREAPP3_1", "NETCOREAPP3_0", "NETCOREAPP2_2", "NETCOREAPP2_1", "NETCOREAPP2_0",
-            "NETCOREAPP1_1", "NETCOREAPP1_0"
-        ];
-
-        foreach (var version in coreVersions)
-        {
-            if (symbols.Contains(version))
-                return version.ToLowerInvariant().Replace('_', '.');
-        }
-
-        // Check for .NET Standard
-        string[] standardVersions =
-        [
-            "NETSTANDARD2_1", "NETSTANDARD2_0", "NETSTANDARD1_6", "NETSTANDARD1_5",
-            "NETSTANDARD1_4", "NETSTANDARD1_3", "NETSTANDARD1_2", "NETSTANDARD1_1", "NETSTANDARD1_0"
-        ];
-
-        foreach (var version in standardVersions)
-        {
-            if (symbols.Contains(version))
-                return version.ToLowerInvariant().Replace('_', '.');
-        }
-
-        // Check for .NET Framework
-        string[] frameworkVersions =
-        [
-            "NET48", "NET472", "NET471", "NET47", "NET462", "NET461",
-            "NET46", "NET452", "NET451", "NET45", "NET40", "NET35", "NET20"
-        ];
-
-        foreach (var version in frameworkVersions)
-        {
-            if (symbols.Contains(version))
-                return version.ToLowerInvariant();
-        }
-
-        // Fallback: check generic symbols
-        if (symbols.Contains("NETCOREAPP"))
-            return ".NET Core";
-        if (symbols.Contains("NETSTANDARD"))
-            return ".NET Standard";
-        if (symbols.Contains("NETFRAMEWORK"))
-            return ".NET Framework";
-
-        return null;
+            RuntimeFlavor.NetCore => ".NET Core",
+            RuntimeFlavor.NetStandard => ".NET Standard",
+            RuntimeFlavor.NetFramework => ".NET Framework",
+            _ => null,
+        };
     }
 
     /// <summary>

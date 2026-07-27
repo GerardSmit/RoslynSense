@@ -235,43 +235,90 @@ internal static class MsBuildLocator
     /// using MSBuild's <c>/getProperty:TargetPath</c>. Returns null if MSBuild
     /// is not found or the property cannot be evaluated.
     /// </summary>
-    public static string? GetTargetPath(string csprojPath)
+    public static string? GetTargetPath(string csprojPath, string? configuration = null)
     {
-        var msbuild = FindMsBuild();
-        if (msbuild is null) return null;
+        var output = GetProperty(csprojPath, "TargetPath", configuration);
+        if (output is null) return null;
+
+        // Pick the last path-shaped line — MSBuild may print warnings before the value.
+        foreach (var line in output.Split('\n').Reverse())
+        {
+            var candidate = line.Trim();
+            if (candidate.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
+                candidate.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Evaluates a single MSBuild property for a project, using whichever driver the project needs:
+    /// the dotnet CLI for SDK-style projects (which works without Visual Studio installed) and
+    /// Visual Studio MSBuild for legacy ones (which the dotnet CLI cannot evaluate at all).
+    /// </summary>
+    /// <returns>The raw stdout, or <c>null</c> when no suitable MSBuild is available.</returns>
+    public static string? GetProperty(string projectPath, string propertyName, string? configuration = null)
+    {
+        var useVsMsBuild = ProjectClassifier.Classify(projectPath).BuildTool == BuildTool.VisualStudioMsBuild;
+
+        string fileName;
+        var arguments = new List<string>();
+
+        if (useVsMsBuild)
+        {
+            var msbuild = FindMsBuild();
+            if (msbuild is null) return null;
+            fileName = msbuild;
+        }
+        else
+        {
+            fileName = "dotnet";
+            arguments.Add("msbuild");
+        }
+
+        arguments.Add(projectPath);
+        arguments.Add("/nologo");
+        arguments.Add("/v:minimal");
+        arguments.Add(BuildProcessHelper.NoNodeReuseArg);
+        arguments.Add($"/getProperty:{propertyName}");
+        if (!string.IsNullOrWhiteSpace(configuration))
+            arguments.Add($"/p:Configuration={configuration}");
 
         try
         {
-            using var process = new Process
+            var startInfo = new ProcessStartInfo
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = msbuild,
-                    Arguments = $"\"{csprojPath}\" /nologo /v:minimal /nodeReuse:false /getProperty:TargetPath",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Path.GetDirectoryName(csprojPath)!
-                }
+                FileName = fileName,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(projectPath)!,
             };
 
-            SetVsEnvironment(process.StartInfo, msbuild);
+            foreach (var argument in arguments)
+                startInfo.ArgumentList.Add(argument);
+
+            BuildProcessHelper.ConfigureMsBuildEnvironment(startInfo);
+            if (useVsMsBuild)
+                SetVsEnvironment(startInfo, fileName);
+
+            using var process = new Process { StartInfo = startInfo };
             process.Start();
             var output = process.StandardOutput.ReadToEnd().Trim();
-            process.WaitForExit();
 
-            // Output is the TargetPath value — pick the last non-empty line (MSBuild may print warnings)
-            foreach (var line in output.Split('\n').Reverse())
+            if (!process.WaitForExit(120_000))
             {
-                var candidate = line.Trim();
-                if (candidate.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
-                    candidate.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    return candidate;
+                try { process.Kill(entireProcessTree: true); } catch { }
+                return null;
             }
-        }
-        catch { }
 
-        return null;
+            return process.ExitCode == 0 ? output : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

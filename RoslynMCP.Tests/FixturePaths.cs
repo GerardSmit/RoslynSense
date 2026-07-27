@@ -41,6 +41,12 @@ internal static class FixturePaths
     public static string ImageHandlerFile => Path.Combine(AspxProjectDir, "ImageHandler.ashx");
     public static string AspxPageHelperFile => Path.Combine(AspxProjectDir, "PageHelper.cs");
     public static string AspxWebConfigFile => Path.Combine(AspxProjectDir, "web.config");
+    public static string WebFormsSiteDir => Path.Combine(s_fixturesRoot, "WebFormsSite");
+    public static string WebFormsSiteFile => Path.Combine(WebFormsSiteDir, "WebFormsSite.csproj");
+    public static string DbmlProjectDir => Path.Combine(s_fixturesRoot, "DbmlProject");
+    public static string ShopDbmlFile => Path.Combine(DbmlProjectDir, "Shop.dbml");
+    public static string DesignerAspxFile => Path.Combine(AspxProjectDir, "Designer.aspx");
+    public static string DesignerAspxDesignerFile => Path.Combine(AspxProjectDir, "Designer.aspx.designer.cs");
     public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");
     public static string RepeaterCodeBehindFile => Path.Combine(AspxProjectDir, "Repeater.aspx.cs");
 

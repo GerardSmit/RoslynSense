@@ -129,7 +129,7 @@ internal static class PathHelper
         if (IsSolutionFile(buildTarget))
             return IsLegacySolution(buildTarget);
         if (buildTarget.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-            return IsLegacyProject(buildTarget);
+            return ProjectClassifier.Classify(buildTarget).BuildTool == BuildTool.VisualStudioMsBuild;
         return false;
     }
 

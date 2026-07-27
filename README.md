@@ -317,7 +317,9 @@ In-process memory is also bounded independently of the host:
 | `ROSLYNMCP_INDEX_IDLE_TIMEOUT_SECONDS` | `600` | Idle eviction for ASPX/Razor project-index caches. |
 | `ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS` | `300` | Ceiling on a single project/solution open. |
 
-**Debugging is per-chat.** Debug tools are *not* forwarded to the shared host — they run in-process in each client, so every chat has its own independent debug session (`netcoredbg` subprocess). Multiple chats can debug the same solution at once without colliding. (Trade-off: a debug session loads its own workspace in the client process, but debugging is interactive and infrequent.)
+**Debugging and running are per-chat.** Debug and run tools are *not* forwarded to the shared host — they run in-process in each client, so every chat has its own independent debug session and its own launched applications. Multiple chats can debug the same solution at once without colliding, and a launched app is torn down with the client that started it rather than being orphaned. (Trade-off: a debug session loads its own workspace in the client process, but debugging is interactive and infrequent.)
+
+Designer regeneration is the exception: it is a side effect on the shared source tree, so `OpenSolution` runs a single watcher in the host rather than one per chat.
 
 **Single host guarantee.** Exactly one host serves a solution at a time: a daemon acquires an exclusive lock file before it begins listening, so a daemon that loses a startup race exits without serving; the OS releases the lock on process death, so a crash self-heals and the next call respawns.
 
@@ -358,6 +360,43 @@ In-process memory is also bounded independently of the host:
 | **BuildProject** | Build a .NET project or solution and return structured errors and warnings. Warnings are grouped by code with counts. Set `background: true` to build in the background. |
 | **GetBuildWarnings** | Retrieve all warnings for a specific warning code (e.g. `CS0414`) from the last build. Returns each warning's file, line, and message. `projectPath` defaults to the last built project. |
 
+### Solution Session
+
+| Tool | Description |
+|------|-------------|
+| **OpenSolution** | Load a solution's projects, report each project's framework and run kind plus the .NET Framework toolchain (MSBuild, IIS Express, SqlMetal), and start watching markup so `.designer.cs` files regenerate on save. Omit `solutionPath` to auto-discover. |
+| **CloseSolution** | Stop the designer watcher and release the session. |
+| **GetSolutionStatus** | Report the open solution, watcher state, and recent automatic designer regenerations. |
+
+### Generated Files
+
+Visual Studio maintains `*.aspx.designer.cs`, `*.ascx.designer.cs`, `*.master.designer.cs` and
+`*.dbml.designer.cs` through custom tools an agent does not have. Rather than hand-editing those
+generated files — where the edit is lost on the next regeneration — edit the markup or model and
+regenerate.
+
+| Tool | Description |
+|------|-------------|
+| **RegenerateDesigner** | Regenerate the `.designer.cs` for WebForms markup (`.aspx`/`.ascx`/`.master`) or a LINQ to SQL model (`.dbml`). Accepts a file, `.csproj`, `.sln`, or directory. Set `dryRun: true` to preview. |
+
+WebForms designers are generated from the resolved control tree, so each server control with an
+`ID` gets a correctly typed field. Controls nested in a template get no field (they are reached via
+`FindControl`), and a control whose field is already declared by hand in the code-behind is skipped
+so no duplicate member is emitted. `.dbml` regeneration shells out to `SqlMetal.exe` from the
+Windows SDK.
+
+### Running Applications
+
+Applications are per-chat: they are launched by the client that asked for them and torn down with
+it, so two chats never fight over one process.
+
+| Tool | Description |
+|------|-------------|
+| **RunProject** | Build and run a project, leaving it running. ASP.NET Core and .NET/.NET Framework console apps launch directly; legacy ASP.NET sites launch under IIS Express using the port and virtual path from the project's `WebProjectProperties`. Waits for the port to accept connections and returns the URL and PID. Builds first by default, like Visual Studio; pass `build: false` to launch existing output. |
+| **StopProject** | Stop by session ID, project path, or `all`. Kills the whole process tree. |
+| **ListRunningProjects** | List applications started in this chat with state, PID, URL and uptime. |
+| **GetProjectOutput** | Read captured stdout/stderr for a session. |
+
 ### Refactoring
 
 | Tool | Description |
@@ -378,12 +417,41 @@ In-process memory is also bounded independently of the host:
 
 ### Debugging
 
-Debugging uses [netcoredbg](https://github.com/Samsung/netcoredbg), which is auto-provisioned on first use. Disable with `--no-debugger`.
+Disable with `--no-debugger`.
+
+The debug engine is selected automatically from the target — you never choose it:
+
+| Target | Engine |
+|--------|--------|
+| .NET / .NET Core | [netcoredbg](https://github.com/Samsung/netcoredbg), auto-provisioned on first use |
+| .NET Framework | ICorDebug, built in |
+
+No single engine covers both: netcoredbg speaks only to CoreCLR, and ICorDebug is the only way into
+.NET Framework. `DebugStartTest` picks from the project's target framework; `DebugAttach` has no
+project to consult, so it picks from the CLR the target process actually loaded — which is how
+attaching to `iisexpress.exe` or `w3wp.exe` resolves to the .NET Framework engine.
+
+.NET Framework debugging binds breakpoints through Windows PDBs, and pending breakpoints rebind as
+modules load — so breakpoints land in shadow-copied `bin` assemblies and in the generated
+`App_Web_*` assemblies produced from inline ASPX code.
+
+Expression evaluation resolves arguments, locals, fields and array elements directly, and calls
+into the debuggee for computed properties and parameterless methods (`order.Total`,
+`order.Describe()`). `DebugSetVariable`-style assignment works for primitives and booleans.
+
+**Cross-architecture targets.** ICorDebug cannot attach across x86/x64, so a target whose bitness
+differs from the server is debugged through a matching worker process running the same engine —
+this is what makes a 32-bit IIS Express app pool debuggable. Selection is automatic. The workers
+are framework-dependent, so debugging a 32-bit target needs the x86 .NET runtime installed; when it
+or the worker is missing, the error says so rather than failing at attach.
+
+One current limit: `DebugStartTest` is not supported for .NET Framework test projects — run the
+tests, then `DebugAttach` to the test host.
 
 | Tool | Description |
 |------|-------------|
 | **DebugStartTest** | Start debugging a .NET test project. Builds, launches the test host, and attaches the debugger. |
-| **DebugAttach** | Attach the debugger to a running .NET process by PID. |
+| **DebugAttach** | Attach the debugger to a running .NET or .NET Framework process by PID. |
 | **DebugSetBreakpoint** | Set a breakpoint at a file and line. Supports conditions and batch mode. |
 | **DebugRemoveBreakpoint** | Remove a breakpoint by ID. Supports batch removal. |
 | **DebugContinue** | Continue, step in, step over, or step out. |
@@ -444,6 +512,25 @@ Example configuration with all three providers:
 ```
 
 Provider tokens: `psql` / `postgres` / `postgresql`, `mssql` / `sqlserver` / `sql`, `sqlite`. Alias prefix is optional (defaults to the canonical provider name).
+
+#### SQL Server: TrustServerCertificate
+
+SQL Server connection strings get `TrustServerCertificate=True` unless they already specify it.
+
+This exists because the same connection string behaves differently in the two SqlClients. A
+.NET Framework app's `System.Data.SqlClient` defaults to `Encrypt=false`, so a `web.config` string
+pointing at a development server with a self-signed certificate works. `Microsoft.Data.SqlClient`,
+which this server uses, has defaulted to `Encrypt=true` since v4.0 — so the identical string fails
+with a certificate-trust error here while the application it was copied from connects fine.
+
+Note that this does weaken transport security: the connection is still encrypted, but an
+unvalidated certificate offers no protection against interception. It is a development-time default.
+To opt back into validation — for a production server, say — state it explicitly, and it is
+respected (the spaced synonym `Trust Server Certificate` works too):
+
+```
+--db prod=mssql:Server=db.example.com;Database=App;TrustServerCertificate=False
+```
 
 #### Referencing connection strings from config files
 
@@ -546,6 +633,38 @@ The provider for each connection string is resolved in this order — first matc
 |--------|-------------|
 | **validate-after-edit** | Step-by-step instructions to validate a C# file after editing. |
 | **investigate-symbol** | Multi-step investigation workflow for a symbol. |
+
+## Skill
+
+Installing via the Claude Code plugin also installs a **`csharp` skill** (`skills/csharp/SKILL.md`).
+Claude loads it automatically when working in a C# project; you can also invoke it explicitly as
+`/roslyn-sense:csharp`.
+
+It carries the C#/.NET conventions plus guidance on driving these tools — which tool to reach for
+instead of grep or a shell build, when to regenerate designer files rather than editing them, and
+how to run and debug an app on either runtime.
+
+Skills are a Claude Code feature. On other MCP clients, point your agent at that file directly —
+it is plain Markdown with no Claude-Code-specific syntax in the body.
+
+### Keeping the tool up to date
+
+The plugin declares the MCP server as `roslyn-sense`, which is the [.NET global tool](#install) —
+installing the plugin does not install the tool.
+
+The server checks NuGet for a newer version itself and mentions one in `OpenSolution`'s output. The
+check costs nothing at session start: it runs on a background task, caches the answer for 24 hours,
+and makes no request at all when that cache is fresh. Updating is left to you, since a running
+server holds its own binary and cannot replace it in place.
+
+Deliberately *not* a `SessionStart` hook running `dotnet tool update`: that takes about five seconds
+even when there is nothing to update, on every single session.
+
+| Env var | Effect |
+|---------|--------|
+| `ROSLYNMCP_NO_UPDATE_CHECK` | `1`/`true`/`on` disables the version check entirely. |
+
+If the tool is missing altogether, the skill tells the agent to install it and ask for a restart.
 
 ## Markup Snippet Convention
 

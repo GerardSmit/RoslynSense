@@ -173,25 +173,29 @@ public static class ListProjectsTool
     {
         if (!File.Exists(csprojPath)) return "?";
 
+        var classification = ProjectClassifier.Classify(csprojPath);
+        if (classification.IsTestProject) return "Test";
+
+        // PackAsTool is packaging metadata rather than a project shape, so it stays a local read.
         try
         {
-            var content = File.ReadAllText(csprojPath);
-            bool isTest = content.Contains("Microsoft.NET.Test.Sdk", StringComparison.OrdinalIgnoreCase) ||
-                          content.Contains("xunit", StringComparison.OrdinalIgnoreCase) ||
-                          content.Contains("NUnit", StringComparison.OrdinalIgnoreCase) ||
-                          content.Contains("MSTest", StringComparison.OrdinalIgnoreCase);
-
-            bool isExe = content.Contains("<OutputType>Exe</OutputType>", StringComparison.OrdinalIgnoreCase);
-            bool isTool = content.Contains("<PackAsTool>true</PackAsTool>", StringComparison.OrdinalIgnoreCase);
-
-            if (isTest) return "Test";
-            if (isTool) return "Tool";
-            if (isExe) return "Exe";
-            return "Library";
+            if (File.ReadAllText(csprojPath)
+                .Contains("<PackAsTool>true</PackAsTool>", StringComparison.OrdinalIgnoreCase))
+                return "Tool";
         }
         catch
         {
-            return "?";
+            // Unreadable file: fall through to whatever the classifier managed to determine.
         }
+
+        return classification.Kind switch
+        {
+            AppKind.AspNetCore => "Web",
+            AppKind.AspNetClassic => "Web (IIS Express)",
+            AppKind.ConsoleApp => "Exe",
+            AppKind.WindowsApp => "WinExe",
+            AppKind.ClassLibrary => "Library",
+            _ => "Library",
+        };
     }
 }

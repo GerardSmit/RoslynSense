@@ -13,19 +13,37 @@ namespace RoslynMCP.Tools;
 public static class ProfileInvestigateTool
 {
     [McpServerTool, Description(
-        "List all active profiling sessions. Each session is created by ProfileTests or ProfileApp " +
-        "and retained for 30 minutes. Returns session IDs for use with other profile investigation tools.")]
+        "List all active profiling sessions and in-flight recordings. Sessions are created by " +
+        "ProfileTests/ProfileApp/ProfileProcess/ProfileStop and retained for 30 minutes; " +
+        "recordings are started by ProfileStart and still collecting. Returns the IDs used by " +
+        "the other profile tools.")]
     public static string ListProfilingSessions(
         IOutputFormatter fmt,
-        ProfilingSessionStore store)
+        ProfilingSessionStore store,
+        ProfileRecordingStore recordings)
     {
         var sessions = store.ListSessions();
+        var active = recordings.All();
         var sb = new StringBuilder();
         fmt.AppendHeader(sb, "Profiling Sessions");
 
+        if (active.Count > 0)
+        {
+            var recordingColumns = new[] { "Recording ID", "Process", "Elapsed" };
+            var recordingRows = active.Select(r => new[]
+            {
+                r.Id,
+                r.Description,
+                $"{r.Elapsed.TotalSeconds:F0}s"
+            }).ToList();
+            fmt.AppendTable(sb, "Active Recordings (stop with ProfileStop)", recordingColumns, recordingRows, active.Count);
+        }
+
         if (sessions.Count == 0)
         {
-            fmt.AppendEmpty(sb, "No active profiling sessions. Run ProfileTests or ProfileApp first.");
+            fmt.AppendEmpty(sb, active.Count > 0
+                ? "No finished sessions yet — ProfileStop an active recording to create one."
+                : "No active profiling sessions. Run ProfileTests, ProfileApp, ProfileProcess, or ProfileStart first.");
             return sb.ToString();
         }
 

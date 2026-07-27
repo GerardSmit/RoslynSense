@@ -248,6 +248,265 @@ public static class ProfileTool
     }
 
     /// <summary>
+    /// Starts a profiling recording that keeps collecting until ProfileStop.
+    /// </summary>
+    [McpServerTool, Description(
+        "Start recording a CPU profile of a running process and return immediately, so you can " +
+        "exercise the app yourself (HTTP requests, test runs, UI actions) while data is being " +
+        "collected. Works on both modern .NET (EventPipe) and .NET Framework (dotTrace attach). " +
+        "Finish with ProfileStop to get the hot methods. The recording stops collecting by " +
+        "itself after maxDurationSeconds; its data stays available for ProfileStop.")]
+    public static async Task<string> ProfileStart(
+        [Description("PID of the process to record (e.g. from RunProject).")]
+        int processId,
+        IOutputFormatter fmt,
+        ProfileRecordingStore recordings,
+        [Description("Project or solution the process belongs to, used by ProfileStop to decide " +
+                     "what counts as own code. Defaults to the solution nearest the working directory.")]
+        string? projectPath = null,
+        [Description("Safety cap: recording stops collecting by itself after this many seconds. Default: 600.")]
+        int maxDurationSeconds = 600,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            string processName;
+            try
+            {
+                using var process = Process.GetProcessById(processId);
+                processName = process.ProcessName;
+            }
+            catch (ArgumentException)
+            {
+                return $"Error: No process with PID {processId} is running.";
+            }
+
+            var id = recordings.NextId();
+            var description = $"recording {processName} (pid {processId})";
+            var tempDir = Path.Combine(Path.GetTempPath(), $"roslyn-mcp-recording-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+
+            ProfileRecording recording;
+            if (DebugRuntimeDetector.ForProcess(processId) == DebugRuntime.NetFramework)
+            {
+                var startError = await StartDotTraceRecordingAsync(
+                    id, description, processId, tempDir, projectPath, maxDurationSeconds,
+                    cancellationToken);
+                if (startError.Error is not null)
+                {
+                    try { Directory.Delete(tempDir, recursive: true); } catch { }
+                    return $"Error: {startError.Error}";
+                }
+                recording = startError.Recording!;
+            }
+            else
+            {
+                var dotnetTracePath = await DebuggerService.FindOrProvisionDotnetTraceAsync(cancellationToken);
+                if (dotnetTracePath is null)
+                {
+                    try { Directory.Delete(tempDir, recursive: true); } catch { }
+                    return "Error: Could not find or install dotnet-trace (needed to convert the recording). " +
+                           "Install it manually with: dotnet tool install -g dotnet-trace";
+                }
+
+                try
+                {
+                    recording = EventPipeRecording.Start(
+                        id, description, processId, tempDir, projectPath, dotnetTracePath);
+                }
+                catch (Exception ex)
+                {
+                    try { Directory.Delete(tempDir, recursive: true); } catch { }
+                    return $"Error: Could not open an EventPipe session on PID {processId}: {ex.Message}";
+                }
+
+                // EventPipe has no built-in timeout (dotTrace does); stop collecting at the cap
+                // so an abandoned recording does not grow a trace file forever. The artifact is
+                // cached and stays available for a later ProfileStop.
+                var capped = recording;
+                _ = Task.Delay(TimeSpan.FromSeconds(maxDurationSeconds), CancellationToken.None)
+                    .ContinueWith(async _ =>
+                    {
+                        if (recordings.Get(capped.Id) is not null)
+                        {
+                            try { await capped.StopAndCollectAsync(CancellationToken.None); }
+                            catch { }
+                        }
+                    }, TaskScheduler.Default);
+            }
+
+            recordings.Add(recording);
+
+            var sb = new StringBuilder();
+            fmt.AppendHeader(sb, "Recording Started");
+            fmt.AppendField(sb, "Recording ID", id);
+            fmt.AppendField(sb, "Process", description);
+            fmt.AppendField(sb, "Max Duration", $"{maxDurationSeconds}s");
+            fmt.AppendSeparator(sb);
+            fmt.AppendHints(sb,
+                "The profiler is now collecting — exercise the app (send requests, run the scenario under investigation)",
+                $"Call ProfileStop with '{id}' when done to get the hot methods",
+                "Keep the window focused: only what runs while recording shows up in the profile");
+            return sb.ToString();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ProfileStart] Unhandled error: {ex}");
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Stops a recording started with ProfileStart and returns the profile results.
+    /// </summary>
+    [McpServerTool, Description(
+        "Stop a recording started with ProfileStart, parse the collected profile, and return " +
+        "the hottest methods. The result is stored as a session for ProfileSearchMethods, " +
+        "ProfileCallers, ProfileCallees, and ProfileHotPaths.")]
+    public static async Task<string> ProfileStop(
+        IOutputFormatter fmt,
+        ProfileRecordingStore recordings,
+        ProfilingSessionStore store,
+        [Description("Recording ID from ProfileStart. May be omitted when only one recording is active.")]
+        string? recordingId = null,
+        [Description("Number of top methods to return. Default: 30.")]
+        int maxResults = 30,
+        [Description("Show only methods from the current solution's code, hiding framework and " +
+                     "third-party methods. Default: true. Set false to include everything.")]
+        bool ownCodeOnly = true,
+        CancellationToken cancellationToken = default)
+    {
+        var (recording, resolveError) = recordings.Resolve(recordingId);
+        if (recording is null)
+            return $"Error: {resolveError}";
+
+        try
+        {
+            var artifactPath = await recording.StopAndCollectAsync(cancellationToken);
+
+            SpeedscopeParser.ProfilingResult result;
+            if (recording.ArtifactKind == ProfileArtifactKind.DotTraceSnapshot)
+            {
+                var tools = await DotTraceService.FindOrProvisionAsync(cancellationToken);
+                if (tools is null)
+                    return "Error: The dotTrace command-line tools disappeared between start and stop.";
+
+                var (reportPath, reportError) = await DotTraceService.GenerateReportAsync(
+                    tools, artifactPath, cancellationToken);
+                if (reportPath is null)
+                    return $"Error: {reportError}";
+
+                result = DotTraceReportParser.Parse(reportPath, int.MaxValue);
+            }
+            else
+            {
+                result = SpeedscopeParser.Parse(artifactPath, int.MaxValue);
+            }
+
+            if (result.Error is not null)
+                return result.Error;
+
+            IReadOnlyList<string>? ownPrefixes = null;
+            if (ownCodeOnly)
+            {
+                ownPrefixes = recording.ProjectPath is not null &&
+                              PathHelper.ResolveCsprojPath(recording.ProjectPath) is { } csproj
+                    ? CodeScope.OwnPrefixesForProject(csproj)
+                    : CodeScope.OwnPrefixesForDirectory(Environment.CurrentDirectory);
+            }
+
+            string? sessionId = null;
+            if (result.FrameNames is not null && result.Samples is not null && result.Weights is not null)
+                sessionId = store.Store(recording.Description, result);
+
+            recordings.Remove(recording.Id);
+            recording.Dispose();
+
+            return FormatResult(result, sessionId, ownPrefixes, maxResults, fmt);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Keep the recording registered: the artifact may still be collectable on retry.
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    private static async Task<(DotTraceRecording? Recording, string? Error)> StartDotTraceRecordingAsync(
+        string id, string description, int pid, string tempDir, string? projectPath,
+        int maxDurationSeconds, CancellationToken cancellationToken)
+    {
+        if (!OperatingSystem.IsWindows())
+            return (null, ".NET Framework profiling is only available on Windows.");
+
+        var tools = await DotTraceService.FindOrProvisionAsync(cancellationToken);
+        if (tools is null)
+            return (null, "Could not find or download the dotTrace command-line tools. " +
+                          "Install dotTrace, or set ROSLYNSENSE_DOTTRACE_DIR to a directory " +
+                          "containing dottrace.exe and Reporter.exe.");
+
+        var snapshotPath = Path.Combine(tempDir, "snapshot.dtp");
+        var args = new StringBuilder();
+        args.Append("attach ").Append(pid);
+        args.Append(" --profiling-type=Sampling --time-measurement=ThreadCycleTime");
+        args.Append(" --save-to=\"").Append(snapshotPath).Append('"');
+        args.Append(" --overwrite --no-check-for-updates");
+        args.Append(" --timeout=").Append(maxDurationSeconds).Append('s');
+        args.Append(" --service-input=stdin --service-output=on");
+
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = tools.DotTracePath,
+                Arguments = args.ToString(),
+                WorkingDirectory = tempDir,
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            }
+        };
+
+        var recording = new DotTraceRecording
+        {
+            Id = id,
+            Description = description,
+            Pid = pid,
+            TempDir = tempDir,
+            StartedAtUtc = DateTime.UtcNow,
+            ProjectPath = projectPath,
+            Process = process,
+            SnapshotPath = snapshotPath,
+        };
+
+        process.OutputDataReceived += (_, e) => { if (e.Data is not null) recording.OnOutputLine(e.Data); };
+        process.ErrorDataReceived += (_, _) => { };
+
+        try
+        {
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+        }
+        catch (Exception ex)
+        {
+            process.Dispose();
+            return (null, $"Could not start dottrace.exe: {ex.Message}");
+        }
+
+        return (recording, null);
+    }
+
+    /// <summary>
     /// Launches a .NET Framework app (console app directly, classic ASP.NET under IIS Express),
     /// profiles it with dotTrace, and stops it again.
     /// </summary>

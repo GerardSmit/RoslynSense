@@ -97,6 +97,7 @@ class Program
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());
         builder.Services.AddSingleton<ProfilingSessionStore>();
+        builder.Services.AddSingleton<ProfileRecordingStore>();
         builder.Services.AddSingleton<RoslynMCP.Services.Memory.MemorySnapshotStore>();
         builder.Services.AddSingleton<BackgroundTaskStore>();
         builder.Services.AddSingleton<BuildWarningsStore>();

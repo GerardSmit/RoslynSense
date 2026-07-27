@@ -89,6 +89,10 @@ class Program
             builder.Services.AddHostedService<WorkspacePreloadHostedService>();
         }
 
+        // Returns immediately: it only starts a background request when the cached answer has
+        // expired, so this costs nothing on a normal session.
+        UpdateCheckService.BeginCheck();
+
         // Register output formatter (markdown default, TOON via tableFormat=="toon")
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         builder.Services.AddSingleton<IOutputFormatter>(useToon ? new ToonFormatter() : new MarkdownFormatter());

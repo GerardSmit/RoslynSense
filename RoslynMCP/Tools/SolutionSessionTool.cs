@@ -195,6 +195,14 @@ public static class SolutionSessionTool
                 : "Requested watching, but no project directory could be watched."
             : "Designer watching is off. Use RegenerateDesigner to update designer files manually.");
 
+        // Surfaced here rather than on every tool: this is the "start here" call, so it is seen
+        // once per session instead of repeatedly.
+        if (UpdateCheckService.GetHint() is { } updateHint)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"> {updateHint}");
+        }
+
         return sb.ToString();
     }
 

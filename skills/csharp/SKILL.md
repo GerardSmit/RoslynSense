@@ -143,21 +143,15 @@ You have access to the **RoslynSense** MCP server, which provides C# code analys
 
 ## If the RoslynSense tools are missing
 
-The server is a .NET global tool. When installed as a Claude Code plugin a session-start hook keeps it current, but that hook runs while MCP servers are still connecting, so a first-ever session can start before the tool exists.
-
-If no RoslynSense tool is available, install it and ask the user to restart the session:
+Install it:
 
 ```
 dotnet tool install --global RoslynSense
 ```
 
-To pick up a newer version:
+You can use it straight away from the shell — `roslyn-sense --cli <tool> --help` — but the MCP tools themselves only appear after the server reconnects, so tell the user to run `/mcp` or restart.
 
-```
-dotnet tool update --global RoslynSense
-```
-
-**An update that fails because the files are in use is expected — skip it and carry on.** The running server (and its shared host process) hold their own binaries, so an update applies on the next start rather than immediately. Do not kill processes to force it; the installed version still works.
+Only run `dotnet tool update --global RoslynSense` when asked, or when told a newer version is available. If it fails because files are in use, ignore it — it applies next start.
 
 ## Markup Snippet Convention
 

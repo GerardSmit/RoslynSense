@@ -513,6 +513,25 @@ Example configuration with all three providers:
 
 Provider tokens: `psql` / `postgres` / `postgresql`, `mssql` / `sqlserver` / `sql`, `sqlite`. Alias prefix is optional (defaults to the canonical provider name).
 
+#### SQL Server: TrustServerCertificate
+
+SQL Server connection strings get `TrustServerCertificate=True` unless they already specify it.
+
+This exists because the same connection string behaves differently in the two SqlClients. A
+.NET Framework app's `System.Data.SqlClient` defaults to `Encrypt=false`, so a `web.config` string
+pointing at a development server with a self-signed certificate works. `Microsoft.Data.SqlClient`,
+which this server uses, has defaulted to `Encrypt=true` since v4.0 — so the identical string fails
+with a certificate-trust error here while the application it was copied from connects fine.
+
+Note that this does weaken transport security: the connection is still encrypted, but an
+unvalidated certificate offers no protection against interception. It is a development-time default.
+To opt back into validation — for a production server, say — state it explicitly, and it is
+respected (the spaced synonym `Trust Server Certificate` works too):
+
+```
+--db prod=mssql:Server=db.example.com;Database=App;TrustServerCertificate=False
+```
+
 #### Referencing connection strings from config files
 
 The connection-string portion can be a raw ADO.NET string *or* a reference to an existing config file so the LLM does not need the secret baked into the MCP config.
@@ -631,19 +650,21 @@ it is plain Markdown with no Claude-Code-specific syntax in the body.
 ### Keeping the tool up to date
 
 The plugin declares the MCP server as `roslyn-sense`, which is the [.NET global tool](#install) —
-installing the plugin does not install the tool. A `SessionStart` hook therefore runs:
+installing the plugin does not install the tool.
 
-```
-dotnet tool update --global RoslynSense || dotnet tool install --global RoslynSense
-```
+The server checks NuGet for a newer version itself and mentions one in `OpenSolution`'s output. The
+check costs nothing at session start: it runs on a background task, caches the answer for 24 hours,
+and makes no request at all when that cache is fresh. Updating is left to you, since a running
+server holds its own binary and cannot replace it in place.
 
-It cannot fail the session: a `SessionStart` hook's exit code is informational, and this one always
-exits 0. An update that fails because the running server holds its own binary is skipped and applies
-on the next start instead.
+Deliberately *not* a `SessionStart` hook running `dotnet tool update`: that takes about five seconds
+even when there is nothing to update, on every single session.
 
-The hook runs while MCP servers are still connecting, so the very first session on a machine without
-the tool may start without it — the skill tells the agent to install it and ask for a restart.
-Disable the hook, if you prefer to manage the tool yourself, by removing `hooks/hooks.json`.
+| Env var | Effect |
+|---------|--------|
+| `ROSLYNMCP_NO_UPDATE_CHECK` | `1`/`true`/`on` disables the version check entirely. |
+
+If the tool is missing altogether, the skill tells the agent to install it and ask for a restart.
 
 ## Markup Snippet Convention
 

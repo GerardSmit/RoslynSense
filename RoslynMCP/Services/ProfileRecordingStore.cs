@@ -143,18 +143,35 @@ public sealed partial class DotTraceRecording : ProfileRecording
 
     private readonly TaskCompletionSource<string> _snapshotSaved =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _started =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly ConcurrentQueue<string> _outputTail = new();
 
     public override ProfileArtifactKind ArtifactKind => ProfileArtifactKind.DotTraceSnapshot;
+
+    /// <summary>Completes once dotTrace reports it is collecting data from the target.</summary>
+    public Task Started => _started.Task;
+
+    /// <summary>The last profiler output lines, for diagnosing a failed attach.</summary>
+    public string OutputTail => string.Join(Environment.NewLine, _outputTail);
 
     /// <summary>Wire this to the process's stdout to observe dotTrace service messages.</summary>
     public void OnOutputLine(string line)
     {
+        _outputTail.Enqueue(line);
+        while (_outputTail.Count > 20)
+            _outputTail.TryDequeue(out _);
+
         // ##dotTrace["snapshot-saved", {pid: 1234, filename:"..."}] — pseudo-JSON (unquoted
         // keys), so a regex is the honest parser here.
         if (!line.Contains("##dotTrace", StringComparison.Ordinal))
             return;
 
-        if (line.Contains("snapshot-saved", StringComparison.Ordinal))
+        if (line.Contains("\"started\"", StringComparison.Ordinal))
+        {
+            _started.TrySetResult();
+        }
+        else if (line.Contains("snapshot-saved", StringComparison.Ordinal))
         {
             var match = SnapshotFileRegex().Match(line);
             var path = match.Success ? match.Groups[1].Value.Replace(@"\\", @"\") : SnapshotPath;
@@ -172,7 +189,13 @@ public sealed partial class DotTraceRecording : ProfileRecording
             snapshotTimeout.CancelAfter(TimeSpan.FromMinutes(3));
             try
             {
-                await _snapshotSaved.Task.WaitAsync(snapshotTimeout.Token);
+                // A crashed profiler never reports a snapshot; racing against its exit fails
+                // fast instead of sitting out the full timeout. Give the output pump a moment
+                // to deliver a snapshot-saved that raced the exit.
+                var exited = Process.WaitForExitAsync(snapshotTimeout.Token);
+                var finished = await Task.WhenAny(_snapshotSaved.Task, exited);
+                if (finished == exited && !_snapshotSaved.Task.IsCompleted)
+                    await Task.WhenAny(_snapshotSaved.Task, Task.Delay(2000, snapshotTimeout.Token));
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {

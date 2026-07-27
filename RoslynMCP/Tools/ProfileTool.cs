@@ -270,6 +270,8 @@ public static class ProfileTool
     {
         try
         {
+            maxDurationSeconds = Math.Clamp(maxDurationSeconds, 5, 24 * 60 * 60);
+
             string processName;
             try
             {
@@ -297,7 +299,30 @@ public static class ProfileTool
                     try { Directory.Delete(tempDir, recursive: true); } catch { }
                     return $"Error: {startError.Error}";
                 }
-                recording = startError.Recording!;
+                var dotTraceRecording = startError.Recording!;
+
+                // Wait for dotTrace to actually attach: reporting success while the profiler is
+                // already dead (arch mismatch, another profiler attached, missing rights) would
+                // waste the caller's whole exercise window.
+                var exited = dotTraceRecording.Process.WaitForExitAsync(cancellationToken);
+                var outcome = await Task.WhenAny(
+                    dotTraceRecording.Started, exited, Task.Delay(TimeSpan.FromSeconds(30), cancellationToken));
+
+                if (outcome == exited)
+                {
+                    var tail = dotTraceRecording.OutputTail;
+                    dotTraceRecording.Dispose();
+                    return $"Error: dotTrace exited before it started collecting. Output:\n\n{tail}";
+                }
+
+                if (!dotTraceRecording.Started.IsCompleted)
+                {
+                    dotTraceRecording.Dispose();
+                    return "Error: dotTrace did not start collecting within 30 seconds. Output:\n\n" +
+                           dotTraceRecording.OutputTail;
+                }
+
+                recording = dotTraceRecording;
             }
             else
             {

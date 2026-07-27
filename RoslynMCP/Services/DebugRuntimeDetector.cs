@@ -24,6 +24,12 @@ internal static class DebugRuntimeDetector
     /// </summary>
     public static DebugRuntime ForProcess(int pid)
     {
+        // .NET Framework is Windows-only, so nothing off Windows can be one. Without this the
+        // probes below would misreport: a Linux process loads no coreclr.dll (the module is
+        // libcoreclr.so) and its host is named `dotnet` rather than `dotnet.exe`.
+        if (!OperatingSystem.IsWindows())
+            return DebugRuntime.CoreClr;
+
         try
         {
             using var process = Process.GetProcessById(pid);

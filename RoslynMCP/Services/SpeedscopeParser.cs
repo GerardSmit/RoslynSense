@@ -88,69 +88,7 @@ public static class SpeedscopeParser
             foreach (var w in weightsArray.EnumerateArray())
                 rawWeights[si++] = w.GetDouble();
 
-            // Compute self-time and total-time per frame
-            var selfTime = new double[frameNames.Length];
-            var totalTime = new double[frameNames.Length];
-            var hitCount = new int[frameNames.Length];
-            double totalDuration = 0;
-
-            for (int i = 0; i < sampleCount; i++)
-            {
-                var stack = rawSamples[i];
-                double weight = rawWeights[i];
-                totalDuration += weight;
-
-                if (stack.Length == 0) continue;
-
-                // Last element in the sample array = top of call stack (leaf/self)
-                int leafFrame = stack[^1];
-                if (leafFrame >= 0 && leafFrame < frameNames.Length)
-                {
-                    selfTime[leafFrame] += weight;
-                    hitCount[leafFrame]++;
-                }
-
-                // All frames in the stack contribute to total-time
-                // Use a HashSet to avoid double-counting recursive calls
-                var seen = new HashSet<int>();
-                foreach (int frameIdx in stack)
-                {
-                    if (frameIdx >= 0 && frameIdx < frameNames.Length && seen.Add(frameIdx))
-                        totalTime[frameIdx] += weight;
-                }
-            }
-
-            if (totalDuration <= 0)
-                return new([], 0, sampleCount, "Profile has zero total duration.");
-
-            // Build method profiles sorted by self-time descending
-            var methods = new List<MethodProfile>();
-            for (int i = 0; i < frameNames.Length; i++)
-            {
-                if (selfTime[i] <= 0 && totalTime[i] <= 0)
-                    continue;
-
-                var (name, module) = SplitMethodName(frameNames[i]);
-                methods.Add(new MethodProfile(
-                    Name: name,
-                    Module: module,
-                    FullName: frameNames[i],
-                    SelfTimeMs: selfTime[i],
-                    TotalTimeMs: totalTime[i],
-                    SelfPercent: selfTime[i] / totalDuration * 100,
-                    TotalPercent: totalTime[i] / totalDuration * 100,
-                    SampleCount: hitCount[i]));
-            }
-
-            methods.Sort((a, b) => b.SelfTimeMs.CompareTo(a.SelfTimeMs));
-
-            var topMethods = methods.Count > maxResults
-                ? methods.GetRange(0, maxResults)
-                : methods;
-
-            return new ProfilingResult(
-                topMethods, totalDuration, sampleCount, Error: null,
-                FrameNames: frameNames, Samples: rawSamples, Weights: rawWeights);
+            return Aggregate(frameNames, rawSamples, rawWeights, maxResults);
         }
         catch (JsonException ex)
         {
@@ -160,6 +98,78 @@ public static class SpeedscopeParser
         {
             return new([], 0, 0, $"Error parsing profile data: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Computes self-time and total-time per frame from raw sampled call stacks and
+    /// returns the top-N hottest methods by self-time. Shared by every profile source
+    /// that produces stacks-with-weights (speedscope JSON, dotTrace reports).
+    /// </summary>
+    internal static ProfilingResult Aggregate(
+        string[] frameNames, int[][] samples, double[] weights, int maxResults)
+    {
+        var selfTime = new double[frameNames.Length];
+        var totalTime = new double[frameNames.Length];
+        var hitCount = new int[frameNames.Length];
+        double totalDuration = 0;
+
+        for (int i = 0; i < samples.Length; i++)
+        {
+            var stack = samples[i];
+            double weight = weights[i];
+            totalDuration += weight;
+
+            if (stack.Length == 0) continue;
+
+            // Last element in the sample array = top of call stack (leaf/self)
+            int leafFrame = stack[^1];
+            if (leafFrame >= 0 && leafFrame < frameNames.Length)
+            {
+                selfTime[leafFrame] += weight;
+                hitCount[leafFrame]++;
+            }
+
+            // All frames in the stack contribute to total-time
+            // Use a HashSet to avoid double-counting recursive calls
+            var seen = new HashSet<int>();
+            foreach (int frameIdx in stack)
+            {
+                if (frameIdx >= 0 && frameIdx < frameNames.Length && seen.Add(frameIdx))
+                    totalTime[frameIdx] += weight;
+            }
+        }
+
+        if (totalDuration <= 0)
+            return new([], 0, samples.Length, "Profile has zero total duration.");
+
+        // Build method profiles sorted by self-time descending
+        var methods = new List<MethodProfile>();
+        for (int i = 0; i < frameNames.Length; i++)
+        {
+            if (selfTime[i] <= 0 && totalTime[i] <= 0)
+                continue;
+
+            var (name, module) = SplitMethodName(frameNames[i]);
+            methods.Add(new MethodProfile(
+                Name: name,
+                Module: module,
+                FullName: frameNames[i],
+                SelfTimeMs: selfTime[i],
+                TotalTimeMs: totalTime[i],
+                SelfPercent: selfTime[i] / totalDuration * 100,
+                TotalPercent: totalTime[i] / totalDuration * 100,
+                SampleCount: hitCount[i]));
+        }
+
+        methods.Sort((a, b) => b.SelfTimeMs.CompareTo(a.SelfTimeMs));
+
+        var topMethods = methods.Count > maxResults
+            ? methods.GetRange(0, maxResults)
+            : methods;
+
+        return new ProfilingResult(
+            topMethods, totalDuration, samples.Length, Error: null,
+            FrameNames: frameNames, Samples: samples, Weights: weights);
     }
 
     /// <summary>

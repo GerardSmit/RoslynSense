@@ -18,6 +18,12 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        // One-shot heap analysis modes: run, print a single JSON document to stdout, exit.
+        // Used by the host's memory tools when the target's bitness differs from the host's,
+        // because ClrMD — like ICorDebug — cannot inspect across x86/x64.
+        if (args.Length >= 2 && args[0] is "--heap-snapshot" or "--heap-roots")
+            return RunHeapCommand(args);
+
         var sessionId = args.Length > 0 && uint.TryParse(args[0], out var parsed) ? parsed : 1u;
         s_session = new DebugSession(sessionId);
 
@@ -68,6 +74,37 @@ internal static class Program
         }
 
         return 0;
+    }
+
+    private static int RunHeapCommand(string[] args)
+    {
+        try
+        {
+            if (!int.TryParse(args[1], out var pid))
+            {
+                Console.Error.WriteLine($"invalid pid '{args[1]}'");
+                return 1;
+            }
+
+            object result = args[0] switch
+            {
+                "--heap-snapshot" => HeapAnalyzer.CaptureStats(pid, CancellationToken.None),
+                _ => HeapAnalyzer.FindPathsToRoot(
+                    pid,
+                    args.Length > 2 ? args[2] : "",
+                    args.Length > 3 && int.TryParse(args[3], out var max) ? max : 3,
+                    CancellationToken.None),
+            };
+
+            Console.Out.WriteLine(JsonSerializer.Serialize(result, HeapAnalyzer.JsonOptions));
+            Console.Out.Flush();
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
     }
 
     private static async Task<WorkerResponse> HandleAsync(WorkerRequest request)

@@ -306,14 +306,28 @@ The debug engine is selected automatically from the target — never pick one:
 
 ## Workflow: Performance Profiling
 
-Profiling uses [dotnet-trace](https://learn.microsoft.com/dotnet/core/diagnostics/dotnet-trace) with CPU sampling, which is auto-provisioned on first use.
+CPU sampling works on both runtimes and is auto-provisioned on first use: modern .NET uses
+[dotnet-trace](https://learn.microsoft.com/dotnet/core/diagnostics/dotnet-trace), .NET Framework
+uses the free JetBrains dotTrace command-line profiler. Both feed the same session store, so the
+investigation tools work identically.
 
 ### Collecting a profile
 
-- **ProfileTests** — profile a test project's execution. Use `filter` to target specific tests. Returns the hottest methods by self-time and a **session ID** for follow-up investigation.
-- **ProfileApp** — profile an application's execution. Returns the same hot methods table and session ID.
+- **ProfileTests** — profile a test project's execution. Use `filter` to target specific tests. Returns the hottest methods by self-time and a **session ID** for follow-up investigation. Modern .NET only — for .NET Framework tests, run them and attach with **ProfileProcess**.
+- **ProfileApp** — profile an application's execution. Modern .NET apps run under dotnet-trace; legacy ASP.NET sites are launched under IIS Express, sampled with dotTrace, and stopped again. Returns the same hot methods table and session ID.
+- **ProfileProcess** — attach to an already-running process by PID (e.g. from **RunProject**), .NET Framework or modern .NET alike. This is the way to profile `iisexpress.exe`/`w3wp.exe` hosting a running site.
 
-Both tools use `--no-build`, so build the project first if needed.
+For web apps, pass `hitUrls` (semicolon-separated) so the pages under investigation are actually
+requested during the profiling window — profiling an idle server measures nothing. ProfileApp
+defaults to hammering the app's root URL for web projects.
+
+By default the hot-methods table shows **only the solution's own code** — framework and
+third-party methods (System.*, SQL client internals, CMS plumbing) are hidden and counted in a
+note. Pass `ownCodeOnly=false` to see everything. For ProfileProcess, pass `projectPath` so the
+right solution defines what counts as own code. The stored session always keeps every method, so
+the investigation tools below search the full profile regardless of this setting.
+
+ProfileTests and ProfileApp use existing build output, so build the project first if needed.
 
 ### Investigating profile results
 
@@ -333,6 +347,22 @@ After profiling, use the session ID to drill into the results:
 - Use **ProfileCallers** to trace upward from a hot method to understand *why* it's being called.
 - Use **ProfileCallees** to trace downward to find *where* time is actually spent.
 - Combine with **GoToDefinition** to navigate to a hot method's source code.
+
+## Workflow: Memory Tracing
+
+Heap snapshots use ClrMD and work on both .NET Framework and modern .NET processes. The target
+keeps running; snapshots are retained for 30 minutes.
+
+1. **MemorySnapshot** — snapshot a process by PID (e.g. from **RunProject**) and see the types using the most memory.
+2. Exercise the app (requests, the suspected scenario), then **MemorySnapshot** again.
+3. **MemoryCompare** — diff the two snapshots to see which types grew in bytes and instance count. Repeated growth across cycles is the leak signature; one-time growth is usually caching.
+4. **MemoryPathsToRoot** — for a growing type, walk the GC root paths that keep instances alive. Static fields and event handlers near the root are the usual leak anchors.
+5. **ListMemorySnapshots** — list snapshots taken in the last 30 minutes.
+
+Memory tips:
+
+- `System.String` and arrays dominating a snapshot is normal — compare against a baseline instead of judging absolute numbers.
+- 32-bit targets (e.g. a 32-bit IIS Express app pool) are inspected through the bundled bitness-matched worker, the same mechanism cross-bitness debugging uses; it requires the x86 .NET runtime, and the error says so when it is missing.
 
 ## Workflow: Background Tasks
 
@@ -373,6 +403,8 @@ For long-running operations (tests, builds, coverage), set `background: true` to
 | Debug a legacy ASP.NET site | **RunProject** then **DebugAttach** with the PID | Assuming .NET Framework cannot be debugged |
 | See why a launched app died | **GetProjectOutput** | Re-running it blind |
 | Profile CPU hotspots | **ProfileTests** or **ProfileApp** | Manual dotnet-trace |
+| Profile a running (IIS Express) site | **ProfileProcess** with the RunProject PID | Assuming .NET Framework cannot be profiled |
+| Find what eats memory / leaks | **MemorySnapshot** → **MemoryCompare** → **MemoryPathsToRoot** | Guessing from Task Manager |
 | Investigate hot methods | **ProfileCallers** / **ProfileCallees** | Guessing without data |
 | Run tests while doing other work | **RunTests** with `background: true` + **GetBackgroundTaskResult** | — |
 | Build while doing other work | **BuildProject** with `background: true` + **GetBackgroundTaskResult** | — |

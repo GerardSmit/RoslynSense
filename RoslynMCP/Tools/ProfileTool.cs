@@ -3,12 +3,14 @@ using System.Diagnostics;
 using System.Text;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Run;
 
 namespace RoslynMCP.Tools;
 
 /// <summary>
-/// Profiles .NET application or test execution using dotnet-trace CPU sampling,
-/// returning the hottest methods by self-time.
+/// Profiles .NET application or test execution, returning the hottest methods by self-time.
+/// Modern .NET is sampled with dotnet-trace (EventPipe); .NET Framework processes are sampled
+/// with the free JetBrains dotTrace command-line profiler, feeding the same session store.
 /// </summary>
 [McpServerToolType]
 public static class ProfileTool
@@ -33,6 +35,9 @@ public static class ProfileTool
         int maxDurationSeconds = 120,
         [Description("Number of top methods to return. Default: 30.")]
         int maxResults = 30,
+        [Description("Show only methods from the current solution's code, hiding framework and " +
+                     "third-party methods. Default: true. Set false to include everything.")]
+        bool ownCodeOnly = true,
         CancellationToken cancellationToken = default)
     {
         try
@@ -46,8 +51,9 @@ public static class ProfileTool
                 filter = PathHelper.BuildSourceFileFilter(normalizedInput, filter);
 
             if (PathHelper.RequiresMsBuild(csprojPath))
-                return "Error: Profiling is not supported for legacy .NET Framework projects. " +
-                       "dotnet-trace only supports .NET Core 3.0+ processes.";
+                return "Error: Test profiling is not supported for legacy .NET Framework test projects " +
+                       "(dotnet-trace only supports .NET Core 3.0+ processes). " +
+                       "Run the tests, then use ProfileProcess to attach to the test host by PID.";
 
             var testArgs = new StringBuilder();
             testArgs.Append("test \"");
@@ -65,10 +71,12 @@ public static class ProfileTool
             if (!string.IsNullOrWhiteSpace(filter))
                 description += $" --filter {filter}";
 
-            return await RunProfileAsync(
-                "dotnet", testArgs.ToString(),
+            return await RunDotnetTraceAsync(
+                $"-- dotnet {testArgs}",
                 Path.GetDirectoryName(csprojPath)!,
-                maxDurationSeconds, maxResults, description, fmt, store, cancellationToken);
+                maxDurationSeconds, maxResults, description, hitUrls: null,
+                ownCodeOnly ? CodeScope.OwnPrefixesForProject(csprojPath) : null,
+                fmt, store, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -85,22 +93,33 @@ public static class ProfileTool
     /// Profiles a .NET application's execution to find CPU hotspots.
     /// </summary>
     [McpServerTool, Description(
-        "Profile a .NET application to find CPU hotspots. Runs the app under dotnet-trace " +
-        "CPU sampling and returns the hottest methods by self-time. " +
+        "Profile a .NET application to find CPU hotspots and returns the hottest methods by " +
+        "self-time. Modern .NET apps run under dotnet-trace CPU sampling; legacy .NET Framework " +
+        "apps (including ASP.NET sites under IIS Express) are launched and sampled with the free " +
+        "dotTrace command-line profiler. For web apps, pass hitUrls so the pages under " +
+        "investigation are actually exercised during the profiling window. " +
         "The profile session is saved for follow-up investigation with ProfileSearchMethods, " +
         "ProfileCallers, ProfileCallees, and ProfileHotPaths. " +
-        "Requires dotnet-trace (auto-installed if missing).")]
+        "Uses existing build output — build the project first.")]
     public static async Task<string> ProfileApp(
         [Description("Path to the project (.csproj) or a source file in the project.")]
         string projectPath,
         IOutputFormatter fmt,
         ProfilingSessionStore store,
+        AppRunService runner,
+        AppSessionStore sessions,
         [Description("Command-line arguments to pass to the application.")]
         string? appArgs = null,
+        [Description("URLs to request repeatedly while profiling, semicolon-separated. " +
+                     "Legacy web projects default to the app's root URL.")]
+        string? hitUrls = null,
         [Description("Maximum profiling duration in seconds. Default: 30.")]
         int maxDurationSeconds = 30,
         [Description("Number of top methods to return. Default: 30.")]
         int maxResults = 30,
+        [Description("Show only methods from the current solution's code, hiding framework and " +
+                     "third-party methods. Default: true. Set false to include everything.")]
+        bool ownCodeOnly = true,
         CancellationToken cancellationToken = default)
     {
         try
@@ -109,9 +128,20 @@ public static class ProfileTool
             if (csprojPath is null)
                 return $"Error: Could not find a .csproj file for '{projectPath}'.";
 
+            var ownPrefixes = ownCodeOnly ? CodeScope.OwnPrefixesForProject(csprojPath) : null;
+
             if (PathHelper.RequiresMsBuild(csprojPath))
-                return "Error: Profiling is not supported for legacy .NET Framework projects. " +
-                       "dotnet-trace only supports .NET Core 3.0+ processes.";
+            {
+                // The netfx launch goes through AppRunService (IIS Express or the built exe),
+                // which has no argument pass-through; silently dropping them would mislead.
+                if (!string.IsNullOrWhiteSpace(appArgs))
+                    return "Error: 'appArgs' is not supported when profiling .NET Framework projects. " +
+                           "Start the app yourself and use ProfileProcess with its PID instead.";
+
+                return await ProfileNetFxAppAsync(
+                    csprojPath, hitUrls, maxDurationSeconds, maxResults, ownPrefixes,
+                    fmt, store, runner, sessions, cancellationToken);
+            }
 
             var runArgs = new StringBuilder();
             runArgs.Append("run --project \"");
@@ -126,10 +156,11 @@ public static class ProfileTool
 
             var description = $"dotnet run {Path.GetFileNameWithoutExtension(csprojPath)}";
 
-            return await RunProfileAsync(
-                "dotnet", runArgs.ToString(),
+            return await RunDotnetTraceAsync(
+                $"-- dotnet {runArgs}",
                 Path.GetDirectoryName(csprojPath)!,
-                maxDurationSeconds, maxResults, description, fmt, store, cancellationToken);
+                maxDurationSeconds, maxResults, description, hitUrls, ownPrefixes,
+                fmt, store, cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -142,11 +173,191 @@ public static class ProfileTool
         }
     }
 
-    private static async Task<string> RunProfileAsync(
-        string command, string arguments,
-        string workingDirectory,
+    /// <summary>
+    /// Profiles an already-running .NET process by attaching to it.
+    /// </summary>
+    [McpServerTool, Description(
+        "Profile an already-running .NET process by PID to find CPU hotspots. Works for both " +
+        "modern .NET (dotnet-trace attach) and .NET Framework processes such as iisexpress.exe " +
+        "or w3wp.exe (dotTrace attach) — use the PID returned by RunProject. For web apps, pass " +
+        "hitUrls so the pages under investigation are exercised during the profiling window. " +
+        "The profile session is saved for follow-up investigation with ProfileSearchMethods, " +
+        "ProfileCallers, ProfileCallees, and ProfileHotPaths.")]
+    public static async Task<string> ProfileProcess(
+        [Description("PID of the process to attach to (e.g. from RunProject).")]
+        int processId,
+        IOutputFormatter fmt,
+        ProfilingSessionStore store,
+        [Description("URLs to request repeatedly while profiling, semicolon-separated.")]
+        string? hitUrls = null,
+        [Description("Profiling duration in seconds. Default: 30.")]
+        int durationSeconds = 30,
+        [Description("Number of top methods to return. Default: 30.")]
+        int maxResults = 30,
+        [Description("Show only methods from the current solution's code, hiding framework and " +
+                     "third-party methods. Default: true. Set false to include everything.")]
+        bool ownCodeOnly = true,
+        [Description("Project or solution the process belongs to, used to decide what counts as " +
+                     "own code. Defaults to the solution nearest the working directory.")]
+        string? projectPath = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            string processName;
+            try
+            {
+                using var process = Process.GetProcessById(processId);
+                processName = process.ProcessName;
+            }
+            catch (ArgumentException)
+            {
+                return $"Error: No process with PID {processId} is running.";
+            }
+
+            IReadOnlyList<string>? ownPrefixes = null;
+            if (ownCodeOnly)
+            {
+                ownPrefixes = projectPath is not null && PathHelper.ResolveCsprojPath(projectPath) is { } csproj
+                    ? CodeScope.OwnPrefixesForProject(csproj)
+                    : CodeScope.OwnPrefixesForDirectory(Environment.CurrentDirectory);
+            }
+
+            var description = $"attach {processName} (pid {processId})";
+
+            if (DebugRuntimeDetector.ForProcess(processId) == DebugRuntime.NetFramework)
+                return await ProfileNetFxProcessAsync(
+                    processId, hitUrls, durationSeconds, maxResults, ownPrefixes, description,
+                    fmt, store, cancellationToken);
+
+            return await RunDotnetTraceAsync(
+                $"-p {processId}",
+                Path.GetTempPath(),
+                durationSeconds, maxResults, description, hitUrls, ownPrefixes,
+                fmt, store, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ProfileProcess] Unhandled error: {ex}");
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Launches a .NET Framework app (console app directly, classic ASP.NET under IIS Express),
+    /// profiles it with dotTrace, and stops it again.
+    /// </summary>
+    private static async Task<string> ProfileNetFxAppAsync(
+        string csprojPath, string? hitUrls, int maxDurationSeconds, int maxResults,
+        IReadOnlyList<string>? ownPrefixes,
+        IOutputFormatter fmt, ProfilingSessionStore store,
+        AppRunService runner, AppSessionStore sessions,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await runner.StartAsync(csprojPath, "Debug", null, null, cancellationToken);
+        if (!outcome.Succeeded)
+            return $"Error: {outcome.Error}\n\n" +
+                   "If the app is already running (e.g. via RunProject), use ProfileProcess with its PID instead.";
+
+        var session = outcome.Session!;
+        try
+        {
+            if (!AppSessionStore.IsLive(session) || session.Process.HasExited)
+            {
+                return "Error: The application exited before profiling could start. Output:\n\n" +
+                       session.Tail(40);
+            }
+
+            // Profiling an idle web app measures nothing; default to hammering the root URL.
+            if (string.IsNullOrWhiteSpace(hitUrls) && session.Url is not null)
+                hitUrls = session.Url;
+
+            var description = $"dotTrace {Path.GetFileNameWithoutExtension(csprojPath)}";
+            return await ProfileNetFxProcessAsync(
+                session.Pid, hitUrls, maxDurationSeconds, maxResults, ownPrefixes, description,
+                fmt, store, cancellationToken);
+        }
+        finally
+        {
+            await AppRunService.StopAsync(session);
+            sessions.Remove(session.Id);
+            session.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Attaches dotTrace to a running .NET Framework process, snapshots after the profiling
+    /// window, converts the snapshot to XML with Reporter.exe, and stores the parsed session.
+    /// </summary>
+    private static async Task<string> ProfileNetFxProcessAsync(
+        int pid, string? hitUrls, int durationSeconds, int maxResults,
+        IReadOnlyList<string>? ownPrefixes, string description,
+        IOutputFormatter fmt, ProfilingSessionStore store,
+        CancellationToken cancellationToken)
+    {
+        if (!OperatingSystem.IsWindows())
+            return "Error: .NET Framework profiling is only available on Windows.";
+
+        var tools = await DotTraceService.FindOrProvisionAsync(cancellationToken);
+        if (tools is null)
+            return "Error: Could not find or download the dotTrace command-line tools. " +
+                   "Install dotTrace, or set ROSLYNSENSE_DOTTRACE_DIR to a directory containing " +
+                   "dottrace.exe and Reporter.exe.";
+
+        var workingDirectory = Path.Combine(Path.GetTempPath(), $"roslyn-mcp-dottrace-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workingDirectory);
+
+        try
+        {
+            using var trafficCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var trafficTask = GenerateTrafficAsync(hitUrls, trafficCts.Token);
+
+            string? snapshotPath, error;
+            try
+            {
+                (snapshotPath, error) = await DotTraceService.AttachAndSnapshotAsync(
+                    tools, pid, durationSeconds, workingDirectory, cancellationToken);
+            }
+            finally
+            {
+                trafficCts.Cancel();
+                await trafficTask;
+            }
+
+            if (snapshotPath is null)
+                return $"Error: {error}";
+
+            var (reportPath, reportError) = await DotTraceService.GenerateReportAsync(
+                tools, snapshotPath, cancellationToken);
+            if (reportPath is null)
+                return $"Error: {reportError}";
+
+            // Parse everything; the own-code scope decides what is shown, not what is kept.
+            var result = DotTraceReportParser.Parse(reportPath, int.MaxValue);
+            if (result.Error is not null)
+                return result.Error;
+
+            string? sessionId = null;
+            if (result.FrameNames is not null && result.Samples is not null && result.Weights is not null)
+                sessionId = store.Store(description, result);
+
+            return FormatResult(result, sessionId, ownPrefixes, maxResults, fmt);
+        }
+        finally
+        {
+            try { Directory.Delete(workingDirectory, recursive: true); } catch { }
+        }
+    }
+
+    private static async Task<string> RunDotnetTraceAsync(
+        string traceTarget, string workingDirectory,
         int maxDurationSeconds, int maxResults,
-        string description,
+        string description, string? hitUrls,
+        IReadOnlyList<string>? ownPrefixes,
         IOutputFormatter fmt,
         ProfilingSessionStore store,
         CancellationToken cancellationToken)
@@ -172,7 +383,7 @@ public static class ProfileTool
                 var duration = TimeSpan.FromSeconds(maxDurationSeconds);
                 traceArgs.Append($" --duration {duration:hh\\:mm\\:ss}");
             }
-            traceArgs.Append($" -- {command} {arguments}");
+            traceArgs.Append($" {traceTarget}");
 
             using var process = new Process
             {
@@ -206,6 +417,9 @@ public static class ProfileTool
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
+            using var trafficCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var trafficTask = GenerateTrafficAsync(hitUrls, trafficCts.Token);
+
             try
             {
                 // Give extra time beyond the trace duration for startup/shutdown
@@ -222,6 +436,11 @@ public static class ProfileTool
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
                 throw;
+            }
+            finally
+            {
+                trafficCts.Cancel();
+                await trafficTask;
             }
 
             // dotnet-trace appends .speedscope.json to the output path
@@ -240,7 +459,8 @@ public static class ProfileTool
                 }
             }
 
-            var result = SpeedscopeParser.Parse(speedscopePath, maxResults);
+            // Parse everything; the own-code scope decides what is shown, not what is kept.
+            var result = SpeedscopeParser.Parse(speedscopePath, int.MaxValue);
 
             if (result.Error is not null)
                 return result.Error;
@@ -250,7 +470,7 @@ public static class ProfileTool
             if (result.FrameNames is not null && result.Samples is not null && result.Weights is not null)
                 sessionId = store.Store(description, result);
 
-            return FormatResult(result, sessionId, fmt);
+            return FormatResult(result, sessionId, ownPrefixes, maxResults, fmt);
         }
         finally
         {
@@ -262,29 +482,94 @@ public static class ProfileTool
         }
     }
 
-    private static string FormatResult(SpeedscopeParser.ProfilingResult result, string? sessionId, IOutputFormatter fmt)
+    /// <summary>
+    /// Requests the given URLs in a loop until cancelled, so a web app under profiling actually
+    /// executes the code paths being investigated. Failures are ignored: a 500 still exercises
+    /// the pipeline, and a refused connection just means the app is not ready yet.
+    /// </summary>
+    private static async Task GenerateTrafficAsync(string? hitUrls, CancellationToken cancellationToken)
     {
+        if (string.IsNullOrWhiteSpace(hitUrls))
+            return;
+
+        var urls = hitUrls.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (urls.Length == 0)
+            return;
+
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            foreach (var url in urls)
+            {
+                try
+                {
+                    using var response = await client.GetAsync(url, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch
+                {
+                    // Ignore request failures; the point is generating load, not asserting health.
+                }
+            }
+
+            try { await Task.Delay(200, cancellationToken); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private static string FormatResult(
+        SpeedscopeParser.ProfilingResult result, string? sessionId,
+        IReadOnlyList<string>? ownPrefixes, int maxResults, IOutputFormatter fmt)
+    {
+        var methods = result.HotMethods;
+        int hidden = 0;
+
+        // An empty prefix list means the scope could not be determined; show everything rather
+        // than an empty table.
+        if (ownPrefixes is { Count: > 0 })
+        {
+            (methods, hidden) = CodeScope.FilterOwn(methods, ownPrefixes);
+
+            // Own methods often have little self-time (it sits in framework/native leaves), so
+            // break self-time ties by subtree time to keep the entry points on top.
+            methods.Sort((a, b) => b.SelfTimeMs != a.SelfTimeMs
+                ? b.SelfTimeMs.CompareTo(a.SelfTimeMs)
+                : b.TotalTimeMs.CompareTo(a.TotalTimeMs));
+        }
+
+        if (methods.Count > maxResults)
+            methods = methods.GetRange(0, maxResults);
+
         var sb = new StringBuilder();
         fmt.AppendHeader(sb, "CPU Profile Results");
         fmt.AppendField(sb, "Total Duration", $"{result.TotalDurationMs:F1}ms");
         fmt.AppendField(sb, "Total Samples", result.TotalSamples);
-        fmt.AppendField(sb, "Methods Shown", result.HotMethods.Count);
+        fmt.AppendField(sb, "Methods Shown", methods.Count);
+        if (hidden > 0)
+            fmt.AppendField(sb, "Scope", $"own code only — {hidden} framework/third-party methods hidden (ownCodeOnly=false to include)");
         if (sessionId is not null)
             fmt.AppendField(sb, "Session ID", sessionId);
         fmt.AppendSeparator(sb);
 
-        if (result.HotMethods.Count == 0)
+        if (methods.Count == 0)
         {
-            fmt.AppendEmpty(sb, "No method samples were captured. The application may have exited too quickly.");
+            fmt.AppendEmpty(sb, hidden > 0
+                ? $"No solution methods were sampled ({hidden} framework/third-party methods hidden). " +
+                  "The app may have been idle in own code — pass ownCodeOnly=false to see everything."
+                : "No method samples were captured. The application may have exited too quickly.");
             return sb.ToString();
         }
 
         var columns = new[] { "#", "Self%", "Total%", "Self(ms)", "Method", "Module" };
         var rows = new List<string[]>();
 
-        for (int i = 0; i < result.HotMethods.Count; i++)
+        for (int i = 0; i < methods.Count; i++)
         {
-            var m = result.HotMethods[i];
+            var m = methods[i];
             rows.Add([
                 (i + 1).ToString(),
                 $"{m.SelfPercent:F1}%",
@@ -295,7 +580,7 @@ public static class ProfileTool
             ]);
         }
 
-        fmt.AppendTable(sb, "Hot Methods", columns, rows, result.HotMethods.Count);
+        fmt.AppendTable(sb, "Hot Methods", columns, rows, methods.Count);
 
         var hints = new List<string>
         {
@@ -309,6 +594,8 @@ public static class ProfileTool
             hints.Add($"Use ProfileSearchMethods with session '{sessionId}' to search for specific methods");
             hints.Add($"Use ProfileCallers/ProfileCallees to investigate call relationships");
             hints.Add($"Use ProfileHotPaths to see the hottest execution paths through a method");
+            if (hidden > 0)
+                hints.Add("The session keeps ALL methods, including hidden ones — investigation tools search everything");
         }
 
         fmt.AppendHints(sb, [.. hints]);

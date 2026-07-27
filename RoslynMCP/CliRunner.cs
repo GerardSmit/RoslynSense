@@ -181,6 +181,7 @@ internal static class CliRunner
         BackgroundTaskStore? taskStore = null;
         BuildWarningsStore? warningsStore = null;
         ProfilingSessionStore? profilingStore = null;
+        RoslynMCP.Services.Memory.MemorySnapshotStore? memoryStore = null;
         DesignerRegenerationService? designerService = null;
         SolutionSessionService? solutionSession = null;
         AppSessionStore? appStore = null;
@@ -210,6 +211,11 @@ internal static class CliRunner
             if (pt == typeof(ProfilingSessionStore))
             {
                 values[i] = profilingStore ??= new ProfilingSessionStore();
+                continue;
+            }
+            if (pt == typeof(RoslynMCP.Services.Memory.MemorySnapshotStore))
+            {
+                values[i] = memoryStore ??= new RoslynMCP.Services.Memory.MemorySnapshotStore();
                 continue;
             }
             if (pt == typeof(DesignerRegenerationService))

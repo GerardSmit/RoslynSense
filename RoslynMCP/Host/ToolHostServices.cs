@@ -25,6 +25,7 @@ internal static class ToolHostServices
         services.AddSingleton(settings);
         services.AddSingleton(formatter);
         services.AddSingleton<ProfilingSessionStore>();
+        services.AddSingleton<RoslynMCP.Services.Memory.MemorySnapshotStore>();
         services.AddSingleton<BackgroundTaskStore>();
         services.AddSingleton<BuildWarningsStore>();
         services.AddSingleton(new DbConnectionRegistry(dbProviders));

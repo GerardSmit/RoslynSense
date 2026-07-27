@@ -305,7 +305,7 @@ internal static class MsBuildLocator
                 SetVsEnvironment(startInfo, fileName);
 
             using var process = new Process { StartInfo = startInfo };
-            process.Start();
+            BuildProcessHelper.StartWithClosedInput(process);
             var output = process.StandardOutput.ReadToEnd().Trim();
 
             if (!process.WaitForExit(120_000))

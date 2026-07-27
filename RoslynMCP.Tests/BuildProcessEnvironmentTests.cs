@@ -45,6 +45,49 @@ public class BuildProcessEnvironmentTests
     }
 
     [Fact]
+    public void WhenConfiguredThenStandardInputIsRedirected()
+    {
+        // The build must not inherit this process's stdin. It is the MCP protocol stream, and an
+        // inherited never-closing pipe also hangs any git a build task spawns: git probes fd 0 to
+        // detect the terminal type even for commands that never read it, and blocks there.
+        var startInfo = new ProcessStartInfo();
+
+        BuildProcessHelper.ConfigureMsBuildEnvironment(startInfo);
+
+        Assert.True(startInfo.RedirectStandardInput);
+    }
+
+    [Fact]
+    public void WhenStartedThenStandardInputIsClosedImmediately()
+    {
+        // Redirecting without closing is worse than inheriting: the child gets a pipe that never
+        // delivers anything and never ends.
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = OperatingSystem.IsWindows() ? "cmd.exe" : "sh",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+        };
+        startInfo.ArgumentList.Add(OperatingSystem.IsWindows() ? "/c" : "-c");
+        startInfo.ArgumentList.Add("exit 0");
+
+        BuildProcessHelper.ConfigureMsBuildEnvironment(startInfo);
+
+        using var process = new Process { StartInfo = startInfo };
+        BuildProcessHelper.StartWithClosedInput(process);
+
+        Assert.True(process.WaitForExit(30_000), "the process should exit promptly");
+
+        // Writing to a closed stream must fail — proof the handle really was released.
+        Assert.ThrowsAny<Exception>(() =>
+        {
+            process.StandardInput.WriteLine("x");
+            process.StandardInput.Flush();
+        });
+    }
+
+    [Fact]
     public void WhenConfiguredThenUnrelatedVariablesAreLeftAlone()
     {
         var startInfo = new ProcessStartInfo();

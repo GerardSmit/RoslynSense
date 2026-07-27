@@ -40,6 +40,18 @@ internal static class BuildProcessHelper
         foreach (var key in LocatorEnvironmentKeys)
             startInfo.Environment.Remove(key);
 
+        // Give the build its own stdin instead of letting it inherit ours. Two reasons, both real:
+        //
+        // 1. This process's stdin is the MCP protocol stream. A build task that reads it would
+        //    consume bytes meant for the client.
+        // 2. Some MSBuild tasks spawn git without redirecting stdin (Unclassified.NetRevisionTask
+        //    is one), and git-for-windows probes fd 0 to detect the terminal type even for
+        //    commands that never read stdin. Against an inherited pipe that never closes, that
+        //    probe blocks forever — the build then hangs with no CPU use and no output.
+        //
+        // StartAsync closes the handle immediately, so the probe completes at once.
+        startInfo.RedirectStandardInput = true;
+
         // Parseable diagnostic output (no spinners / progress bars).
         startInfo.Environment["MSBUILDTERMINALLOGGER"] = "off";
 
@@ -51,6 +63,30 @@ internal static class BuildProcessHelper
         // Belt-and-braces: also disable the SDK build server, which caches Roslyn
         // and Razor compilers and can wedge the same way.
         startInfo.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
+    }
+
+    /// <summary>
+    /// Starts a build process and immediately closes its stdin.
+    /// </summary>
+    /// <remarks>
+    /// Use this rather than <see cref="Process.Start()"/> for anything configured by
+    /// <see cref="ConfigureMsBuildEnvironment"/>. That method redirects stdin so the build cannot
+    /// read the MCP protocol stream, but a redirected stdin left open is worse than an inherited
+    /// one: a git subprocess probing fd 0 blocks on it indefinitely. Closing the handle right away
+    /// gives the probe an immediate answer.
+    /// </remarks>
+    public static void StartWithClosedInput(Process process)
+    {
+        process.Start();
+
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch
+        {
+            // Not redirected, or the process exited already; nothing to close.
+        }
     }
 
     /// <summary>

@@ -276,7 +276,7 @@ internal static class BackgroundTaskHelper
             if (e.Data is not null) stderr.AppendLine(e.Data);
         };
 
-        process.Start();
+        BuildProcessHelper.StartWithClosedInput(process);
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 

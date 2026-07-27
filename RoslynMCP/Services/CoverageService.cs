@@ -90,7 +90,7 @@ public static class CoverageService
                 if (e.Data is not null) stderr.AppendLine(e.Data);
             };
 
-            process.Start();
+            BuildProcessHelper.StartWithClosedInput(process);
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
@@ -193,7 +193,7 @@ public static class CoverageService
             var buildErr = new StringBuilder();
             buildProcess.OutputDataReceived += (_, e) => { if (e.Data is not null) buildOut.AppendLine(e.Data); };
             buildProcess.ErrorDataReceived += (_, e) => { if (e.Data is not null) buildErr.AppendLine(e.Data); };
-            buildProcess.Start();
+            BuildProcessHelper.StartWithClosedInput(buildProcess);
             buildProcess.BeginOutputReadLine();
             buildProcess.BeginErrorReadLine();
             try { await buildProcess.WaitForExitAsync(linkedToken); }
@@ -252,7 +252,7 @@ public static class CoverageService
             var stderr = new StringBuilder();
             process.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
             process.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
-            process.Start();
+            BuildProcessHelper.StartWithClosedInput(process);
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             try { await process.WaitForExitAsync(linkedToken); }

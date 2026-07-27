@@ -1335,7 +1335,7 @@ internal static class WorkspaceService
 
         try
         {
-            process.Start();
+            BuildProcessHelper.StartWithClosedInput(process);
 
             // Drain stdout/stderr in parallel to prevent pipe deadlock
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);

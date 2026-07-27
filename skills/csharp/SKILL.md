@@ -141,6 +141,24 @@ You have access to the **RoslynSense** MCP server, which provides C# code analys
 
 **Always prefer RoslynSense tools over shell commands or text-based grep when working with C# code.** These tools provide compiler-accurate results — they understand types, overloads, generics, and cross-project references.
 
+## If the RoslynSense tools are missing
+
+The server is a .NET global tool. When installed as a Claude Code plugin a session-start hook keeps it current, but that hook runs while MCP servers are still connecting, so a first-ever session can start before the tool exists.
+
+If no RoslynSense tool is available, install it and ask the user to restart the session:
+
+```
+dotnet tool install --global RoslynSense
+```
+
+To pick up a newer version:
+
+```
+dotnet tool update --global RoslynSense
+```
+
+**An update that fails because the files are in use is expected — skip it and carry on.** The running server (and its shared host process) hold their own binaries, so an update applies on the next start rather than immediately. Do not kill processes to force it; the installed version still works.
+
 ## Markup Snippet Convention
 
 Many RoslynSense tools use a `markupSnippet` parameter with `[| |]` delimiters to identify a target symbol. Copy a small code snippet from the file and wrap the target symbol:

@@ -628,6 +628,23 @@ how to run and debug an app on either runtime.
 Skills are a Claude Code feature. On other MCP clients, point your agent at that file directly —
 it is plain Markdown with no Claude-Code-specific syntax in the body.
 
+### Keeping the tool up to date
+
+The plugin declares the MCP server as `roslyn-sense`, which is the [.NET global tool](#install) —
+installing the plugin does not install the tool. A `SessionStart` hook therefore runs:
+
+```
+dotnet tool update --global RoslynSense || dotnet tool install --global RoslynSense
+```
+
+It cannot fail the session: a `SessionStart` hook's exit code is informational, and this one always
+exits 0. An update that fails because the running server holds its own binary is skipped and applies
+on the next start instead.
+
+The hook runs while MCP servers are still connecting, so the very first session on a machine without
+the tool may start without it — the skill tells the agent to install it and ask for a restart.
+Disable the hook, if you prefer to manage the tool yourself, by removing `hooks/hooks.json`.
+
 ## Markup Snippet Convention
 
 Many tools use a `markupSnippet` parameter with `[| |]` delimiters to identify a target symbol:

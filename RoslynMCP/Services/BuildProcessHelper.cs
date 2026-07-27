@@ -14,8 +14,32 @@ internal static class BuildProcessHelper
     /// host process. Apply to every <see cref="ProcessStartInfo"/> that spawns
     /// <c>dotnet</c>, <c>msbuild</c>, <c>dotnet-coverage</c>, or <c>vstest</c>.
     /// </summary>
+    /// <summary>
+    /// Variables MSBuildLocator sets on THIS process to pin it to the .NET SDK's MSBuild, so that
+    /// MSBuildWorkspace can load projects in-process.
+    /// </summary>
+    /// <remarks>
+    /// They must never reach a child build. A spawned Visual Studio <c>MSBuild.exe</c> that
+    /// inherits them resolves <c>$(MSBuildExtensionsPath)</c> — and therefore
+    /// <c>$(VSToolsPath)</c> — into the .NET SDK directory, where
+    /// <c>Microsoft.WebApplication.targets</c> does not exist. Legacy web projects then fail to
+    /// import it with MSB4226, even though Visual Studio is installed correctly.
+    /// </remarks>
+    private static readonly string[] LocatorEnvironmentKeys =
+    [
+        "MSBUILD_EXE_PATH",
+        "MSBuildExtensionsPath",
+        "MSBuildExtensionsPath32",
+        "MSBuildExtensionsPath64",
+        "MSBuildSDKsPath",
+    ];
+
     public static void ConfigureMsBuildEnvironment(ProcessStartInfo startInfo)
     {
+        // Let the child resolve its own MSBuild layout from wherever it is installed.
+        foreach (var key in LocatorEnvironmentKeys)
+            startInfo.Environment.Remove(key);
+
         // Parseable diagnostic output (no spinners / progress bars).
         startInfo.Environment["MSBUILDTERMINALLOGGER"] = "off";
 

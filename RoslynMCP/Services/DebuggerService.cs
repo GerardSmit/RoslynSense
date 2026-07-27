@@ -10,7 +10,7 @@ namespace RoslynMCP.Services;
 /// Supports starting test debug sessions (VSTEST_HOST_DEBUG), attaching to processes,
 /// breakpoint management, stepping, expression evaluation, and stack inspection.
 /// </summary>
-internal sealed partial class DebuggerService : IDisposable
+internal sealed partial class DebuggerService : IDebugBackend
 {
     [GeneratedRegex(@"Process Id:\s*(\d+)", RegexOptions.IgnoreCase)]
     private static partial Regex TestHostPidRegex();

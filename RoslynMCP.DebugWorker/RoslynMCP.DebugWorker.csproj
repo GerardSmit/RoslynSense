@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Per-architecture ICorDebug worker. ICorDebug cannot attach across x86/x64, so the host runs
+    the worker whose bitness matches the debug TARGET and drives it over stdio. The RID's apphost
+    is what actually fixes the process bitness, so both flavours must be published by RID:
+      dotnet publish -r win-x64 -o workers/x64
+      dotnet publish -r win-x86 -o workers/x86
+    It hosts the same DebugSession the host runs in-process, so behaviour cannot drift.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>RoslynMCP.DebugWorker</RootNamespace>
+    <AssemblyName>RoslynMCP.DebugWorker</AssemblyName>
+    <RuntimeIdentifiers>win-x86;win-x64</RuntimeIdentifiers>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- stdout is the IPC channel; nothing else may write to it. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RoslynMCP.Debugger\RoslynMCP.Debugger.csproj" />
+  </ItemGroup>
+
+</Project>

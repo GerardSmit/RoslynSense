@@ -1,0 +1,184 @@
+namespace RoslynMCP.Debugger;
+
+/// <summary>Which runtime the debuggee hosts, selecting the ICorDebug bootstrap.</summary>
+public enum DebugRuntime
+{
+    /// <summary>The caller did not say; the engine infers it from the target.</summary>
+    Unspecified,
+
+    NetFramework,
+    CoreClr,
+}
+
+public enum StepKind
+{
+    Over,
+    Into,
+    Out,
+}
+
+/// <summary>Why the debuggee raised an event.</summary>
+public enum DebugEventKind
+{
+    Unspecified,
+    Created,
+    Breakpoint,
+    Exception,
+    Output,
+    Exited,
+
+    /// <summary>A module loaded. Diagnostic only — not a stop. Makes shadow-copied and generated
+    /// <c>App_Web_*</c> assemblies visible.</summary>
+    Module,
+
+    /// <summary>A pending source breakpoint bound to real code.</summary>
+    BreakpointBound,
+
+    /// <summary>A source-level step completed — a distinct stop reason from a breakpoint hit.</summary>
+    Step,
+
+    /// <summary>The debuggee was suspended by an explicit pause.</summary>
+    Paused,
+
+    /// <summary>A bound breakpoint lost its module (unload or app-domain recycle) and is pending
+    /// again until the module reloads.</summary>
+    BreakpointUnbound,
+}
+
+/// <summary>A span of source, used to report where a breakpoint was requested versus where it bound.</summary>
+public sealed class SourceRange
+{
+    public string FilePath { get; set; } = "";
+    public uint Line { get; set; }
+    public uint Column { get; set; }
+    public uint EndLine { get; set; }
+    public uint EndColumn { get; set; }
+
+    /// <summary>
+    /// A detached copy. Ranges are handed to callers and stored on events, so they must not alias
+    /// a range the engine may still mutate.
+    /// </summary>
+    public SourceRange Clone() => new()
+    {
+        FilePath = FilePath,
+        Line = Line,
+        Column = Column,
+        EndLine = EndLine,
+        EndColumn = EndColumn,
+    };
+}
+
+/// <summary>Something that happened in the debuggee.</summary>
+public sealed class DebugEvent
+{
+    public DebugEventKind Kind { get; set; }
+    public string Message { get; set; } = "";
+    public string MethodName { get; set; } = "";
+    public int ThreadId { get; set; }
+
+    /// <summary>The stop location for breakpoint, step and pause events, when symbols resolve it.</summary>
+    public string FilePath { get; set; } = "";
+
+    /// <summary>1-based; 0 when unknown.</summary>
+    public uint Line { get; set; }
+
+    /// <summary>1-based; 0 when unknown.</summary>
+    public uint Column { get; set; }
+
+    public SourceRange? RequestedLocation { get; set; }
+    public SourceRange? ActualLocation { get; set; }
+    public string BreakpointId { get; set; } = "";
+}
+
+/// <summary>A breakpoint request, which may bind now or when a matching module loads.</summary>
+public sealed class BreakpointSpec
+{
+    /// <summary>Method-entry form: optional type plus a required method name.</summary>
+    public string TypeName { get; set; } = "";
+    public string MethodName { get; set; } = "";
+
+    /// <summary>Source-line form. Takes precedence when set; binds through PDB sequence points as
+    /// modules load, including delayed and shadow-copied assemblies.</summary>
+    public string FilePath { get; set; } = "";
+
+    /// <summary>1-based.</summary>
+    public uint Line { get; set; }
+
+    /// <summary>Stop only on hit number <c>SkipHits + 1</c> and later.</summary>
+    public uint SkipHits { get; set; }
+
+    /// <summary>Optional <c>name == literal</c> / <c>name != literal</c> compared against the
+    /// stringified value of an argument, local, or dotted member path. Empty means always stop.</summary>
+    public string Condition { get; set; } = "";
+
+    public string Id { get; set; } = "";
+    public uint Column { get; set; }
+    public uint EndLine { get; set; }
+    public uint EndColumn { get; set; }
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Removed automatically once hit — used to implement "run to location".</summary>
+    public bool Temporary { get; set; }
+
+    public BreakpointKind Kind { get; set; }
+}
+
+public sealed class StackFrame
+{
+    public uint Index { get; set; }
+
+    /// <summary>Formatted as <c>Type.Method</c>.</summary>
+    public string Method { get; set; } = "";
+
+    /// <summary>Empty for frames without symbols.</summary>
+    public string FilePath { get; set; } = "";
+
+    /// <summary>1-based; 0 when unknown.</summary>
+    public uint Line { get; set; }
+
+    /// <summary>1-based; 0 when unknown.</summary>
+    public uint Column { get; set; }
+
+    public int ThreadId { get; set; }
+}
+
+public sealed class DebugThread
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+    public bool Stopped { get; set; }
+    public string Location { get; set; } = "";
+}
+
+public sealed class DebugModule
+{
+    public string Name { get; set; } = "";
+    public string Path { get; set; } = "";
+
+    /// <summary>Whether a PDB was found. Without symbols, breakpoints in this module never bind.</summary>
+    public bool SymbolsLoaded { get; set; }
+
+    public string SymbolPath { get; set; } = "";
+    public string Runtime { get; set; } = "";
+}
+
+public sealed class DebugVariable
+{
+    public string Name { get; set; } = "";
+    public string Value { get; set; } = "";
+
+    /// <summary><c>arg</c> or <c>local</c>.</summary>
+    public string Kind { get; set; } = "";
+
+    public string VariablesReference { get; set; } = "";
+    public bool Settable { get; set; }
+}
+
+public sealed class DebugScope
+{
+    public string Name { get; set; } = "";
+    public string VariablesReference { get; set; } = "";
+
+    /// <summary>Whether enumerating this scope is costly enough to defer until asked.</summary>
+    public bool Expensive { get; set; }
+}

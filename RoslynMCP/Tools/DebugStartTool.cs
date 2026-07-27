@@ -6,6 +6,7 @@ using RoslynMCP.Services;
 namespace RoslynMCP.Tools;
 
 [McpServerToolType]
+[InProcessOnly]
 public static class DebugStartTool
 {
     /// <summary>
@@ -39,12 +40,10 @@ public static class DebugStartTool
             if (PathHelper.IsSourceFile(normalizedInput))
                 filter = PathHelper.BuildSourceFileFilter(normalizedInput, filter);
 
-            if (PathHelper.RequiresMsBuild(csprojPath))
-                return "Error: Debugging is not supported for legacy .NET Framework projects. " +
-                       "netcoredbg only supports .NET Core 3.0+ and .NET 5+ projects.";
-
             DebugSessionManager.DisposeSession();
-            var session = DebugSessionManager.CreateSession();
+
+            // The engine follows the project: ICorDebug for .NET Framework, netcoredbg for CoreCLR.
+            var session = DebugSessionManager.CreateSessionForProject(csprojPath);
             var breakpoints = ParseBreakpoints(initialBreakpoints);
             var result = await session.StartTestSessionAsync(csprojPath, filter, breakpoints, cancellationToken);
             var sb = new StringBuilder(result);
@@ -81,7 +80,9 @@ public static class DebugStartTool
                 return await DebuggerService.ListDotNetProcessesAsync(cancellationToken);
 
             DebugSessionManager.DisposeSession();
-            var session = DebugSessionManager.CreateSession();
+
+            // No project here, so the engine follows the CLR the target process actually loaded.
+            var session = DebugSessionManager.CreateSessionForProcess(pid);
             var breakpoints = ParseBreakpoints(initialBreakpoints);
             var result = await session.AttachToProcessAsync(pid, breakpoints, cancellationToken);
             var sb = new StringBuilder(result);

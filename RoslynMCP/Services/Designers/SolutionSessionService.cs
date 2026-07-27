@@ -1,0 +1,198 @@
+using System.Collections.Concurrent;
+
+namespace RoslynMCP.Services.Designers;
+
+/// <summary>A designer regeneration triggered by the watcher rather than by a tool call.</summary>
+public sealed record WatchedRegeneration(
+    string SourcePath,
+    DesignerOutcome Outcome,
+    DateTime AtUtc,
+    IReadOnlyList<string> Errors);
+
+/// <summary>
+/// Tracks the currently open solution and, optionally, watches it so generated designer files stay
+/// in step with the markup they come from.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This deliberately lives at solution scope rather than per chat: regenerating a designer file is
+/// a side effect on the shared source tree, so several chats each running their own watcher would
+/// duplicate the work and race on the same files.
+/// </para>
+/// <para>
+/// The watcher only reacts to markup and model files, never to <c>.cs</c>, so writing a designer
+/// file cannot retrigger it.
+/// </para>
+/// </remarks>
+public sealed class SolutionSessionService(DesignerRegenerationService regeneration) : IDisposable
+{
+    /// <summary>
+    /// How long to wait after the last change to a file before regenerating. Editors commonly
+    /// write a file in several bursts, and each burst raises its own event.
+    /// </summary>
+    private static readonly TimeSpan DebounceDelay = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>How many recent regenerations to keep for reporting.</summary>
+    private const int HistoryLimit = 50;
+
+    private readonly Lock _gate = new();
+    private readonly List<FileSystemWatcher> _watchers = [];
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _pending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<WatchedRegeneration> _history = new();
+
+    public string? SolutionPath { get; private set; }
+    public bool IsWatching { get; private set; }
+
+    /// <summary>Most recent watcher-driven regenerations, newest last.</summary>
+    public IReadOnlyList<WatchedRegeneration> History => [.. _history];
+
+    /// <summary>Number of regenerations queued but not yet applied.</summary>
+    public int PendingCount => _pending.Count;
+
+    public void Open(string solutionPath, IEnumerable<string> projectDirectories, bool watch)
+    {
+        lock (_gate)
+        {
+            StopWatchersLocked();
+
+            SolutionPath = solutionPath;
+            IsWatching = false;
+
+            if (!watch)
+                return;
+
+            foreach (var directory in projectDirectories.Distinct(StringComparer.OrdinalIgnoreCase))
+                TryWatchLocked(directory);
+
+            IsWatching = _watchers.Count > 0;
+        }
+    }
+
+    public void Close()
+    {
+        lock (_gate)
+        {
+            StopWatchersLocked();
+            SolutionPath = null;
+            IsWatching = false;
+            _history.Clear();
+        }
+    }
+
+    private void TryWatchLocked(string directory)
+    {
+        if (!Directory.Exists(directory))
+            return;
+
+        try
+        {
+            var watcher = new FileSystemWatcher(directory)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+                EnableRaisingEvents = true,
+            };
+
+            watcher.Changed += (_, e) => OnChanged(e.FullPath);
+            watcher.Created += (_, e) => OnChanged(e.FullPath);
+            watcher.Renamed += (_, e) => OnChanged(e.FullPath);
+
+            // Deletions are ignored: removing markup does not imply the designer should be
+            // rewritten, and deleting a generated file the user may still need is not this
+            // service's call to make.
+            _watchers.Add(watcher);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[SolutionSession] Could not watch '{directory}': {ex.Message}");
+        }
+    }
+
+    private void StopWatchersLocked()
+    {
+        foreach (var watcher in _watchers)
+        {
+            try
+            {
+                watcher.EnableRaisingEvents = false;
+                watcher.Dispose();
+            }
+            catch
+            {
+                // A watcher that is already gone needs no further cleanup.
+            }
+        }
+
+        _watchers.Clear();
+
+        foreach (var cts in _pending.Values)
+        {
+            try { cts.Cancel(); cts.Dispose(); } catch { }
+        }
+
+        _pending.Clear();
+    }
+
+    private void OnChanged(string path)
+    {
+        if (IsBuildOutput(path) || !regeneration.IsGeneratedFrom(path))
+            return;
+
+        // Restart this file's debounce window; the previous pending run is superseded.
+        var cts = new CancellationTokenSource();
+        if (_pending.TryRemove(path, out var previous))
+        {
+            try { previous.Cancel(); previous.Dispose(); } catch { }
+        }
+
+        _pending[path] = cts;
+        _ = RegenerateAfterDebounceAsync(path, cts);
+    }
+
+    private async Task RegenerateAfterDebounceAsync(string path, CancellationTokenSource cts)
+    {
+        try
+        {
+            await Task.Delay(DebounceDelay, cts.Token);
+
+            var result = await regeneration.RegenerateAsync(path, dryRun: false, cts.Token);
+            Record(new WatchedRegeneration(path, result.Outcome, DateTime.UtcNow, result.Errors));
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer change to the same file.
+        }
+        catch (Exception ex)
+        {
+            // A watcher callback runs on a pool thread with nobody to catch for it; an escaping
+            // exception would take the process down.
+            Record(new WatchedRegeneration(path, DesignerOutcome.Failed, DateTime.UtcNow, [ex.Message]));
+        }
+        finally
+        {
+            if (_pending.TryGetValue(path, out var current) && ReferenceEquals(current, cts))
+                _pending.TryRemove(path, out _);
+
+            try { cts.Dispose(); } catch { }
+        }
+    }
+
+    private void Record(WatchedRegeneration entry)
+    {
+        // Unchanged results are the steady state and would crowd out anything worth reporting.
+        if (entry.Outcome == DesignerOutcome.Unchanged)
+            return;
+
+        _history.Enqueue(entry);
+        while (_history.Count > HistoryLimit)
+            _history.TryDequeue(out _);
+    }
+
+    private static bool IsBuildOutput(string path) =>
+        path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(segment =>
+                segment.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+                segment.Equals("bin", StringComparison.OrdinalIgnoreCase));
+
+    public void Dispose() => Close();
+}

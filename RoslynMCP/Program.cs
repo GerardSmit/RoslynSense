@@ -7,6 +7,8 @@ using ModelContextProtocol.Server;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
+using RoslynMCP.Services.Designers;
+using RoslynMCP.Services.Run;
 using RoslynMCP.Tools;
 using RoslynMCP.Tools.Razor;
 using RoslynMCP.Tools.WebForms;
@@ -96,9 +98,16 @@ class Program
         builder.Services.AddSingleton(new DbConnectionRegistry(dbProviders));
         builder.Services.AddSingleton<ExecutionPlanStore>();
 
+        builder.Services.AddSingleton<DesignerRegenerationService>();
+        builder.Services.AddSingleton<SolutionSessionService>();
+        builder.Services.AddSingleton<AppSessionStore>();
+        builder.Services.AddSingleton<AppRunService>();
+        builder.Services.AddSingleton<IDesignerGenerator, DbmlDesignerGenerator>();
+
         // Register non-C# file type handlers conditionally
         if (settings.WebForms)
         {
+            builder.Services.AddSingleton<IDesignerGenerator, AspxDesignerGenerator>();
             builder.Services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
             builder.Services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
             builder.Services.AddSingleton<IOutlineHandler, AspxOutline>();

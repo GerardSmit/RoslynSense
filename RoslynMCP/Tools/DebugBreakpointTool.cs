@@ -6,6 +6,7 @@ using RoslynMCP.Services;
 namespace RoslynMCP.Tools;
 
 [McpServerToolType]
+[InProcessOnly]
 public static class DebugBreakpointTool
 {
     /// <summary>

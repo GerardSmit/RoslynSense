@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Tools;
 
 namespace RoslynMCP.Daemon;
 
@@ -31,14 +32,13 @@ internal static class DaemonClient
     {
         List<Tool>? toolListCache = null;
 
-        // Debug tools share a single, process-wide, stateful session (DebugSessionManager +
-        // a netcoredbg subprocess). Forwarding them to a host shared across chats would make
-        // two chats fight over one session. Instead they run IN-PROCESS in each client, so
-        // every chat gets its own independent debug session. The heavy read/analysis tools
-        // still go to the shared host.
+        // Tools marked [InProcessOnly] own a stateful, process-wide session (a debugger attached
+        // to a target, a launched app and its process tree). Forwarding them to a host shared
+        // across chats would make two chats fight over one session, so they run IN-PROCESS in
+        // each client. The heavy read/analysis tools still go to the shared host.
         var inProcessTools = new HashSet<string>(
             toolMethods
-                .Where(m => m.DeclaringType?.Name.StartsWith("Debug", StringComparison.Ordinal) == true)
+                .Where(m => m.DeclaringType?.GetCustomAttribute<InProcessOnlyAttribute>() is not null)
                 .Select(ToolInvoker.ToolCommandName),
             StringComparer.OrdinalIgnoreCase);
 

@@ -6,6 +6,8 @@ using ModelContextProtocol.Server;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
+using RoslynMCP.Services.Designers;
+using RoslynMCP.Services.Run;
 using RoslynMCP.Tools; // IFindUsagesHandler, IGoToDefinitionHandler, etc.
 using RoslynMCP.Tools.Razor;
 using RoslynMCP.Tools.WebForms;
@@ -32,6 +34,7 @@ internal static class CliRunner
         typeof(IOutputFormatter),
         typeof(CancellationToken),
         typeof(BackgroundTaskStore),
+        typeof(BuildWarningsStore),
         typeof(ProfilingSessionStore),
         typeof(IEnumerable<IFindUsagesHandler>),
         typeof(IEnumerable<IGoToDefinitionHandler>),
@@ -39,6 +42,10 @@ internal static class CliRunner
         typeof(IEnumerable<IRenameHandler>),
         typeof(IEnumerable<IDiagnosticsHandler>),
         typeof(DbConnectionRegistry),
+        typeof(DesignerRegenerationService),
+        typeof(SolutionSessionService),
+        typeof(AppSessionStore),
+        typeof(AppRunService),
     ];
 
     // -------------------------------------------------------------------------
@@ -172,7 +179,12 @@ internal static class CliRunner
         IRenameHandler[]? renameHandlers = null;
         IDiagnosticsHandler[]? diagnosticsHandlers = null;
         BackgroundTaskStore? taskStore = null;
+        BuildWarningsStore? warningsStore = null;
         ProfilingSessionStore? profilingStore = null;
+        DesignerRegenerationService? designerService = null;
+        SolutionSessionService? solutionSession = null;
+        AppSessionStore? appStore = null;
+        AppRunService? appRunner = null;
 
         var parameters = method.GetParameters();
         var values = new object?[parameters.Length];
@@ -190,9 +202,36 @@ internal static class CliRunner
                 values[i] = taskStore ??= new BackgroundTaskStore();
                 continue;
             }
+            if (pt == typeof(BuildWarningsStore))
+            {
+                values[i] = warningsStore ??= new BuildWarningsStore();
+                continue;
+            }
             if (pt == typeof(ProfilingSessionStore))
             {
                 values[i] = profilingStore ??= new ProfilingSessionStore();
+                continue;
+            }
+            if (pt == typeof(DesignerRegenerationService))
+            {
+                values[i] = designerService ??= CreateDesignerService();
+                continue;
+            }
+            if (pt == typeof(AppSessionStore))
+            {
+                values[i] = appStore ??= new AppSessionStore();
+                continue;
+            }
+            if (pt == typeof(AppRunService))
+            {
+                values[i] = appRunner ??= new AppRunService(appStore ??= new AppSessionStore());
+                continue;
+            }
+            if (pt == typeof(SolutionSessionService))
+            {
+                // A CLI invocation is a single shot, so watching would never observe a change.
+                values[i] = solutionSession ??= new SolutionSessionService(
+                    designerService ??= CreateDesignerService());
                 continue;
             }
             if (pt == typeof(IEnumerable<IFindUsagesHandler>))
@@ -434,6 +473,9 @@ internal static class CliRunner
         if (t == typeof(long)) return "long";
         return t.Name;
     }
+
+    private static DesignerRegenerationService CreateDesignerService() =>
+        new([new AspxDesignerGenerator(), new DbmlDesignerGenerator()]);
 
     // -------------------------------------------------------------------------
     // Naming helpers

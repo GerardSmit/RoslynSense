@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The ICorDebug engine, shared by the in-process fast path and the bitness-matched worker.
+    Windows-only: ICorDebug is a Windows COM API, and the .NET Framework bootstrap goes through
+    the desktop CLR shim.
+  -->
+  <!--
+    Targets plain net10.0, not net10.0-windows, so the cross-platform RoslynMCP and its test
+    project can reference it. The Windows-only surface is expressed with [SupportedOSPlatform]
+    and guarded at runtime instead, which also keeps the Linux CI leg building.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>RoslynMCP.Debugger</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RuntimeIdentifiers>win-x86;win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Managed wrappers over ICorDebug / ICLRMetaHost / ISymUnmanaged, so the COM vtable and
+         QueryInterface plumbing does not have to be hand-written. -->
+    <PackageReference Include="ClrDebug" Version="0.4.1" />
+    <!-- The CoreCLR-side bootstrap; the .NET Framework side uses the desktop CLR shim instead. -->
+    <PackageReference Include="Microsoft.Diagnostics.DbgShim" Version="9.0.661903" />
+  </ItemGroup>
+
+</Project>

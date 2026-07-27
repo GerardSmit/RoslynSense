@@ -1,0 +1,327 @@
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using RoslynMCP.Services.Designers;
+using Xunit;
+
+namespace RoslynMCP.Tests;
+
+/// <summary>
+/// Covers ASPX designer regeneration.
+/// </summary>
+/// <remarks>
+/// Variations run against an isolated in-memory project (see <see cref="MarkupScenario"/>) rather
+/// than the shared <c>AspxProject</c> fixture: writing extra designer files into that fixture would
+/// declare the same partial-class members twice and change what regeneration legitimately emits.
+/// One end-to-end test still exercises the real service against the committed fixture.
+/// </remarks>
+public class DesignerGenerationTests
+{
+    [Fact]
+    public async Task WhenMarkupUnchangedThenRegenerationReproducesCommittedDesignerExactly()
+    {
+        var service = new DesignerRegenerationService([new AspxDesignerGenerator()]);
+
+        var result = await service.RegenerateAsync(FixturePaths.DesignerAspxFile, dryRun: true, default);
+
+        // Unchanged means the generated text was byte-identical to the checked-in file.
+        Assert.Empty(result.Errors);
+        Assert.Equal(DesignerOutcome.Unchanged, result.Outcome);
+    }
+
+    [Fact]
+    public async Task WhenPageHasControlsThenEachTopLevelControlGetsATypedField()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <form id="theForm" runat="server">
+                        <asp:Label ID="lblHeading" runat="server" />
+                        <asp:TextBox ID="txtName" runat="server" />
+                    </form>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var content = await scenario.GenerateAsync();
+
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlForm theForm;", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.Label lblHeading;", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.TextBox txtName;", content);
+        Assert.Equal(3, CountFields(content));
+    }
+
+    [Fact]
+    public async Task WhenControlAddedThenExactlyOneFieldIsAdded()
+    {
+        const string codeBehind = "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }";
+        const string before = """
+                              <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                              <asp:Label ID="lblHeading" runat="server" />
+                              """;
+
+        await using var original = await MarkupScenario.CreateAsync(before, codeBehind);
+        var baseline = await original.GenerateAsync();
+
+        await using var extended = await MarkupScenario.CreateAsync(
+            before + "\r\n<asp:Label ID=\"lblAdded\" runat=\"server\" />", codeBehind);
+        var updated = await extended.GenerateAsync();
+
+        Assert.Contains("protected global::System.Web.UI.WebControls.Label lblAdded;", updated);
+        Assert.Equal(CountFields(baseline) + 1, CountFields(updated));
+    }
+
+    [Fact]
+    public async Task WhenControlNestedInTemplateThenNoFieldIsGenerated()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Repeater ID="rptItems" runat="server">
+                        <ItemTemplate>
+                            <asp:Label ID="lblNested" runat="server" />
+                        </ItemTemplate>
+                    </asp:Repeater>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var content = await scenario.GenerateAsync();
+
+        // A template-nested control is reached through FindControl, never a designer field.
+        Assert.Contains("rptItems;", content);
+        Assert.DoesNotContain("lblNested", content);
+        Assert.Equal(1, CountFields(content));
+    }
+
+    [Fact]
+    public async Task WhenFieldDeclaredInCodeBehindThenDesignerSkipsItToAvoidDuplicate()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Label ID="lblHandWritten" runat="server" />
+                    <asp:Label ID="lblGenerated" runat="server" />
+                    """,
+            codeBehind: """
+                        namespace Fixture {
+                            public partial class SamplePage : System.Web.UI.Page {
+                                protected System.Web.UI.WebControls.Label lblHandWritten;
+                            }
+                        }
+                        """);
+
+        var content = await scenario.GenerateAsync();
+
+        // Emitting lblHandWritten here as well would be a duplicate member (CS0102).
+        Assert.DoesNotContain("lblHandWritten", content);
+        Assert.Contains("lblGenerated;", content);
+        Assert.Equal(1, CountFields(content));
+    }
+
+    [Fact]
+    public async Task WhenInheritsCannotBeResolvedThenGenerationFailsWithoutContent()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: "<%@ Page Language=\"C#\" Inherits=\"Fixture.NoSuchClassAnywhere\" %>\r\n<html>",
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var result = await scenario.GenerateResultAsync();
+
+        Assert.Null(result.Content);
+        Assert.NotEmpty(result.Errors);
+    }
+
+    [Fact]
+    public async Task WhenGenerationFailsThenExistingDesignerIsLeftUntouched()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: "<%@ Page Language=\"C#\" Inherits=\"Fixture.NoSuchClassAnywhere\" %>\r\n<html>",
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        const string existing = "// previously generated content";
+        await File.WriteAllTextAsync(scenario.DesignerPath, existing);
+
+        var result = await scenario.RegenerateThroughServiceAsync(dryRun: false);
+
+        Assert.Equal(DesignerOutcome.Failed, result.Outcome);
+        Assert.Equal(existing, await File.ReadAllTextAsync(scenario.DesignerPath));
+    }
+
+    [Fact]
+    public async Task WhenDryRunThenNothingIsWritten()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Label ID="lblHeading" runat="server" />
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var result = await scenario.GenerateResultAsync();
+
+        Assert.NotNull(result.Content);
+        Assert.False(File.Exists(scenario.DesignerPath));
+    }
+
+    [Theory]
+    [InlineData("Page.aspx", "Page.aspx.designer.cs")]
+    [InlineData("Control.ascx", "Control.ascx.designer.cs")]
+    [InlineData("Site.master", "Site.master.designer.cs")]
+    public void WhenMarkupFileThenDesignerPathAppendsSuffix(string source, string expected)
+    {
+        var generator = new AspxDesignerGenerator();
+
+        Assert.True(generator.CanHandle(source));
+        Assert.Equal(expected, generator.GetDesignerPath(source));
+    }
+
+    [Theory]
+    [InlineData("Handler.ashx")]
+    [InlineData("Service.asmx")]
+    [InlineData("Model.dbml")]
+    public void WhenFileHasNoControlTreeThenAspxGeneratorDeclinesIt(string source) =>
+        Assert.False(new AspxDesignerGenerator().CanHandle(source));
+
+    [Fact]
+    public void WhenDbmlThenDesignerPathReplacesExtensionRatherThanAppending()
+    {
+        var generator = new DbmlDesignerGenerator();
+
+        Assert.True(generator.CanHandle("Northwind.dbml"));
+
+        // LINQ to SQL emits Northwind.designer.cs, not Northwind.dbml.designer.cs.
+        Assert.Equal("Northwind.designer.cs", generator.GetDesignerPath("Northwind.dbml"));
+    }
+
+    [Theory]
+    [InlineData("// existing\r\nline\r\n", "\r\n")]
+    [InlineData("// existing\nline\n", "\n")]
+    public async Task WhenDesignerExistsThenRegenerationKeepsItsLineEndings(
+        string existing, string expectedNewline)
+    {
+        // A repository with `text=auto eol=lf` checks designer files out as LF even on Windows,
+        // while the generator's platform newline is CRLF. Without matching the file, every
+        // regeneration would rewrite every line — and the byte-for-byte comparison would fail.
+        var path = Path.Combine(Path.GetTempPath(), $"roslynsense-eol-{Guid.NewGuid():N}.designer.cs");
+        await File.WriteAllTextAsync(path, existing);
+
+        try
+        {
+            var result = DesignerRegenerationService.MatchLineEndings("alpha\r\nbeta\r\n", path);
+
+            Assert.Equal($"alpha{expectedNewline}beta{expectedNewline}", result);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void WhenDesignerIsNewThenCrlfIsUsedAsVisualStudioWould()
+    {
+        var absent = Path.Combine(Path.GetTempPath(), $"roslynsense-absent-{Guid.NewGuid():N}.designer.cs");
+
+        Assert.Equal("alpha\r\nbeta\r\n", DesignerRegenerationService.MatchLineEndings("alpha\nbeta\n", absent));
+    }
+
+    private static int CountFields(string designerContent) =>
+        designerContent.Split("        protected global::").Length - 1;
+
+    /// <summary>
+    /// A self-contained markup + code-behind pair in a temp directory, backed by an in-memory
+    /// Roslyn project that reuses the fixture's System.Web stubs so <c>asp:*</c> tags resolve.
+    /// </summary>
+    private sealed class MarkupScenario : IAsyncDisposable
+    {
+        private static readonly string StubSource =
+            File.ReadAllText(Path.Combine(FixturePaths.AspxProjectDir, "SystemWebStubs.cs"));
+
+        private readonly AdhocWorkspace _workspace = new();
+
+        public required string Directory { get; init; }
+        public required string MarkupPath { get; init; }
+        public Project Project { get; private set; } = null!;
+
+        public string DesignerPath => MarkupPath + ".designer.cs";
+
+        public static Task<MarkupScenario> CreateAsync(string markup, string codeBehind)
+        {
+            var directory = Path.Combine(
+                Path.GetTempPath(), "roslynsense-designer-" + Guid.NewGuid().ToString("N"));
+            System.IO.Directory.CreateDirectory(directory);
+
+            var markupPath = Path.Combine(directory, "SamplePage.aspx");
+            File.WriteAllText(markupPath, markup);
+
+            var scenario = new MarkupScenario
+            {
+                Directory = directory,
+                MarkupPath = markupPath,
+            };
+
+            scenario.Project = scenario.BuildProject(codeBehind);
+            return Task.FromResult(scenario);
+        }
+
+        private Project BuildProject(string codeBehind)
+        {
+            // The stubs shadow System.Web types, so only the core runtime assemblies are needed.
+            var references = new[] { "System.Private.CoreLib.dll", "System.Runtime.dll", "netstandard.dll" }
+                .Select(name => Path.Combine(
+                    Path.GetDirectoryName(typeof(object).Assembly.Location)!, name))
+                .Where(File.Exists)
+                .Select(path => (MetadataReference)MetadataReference.CreateFromFile(path));
+
+            var projectId = ProjectId.CreateNewId();
+            var solution = _workspace.CurrentSolution
+                .AddProject(ProjectInfo.Create(
+                    projectId, VersionStamp.Create(), "Fixture", "Fixture", LanguageNames.CSharp,
+                    filePath: Path.Combine(Directory, "Fixture.csproj"),
+                    compilationOptions: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)))
+                .AddMetadataReferences(projectId, references);
+
+            solution = AddDocument(solution, projectId, "SystemWebStubs.cs", StubSource);
+            solution = AddDocument(solution, projectId, "SamplePage.aspx.cs", codeBehind);
+
+            return solution.GetProject(projectId)!;
+        }
+
+        private Solution AddDocument(Solution solution, ProjectId projectId, string name, string text) =>
+            solution.AddDocument(
+                DocumentId.CreateNewId(projectId), name, text,
+                filePath: Path.Combine(Directory, name));
+
+        public async Task<DesignerResult> GenerateResultAsync() =>
+            await new AspxDesignerGenerator().GenerateAsync(MarkupPath, Project, default);
+
+        public async Task<string> GenerateAsync()
+        {
+            var result = await GenerateResultAsync();
+            Assert.True(result.Content is not null,
+                $"Generation failed: {string.Join("; ", result.Errors)}");
+            return result.Content!;
+        }
+
+        /// <summary>Runs the full service, which resolves the project from disk rather than in memory.</summary>
+        public async Task<DesignerRegeneration> RegenerateThroughServiceAsync(bool dryRun)
+        {
+            // A minimal SDK project file so the service's project lookup succeeds.
+            await File.WriteAllTextAsync(
+                Path.Combine(Directory, "Fixture.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                </Project>
+                """);
+
+            var service = new DesignerRegenerationService([new AspxDesignerGenerator()]);
+            return await service.RegenerateAsync(MarkupPath, dryRun, default);
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            _workspace.Dispose();
+            try { System.IO.Directory.Delete(Directory, recursive: true); } catch { }
+            return ValueTask.CompletedTask;
+        }
+    }
+}

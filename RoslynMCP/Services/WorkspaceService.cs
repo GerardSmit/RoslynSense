@@ -1395,7 +1395,7 @@ internal static class WorkspaceService
             var filtered = refsToAdd.Where(r => !existingPaths.Contains(r.Display ?? "")).ToList();
             if (filtered.Count == 0) continue;
 
-            string framework = InferTargetFrameworkKind(project);
+            var framework = ProjectClassifier.Classify(project).Runtime;
             Console.Error.WriteLine($"[WorkspaceService] Project '{project.Name}' ({framework}) missing framework references, injecting {filtered.Count} assemblies.");
 
             solution = solution.WithProjectMetadataReferences(
@@ -1412,9 +1412,8 @@ internal static class WorkspaceService
     private static List<MetadataReference> GetFrameworkReferences(Project project)
     {
         var refs = new List<MetadataReference>();
-        string kind = InferTargetFrameworkKind(project);
 
-        if (kind == "netfx")
+        if (ProjectClassifier.Classify(project).Runtime == RuntimeFlavor.NetFramework)
         {
             // .NET Framework — use reference assemblies from the targeting pack
             var refAssembliesBase = Path.Combine(
@@ -1501,37 +1500,6 @@ internal static class WorkspaceService
         return refs;
     }
 
-    /// <summary>
-    /// Determines if the project targets .NET Framework, .NET Standard, or modern .NET.
-    /// </summary>
-    private static string InferTargetFrameworkKind(Project project)
-    {
-        if (project.ParseOptions is CSharpParseOptions parseOptions)
-        {
-            var symbols = parseOptions.PreprocessorSymbolNames;
-            foreach (var sym in symbols)
-            {
-                // NET48, NET472, etc. — .NET Framework
-                if (sym.StartsWith("NET4", StringComparison.OrdinalIgnoreCase) &&
-                    !sym.StartsWith("NET40_OR_GREATER", StringComparison.OrdinalIgnoreCase))
-                    return "netfx";
-
-                if (sym.StartsWith("NET35", StringComparison.OrdinalIgnoreCase) ||
-                    sym.StartsWith("NET20", StringComparison.OrdinalIgnoreCase))
-                    return "netfx";
-
-                // NETFRAMEWORK is the definitive symbol
-                if (sym.Equals("NETFRAMEWORK", StringComparison.OrdinalIgnoreCase))
-                    return "netfx";
-
-                if (sym.Equals("NETSTANDARD", StringComparison.OrdinalIgnoreCase) ||
-                    sym.StartsWith("NETSTANDARD", StringComparison.OrdinalIgnoreCase))
-                    return "netstandard";
-            }
-        }
-
-        return "modern";
-    }
 
     private sealed class CachedWorkspaceEntry : IDisposable
     {

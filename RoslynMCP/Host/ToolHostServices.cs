@@ -2,6 +2,8 @@ using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
+using RoslynMCP.Services.Designers;
+using RoslynMCP.Services.Run;
 using RoslynMCP.Tools;
 using RoslynMCP.Tools.Razor;
 using RoslynMCP.Tools.WebForms;
@@ -28,8 +30,15 @@ internal static class ToolHostServices
         services.AddSingleton(new DbConnectionRegistry(dbProviders));
         services.AddSingleton<ExecutionPlanStore>();
 
+        services.AddSingleton<DesignerRegenerationService>();
+        services.AddSingleton<SolutionSessionService>();
+        services.AddSingleton<AppSessionStore>();
+        services.AddSingleton<AppRunService>();
+        services.AddSingleton<IDesignerGenerator, DbmlDesignerGenerator>();
+
         if (settings.WebForms)
         {
+            services.AddSingleton<IDesignerGenerator, AspxDesignerGenerator>();
             services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
             services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
             services.AddSingleton<IOutlineHandler, AspxOutline>();

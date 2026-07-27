@@ -9,6 +9,9 @@ namespace RoslynMCP.Tools;
 [McpServerToolType]
 public static class BuildProjectTool
 {
+    /// <summary>Leads the output of any build that ran to completion successfully.</summary>
+    internal const string BuildSucceededBanner = "✅ **Build Succeeded**";
+
     [McpServerTool, Description(
         "Build a .NET project or solution. Set background=true to build in the background " +
         "and continue working — check results later with GetBackgroundTaskResult.")]
@@ -128,6 +131,35 @@ public static class BuildProjectTool
         }
     }
 
+    /// <summary>
+    /// Builds a target and reports only whether it succeeded, for callers that build as a step
+    /// towards something else rather than to report diagnostics.
+    /// </summary>
+    /// <remarks>
+    /// Goes through <see cref="BuildProject"/> so the driver selection (dotnet CLI versus Visual
+    /// Studio MSBuild) and the MSBuild process hygiene stay in one place.
+    /// </remarks>
+    internal static async Task<(bool Ok, string Output)> TryBuildAsync(
+        string projectPath,
+        string configuration,
+        BuildWarningsStore warningsStore,
+        int timeoutSeconds = 600,
+        CancellationToken cancellationToken = default)
+    {
+        var output = await BuildProject(
+            projectPath,
+            taskStore: new BackgroundTaskStore(),
+            warningsStore: warningsStore,
+            configuration: configuration,
+            background: false,
+            timeoutSeconds: timeoutSeconds,
+            cancellationToken: cancellationToken);
+
+        // A completed build always leads with this banner; every other shape (resolution error,
+        // timeout, cancellation) means the build did not succeed.
+        return (output.StartsWith(BuildSucceededBanner, StringComparison.Ordinal), output);
+    }
+
     internal static string ResolveBuildTarget(string path)
     {
         var normalized = PathHelper.NormalizePath(path);
@@ -162,7 +194,7 @@ public static class BuildProjectTool
         var sb = new StringBuilder();
 
         if (exitCode == 0)
-            sb.AppendLine("✅ **Build Succeeded**");
+            sb.AppendLine(BuildSucceededBanner);
         else
             sb.AppendLine("❌ **Build Failed**");
 

@@ -112,6 +112,11 @@ public class LspSignatureAndPullTests
 
         var location = Assert.Single(locations);
         Assert.Contains("Decompiled", location.Uri); // generated source under the temp dir
+
+        // Must be the runtime implementation, not the ref assembly whose bodies are all
+        // `throw null` (ReferenceAssemblyRedirector).
+        string decompiled = await File.ReadAllTextAsync(LspConverters.UriToPath(location.Uri));
+        Assert.DoesNotContain("throw null;", decompiled);
     }
 
     private static (int Line, int Character) PositionOf(string text, string anchor)

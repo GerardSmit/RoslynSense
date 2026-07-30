@@ -66,6 +66,12 @@ internal static class DecompiledSourceService
             return null;
 
         string reflectionTypeName = GetReflectionTypeName(containingType);
+
+        // Compilations reference *reference assemblies* (SDK ref packs, nuget ref/ folders),
+        // whose method bodies are all `throw null`. Redirect to the runtime implementation
+        // assembly — following type forwarders (e.g. System.Runtime -> System.Private.CoreLib) —
+        // so the decompiled source shows real bodies.
+        assemblyPath = ReferenceAssemblyRedirector.RedirectToImplementation(assemblyPath, reflectionTypeName);
         string outputDirectory = GetOutputDirectory(assemblyPath, reflectionTypeName);
         string sourceFilePath = Path.Combine(outputDirectory, SourceFileName);
         string manifestPath = Path.Combine(outputDirectory, ManifestFileName);

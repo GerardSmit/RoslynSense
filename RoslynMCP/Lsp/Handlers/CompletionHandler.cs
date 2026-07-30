@@ -11,7 +11,8 @@ internal static class CompletionHandler
 {
     private const int MaxItems = 1000;
 
-    public static async Task<CompletionList> CompletionAsync(CompletionParams p, CancellationToken ct)
+    public static async Task<CompletionList> CompletionAsync(
+        CompletionParams p, LspResolveCache cache, CancellationToken ct)
     {
         if (await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct) is not
             var (document, text, offset) || document is null)
@@ -28,18 +29,42 @@ internal static class CompletionHandler
         // The span Roslyn wants replaced by the committed item (usually the partial word).
         var defaultRange = LspConverters.ToRange(text.Lines, completions.Span);
 
-        var items = completions.ItemsList
-            .Take(MaxItems)
-            .Select(item => new CompletionItem(
+        var cachedItems = completions.ItemsList.Take(MaxItems).ToList();
+        long cacheId = cache.StoreCompletions(document, cachedItems);
+
+        var items = cachedItems
+            .Select((item, index) => new CompletionItem(
                 item.DisplayText,
                 ToLspKind(item),
                 string.IsNullOrEmpty(item.InlineDescription) ? null : item.InlineDescription,
                 item.SortText,
                 item.FilterText,
-                new TextEdit(defaultRange, item.DisplayText)))
+                new TextEdit(defaultRange, item.DisplayText))
+            {
+                Data = new CompletionItemData(cacheId, index),
+            })
             .ToArray();
 
         return new CompletionList(completions.ItemsList.Count > MaxItems, items);
+    }
+
+    /// <summary>completionItem/resolve: attaches documentation to the selected item.</summary>
+    public static async Task<CompletionItem> ResolveAsync(
+        CompletionItem item, LspResolveCache cache, CancellationToken ct)
+    {
+        if (item.Data is null || cache.GetCompletion(item.Data.CacheId, item.Data.Index) is not
+            var (document, roslynItem) || document is null)
+            return item;
+
+        var service = CompletionService.GetService(document);
+        if (service is null)
+            return item;
+
+        var description = await service.GetDescriptionAsync(document, roslynItem, ct);
+        if (description is null || description.TaggedParts.IsEmpty)
+            return item;
+
+        return item with { Documentation = new MarkupContent("markdown", description.Text) };
     }
 
     private static int ToLspKind(Microsoft.CodeAnalysis.Completion.CompletionItem item)

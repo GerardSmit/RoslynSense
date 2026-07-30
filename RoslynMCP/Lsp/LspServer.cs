@@ -16,6 +16,7 @@ internal sealed class LspServer : IDisposable
     public string SessionId { get; } = Guid.NewGuid().ToString("N");
 
     private readonly IServiceProvider _services;
+    private readonly LspResolveCache _resolveCache = new();
     private JsonRpc? _rpc;
     private DiagnosticsPublisher? _diagnostics;
 
@@ -50,8 +51,8 @@ internal sealed class LspServer : IDisposable
             RenameProvider = new RenameOptions(PrepareProvider: true),
             CompletionProvider = new CompletionOptions(
                 TriggerCharacters: [".", " ", "(", "<", "["],
-                ResolveProvider: false),
-            CodeActionProvider = true,
+                ResolveProvider: true),
+            CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
         };
 
@@ -156,11 +157,19 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/completion", UseSingleObjectParameterDeserialization = true)]
     public Task<CompletionList> Completion(CompletionParams p, CancellationToken ct) =>
-        Handlers.CompletionHandler.CompletionAsync(p, ct);
+        Handlers.CompletionHandler.CompletionAsync(p, _resolveCache, ct);
+
+    [JsonRpcMethod("completionItem/resolve", UseSingleObjectParameterDeserialization = true)]
+    public Task<CompletionItem> CompletionResolve(CompletionItem item, CancellationToken ct) =>
+        Handlers.CompletionHandler.ResolveAsync(item, _resolveCache, ct);
 
     [JsonRpcMethod("textDocument/codeAction", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeAction[]> CodeAction(CodeActionParams p, CancellationToken ct) =>
-        Handlers.CodeActionHandler.CodeActionsAsync(p, ct);
+        Handlers.CodeActionHandler.CodeActionsAsync(p, _resolveCache, ct);
+
+    [JsonRpcMethod("codeAction/resolve", UseSingleObjectParameterDeserialization = true)]
+    public Task<Protocol.CodeAction> CodeActionResolve(Protocol.CodeAction action, CancellationToken ct) =>
+        Handlers.CodeActionHandler.ResolveAsync(action, _resolveCache, ct);
 
     [JsonRpcMethod("textDocument/formatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> Formatting(DocumentFormattingParams p, CancellationToken ct) =>

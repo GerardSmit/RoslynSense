@@ -16,7 +16,18 @@ public sealed record CompletionItem(
     [property: JsonPropertyName("detail")] string? Detail,
     [property: JsonPropertyName("sortText")] string? SortText,
     [property: JsonPropertyName("filterText")] string? FilterText,
-    [property: JsonPropertyName("textEdit")] TextEdit? TextEdit);
+    [property: JsonPropertyName("textEdit")] TextEdit? TextEdit)
+{
+    /// <summary>Server-defined resolve payload: round-tripped by the client into
+    /// completionItem/resolve. Holds a cache generation + item index.</summary>
+    [JsonPropertyName("data")] public CompletionItemData? Data { get; init; }
+
+    [JsonPropertyName("documentation")] public MarkupContent? Documentation { get; init; }
+}
+
+public sealed record CompletionItemData(
+    [property: JsonPropertyName("cacheId")] long CacheId,
+    [property: JsonPropertyName("index")] int Index);
 
 /// <summary>LSP CompletionItemKind constants (1-based protocol enum).</summary>
 public static class LspCompletionItemKind
@@ -59,7 +70,18 @@ public sealed record CodeActionContext(
 public sealed record CodeAction(
     [property: JsonPropertyName("title")] string Title,
     [property: JsonPropertyName("kind")] string Kind, // "quickfix" | "refactor" | ...
-    [property: JsonPropertyName("edit")] WorkspaceEdit? Edit);
+    [property: JsonPropertyName("edit")] WorkspaceEdit? Edit)
+{
+    /// <summary>Server-defined resolve payload: id of the cached Roslyn action whose edit is
+    /// computed lazily in codeAction/resolve.</summary>
+    [JsonPropertyName("data")] public CodeActionData? Data { get; init; }
+}
+
+public sealed record CodeActionData(
+    [property: JsonPropertyName("id")] long Id);
+
+public sealed record CodeActionOptions(
+    [property: JsonPropertyName("resolveProvider")] bool ResolveProvider);
 
 public sealed record DocumentFormattingParams(
     [property: JsonPropertyName("textDocument")] TextDocumentIdentifier TextDocument,

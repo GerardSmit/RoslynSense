@@ -143,7 +143,7 @@ public static class CodeActionsTool
             }
 
             // Find refactoring actions (work on any code selection, no diagnostics needed)
-            var refactoringProviders = GetRefactoringProviders();
+            var refactoringProviders = GetRefactoringProviders(fileCtx.Project);
             foreach (var provider in refactoringProviders)
             {
                 var actions = new List<CodeAction>();
@@ -266,8 +266,8 @@ public static class CodeActionsTool
     }
 
     private static IReadOnlyList<CodeFixProvider> GetCodeFixProviders(Project project) =>
-        CodeFixCatalog.GetCodeFixProviders();
+        CodeFixCatalog.GetCodeFixProviders(project.Solution.Workspace);
 
-    private static IReadOnlyList<CodeRefactoringProvider> GetRefactoringProviders() =>
-        CodeFixCatalog.GetRefactoringProviders();
+    private static IReadOnlyList<CodeRefactoringProvider> GetRefactoringProviders(Project project) =>
+        CodeFixCatalog.GetRefactoringProviders(project.Solution.Workspace);
 }

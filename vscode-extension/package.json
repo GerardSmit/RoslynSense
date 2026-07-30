@@ -12,10 +12,21 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:csharp"
+    "onLanguage:csharp",
+    "workspaceContains:**/*.{sln,slnx,csproj}"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "roslynSense.openSolution",
+        "title": "RoslynSense: Pick Solution"
+      },
+      {
+        "command": "roslynSense.restartServer",
+        "title": "RoslynSense: Restart Server"
+      }
+    ],
     "configuration": {
       "title": "RoslynSense",
       "properties": {
@@ -27,7 +38,7 @@
         "roslynSense.solutionPath": {
           "type": "string",
           "default": "",
-          "description": "Optional explicit .sln path. When empty, the server resolves the nearest solution from the workspace folder."
+          "description": "Default solution for this workspace. When empty: a single found .sln/.slnx is used automatically, multiple prompt a picker (use 'RoslynSense: Pick Solution' to change), none lets the server resolve from the workspace folder."
         },
         "roslynSense.trace.server": {
           "type": "string",

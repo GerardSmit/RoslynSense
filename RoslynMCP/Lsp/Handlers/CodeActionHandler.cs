@@ -10,13 +10,14 @@ using LspCodeAction = RoslynMCP.Lsp.Protocol.CodeAction;
 namespace RoslynMCP.Lsp.Handlers;
 
 /// <summary>textDocument/codeAction: quick fixes for diagnostics in the range + refactorings
-/// at the selection. Edits are resolved eagerly into a <see cref="WorkspaceEdit"/> (no
-/// codeAction/resolve round-trip; the action count is capped to keep this bounded).</summary>
+/// at the selection. The initial response carries titles only; the workspace edit is computed
+/// lazily in codeAction/resolve for the action the user actually picks.</summary>
 internal static class CodeActionHandler
 {
     private const int MaxActions = 25;
 
-    public static async Task<LspCodeAction[]> CodeActionsAsync(CodeActionParams p, CancellationToken ct)
+    public static async Task<LspCodeAction[]> CodeActionsAsync(
+        CodeActionParams p, LspResolveCache cache, CancellationToken ct)
     {
         var document = await LspDocumentResolver.ResolveAsync(
             LspConverters.UriToPath(p.TextDocument.Uri), ct);
@@ -40,7 +41,7 @@ internal static class CodeActionHandler
 
             foreach (var diagnostic in diagnostics)
             {
-                foreach (var provider in CodeFixCatalog.GetCodeFixProviders())
+                foreach (var provider in CodeFixCatalog.GetCodeFixProviders(document.Project.Solution.Workspace))
                 {
                     if (actions.Count >= MaxActions)
                         break;
@@ -59,7 +60,7 @@ internal static class CodeActionHandler
         }
 
         // Refactorings at the selection.
-        foreach (var provider in CodeFixCatalog.GetRefactoringProviders())
+        foreach (var provider in CodeFixCatalog.GetRefactoringProviders(document.Project.Solution.Workspace))
         {
             if (actions.Count >= MaxActions)
                 break;
@@ -73,14 +74,23 @@ internal static class CodeActionHandler
             actions.AddRange(collected.Select(a => (a, "refactor")));
         }
 
-        var results = new List<LspCodeAction>();
-        foreach (var (action, kind) in actions.Take(MaxActions))
-        {
-            var edit = await TryResolveEditAsync(document.Project.Solution, action, ct);
-            if (edit is not null)
-                results.Add(new LspCodeAction(action.Title, kind, edit));
-        }
-        return results.ToArray();
+        return actions.Take(MaxActions)
+            .Select(a => new LspCodeAction(a.Action.Title, a.Kind, Edit: null)
+            {
+                Data = new CodeActionData(cache.StoreAction(a.Action, document.Project.Solution)),
+            })
+            .ToArray();
+    }
+
+    /// <summary>codeAction/resolve: computes the workspace edit for one cached action.</summary>
+    public static async Task<LspCodeAction> ResolveAsync(
+        LspCodeAction action, LspResolveCache cache, CancellationToken ct)
+    {
+        if (action.Data is null || cache.GetAction(action.Data.Id) is not var (roslynAction, oldSolution) || roslynAction is null)
+            return action; // evicted/unknown — client will surface "no edit" on apply
+
+        var edit = await TryResolveEditAsync(oldSolution, roslynAction, ct);
+        return action with { Edit = edit };
     }
 
     private static async Task<WorkspaceEdit?> TryResolveEditAsync(

@@ -36,7 +36,7 @@ public sealed record ServerCapabilities
     [JsonPropertyName("renameProvider")] public RenameOptions? RenameProvider { get; init; }
     [JsonPropertyName("completionProvider")] public CompletionOptions? CompletionProvider { get; init; }
     [JsonPropertyName("signatureHelpProvider")] public SignatureHelpOptions? SignatureHelpProvider { get; init; }
-    [JsonPropertyName("codeActionProvider")] public bool CodeActionProvider { get; init; }
+    [JsonPropertyName("codeActionProvider")] public CodeActionOptions? CodeActionProvider { get; init; }
     [JsonPropertyName("documentFormattingProvider")] public bool DocumentFormattingProvider { get; init; }
 }
 

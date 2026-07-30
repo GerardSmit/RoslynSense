@@ -66,14 +66,21 @@ internal static class CodeLensHandler
                 object[] inheritanceArgs =
                     [p.TextDocument.Uri, identifierPosition.Line, identifierPosition.Character];
 
-                var upTitles = InheritanceMarkersHandler.ApplicableUpKinds(symbol)
-                    .SelectMany(kind => InheritanceMarkersHandler.ComputeUpTargets(symbol, kind))
-                    .Select(t => t.Title)
+                // Compact titles: type names only ("↑ impl. IHostedService"), never full
+                // member paths — the QuickPick behind the click carries the detail.
+                var shortNames = InheritanceMarkersHandler.ApplicableUpKinds(symbol)
+                    .SelectMany(kind => InheritanceMarkersHandler.ComputeUpTargets(symbol, kind)
+                        .Select(t => kind switch
+                        {
+                            "overrides" => $"overrides {t.Symbol.ContainingType?.Name ?? t.Symbol.Name}",
+                            "implements" => $"impl. {t.Symbol.ContainingType?.Name ?? t.Symbol.Name}",
+                            _ => t.Symbol.Name, // type's bases/interfaces — the name is the info
+                        }))
                     .ToList();
-                if (upTitles.Count > 0)
+                if (shortNames.Count > 0)
                 {
-                    string title = "↑ " + upTitles[0]
-                        + (upTitles.Count > 1 ? $" (+{upTitles.Count - 1})" : "");
+                    string title = "↑ " + string.Join(", ", shortNames.Take(2))
+                        + (shortNames.Count > 2 ? $" +{shortNames.Count - 2}" : "");
                     lenses.Add(new LspCodeLens(range, new Command(
                         title, "roslynSense.showInheritanceAt", inheritanceArgs)));
                 }

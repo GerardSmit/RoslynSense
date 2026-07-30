@@ -333,7 +333,7 @@ editor ──stdio──> roslyn-sense --lsp ──named pipe──> per-solutio
 
 The `--lsp` process is a thin proxy: it connects to (or spawns) the per-solution daemon and forwards LSP JSON-RPC over the daemon's pipe. Without a resolvable solution or reachable daemon it hosts the LSP session in-process.
 
-Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), push diagnostics, completion, code actions (quick fixes + refactorings), and document formatting. Position encoding is UTF-16.
+Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), push diagnostics, completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, and semantic tokens. Position encoding is UTF-16.
 
 Options: `--solution <path>` pins the solution explicitly; otherwise the nearest solution to the working directory is used.
 

@@ -54,6 +54,13 @@ internal sealed class LspServer : IDisposable
                 ResolveProvider: true),
             CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
+            DocumentRangeFormattingProvider = true,
+            FoldingRangeProvider = true,
+            CallHierarchyProvider = true,
+            TypeHierarchyProvider = true,
+            SemanticTokensProvider = new SemanticTokensOptions(
+                new SemanticTokensLegend(Handlers.SemanticTokensHandler.TokenTypes, TokenModifiers: []),
+                Full: true),
         };
 
         string? version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3);
@@ -174,6 +181,42 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("textDocument/formatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> Formatting(DocumentFormattingParams p, CancellationToken ct) =>
         Handlers.FormattingHandler.FormatAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/rangeFormatting", UseSingleObjectParameterDeserialization = true)]
+    public Task<TextEdit[]> RangeFormatting(DocumentRangeFormattingParams p, CancellationToken ct) =>
+        Handlers.FormattingHandler.FormatRangeAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/foldingRange", UseSingleObjectParameterDeserialization = true)]
+    public Task<Protocol.FoldingRange[]> FoldingRange(FoldingRangeParams p, CancellationToken ct) =>
+        Handlers.FoldingRangeHandler.FoldingRangesAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/prepareCallHierarchy", UseSingleObjectParameterDeserialization = true)]
+    public Task<HierarchyItem[]> PrepareCallHierarchy(TextDocumentPositionParams p, CancellationToken ct) =>
+        Handlers.CallHierarchyHandler.PrepareAsync(p, ct);
+
+    [JsonRpcMethod("callHierarchy/incomingCalls", UseSingleObjectParameterDeserialization = true)]
+    public Task<CallHierarchyIncomingCall[]> IncomingCalls(CallHierarchyCallsParams p, CancellationToken ct) =>
+        Handlers.CallHierarchyHandler.IncomingCallsAsync(p, ct);
+
+    [JsonRpcMethod("callHierarchy/outgoingCalls", UseSingleObjectParameterDeserialization = true)]
+    public Task<CallHierarchyOutgoingCall[]> OutgoingCalls(CallHierarchyCallsParams p, CancellationToken ct) =>
+        Handlers.CallHierarchyHandler.OutgoingCallsAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/prepareTypeHierarchy", UseSingleObjectParameterDeserialization = true)]
+    public Task<HierarchyItem[]> PrepareTypeHierarchy(TextDocumentPositionParams p, CancellationToken ct) =>
+        Handlers.TypeHierarchyHandler.PrepareAsync(p, ct);
+
+    [JsonRpcMethod("typeHierarchy/supertypes", UseSingleObjectParameterDeserialization = true)]
+    public Task<HierarchyItem[]> Supertypes(TypeHierarchyItemParams p, CancellationToken ct) =>
+        Handlers.TypeHierarchyHandler.SupertypesAsync(p, ct);
+
+    [JsonRpcMethod("typeHierarchy/subtypes", UseSingleObjectParameterDeserialization = true)]
+    public Task<HierarchyItem[]> Subtypes(TypeHierarchyItemParams p, CancellationToken ct) =>
+        Handlers.TypeHierarchyHandler.SubtypesAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/semanticTokens/full", UseSingleObjectParameterDeserialization = true)]
+    public Task<SemanticTokens> SemanticTokensFull(SemanticTokensParams p, CancellationToken ct) =>
+        Handlers.SemanticTokensHandler.SemanticTokensFullAsync(p, ct);
 
     public void Dispose()
     {

@@ -38,6 +38,11 @@ public sealed record ServerCapabilities
     [JsonPropertyName("signatureHelpProvider")] public SignatureHelpOptions? SignatureHelpProvider { get; init; }
     [JsonPropertyName("codeActionProvider")] public CodeActionOptions? CodeActionProvider { get; init; }
     [JsonPropertyName("documentFormattingProvider")] public bool DocumentFormattingProvider { get; init; }
+    [JsonPropertyName("documentRangeFormattingProvider")] public bool DocumentRangeFormattingProvider { get; init; }
+    [JsonPropertyName("foldingRangeProvider")] public bool FoldingRangeProvider { get; init; }
+    [JsonPropertyName("callHierarchyProvider")] public bool CallHierarchyProvider { get; init; }
+    [JsonPropertyName("typeHierarchyProvider")] public bool TypeHierarchyProvider { get; init; }
+    [JsonPropertyName("semanticTokensProvider")] public SemanticTokensOptions? SemanticTokensProvider { get; init; }
 }
 
 public sealed record TextDocumentSyncOptions(

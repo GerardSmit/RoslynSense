@@ -65,9 +65,16 @@ internal static class CallHierarchyHandler
 
         var solution = document.Project.Solution;
         var byTarget = new Dictionary<ISymbol, List<Protocol.Range>>(SymbolEqualityComparer.Default);
+        string itemPath = LspConverters.UriToPath(p.Item.Uri);
 
         foreach (var syntaxRef in symbol.DeclaringSyntaxReferences)
         {
+            // fromRanges are interpreted relative to the item's document — a partial type's
+            // other files would produce ranges pointing at the wrong file.
+            if (!string.Equals(Services.PathHelper.NormalizePath(syntaxRef.SyntaxTree.FilePath),
+                    itemPath, StringComparison.OrdinalIgnoreCase))
+                continue;
+
             var declaration = await syntaxRef.GetSyntaxAsync(ct);
             var declDocument = solution.GetDocument(syntaxRef.SyntaxTree);
             var model = declDocument is null ? null : await declDocument.GetSemanticModelAsync(ct);

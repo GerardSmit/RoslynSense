@@ -1,8 +1,8 @@
-using System.Reflection;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CodeRefactorings;
 using Microsoft.CodeAnalysis.Host;
+using Microsoft.CodeAnalysis.Host.Mef;
 
 namespace RoslynMCP.Services;
 
@@ -10,7 +10,8 @@ namespace RoslynMCP.Services;
 /// Discovers Roslyn's built-in C# code fix and refactoring providers from the workspace's MEF
 /// composition (which includes Microsoft.CodeAnalysis.CSharp.Features). MEF satisfies the
 /// providers' [ImportingConstructor] dependencies — instantiating them via Activator yields
-/// inert instances that silently register nothing.
+/// inert instances that silently register nothing. IMefHostExportProvider is internal in
+/// Roslyn; accessed via Publicizer (see RoslynMCP.csproj).
 /// Shared by the MCP get_code_actions tool and the LSP textDocument/codeAction handler.
 /// </summary>
 internal static class CodeFixCatalog
@@ -54,44 +55,23 @@ internal static class CodeFixCatalog
 
     private static IReadOnlyList<T> LoadExports<T>(HostServices host) where T : class
     {
-        // IMefHostExportProvider is internal, so its generic GetExports<TExtension, TMetadata>
-        // is invoked via reflection. This is the only supported way to obtain MEF-composed
-        // provider instances (with [ImportingConstructor] dependencies satisfied) — Activator
-        // instantiation yields inert providers that silently register nothing.
         var providers = new List<T>();
-        try
+        if (host is not IMefHostExportProvider mef)
+            return providers;
+
+        foreach (var lazy in mef.GetExports<T, LanguagesMetadata>())
         {
-            var mefInterface = typeof(HostServices).Assembly
-                .GetType("Microsoft.CodeAnalysis.Host.Mef.IMefHostExportProvider");
-            if (mefInterface is null || !mefInterface.IsInstanceOfType(host))
-                return providers;
+            if (lazy.Metadata.Languages?.Contains(LanguageNames.CSharp) != true)
+                continue;
 
-            var getExports = mefInterface.GetMethods()
-                .First(m => m.Name == "GetExports" && m.GetGenericArguments().Length == 2)
-                .MakeGenericMethod(typeof(T), typeof(LanguagesMetadata));
-
-            var exports = (System.Collections.IEnumerable)getExports.Invoke(host, null)!;
-            foreach (object lazy in exports)
+            try
             {
-                var lazyType = lazy.GetType();
-                var metadata = (LanguagesMetadata?)lazyType.GetProperty("Metadata")?.GetValue(lazy);
-                if (metadata?.Languages?.Contains(LanguageNames.CSharp) != true)
-                    continue;
-
-                try
-                {
-                    if (lazyType.GetProperty("Value")?.GetValue(lazy) is T provider)
-                        providers.Add(provider);
-                }
-                catch (TargetInvocationException)
-                {
-                    // Provider's own composition failed — skip it.
-                }
+                providers.Add(lazy.Value);
             }
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[CodeFixCatalog] Failed to load {typeof(T).Name} exports: {ex.Message}");
+            catch (Exception)
+            {
+                // Provider's own composition failed — skip it.
+            }
         }
         return providers;
     }

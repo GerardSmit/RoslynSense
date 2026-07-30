@@ -293,7 +293,12 @@ internal static class WorkspaceService
     public static MSBuildWorkspace CreateWorkspace(TextWriter? diagnosticWriter = null, bool isLegacy = false)
     {
         var properties = isLegacy ? CreateLegacyProperties() : CreateDefaultProperties();
-        var workspace = MSBuildWorkspace.Create(properties);
+        // Own assembly joins the MEF catalog: it exports no-op implementations for the
+        // VS-only Pythia contracts that CSharp.Features providers import (see PythiaStubExports).
+        var host = Microsoft.CodeAnalysis.Host.Mef.MefHostServices.Create(
+            Microsoft.CodeAnalysis.Host.Mef.MefHostServices.DefaultAssemblies
+                .Add(typeof(NullPythiaSignatureHelpImplementation).Assembly));
+        var workspace = MSBuildWorkspace.Create(properties, host);
 
         workspace.RegisterWorkspaceFailedHandler(args =>
         {

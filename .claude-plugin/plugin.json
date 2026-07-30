@@ -8,6 +8,7 @@
   },
   "homepage": "https://github.com/GerardSmit/RoslynSense",
   "repository": "https://github.com/GerardSmit/RoslynSense",
+  "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "RoslynSense": {
       "type": "stdio",

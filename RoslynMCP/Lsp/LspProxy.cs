@@ -16,10 +16,14 @@ internal static class LspProxy
     public static async Task<int> RunAsync(string[] args)
     {
         string? solutionArg = null;
-        for (int i = 0; i < args.Length - 1; i++)
+        for (int i = 0; i < args.Length; i++)
         {
-            if (args[i].Equals("--solution", StringComparison.OrdinalIgnoreCase))
+            if (!args[i].Equals("--solution", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (i + 1 < args.Length)
                 solutionArg = args[i + 1];
+            else
+                Console.Error.WriteLine("[roslyn-sense] --solution requires a path; ignoring.");
         }
 
         string startPath = solutionArg ?? Directory.GetCurrentDirectory();

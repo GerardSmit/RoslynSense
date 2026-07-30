@@ -19,6 +19,33 @@ internal sealed class LspServer : IDisposable
     private readonly LspResolveCache _resolveCache = new();
     private JsonRpc? _rpc;
     private DiagnosticsPublisher? _diagnostics;
+    private bool _clientPullsDiagnostics;
+    private CancellationTokenSource? _refreshDebounce;
+
+    /// <summary>Nudges a pull-diagnostics client to re-pull (cross-file effects: an edit in
+    /// one document changes diagnostics in others). Debounced — mirrors the ~2s batching in
+    /// Roslyn's own LSP server. The client re-pulls the changed document itself immediately;
+    /// this only covers everything else.</summary>
+    private void ScheduleDiagnosticsRefresh()
+    {
+        if (!_clientPullsDiagnostics || _rpc is not { } rpc)
+            return;
+
+        _refreshDebounce?.Cancel();
+        var cts = _refreshDebounce = new CancellationTokenSource();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), cts.Token);
+                await rpc.InvokeAsync("workspace/diagnostic/refresh");
+            }
+            catch (Exception)
+            {
+                // Cancelled by a newer edit, or the client doesn't support refresh.
+            }
+        });
+    }
 
     public LspServer(IServiceProvider services) => _services = services;
 
@@ -34,6 +61,10 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("initialize", UseSingleObjectParameterDeserialization = true)]
     public InitializeResult Initialize(InitializeParams p)
     {
+        // Pull-capable clients (LSP 3.17) get pull diagnostics only — pushing too would
+        // draw duplicate squiggles.
+        _clientPullsDiagnostics = p.Capabilities?.TextDocument?.Diagnostic is not null;
+
         var capabilities = new ServerCapabilities
         {
             TextDocumentSync = new TextDocumentSyncOptions(
@@ -49,18 +80,31 @@ internal sealed class LspServer : IDisposable
             WorkspaceSymbolProvider = true,
             DocumentHighlightProvider = true,
             RenameProvider = new RenameOptions(PrepareProvider: true),
+            // No " " or "(" triggers: space fires on every keystroke boundary (junk requests
+            // that burn Roslyn's provider time budgets), "(" belongs to signature help.
             CompletionProvider = new CompletionOptions(
-                TriggerCharacters: [".", " ", "(", "<", "["],
+                TriggerCharacters: [".", "["],
                 ResolveProvider: true),
+            SignatureHelpProvider = new SignatureHelpOptions(
+                TriggerCharacters: ["(", ",", "<"],
+                RetriggerCharacters: [")", "]", ">"]),
             CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
             DocumentRangeFormattingProvider = true,
+            DocumentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions(
+                FirstTriggerCharacter: ";",
+                MoreTriggerCharacter: ["}", "\n"]),
             FoldingRangeProvider = true,
             CallHierarchyProvider = true,
             TypeHierarchyProvider = true,
             SemanticTokensProvider = new SemanticTokensOptions(
                 new SemanticTokensLegend(Handlers.SemanticTokensHandler.TokenTypes, TokenModifiers: []),
                 Full: true),
+            DiagnosticProvider = new DiagnosticOptions(
+                InterFileDependencies: false, WorkspaceDiagnostics: false),
+            CodeLensProvider = new CodeLensOptions(ResolveProvider: true),
+            ExecuteCommandProvider = new ExecuteCommandOptions(Handlers.ExecuteCommandHandler.Commands),
+            InlayHintProvider = new InlayHintOptions(ResolveProvider: false),
         };
 
         string? version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3);
@@ -84,7 +128,8 @@ internal sealed class LspServer : IDisposable
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         OpenDocumentStore.Open(SessionId, path,
             SourceText.From(p.TextDocument.Text), p.TextDocument.Version);
-        _diagnostics?.Schedule(path, immediate: true);
+        if (!_clientPullsDiagnostics)
+            _diagnostics?.Schedule(path, immediate: true);
     }
 
     [JsonRpcMethod("textDocument/didChange", UseSingleObjectParameterDeserialization = true)]
@@ -102,14 +147,18 @@ internal sealed class LspServer : IDisposable
             return text;
         });
 
-        if (result is not null)
+        if (result is not null && !_clientPullsDiagnostics)
             _diagnostics?.Schedule(path, immediate: false);
+        if (result is not null)
+            ScheduleDiagnosticsRefresh();
     }
 
     [JsonRpcMethod("textDocument/didSave", UseSingleObjectParameterDeserialization = true)]
     public void DidSave(DidSaveTextDocumentParams p)
     {
-        _diagnostics?.Schedule(LspConverters.UriToPath(p.TextDocument.Uri), immediate: true);
+        if (!_clientPullsDiagnostics)
+            _diagnostics?.Schedule(LspConverters.UriToPath(p.TextDocument.Uri), immediate: true);
+        ScheduleDiagnosticsRefresh();
     }
 
     [JsonRpcMethod("textDocument/didClose", UseSingleObjectParameterDeserialization = true)]
@@ -162,6 +211,10 @@ internal sealed class LspServer : IDisposable
     public Task<WorkspaceEdit?> Rename(RenameParams p, CancellationToken ct) =>
         Handlers.RenameHandler.RenameAsync(p, ct);
 
+    [JsonRpcMethod("textDocument/signatureHelp", UseSingleObjectParameterDeserialization = true)]
+    public Task<Protocol.SignatureHelp?> SignatureHelp(SignatureHelpParams p, CancellationToken ct) =>
+        Handlers.SignatureHelpHandler.SignatureHelpAsync(p, ct);
+
     [JsonRpcMethod("textDocument/completion", UseSingleObjectParameterDeserialization = true)]
     public Task<CompletionList> Completion(CompletionParams p, CancellationToken ct) =>
         Handlers.CompletionHandler.CompletionAsync(p, _resolveCache, ct);
@@ -185,6 +238,10 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("textDocument/rangeFormatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> RangeFormatting(DocumentRangeFormattingParams p, CancellationToken ct) =>
         Handlers.FormattingHandler.FormatRangeAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/onTypeFormatting", UseSingleObjectParameterDeserialization = true)]
+    public Task<TextEdit[]> OnTypeFormatting(DocumentOnTypeFormattingParams p, CancellationToken ct) =>
+        Handlers.FormattingHandler.FormatOnTypeAsync(p, ct);
 
     [JsonRpcMethod("textDocument/foldingRange", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.FoldingRange[]> FoldingRange(FoldingRangeParams p, CancellationToken ct) =>
@@ -218,10 +275,56 @@ internal sealed class LspServer : IDisposable
     public Task<SemanticTokens> SemanticTokensFull(SemanticTokensParams p, CancellationToken ct) =>
         Handlers.SemanticTokensHandler.SemanticTokensFullAsync(p, ct);
 
+    [JsonRpcMethod("textDocument/diagnostic", UseSingleObjectParameterDeserialization = true)]
+    public Task<object> Diagnostic(DocumentDiagnosticParams p, CancellationToken ct) =>
+        Handlers.DiagnosticsHandler.PullAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/codeLens", UseSingleObjectParameterDeserialization = true)]
+    public Task<Protocol.CodeLens[]> CodeLens(CodeLensParams p, CancellationToken ct) =>
+        Handlers.CodeLensHandler.CodeLensAsync(p, ct);
+
+    [JsonRpcMethod("codeLens/resolve", UseSingleObjectParameterDeserialization = true)]
+    public Task<Protocol.CodeLens> CodeLensResolve(Protocol.CodeLens lens, CancellationToken ct) =>
+        Handlers.CodeLensHandler.ResolveAsync(lens, ct);
+
+    [JsonRpcMethod("workspace/executeCommand", UseSingleObjectParameterDeserialization = true)]
+    public Task<string> ExecuteCommand(ExecuteCommandParams p, CancellationToken ct) =>
+        Handlers.ExecuteCommandHandler.ExecuteAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/inlayHint", UseSingleObjectParameterDeserialization = true)]
+    public Task<InlayHint[]> InlayHint(InlayHintParams p, CancellationToken ct) =>
+        Handlers.InlayHintHandler.InlayHintsAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/onAutoInsert", UseSingleObjectParameterDeserialization = true)]
+    public Task<OnAutoInsertResult?> OnAutoInsert(OnAutoInsertParams p, CancellationToken ct) =>
+        Handlers.OnAutoInsertHandler.OnAutoInsertAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/inheritanceMarkers", UseSingleObjectParameterDeserialization = true)]
+    public Task<InheritanceMarker[]> InheritanceMarkers(InheritanceMarkersParams p, CancellationToken ct) =>
+        Handlers.InheritanceMarkersHandler.MarkersAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/resolveInheritanceTarget", UseSingleObjectParameterDeserialization = true)]
+    public Task<Location?> ResolveInheritanceTarget(ResolveInheritanceTargetParams p, CancellationToken ct) =>
+        Handlers.InheritanceMarkersHandler.ResolveTargetAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/runningProcesses")]
+    public RunningProcess[] RunningProcesses() =>
+        Services.Run.RunningProcessRegistry.List()
+            .Select(e => new RunningProcess(
+                e.SessionId, e.Pid,
+                Path.GetFileNameWithoutExtension(e.ProjectPath),
+                e.ProjectPath, e.Url, e.StartedAtUtc.ToString("O")))
+            .ToArray();
+
+    [JsonRpcMethod("roslynSense/killProcess", UseSingleObjectParameterDeserialization = true)]
+    public string KillProcess(KillProcessParams p) =>
+        Services.Run.RunningProcessRegistry.Kill(p.Pid);
+
     public void Dispose()
     {
         LspSessionRegistry.Unregister(SessionId);
         OpenDocumentStore.CloseSession(SessionId);
         _diagnostics?.Dispose();
+        _refreshDebounce?.Cancel();
     }
 }

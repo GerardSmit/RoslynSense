@@ -69,6 +69,40 @@ public class LspResolveTests
     }
 
     [Fact]
+    public async Task CompletionIncludesUnimportedTypesForTypedPrefix()
+    {
+        // Calculator.cs has no 'using System.Text' — StringBuilder can only appear via
+        // import completion. With a typed prefix the prefix-ranked list must surface it
+        // even though the raw list exceeds the item cap.
+        string path = FixturePaths.CalculatorFile;
+        string original = await File.ReadAllTextAsync(path);
+        string anchor = "return new Result(Add(a, b), Subtract(a, b));";
+        string modified = original.Replace(anchor, "StringB\r\n        " + anchor);
+        Assert.NotEqual(original, modified);
+
+        string session = Guid.NewGuid().ToString("N");
+        try
+        {
+            RoslynMCP.Services.OpenDocumentStore.Open(session, path,
+                Microsoft.CodeAnalysis.Text.SourceText.From(modified), 1);
+
+            var (line, character) = PositionOf(modified, "StringB");
+            var cache = new LspResolveCache();
+            var list = await CompletionHandler.CompletionAsync(
+                new CompletionParams(
+                    new TextDocumentIdentifier(LspConverters.PathToUri(path)),
+                    new Position(line, character + "StringB".Length)),
+                cache, default);
+
+            Assert.Contains(list.Items, i => i.Label == "StringBuilder");
+        }
+        finally
+        {
+            RoslynMCP.Services.OpenDocumentStore.Close(session, path);
+        }
+    }
+
+    [Fact]
     public async Task ResolveWithStaleDataReturnsItemUnchanged()
     {
         var cache = new LspResolveCache();

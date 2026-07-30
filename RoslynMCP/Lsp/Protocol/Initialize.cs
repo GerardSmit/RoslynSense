@@ -7,7 +7,17 @@ namespace RoslynMCP.Lsp.Protocol;
 public sealed record InitializeParams(
     [property: JsonPropertyName("processId")] int? ProcessId,
     [property: JsonPropertyName("rootUri")] string? RootUri,
-    [property: JsonPropertyName("workspaceFolders")] WorkspaceFolder[]? WorkspaceFolders);
+    [property: JsonPropertyName("workspaceFolders")] WorkspaceFolder[]? WorkspaceFolders,
+    [property: JsonPropertyName("capabilities")] ClientCapabilities? Capabilities);
+
+public sealed record ClientCapabilities(
+    [property: JsonPropertyName("textDocument")] TextDocumentClientCapabilities? TextDocument);
+
+/// <summary>Only the client capabilities the server branches on. A non-null
+/// <see cref="Diagnostic"/> means the client pulls diagnostics (LSP 3.17), so the
+/// session skips push publishing to avoid duplicate squiggles.</summary>
+public sealed record TextDocumentClientCapabilities(
+    [property: JsonPropertyName("diagnostic")] System.Text.Json.JsonElement? Diagnostic);
 
 public sealed record WorkspaceFolder(
     [property: JsonPropertyName("uri")] string Uri,
@@ -39,10 +49,15 @@ public sealed record ServerCapabilities
     [JsonPropertyName("codeActionProvider")] public CodeActionOptions? CodeActionProvider { get; init; }
     [JsonPropertyName("documentFormattingProvider")] public bool DocumentFormattingProvider { get; init; }
     [JsonPropertyName("documentRangeFormattingProvider")] public bool DocumentRangeFormattingProvider { get; init; }
+    [JsonPropertyName("documentOnTypeFormattingProvider")] public DocumentOnTypeFormattingOptions? DocumentOnTypeFormattingProvider { get; init; }
     [JsonPropertyName("foldingRangeProvider")] public bool FoldingRangeProvider { get; init; }
     [JsonPropertyName("callHierarchyProvider")] public bool CallHierarchyProvider { get; init; }
     [JsonPropertyName("typeHierarchyProvider")] public bool TypeHierarchyProvider { get; init; }
     [JsonPropertyName("semanticTokensProvider")] public SemanticTokensOptions? SemanticTokensProvider { get; init; }
+    [JsonPropertyName("diagnosticProvider")] public DiagnosticOptions? DiagnosticProvider { get; init; }
+    [JsonPropertyName("codeLensProvider")] public CodeLensOptions? CodeLensProvider { get; init; }
+    [JsonPropertyName("executeCommandProvider")] public ExecuteCommandOptions? ExecuteCommandProvider { get; init; }
+    [JsonPropertyName("inlayHintProvider")] public InlayHintOptions? InlayHintProvider { get; init; }
 }
 
 public sealed record TextDocumentSyncOptions(
@@ -61,4 +76,5 @@ public sealed record CompletionOptions(
     [property: JsonPropertyName("resolveProvider")] bool ResolveProvider);
 
 public sealed record SignatureHelpOptions(
-    [property: JsonPropertyName("triggerCharacters")] string[] TriggerCharacters);
+    [property: JsonPropertyName("triggerCharacters")] string[] TriggerCharacters,
+    [property: JsonPropertyName("retriggerCharacters")] string[] RetriggerCharacters);

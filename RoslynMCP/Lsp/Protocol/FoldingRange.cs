@@ -20,3 +20,12 @@ public static class FoldingRangeKind
 public sealed record DocumentRangeFormattingParams(
     [property: JsonPropertyName("textDocument")] TextDocumentIdentifier TextDocument,
     [property: JsonPropertyName("range")] Range Range);
+
+public sealed record DocumentOnTypeFormattingParams(
+    [property: JsonPropertyName("textDocument")] TextDocumentIdentifier TextDocument,
+    [property: JsonPropertyName("position")] Position Position,
+    [property: JsonPropertyName("ch")] string Character);
+
+public sealed record DocumentOnTypeFormattingOptions(
+    [property: JsonPropertyName("firstTriggerCharacter")] string FirstTriggerCharacter,
+    [property: JsonPropertyName("moreTriggerCharacter")] string[] MoreTriggerCharacter);

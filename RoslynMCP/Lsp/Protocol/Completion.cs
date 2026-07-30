@@ -4,7 +4,12 @@ namespace RoslynMCP.Lsp.Protocol;
 
 public sealed record CompletionParams(
     [property: JsonPropertyName("textDocument")] TextDocumentIdentifier TextDocument,
-    [property: JsonPropertyName("position")] Position Position);
+    [property: JsonPropertyName("position")] Position Position,
+    [property: JsonPropertyName("context")] LspCompletionContext? Context = null);
+
+public sealed record LspCompletionContext(
+    [property: JsonPropertyName("triggerKind")] int TriggerKind, // 1 invoked, 2 trigger char, 3 re-trigger
+    [property: JsonPropertyName("triggerCharacter")] string? TriggerCharacter);
 
 public sealed record CompletionList(
     [property: JsonPropertyName("isIncomplete")] bool IsIncomplete,
@@ -23,6 +28,14 @@ public sealed record CompletionItem(
     [JsonPropertyName("data")] public CompletionItemData? Data { get; init; }
 
     [JsonPropertyName("documentation")] public MarkupContent? Documentation { get; init; }
+
+    /// <summary>Extra edits away from the main edit — e.g. the auto-inserted using directive
+    /// for import completion. Filled lazily in completionItem/resolve.</summary>
+    [JsonPropertyName("additionalTextEdits")] public TextEdit[]? AdditionalTextEdits { get; init; }
+
+    [JsonPropertyName("preselect")] public bool? Preselect { get; init; }
+
+    [JsonPropertyName("commitCharacters")] public string[]? CommitCharacters { get; init; }
 }
 
 public sealed record CompletionItemData(

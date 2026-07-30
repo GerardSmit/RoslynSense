@@ -21,6 +21,14 @@
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
             <PrivateAssets>all</PrivateAssets>
         </PackageReference>
+        <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="all" ExcludeAssets="runtime" />
+    </ItemGroup>
+
+    <!-- Mirror of RoslynMCP's publicized assemblies so tests can reach the same internals. -->
+    <ItemGroup>
+        <Publicize Include="Microsoft.CodeAnalysis.Features" />
+        <Publicize Include="Microsoft.CodeAnalysis.CSharp.Features" />
+        <Publicize Include="Microsoft.CodeAnalysis.Workspaces" />
     </ItemGroup>
 
     <ItemGroup>

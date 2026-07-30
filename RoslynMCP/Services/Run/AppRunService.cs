@@ -70,6 +70,7 @@ public sealed class AppRunService(AppSessionStore store)
         {
             try { session.MarkExited(session.Process.ExitCode); }
             catch { session.MarkExited(null); }
+            RunningProcessRegistry.Unregister(session);
         };
 
         try
@@ -85,6 +86,7 @@ public sealed class AppRunService(AppSessionStore store)
         }
 
         store.Add(session);
+        RunningProcessRegistry.Register(session);
 
         if (spec.Port is { } listenPort)
         {
@@ -138,6 +140,7 @@ public sealed class AppRunService(AppSessionStore store)
 
         await BuildProcessHelper.KillAndDrainAsync(session.Process);
         session.MarkStopped();
+        RunningProcessRegistry.Unregister(session);
         return true;
     }
 }

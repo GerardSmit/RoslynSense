@@ -25,8 +25,44 @@
       {
         "command": "roslynSense.restartServer",
         "title": "RoslynSense: Restart Server"
+      },
+      {
+        "command": "roslynSense.restorePackages",
+        "title": "RoslynSense: Restore NuGet Packages"
+      },
+      {
+        "command": "roslynSense.reloadRoslynWorkspace",
+        "title": "RoslynSense: Reload Workspace"
+      },
+      {
+        "command": "roslynSense.showProcesses",
+        "title": "RoslynSense: Show Running Processes"
+      },
+      {
+        "command": "roslynSense.runTest",
+        "title": "RoslynSense: Run Test"
+      },
+      {
+        "command": "roslynSense.showReferences",
+        "title": "RoslynSense: Show References"
+      },
+      {
+        "command": "roslynSense.openLocation",
+        "title": "RoslynSense: Open Location"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        { "command": "roslynSense.runTest", "when": "false" },
+        { "command": "roslynSense.showReferences", "when": "false" },
+        { "command": "roslynSense.openLocation", "when": "false" }
+      ]
+    },
+    "configurationDefaults": {
+      "[csharp]": {
+        "editor.formatOnType": true
+      }
+    },
     "configuration": {
       "title": "RoslynSense",
       "properties": {

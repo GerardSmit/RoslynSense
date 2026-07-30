@@ -152,8 +152,10 @@ internal static class PathHelper
     /// </summary>
     public static string[] FindSolutionFiles(string directory)
     {
-        var sln = Directory.GetFiles(directory, "*.sln");
-        var slnx = Directory.GetFiles(directory, "*.slnx");
+        // Sorted case-insensitively: callers take the first entry, and the plugin's node
+        // drain hook mirrors this ordering — OS enumeration order would diverge from it.
+        var sln = Directory.GetFiles(directory, "*.sln").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+        var slnx = Directory.GetFiles(directory, "*.slnx").OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
         if (sln.Length == 0) return slnx;
         if (slnx.Length == 0) return sln;
         return [.. sln, .. slnx];

@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using Microsoft.CodeAnalysis;
 using RoslynMCP.Lsp.Protocol;
 using StreamJsonRpc;
 
@@ -25,8 +24,9 @@ internal sealed class DiagnosticsPublisher : IDisposable
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_disposed.Token);
         var previous = _pending.Exchange(filePath, cts);
+        // Cancel only — disposing here races the in-flight task still holding the token
+        // (ObjectDisposedException inside Task.Delay); the GC reclaims cancelled sources.
         previous?.Cancel();
-        previous?.Dispose();
 
         _ = RunAsync(filePath, immediate, cts.Token);
     }
@@ -48,23 +48,7 @@ internal sealed class DiagnosticsPublisher : IDisposable
             if (!immediate)
                 await Task.Delay(Debounce, ct);
 
-            var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
-            if (document is null)
-                return;
-
-            var model = await document.GetSemanticModelAsync(ct);
-            if (model is null)
-                return;
-
-            var diagnostics = model.GetDiagnostics(cancellationToken: ct)
-                .Where(d => d.Severity != DiagnosticSeverity.Hidden && d.Location.IsInSource)
-                .Select(d => new Protocol.Diagnostic(
-                    LspConverters.ToRange(d.Location.GetLineSpan().Span),
-                    LspConverters.ToLspSeverity(d.Severity),
-                    d.Id,
-                    "roslyn-sense",
-                    d.GetMessage()))
-                .ToArray();
+            var diagnostics = await Handlers.DiagnosticsHandler.ComputeAsync(filePath, ct);
 
             ct.ThrowIfCancellationRequested();
             await PublishAsync(filePath, diagnostics, ct);

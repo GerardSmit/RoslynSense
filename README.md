@@ -333,7 +333,9 @@ editor ──stdio──> roslyn-sense --lsp ──named pipe──> per-solutio
 
 The `--lsp` process is a thin proxy: it connects to (or spawns) the per-solution daemon and forwards LSP JSON-RPC over the daemon's pipe. Without a resolvable solution or reachable daemon it hosts the LSP session in-process.
 
-Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), push diagnostics, completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, and semantic tokens. Position encoding is UTF-16.
+Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), diagnostics (push, or pull for LSP 3.17 clients), completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, semantic tokens, inlay hints (parameter names + implicit types), code lens (reference counts, override/implements links, run-test), workspace commands (`roslynSense.restore`, `roslynSense.reloadWorkspace`), and doc-comment generation on `///` (custom `roslynSense/onAutoInsert`). Position encoding is UTF-16.
+
+The VSCode extension also shows a status-bar counter of applications launched by AI chats (`run_project`), with click-to-inspect and kill (custom `roslynSense/runningProcesses` / `roslynSense/killProcess`, backed by a cross-process registry — launches stay per-chat, visibility is machine-wide).
 
 Options: `--solution <path>` pins the solution explicitly; otherwise the nearest solution to the working directory is used.
 

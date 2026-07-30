@@ -262,6 +262,65 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
                 );
             }
         ),
+        // Gutter arrows aren't clickable (no VSCode API for gutter clicks) — this command
+        // (context menu / palette) lists the inheritance targets for the current line.
+        vscode.commands.registerCommand('roslynSense.showInheritance', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!client || !editor || editor.document.languageId !== 'csharp') {
+                return;
+            }
+            let markers: InheritanceMarker[];
+            try {
+                markers = await client.sendRequest<InheritanceMarker[]>(
+                    'roslynSense/inheritanceMarkers',
+                    { textDocument: { uri: code2Protocol(editor.document.uri) } }
+                );
+            } catch {
+                return;
+            }
+            const line = editor.selection.active.line;
+            const atLine = markers.filter((m) => m.line === line);
+            const items = atLine.flatMap((marker) =>
+                marker.targets.map((t, index) => ({
+                    label: `${UP_KINDS.has(marker.kind) ? '$(arrow-up)' : '$(arrow-down)'} ${t.title}`,
+                    marker,
+                    target: t,
+                    index,
+                }))
+            );
+            if (items.length === 0) {
+                void vscode.window.showInformationMessage(
+                    'RoslynSense: no inheritance relations on this line.'
+                );
+                return;
+            }
+            const picked =
+                items.length === 1
+                    ? items[0]
+                    : await vscode.window.showQuickPick(items, {
+                          placeHolder: 'Inheritance relations',
+                      });
+            if (!picked) {
+                return;
+            }
+            if (picked.target.uri) {
+                await vscode.commands.executeCommand(
+                    'roslynSense.openLocation',
+                    picked.target.uri,
+                    picked.target.line,
+                    picked.target.character
+                );
+            } else {
+                await vscode.commands.executeCommand(
+                    'roslynSense.openInheritanceTarget',
+                    code2Protocol(editor.document.uri),
+                    picked.marker.line,
+                    picked.marker.character,
+                    picked.marker.kind,
+                    picked.index
+                );
+            }
+        }),
         // Gutter marker link for a metadata target: server decompiles and returns a location.
         vscode.commands.registerCommand(
             'roslynSense.openInheritanceTarget',

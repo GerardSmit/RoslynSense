@@ -49,6 +49,10 @@
       {
         "command": "roslynSense.openLocation",
         "title": "RoslynSense: Open Location"
+      },
+      {
+        "command": "roslynSense.showInheritance",
+        "title": "RoslynSense: Show Inheritance"
       }
     ],
     "menus": {
@@ -56,8 +60,22 @@
         { "command": "roslynSense.runTest", "when": "false" },
         { "command": "roslynSense.showReferences", "when": "false" },
         { "command": "roslynSense.openLocation", "when": "false" }
+      ],
+      "editor/context": [
+        {
+          "command": "roslynSense.showInheritance",
+          "when": "editorLangId == csharp",
+          "group": "navigation@50"
+        }
       ]
     },
+    "keybindings": [
+      {
+        "command": "roslynSense.showInheritance",
+        "key": "ctrl+alt+u",
+        "when": "editorTextFocus && editorLangId == csharp"
+      }
+    ],
     "configurationDefaults": {
       "[csharp]": {
         "editor.formatOnType": true

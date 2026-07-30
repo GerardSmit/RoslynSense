@@ -36,7 +36,18 @@ internal static class NavigationHandlers
 
         // Aliases and partials: prefer the definition part(s) in source.
         symbol = symbol.OriginalDefinition;
-        return HandlerHelpers.ToLocations(symbol.Locations);
+        var locations = HandlerHelpers.ToLocations(symbol.Locations);
+        if (locations.Length > 0)
+            return locations;
+
+        // Metadata symbol (framework/package type): decompile the containing type so
+        // go-to-definition lands in generated source instead of failing.
+        var decompiled = await Services.DecompiledSourceService.TryDecompileSymbolAsync(
+            symbol, document.Project, ct);
+        var location = decompiled?.Locations.FirstOrDefault(l => l.IsInSource);
+        return location is not null && LspConverters.ToLocation(location) is { } lsp
+            ? [lsp]
+            : Array.Empty<LspLocation>();
     }
 
     public static async Task<LspLocation[]> ReferencesAsync(ReferenceParams p, CancellationToken ct)

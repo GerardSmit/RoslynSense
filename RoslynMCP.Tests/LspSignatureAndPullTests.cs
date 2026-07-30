@@ -97,6 +97,23 @@ public class LspSignatureAndPullTests
         }
     }
 
+    [Fact]
+    public async Task DefinitionOnMetadataSymbolDecompiles()
+    {
+        string uri = LspConverters.PathToUri(FixturePaths.FrameworkReferencesFile);
+        string text = await File.ReadAllTextAsync(FixturePaths.FrameworkReferencesFile);
+        var (line, character) = PositionOf(text, "Console.WriteLine");
+
+        var locations = await NavigationHandlers.DefinitionAsync(
+            new TextDocumentPositionParams(
+                new TextDocumentIdentifier(uri),
+                new Position(line, character + "Console.".Length + 1)),
+            typeDefinition: false, default);
+
+        var location = Assert.Single(locations);
+        Assert.Contains("Decompiled", location.Uri); // generated source under the temp dir
+    }
+
     private static (int Line, int Character) PositionOf(string text, string anchor)
     {
         int index = text.IndexOf(anchor, StringComparison.Ordinal);

@@ -789,6 +789,32 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// Returns the most-recently-used cached solution (with open-buffer overlays applied), or
+    /// null when nothing is loaded yet. Used by solution-wide queries that aren't anchored to
+    /// a file (LSP workspace/symbol).
+    /// </summary>
+    public static Solution? TryGetMostRecentSolution()
+    {
+        CachedWorkspaceEntry? entry = null;
+        s_cacheLock.Wait();
+        try
+        {
+            foreach (var e in s_cache.Values)
+                if (entry is null || e.LastAccessedUtc > entry.LastAccessedUtc)
+                    entry = e;
+        }
+        finally { s_cacheLock.Release(); }
+
+        if (entry is null)
+            return null;
+
+        var project = entry.Workspace.CurrentSolution.GetProject(entry.PrimaryProjectId);
+        return project is null
+            ? entry.Workspace.CurrentSolution
+            : ApplyOpenDocumentOverlay(entry, project).Solution;
+    }
+
+    /// <summary>
     /// Evicts all cached workspace entries immediately.
     /// </summary>
     public static async Task EvictAllAsync(CancellationToken cancellationToken = default)
@@ -864,10 +890,15 @@ internal static class WorkspaceService
     /// <paramref name="cacheTime"/>. The workspace's internal solution is unchanged.
     /// </summary>
     private static Project RefreshDocumentIfStale(
-        Workspace workspace, Project project, string filePath, DateTime cacheTime)
+        Project project, string filePath, DateTime cacheTime)
     {
         var document = FindDocumentInProject(project, filePath);
         if (document is null)
+            return project;
+
+        // An open editor buffer (LSP) is authoritative over disk — it was already applied by
+        // the overlay pass, and disk mtime says nothing about unsaved edits.
+        if (OpenDocumentStore.IsOpen(filePath))
             return project;
 
         var fileInfo = new FileInfo(filePath);
@@ -876,7 +907,7 @@ internal static class WorkspaceService
 
         using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         var text = SourceText.From(stream);
-        var updatedSolution = workspace.CurrentSolution.WithDocumentText(document.Id, text);
+        var updatedSolution = project.Solution.WithDocumentText(document.Id, text);
         return updatedSolution.GetProject(project.Id) ?? project;
     }
 
@@ -1076,10 +1107,60 @@ internal static class WorkspaceService
         entry.LastAccessedUtc = DateTime.UtcNow;
         var project = entry.GetProject(requestedProjectPath);
 
+        project = ApplyOpenDocumentOverlay(entry, project);
+
         if (targetFilePath != null)
-            project = RefreshDocumentIfStale(entry.Workspace, project, targetFilePath, entry.CachedAtUtc);
+            project = RefreshDocumentIfStale(project, targetFilePath, entry.CachedAtUtc);
 
         return (entry.Workspace, project);
+    }
+
+    /// <summary>
+    /// Overlays every open editor buffer (<see cref="OpenDocumentStore"/>) onto the snapshot,
+    /// so cross-file analysis (find usages, diagnostics, rename) sees unsaved edits in ALL
+    /// open files, not just the requested one. The forked solution is memoized per store
+    /// generation — rebuilding it on every request would re-fork N documents each call.
+    /// </summary>
+    private static Project ApplyOpenDocumentOverlay(CachedWorkspaceEntry entry, Project project)
+    {
+        if (OpenDocumentStore.IsEmpty)
+            return project;
+
+        long generation = OpenDocumentStore.Generation;
+        var baseSolution = project.Solution;
+        Solution? overlay;
+        lock (entry.OverlayLock)
+        {
+            // The base-solution check catches incremental project adds, which change
+            // CurrentSolution without bumping the store generation.
+            if (entry.OverlayGeneration == generation && ReferenceEquals(entry.OverlayBase, baseSolution))
+            {
+                overlay = entry.OverlaySolution;
+            }
+            else
+            {
+                overlay = null;
+                var solution = baseSolution;
+                bool any = false;
+                foreach (var (path, text) in OpenDocumentStore.SnapshotAll())
+                {
+                    // Multi-targeting: the same file can back several DocumentIds.
+                    foreach (var docId in solution.GetDocumentIdsWithFilePath(path))
+                    {
+                        solution = solution.WithDocumentText(docId, text);
+                        any = true;
+                    }
+                }
+                if (any)
+                    overlay = solution;
+
+                entry.OverlaySolution = overlay;
+                entry.OverlayBase = baseSolution;
+                entry.OverlayGeneration = generation;
+            }
+        }
+
+        return overlay?.GetProject(project.Id) ?? project;
     }
 
     private static void EvictExpiredEntries(object? state)
@@ -1532,6 +1613,12 @@ internal static class WorkspaceService
         /// (MSBuildWorkspace is not safe for concurrent opens; reads stay safe via immutable
         /// solution snapshots).</summary>
         public SemaphoreSlim LoadGate { get; } = new(1, 1);
+
+        /// <summary>Memoized open-editor-buffer overlay (see ApplyOpenDocumentOverlay).</summary>
+        public object OverlayLock { get; } = new();
+        public Solution? OverlaySolution { get; set; }
+        public Solution? OverlayBase { get; set; }
+        public long OverlayGeneration { get; set; } = -1;
 
         public CachedWorkspaceEntry(
             string cacheKey,

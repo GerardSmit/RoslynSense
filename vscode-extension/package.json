@@ -1,0 +1,54 @@
+{
+  "name": "roslyn-sense",
+  "displayName": "RoslynSense",
+  "description": "C# language server backed by the RoslynSense shared daemon — the same loaded solution your MCP-connected AI assistant uses.",
+  "version": "0.1.0",
+  "publisher": "roslyn-sense",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:csharp"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "RoslynSense",
+      "properties": {
+        "roslynSense.serverPath": {
+          "type": "string",
+          "default": "roslyn-sense",
+          "description": "Path to the roslyn-sense executable (dotnet tool). Defaults to 'roslyn-sense' on PATH."
+        },
+        "roslynSense.solutionPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit .sln path. When empty, the server resolves the nearest solution from the workspace folder."
+        },
+        "roslynSense.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace LSP communication between VSCode and roslyn-sense."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

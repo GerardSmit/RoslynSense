@@ -410,3 +410,7 @@ FodyWeavers.xsd
 
 # Fixture build output (configuration-independent)
 RoslynMCP.Tests/Fixtures/**/lib/
+
+# VSCode extension build output
+vscode-extension/out/
+vscode-extension/*.vsix

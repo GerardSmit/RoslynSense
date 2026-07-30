@@ -23,6 +23,12 @@ class Program
         if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
             return await RoslynMCP.CliRunner.RunAsync(args[1..]);
 
+        // LSP mode: roslyn-sense --lsp [--solution <path>]
+        // Spawned by an editor as its C# language server; proxies LSP to the shared daemon so
+        // the editor and MCP clients share one loaded solution (in-process fallback otherwise).
+        if (args.Length > 0 && args[0].Equals("--lsp", StringComparison.OrdinalIgnoreCase))
+            return await RoslynMCP.Lsp.LspProxy.RunAsync(args[1..]);
+
         // Shared-host daemon mode: roslyn-sense --host <solution>
         // Long-lived process that owns the Roslyn workspaces for one solution and serves tool
         // calls forwarded by thin MCP-client processes over a named pipe.

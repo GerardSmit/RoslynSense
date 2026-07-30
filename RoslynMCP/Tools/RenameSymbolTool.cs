@@ -158,14 +158,14 @@ public static class RenameSymbolTool
                 foreach (var change in changedDocs)
                 {
                     if (!string.IsNullOrEmpty(change.FilePath) && File.Exists(change.FilePath))
-                        await File.WriteAllTextAsync(change.FilePath, change.NewText, cancellationToken);
+                        await WriteChangedFileAsync(change.FilePath, change.NewText, oldName, newName, cancellationToken);
                 }
 
                 // Write non-C# changes
                 foreach (var change in nonCSharpChanges)
                 {
                     if (!string.IsNullOrEmpty(change.FilePath) && File.Exists(change.FilePath))
-                        await File.WriteAllTextAsync(change.FilePath, change.NewText, cancellationToken);
+                        await WriteChangedFileAsync(change.FilePath, change.NewText, oldName, newName, cancellationToken);
                 }
 
                 // Rename files
@@ -232,6 +232,26 @@ public static class RenameSymbolTool
             Console.Error.WriteLine($"[RenameSymbol] Unhandled error: {ex}");
             return $"Error: {ex.Message}";
         }
+    }
+
+    /// <summary>
+    /// Writes a renamed file. When the file is open in a connected editor (LSP), the change
+    /// is routed through <c>workspace/applyEdit</c> instead of a disk write — writing disk
+    /// under a dirty editor buffer would race the user's unsaved edits and break editor undo.
+    /// Falls back to disk when no editor applies the edit.
+    /// </summary>
+    private static async Task WriteChangedFileAsync(
+        string filePath, string newText, string oldName, string newName, CancellationToken cancellationToken)
+    {
+        if (Services.OpenDocumentStore.IsOpen(filePath))
+        {
+            bool applied = await Lsp.LspSessionRegistry.TryApplyFullTextEditAsync(
+                filePath, newText, $"Rename {oldName} → {newName}", cancellationToken);
+            if (applied)
+                return;
+        }
+
+        await File.WriteAllTextAsync(filePath, newText, cancellationToken);
     }
 
     private static bool IsValidIdentifier(string name)

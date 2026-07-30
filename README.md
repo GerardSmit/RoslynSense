@@ -323,6 +323,22 @@ Designer regeneration is the exception: it is a side effect on the shared source
 
 **Single host guarantee.** Exactly one host serves a solution at a time: a daemon acquires an exclusive lock file before it begins listening, so a daemon that loses a startup race exits without serving; the OS releases the lock on process death, so a crash self-heals and the next call respawns.
 
+## LSP server (editor integration)
+
+RoslynSense is also a Language Server Protocol server: run `roslyn-sense --lsp` and any LSP editor (VSCode, Neovim, Helix, …) gets C# language features from the **same shared daemon** the MCP clients use. One solution load serves both the editor and the AI assistant — and document sync means the assistant's analysis tools (diagnostics, find usages, rename, …) see the editor's **unsaved buffers**, while LSP rename/code actions are returned as workspace edits applied in the editor (never disk writes under a dirty buffer).
+
+```
+editor ──stdio──> roslyn-sense --lsp ──named pipe──> per-solution daemon <──named pipe── MCP clients (chats)
+```
+
+The `--lsp` process is a thin proxy: it connects to (or spawns) the per-solution daemon and forwards LSP JSON-RPC over the daemon's pipe. Without a resolvable solution or reachable daemon it hosts the LSP session in-process.
+
+Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), push diagnostics, completion, code actions (quick fixes + refactorings), and document formatting. Position encoding is UTF-16.
+
+Options: `--solution <path>` pins the solution explicitly; otherwise the nearest solution to the working directory is used.
+
+A minimal VSCode extension lives in [`vscode-extension/`](vscode-extension/) — see its README for setup and coexistence notes with the Microsoft C# extension.
+
 ## Tools
 
 ### Code Analysis

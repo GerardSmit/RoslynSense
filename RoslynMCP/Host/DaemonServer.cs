@@ -143,6 +143,20 @@ internal sealed class DaemonServer
                 if (request is null)
                     return; // client disconnected without sending
 
+                if (string.Equals(request.Kind, "lsp", StringComparison.Ordinal))
+                {
+                    // LSP handshake: this connection becomes a long-lived duplex LSP session.
+                    // Handing the raw pipe over is safe because ReadMessageAsync reads exactly
+                    // 4+N framed bytes and never buffers ahead — the next byte on the pipe is
+                    // the first byte of LSP JSON-RPC. The `await using` above keeps disposal
+                    // ownership here; the session runs until the editor disconnects, and
+                    // OnConnectionOpened/Closed keeps the idle timer disarmed meanwhile.
+                    Console.Error.WriteLine("[Daemon] LSP session attached.");
+                    await Lsp.LspSessionHost.RunAsync(pipe, _services, ct);
+                    Console.Error.WriteLine("[Daemon] LSP session ended.");
+                    return;
+                }
+
                 var response = await DispatchAsync(request, ct);
                 await IpcProtocol.WriteMessageAsync(pipe, response, ct);
                 if (OperatingSystem.IsWindows())

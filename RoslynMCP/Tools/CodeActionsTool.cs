@@ -265,80 +265,9 @@ public static class CodeActionsTool
         }
     }
 
-    private static IReadOnlyList<CodeFixProvider>? s_cachedProviders;
+    private static IReadOnlyList<CodeFixProvider> GetCodeFixProviders(Project project) =>
+        CodeFixCatalog.GetCodeFixProviders();
 
-    private static IReadOnlyList<CodeFixProvider> GetCodeFixProviders(Project project)
-    {
-        if (s_cachedProviders is not null)
-            return s_cachedProviders;
-
-        var providers = new List<CodeFixProvider>();
-
-        // Load built-in Roslyn C# code fix providers from the Features assembly
-        try
-        {
-            var featuresAssembly = System.Reflection.Assembly.Load("Microsoft.CodeAnalysis.CSharp.Features");
-
-            foreach (var type in featuresAssembly.GetTypes())
-            {
-                if (type.IsAbstract || !typeof(CodeFixProvider).IsAssignableFrom(type))
-                    continue;
-
-                try
-                {
-                    if (Activator.CreateInstance(type) is CodeFixProvider provider)
-                        providers.Add(provider);
-                }
-                catch
-                {
-                    // Some providers require dependencies or special constructors
-                }
-            }
-        }
-        catch
-        {
-            // Features assembly may not be available
-        }
-
-        s_cachedProviders = providers;
-        return providers;
-    }
-
-    private static IReadOnlyList<CodeRefactoringProvider>? s_cachedRefactoringProviders;
-
-    private static IReadOnlyList<CodeRefactoringProvider> GetRefactoringProviders()
-    {
-        if (s_cachedRefactoringProviders is not null)
-            return s_cachedRefactoringProviders;
-
-        var providers = new List<CodeRefactoringProvider>();
-
-        try
-        {
-            var featuresAssembly = System.Reflection.Assembly.Load("Microsoft.CodeAnalysis.CSharp.Features");
-
-            foreach (var type in featuresAssembly.GetTypes())
-            {
-                if (type.IsAbstract || !typeof(CodeRefactoringProvider).IsAssignableFrom(type))
-                    continue;
-
-                try
-                {
-                    if (Activator.CreateInstance(type) is CodeRefactoringProvider provider)
-                        providers.Add(provider);
-                }
-                catch
-                {
-                    // Some providers require dependencies or special constructors
-                }
-            }
-        }
-        catch
-        {
-            // Features assembly may not be available
-        }
-
-        s_cachedRefactoringProviders = providers;
-        return providers;
-    }
+    private static IReadOnlyList<CodeRefactoringProvider> GetRefactoringProviders() =>
+        CodeFixCatalog.GetRefactoringProviders();
 }

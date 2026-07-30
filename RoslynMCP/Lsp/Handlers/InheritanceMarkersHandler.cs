@@ -104,7 +104,7 @@ internal static class InheritanceMarkersHandler
         return location is null ? null : LspConverters.ToLocation(location);
     }
 
-    private static IEnumerable<string> ApplicableUpKinds(ISymbol symbol)
+    internal static IEnumerable<string> ApplicableUpKinds(ISymbol symbol)
     {
         switch (symbol)
         {
@@ -120,7 +120,7 @@ internal static class InheritanceMarkersHandler
         }
     }
 
-    private static string? ApplicableDownKind(ISymbol symbol) => symbol switch
+    internal static string? ApplicableDownKind(ISymbol symbol) => symbol switch
     {
         INamedTypeSymbol { TypeKind: TypeKind.Interface } => "derived",
         INamedTypeSymbol { TypeKind: TypeKind.Class, IsSealed: false } => "derived",
@@ -133,7 +133,7 @@ internal static class InheritanceMarkersHandler
     };
 
     /// <summary>Deterministic order — resolveInheritanceTarget picks by index.</summary>
-    private static List<(ISymbol Symbol, string Title)> ComputeUpTargets(ISymbol symbol, string kind)
+    internal static List<(ISymbol Symbol, string Title)> ComputeUpTargets(ISymbol symbol, string kind)
     {
         var targets = new List<(ISymbol, string)>();
         switch (kind)
@@ -164,7 +164,7 @@ internal static class InheritanceMarkersHandler
         return targets;
     }
 
-    private static async Task<List<(ISymbol Symbol, string Title)>> ComputeDownTargetsAsync(
+    internal static async Task<List<(ISymbol Symbol, string Title)>> ComputeDownTargetsAsync(
         ISymbol symbol, string kind, Solution solution, CancellationToken ct)
     {
         var targets = new List<(ISymbol, string)>();

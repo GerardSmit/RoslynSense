@@ -37,7 +37,8 @@ internal static class CodeLensHandler
 
         var root = await document.GetSyntaxRootAsync(ct);
         var text = await document.GetTextAsync(ct);
-        if (root is null)
+        var model = await document.GetSemanticModelAsync(ct);
+        if (root is null || model is null)
             return Array.Empty<LspCodeLens>();
 
         string? projectPath = document.Project.FilePath;
@@ -55,6 +56,41 @@ internal static class CodeLensHandler
                     identifierPosition.Line, identifierPosition.Character, "references"),
             });
 
+            // Inheritance lenses — the clickable counterpart to the gutter arrows (which
+            // VSCode gives no click/hover events for). Up relations are cheap and inline;
+            // down counts (derived/implementations) need workspace queries -> lazy resolve,
+            // and only where results are likely (interfaces, abstract members) to avoid a
+            // wall of "0 overrides".
+            if (model.GetDeclaredSymbol(declaration, ct) is { } symbol)
+            {
+                object[] inheritanceArgs =
+                    [p.TextDocument.Uri, identifierPosition.Line, identifierPosition.Character];
+
+                var upTitles = InheritanceMarkersHandler.ApplicableUpKinds(symbol)
+                    .SelectMany(kind => InheritanceMarkersHandler.ComputeUpTargets(symbol, kind))
+                    .Select(t => t.Title)
+                    .ToList();
+                if (upTitles.Count > 0)
+                {
+                    string title = "↑ " + upTitles[0]
+                        + (upTitles.Count > 1 ? $" (+{upTitles.Count - 1})" : "");
+                    lenses.Add(new LspCodeLens(range, new Command(
+                        title, "roslynSense.showInheritanceAt", inheritanceArgs)));
+                }
+
+                bool likelyHasDown = symbol is INamedTypeSymbol { TypeKind: TypeKind.Interface }
+                    || symbol.ContainingType?.TypeKind == TypeKind.Interface
+                    || symbol.IsAbstract;
+                if (likelyHasDown && InheritanceMarkersHandler.ApplicableDownKind(symbol) is { } downKind)
+                {
+                    lenses.Add(new LspCodeLens(range, Command: null)
+                    {
+                        Data = new CodeLensData(p.TextDocument.Uri,
+                            identifierPosition.Line, identifierPosition.Character, downKind),
+                    });
+                }
+            }
+
             if (declaration is MethodDeclarationSyntax method && IsTestMethod(method)
                 && FullyQualifiedName(method) is { } fqn)
                 lenses.Add(new LspCodeLens(range, new Command(
@@ -63,9 +99,13 @@ internal static class CodeLensHandler
         return lenses.ToArray();
     }
 
-    /// <summary>codeLens/resolve: computes the reference count for one visible lens.</summary>
+    /// <summary>codeLens/resolve: computes the reference count (or inheritance-down count)
+    /// for one visible lens.</summary>
     public static async Task<LspCodeLens> ResolveAsync(LspCodeLens lens, CancellationToken ct)
     {
+        if (lens.Data is { Kind: "derived" or "implemented" or "overridden" } downData)
+            return await ResolveInheritanceDownAsync(lens, downData, ct);
+
         if (lens.Data is not { Kind: "references" } data)
             return lens;
 
@@ -99,6 +139,35 @@ internal static class CodeLensHandler
         {
             Command = new Command(title, "roslynSense.showReferences",
                 [data.Uri, data.Line, data.Character, locations.Take(MaxReferenceLocations).ToArray()]),
+        };
+    }
+
+    private static async Task<LspCodeLens> ResolveInheritanceDownAsync(
+        LspCodeLens lens, CodeLensData data, CancellationToken ct)
+    {
+        object[] args = [data.Uri, data.Line, data.Character];
+        var inert = new Command("", "roslynSense.showInheritanceAt", args);
+
+        var resolved = await HandlerHelpers.ResolveAsync(
+            new TextDocumentIdentifier(data.Uri), new Position(data.Line, data.Character), ct);
+        if (resolved is not var (document, _, offset))
+            return lens with { Command = inert };
+
+        var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
+        if (symbol is null)
+            return lens with { Command = inert };
+
+        var targets = await InheritanceMarkersHandler.ComputeDownTargetsAsync(
+            symbol, data.Kind, document.Project.Solution, ct);
+        string noun = data.Kind switch
+        {
+            "implemented" => targets.Count == 1 ? "implementation" : "implementations",
+            "overridden" => targets.Count == 1 ? "override" : "overrides",
+            _ => "derived",
+        };
+        return lens with
+        {
+            Command = new Command($"↓ {targets.Count} {noun}", "roslynSense.showInheritanceAt", args),
         };
     }
 

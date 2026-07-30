@@ -1,8 +1,11 @@
 import * as vscode from 'vscode';
 import {
+    CloseAction,
+    ErrorAction,
     LanguageClient,
     LanguageClientOptions,
     ServerOptions,
+    State,
     TransportKind,
 } from 'vscode-languageclient/node';
 
@@ -95,14 +98,56 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
         options: { cwd },
     };
 
+    // More generous than the default error handler (which gives up after 5 restarts in a
+    // short window with "Cannot call write after a stream was destroyed"): keep restarting
+    // as long as crashes are not rapid-fire; only a crash loop stops the client, with the
+    // status item offering a manual restart.
+    const restartTimes: number[] = [];
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'csharp' }],
         uriConverters: { code2Protocol, protocol2Code },
         // No client-side file watcher: the server checks file freshness itself on every
         // request (mtime-based), so didChangeWatchedFiles traffic would be redundant.
+        errorHandler: {
+            error: () => ({ action: ErrorAction.Continue }),
+            closed: () => {
+                const now = Date.now();
+                restartTimes.push(now);
+                while (restartTimes.length > 0 && now - restartTimes[0] > 3 * 60_000) {
+                    restartTimes.shift();
+                }
+                if (restartTimes.length > 8) {
+                    if (statusItem) {
+                        statusItem.severity = vscode.LanguageStatusSeverity.Error;
+                        statusItem.text = 'RoslynSense: crashed repeatedly';
+                        statusItem.command = {
+                            title: 'Restart Server',
+                            command: 'roslynSense.restartServer',
+                        };
+                    }
+                    return { action: CloseAction.DoNotRestart };
+                }
+                return { action: CloseAction.Restart };
+            },
+        },
     };
 
     client = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
+    client.onDidChangeState((e) => {
+        if (!statusItem) {
+            return;
+        }
+        if (e.newState === State.Starting) {
+            statusItem.busy = true;
+            statusItem.text = 'RoslynSense: reconnecting';
+        } else if (e.newState === State.Running) {
+            statusItem.busy = false;
+            statusItem.severity = vscode.LanguageStatusSeverity.Information;
+            statusItem.text = solutionPath
+                ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
+                : 'RoslynSense: running';
+        }
+    });
 
     statusItem ??= vscode.languages.createLanguageStatusItem(
         'roslynSense.status', { language: 'csharp' });
@@ -211,6 +256,61 @@ function registerOnAutoInsert(context: vscode.ExtensionContext): void {
     );
 }
 
+async function showInheritanceForLine(line: number | undefined): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!client || !editor || editor.document.languageId !== 'csharp' || line === undefined) {
+        return;
+    }
+    let markers: InheritanceMarker[];
+    try {
+        markers = await client.sendRequest<InheritanceMarker[]>(
+            'roslynSense/inheritanceMarkers',
+            { textDocument: { uri: code2Protocol(editor.document.uri) } }
+        );
+    } catch {
+        return;
+    }
+    const atLine = markers.filter((m) => m.line === line);
+    const items = atLine.flatMap((marker) =>
+        marker.targets.map((t, index) => ({
+            label: `${UP_KINDS.has(marker.kind) ? '$(arrow-up)' : '$(arrow-down)'} ${t.title}`,
+            marker,
+            target: t,
+            index,
+        }))
+    );
+    if (items.length === 0) {
+        void vscode.window.showInformationMessage(
+            'RoslynSense: no inheritance relations on this line.'
+        );
+        return;
+    }
+    const picked =
+        items.length === 1
+            ? items[0]
+            : await vscode.window.showQuickPick(items, { placeHolder: 'Inheritance relations' });
+    if (!picked) {
+        return;
+    }
+    if (picked.target.uri) {
+        await vscode.commands.executeCommand(
+            'roslynSense.openLocation',
+            picked.target.uri,
+            picked.target.line,
+            picked.target.character
+        );
+    } else {
+        await vscode.commands.executeCommand(
+            'roslynSense.openInheritanceTarget',
+            code2Protocol(editor.document.uri),
+            picked.marker.line,
+            picked.marker.character,
+            picked.marker.kind,
+            picked.index
+        );
+    }
+}
+
 function registerLensCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         // CodeLens "▶ Run test": run the test in a terminal via dotnet test --filter.
@@ -262,65 +362,16 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
                 );
             }
         ),
-        // Gutter arrows aren't clickable (no VSCode API for gutter clicks) — this command
-        // (context menu / palette) lists the inheritance targets for the current line.
-        vscode.commands.registerCommand('roslynSense.showInheritance', async () => {
-            const editor = vscode.window.activeTextEditor;
-            if (!client || !editor || editor.document.languageId !== 'csharp') {
-                return;
-            }
-            let markers: InheritanceMarker[];
-            try {
-                markers = await client.sendRequest<InheritanceMarker[]>(
-                    'roslynSense/inheritanceMarkers',
-                    { textDocument: { uri: code2Protocol(editor.document.uri) } }
-                );
-            } catch {
-                return;
-            }
-            const line = editor.selection.active.line;
-            const atLine = markers.filter((m) => m.line === line);
-            const items = atLine.flatMap((marker) =>
-                marker.targets.map((t, index) => ({
-                    label: `${UP_KINDS.has(marker.kind) ? '$(arrow-up)' : '$(arrow-down)'} ${t.title}`,
-                    marker,
-                    target: t,
-                    index,
-                }))
-            );
-            if (items.length === 0) {
-                void vscode.window.showInformationMessage(
-                    'RoslynSense: no inheritance relations on this line.'
-                );
-                return;
-            }
-            const picked =
-                items.length === 1
-                    ? items[0]
-                    : await vscode.window.showQuickPick(items, {
-                          placeHolder: 'Inheritance relations',
-                      });
-            if (!picked) {
-                return;
-            }
-            if (picked.target.uri) {
-                await vscode.commands.executeCommand(
-                    'roslynSense.openLocation',
-                    picked.target.uri,
-                    picked.target.line,
-                    picked.target.character
-                );
-            } else {
-                await vscode.commands.executeCommand(
-                    'roslynSense.openInheritanceTarget',
-                    code2Protocol(editor.document.uri),
-                    picked.marker.line,
-                    picked.marker.character,
-                    picked.marker.kind,
-                    picked.index
-                );
-            }
-        }),
+        // Inheritance list for a line: invoked by the inheritance CodeLens, the editor
+        // context menu, and Ctrl+Alt+U (gutter arrows themselves aren't clickable —
+        // no VSCode API for gutter clicks).
+        vscode.commands.registerCommand('roslynSense.showInheritance', () =>
+            showInheritanceForLine(vscode.window.activeTextEditor?.selection.active.line)
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.showInheritanceAt',
+            (_uri: string, line: number) => showInheritanceForLine(line)
+        ),
         // Gutter marker link for a metadata target: server decompiles and returns a location.
         vscode.commands.registerCommand(
             'roslynSense.openInheritanceTarget',

@@ -296,6 +296,11 @@ public static class NuGetService
         string successMessage,
         CancellationToken ct)
     {
+        // Splitting an empty list leaves both halves empty, which would otherwise read as
+        // "everything succeeded" rather than "nothing was selected".
+        if (projectPaths.Count == 0)
+            return new PackageOperationResult(false, "No project selected.");
+
         var legacyProjects = projectPaths.Where(PackagesConfigService.Uses).ToList();
         var modernProjects = projectPaths.Except(legacyProjects, StringComparer.OrdinalIgnoreCase).ToList();
 

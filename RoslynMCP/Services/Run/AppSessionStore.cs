@@ -39,6 +39,14 @@ public sealed class AppSession : IDisposable
     public int? Port { get; init; }
     public DebugRuntime DebugRuntime { get; init; }
 
+    /// <summary>The command this session started, quoted so it can be pasted into a shell.</summary>
+    public string CommandLine =>
+        string.Join(' ', new[] { Quote(Process.StartInfo.FileName) }
+            .Concat(Process.StartInfo.ArgumentList.Select(Quote)));
+
+    private static string Quote(string value) =>
+        value.Contains(' ') ? $"\"{value}\"" : value;
+
     public AppSessionState State { get; private set; } = AppSessionState.Starting;
     public int? ExitCode { get; private set; }
     public DateTime? EndedAtUtc { get; private set; }

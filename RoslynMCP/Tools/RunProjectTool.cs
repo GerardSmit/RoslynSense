@@ -198,6 +198,21 @@ public static class RunProjectTool
             return sb.ToString();
         }
 
+        // A launched app belongs to the process that started it and is killed when that process
+        // exits. In a chat that is the whole conversation; from the one-shot CLI it is the next
+        // few milliseconds, so the session handles below would name something already dead.
+        if (CliRunner.IsOneShot)
+        {
+            sb.AppendLine(
+                "**This was started from `--cli`, which exits immediately — the app is being " +
+                "stopped with it.** Run it from an MCP session, or start it yourself with:");
+            sb.AppendLine();
+            sb.AppendLine("```");
+            sb.AppendLine($"{session.CommandLine}");
+            sb.AppendLine("```");
+            return sb.ToString();
+        }
+
         fmt.AppendHints(sb,
             $"Use GetProjectOutput with '{session.Id}' to read its output",
             $"Use StopProject with '{session.Id}' when finished",

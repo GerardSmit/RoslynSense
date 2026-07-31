@@ -28,6 +28,16 @@ namespace RoslynMCP;
 /// </summary>
 internal static class CliRunner
 {
+    /// <summary>
+    /// Whether this process is a one-shot CLI invocation rather than a long-lived MCP session.
+    /// </summary>
+    /// <remarks>
+    /// Tools that start something meant to outlive the call — a web app, a debug session — have
+    /// to know: everything launched dies with this process, so promising a handle to stop later
+    /// would be a lie.
+    /// </remarks>
+    public static bool IsOneShot { get; private set; }
+
     // DI-injected parameter types that the runner provides automatically.
     private static readonly HashSet<Type> s_diTypes =
     [
@@ -54,6 +64,8 @@ internal static class CliRunner
 
     public static async Task<int> RunAsync(string[] args)
     {
+        IsOneShot = true;
+
         // --cli --help  →  list all tools
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {

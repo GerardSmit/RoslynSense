@@ -213,6 +213,47 @@ internal sealed class LspServer : IDisposable
     public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
         Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
 
+    // ---- Packages -----------------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/nuget/search", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageSummaryDto[]> NuGetSearch(Handlers.NuGetSearchParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.SearchAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/versions", UseSingleObjectParameterDeserialization = true)]
+    public Task<IReadOnlyList<string>> NuGetVersions(Handlers.NuGetVersionsParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.VersionsAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/installed")]
+    public Task<Handlers.ProjectPackagesDto[]> NuGetInstalled(CancellationToken ct) =>
+        Handlers.NuGetHandler.InstalledAsync(ct);
+
+    [JsonRpcMethod("roslynSense/nuget/updates", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageSummaryDto[]> NuGetUpdates(Handlers.NuGetUpdatesParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.UpdatesAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/consolidations")]
+    public Task<Handlers.ConsolidationDto[]> NuGetConsolidations(CancellationToken ct) =>
+        Handlers.NuGetHandler.ConsolidationsAsync(ct);
+
+    [JsonRpcMethod("roslynSense/nuget/sources")]
+    public string[] NuGetSources() => Handlers.NuGetHandler.Sources();
+
+    [JsonRpcMethod("roslynSense/nuget/install", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageOperationDto> NuGetInstall(Handlers.NuGetOperationParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.InstallAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/update", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageOperationDto> NuGetUpdate(Handlers.NuGetOperationParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.InstallAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/uninstall", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageOperationDto> NuGetUninstall(Handlers.NuGetOperationParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.UninstallAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/consolidate", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageOperationDto> NuGetConsolidate(Handlers.NuGetOperationParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.ConsolidateAsync(p, ct);
+
     // ---- Tests ------------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/testProjects")]

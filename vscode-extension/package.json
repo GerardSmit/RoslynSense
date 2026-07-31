@@ -173,6 +173,35 @@
     "breakpoints": [
       { "language": "csharp" }
     ],
+    "taskDefinitions": [
+      {
+        "type": "roslynsense",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "type": "string",
+            "enum": [
+              "build",
+              "rebuild",
+              "clean",
+              "test",
+              "watch"
+            ],
+            "description": "What to run."
+          },
+          "project": {
+            "type": "string",
+            "description": "Project or solution path. Omit for the whole solution."
+          },
+          "configuration": {
+            "type": "string",
+            "default": "Debug"
+          }
+        }
+      }
+    ],
     "debuggers": [
       {
         "type": "roslynsense",

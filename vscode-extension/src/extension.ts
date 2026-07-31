@@ -12,6 +12,7 @@ import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
 import { registerTestController, runTestById } from './testController';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerNuGetPanel } from './nugetPanel';
+import { registerTaskProvider } from './taskProvider';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -1660,6 +1661,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerTestController(context, () => client);
     registerSolutionExplorer(context, () => client);
     registerNuGetPanel(context, () => client);
+    registerTaskProvider(context, () => client);
 
     await startClient(context);
 }

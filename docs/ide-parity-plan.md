@@ -70,7 +70,11 @@ deliberately out of scope here.
 | T2.3 `$/progress` · T2.4 refresh fan-out | Done |
 | T1.2 native F5 (netcoredbg DAP) | Done |
 | T1.3 Test Explorer | Done |
-| Everything below | Not started |
+| T2.8–T2.10 snippets, token modifiers, user-visible messages | Done |
+| T2.1 Solution Explorer | Done server-side and client-side; search/reveal endpoints, drag-drop, add/delete/rename, and generated-file nodes still open |
+| T2.2 NuGet panel | Webview done; the whole `NuGetService` server side is still open |
+| T2.5 build tasks | Done (task provider + `$msCompile`); build-error DiagnosticCollection ships with T1.2's launch path |
+| Everything else | Not started |
 
 Notes from implementation, kept because they change what the remaining work can assume:
 

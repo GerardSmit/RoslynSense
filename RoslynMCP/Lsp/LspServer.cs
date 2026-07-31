@@ -218,6 +218,25 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/attachTargets")]
     public AttachTarget[] AttachTargets() => Handlers.LaunchHandler.AttachTargets();
 
+    // ---- Hot reload ---------------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/hotReloadStart", UseSingleObjectParameterDeserialization = true)]
+    public Task<HotReloadResultDto> HotReloadStart(HotReloadParams p, CancellationToken ct) =>
+        Handlers.HotReloadHandler.StartAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/hotReloadApply", UseSingleObjectParameterDeserialization = true)]
+    public Task<HotReloadResultDto> HotReloadApply(HotReloadParams p, CancellationToken ct) =>
+        Handlers.HotReloadHandler.ApplyAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/hotReloadStop", UseSingleObjectParameterDeserialization = true)]
+    public HotReloadResultDto HotReloadStop(HotReloadParams p) => Handlers.HotReloadHandler.Stop(p);
+
+    [JsonRpcMethod("roslynSense/hotReloadStatus")]
+    public HotReloadStatusDto HotReloadStatus() => Handlers.HotReloadHandler.Status();
+
+    [JsonRpcMethod("roslynSense/hotReloadEnvironment")]
+    public HotReloadEnvironmentDto HotReloadEnvironment() => Handlers.HotReloadHandler.Environment();
+
     // ---- Solution Explorer --------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/solutionTree", UseSingleObjectParameterDeserialization = true)]

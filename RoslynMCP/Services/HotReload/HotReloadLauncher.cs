@@ -1,0 +1,63 @@
+using System.Diagnostics;
+
+namespace RoslynMCP.Services.HotReload;
+
+/// <summary>
+/// Prepares a process to accept hot reload, which has to happen before it starts.
+/// </summary>
+/// <remarks>
+/// Both settings are start-time only. <c>DOTNET_MODIFIABLE_ASSEMBLIES</c> tells the runtime to
+/// load assemblies in a form that can be updated at all — set it afterwards and every apply is
+/// accepted and silently does nothing. <c>DOTNET_STARTUP_HOOKS</c> is read once during startup, so
+/// the agent has to be listed there rather than injected later. This is the whole reason hot
+/// reload is a launch option and not something that can be switched on for a running app.
+/// </remarks>
+internal static class HotReloadLauncher
+{
+    /// <summary>Where the agent is published, beside the tool like the debug workers.</summary>
+    private const string AgentDirectory = "hotreload";
+
+    private const string AgentFileName = "RoslynMCP.HotReloadAgent.dll";
+
+    /// <summary>Locates the agent assembly, or null when the tool was built without it.</summary>
+    public static string? FindAgent()
+    {
+        foreach (var root in new[] { AppContext.BaseDirectory, Path.GetDirectoryName(Environment.ProcessPath) })
+        {
+            if (string.IsNullOrEmpty(root))
+                continue;
+
+            string candidate = Path.Combine(root, AgentDirectory, AgentFileName);
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Adds the agent to a launch, leaving any startup hook the user already configured in place.
+    /// </summary>
+    /// <returns>Whether hot reload will be available in the launched process.</returns>
+    public static bool Inject(ProcessStartInfo startInfo)
+    {
+        if (FindAgent() is not { } agent)
+            return false;
+
+        startInfo.Environment["DOTNET_MODIFIABLE_ASSEMBLIES"] = "debug";
+        startInfo.Environment[HotReloadAgentServer.PipeVariableName] =
+            HotReloadAgentServer.Instance.PipeName;
+
+        // Appending rather than assigning: a project may already run a hook of its own, and
+        // replacing it would change how the app starts.
+        string existing = startInfo.Environment.TryGetValue("DOTNET_STARTUP_HOOKS", out string? hooks)
+            ? hooks ?? ""
+            : Environment.GetEnvironmentVariable("DOTNET_STARTUP_HOOKS") ?? "";
+
+        startInfo.Environment["DOTNET_STARTUP_HOOKS"] = existing.Length == 0
+            ? agent
+            : $"{existing}{Path.PathSeparator}{agent}";
+
+        return true;
+    }
+}

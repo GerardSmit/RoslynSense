@@ -449,6 +449,24 @@ internal sealed class IcorDebugBackend : IDebugBackend
         Task.FromResult(
             "The .NET Framework engine cannot suspend a running target. Set a breakpoint instead.");
 
+    /// <summary>
+    /// Applies one hot reload delta to a module loaded in the debuggee.
+    /// </summary>
+    /// <remarks>
+    /// This is the only route onto the desktop runtime: .NET Framework has no in-process metadata
+    /// updater, so the edit has to go through the debugger that is already attached. The engine
+    /// enabled EnC JIT flags on every module as it loaded, which is what makes the apply possible
+    /// at all — a module JITted without them refuses the change.
+    /// </remarks>
+    public Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, CancellationToken cancellationToken = default)
+    {
+        if (_engine is null)
+            return Task.FromResult((false, "No .NET Framework debug session is attached."));
+
+        return _engine.ApplyDeltaAsync(assemblyName, metadata, il);
+    }
+
     /// <summary>Reads the type out of a <c>Type: message</c> event line.</summary>
     private static string ExceptionTypeOf(string message)
     {

@@ -27,7 +27,7 @@ public sealed class WorkerRequest
     public int Id { get; set; }
 
     /// <summary>One of: attach, launch, addBreakpoint, removeBreakpoint, continue, step,
-    /// stackTrace, variables, evaluate, setVariable, terminate.</summary>
+    /// stackTrace, variables, evaluate, setVariable, applyDelta, terminate.</summary>
     public string Op { get; set; } = "";
 
     public int Pid { get; set; }
@@ -45,6 +45,11 @@ public sealed class WorkerRequest
     public List<string>? Arguments { get; set; }
     public Dictionary<string, string>? Environment { get; set; }
     public string? WorkingDirectory { get; set; }
+
+    /// <summary>Hot reload deltas. Base64 in transit because the protocol is line-delimited JSON;
+    /// they are small (one method's IL), so the encoding cost does not matter.</summary>
+    public string? MetadataDelta { get; set; }
+    public string? IlDelta { get; set; }
 }
 
 public sealed class WorkerResponse

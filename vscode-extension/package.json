@@ -177,6 +177,16 @@
         "command": "roslynSense.runWithHotReload",
         "title": "Run with Hot Reload",
         "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.applyHotReload",
+        "title": "Apply Hot Reload",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.stopHotReload",
+        "title": "Stop Hot Reload Session",
+        "category": "RoslynSense"
       }
     ],
     "viewsContainers": {
@@ -528,6 +538,11 @@
           ],
           "default": "off",
           "description": "Trace LSP communication between VSCode and roslyn-sense."
+        },
+        "roslynSense.hotReload.applyOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Apply saved C# edits to the running application without restarting it. Rude edits (signature changes, new generic methods) are reported instead and still need a restart."
         }
       }
     }

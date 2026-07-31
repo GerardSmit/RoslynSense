@@ -21,7 +21,8 @@ public sealed class AppRunService(AppSessionStore store)
         string configuration,
         string? launchProfile,
         IReadOnlyDictionary<string, string>? environment,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool hotReload = false)
     {
         var spec = RunConfigResolver.Resolve(projectPath, configuration, launchProfile, environment);
         if (!spec.CanRun)
@@ -51,6 +52,9 @@ public sealed class AppRunService(AppSessionStore store)
             startInfo.ArgumentList.Add(argument);
         foreach (var pair in spec.Environment)
             startInfo.Environment[pair.Key] = pair.Value;
+
+        if (hotReload && spec.DebugRuntime != DebugRuntime.NetFramework)
+            HotReload.HotReloadLauncher.Inject(startInfo);
 
         var session = new AppSession
         {

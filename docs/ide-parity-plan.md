@@ -80,14 +80,14 @@ deliberately out of scope here.
 | T3.1 structured debug data | Done (`StackFrameInfo`/`VariableInfo`/`ThreadInfo`, lazy child expansion, both engines) |
 | T3.2 AI mirror fidelity | Done (real stacks, variable trees, pause, terminate, setVariable, exception filters and info) |
 | T3.3 hit counts and logpoints | Done — emulated in `PublishingDebugBackend`; unavailable in the native session, as netcoredbg advertises neither |
-| T3.4 data breakpoints | Out of scope by decision |
+| T3.4 data breakpoints | Done — emulated by step-and-compare in `DataBreakpointWatcher`, on both runtimes; `write` access only |
 | TM.5 debugger tools | Done (`debug_pause`, `debug_select_frame`, `debug_expand`, `debug_set_variable`) |
 | TM.2 project and package mutation | Done (packages via `NuGetService`; references, add/delete file, create project, add to solution via `ProjectMutationService`) |
 | TM.4 structured tests and formatting | Done (`get_test_failures` over a recorded run history, `format_document`, `rename_file`) |
 | T2.11 multi-root | Done — solution bound per workspace folder, one client per solution, binding follows the focused editor |
 | T2.12 metadata as source | Done — one `roslynSense/virtualDocument` resolver behind `roslynsense-generated:` and `roslynsense-metadata:`, plus generated-file nodes in the tree |
 | T3.5 .NET Framework debugging | Done — `roslyn-sense --dap` serves DAP over the ICorDebug backend; the extension selects it for Framework targets |
-| T3.6 Hot Reload | Deferred by decision: `dotnet watch`, not EnC against netcoredbg |
+| T3.6 Hot Reload | Done — real EnC: Roslyn deltas applied in-process on CoreCLR (`RoslynMCP.HotReloadAgent`) and through `ICorDebugModule2::ApplyChanges` on .NET Framework |
 
 Notes from implementation, kept because they change what the remaining work can assume:
 
@@ -908,11 +908,34 @@ netcoredbg gains them:
 - Both are implemented once in the backend decorator and therefore work for MCP tools and the mirror
   adapter alike. Document clearly that the native `roslynsense` session does not support them yet.
 
-## T3.4 Data breakpoints
+## T3.4 Data breakpoints — implemented by emulation
 
-Not supported by netcoredbg and not expressible over MI. Out of scope; record the decision so it is
-not re-litigated. (ICorDebug could technically support them for .NET Framework via
-`ICorDebugProcess::SetWriteWatchPoint`-style tricks, but the cost/benefit is poor.)
+The original entry called this out of scope because no engine exposes a watchpoint: netcoredbg has
+no `setDataBreakpoints` and nothing in MI expresses one, and ICorDebug's value breakpoints are not
+honored by any current runtime. That is still true, and it is beside the point — the capability
+does not have to come from the engine.
+
+`DataBreakpointWatcher` builds it out of the two operations both engines *do* have: step, and
+evaluate. Continue becomes a step-and-compare walk; the walk stops on the statement after a watched
+expression reads back differently. This lands the same way on both runtimes because it sits in
+`PublishingDebugBackend`, above the engine choice, so it covers CoreCLR (netcoredbg over MI) and
+.NET Framework (ICorDebug) with one implementation, and reaches the MCP tools, the AI mirror
+adapter, and the Framework DAP server at once.
+
+Three consequences are reported rather than hidden:
+
+- **Only `write`.** A read leaves the value alone, so comparing values cannot see one.
+  `dataBreakpointInfo` advertises `["write"]` and a `read` request comes back unverified with the
+  reason.
+- **The stop is one statement late.** A change can only be observed once it has happened.
+- **It is slow, and only while armed.** A debugger round trip per statement, bounded by
+  `StepBudget`; with no watch set, continue is an ordinary continue.
+
+An expression that stops resolving — the walk stepped into a callee — is skipped rather than read
+as a change, so a write inside a callee surfaces on return instead of stopping on every call.
+
+Surface: `dataBreakpointInfo` / `setDataBreakpoints` in `DapServer` and in `AiDebugAdapter`, plus
+`DebugWatchValue` / `DebugUnwatchValues` for the AI.
 
 ## T3.5 .NET Framework native debugging
 
@@ -922,17 +945,40 @@ debugger type can select it when `isNetFramework` is true, giving the user real 
 projects too. This is the largest single item in Tier 3 and should be scheduled last; T1.2 ships
 with a clear "Framework projects: use the AI session" message until then.
 
-## T3.6 Hot Reload — scope decision
+## T3.6 Hot Reload — implemented as real Edit-and-Continue
 
-True Edit-and-Continue requires Roslyn's EnC delta emission plus a managed apply agent in the target
-process, and netcoredbg has no EnC support at all. Recommendation:
+The earlier recommendation was to ship `dotnet watch` instead of EnC, on the grounds that netcoredbg
+has no EnC support. The premise was sound and the conclusion did not follow: **the debugger is not
+involved on CoreCLR at all.** `MetadataUpdater.ApplyUpdate` changes a loaded assembly from inside
+the process, which is what `dotnet watch` itself uses, so hot reload works on an app that is merely
+running — which is the case that matters for the inner loop. Nothing about it needs netcoredbg.
 
-- **Do not** attempt EnC against netcoredbg.
-- Ship `dotnet watch` integration instead: a `roslynsense: watch` task and a "Run with Hot Reload"
-  command that starts `dotnet watch run` and surfaces its rude-edit/restart output. This covers the
-  ASP.NET inner loop, which is where hot reload actually pays off.
-- Revisit real EnC only if/when we own the adapter end to end (T3.5's DAP server is the natural
-  place, since ICorDebug does expose `ICorDebugModule2::ApplyChanges`).
+Three pieces:
+
+1. **Delta computation** — `HotReloadService` over `UnitTestingHotReloadService`, the supported
+   entry point into Roslyn's EnC engine (the same one behind Visual Studio's Apply Code Changes).
+   `StartSessionAsync` captures the built output as the baseline; `EmitSolutionUpdateAsync` returns
+   per-module metadata/IL/PDB deltas plus the diagnostics for anything it refuses. Rude edits are
+   therefore decided by the compiler that would have to emit them, not guessed at. Updates are
+   committed as emitted, so the next apply diffs against the last one rather than the original
+   build. Capabilities come from the running runtime (intersection across connected apps) so an
+   unapplicable edit is reported at the keyboard rather than at apply time.
+
+2. **CoreCLR apply** — `RoslynMCP.HotReloadAgent`, a dependency-free `net6.0` startup hook injected
+   through `DOTNET_STARTUP_HOOKS`, connecting back over a named pipe and calling `ApplyUpdate`.
+   Deltas are addressed by MVID, not assembly name, so a name loaded into two contexts cannot be
+   corrupted by applying to the wrong one. `DOTNET_MODIFIABLE_ASSEMBLIES=debug` and the hook list
+   are both start-time only, which is why hot reload is a launch option (`RunProject hotReload=true`,
+   or automatically for a `roslynsense` F5 session) rather than something switchable later.
+
+3. **.NET Framework apply** — `ICorDebugModule2::ApplyChanges` through the engine this repo already
+   owns; the EnC JIT flags were already being set on every module as it loaded. The session can be
+   in another process (the editor's `--dap`, or an AI client), so the delta travels over the same
+   command pipe the debug bridge uses, via a new `apply_delta` action.
+
+Surface: `roslynSense/hotReload{Start,Apply,Stop,Status,Environment}`, the `ApplyHotReload` /
+`StopHotReload` MCP tools, and `Apply Hot Reload` plus `roslynSense.hotReload.applyOnSave` in the
+extension. Rude edits are published as diagnostics with file and line, with a Restart action.
 
 ---
 

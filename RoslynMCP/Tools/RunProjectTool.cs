@@ -36,6 +36,9 @@ public static class RunProjectTool
         string? environment = null,
         [Description("Build before launching. Defaults to true; set false to launch existing output.")]
         bool build = true,
+        [Description("Start the app so ApplyHotReload can patch it later without a restart. " +
+                     "Has to be decided here: the runtime reads the settings only at startup.")]
+        bool hotReload = false,
         CancellationToken cancellationToken = default)
     {
         try
@@ -59,12 +62,13 @@ public static class RunProjectTool
             }
 
             var outcome = await runner.StartAsync(
-                resolved, configuration, profile, ParseEnvironment(environment), cancellationToken);
+                resolved, configuration, profile, ParseEnvironment(environment), cancellationToken,
+                hotReload);
 
             if (!outcome.Succeeded)
                 return $"Error: {outcome.Error}";
 
-            return Describe(outcome.Session!, fmt);
+            return Describe(outcome.Session!, fmt, hotReload);
         }
         catch (OperationCanceledException)
         {
@@ -176,7 +180,7 @@ public static class RunProjectTool
         return resolved is null ? [] : [.. store.LiveFor(resolved)];
     }
 
-    private static string Describe(AppSession session, IOutputFormatter fmt)
+    private static string Describe(AppSession session, IOutputFormatter fmt, bool hotReload = false)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"# Started {Path.GetFileNameWithoutExtension(session.ProjectPath)} — session `{session.Id}`");
@@ -185,6 +189,13 @@ public static class RunProjectTool
         if (session.Url is not null)
             sb.AppendLine($"- **URL**: {session.Url}");
         sb.AppendLine($"- **Runtime**: {(session.DebugRuntime == DebugRuntime.NetFramework ? ".NET Framework" : "CoreCLR")}");
+        if (hotReload)
+        {
+            sb.AppendLine(session.DebugRuntime == DebugRuntime.NetFramework
+                ? "- **Hot reload**: unavailable — .NET Framework applies edits through a debug " +
+                  "session, so use DebugAttach and then ApplyHotReload"
+                : "- **Hot reload**: enabled — use ApplyHotReload after editing");
+        }
         sb.AppendLine();
 
         // A process that is already gone means startup failed; its output is the diagnosis.

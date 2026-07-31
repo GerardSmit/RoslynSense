@@ -15,6 +15,7 @@ import { registerVirtualDocuments } from './virtualDocuments';
 import { registerNuGetPanel } from './nugetPanel';
 import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
+import { registerHotReload } from './hotReload';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -1293,9 +1294,10 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                     supportsTerminateRequest: true,
                     supportTerminateDebuggee: false,
                     supportsConditionalBreakpoints: true,
-                    // Both are emulated server-side; neither engine implements them.
+                    // All three are emulated server-side; neither engine implements them.
                     supportsHitConditionalBreakpoints: true,
                     supportsLogPoints: true,
+                    supportsDataBreakpoints: true,
                     supportsExceptionInfoRequest: true,
                     supportsExceptionFilterOptions: true,
                     exceptionBreakpointFilters: [
@@ -1476,8 +1478,15 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 const session = await this.currentSession();
                 if (session?.state === 'stopped') {
                     this.lastState = 'stopped';
+                    // A watched value changing outranks the reason the resume started with: the
+                    // user pressed Continue, but the watch is what stopped them.
+                    const hit = await this.structured<{ description: string }>('data_hit');
                     this.event('stopped', {
-                        reason: session.reason ?? (action === 'continue' ? 'breakpoint' : 'step'),
+                        reason: hit
+                            ? 'data breakpoint'
+                            : session.reason ?? (action === 'continue' ? 'breakpoint' : 'step'),
+                        description: hit?.description,
+                        text: hit?.description,
                         threadId: 1,
                         allThreadsStopped: true,
                     });
@@ -1535,6 +1544,49 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                     verified.push({ verified: result.ok, line: bp.line });
                 }
                 this.respond(request, { breakpoints: verified });
+                return;
+            }
+
+            case 'dataBreakpointInfo': {
+                // The id has to survive a round trip through VSCode, so it carries the frame the
+                // name was read in rather than a handle the server would have to remember.
+                const name: string = request.arguments?.name ?? '';
+                const frameId: number = request.arguments?.frameId ?? 0;
+                this.respond(request, name.length === 0
+                    ? { dataId: null, description: 'Break on value change needs a named value.' }
+                    : {
+                        dataId: `${frameId}:${name}`,
+                        description: `${name} (break when the value changes)`,
+                        // A read leaves the value alone, so it cannot be seen by comparing one.
+                        accessTypes: ['write'],
+                        canPersist: false,
+                    });
+                return;
+            }
+
+            case 'setDataBreakpoints': {
+                const wanted: { dataId: string; accessType?: string; condition?: string; hitCondition?: string }[] =
+                    request.arguments?.breakpoints ?? [];
+
+                const result = await this.command('set_data_breakpoints', {
+                    dataBreakpoints: wanted.map((bp) => ({
+                        dataId: bp.dataId,
+                        expression: bp.dataId.slice(bp.dataId.indexOf(':') + 1),
+                        accessType: bp.accessType ?? 'write',
+                        condition: bp.condition,
+                        hitCondition: bp.hitCondition,
+                    })),
+                });
+
+                const statuses = result.ok
+                    ? parseJson<{ verified: boolean; message: string }[]>(result.result) ?? []
+                    : [];
+                this.respond(request, {
+                    breakpoints: wanted.map((_, i) => ({
+                        verified: statuses[i]?.verified ?? false,
+                        message: statuses[i]?.message || undefined,
+                    })),
+                }, result.ok, result.ok ? undefined : result.result);
                 return;
             }
 
@@ -1898,6 +1950,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerVirtualDocuments(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
+    registerHotReload(context, () => client);
     registerEditorContext(
         context,
         () => client,

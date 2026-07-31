@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
+import { withHotReloadEnvironment } from './hotReload';
 
 /**
  * Build/rebuild/clean/test/watch tasks per project, so `preLaunchTask`, `Ctrl+Shift+B`, and
@@ -163,12 +164,25 @@ export function registerTaskProvider(
                     projects.map((p) => ({ label: p.projectName, description: p.projectPath, project: p })),
                     { title: 'Run with Hot Reload' }))?.project;
 
-            if (picked) {
-                await vscode.tasks.executeTask(makeTask(
-                    { type: TASK_TYPE, task: 'watch', project: picked.projectPath },
-                    `watch ${picked.projectName}`,
-                    ['watch', '--project', picked.projectPath, 'run']));
+            if (!picked) {
+                return;
             }
+
+            // `dotnet run` rather than `dotnet watch`: the deltas come from Roslyn through
+            // roslynSense/hotReloadApply, so the process only has to be started in a state that
+            // accepts them. Watch would rebuild and restart, which is the thing hot reload avoids.
+            const task = makeTask(
+                { type: TASK_TYPE, task: 'watch', project: picked.projectPath },
+                `run ${picked.projectName} (hot reload)`,
+                ['run', '--project', picked.projectPath]);
+
+            task.execution = new vscode.ShellExecution(
+                'dotnet',
+                ['run', '--project', picked.projectPath].map(
+                    (arg) => ({ value: arg, quoting: vscode.ShellQuoting.Strong })),
+                { env: await withHotReloadEnvironment(client, {}) });
+
+            await vscode.tasks.executeTask(task);
         })
     );
 }

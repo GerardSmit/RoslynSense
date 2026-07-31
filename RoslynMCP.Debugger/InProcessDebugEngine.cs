@@ -39,6 +39,9 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
         uint frameIndex, string name, string value) =>
         _session.SetVariableAsync(frameIndex, name, value);
 
+    public Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il) =>
+        _session.ApplyDeltaAsync(assemblyName, metadata, il);
+
     public void Terminate() => _session.Terminate();
 
     public void Dispose() => _session.Terminate();

@@ -45,6 +45,18 @@
         <None Include="Fixtures\**\*" Exclude="Fixtures\**\obj\**\*;Fixtures\**\bin\**\*" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
+    <!--
+      The hot reload agent is a payload beside the tool rather than a referenced assembly, so a
+      ProjectReference does not bring it along. The tests assert it is findable, which is exactly
+      the thing that would otherwise break silently in a package.
+    -->
+    <Target Name="CopyHotReloadAgentForTests" AfterTargets="Build">
+      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)">
+        <Output TaskParameter="TargetOutputs" ItemName="_HotReloadAgentForTests" />
+      </MSBuild>
+      <Copy SourceFiles="@(_HotReloadAgentForTests)" DestinationFolder="$(OutputPath)hotreload" SkipUnchangedFiles="true" />
+    </Target>
+
     <Target Name="PrepareFixtureProjects" BeforeTargets="BeforeBuild">
         <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />

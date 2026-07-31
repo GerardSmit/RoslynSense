@@ -41,6 +41,16 @@ public interface IDebugEngine : IDisposable
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(
         uint frameIndex, string name, string value);
 
+    /// <summary>
+    /// Applies one Edit-and-Continue delta to a loaded module, by simple assembly name.
+    /// </summary>
+    /// <remarks>
+    /// This is how hot reload reaches .NET Framework. CoreCLR has an in-process updater and needs
+    /// no debugger at all; the desktop runtime has only <c>ICorDebugModule2::ApplyChanges</c>, so
+    /// the app must already be under this engine for an edit to land.
+    /// </remarks>
+    Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il);
+
     void Terminate();
 }
 

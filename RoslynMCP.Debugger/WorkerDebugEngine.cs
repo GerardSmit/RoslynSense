@@ -263,6 +263,26 @@ public sealed class WorkerDebugEngine : IDebugEngine
         }
     }
 
+    public async Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il)
+    {
+        try
+        {
+            await SendAsync(new WorkerRequest
+            {
+                Op = "applyDelta",
+                Name = assemblyName,
+                MetadataDelta = Convert.ToBase64String(metadata),
+                IlDelta = Convert.ToBase64String(il),
+            });
+
+            return (true, "");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
     public void Terminate()
     {
         try { Send(new WorkerRequest { Op = "terminate" }); } catch { }

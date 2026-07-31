@@ -113,6 +113,30 @@
       </ItemGroup>
     </Target>
 
+    <!--
+      The hot reload agent is injected into the *user's* process through DOTNET_STARTUP_HOOKS, so
+      it is shipped as a payload rather than referenced: nothing here calls into it, and it targets
+      net6.0 so one build loads on every runtime a user's app might be on.
+    -->
+    <Target Name="CopyHotReloadAgent" AfterTargets="Build">
+      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)">
+        <Output TaskParameter="TargetOutputs" ItemName="_HotReloadAgentOutput" />
+      </MSBuild>
+      <Copy SourceFiles="@(_HotReloadAgentOutput)" DestinationFolder="$(OutputPath)hotreload" SkipUnchangedFiles="true" />
+    </Target>
+
+    <Target Name="AddHotReloadAgentToPublish" AfterTargets="ComputeFilesToPublish">
+      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)">
+        <Output TaskParameter="TargetOutputs" ItemName="_HotReloadAgentPublish" />
+      </MSBuild>
+      <ItemGroup>
+        <ResolvedFileToPublish Include="@(_HotReloadAgentPublish)">
+          <RelativePath>hotreload\%(Filename)%(Extension)</RelativePath>
+          <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </ResolvedFileToPublish>
+      </ItemGroup>
+    </Target>
+
     <ItemGroup>
       <ProjectReference Include="..\WebFormsCore.Parser\WebFormsCore.Parser.csproj" />
       <ProjectReference Include="..\RoslynMCP.Debugger\RoslynMCP.Debugger.csproj" />

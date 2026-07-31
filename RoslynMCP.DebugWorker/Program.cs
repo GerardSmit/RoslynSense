@@ -175,6 +175,17 @@ internal static class Program
                     break;
                 }
 
+                case "applyDelta":
+                {
+                    var (ok, error) = await session.ApplyDeltaAsync(
+                        request.Name ?? "",
+                        Convert.FromBase64String(request.MetadataDelta ?? ""),
+                        Convert.FromBase64String(request.IlDelta ?? ""));
+                    response.Ok = ok;
+                    response.Error = error;
+                    break;
+                }
+
                 case "terminate":
                     session.Terminate();
                     break;

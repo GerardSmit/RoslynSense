@@ -21,6 +21,13 @@ interface LaunchTarget {
     projectPath: string;
     projectName: string;
     runnable: boolean;
+    isNetFramework: boolean;
+}
+
+interface ToolchainInfo {
+    msbuildPath: string;
+    hasDesktopClr: boolean;
+    iisExpressPath: string | null;
 }
 
 export function registerTaskProvider(
@@ -43,18 +50,35 @@ export function registerTaskProvider(
                     return [];
                 }
 
+                const msbuild = projects.some((p) => p.isNetFramework)
+                    ? (await fetchToolchain(client))?.msbuildPath
+                    : undefined;
+
                 const tasks: vscode.Task[] = [];
                 for (const project of projects) {
+                    // The dotnet CLI cannot build a non-SDK project; those need Visual Studio's
+                    // MSBuild, which the server locates.
+                    const legacy = project.isNetFramework && msbuild ? msbuild : undefined;
+
                     tasks.push(
                         makeTask({ type: TASK_TYPE, task: 'build', project: project.projectPath },
                             `build ${project.projectName}`,
-                            ['build', project.projectPath, '--nologo']),
+                            legacy
+                                ? [project.projectPath, '/nologo', '/v:minimal']
+                                : ['build', project.projectPath, '--nologo'],
+                            legacy),
                         makeTask({ type: TASK_TYPE, task: 'rebuild', project: project.projectPath },
                             `rebuild ${project.projectName}`,
-                            ['build', project.projectPath, '--no-incremental', '--nologo']),
+                            legacy
+                                ? [project.projectPath, '/nologo', '/v:minimal', '/t:Rebuild']
+                                : ['build', project.projectPath, '--no-incremental', '--nologo'],
+                            legacy),
                         makeTask({ type: TASK_TYPE, task: 'clean', project: project.projectPath },
                             `clean ${project.projectName}`,
-                            ['clean', project.projectPath, '--nologo'])
+                            legacy
+                                ? [project.projectPath, '/nologo', '/t:Clean']
+                                : ['clean', project.projectPath, '--nologo'],
+                            legacy)
                     );
 
                     // Hot reload for the ASP.NET inner loop. Real Edit-and-Continue is not on
@@ -71,13 +95,33 @@ export function registerTaskProvider(
             },
 
             // Called for a task the user wrote in tasks.json: fill in the execution.
-            resolveTask(task) {
+            async resolveTask(task) {
                 const definition = task.definition as TaskDefinition;
                 if (!definition.task) {
                     return undefined;
                 }
                 const target = definition.project ?? '';
                 const configuration = definition.configuration ?? 'Debug';
+
+                const client = getClient();
+                const legacy = client && target
+                    ? await msbuildFor(client, target)
+                    : undefined;
+
+                if (legacy) {
+                    // MSBuild has no `watch`; the rest map onto targets.
+                    const msbuildArgs: Record<TaskDefinition['task'], string[] | null> = {
+                        build: [target, '/nologo', '/v:minimal', `/p:Configuration=${configuration}`],
+                        rebuild: [target, '/nologo', '/v:minimal', '/t:Rebuild', `/p:Configuration=${configuration}`],
+                        clean: [target, '/nologo', '/t:Clean', `/p:Configuration=${configuration}`],
+                        test: null,
+                        watch: null,
+                    };
+                    const args = msbuildArgs[definition.task];
+                    if (args) {
+                        return makeTask(definition, task.name, args, legacy);
+                    }
+                }
 
                 const args: Record<TaskDefinition['task'], string[]> = {
                     build: ['build', target, '-c', configuration, '--nologo'],
@@ -129,17 +173,44 @@ export function registerTaskProvider(
     );
 }
 
+/// Visual Studio's MSBuild when the project needs it, otherwise undefined.
+async function msbuildFor(client: LanguageClient, projectPath: string): Promise<string | undefined> {
+    try {
+        const targets = await client.sendRequest<LaunchTarget[]>(
+            'roslynSense/launchTargets', { configuration: null });
+        const match = targets.find(
+            (t) => t.projectPath.toLowerCase() === projectPath.toLowerCase());
+        if (!match?.isNetFramework) {
+            return undefined;
+        }
+        return (await fetchToolchain(client))?.msbuildPath || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function fetchToolchain(client: LanguageClient): Promise<ToolchainInfo | undefined> {
+    try {
+        return await client.sendRequest<ToolchainInfo>('roslynSense/toolchain');
+    } catch {
+        return undefined;
+    }
+}
+
 function makeTask(
     definition: TaskDefinition,
     name: string,
-    args: string[]
+    args: string[],
+    executable?: string
 ): vscode.Task {
     const task = new vscode.Task(
         definition,
         vscode.TaskScope.Workspace,
         name,
         'RoslynSense',
-        new vscode.ShellExecution('dotnet', args.map((arg) => ({ value: arg, quoting: vscode.ShellQuoting.Strong }))),
+        new vscode.ShellExecution(
+            executable ?? 'dotnet',
+            args.map((arg) => ({ value: arg, quoting: vscode.ShellQuoting.Strong }))),
         ['$msCompile']
     );
 

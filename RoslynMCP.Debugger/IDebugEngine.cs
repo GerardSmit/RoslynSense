@@ -15,6 +15,21 @@ public interface IDebugEngine : IDisposable
     ChannelReader<DebugEvent> Events { get; }
 
     void Attach(int pid, IEnumerable<BreakpointSpec> breakpoints, DebugRuntime runtime);
+
+    /// <summary>
+    /// Starts the debuggee suspended and attaches before any of its code runs.
+    /// </summary>
+    /// <remarks>
+    /// Attaching to an already-started process cannot catch anything in Main or a static
+    /// constructor, which is exactly where a startup bug lives — so F5 has to launch, not attach.
+    /// </remarks>
+    void Launch(
+        string executable,
+        IReadOnlyList<string> arguments,
+        IEnumerable<BreakpointSpec> breakpoints,
+        IReadOnlyDictionary<string, string>? environment,
+        string? workingDirectory,
+        DebugRuntime runtime);
     void AddBreakpoint(BreakpointSpec spec);
     bool RemoveBreakpoint(string filePath, int line);
     void Continue();
@@ -55,6 +70,34 @@ public static class DebugEngineFactory
                 $"found (expected under '{WorkerDirectory}/{Suffix(targetArch)}'). Either install it or " +
                 $"run the target as {Describe(ProcessArch.Host)} — for IIS Express, use the " +
                 $"{Describe(ProcessArch.Host)} iisexpress.exe.");
+        }
+
+        return new WorkerDebugEngine(worker, sessionId);
+    }
+
+    /// <summary>
+    /// The engine for a program about to be launched, chosen from the executable's own bitness.
+    /// </summary>
+    /// <remarks>
+    /// A .NET Framework build is frequently x86 (AnyCPU with Prefer32Bit, or an explicit x86
+    /// target) while this host is x64, and ICorDebug cannot cross that boundary — so the choice
+    /// has to be made from the PE header before the process exists to ask.
+    /// </remarks>
+    public static IDebugEngine ForExecutable(string executablePath, uint sessionId = 1)
+    {
+        var targetArch = ProcessArch.OfExecutable(executablePath);
+        if (targetArch == ProcessArch.Host)
+            return new InProcessDebugEngine(sessionId);
+
+        var worker = FindWorker(targetArch);
+        if (worker is null)
+        {
+            throw new InvalidOperationException(
+                $"'{Path.GetFileName(executablePath)}' is {Describe(targetArch)} but this host is " +
+                $"{Describe(ProcessArch.Host)}, and ICorDebug cannot debug across architectures. " +
+                $"The matching debug worker was not found (expected under " +
+                $"'{WorkerDirectory}/{Suffix(targetArch)}'). Either install it, or build the " +
+                $"project as {Describe(ProcessArch.Host)}.");
         }
 
         return new WorkerDebugEngine(worker, sessionId);

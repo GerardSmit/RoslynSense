@@ -84,6 +84,16 @@ internal sealed class DapServer
                     await EventAsync("initialized", null);
                     break;
 
+                case "launch":
+                {
+                    string result = await LaunchAsync(arguments, ct);
+                    bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+                    await RespondAsync(message, null, ok, ok ? null : result);
+                    if (!ok)
+                        await EventAsync("terminated", null);
+                    break;
+                }
+
                 case "attach":
                 {
                     int pid = arguments?["processId"]?.GetValue<int>() ?? 0;
@@ -331,6 +341,60 @@ internal sealed class DapServer
         {
             await RespondAsync(message, null, false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Resolves the project the client named into a concrete launch and starts it suspended.
+    /// </summary>
+    /// <remarks>
+    /// The configuration carries a project rather than an executable, so the same resolution the
+    /// Run command uses applies here — including IIS Express for a legacy web project, which is
+    /// launched and then attached to, since the site's code runs in the worker rather than in the
+    /// process the client asked to start.
+    /// </remarks>
+    private async Task<string> LaunchAsync(JsonNode? arguments, CancellationToken ct)
+    {
+        string? projectPath = arguments?["projectPath"]?.GetValue<string>();
+        string? program = arguments?["program"]?.GetValue<string>();
+
+        if (_backend is not PublishingDebugBackend { Inner: IcorDebugBackend engine })
+            return "Error: this adapter only debugs .NET Framework targets.";
+
+        if (projectPath is { Length: > 0 })
+        {
+            var spec = Run.RunConfigResolver.Resolve(
+                projectPath,
+                arguments?["configuration"]?.GetValue<string>() ?? "Debug");
+
+            if (!spec.CanRun)
+                return $"Error: {spec.Error}";
+
+            return await engine.LaunchAsync(
+                spec.Executable,
+                spec.Arguments,
+                spec.Environment,
+                spec.WorkingDirectory,
+                initialBreakpoints: null,
+                ct);
+        }
+
+        if (program is { Length: > 0 })
+        {
+            var environment = new Dictionary<string, string>();
+            foreach (var entry in arguments?["env"]?.AsObject() ?? [])
+                environment[entry.Key] = entry.Value?.GetValue<string>() ?? "";
+
+            var argumentList = (arguments?["args"]?.AsArray() ?? [])
+                .Select(a => a?.GetValue<string>() ?? "")
+                .ToList();
+
+            return await engine.LaunchAsync(
+                program, argumentList, environment,
+                arguments?["cwd"]?.GetValue<string>(),
+                initialBreakpoints: null, ct);
+        }
+
+        return "Error: the launch configuration named neither a project nor a program.";
     }
 
     private static JsonObject Capabilities() => new()

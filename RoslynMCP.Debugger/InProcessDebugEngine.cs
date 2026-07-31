@@ -14,6 +14,12 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
     public void Attach(int pid, IEnumerable<BreakpointSpec> breakpoints, DebugRuntime runtime) =>
         _session.Attach(pid, breakpoints, runtime);
 
+    public void Launch(
+        string executable, IReadOnlyList<string> arguments, IEnumerable<BreakpointSpec> breakpoints,
+        IReadOnlyDictionary<string, string>? environment, string? workingDirectory,
+        DebugRuntime runtime) =>
+        _session.Launch(executable, arguments, breakpoints, environment, workingDirectory, runtime);
+
     public void AddBreakpoint(BreakpointSpec spec) => _session.AddBreakpoint(spec);
 
     public bool RemoveBreakpoint(string filePath, int line) => _session.RemoveBreakpoint(filePath, line);

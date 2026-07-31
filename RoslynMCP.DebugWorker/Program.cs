@@ -120,6 +120,16 @@ internal static class Program
                     session.Attach(request.Pid, request.Breakpoints ?? [], request.Runtime);
                     break;
 
+                case "launch":
+                    session.Launch(
+                        request.Executable ?? throw new ArgumentException("no executable supplied"),
+                        request.Arguments ?? [],
+                        request.Breakpoints ?? [],
+                        request.Environment,
+                        request.WorkingDirectory,
+                        request.Runtime);
+                    break;
+
                 case "addBreakpoint":
                     if (request.Breakpoint is null)
                         throw new ArgumentException("no breakpoint supplied");

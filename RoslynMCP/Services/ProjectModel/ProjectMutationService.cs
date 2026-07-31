@@ -42,11 +42,23 @@ public static class ProjectMutationService
                 $"{Path.GetFileNameWithoutExtension(projectPath)}; adding this would make a cycle.");
         }
 
-        var (exitCode, output) = await RunDotnetAsync(
-            ["add", projectPath, "reference", referencedProjectPath], ct);
+        // `dotnet add reference` rejects a non-SDK project, so those are edited directly. The
+        // legacy form also needs the referenced project's GUID and name, which MSBuild resolves
+        // from the element rather than from the file — VS writes them, and tooling expects them.
+        if (!IsSdkStyle(projectPath))
+        {
+            string? failure = AddLegacyProjectReference(projectPath, referencedProjectPath);
+            if (failure is not null)
+                return new MutationResult(false, failure);
+        }
+        else
+        {
+            var (exitCode, output) = await RunDotnetAsync(
+                ["add", projectPath, "reference", referencedProjectPath], ct);
 
-        if (exitCode != 0)
-            return new MutationResult(false, FirstError(output));
+            if (exitCode != 0)
+                return new MutationResult(false, FirstError(output));
+        }
 
         await InvalidateAsync(ct, projectPath);
         return new MutationResult(true,
@@ -60,16 +72,114 @@ public static class ProjectMutationService
         if (!File.Exists(projectPath))
             return new MutationResult(false, $"Project not found: {projectPath}");
 
-        var (exitCode, output) = await RunDotnetAsync(
-            ["remove", projectPath, "reference", referencedProjectPath], ct);
+        if (!IsSdkStyle(projectPath))
+        {
+            RemoveLegacyProjectReference(projectPath, referencedProjectPath);
+        }
+        else
+        {
+            var (exitCode, output) = await RunDotnetAsync(
+                ["remove", projectPath, "reference", referencedProjectPath], ct);
 
-        if (exitCode != 0)
-            return new MutationResult(false, FirstError(output));
+            if (exitCode != 0)
+                return new MutationResult(false, FirstError(output));
+        }
 
         await InvalidateAsync(ct, projectPath);
         return new MutationResult(true,
             $"{Path.GetFileNameWithoutExtension(projectPath)} no longer references " +
             $"{Path.GetFileNameWithoutExtension(referencedProjectPath)}.");
+    }
+
+    /// <summary>Whether the project uses the SDK format, which the dotnet CLI can edit.</summary>
+    internal static bool IsSdkStyle(string projectPath)
+    {
+        try
+        {
+            var root = XDocument.Load(projectPath).Root;
+            return root?.Attribute("Sdk") is not null ||
+                   root?.Elements().Any(e => e.Name.LocalName == "Sdk") == true;
+        }
+        catch
+        {
+            return true; // assume modern; the CLI reports a better error than a guess would
+        }
+    }
+
+    /// <returns><c>null</c> on success, or why it failed.</returns>
+    private static string? AddLegacyProjectReference(string projectPath, string referencedProjectPath)
+    {
+        try
+        {
+            var document = XDocument.Load(projectPath);
+            if (document.Root is null)
+                return "The project file is empty.";
+
+            var ns = document.Root.Name.Namespace;
+            string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+            string include = Path.GetRelativePath(projectDirectory, referencedProjectPath);
+
+            bool alreadyThere = document.Root.Descendants(ns + "ProjectReference")
+                .Any(r => string.Equals(r.Attribute("Include")?.Value, include, StringComparison.OrdinalIgnoreCase));
+            if (alreadyThere)
+                return null;
+
+            var group = document.Root.Elements(ns + "ItemGroup")
+                .FirstOrDefault(g => g.Elements(ns + "ProjectReference").Any());
+            if (group is null)
+            {
+                group = new XElement(ns + "ItemGroup");
+                document.Root.Add(group);
+            }
+
+            var reference = new XElement(ns + "ProjectReference", new XAttribute("Include", include));
+            if (ReadProperty(referencedProjectPath, "ProjectGuid") is { Length: > 0 } guid)
+            {
+                reference.Add(
+                    new XElement(ns + "Project", guid),
+                    new XElement(ns + "Name", Path.GetFileNameWithoutExtension(referencedProjectPath)));
+            }
+
+            group.Add(reference);
+            document.Save(projectPath);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"Could not edit '{Path.GetFileName(projectPath)}': {ex.Message}";
+        }
+    }
+
+    private static void RemoveLegacyProjectReference(string projectPath, string referencedProjectPath)
+    {
+        try
+        {
+            var document = XDocument.Load(projectPath);
+            if (document.Root is null)
+                return;
+
+            var ns = document.Root.Name.Namespace;
+            string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+            string include = Path.GetRelativePath(projectDirectory, referencedProjectPath);
+
+            var stale = document.Root.Descendants(ns + "ProjectReference")
+                .Where(r => string.Equals(
+                    r.Attribute("Include")?.Value, include, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (stale.Count == 0)
+                return;
+
+            foreach (var reference in stale)
+                reference.Remove();
+            document.Save(projectPath);
+        }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not remove the project reference from '{Path.GetFileName(projectPath)}': {ex.Message}",
+                key: $"project-reference:{projectPath}");
+        }
     }
 
     /// <summary>What a new file should contain.</summary>

@@ -59,11 +59,19 @@ internal sealed class IcorDebugBackend : IDebugBackend
         IEnumerable<(string file, int line)>? initialBreakpoints = null,
         CancellationToken cancellationToken = default)
     {
-        // Launching a test host under ICorDebug means driving vstest's own process tree, which the
-        // engine has no notion of. Attaching to an already-running host is the supported route.
-        await Task.CompletedTask;
-        return "Error: Debugging .NET Framework test projects is not supported yet. " +
-               "Run the tests, then use DebugAttach with the test host's PID.";
+        // vstest owns the process tree, so the host cannot be launched under the debugger
+        // directly. VSTEST_HOST_DEBUG makes it suspend and print its pid instead, which is the
+        // window to attach in — the same trick the CoreCLR backend uses.
+        var (pid, error) = await Testing.TestRunService.StartForDebugAsync(
+            csprojPath, filter, cancellationToken);
+
+        if (pid == 0)
+            return $"Error: {error ?? "the test host did not start."}";
+
+        string attached = await AttachToProcessAsync(pid, initialBreakpoints, cancellationToken);
+        return attached.StartsWith("Error", StringComparison.OrdinalIgnoreCase)
+            ? attached
+            : $"{attached}\nTest host pid {pid}. Use DebugContinue to start the tests.";
     }
 
     public async Task<string> AttachToProcessAsync(
@@ -102,6 +110,60 @@ internal sealed class IcorDebugBackend : IDebugBackend
                 sb.AppendLine($"  #{bp.Id} — {Path.GetFileName(bp.FilePath)}:{bp.Line}");
         }
 
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Starts a program under the debugger, suspended, so a breakpoint in <c>Main</c> or a static
+    /// constructor is hit — which attaching can never manage, since by the time it lands that code
+    /// has already run.
+    /// </summary>
+    public async Task<string> LaunchAsync(
+        string executable,
+        IReadOnlyList<string> arguments,
+        IReadOnlyDictionary<string, string>? environment,
+        string? workingDirectory,
+        IEnumerable<(string file, int line)>? initialBreakpoints = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_state != DebuggerService.DebugState.NotStarted)
+            return "Error: A debug session is already active. Call DebugStop first.";
+        if (!File.Exists(executable))
+            return $"Error: '{executable}' does not exist. Build the project first.";
+
+        var specs = BuildSpecs(initialBreakpoints);
+
+        try
+        {
+            // The engine has to match the *target's* bitness, and a Framework build can be x86
+            // while this host is x64; the factory picks the worker from the executable itself.
+            _engine = DebugEngineFactory.ForExecutable(executable);
+            StartPump();
+            _state = DebuggerService.DebugState.Starting;
+            Engine.Launch(
+                executable, arguments, specs, environment,
+                workingDirectory ?? Path.GetDirectoryName(executable),
+                EngineRuntime.NetFramework);
+        }
+        catch (Exception ex)
+        {
+            _state = DebuggerService.DebugState.NotStarted;
+            _engine = null;
+            return $"Error: Could not launch '{Path.GetFileName(executable)}': {ex.Message}";
+        }
+
+        _state = DebuggerService.DebugState.Running;
+        await Task.CompletedTask;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"Launched {Path.GetFileName(executable)} under the ICorDebug engine (.NET Framework).");
+        if (_breakpoints.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("**Breakpoints:**");
+            foreach (var bp in _breakpoints.Values.OrderBy(b => b.Id))
+                sb.AppendLine($"  #{bp.Id} — {Path.GetFileName(bp.FilePath)}:{bp.Line}");
+        }
         return sb.ToString();
     }
 

@@ -70,6 +70,14 @@ internal static partial class LaunchHandler
             .ToArray());
     }
 
+    /// <summary>What the machine offers for .NET Framework work, so the client can pick MSBuild
+    /// over the dotnet CLI and explain a missing install instead of failing opaquely.</summary>
+    public static ToolchainInfo Toolchain()
+    {
+        var info = NetFxToolchain.Info;
+        return new ToolchainInfo(info.MsBuildPath, info.DesktopClr, info.PreferredIisExpress);
+    }
+
     private static LaunchTarget Describe(string projectPath, string configuration)
     {
         var classification = ProjectClassifier.Classify(projectPath);
@@ -87,16 +95,18 @@ internal static partial class LaunchHandler
                     : "Produces a library, so there is nothing to launch.");
         }
 
-        // netcoredbg cannot debug .NET Framework. Say so here rather than letting the adapter
-        // fail after the session starts, which reads as a broken debugger.
-        if (isNetFramework)
+        // A Framework target is launchable, but by the ICorDebug adapter rather than netcoredbg —
+        // the client picks between them on IsNetFramework. What it does need is the toolchain:
+        // without MSBuild there is nothing to build, and the failure would otherwise surface as a
+        // missing executable.
+        if (isNetFramework && NetFxToolchain.Info.MsBuildPath.Length == 0)
         {
             return new LaunchTarget(
                 projectPath, name, classification.Kind.ToString(), classification.TargetFramework,
                 IsNetFramework: true, classification.IsTestProject, Runnable: false,
                 Program: null, Args: [], Cwd: null, Env: [], Url: null,
-                Error: ".NET Framework projects are not supported by this debugger yet. " +
-                       "Ask the AI assistant to start a debug session instead — it uses ICorDebug.");
+                Error: "This is a .NET Framework project and Visual Studio's MSBuild was not found. " +
+                       "Install Visual Studio or the Build Tools to build and debug it.");
         }
 
         var spec = RunConfigResolver.Resolve(projectPath, configuration);
@@ -181,19 +191,37 @@ internal static partial class LaunchHandler
         await using var progress = await ProgressReporter.BeginAsync(
             $"Building {Path.GetFileNameWithoutExtension(projectPath)}", ct);
 
-        var startInfo = new ProcessStartInfo("dotnet",
-            $"build \"{projectPath}\" -c {configuration} --nologo -consoleloggerparameters:NoSummary")
+        // The dotnet CLI cannot build a non-SDK project at all — it needs Visual Studio's MSBuild,
+        // which also has to run with the VS environment set for the legacy targets to resolve.
+        bool isNetFramework =
+            ProjectClassifier.Classify(projectPath).DebugRuntime == DebugRuntime.NetFramework;
+        string? msbuild = isNetFramework ? MsBuildLocator.FindMsBuild() : null;
+
+        if (isNetFramework && msbuild is null)
         {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(projectPath),
-        };
+            return new BuildResult(false,
+                "This is a .NET Framework project and Visual Studio's MSBuild was not found. " +
+                "Install Visual Studio or the Build Tools for Visual Studio.", [], []);
+        }
+
+        var startInfo = msbuild is not null
+            ? new ProcessStartInfo(msbuild,
+                $"\"{projectPath}\" /nologo /v:minimal /p:Configuration={configuration}")
+            : new ProcessStartInfo("dotnet",
+                $"build \"{projectPath}\" -c {configuration} --nologo -consoleloggerparameters:NoSummary");
+
+        startInfo.RedirectStandardOutput = true;
+        startInfo.RedirectStandardError = true;
+        startInfo.UseShellExecute = false;
+        startInfo.CreateNoWindow = true;
+        startInfo.WorkingDirectory = Path.GetDirectoryName(projectPath);
+
+        if (msbuild is not null)
+            MsBuildLocator.SetVsEnvironment(startInfo, msbuild);
 
         using var process = Process.Start(startInfo);
         if (process is null)
-            return new BuildResult(false, "Failed to start dotnet build.", [], []);
+            return new BuildResult(false, "Failed to start the build.", [], []);
 
         string stdout = await process.StandardOutput.ReadToEndAsync(ct);
         string stderr = await process.StandardError.ReadToEndAsync(ct);

@@ -204,6 +204,9 @@ internal sealed class LspServer : IDisposable
 
     // ---- Launch and debug -------------------------------------------------------------
 
+    [JsonRpcMethod("roslynSense/toolchain")]
+    public ToolchainInfo Toolchain() => Handlers.LaunchHandler.Toolchain();
+
     [JsonRpcMethod("roslynSense/debuggerPath")]
     public Task<DebuggerPathResult> DebuggerPath(CancellationToken ct) =>
         Handlers.LaunchHandler.DebuggerPathAsync(ct);

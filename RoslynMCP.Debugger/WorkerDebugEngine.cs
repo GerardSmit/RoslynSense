@@ -182,6 +182,21 @@ public sealed class WorkerDebugEngine : IDebugEngine
             Breakpoints = [.. breakpoints],
         }).GetAwaiter().GetResult();
 
+    public void Launch(
+        string executable, IReadOnlyList<string> arguments, IEnumerable<BreakpointSpec> breakpoints,
+        IReadOnlyDictionary<string, string>? environment, string? workingDirectory,
+        DebugRuntime runtime) =>
+        SendAsync(new WorkerRequest
+        {
+            Op = "launch",
+            Executable = executable,
+            Arguments = [.. arguments],
+            Environment = environment is null ? null : new Dictionary<string, string>(environment),
+            WorkingDirectory = workingDirectory,
+            Runtime = runtime,
+            Breakpoints = [.. breakpoints],
+        }).GetAwaiter().GetResult();
+
     public void AddBreakpoint(BreakpointSpec spec) =>
         Send(new WorkerRequest { Op = "addBreakpoint", Breakpoint = spec });
 

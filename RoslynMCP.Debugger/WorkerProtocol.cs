@@ -26,8 +26,8 @@ public sealed class WorkerRequest
 {
     public int Id { get; set; }
 
-    /// <summary>One of: attach, addBreakpoint, removeBreakpoint, continue, step, stackTrace,
-    /// variables, evaluate, setVariable, terminate.</summary>
+    /// <summary>One of: attach, launch, addBreakpoint, removeBreakpoint, continue, step,
+    /// stackTrace, variables, evaluate, setVariable, terminate.</summary>
     public string Op { get; set; } = "";
 
     public int Pid { get; set; }
@@ -41,6 +41,10 @@ public sealed class WorkerRequest
     public string? Expression { get; set; }
     public string? Name { get; set; }
     public string? Value { get; set; }
+    public string? Executable { get; set; }
+    public List<string>? Arguments { get; set; }
+    public Dictionary<string, string>? Environment { get; set; }
+    public string? WorkingDirectory { get; set; }
 }
 
 public sealed class WorkerResponse

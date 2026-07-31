@@ -10,6 +10,15 @@ public sealed record DebuggerPathResult(
     [property: JsonPropertyName("provisioned")] bool Provisioned,
     [property: JsonPropertyName("error")] string? Error);
 
+/// <summary>
+/// What this machine can build and debug .NET Framework projects with. Empty paths mean the tool
+/// was not found, which the client turns into an actionable message rather than a failed build.
+/// </summary>
+public sealed record ToolchainInfo(
+    [property: JsonPropertyName("msbuildPath")] string MsBuildPath,
+    [property: JsonPropertyName("hasDesktopClr")] bool HasDesktopClr,
+    [property: JsonPropertyName("iisExpressPath")] string? IisExpressPath);
+
 public sealed record LaunchTargetsParams(
     [property: JsonPropertyName("configuration")] string? Configuration = null);
 

@@ -78,7 +78,7 @@ public static class GetRoslynDiagnosticsTool
 
         // Project-wide diagnostics (.csproj path)
         if (systemPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-            return await GetProjectDiagnosticsAsync(systemPath, severityFilter, maxResults, fmt, cancellationToken);
+            return await GetProjectDiagnosticsAsync(systemPath, severityFilter, runAnalyzers, maxResults, fmt, cancellationToken);
 
         // Single C# file diagnostics
         return await GetFileDiagnosticsAsync(systemPath, severityFilter, runAnalyzers, maxResults, fmt, cancellationToken);
@@ -115,7 +115,7 @@ public static class GetRoslynDiagnosticsTool
     /// Project-wide diagnostics for all files in a .csproj.
     /// </summary>
     private static async Task<string> GetProjectDiagnosticsAsync(
-        string csprojPath, string severityFilter, int maxResults,
+        string csprojPath, string severityFilter, bool runAnalyzers, int maxResults,
         IOutputFormatter fmt, CancellationToken cancellationToken)
     {
         if (!File.Exists(csprojPath))
@@ -131,9 +131,21 @@ public static class GetRoslynDiagnosticsTool
         if (compilation is null)
             return "Error: Unable to produce compilation for project.";
 
-        var diagnostics = compilation.GetDiagnostics()
+        var compilerDiagnostics = compilation.GetDiagnostics()
             .Where(d => d.Location.IsInSource)
-            .Where(d => d.Severity != DiagnosticSeverity.Hidden)
+            .Where(d => d.Severity != DiagnosticSeverity.Hidden);
+
+        // Project scope ran compiler diagnostics only while file scope ran analyzers, so the
+        // same rule reported or vanished depending on how it was asked for.
+        var analyzerDiagnostics = runAnalyzers
+            ? await AnalyzerService.RunAnalyzersAsync(
+                project, compilation, filePath: null, Console.Error, cancellationToken)
+            : Array.Empty<Diagnostic>();
+
+        var diagnostics = compilerDiagnostics
+            .Concat(analyzerDiagnostics.Where(d => d.Severity != DiagnosticSeverity.Hidden))
+            .GroupBy(d => (d.Id, d.Location.SourceSpan, d.Location.SourceTree?.FilePath))
+            .Select(g => g.First())
             .ToList();
 
         if (filter is not null)

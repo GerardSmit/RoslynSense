@@ -8,6 +8,8 @@ import {
     State,
     TransportKind,
 } from 'vscode-languageclient/node';
+import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
+import { registerTestController, runTestById } from './testController';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -106,11 +108,24 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     // status item offering a manual restart.
     const restartTimes: number[] = [];
     let initFailures = 0;
+
+    function createWorkspaceWatchers(): vscode.FileSystemWatcher[] {
+        // VS Code globs cannot express "not under bin/obj", so build output is filtered
+        // server-side instead; the events are cheap and the server drops them before it does
+        // any work.
+        return [
+            '**/*.cs',
+            '**/*.{csproj,vbproj,fsproj,props,targets,sln,slnx,slnf}',
+            '**/{.editorconfig,.globalconfig,Directory.Packages.props}',
+        ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
+    }
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'csharp' }],
         uriConverters: { code2Protocol, protocol2Code },
-        // No client-side file watcher: the server checks file freshness itself on every
-        // request (mtime-based), so didChangeWatchedFiles traffic would be redundant.
+        // Content changes to open files arrive via didChange; these watchers cover what the
+        // editor never sees — files created, deleted, or rewritten outside it (git checkout,
+        // scaffolding, another agent). The server coalesces the burst a branch switch produces.
+        synchronize: { fileEvents: createWorkspaceWatchers() },
         // A cold daemon spawn (first window on a solution) can lose the very first
         // connection attempt; a failed initialize must retry, not surface an error toast.
         initializationFailedHandler: () => {
@@ -322,19 +337,36 @@ async function showInheritanceForLine(line: number | undefined): Promise<void> {
     }
 }
 
+async function runTestFromLens(
+    fullyQualifiedName: string,
+    projectPath: string,
+    mode: 'run' | 'debug'
+): Promise<void> {
+    const ran = await runTestById(fullyQualifiedName, projectPath, mode);
+    if (ran) {
+        return;
+    }
+    // The Test Explorer has not discovered this project yet (nothing expanded it). Falling
+    // back to a terminal keeps the lens useful instead of doing nothing.
+    const terminal = vscode.window.createTerminal('RoslynSense Test');
+    terminal.show();
+    const project = projectPath ? ` "${projectPath}"` : '';
+    terminal.sendText(`dotnet test${project} --filter "FullyQualifiedName~${fullyQualifiedName}"`);
+}
+
 function registerLensCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
-        // CodeLens "▶ Run test": run the test in a terminal via dotnet test --filter.
+        // CodeLens "▶ Run test" / "Debug test": route into the Test Explorer so results land
+        // in the test UI with pass/fail decorations, rather than as terminal scrollback.
         vscode.commands.registerCommand(
             'roslynSense.runTest',
-            (fullyQualifiedName: string, projectPath: string) => {
-                const terminal = vscode.window.createTerminal('RoslynSense Test');
-                terminal.show();
-                const project = projectPath ? ` "${projectPath}"` : '';
-                terminal.sendText(
-                    `dotnet test${project} --filter "FullyQualifiedName~${fullyQualifiedName}"`
-                );
-            }
+            (fullyQualifiedName: string, projectPath: string) =>
+                runTestFromLens(fullyQualifiedName, projectPath, 'run')
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.debugTest',
+            (fullyQualifiedName: string, projectPath: string) =>
+                runTestFromLens(fullyQualifiedName, projectPath, 'debug')
         ),
         // CodeLens "N references": open VSCode's references peek with server-provided locations.
         vscode.commands.registerCommand(
@@ -837,9 +869,11 @@ function registerBreakpointForwarding(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.debug.onDidChangeBreakpoints((e) => {
             sendBreakpointSnapshot();
-            // While the AI DAP session is attached, VSCode already routes breakpoint edits
-            // through the adapter's setBreakpoints — forwarding here would double them.
-            const adapterAttached = vscode.debug.activeDebugSession?.type === 'roslynsense-ai';
+            // While a DAP session owns breakpoints — the AI mirror via its setBreakpoints, or
+            // a real netcoredbg session natively — forwarding here would double them. The
+            // shared snapshot above still goes out, so the persisted set stays correct.
+            const activeType = vscode.debug.activeDebugSession?.type;
+            const adapterAttached = activeType === 'roslynsense-ai' || activeType === DEBUG_TYPE;
             for (const bp of e.added) {
                 const key = vscodeBpKey(bp);
                 if (!key || suppressedAdds.delete(key) || adapterAttached) {
@@ -1620,6 +1654,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerInheritanceMarkers(context);
     registerDebugBridge(context);
     registerAiDebugAdapter(context);
+    registerDebugLaunch(context, () => client);
+    registerTestController(context, () => client);
 
     await startClient(context);
 }

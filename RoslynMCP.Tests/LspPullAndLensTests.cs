@@ -135,9 +135,11 @@ public class LspPullAndLensTests
     [Fact]
     public async Task ExecuteCommandRejectsUnknownCommand()
     {
+        // Commands return heterogeneous payloads now (build returns a structured result), so
+        // the handler's contract is object; the unknown-command case is still a message.
         var result = await ExecuteCommandHandler.ExecuteAsync(
             new ExecuteCommandParams("does.not.exist", null), default);
-        Assert.Contains("Unknown command", result);
+        Assert.Contains("Unknown command", Assert.IsType<string>(result));
     }
 
     private static (int Line, int Character) PositionOf(string text, string anchor)

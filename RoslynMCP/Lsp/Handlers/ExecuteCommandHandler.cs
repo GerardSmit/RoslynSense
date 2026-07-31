@@ -11,23 +11,49 @@ internal static class ExecuteCommandHandler
 {
     public const string RestoreCommand = "roslynSense.restore";
     public const string ReloadCommand = "roslynSense.reloadWorkspace";
+    public const string BuildCommand = "roslynSense.build";
 
-    public static readonly string[] Commands = [RestoreCommand, ReloadCommand];
+    public static readonly string[] Commands = [RestoreCommand, ReloadCommand, BuildCommand];
 
-    public static async Task<string> ExecuteAsync(ExecuteCommandParams p, CancellationToken ct)
+    public static async Task<object> ExecuteAsync(ExecuteCommandParams p, CancellationToken ct)
     {
         switch (p.Command)
         {
             case RestoreCommand:
                 return await RestoreAsync(p, ct);
 
+            case BuildCommand:
+                return await BuildAsync(p, ct);
+
             case ReloadCommand:
-                await WorkspaceService.EvictAllAsync(ct);
+                await using (await ProgressReporter.BeginAsync("Reloading workspace", ct))
+                {
+                    AnalyzerDiagnosticCache.Clear();
+                    await WorkspaceService.EvictAllAsync(ct);
+                }
+                await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, ct);
                 return "Workspace reloaded.";
 
             default:
                 return $"Unknown command '{p.Command}'.";
         }
+    }
+
+    /// <summary>Builds before a debug launch. Returns structured diagnostics so the client can
+    /// surface them in Problems rather than as a wall of text.</summary>
+    private static async Task<BuildResult> BuildAsync(ExecuteCommandParams p, CancellationToken ct)
+    {
+        string? projectPath = p.Arguments is [{ ValueKind: System.Text.Json.JsonValueKind.String } arg, ..]
+            ? arg.GetString()
+            : null;
+        if (string.IsNullOrEmpty(projectPath))
+            return new BuildResult(false, "No project to build.", [], []);
+
+        string configuration = p.Arguments is [_, { ValueKind: System.Text.Json.JsonValueKind.String } second, ..]
+            ? second.GetString() ?? "Debug"
+            : "Debug";
+
+        return await LaunchHandler.BuildAsync(projectPath, configuration, ct);
     }
 
     private static async Task<string> RestoreAsync(ExecuteCommandParams p, CancellationToken ct)
@@ -46,6 +72,9 @@ internal static class ExecuteCommandHandler
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+
+        await using var progress = await ProgressReporter.BeginAsync(
+            $"Restoring {Path.GetFileName(target)}", ct);
 
         using var process = Process.Start(startInfo);
         if (process is null)

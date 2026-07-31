@@ -444,6 +444,9 @@ internal static class WorkspaceService
         // only reach the loader after resolving it and breaking out.
         string cacheKey = loadKey!;
 
+        await using var progress = await ProgressReporter.BeginAsync(
+            $"Loading {Path.GetFileNameWithoutExtension(cacheKey)}", cancellationToken);
+
         try
         {
             if (isDecompile)
@@ -464,7 +467,9 @@ internal static class WorkspaceService
 
                 try
                 {
+                    progress.Report("Restoring packages");
                     await EnsureRestoredAsync(normalizedPath, cancellationToken);
+                    progress.Report($"Opening {Path.GetFileName(normalizedPath)}");
 
                     // Hard ceiling on OpenProjectAsync so a wedged BuildHost-net472 subprocess
                     // (common with legacy WebForms + source generators) cannot freeze the
@@ -703,9 +708,12 @@ internal static class WorkspaceService
                     }
                     catch (Exception ex)
                     {
-                        Console.Error.WriteLine($"[WorkspaceService] Error opening project '{projectPath}': {ex.Message}");
-                        if (ex.InnerException != null)
-                            Console.Error.WriteLine($"[WorkspaceService] Inner exception: {ex.InnerException.Message}");
+                        // Visible to the user: a project that will not load makes every feature
+                        // in it look broken, with no other clue as to why.
+                        ServiceLog.Error(
+                            $"Could not open '{Path.GetFileName(projectPath)}': {ex.Message}" +
+                            (ex.InnerException is { } inner ? $" ({inner.Message})" : ""),
+                            key: $"project-load:{projectPath}");
                     }
                 }
             }
@@ -877,10 +885,19 @@ internal static class WorkspaceService
     }
 
     /// <summary>Evicts only the single entry serving <paramref name="projectPath"/> (no global sweep).</summary>
-    internal static async Task EvictProjectForTests(string projectPath)
+    internal static Task EvictProjectForTests(string projectPath) => EvictProjectAsync(projectPath);
+
+    /// <summary>
+    /// Evicts the cached workspace entry serving <paramref name="projectPath"/>, leaving other
+    /// solutions loaded. Used when a change is known to be local to one project — a source file
+    /// appearing or disappearing on disk — where a full sweep would needlessly discard
+    /// everything else.
+    /// </summary>
+    public static async Task EvictProjectAsync(
+        string projectPath, CancellationToken cancellationToken = default)
     {
         string key = Path.GetFullPath(projectPath);
-        await s_cacheLock.WaitAsync();
+        await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
             if (s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.TryGetValue(ck, out var entry))

@@ -20,17 +20,17 @@ internal sealed class LspServer : IDisposable
     private JsonRpc? _rpc;
     private DiagnosticsPublisher? _diagnostics;
     private bool _clientPullsDiagnostics;
+    private bool _clientRefreshesCodeLens;
+    private bool _clientRefreshesInlayHints;
     private CancellationTokenSource? _refreshDebounce;
 
-    /// <summary>Nudges a pull-diagnostics client to re-pull (cross-file effects: an edit in
-    /// one document changes diagnostics in others). Debounced — mirrors the ~2s batching in
-    /// Roslyn's own LSP server. The client re-pulls the changed document itself immediately;
+    /// <summary>Nudges the client to re-request derived data after a change whose effects reach
+    /// beyond the edited document: diagnostics (cross-file), code lens reference counts, and
+    /// inlay hints all go stale on an edit somewhere else. Debounced — mirrors the ~2s batching
+    /// in Roslyn's own LSP server. The client re-pulls the changed document itself immediately;
     /// this only covers everything else.</summary>
-    private void ScheduleDiagnosticsRefresh()
+    private void ScheduleClientRefresh(RefreshKind kinds = RefreshKind.All)
     {
-        if (!_clientPullsDiagnostics || _rpc is not { } rpc)
-            return;
-
         _refreshDebounce?.Cancel();
         var cts = _refreshDebounce = new CancellationTokenSource();
         _ = Task.Run(async () =>
@@ -38,13 +38,38 @@ internal sealed class LspServer : IDisposable
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(2), cts.Token);
-                await rpc.InvokeAsync("workspace/diagnostic/refresh");
+                await RefreshClientAsync(kinds, cts.Token);
             }
             catch (Exception)
             {
-                // Cancelled by a newer edit, or the client doesn't support refresh.
+                // Cancelled by a newer edit, or the client went away.
             }
         });
+    }
+
+    /// <summary>Sends the refresh requests the client actually declared support for.
+    /// Unsupported ones are skipped rather than sent-and-swallowed, because an unknown method
+    /// is an error response the client may log as a server fault.</summary>
+    internal async Task RefreshClientAsync(RefreshKind kinds, CancellationToken ct = default)
+    {
+        if (_rpc is not { } rpc)
+            return;
+
+        if (kinds.HasFlag(RefreshKind.Diagnostics) && _clientPullsDiagnostics)
+            await InvokeRefreshAsync(rpc, "workspace/diagnostic/refresh", ct);
+        if (kinds.HasFlag(RefreshKind.CodeLens) && _clientRefreshesCodeLens)
+            await InvokeRefreshAsync(rpc, "workspace/codeLens/refresh", ct);
+        if (kinds.HasFlag(RefreshKind.InlayHint) && _clientRefreshesInlayHints)
+            await InvokeRefreshAsync(rpc, "workspace/inlayHint/refresh", ct);
+    }
+
+    private static async Task InvokeRefreshAsync(JsonRpc rpc, string method, CancellationToken ct)
+    {
+        try { await rpc.InvokeWithCancellationAsync(method, cancellationToken: ct); }
+        catch (Exception ex) when (ex is RemoteInvocationException or ConnectionLostException or ObjectDisposedException)
+        {
+            // Client refused or disconnected — refreshes are advisory.
+        }
     }
 
     public LspServer(IServiceProvider services) => _services = services;
@@ -53,7 +78,9 @@ internal sealed class LspServer : IDisposable
     {
         _rpc = rpc;
         _diagnostics = new DiagnosticsPublisher(rpc);
-        LspSessionRegistry.Register(SessionId, rpc);
+        LspSessionRegistry.Register(SessionId, rpc, this);
+        LspProgress.Install();
+        LspLog.Install();
     }
 
     // ---- Lifecycle -------------------------------------------------------------------
@@ -64,6 +91,10 @@ internal sealed class LspServer : IDisposable
         // Pull-capable clients (LSP 3.17) get pull diagnostics only — pushing too would
         // draw duplicate squiggles.
         _clientPullsDiagnostics = p.Capabilities?.TextDocument?.Diagnostic is not null;
+        _clientRefreshesCodeLens = p.Capabilities?.Workspace?.CodeLens?.RefreshSupport ?? false;
+        _clientRefreshesInlayHints = p.Capabilities?.Workspace?.InlayHint?.RefreshSupport ?? false;
+        LspClientState.SnippetSupport =
+            p.Capabilities?.TextDocument?.Completion?.CompletionItem?.SnippetSupport ?? false;
 
         var capabilities = new ServerCapabilities
         {
@@ -98,7 +129,9 @@ internal sealed class LspServer : IDisposable
             CallHierarchyProvider = true,
             TypeHierarchyProvider = true,
             SemanticTokensProvider = new SemanticTokensOptions(
-                new SemanticTokensLegend(Handlers.SemanticTokensHandler.TokenTypes, TokenModifiers: []),
+                new SemanticTokensLegend(
+                    Handlers.SemanticTokensHandler.TokenTypes,
+                    Handlers.SemanticTokensHandler.TokenModifiers),
                 Full: true),
             DiagnosticProvider = new DiagnosticOptions(
                 InterFileDependencies: false, WorkspaceDiagnostics: false),
@@ -150,7 +183,7 @@ internal sealed class LspServer : IDisposable
         if (result is not null && !_clientPullsDiagnostics)
             _diagnostics?.Schedule(path, immediate: false);
         if (result is not null)
-            ScheduleDiagnosticsRefresh();
+            ScheduleClientRefresh();
     }
 
     [JsonRpcMethod("textDocument/didSave", UseSingleObjectParameterDeserialization = true)]
@@ -158,8 +191,47 @@ internal sealed class LspServer : IDisposable
     {
         if (!_clientPullsDiagnostics)
             _diagnostics?.Schedule(LspConverters.UriToPath(p.TextDocument.Uri), immediate: true);
-        ScheduleDiagnosticsRefresh();
+        ScheduleClientRefresh();
     }
+
+    // ---- Launch and debug -------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/debuggerPath")]
+    public Task<DebuggerPathResult> DebuggerPath(CancellationToken ct) =>
+        Handlers.LaunchHandler.DebuggerPathAsync(ct);
+
+    [JsonRpcMethod("roslynSense/launchTargets", UseSingleObjectParameterDeserialization = true)]
+    public Task<LaunchTarget[]> LaunchTargets(LaunchTargetsParams p, CancellationToken ct) =>
+        Handlers.LaunchHandler.LaunchTargetsAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/attachTargets")]
+    public AttachTarget[] AttachTargets() => Handlers.LaunchHandler.AttachTargets();
+
+    // ---- Tests ------------------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/testProjects")]
+    public Task<TestProjectInfo[]> TestProjects(CancellationToken ct) =>
+        Handlers.TestHandler.ProjectsAsync(ct);
+
+    [JsonRpcMethod("roslynSense/testDiscover", UseSingleObjectParameterDeserialization = true)]
+    public Task<TestInfo[]> TestDiscover(TestDiscoverParams p, CancellationToken ct) =>
+        Handlers.TestHandler.DiscoverAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/testRun", UseSingleObjectParameterDeserialization = true)]
+    public Task<TestResultInfo[]> TestRun(TestRunParams p, CancellationToken ct) =>
+        Handlers.TestHandler.RunAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/testDebug", UseSingleObjectParameterDeserialization = true)]
+    public Task<TestDebugResult> TestDebug(TestDebugParams p, CancellationToken ct) =>
+        Handlers.TestHandler.DebugAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/testCoverage", UseSingleObjectParameterDeserialization = true)]
+    public FileCoverageInfo[] TestCoverage(TestCoverageParams p) =>
+        Handlers.TestHandler.Coverage(p);
+
+    [JsonRpcMethod("workspace/didChangeWatchedFiles", UseSingleObjectParameterDeserialization = true)]
+    public void DidChangeWatchedFiles(DidChangeWatchedFilesParams p) =>
+        Handlers.WatchedFilesHandler.Handle(p);
 
     [JsonRpcMethod("textDocument/didClose", UseSingleObjectParameterDeserialization = true)]
     public void DidClose(DidCloseTextDocumentParams p)
@@ -288,7 +360,7 @@ internal sealed class LspServer : IDisposable
         Handlers.CodeLensHandler.ResolveAsync(lens, ct);
 
     [JsonRpcMethod("workspace/executeCommand", UseSingleObjectParameterDeserialization = true)]
-    public Task<string> ExecuteCommand(ExecuteCommandParams p, CancellationToken ct) =>
+    public Task<object> ExecuteCommand(ExecuteCommandParams p, CancellationToken ct) =>
         Handlers.ExecuteCommandHandler.ExecuteAsync(p, ct);
 
     [JsonRpcMethod("textDocument/inlayHint", UseSingleObjectParameterDeserialization = true)]

@@ -100,8 +100,12 @@ internal static class CodeLensHandler
 
             if (declaration is MethodDeclarationSyntax method && IsTestMethod(method)
                 && FullyQualifiedName(method) is { } fqn)
+            {
                 lenses.Add(new LspCodeLens(range, new Command(
                     "▶ Run test", "roslynSense.runTest", [fqn, projectPath ?? ""])));
+                lenses.Add(new LspCodeLens(range, new Command(
+                    "Debug test", "roslynSense.debugTest", [fqn, projectPath ?? ""])));
+            }
         }
         return lenses.ToArray();
     }

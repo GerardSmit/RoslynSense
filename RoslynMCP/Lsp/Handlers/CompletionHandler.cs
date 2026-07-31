@@ -1,5 +1,6 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using CompletionItem = RoslynMCP.Lsp.Protocol.CompletionItem;
 using CompletionList = RoslynMCP.Lsp.Protocol.CompletionList;
@@ -137,20 +138,28 @@ internal static class CompletionHandler
         if (service is null)
             return item;
 
-        // Additional edits (e.g. the using directive) — everything the real completion
-        // change touches outside the item's own replacement span.
+        // The real committed change: the using directive an import completion adds, and — for
+        // override/interface completions — the generated member body, which is nothing like
+        // the label the initial pass proposed.
         if (roslynItem.IsComplexTextEdit || roslynItem.Flags.HasFlag(CompletionItemFlags.Expanded))
         {
             try
             {
                 var change = await service.GetChangeAsync(document, roslynItem, cancellationToken: ct);
                 var text = await document.GetTextAsync(ct);
+
                 var extra = change.TextChanges
                     .Where(c => !c.Span.IntersectsWith(roslynItem.Span))
                     .Select(c => new TextEdit(LspConverters.ToRange(text.Lines, c.Span), c.NewText ?? ""))
                     .ToArray();
                 if (extra.Length > 0)
                     item = item with { AdditionalTextEdits = extra };
+
+                var main = change.TextChanges
+                    .Where(c => c.Span.IntersectsWith(roslynItem.Span))
+                    .ToList();
+                if (main.Count == 1)
+                    item = WithCommittedEdit(item, main[0], change.NewPosition ?? -1, text);
             }
             catch (OperationCanceledException) { throw; }
             catch { /* best effort — the plain insertion still works */ }
@@ -162,6 +171,33 @@ internal static class CompletionHandler
 
         return item;
     }
+
+    /// <summary>
+    /// Replaces the item's placeholder edit with what Roslyn actually commits, and — when the
+    /// client understands snippets — turns Roslyn's post-commit caret position into a <c>$0</c>
+    /// tab stop. That is what leaves the caret inside a generated override body rather than
+    /// after the closing brace.
+    /// </summary>
+    private static CompletionItem WithCommittedEdit(
+        CompletionItem item, TextChange change, int newPosition, SourceText text)
+    {
+        string newText = change.NewText ?? "";
+        var range = LspConverters.ToRange(text.Lines, change.Span);
+
+        int caret = newPosition - change.Span.Start;
+        if (!LspClientState.SnippetSupport || caret < 0 || caret > newText.Length)
+            return item with { TextEdit = new TextEdit(range, newText), InsertTextFormat = LspInsertTextFormat.PlainText };
+
+        string snippet = EscapeSnippet(newText[..caret]) + "$0" + EscapeSnippet(newText[caret..]);
+        return item with
+        {
+            TextEdit = new TextEdit(range, snippet),
+            InsertTextFormat = LspInsertTextFormat.Snippet,
+        };
+    }
+
+    private static string EscapeSnippet(string value) =>
+        value.Replace("\\", "\\\\").Replace("$", "\\$").Replace("}", "\\}");
 
     private static int ToLspKind(Microsoft.CodeAnalysis.Completion.CompletionItem item)
     {

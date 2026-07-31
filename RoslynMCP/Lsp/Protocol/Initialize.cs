@@ -11,13 +11,32 @@ public sealed record InitializeParams(
     [property: JsonPropertyName("capabilities")] ClientCapabilities? Capabilities);
 
 public sealed record ClientCapabilities(
-    [property: JsonPropertyName("textDocument")] TextDocumentClientCapabilities? TextDocument);
+    [property: JsonPropertyName("textDocument")] TextDocumentClientCapabilities? TextDocument,
+    [property: JsonPropertyName("workspace")] WorkspaceClientCapabilities? Workspace = null);
 
 /// <summary>Only the client capabilities the server branches on. A non-null
 /// <see cref="Diagnostic"/> means the client pulls diagnostics (LSP 3.17), so the
 /// session skips push publishing to avoid duplicate squiggles.</summary>
 public sealed record TextDocumentClientCapabilities(
-    [property: JsonPropertyName("diagnostic")] System.Text.Json.JsonElement? Diagnostic);
+    [property: JsonPropertyName("diagnostic")] System.Text.Json.JsonElement? Diagnostic,
+    [property: JsonPropertyName("completion")] CompletionClientCapabilities? Completion = null);
+
+public sealed record CompletionClientCapabilities(
+    [property: JsonPropertyName("completionItem")] CompletionItemClientCapabilities? CompletionItem);
+
+public sealed record CompletionItemClientCapabilities(
+    [property: JsonPropertyName("snippetSupport")] bool SnippetSupport);
+
+/// <summary>Workspace-side capabilities. The refresh flags say whether the client will honor
+/// a server-initiated "re-request everything" nudge; sending one to a client that doesn't
+/// support it is an error response, so each is gated.</summary>
+public sealed record WorkspaceClientCapabilities(
+    [property: JsonPropertyName("codeLens")] RefreshCapability? CodeLens = null,
+    [property: JsonPropertyName("inlayHint")] RefreshCapability? InlayHint = null,
+    [property: JsonPropertyName("diagnostics")] RefreshCapability? Diagnostics = null);
+
+public sealed record RefreshCapability(
+    [property: JsonPropertyName("refreshSupport")] bool RefreshSupport);
 
 public sealed record WorkspaceFolder(
     [property: JsonPropertyName("uri")] string Uri,

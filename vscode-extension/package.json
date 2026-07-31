@@ -2,14 +2,16 @@
   "name": "roslyn-sense",
   "displayName": "RoslynSense",
   "description": "C# language server backed by the RoslynSense shared daemon — the same loaded solution your MCP-connected AI assistant uses.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "roslyn-sense",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Debuggers",
+    "Testing"
   ],
   "activationEvents": [
     "onLanguage:csharp",
@@ -61,12 +63,106 @@
       {
         "command": "roslynSense.openAiDebugSession",
         "title": "RoslynSense: Open AI Debug Session in Debugger"
+      },
+      {
+        "command": "roslynSense.pickProcess",
+        "title": "RoslynSense: Pick .NET Process"
       }
     ],
     "breakpoints": [
       { "language": "csharp" }
     ],
     "debuggers": [
+      {
+        "type": "roslynsense",
+        "label": "C# (RoslynSense)",
+        "languages": [
+          "csharp"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "projectPath": {
+                "type": "string",
+                "description": "Project to launch. Omit to be prompted."
+              },
+              "configuration": {
+                "type": "string",
+                "description": "Build configuration.",
+                "default": "Debug"
+              },
+              "program": {
+                "type": "string",
+                "description": "Executable to launch. Resolved from the project when omitted."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "cwd": {
+                "type": "string"
+              },
+              "env": {
+                "type": "object",
+                "default": {}
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Break at the program's entry point."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "default": true
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "processId": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "PID of the .NET process to attach to."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "roslynsense",
+            "request": "launch",
+            "name": "C#: Launch"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "C#: Launch project (RoslynSense)",
+            "description": "Build and debug a .NET project.",
+            "body": {
+              "type": "roslynsense",
+              "request": "launch",
+              "name": "C#: Launch",
+              "projectPath": "^\"\\${workspaceFolder}/${1:Project}/${1:Project}.csproj\"",
+              "stopAtEntry": false
+            }
+          },
+          {
+            "label": "C#: Attach to process (RoslynSense)",
+            "description": "Attach the debugger to a running .NET process.",
+            "body": {
+              "type": "roslynsense",
+              "request": "attach",
+              "name": "C#: Attach",
+              "processId": "^\"\\${command:roslynSense.pickProcess}\""
+            }
+          }
+        ]
+      },
       {
         "type": "roslynsense-ai",
         "label": "RoslynSense AI Session",
@@ -128,6 +224,11 @@
           "type": "string",
           "default": "",
           "description": "Default solution for this workspace. When empty: a single found .sln/.slnx is used automatically, multiple prompt a picker (use 'RoslynSense: Pick Solution' to change), none lets the server resolve from the workspace folder."
+        },
+        "roslynSense.debuggerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to netcoredbg. When empty, the server locates it (PATH, common install locations) and downloads it if needed."
         },
         "roslynSense.trace.server": {
           "type": "string",

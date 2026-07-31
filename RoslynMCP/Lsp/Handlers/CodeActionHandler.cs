@@ -16,6 +16,10 @@ internal static class CodeActionHandler
 {
     private const int MaxActions = 25;
 
+    /// <summary>Analyzer diagnostics now compete for these slots alongside compiler ones,
+    /// so the range budget is wider than the compiler-only original.</summary>
+    private const int MaxDiagnosticsPerRange = 25;
+
     public static async Task<LspCodeAction[]> CodeActionsAsync(
         CodeActionParams p, LspResolveCache cache, CancellationToken ct)
     {
@@ -29,14 +33,21 @@ internal static class CodeActionHandler
 
         var actions = new List<(CodeAction Action, string Kind)>();
 
-        // Quick fixes for diagnostics intersecting the range.
+        // Quick fixes for diagnostics intersecting the range. Analyzer diagnostics come from
+        // cache only — computing them inside a lightbulb request would stall the UI, and the
+        // publisher has almost always populated the cache by the time the user asks.
         var model = await document.GetSemanticModelAsync(ct);
         if (model is not null)
         {
-            var diagnostics = model.GetDiagnostics(cancellationToken: ct)
+            var analyzerDiagnostics = AnalyzerDiagnosticCache.TryGet(
+                document, await AnalyzerDiagnosticCache.GetVersionAsync(document, ct));
+
+            var diagnostics = DiagnosticsHandler
+                .Merge(model.GetDiagnostics(cancellationToken: ct), analyzerDiagnostics)
                 .Where(d => d.Location.IsInSource && d.Location.SourceSpan.IntersectsWith(span))
-                .Where(d => d.Severity is DiagnosticSeverity.Error or DiagnosticSeverity.Warning)
-                .Take(10)
+                .Where(d => d.Severity is DiagnosticSeverity.Error
+                    or DiagnosticSeverity.Warning or DiagnosticSeverity.Info)
+                .Take(MaxDiagnosticsPerRange)
                 .ToList();
 
             foreach (var diagnostic in diagnostics)

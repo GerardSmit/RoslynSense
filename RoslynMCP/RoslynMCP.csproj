@@ -19,6 +19,10 @@
       <PackageReference Include="JsonPath.Net" Version="2.1.1" />
       <PackageReference Include="Microsoft.AspNetCore.Razor.Language" Version="6.0.36" />
       <PackageReference Include="Microsoft.Build.Framework" Version="17.11.48" ExcludeAssets="runtime" PrivateAssets="all" />
+      <!-- Item-model evaluation (DependentUpon, PackageReference, imports) and .sln parsing for
+           the Solution Explorer. Runtime assets excluded so it binds to the MSBuild that
+           Microsoft.Build.Locator registered, exactly like Build.Framework above. -->
+      <PackageReference Include="Microsoft.Build" Version="17.11.48" ExcludeAssets="runtime" PrivateAssets="all" />
       <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="5.6.0" />
       <!-- Pulled in by StreamJsonRpc via MessagePack; MSBuildLocator (MSBL001) requires the MSBuild-owned assembly be excluded at runtime. -->

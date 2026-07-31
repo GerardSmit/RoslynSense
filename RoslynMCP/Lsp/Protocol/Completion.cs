@@ -36,6 +36,16 @@ public sealed record CompletionItem(
     [JsonPropertyName("preselect")] public bool? Preselect { get; init; }
 
     [JsonPropertyName("commitCharacters")] public string[]? CommitCharacters { get; init; }
+
+    /// <summary>1 = plain text, 2 = snippet. Snippets carry tab stops, which is what puts the
+    /// caret inside a generated override body instead of after it.</summary>
+    [JsonPropertyName("insertTextFormat")] public int? InsertTextFormat { get; init; }
+}
+
+public static class LspInsertTextFormat
+{
+    public const int PlainText = 1;
+    public const int Snippet = 2;
 }
 
 public sealed record CompletionItemData(

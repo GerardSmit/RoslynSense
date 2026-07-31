@@ -16,12 +16,42 @@ namespace RoslynMCP.Lsp;
 internal static class LspSessionRegistry
 {
     private static readonly ConcurrentDictionary<string, JsonRpc> s_sessions = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, LspServer> s_servers = new(StringComparer.Ordinal);
 
-    public static void Register(string sessionId, JsonRpc rpc) => s_sessions[sessionId] = rpc;
+    public static void Register(string sessionId, JsonRpc rpc, LspServer server)
+    {
+        s_sessions[sessionId] = rpc;
+        s_servers[sessionId] = server;
+    }
 
-    public static void Unregister(string sessionId) => s_sessions.TryRemove(sessionId, out _);
+    public static void Unregister(string sessionId)
+    {
+        s_sessions.TryRemove(sessionId, out _);
+        s_servers.TryRemove(sessionId, out _);
+    }
 
     public static bool HasSessions => !s_sessions.IsEmpty;
+
+    /// <summary>Snapshot of the connected editors' RPC channels.</summary>
+    internal static IReadOnlyList<JsonRpc> ActiveSessions() => s_sessions.Values.ToList();
+
+    /// <summary>
+    /// Asks every connected editor to re-request derived data. Used by background work that
+    /// completes after a response was already sent — analyzer diagnostics landing in the cache,
+    /// a workspace reload — where the client otherwise keeps showing a stale answer.
+    /// Each session honors only the refresh kinds it declared support for.
+    /// </summary>
+    public static async Task RequestRefreshAsync(RefreshKind kinds, CancellationToken ct = default)
+    {
+        foreach (var server in s_servers.Values)
+        {
+            try { await server.RefreshClientAsync(kinds, ct); }
+            catch (Exception ex) when (ex is RemoteInvocationException or ConnectionLostException or ObjectDisposedException)
+            {
+                // Session gone — the others still get their nudge.
+            }
+        }
+    }
 
     /// <summary>
     /// Routes a debug command from an LLM client into the editor's own debug session

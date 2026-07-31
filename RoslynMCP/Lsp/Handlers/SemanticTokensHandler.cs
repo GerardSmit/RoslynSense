@@ -17,8 +17,31 @@ internal static class SemanticTokensHandler
         "string", "number", "operator", "macro", "type", "label",
     ];
 
+    /// <summary>Legend of modifier bits. Index i in this array is bit 1&lt;&lt;i in the encoded
+    /// modifier field.</summary>
+    public static readonly string[] TokenModifiers =
+    [
+        "static", "readonly", "declaration",
+    ];
+
     private static readonly Dictionary<string, int> s_typeIndex =
         TokenTypes.Select((t, i) => (t, i)).ToDictionary(x => x.t, x => x.i);
+
+    private const int StaticModifier = 1 << 0;
+    private const int ReadonlyModifier = 1 << 1;
+
+    /// <summary>
+    /// Roslyn emits additive classifications as spans that overlap the primary one — a static
+    /// member gets both "method" and "static symbol" over the same text. Mapping those overlaps
+    /// to modifier bits costs no extra semantic work, which is why only the additive
+    /// classifications Roslyn already produces are supported here.
+    /// </summary>
+    private static readonly Dictionary<string, int> s_modifierMap = new()
+    {
+        [ClassificationTypeNames.StaticSymbol] = StaticModifier,
+        ["static symbol"] = StaticModifier,
+        [ClassificationTypeNames.ConstantName] = ReadonlyModifier,
+    };
 
     /// <summary>Roslyn classification type → legend token type. Additive classifications
     /// (static symbol, reassigned variable, …) and plain identifiers/punctuation are absent —
@@ -76,7 +99,16 @@ internal static class SemanticTokensHandler
         // Classifier returns overlapping syntactic + semantic + additive results; keep only
         // mapped types, then resolve overlaps by span start (semantic names win over the
         // unmapped "identifier" they overlap, which is already filtered out).
-        var tokens = new List<(int Line, int Char, int Length, int Type)>();
+        // Additive spans are collected first: they overlap the primary span they modify, so
+        // they must not be consumed by the overlap filter below.
+        var modifiersBySpan = new Dictionary<TextSpan, int>();
+        foreach (var span in spans)
+        {
+            if (s_modifierMap.TryGetValue(span.ClassificationType, out int bit))
+                modifiersBySpan[span.TextSpan] = modifiersBySpan.GetValueOrDefault(span.TextSpan) | bit;
+        }
+
+        var tokens = new List<(int Line, int Char, int Length, int Type, int Modifiers)>();
         int lastEnd = -1;
         foreach (var span in spans
                      .Where(s => s_classificationMap.ContainsKey(s.ClassificationType))
@@ -88,6 +120,7 @@ internal static class SemanticTokensHandler
             lastEnd = span.TextSpan.End;
 
             int type = s_typeIndex[s_classificationMap[span.ClassificationType]];
+            int modifiers = modifiersBySpan.GetValueOrDefault(span.TextSpan);
             var linePositions = text.Lines.GetLinePositionSpan(span.TextSpan);
 
             // Split multi-line spans (block comments, verbatim strings) into per-line tokens.
@@ -99,7 +132,7 @@ internal static class SemanticTokensHandler
                 int end = line == linePositions.End.Line
                     ? span.TextSpan.End : textLine.End;
                 if (end > start)
-                    tokens.Add((line, start - textLine.Start, end - start, type));
+                    tokens.Add((line, start - textLine.Start, end - start, type, modifiers));
             }
         }
 
@@ -108,12 +141,12 @@ internal static class SemanticTokensHandler
         int prevLine = 0, prevChar = 0;
         for (int i = 0; i < tokens.Count; i++)
         {
-            var (line, ch, length, type) = tokens[i];
+            var (line, ch, length, type, modifiers) = tokens[i];
             data[i * 5] = line - prevLine;
             data[i * 5 + 1] = line == prevLine ? ch - prevChar : ch;
             data[i * 5 + 2] = length;
             data[i * 5 + 3] = type;
-            data[i * 5 + 4] = 0;
+            data[i * 5 + 4] = modifiers;
             prevLine = line;
             prevChar = ch;
         }

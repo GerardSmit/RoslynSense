@@ -483,7 +483,16 @@ internal sealed partial class DebuggerService : IDebugBackend
     private static readonly string s_toolsDirectory = Path.Combine(
         Path.GetTempPath(), "RoslynMCP", "Tools");
 
-    private static async Task<string?> FindOrProvisionNetcoredbgAsync(CancellationToken cancellationToken)
+    /// <summary>True when the debugger is already on disk, so callers can decide whether to
+    /// announce a download before one happens.</summary>
+    public static bool HasCachedNetcoredbg() => GetCachedNetcoredbgPath() is not null;
+
+    /// <summary>
+    /// Locates netcoredbg — tools cache, PATH, common install locations — downloading it as a
+    /// last resort. Shared by the AI-owned MI sessions and the editor's DAP sessions, which
+    /// both drive the same binary in different interpreter modes.
+    /// </summary>
+    public static async Task<string?> FindOrProvisionNetcoredbgAsync(CancellationToken cancellationToken)
     {
         // 1. Check our tools cache first
         var cachedPath = GetCachedNetcoredbgPath();

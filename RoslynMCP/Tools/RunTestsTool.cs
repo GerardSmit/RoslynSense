@@ -344,13 +344,11 @@ public static class RunTestsTool
     internal static string FormatTrxOutput(string trxPath, int exitCode, IOutputFormatter fmt)
     {
         var sb = new StringBuilder();
-        XNamespace ns = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
-        var doc = XDocument.Load(trxPath);
-        var results = doc.Descendants(ns + "UnitTestResult").ToList();
+        var results = Services.Testing.TrxParser.Parse(trxPath);
 
-        int passed = results.Count(r => r.Attribute("outcome")?.Value == "Passed");
-        int failed = results.Count(r => r.Attribute("outcome")?.Value == "Failed");
-        int skipped = results.Count(r => r.Attribute("outcome")?.Value is "NotExecuted" or "Inconclusive");
+        int passed = results.Count(r => r.Outcome == "Passed");
+        int failed = results.Count(r => r.Outcome == "Failed");
+        int skipped = results.Count(r => r.Outcome is "NotExecuted" or "Inconclusive");
         int total = results.Count;
 
         if (exitCode == 0)
@@ -364,19 +362,17 @@ public static class RunTestsTool
         if (skipped > 0) fmt.AppendField(sb, "Skipped", skipped);
 
         // Show failed tests with details
-        var failedResults = results.Where(r => r.Attribute("outcome")?.Value == "Failed").ToList();
+        var failedResults = results.Where(r => r.Failed).ToList();
         if (failedResults.Count > 0)
         {
             fmt.AppendSeparator(sb);
             fmt.AppendHeader(sb, "Failed Tests", 2);
             foreach (var result in failedResults)
             {
-                var testName = result.Attribute("testName")?.Value ?? "Unknown";
-                var duration = result.Attribute("duration")?.Value;
-                var output = result.Element(ns + "Output");
-                var errorInfo = output?.Element(ns + "ErrorInfo");
-                var message = errorInfo?.Element(ns + "Message")?.Value;
-                var stackTrace = errorInfo?.Element(ns + "StackTrace")?.Value;
+                var testName = result.FullyQualifiedName;
+                var duration = result.DurationMs > 0 ? $"{result.DurationMs:0.###} ms" : null;
+                var message = result.ErrorMessage;
+                var stackTrace = result.StackTrace;
 
                 fmt.AppendHeader(sb, fmt.Escape(testName), 3);
                 if (duration is not null) fmt.AppendField(sb, "Duration", duration);

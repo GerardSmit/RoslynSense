@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis.Diagnostics;
+using RoslynMCP.Config;
 using RoslynMCP.Services;
 using Xunit;
 
@@ -103,16 +104,46 @@ public class AnalyzerInfrastructureTests
         var compilation = await project.GetCompilationAsync();
         Assert.NotNull(compilation);
 
-        var writer = new StringWriter();
+        // Roslyn's built-in IDE analyzers are not project analyzer references, so they still
+        // run here — turning the code-style switch off is what leaves nothing to report.
+        LspFeatureOptions.CodeStyleDiagnostics = false;
+        try
+        {
+            var writer = new StringWriter();
+            var diagnostics = (await AnalyzerService.RunAnalyzersAsync(
+                    project,
+                    compilation!,
+                    FixturePaths.BrokenSemanticFile,
+                    writer))
+                .ToList();
+
+            Assert.Empty(diagnostics);
+            Assert.Contains("No analyzer references found", writer.ToString());
+        }
+        finally
+        {
+            LspFeatureOptions.CodeStyleDiagnostics = true;
+        }
+    }
+
+    [Fact]
+    public async Task WhenProjectHasNoAnalyzerReferencesThenIdeCodeStyleAnalyzersStillRun()
+    {
+        var project = await RoslynTestHelpers.OpenProjectAsync(
+            FixturePaths.BrokenProjectFile,
+            FixturePaths.BrokenSemanticFile);
+        var analyzerFreeSolution = project.Solution;
+        foreach (var analyzerReference in project.AnalyzerReferences)
+            analyzerFreeSolution = analyzerFreeSolution.RemoveAnalyzerReference(project.Id, analyzerReference);
+
+        project = analyzerFreeSolution.GetProject(project.Id)!;
+        var compilation = await project.GetCompilationAsync();
+
         var diagnostics = (await AnalyzerService.RunAnalyzersAsync(
-                project,
-                compilation!,
-                FixturePaths.BrokenSemanticFile,
-                writer))
+                project, compilation!, FixturePaths.BrokenSemanticFile, new StringWriter()))
             .ToList();
 
-        Assert.Empty(diagnostics);
-        Assert.Contains("No analyzer references found", writer.ToString());
+        Assert.Contains(diagnostics, d => d.Id.StartsWith("IDE", StringComparison.Ordinal));
     }
 
     [Fact]

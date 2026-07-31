@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using RoslynMCP.Config;
 using RoslynMCP.Lsp.Protocol;
 using StreamJsonRpc;
 
@@ -8,10 +9,14 @@ namespace RoslynMCP.Lsp;
 /// Computes and pushes <c>textDocument/publishDiagnostics</c> for one LSP session.
 /// Debounced per document: rapid didChange bursts collapse into one compute ~400ms after
 /// the last keystroke; didOpen/didSave publish immediately.
+/// Two phases per schedule — compiler diagnostics first so squiggles keep their current
+/// latency, then analyzers after a longer idle, republished as the union. publishDiagnostics
+/// replaces the whole set per URI, so phase two must re-send phase one's findings with it.
 /// </summary>
 internal sealed class DiagnosticsPublisher : IDisposable
 {
     private static readonly TimeSpan Debounce = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan AnalyzerDebounce = TimeSpan.FromMilliseconds(1500);
 
     private readonly JsonRpc _rpc;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _pending =
@@ -52,12 +57,27 @@ internal sealed class DiagnosticsPublisher : IDisposable
 
             ct.ThrowIfCancellationRequested();
             await PublishAsync(filePath, diagnostics, ct);
+
+            if (LspFeatureOptions.AnalyzerDiagnostics)
+                await RunAnalyzerPhaseAsync(filePath, ct);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Lsp] Diagnostics for '{filePath}' failed: {ex.Message}");
         }
+    }
+
+    /// <summary>Phase two. Cancelled outright by the next keystroke, which is the point:
+    /// analyzers only run once the user pauses.</summary>
+    private async Task RunAnalyzerPhaseAsync(string filePath, CancellationToken ct)
+    {
+        await Task.Delay(AnalyzerDebounce, ct);
+
+        var merged = await Handlers.DiagnosticsHandler.ComputeWithAnalyzersAsync(filePath, ct);
+
+        ct.ThrowIfCancellationRequested();
+        await PublishAsync(filePath, merged, ct);
     }
 
     private Task PublishAsync(string filePath, Protocol.Diagnostic[] diagnostics, CancellationToken ct)

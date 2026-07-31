@@ -1,5 +1,6 @@
 using System.Reflection;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Config;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using StreamJsonRpc;
@@ -134,7 +135,8 @@ internal sealed class LspServer : IDisposable
                     Handlers.SemanticTokensHandler.TokenModifiers),
                 Full: true),
             DiagnosticProvider = new DiagnosticOptions(
-                InterFileDependencies: false, WorkspaceDiagnostics: false),
+                InterFileDependencies: true,
+                WorkspaceDiagnostics: LspFeatureOptions.WorkspaceDiagnosticsScope != "off"),
             CodeLensProvider = new CodeLensOptions(ResolveProvider: true),
             ExecuteCommandProvider = new ExecuteCommandOptions(Handlers.ExecuteCommandHandler.Commands),
             InlayHintProvider = new InlayHintOptions(ResolveProvider: false),
@@ -281,6 +283,11 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/testCoverage", UseSingleObjectParameterDeserialization = true)]
     public FileCoverageInfo[] TestCoverage(TestCoverageParams p) =>
         Handlers.TestHandler.Coverage(p);
+
+    [JsonRpcMethod("workspace/diagnostic", UseSingleObjectParameterDeserialization = true)]
+    public Task<WorkspaceDiagnosticReport> WorkspaceDiagnostic(
+        WorkspaceDiagnosticParams p, CancellationToken ct) =>
+        Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/editorContext", UseSingleObjectParameterDeserialization = true)]
     public void EditorContext(Handlers.EditorContextParams p) =>

@@ -120,4 +120,7 @@ public static class OpenDocumentStore
     /// <summary>True when the file is open in some editor (its buffer may differ from disk).</summary>
     public static bool IsOpen(string filePath) =>
         s_docs.ContainsKey(PathHelper.NormalizePath(filePath));
+
+    /// <summary>Every open document's path — the scope signal for workspace-wide sweeps.</summary>
+    public static IReadOnlyCollection<string> OpenPaths() => s_docs.Keys.ToList();
 }

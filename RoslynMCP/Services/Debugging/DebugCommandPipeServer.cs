@@ -8,7 +8,8 @@ internal sealed record DebugPipeRequest(
     string Action,          // continue | step_in | step_over | step_out | pause | evaluate |
                             // locals | stacktrace | status | stop | set_breakpoint |
                             // remove_breakpoint | frames | variables | children | set_variable |
-                            // threads | exception_info | exception_filters | drain_log
+                            // threads | exception_info | exception_filters | drain_log |
+                            // set_data_breakpoints | data_hit | apply_delta
     string? Expression = null,
     string? File = null,
     int Line = 0,
@@ -19,7 +20,11 @@ internal sealed record DebugPipeRequest(
     int FrameId = 0,
     int VariablesReference = 0,
     string? Value = null,
-    string[]? Filters = null);
+    string[]? Filters = null,
+    DataBreakpointSpec[]? DataBreakpoints = null,
+    string? AssemblyName = null,
+    string? MetadataDelta = null,
+    string? IlDelta = null);
 
 internal sealed record DebugPipeResponse(bool Ok, string? Result, string? Error);
 
@@ -144,6 +149,18 @@ internal sealed class DebugCommandPipeServer : IDisposable
                         request.Expression, request.Value ?? "", request.FrameId, ct)),
                 "exception_filters" => await session.SetExceptionFiltersAsync(
                     ExceptionFilters.FromIds(request.Filters ?? []), ct),
+                // Value watches live in the decorator, not the engine, so both are answered by
+                // the wrapper or refused rather than reaching the engine at all.
+                "set_data_breakpoints" => session is PublishingDebugBackend watching
+                    ? Json(await watching.SetDataBreakpointsAsync(request.DataBreakpoints ?? [], ct))
+                    : throw new NotSupportedException("This session cannot watch values."),
+                "data_hit" => Json((session as PublishingDebugBackend)?.DataBreakpoints.LastHit),
+
+                // Hot reload on .NET Framework has to travel this way: the delta is computed where
+                // the workspace is loaded, but ICorDebug can only apply it from the process that
+                // owns the debug session.
+                "apply_delta" when request.AssemblyName is { Length: > 0 } => await ApplyDeltaAsync(
+                    session, request, ct),
                 "drain_log" => Json(
                     (session as PublishingDebugBackend)?.DrainLog() ?? (IReadOnlyList<string>)[]),
                 "remove_breakpoint" when request.BreakpointId > 0 =>
@@ -156,6 +173,22 @@ internal sealed class DebugCommandPipeServer : IDisposable
         {
             return new DebugPipeResponse(false, null, ex.Message);
         }
+    }
+
+    private static async Task<string> ApplyDeltaAsync(
+        IDebugBackend session, DebugPipeRequest request, CancellationToken ct)
+    {
+        var engine = (session as PublishingDebugBackend)?.Inner ?? session;
+        if (engine is not IcorDebugBackend icor)
+            return "Error: this session does not debug .NET Framework, so it cannot apply a delta.";
+
+        var (ok, error) = await icor.ApplyDeltaAsync(
+            request.AssemblyName!,
+            Convert.FromBase64String(request.MetadataDelta ?? ""),
+            Convert.FromBase64String(request.IlDelta ?? ""),
+            ct);
+
+        return ok ? "Applied." : $"Error: {error}";
     }
 
     private static string Json<T>(T value) =>

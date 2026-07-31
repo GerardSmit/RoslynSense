@@ -26,7 +26,9 @@ internal static class DebugBridgeHandler
             p.OwnerPid,
             new DebugPipeRequest(
                 p.Action, p.Expression, p.File, p.Line, p.Condition, p.BreakpointId,
-                p.HitCondition, p.LogMessage, p.FrameId, p.VariablesReference, p.Value, p.Filters),
+                p.HitCondition, p.LogMessage, p.FrameId, p.VariablesReference, p.Value, p.Filters,
+                p.DataBreakpoints?.Select(d => new DataBreakpointSpec(
+                    d.DataId, d.Expression, d.AccessType, d.Condition, d.HitCondition)).ToArray()),
             ct);
         return response.Ok
             ? new DebugCommandResult(true, response.Result ?? "")

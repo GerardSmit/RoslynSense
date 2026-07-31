@@ -19,6 +19,7 @@ internal sealed class PublishingDebugBackend : IDebugBackend
     private sealed record EmulatedBreakpoint(string? HitCondition, string? LogMessage);
 
     private readonly IDebugBackend _inner;
+    private readonly DataBreakpointWatcher _watcher;
     private readonly List<DebugStateStore.Breakpoint> _breakpoints = [];
     private readonly ConcurrentDictionary<int, EmulatedBreakpoint> _emulated = new();
     private readonly ConcurrentDictionary<int, int> _hits = new();
@@ -27,10 +28,18 @@ internal sealed class PublishingDebugBackend : IDebugBackend
     private string _target = "";
     private bool _started;
 
-    public PublishingDebugBackend(IDebugBackend inner) => _inner = inner;
+    public PublishingDebugBackend(IDebugBackend inner)
+    {
+        _inner = inner;
+        _watcher = new DataBreakpointWatcher(inner);
+    }
 
     /// <summary>The wrapped engine — for engine-selection assertions and diagnostics.</summary>
     public IDebugBackend Inner => _inner;
+
+    /// <summary>The armed value watches. Empty unless the client set one, because watching costs a
+    /// step per statement.</summary>
+    public DataBreakpointWatcher DataBreakpoints => _watcher;
 
     public DebuggerService.StoppedFrame? CurrentFrame => _inner.CurrentFrame;
 
@@ -123,8 +132,42 @@ internal sealed class PublishingDebugBackend : IDebugBackend
         return result;
     }
 
+    /// <summary>
+    /// Replaces the armed data breakpoints, which is what DAP's <c>setDataBreakpoints</c> means:
+    /// the client sends the whole set every time, so anything absent is removed.
+    /// </summary>
+    public Task<IReadOnlyList<DataBreakpointStatus>> SetDataBreakpointsAsync(
+        IReadOnlyList<DataBreakpointSpec> specs, CancellationToken cancellationToken = default) =>
+        _watcher.SetAsync(specs, cancellationToken);
+
     public Task<string> ContinueAsync(CancellationToken cancellationToken = default) =>
-        ResumeAsync(() => _inner.ContinueAsync(cancellationToken), cancellationToken);
+        _watcher.Any
+            ? WatchedContinueAsync(cancellationToken)
+            : ResumeAsync(() => _inner.ContinueAsync(cancellationToken), cancellationToken);
+
+    /// <summary>
+    /// Continue, when a data breakpoint is armed, is a step-and-compare walk rather than a resume:
+    /// a plain continue would run straight past the write we are waiting for.
+    /// </summary>
+    private async Task<string> WatchedContinueAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var (outcome, message) = await _watcher.ContinueAsync(
+                async () => !await ShouldResumeThroughAsync(cancellationToken),
+                cancellationToken);
+
+            return outcome switch
+            {
+                DataWatchOutcome.Changed => $"Data breakpoint hit — {message}",
+                _ => message,
+            };
+        }
+        finally
+        {
+            Publish();
+        }
+    }
 
     public Task<string> StepInAsync(CancellationToken cancellationToken = default) =>
         ResumeAsync(() => _inner.StepInAsync(cancellationToken), cancellationToken);
@@ -180,6 +223,7 @@ internal sealed class PublishingDebugBackend : IDebugBackend
     public string Stop()
     {
         var result = _inner.Stop();
+        _watcher.Clear();
         DebugStateStore.Clear(Environment.ProcessId);
         _started = false;
         return result;
@@ -211,9 +255,17 @@ internal sealed class PublishingDebugBackend : IDebugBackend
             for (int resumes = 0; resumes < MaxEmulatedResumes; resumes++)
             {
                 if (!await ShouldResumeThroughAsync(cancellationToken))
-                    return result;
+                    break;
 
                 result = await _inner.ContinueAsync(cancellationToken);
+            }
+
+            // A step can be what writes the watched value, so the baselines are refreshed here
+            // too — otherwise the next continue would report a change the user already saw.
+            if (_watcher.Any && _inner.CurrentFrame is not null &&
+                await _watcher.CheckAsync(cancellationToken) is { } hit)
+            {
+                return $"Data breakpoint hit — {hit.Description}\n{result}";
             }
 
             return result;

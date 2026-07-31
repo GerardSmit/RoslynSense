@@ -39,6 +39,11 @@ internal sealed class DapServer
     public static async Task<int> RunAsync(string[] args, CancellationToken ct = default)
     {
         using var backend = new PublishingDebugBackend(new IcorDebugBackend());
+
+        // The same command pipe the AI-owned sessions expose. Hot reload needs it: the delta is
+        // computed in the daemon, where the workspace lives, but only this process can apply it.
+        using var commands = new DebugCommandPipeServer(() => backend);
+
         var server = new DapServer(
             backend, Console.OpenStandardInput(), Console.OpenStandardOutput());
 
@@ -134,6 +139,70 @@ internal sealed class DapServer
                             ["line"] = line,
                         });
                     }
+                    await RespondAsync(message, new JsonObject { ["breakpoints"] = verified });
+                    break;
+                }
+
+                case "dataBreakpointInfo":
+                {
+                    // The client asks this about a name it saw in the Variables view; the frame is
+                    // part of the id so the same name in two frames is two watches.
+                    string name = arguments?["name"]?.GetValue<string>() ?? "";
+                    int frameId = arguments?["frameId"]?.GetValue<int>() ?? 0;
+
+                    if (name.Length == 0 || _backend.CurrentFrame is null)
+                    {
+                        await RespondAsync(message, new JsonObject
+                        {
+                            ["dataId"] = null,
+                            ["description"] = "Break on value change needs a suspended target and a named value.",
+                        });
+                        break;
+                    }
+
+                    await RespondAsync(message, new JsonObject
+                    {
+                        ["dataId"] = DataBreakpointId.For(name, frameId),
+                        ["description"] = $"{name} (break when the value changes)",
+                        // Reads are not detectable by comparing values, so they are not offered.
+                        ["accessTypes"] = new JsonArray { "write" },
+                        ["canPersist"] = false,
+                    });
+                    break;
+                }
+
+                case "setDataBreakpoints":
+                {
+                    if (_backend is not PublishingDebugBackend watching)
+                    {
+                        await RespondAsync(message, null, false, "This adapter cannot watch values.");
+                        break;
+                    }
+
+                    var specs = new List<DataBreakpointSpec>();
+                    foreach (var entry in arguments?["breakpoints"]?.AsArray() ?? [])
+                    {
+                        string dataId = entry?["dataId"]?.GetValue<string>() ?? "";
+                        if (dataId.Length == 0)
+                            continue;
+
+                        specs.Add(new DataBreakpointSpec(
+                            dataId,
+                            DataBreakpointId.ExpressionOf(dataId),
+                            entry?["accessType"]?.GetValue<string>() ?? "write",
+                            entry?["condition"]?.GetValue<string>(),
+                            entry?["hitCondition"]?.GetValue<string>()));
+                    }
+
+                    var verified = new JsonArray();
+                    foreach (var status in await watching.SetDataBreakpointsAsync(specs, ct))
+                    {
+                        var result = new JsonObject { ["verified"] = status.Verified };
+                        if (!status.Verified)
+                            result["message"] = status.Message;
+                        verified.Add(result);
+                    }
+
                     await RespondAsync(message, new JsonObject { ["breakpoints"] = verified });
                     break;
                 }
@@ -457,9 +526,10 @@ internal sealed class DapServer
         ["supportsExceptionInfoRequest"] = true,
         ["supportsTerminateRequest"] = true,
         ["supportsEvaluateForHovers"] = true,
-        // Both are emulated by PublishingDebugBackend rather than by the engine.
+        // These three are emulated by PublishingDebugBackend rather than by the engine.
         ["supportsHitConditionalBreakpoints"] = true,
         ["supportsLogPoints"] = true,
+        ["supportsDataBreakpoints"] = true,
         ["exceptionBreakpointFilters"] = new JsonArray
         {
             new JsonObject { ["filter"] = "all", ["label"] = "All Exceptions" },
@@ -476,12 +546,19 @@ internal sealed class DapServer
             return;
         }
 
+        // A value change outranks the reason the resume was started with: the user pressed
+        // Continue, but what actually stopped them is the watch.
+        var dataHit = (_backend as PublishingDebugBackend)?.DataBreakpoints.LastHit;
+
         await EventAsync("stopped", new JsonObject
         {
-            ["reason"] = frame.ExceptionName is { Length: > 0 } ? "exception" : defaultReason,
+            ["reason"] = dataHit is not null ? "data breakpoint"
+                : frame.ExceptionName is { Length: > 0 } ? "exception"
+                : defaultReason,
             ["threadId"] = 1,
             ["allThreadsStopped"] = true,
-            ["text"] = frame.ExceptionMessage,
+            ["description"] = dataHit?.Description,
+            ["text"] = dataHit?.Description ?? frame.ExceptionMessage,
         });
     }
 

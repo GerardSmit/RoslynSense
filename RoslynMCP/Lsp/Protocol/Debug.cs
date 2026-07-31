@@ -35,7 +35,16 @@ public sealed record DebugCommandParams(
     [property: JsonPropertyName("frameId")] int FrameId = 0,
     [property: JsonPropertyName("variablesReference")] int VariablesReference = 0,
     [property: JsonPropertyName("value")] string? Value = null,
-    [property: JsonPropertyName("filters")] string[]? Filters = null);
+    [property: JsonPropertyName("filters")] string[]? Filters = null,
+    [property: JsonPropertyName("dataBreakpoints")] DataBreakpointParams[]? DataBreakpoints = null);
+
+/// <summary>One value watch in a <c>set_data_breakpoints</c> command.</summary>
+public sealed record DataBreakpointParams(
+    [property: JsonPropertyName("dataId")] string DataId,
+    [property: JsonPropertyName("expression")] string Expression,
+    [property: JsonPropertyName("accessType")] string AccessType = "write",
+    [property: JsonPropertyName("condition")] string? Condition = null,
+    [property: JsonPropertyName("hitCondition")] string? HitCondition = null);
 
 public sealed record DebugCommandResult(
     [property: JsonPropertyName("ok")] bool Ok,

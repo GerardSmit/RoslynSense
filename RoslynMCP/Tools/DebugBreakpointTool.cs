@@ -160,4 +160,72 @@ public static class DebugBreakpointTool
             return $"Error: {ex.Message}";
         }
     }
+
+    [McpServerTool, Description(
+        "Break when a value changes rather than when a line is reached — the answer to 'what is " +
+        "setting this field to null?'. The expression is evaluated in the current frame, so the " +
+        "target must be suspended first. Continue then steps and compares instead of running " +
+        "free, which is much slower than a normal breakpoint, and the stop lands on the statement " +
+        "after the write. Only changes are detectable, never reads.")]
+    public static async Task<string> DebugWatchValue(
+        [Description("Expression to watch, e.g. 'order.Total' or '_cache.Count'.")]
+        string expression,
+        IOutputFormatter fmt,
+        [Description("Only stop when this expression is also true at the moment of the change.")]
+        string? condition = null,
+        [Description("Hit-count rule for the change, e.g. '>= 3' or '% 5'.")]
+        string? hitCondition = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (DebugSessionManager.GetSession() is not Services.Debugging.PublishingDebugBackend session)
+                return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+
+            if (session.CurrentFrame is null)
+                return "Error: The target is running. Watches read the current frame, so pause or " +
+                    "hit a breakpoint first.";
+
+            var specs = session.DataBreakpoints.Watches
+                .Where(w => !w.Expression.Equals(expression, StringComparison.Ordinal))
+                .Append(new Services.Debugging.DataBreakpointSpec(
+                    Services.Debugging.DataBreakpointId.For(expression, 0),
+                    expression, "write", condition, hitCondition))
+                .ToList();
+
+            var results = await session.SetDataBreakpointsAsync(specs, cancellationToken);
+            if (results.FirstOrDefault(r => !r.Verified) is { } failed)
+                return $"Error: {failed.Message}";
+
+            var sb = new StringBuilder($"Watching {specs.Count} value(s): " +
+                string.Join(", ", specs.Select(s => s.Expression)) + ".");
+            fmt.AppendHints(sb,
+                "Use DebugContinue to run until one of them changes",
+                "Use DebugUnwatchValues to drop the watches and get normal speed back");
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description(
+        "Drop every watched value set by DebugWatchValue, so Continue runs at full speed again.")]
+    public static async Task<string> DebugUnwatchValues(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (DebugSessionManager.GetSession() is not Services.Debugging.PublishingDebugBackend session)
+                return "Error: No active debug session.";
+
+            int count = session.DataBreakpoints.Watches.Count;
+            await session.SetDataBreakpointsAsync([], cancellationToken);
+            return count == 0 ? "No values were being watched." : $"Dropped {count} value watch(es).";
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
 }

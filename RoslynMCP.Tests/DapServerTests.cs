@@ -26,6 +26,38 @@ public class DapServerTests
         // Emulated a layer up rather than by the engine, but true from the client's side.
         Assert.True(capabilities["supportsHitConditionalBreakpoints"]!.GetValue<bool>());
         Assert.True(capabilities["supportsLogPoints"]!.GetValue<bool>());
+        Assert.True(capabilities["supportsDataBreakpoints"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task DataBreakpointInfoOffersWriteOnlyAndAnIdThatCarriesTheFrame()
+    {
+        var backend = new FakeBackend
+        {
+            Frame = new DebuggerService.StoppedFrame("breakpoint-hit", "Order.Total", @"C:\src\Order.cs", 42, 1),
+        };
+
+        var responses = await ConverseAsync(backend, [
+            Request(1, "dataBreakpointInfo", new JsonObject { ["name"] = "total", ["frameId"] = 2 }),
+        ]);
+
+        var body = responses.Single(r => r["command"]?.GetValue<string>() == "dataBreakpointInfo")["body"];
+
+        Assert.Equal("2:total", body!["dataId"]!.GetValue<string>());
+        Assert.Equal("write", body["accessTypes"]!.AsArray().Single()!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task DataBreakpointInfoRefusesWhileTheTargetIsRunning()
+    {
+        // The expression is evaluated in the current frame, so there has to be one.
+        var responses = await ConverseAsync(new FakeBackend(), [
+            Request(1, "dataBreakpointInfo", new JsonObject { ["name"] = "total" }),
+        ]);
+
+        var body = responses.Single(r => r["command"]?.GetValue<string>() == "dataBreakpointInfo")["body"];
+
+        Assert.Null(body!["dataId"]?.GetValue<string>());
     }
 
     [Fact]

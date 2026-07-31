@@ -38,8 +38,6 @@ internal sealed class DapServer
 
     public static async Task<int> RunAsync(string[] args, CancellationToken ct = default)
     {
-        // Attaching is the supported entry: launching under ICorDebug would mean driving the
-        // target's process tree, which the engine has no notion of.
         using var backend = new PublishingDebugBackend(new IcorDebugBackend());
         var server = new DapServer(
             backend, Console.OpenStandardInput(), Console.OpenStandardOutput());
@@ -357,7 +355,9 @@ internal sealed class DapServer
         string? projectPath = arguments?["projectPath"]?.GetValue<string>();
         string? program = arguments?["program"]?.GetValue<string>();
 
-        if (_backend is not PublishingDebugBackend { Inner: IcorDebugBackend engine })
+        // Through the decorator, not around it: a launched session has to reach DebugStateStore
+        // like any other, or the AI's debug tools cannot see what the user is debugging.
+        if (_backend is not PublishingDebugBackend publishing)
             return "Error: this adapter only debugs .NET Framework targets.";
 
         if (projectPath is { Length: > 0 })
@@ -369,13 +369,21 @@ internal sealed class DapServer
             if (!spec.CanRun)
                 return $"Error: {spec.Error}";
 
-            return await engine.LaunchAsync(
+            string result = await publishing.LaunchAsync(
                 spec.Executable,
                 spec.Arguments,
                 spec.Environment,
                 spec.WorkingDirectory,
                 initialBreakpoints: null,
                 ct);
+
+            if (!result.StartsWith("Error", StringComparison.OrdinalIgnoreCase) &&
+                spec.Port is { } port && spec.Url is { Length: > 0 } url)
+            {
+                _ = AnnounceWhenListeningAsync(port, url, ct);
+            }
+
+            return result;
         }
 
         if (program is { Length: > 0 })
@@ -388,13 +396,57 @@ internal sealed class DapServer
                 .Select(a => a?.GetValue<string>() ?? "")
                 .ToList();
 
-            return await engine.LaunchAsync(
+            return await publishing.LaunchAsync(
                 program, argumentList, environment,
                 arguments?["cwd"]?.GetValue<string>(),
                 initialBreakpoints: null, ct);
         }
 
         return "Error: the launch configuration named neither a project nor a program.";
+    }
+
+    /// <summary>
+    /// Waits for the site's port to accept a connection, then says so in the wording the client
+    /// watches for.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes F5 on a classic ASP.NET site behave like F5 on anything else. IIS
+    /// Express prints nothing a "server ready" rule can match, and — more importantly — none of
+    /// the site's own code runs until a request arrives, so without opening the browser the
+    /// session looks like it launched and died. The wording matches Kestrel's because the client
+    /// already watches for it.
+    /// </remarks>
+    private async Task AnnounceWhenListeningAsync(int port, string url, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
+        {
+            try
+            {
+                using var client = new System.Net.Sockets.TcpClient();
+                await client.ConnectAsync("127.0.0.1", port, ct);
+
+                await EventAsync("output", new JsonObject
+                {
+                    ["category"] = "console",
+                    ["output"] = $"Now listening on: {url}\n",
+                });
+                return;
+            }
+            catch (Exception ex) when (ex is System.Net.Sockets.SocketException or OperationCanceledException)
+            {
+                if (ct.IsCancellationRequested)
+                    return;
+                await Task.Delay(200, CancellationToken.None);
+            }
+        }
+
+        await EventAsync("output", new JsonObject
+        {
+            ["category"] = "stderr",
+            ["output"] = $"The site did not start listening on port {port}.\n",
+        });
     }
 
     private static JsonObject Capabilities() => new()

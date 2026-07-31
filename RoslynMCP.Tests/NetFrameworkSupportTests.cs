@@ -206,4 +206,26 @@ public class NetFrameworkSupportTests : IDisposable
             PackagesConfigService.FrameworkScore("net472", "net472") >
             PackagesConfigService.FrameworkScore("net471", "net472"));
     }
+
+    // === Classic ASP.NET under IIS Express ===
+
+    [Fact]
+    public void ALegacyWebProjectIsLaunchableRatherThanRefused()
+    {
+        // The launch list used to mark every Framework project unrunnable and point at the AI
+        // session; a web project has to appear as a real F5 target now.
+        var classification = RoslynMCP.Services.ProjectClassifier.Classify(FixturePaths.WebFormsSiteFile);
+
+        Assert.Equal(RoslynMCP.Services.AppKind.AspNetClassic, classification.Kind);
+        Assert.True(classification.IsRunnable);
+        Assert.Equal(RoslynMCP.Services.BuildTool.VisualStudioMsBuild, classification.BuildTool);
+    }
+
+    [Fact]
+    public void ALegacyWebProjectBuildsWithMsBuildRatherThanTheCli()
+    {
+        // `dotnet build` cannot build it at all, so the choice of driver is the difference
+        // between F5 working and failing before it starts.
+        Assert.False(ProjectMutationService.IsSdkStyle(FixturePaths.WebFormsSiteFile));
+    }
 }

@@ -61,6 +61,36 @@ internal sealed class PublishingDebugBackend : IDebugBackend
         return result;
     }
 
+    /// <summary>
+    /// Launches through the ICorDebug backend, which is the only one that can start a target
+    /// rather than attach to it, and publishes the session like any other.
+    /// </summary>
+    public async Task<string> LaunchAsync(
+        string executable,
+        IReadOnlyList<string> arguments,
+        IReadOnlyDictionary<string, string>? environment,
+        string? workingDirectory,
+        IEnumerable<(string file, int line)>? initialBreakpoints = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_inner is not IcorDebugBackend engine)
+            return "Error: this engine cannot launch a target; attach to a running process instead.";
+
+        _kind = "launch";
+        _target = executable;
+        TrackInitialBreakpoints(initialBreakpoints);
+
+        var result = await engine.LaunchAsync(
+            executable, arguments, environment, workingDirectory, initialBreakpoints, cancellationToken);
+
+        // Only a started session belongs in the store — a failed launch has nothing to mirror.
+        _started = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+        if (_started)
+            Publish();
+
+        return result;
+    }
+
     public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
         string filePath, int line, string? condition = null, string? hitCondition = null,
         string? logMessage = null, CancellationToken cancellationToken = default)

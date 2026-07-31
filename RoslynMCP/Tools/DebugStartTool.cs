@@ -106,6 +106,70 @@ public static class DebugStartTool
     }
 
     /// <summary>
+    /// Starts a project under the debugger, suspended, rather than attaching after the fact.
+    /// </summary>
+    [McpServerTool, Description(
+        "Start a project under the debugger and stop at its breakpoints, including ones in Main " +
+        "or a static constructor that attaching would miss. Works for console, desktop, and " +
+        "legacy ASP.NET projects — a web project starts under IIS Express, and its code runs on " +
+        "the first request, so open the reported URL to reach a breakpoint.")]
+    public static async Task<string> DebugLaunch(
+        [Description("Path to the project to launch.")] string projectPath,
+        IOutputFormatter fmt,
+        [Description("Build configuration (default: Debug).")] string configuration = "Debug",
+        [Description("Optional initial breakpoints as 'file:line' pairs, semicolon-separated.")]
+        string? initialBreakpoints = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            string? resolved = PathHelper.ResolveCsprojPath(projectPath);
+            if (resolved is null)
+                return $"Error: project '{projectPath}' not found.";
+
+            var spec = Services.Run.RunConfigResolver.Resolve(resolved, configuration);
+            if (!spec.CanRun)
+                return $"Error: {spec.Error}";
+
+            DebugSessionManager.DisposeSession();
+            var session = DebugSessionManager.CreateSessionForProject(resolved);
+
+            // Launching suspended is an ICorDebug capability; netcoredbg's own session is
+            // attach-based, so a CoreCLR target still starts and then gets attached to.
+            if (session is not Services.Debugging.PublishingDebugBackend publishing ||
+                publishing.Inner is not IcorDebugBackend)
+            {
+                return "Error: launching under the debugger is supported for .NET Framework " +
+                       "projects. For .NET, use RunProject and then DebugAttach.";
+            }
+
+            var (breakpoints, conditioned, sharedCount) = MergeSharedBreakpoints(
+                ParseBreakpoints(initialBreakpoints), Directory.GetCurrentDirectory());
+
+            string result = await publishing.LaunchAsync(
+                spec.Executable, spec.Arguments, spec.Environment, spec.WorkingDirectory,
+                breakpoints, cancellationToken);
+
+            await ApplyConditionedBreakpointsAsync(session, conditioned, cancellationToken);
+
+            var sb = new StringBuilder(result);
+            if (sharedCount > 0)
+                sb.Append($"\n\n_Applied {sharedCount} breakpoint(s) from the editor's shared set._");
+            if (spec.Url is { Length: > 0 } url)
+                sb.Append($"\n\nThe site is at {url} — nothing runs until a request arrives.");
+
+            fmt.AppendHints(sb,
+                "Use DebugSetBreakpoint to add breakpoints",
+                "Use DebugContinue to run on");
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    /// <summary>
     /// Folds the editor's shared per-solution breakpoint set (<see cref="SharedBreakpointStore"/>)
     /// into the session's initial breakpoints, so a session started by the chat honors what the
     /// user placed (or removed) in the editor — even with no editor open right now.

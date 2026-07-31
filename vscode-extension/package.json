@@ -150,6 +150,28 @@
         "command": "roslynSense.manageNuGetForProject",
         "title": "Manage NuGet Packages…",
         "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newFile",
+        "title": "New File…",
+        "category": "RoslynSense",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newFolder",
+        "title": "New Folder…",
+        "category": "RoslynSense",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.rename",
+        "title": "Rename…",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.delete",
+        "title": "Delete",
+        "category": "RoslynSense"
       }
     ],
     "viewsContainers": {
@@ -171,7 +193,9 @@
       ]
     },
     "breakpoints": [
-      { "language": "csharp" }
+      {
+        "language": "csharp"
+      }
     ],
     "taskDefinitions": [
       {
@@ -296,7 +320,9 @@
       {
         "type": "roslynsense-ai",
         "label": "RoslynSense AI Session",
-        "languages": ["csharp"],
+        "languages": [
+          "csharp"
+        ],
         "configurationAttributes": {
           "attach": {
             "properties": {
@@ -318,9 +344,18 @@
     ],
     "menus": {
       "commandPalette": [
-        { "command": "roslynSense.runTest", "when": "false" },
-        { "command": "roslynSense.showReferences", "when": "false" },
-        { "command": "roslynSense.openLocation", "when": "false" }
+        {
+          "command": "roslynSense.runTest",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.showReferences",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.openLocation",
+          "when": "false"
+        }
       ],
       "editor/context": [
         {
@@ -391,6 +426,26 @@
           "command": "roslynSense.manageNuGetForProject",
           "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|dependencies|packages)$/",
           "group": "1_edit"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newFile",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder)$/",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newFolder",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder)$/",
+          "group": "2_modify@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.rename",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "2_modify@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.delete",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "2_modify@4"
         }
       ]
     },
@@ -461,7 +516,11 @@
         },
         "roslynSense.trace.server": {
           "type": "string",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "default": "off",
           "description": "Trace LSP communication between VSCode and roslyn-sense."
         }

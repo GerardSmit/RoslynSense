@@ -1,3 +1,4 @@
+import * as Path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 
@@ -24,6 +25,16 @@ interface SolutionTreeNode {
 
 const VIEW_ID = 'roslynSense.solutionExplorer';
 
+/** Private drag payload: newline-separated resource URIs. */
+const DROP_MIME = 'application/vnd.code.tree.roslynsense.solutionexplorer';
+
+interface TreeEditResult {
+    ok: boolean;
+    message: string;
+    uri: string | null;
+    edit: unknown;
+}
+
 /** Toggle state, persisted per workspace so the view opens the way it was left. */
 interface ViewState {
     showAllFiles: boolean;
@@ -45,6 +56,28 @@ export function registerSolutionExplorer(
 
     const changeEmitter = new vscode.EventEmitter<SolutionTreeNode | undefined>();
     const nodesById = new Map<string, SolutionTreeNode>();
+
+    async function fetchChildren(nodeId: string | null): Promise<SolutionTreeNode[]> {
+        const client = getClient();
+        if (!client) {
+            return [];
+        }
+        try {
+            const children = await client.sendRequest<SolutionTreeNode[]>(
+                'roslynSense/solutionTree',
+                {
+                    nodeId,
+                    showAllFiles: state.showAllFiles,
+                    showIgnored: state.showIgnored,
+                    filter: filter ?? null,
+                }
+            );
+            children.forEach((child) => nodesById.set(child.id, child));
+            return children;
+        } catch {
+            return [];
+        }
+    }
 
     const provider: vscode.TreeDataProvider<SolutionTreeNode> = {
         onDidChangeTreeData: changeEmitter.event,
@@ -84,27 +117,7 @@ export function registerSolutionExplorer(
             return item;
         },
 
-        async getChildren(node) {
-            const client = getClient();
-            if (!client) {
-                return [];
-            }
-            try {
-                const children = await client.sendRequest<SolutionTreeNode[]>(
-                    'roslynSense/solutionTree',
-                    {
-                        nodeId: node?.id ?? null,
-                        showAllFiles: state.showAllFiles,
-                        showIgnored: state.showIgnored,
-                        filter: filter ?? null,
-                    }
-                );
-                children.forEach((child) => nodesById.set(child.id, child));
-                return children;
-            } catch {
-                return [];
-            }
-        },
+        getChildren: (node) => fetchChildren(node?.id ?? null),
 
         getParent(node) {
             // Reveal needs a parent chain; ids encode enough to find it for files.
@@ -117,10 +130,100 @@ export function registerSolutionExplorer(
         treeDataProvider: provider,
         canSelectMany: true,
         showCollapseAll: true,
+        dragAndDropController: {
+            dropMimeTypes: [DROP_MIME],
+            dragMimeTypes: [DROP_MIME],
+
+            handleDrag(source, data) {
+                // Only things with a file behind them can be moved; a Dependencies node has
+                // nowhere to go.
+                const movable = source.filter((node) => node.resourceUri).map((node) => node.resourceUri);
+                if (movable.length > 0) {
+                    data.set(DROP_MIME, new vscode.DataTransferItem(movable.join('\n')));
+                }
+            },
+
+            async handleDrop(target, data) {
+                const payload = data.get(DROP_MIME);
+                if (!payload || !target?.resourceUri) {
+                    return;
+                }
+                for (const uri of String(await payload.asString()).split('\n').filter(Boolean)) {
+                    await edit({
+                        action: 'move',
+                        targetUri: uri,
+                        destinationUri: target.resourceUri,
+                    });
+                }
+                refresh();
+            },
+        },
     });
     context.subscriptions.push(view, changeEmitter);
 
     const refresh = () => changeEmitter.fire(undefined);
+
+    /// Runs one tree edit and applies whatever namespace fixups it implies. The edits come back
+    /// rather than being written server-side so an open, unsaved file is changed in its buffer.
+    async function edit(params: Record<string, unknown>): Promise<TreeEditResult | undefined> {
+        const client = getClient();
+        if (!client) {
+            return undefined;
+        }
+
+        const result = await client.sendRequest<TreeEditResult>(
+            'roslynSense/solutionTreeEdit', params);
+
+        if (!result.ok) {
+            void vscode.window.showErrorMessage(result.message);
+            return result;
+        }
+
+        if (result.edit) {
+            await vscode.workspace.applyEdit(
+                await client.protocol2CodeConverter.asWorkspaceEdit(result.edit));
+        }
+        return result;
+    }
+
+    /// Expands each ancestor the server names, then selects the file. Without this, revealing
+    /// only works for a file whose branch the user already happened to expand.
+    async function revealUri(uri: vscode.Uri): Promise<boolean> {
+        const client = getClient();
+        if (!client) {
+            return false;
+        }
+
+        let chain: string[];
+        try {
+            const result = await client.sendRequest<{ path: string[] }>(
+                'roslynSense/solutionTreeReveal', { uri: uri.toString() });
+            chain = result?.path ?? [];
+        } catch {
+            return false;
+        }
+        if (chain.length === 0) {
+            return false;
+        }
+
+        let node: SolutionTreeNode | undefined;
+        for (const id of chain) {
+            node = nodesById.get(id) ?? (await fetchChildren(node?.id ?? null))
+                .find((child) => child.id === id);
+            if (!node) {
+                return false;
+            }
+            if (node.id !== chain[chain.length - 1]) {
+                await view.reveal(node, { select: false, focus: false, expand: true });
+            }
+        }
+
+        if (node) {
+            await view.reveal(node, { select: true, focus: false });
+            return true;
+        }
+        return false;
+    }
 
     const setToggle = async (key: keyof ViewState, value: boolean) => {
         state[key] = value;
@@ -232,6 +335,96 @@ export function registerSolutionExplorer(
             }
         ),
         vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.newFile',
+            async (node: SolutionTreeNode) => {
+                const name = await vscode.window.showInputBox({
+                    title: 'New file',
+                    prompt: 'File name, with or without an extension',
+                    placeHolder: 'OrderTotal.cs',
+                });
+                if (!name) {
+                    return;
+                }
+                const kind = Path.extname(name) && Path.extname(name) !== '.cs'
+                    ? 'empty'
+                    : await vscode.window.showQuickPick(
+                        ['class', 'interface', 'record', 'enum', 'empty'],
+                        { title: 'What should it contain?' });
+                if (!kind) {
+                    return;
+                }
+
+                const result = await edit({
+                    action: 'addFile',
+                    targetUri: containerUriOf(node),
+                    projectPath: projectPathOf(node),
+                    name,
+                    kind,
+                });
+                refresh();
+                if (result?.ok && result.uri) {
+                    await vscode.window.showTextDocument(vscode.Uri.parse(result.uri));
+                }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.newFolder',
+            async (node: SolutionTreeNode) => {
+                const name = await vscode.window.showInputBox({
+                    title: 'New folder',
+                    prompt: 'Folder name',
+                });
+                if (name) {
+                    await edit({ action: 'addFolder', targetUri: containerUriOf(node), name });
+                    refresh();
+                }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.rename',
+            async (node: SolutionTreeNode) => {
+                if (!node.resourceUri) {
+                    return;
+                }
+                const current = Path.basename(vscode.Uri.parse(node.resourceUri).fsPath);
+                const name = await vscode.window.showInputBox({
+                    title: 'Rename',
+                    value: current,
+                    valueSelection: [0, current.lastIndexOf('.') > 0 ? current.lastIndexOf('.') : current.length],
+                });
+                if (!name || name === current) {
+                    return;
+                }
+                await edit({ action: 'rename', targetUri: node.resourceUri, name });
+                refresh();
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.delete',
+            async (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
+                const targets = (selected?.length ? selected : [node]).filter((n) => n.resourceUri);
+                if (targets.length === 0) {
+                    return;
+                }
+
+                // Deleting from a tree is easy to do by accident and impossible to undo.
+                const confirmed = await vscode.window.showWarningMessage(
+                    targets.length === 1
+                        ? `Delete ${targets[0].label}?`
+                        : `Delete ${targets.length} items?`,
+                    { modal: true },
+                    'Delete'
+                );
+                if (confirmed !== 'Delete') {
+                    return;
+                }
+                for (const target of targets) {
+                    await edit({ action: 'delete', targetUri: target.resourceUri });
+                }
+                refresh();
+            }
+        ),
+        vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.buildProject',
             async (node: SolutionTreeNode) => {
                 const client = getClient();
@@ -259,9 +452,36 @@ export function registerSolutionExplorer(
             const node = nodesById.get(`file:${editor.document.uri.fsPath}`);
             if (node) {
                 await view.reveal(node, { select: true, focus: false });
+            } else {
+                await revealUri(editor.document.uri);
             }
         })
     );
+}
+
+/** Where a "new file here" lands: the node's own folder, or the folder its file sits in. */
+function containerUriOf(node: SolutionTreeNode | undefined): string | undefined {
+    if (!node) {
+        return undefined;
+    }
+    if (node.resourceUri) {
+        return node.resourceUri;
+    }
+    // A project node without a resource is still addressable through its id.
+    return node.id.startsWith('project:')
+        ? vscode.Uri.file(node.id.slice('project:'.length)).toString()
+        : undefined;
+}
+
+function projectPathOf(node: SolutionTreeNode | undefined): string | undefined {
+    if (node?.id.startsWith('project:')) {
+        return node.id.slice('project:'.length);
+    }
+    // folder ids are "folder:<projectPath>|<directory>".
+    if (node?.id.startsWith('folder:')) {
+        return node.id.slice('folder:'.length).split('|')[0];
+    }
+    return undefined;
 }
 
 function parentIdOf(id: string): string | undefined {

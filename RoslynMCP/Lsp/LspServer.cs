@@ -221,6 +221,19 @@ internal sealed class LspServer : IDisposable
     public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
         Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/solutionTreeSearch", UseSingleObjectParameterDeserialization = true)]
+    public Task<SolutionTreeNode[]> SolutionTreeSearch(SolutionTreeSearchParams p, CancellationToken ct) =>
+        Handlers.SolutionTreeSearchHandler.SearchAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/solutionTreeReveal", UseSingleObjectParameterDeserialization = true)]
+    public Task<SolutionTreeRevealResult> SolutionTreeReveal(
+        SolutionTreeRevealParams p, CancellationToken ct) =>
+        Handlers.SolutionTreeSearchHandler.RevealAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/solutionTreeEdit", UseSingleObjectParameterDeserialization = true)]
+    public Task<SolutionTreeEditResult> SolutionTreeEdit(SolutionTreeEditParams p, CancellationToken ct) =>
+        Handlers.SolutionTreeEditHandler.EditAsync(p, ct);
+
     // ---- Packages -----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/nuget/search", UseSingleObjectParameterDeserialization = true)]

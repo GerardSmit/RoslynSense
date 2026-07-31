@@ -71,7 +71,7 @@ deliberately out of scope here.
 | T1.2 native F5 (netcoredbg DAP) | Done |
 | T1.3 Test Explorer | Done |
 | T2.8–T2.10 snippets, token modifiers, user-visible messages | Done |
-| T2.1 Solution Explorer | Done server-side and client-side; search/reveal endpoints, drag-drop, add/delete/rename, and generated-file nodes still open |
+| T2.1 Solution Explorer | Done — search and reveal endpoints, drag-and-drop, add/delete/rename from the tree; generated-file nodes wait on T2.12 |
 | T2.2 NuGet panel | Done — webview plus `NuGetService` (real NuGet.config sources, search/versions/installed/updates/consolidations, CLI-backed mutations, icon proxy) |
 | T2.5 build tasks | Done (task provider + `$msCompile`); build-error DiagnosticCollection ships with T1.2's launch path |
 | T2.7 file rename fixups | Done (`workspace/willRenameFiles` renames the matching type and its references) |

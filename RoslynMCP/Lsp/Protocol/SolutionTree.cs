@@ -60,3 +60,24 @@ public sealed record SolutionTreeRevealParams(
 /// each ancestor before revealing.</summary>
 public sealed record SolutionTreeRevealResult(
     [property: JsonPropertyName("path")] string[] Path);
+
+/// <summary>An edit made from the tree: new file or folder, delete, rename, or a drag-and-drop
+/// move.</summary>
+public sealed record SolutionTreeEditParams(
+    [property: JsonPropertyName("action")] string Action,   // addFile | addFolder | delete | rename | move
+    [property: JsonPropertyName("targetUri")] string? TargetUri = null,
+    [property: JsonPropertyName("projectPath")] string? ProjectPath = null,
+    [property: JsonPropertyName("name")] string? Name = null,
+    [property: JsonPropertyName("kind")] string? Kind = null,
+    [property: JsonPropertyName("destinationUri")] string? DestinationUri = null);
+
+/// <summary>
+/// The outcome of a tree edit. <see cref="Edit"/> carries the namespace and type fixups a rename
+/// implies; the client applies them rather than the server writing them, so a file open with
+/// unsaved changes is edited in the buffer instead of being overwritten on disk.
+/// </summary>
+public sealed record SolutionTreeEditResult(
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("uri")] string? Uri = null,
+    [property: JsonPropertyName("edit")] WorkspaceEdit? Edit = null);

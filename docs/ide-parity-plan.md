@@ -87,7 +87,7 @@ deliberately out of scope here.
 | T2.11 multi-root | Done — solution bound per workspace folder, one client per solution, binding follows the focused editor |
 | T2.12 metadata as source | Done — one `roslynSense/virtualDocument` resolver behind `roslynsense-generated:` and `roslynsense-metadata:`, plus generated-file nodes in the tree |
 | T3.5 .NET Framework debugging | Done — `roslyn-sense --dap` serves DAP over the ICorDebug backend; the extension selects it for Framework targets |
-| T3.6 Hot Reload | Done — real EnC: Roslyn deltas applied in-process on CoreCLR (`RoslynMCP.HotReloadAgent`) and through `ICorDebugModule2::ApplyChanges` on .NET Framework |
+| T3.6 Hot Reload | Done for CoreCLR (Roslyn deltas applied in-process by `RoslynMCP.HotReloadAgent`). .NET Framework: implemented but **not working** — `ICorDebugModule2::ApplyChanges` access-violated the host, so the in-process engine now refuses it (see below) |
 
 Notes from implementation, kept because they change what the remaining work can assume:
 
@@ -971,10 +971,31 @@ Three pieces:
    are both start-time only, which is why hot reload is a launch option (`RunProject hotReload=true`,
    or automatically for a `roslynsense` F5 session) rather than something switchable later.
 
-3. **.NET Framework apply** — `ICorDebugModule2::ApplyChanges` through the engine this repo already
-   owns; the EnC JIT flags were already being set on every module as it loaded. The session can be
-   in another process (the editor's `--dap`, or an AI client), so the delta travels over the same
-   command pipe the debug bridge uses, via a new `apply_delta` action.
+3. **.NET Framework apply — implemented, and it does not work yet.** The route is
+   `ICorDebugModule2::ApplyChanges` through the engine this repo already owns; the EnC JIT flags
+   were already being set on every module as it loaded, and the delta travels over the debug-bridge
+   pipe (`apply_delta`) when the session lives in another process.
+
+   Driving it end to end against a live `net48` process — Roslyn-built baseline, Roslyn
+   `EmitDifference`, launched (not attached) so the EnC flags applied — **faulted inside
+   `ApplyChanges` with an access violation and killed the host process.** No HRESULT, no managed
+   exception: the desktop CLR does not validate the delta it is given.
+
+   Two things follow, and both are now true of the code:
+
+   - `InProcessDebugEngine.ApplyDeltaAsync` refuses. In the tool, "the host" is the editor's
+     language server and every other chat's loaded workspace; that is not something to stake on a
+     metadata blob being well-formed. Only `WorkerDebugEngine` — a separate, disposable process —
+     is allowed to make the call.
+   - The status above says "not working" rather than "done". Whether the fault was a malformed
+     baseline in the harness (stub `EditAndContinueMethodDebugInformation` providers) or something
+     the desktop CLR will not accept from a modern Roslyn is **not yet established**. The next step
+     is to drive the same scenario through `HotReloadService`'s real path, where Roslyn's own EnC
+     engine builds the baseline from the PDB, against an MSBuild-built Framework executable.
+
+   `RoslynMCP.Tests/FrameworkHotReloadTests.cs` reproduces it, gated behind
+   `ROSLYNSENSE_TEST_FX_HOTRELOAD=1` because a crashing test aborts the whole run instead of
+   failing one case.
 
 Surface: `roslynSense/hotReload{Start,Apply,Stop,Status,Environment}`, the `ApplyHotReload` /
 `StopHotReload` MCP tools, and `Apply Hot Reload` plus `roslynSense.hotReload.applyOnSave` in the

@@ -39,8 +39,23 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
         uint frameIndex, string name, string value) =>
         _session.SetVariableAsync(frameIndex, name, value);
 
+    /// <summary>
+    /// Refused in-process: <c>ICorDebugModule2::ApplyChanges</c> does not validate the delta it is
+    /// handed, and a malformed one faults inside the CLR rather than returning a failing HRESULT.
+    /// </summary>
+    /// <remarks>
+    /// Observed, not theorised. Applying a hand-built delta took the whole host down with an
+    /// access violation inside <c>ApplyChanges</c> — no managed exception, nothing catchable, the
+    /// process simply gone. In the tool that host is the editor's language server and every other
+    /// chat's workspace, which is far too much to stake on a metadata blob being well-formed.
+    /// <see cref="WorkerDebugEngine"/> runs the same call in a separate process, where the blast
+    /// radius is one disposable worker, so that is the only path allowed to make it.
+    /// </remarks>
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il) =>
-        _session.ApplyDeltaAsync(assemblyName, metadata, il);
+        Task.FromResult((false,
+            "Hot reload on .NET Framework is applied out of process. ICorDebug's ApplyChanges " +
+            "faults on a malformed delta instead of failing, which would take this process with " +
+            "it, so the in-process engine refuses it."));
 
     public void Terminate() => _session.Terminate();
 

@@ -66,51 +66,39 @@ public class EditorContextTests
     }
 
     [Fact]
-    public void ToolReportsPlainlyWhenNoEditorHasReported()
-    {
-        string empty = Path.Combine(Path.GetTempPath(), $"no-editor-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(empty);
-        string previous = Directory.GetCurrentDirectory();
-
-        try
-        {
-            Directory.SetCurrentDirectory(empty);
-            string result = EditorContextTool.GetEditorContext(new MarkdownFormatter());
-            Assert.Contains("No editor is connected", result);
-        }
-        finally
-        {
-            Directory.SetCurrentDirectory(previous);
-            Directory.Delete(empty, recursive: true);
-        }
-    }
+    public void ToolReportsPlainlyWhenNoEditorHasReported() =>
+        Assert.Contains("No editor is connected",
+            EditorContextTool.Format(null, new MarkdownFormatter()));
 
     [Fact]
     public void StaleContextIsReportedAsStaleRatherThanUsed()
     {
-        string solution = Directory
-            .EnumerateFiles(FixturePaths.MultiSolutionDir, "*.sln")
-            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
-            .First();
-
-        EditorContextStore.Write(solution, new EditorContextStore.Context(
+        var stale = new EditorContextStore.Context(
             @"C:\x\Old.cs", 1, 1, "Old.Method", null, [], [], [],
-            UpdatedAtUtc: DateTime.UtcNow.AddHours(-9)));
+            UpdatedAtUtc: DateTime.UtcNow.AddHours(-9));
 
-        string previous = Directory.GetCurrentDirectory();
-        try
-        {
-            Directory.SetCurrentDirectory(FixturePaths.MultiSolutionDir);
-            string result = EditorContextTool.GetEditorContext(new MarkdownFormatter());
+        string result = EditorContextTool.Format(stale, new MarkdownFormatter());
 
-            // Answering from an hours-old cursor position produces confidently wrong answers.
-            Assert.Contains("stale", result, StringComparison.OrdinalIgnoreCase);
-            Assert.DoesNotContain("Old.Method", result);
-        }
-        finally
-        {
-            Directory.SetCurrentDirectory(previous);
-            EditorContextStore.Clear(solution);
-        }
+        // Answering from an hours-old cursor position produces confidently wrong answers.
+        Assert.Contains("stale", result, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Old.Method", result);
+    }
+
+    [Fact]
+    public void FreshContextRendersTheCursorAndEnclosingSymbol()
+    {
+        var context = new EditorContextStore.Context(
+            @"C:\src\Orders.cs", 41, 8, "OrderCalculator.Total", "total += lineTotal;",
+            OpenFiles: [@"C:\src\Orders.cs"],
+            DirtyFiles: [@"C:\src\Orders.cs"],
+            Diagnostics: [new EditorContextStore.VisibleDiagnostic("Error", "CS0103", "missing", 41)],
+            UpdatedAtUtc: DateTime.UtcNow);
+
+        string result = EditorContextTool.Format(context, new MarkdownFormatter());
+
+        Assert.Contains("OrderCalculator.Total", result);
+        Assert.Contains("line 42", result); // 0-based internally, 1-based for humans
+        Assert.Contains("total += lineTotal;", result);
+        Assert.Contains("CS0103", result);
     }
 }

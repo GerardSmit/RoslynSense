@@ -60,6 +60,11 @@ public static class ProjectEvaluationService
             if (s_cache.TryGetValue(key, out cached) && IsFresh(cached.Stamps))
                 return cached.Evaluation;
 
+            // Microsoft.Build ships with runtime assets excluded, so its assemblies resolve
+            // only through MSBuildLocator's resolver. Touching a Microsoft.Build type before
+            // registration takes down the process rather than throwing.
+            WorkspaceService.EnsureRegistered();
+
             var (evaluation, stamps) = await Task.Run(() => Evaluate(key), cancellationToken);
             if (evaluation is not null)
                 s_cache[key] = new CacheEntry(evaluation, stamps);
@@ -93,6 +98,9 @@ public static class ProjectEvaluationService
         return true;
     }
 
+    // NoInlining matters: the JIT resolves a method's types on entry, so inlining this into a
+    // caller would load Microsoft.Build before EnsureRegistered() had run.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static (ProjectEvaluation?, IReadOnlyDictionary<string, DateTime>) Evaluate(string projectPath)
     {
         var stamps = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);

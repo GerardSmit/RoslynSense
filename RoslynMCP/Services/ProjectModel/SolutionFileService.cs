@@ -27,9 +27,14 @@ public static class SolutionFileService
 
         try
         {
-            return solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
-                ? ReadSlnx(solutionPath)
-                : ReadSln(solutionPath);
+            if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+                return ReadSlnx(solutionPath);
+
+            // Microsoft.Build ships with runtime assets excluded, so SolutionFile resolves only
+            // through MSBuildLocator's resolver — touching it before registration takes down the
+            // process rather than throwing.
+            WorkspaceService.EnsureRegistered();
+            return ReadSln(solutionPath);
         }
         catch (Exception ex)
         {
@@ -40,6 +45,9 @@ public static class SolutionFileService
         }
     }
 
+    // NoInlining: the JIT resolves a method's types on entry, so inlining this would load
+    // Microsoft.Build before EnsureRegistered() had run.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static IReadOnlyList<SolutionNode> ReadSln(string solutionPath)
     {
         var solution = SolutionFile.Parse(solutionPath);

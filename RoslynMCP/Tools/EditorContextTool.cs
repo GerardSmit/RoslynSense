@@ -16,9 +16,13 @@ public static class EditorContextTool
         "position and enclosing symbol, current selection, open and unsaved files, and the " +
         "diagnostics visible in the active editor. Use this when the user refers to 'this' " +
         "method/file/error without naming it. Returns a notice when no editor is connected.")]
-    public static string GetEditorContext(IOutputFormatter fmt)
+    public static string GetEditorContext(IOutputFormatter fmt) =>
+        Format(EditorContextStore.ReadNearest(Directory.GetCurrentDirectory()), fmt);
+
+    /// <summary>Rendering, split from lookup so it can be exercised without moving the
+    /// process's working directory — which the whole server resolves paths from.</summary>
+    internal static string Format(EditorContextStore.Context? context, IOutputFormatter fmt)
     {
-        var context = EditorContextStore.ReadNearest(Directory.GetCurrentDirectory());
         if (context is null)
             return "No editor is connected, or it has not reported any context yet.";
 

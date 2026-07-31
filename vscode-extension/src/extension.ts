@@ -10,6 +10,8 @@ import {
 } from 'vscode-languageclient/node';
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
 import { registerTestController, runTestById } from './testController';
+import { registerSolutionExplorer } from './solutionExplorer';
+import { registerNuGetPanel } from './nugetPanel';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -1656,6 +1658,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerAiDebugAdapter(context);
     registerDebugLaunch(context, () => client);
     registerTestController(context, () => client);
+    registerSolutionExplorer(context, () => client);
+    registerNuGetPanel(context, () => client);
 
     await startClient(context);
 }

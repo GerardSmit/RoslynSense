@@ -207,6 +207,12 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/attachTargets")]
     public AttachTarget[] AttachTargets() => Handlers.LaunchHandler.AttachTargets();
 
+    // ---- Solution Explorer --------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/solutionTree", UseSingleObjectParameterDeserialization = true)]
+    public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
+        Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
+
     // ---- Tests ------------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/testProjects")]

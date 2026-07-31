@@ -67,8 +67,109 @@
       {
         "command": "roslynSense.pickProcess",
         "title": "RoslynSense: Pick .NET Process"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.refresh",
+        "title": "Refresh",
+        "category": "RoslynSense",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showAllFiles",
+        "title": "Show All Files",
+        "category": "RoslynSense",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.hideNonProjectFiles",
+        "title": "Show Project Items Only",
+        "category": "RoslynSense",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showIgnored",
+        "title": "Show Ignored Folders",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.hideIgnored",
+        "title": "Hide Ignored Folders",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.revealActiveFile",
+        "title": "Toggle: Always Select Opened File",
+        "category": "RoslynSense",
+        "icon": "$(target)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.search",
+        "title": "Filter Solution",
+        "category": "RoslynSense",
+        "icon": "$(search)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.clearSearch",
+        "title": "Clear Filter",
+        "category": "RoslynSense",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.goToNode",
+        "title": "Go to Node in Solution",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.revealInExplorer",
+        "title": "Reveal in File Explorer",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.findInFolder",
+        "title": "Find in Folder",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.openProjectFile",
+        "title": "Edit Project File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.buildProject",
+        "title": "Build Project",
+        "category": "RoslynSense",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "roslynSense.manageNuGet",
+        "title": "Manage NuGet Packages",
+        "category": "RoslynSense",
+        "icon": "$(package)"
+      },
+      {
+        "command": "roslynSense.manageNuGetForProject",
+        "title": "Manage NuGet Packages…",
+        "category": "RoslynSense"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "roslynSense",
+          "title": "RoslynSense",
+          "icon": "media/solution.svg"
+        }
+      ]
+    },
+    "views": {
+      "roslynSense": [
+        {
+          "id": "roslynSense.solutionExplorer",
+          "name": "Solution",
+          "contextualTitle": "Solution Explorer"
+        }
+      ]
+    },
     "breakpoints": [
       { "language": "csharp" }
     ],
@@ -198,6 +299,70 @@
           "when": "editorLangId == csharp",
           "group": "navigation@50"
         }
+      ],
+      "view/title": [
+        {
+          "command": "roslynSense.solutionExplorer.search",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showAllFiles",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.showAllFiles",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.hideNonProjectFiles",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.showAllFiles",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.revealActiveFile",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.refresh",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showIgnored",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.showIgnored",
+          "group": "1_toggles"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.hideIgnored",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.showIgnored",
+          "group": "1_toggles"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "roslynSense.solutionExplorer.buildProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "group": "inline"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.openProjectFile",
+          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "group": "1_edit"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.findInFolder",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(folder|project|solutionFolder)$/",
+          "group": "2_search"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.revealInExplorer",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder|project)$/",
+          "group": "3_os"
+        },
+        {
+          "command": "roslynSense.manageNuGetForProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|dependencies|packages)$/",
+          "group": "1_edit"
+        }
       ]
     },
     "keybindings": [
@@ -205,6 +370,36 @@
         "command": "roslynSense.showInheritance",
         "key": "ctrl+alt+u",
         "when": "editorTextFocus && editorLangId == csharp"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.search",
+        "key": "ctrl+f",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.clearSearch",
+        "key": "escape",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.openProjectFile",
+        "key": "alt+enter",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.findInFolder",
+        "key": "ctrl+shift+f",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.buildProject",
+        "key": "ctrl+shift+b",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.goToNode",
+        "key": "ctrl+t",
+        "when": "focusedView == roslynSense.solutionExplorer"
       }
     ],
     "configurationDefaults": {

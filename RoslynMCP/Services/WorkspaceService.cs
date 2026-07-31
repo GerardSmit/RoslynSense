@@ -802,6 +802,24 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// The solution this process was started for, when it was started for one.
+    /// </summary>
+    /// <remarks>
+    /// Set from <c>--host &lt;solution&gt;</c> or <c>--lsp --solution &lt;path&gt;</c>. It is known
+    /// before any project is loaded, which matters for anything that needs the solution's
+    /// <em>identity</em> rather than its contents — the Solution Explorer reads the .sln directly,
+    /// and inferring the path from whatever workspace happened to be cached left it empty until
+    /// someone opened a file, and wrong once someone opened decompiled source.
+    /// </remarks>
+    public static string? BoundSolutionPath { get; private set; }
+
+    public static void BindSolution(string? solutionPath)
+    {
+        if (solutionPath is { Length: > 0 } path && PathHelper.IsSolutionFile(path) && File.Exists(path))
+            BoundSolutionPath = Path.GetFullPath(path);
+    }
+
+    /// <summary>
     /// Returns the most-recently-used cached solution (with open-buffer overlays applied), or
     /// null when nothing is loaded yet. Used by solution-wide queries that aren't anchored to
     /// a file (LSP workspace/symbol).
@@ -812,9 +830,17 @@ internal static class WorkspaceService
         s_cacheLock.Wait();
         try
         {
-            foreach (var e in s_cache.Values)
+            // Synthetic entries are skipped. Opening a decompiled file caches an ad-hoc workspace
+            // keyed by its manifest, and it is by definition the most recently used one — so the
+            // Solution Explorer, which asks this for the solution to list, emptied itself every
+            // time someone looked at decompiled source.
+            foreach (var (key, e) in s_cache)
+            {
+                if (DecompiledSourceService.IsDecompiledPath(key))
+                    continue;
                 if (entry is null || e.LastAccessedUtc > entry.LastAccessedUtc)
                     entry = e;
+            }
         }
         finally { s_cacheLock.Release(); }
 

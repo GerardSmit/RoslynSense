@@ -42,6 +42,14 @@ internal static class DecompiledSourceService
     public static bool IsGeneratedProjectPath(string projectPath) =>
         string.Equals(Path.GetFileName(projectPath), ManifestFileName, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Whether a path belongs to the decompiled cache — a source file, or the manifest that
+    /// stands in for its project.
+    /// </summary>
+    public static bool IsDecompiledPath(string? path) =>
+        path is { Length: > 0 } &&
+        Path.GetFullPath(path).StartsWith(s_rootDirectory, StringComparison.OrdinalIgnoreCase);
+
     public static string? TryGetGeneratedProjectPath(string filePath)
     {
         string? directory = Path.GetDirectoryName(filePath);
@@ -755,7 +763,14 @@ internal static class DecompiledSourceService
 
         AddReference(assemblyPath, copyToTemp: true);
 
-        if (AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") is string trustedPlatformAssemblies)
+        // One framework, not two. This host runs on .NET 10, so its TRUSTED_PLATFORM_ASSEMBLIES
+        // are CoreCLR's — correct for decompiling a Core assembly, and poison for a .NET Framework
+        // one. Mixing them puts two definitions of the core library in a single compilation, and
+        // the result is a decompiled file whose every framework type "does not exist": System.Web
+        // resolves against .NET 10's System.Runtime rather than the mscorlib it was built for.
+        // A Framework assembly's own directory carries the matching set, so that is used instead.
+        if (!IsFrameworkAssembly(assemblyPath) &&
+            AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") is string trustedPlatformAssemblies)
         {
             foreach (string path in trustedPlatformAssemblies.Split(
                          Path.PathSeparator,
@@ -776,6 +791,50 @@ internal static class DecompiledSourceService
         }
 
         return (references, tempDir);
+    }
+
+    /// <summary>
+    /// Whether an assembly targets .NET Framework rather than CoreCLR.
+    /// </summary>
+    /// <remarks>
+    /// Decided from what it references, not from where it sits: a Framework assembly references
+    /// <c>mscorlib</c> as its core library, a Core one references <c>System.Runtime</c>. Paths
+    /// would be a guess — reference assemblies, the GAC, unification directories and NuGet
+    /// packages all hold both kinds.
+    /// </remarks>
+    internal static bool IsFrameworkAssembly(string assemblyPath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(assemblyPath);
+            using var reader = new System.Reflection.PortableExecutable.PEReader(stream);
+            if (!reader.HasMetadata)
+                return false;
+
+            var metadata = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(reader);
+
+            // mscorlib itself references nothing, so it is recognised by its own name.
+            if (metadata.GetString(metadata.GetAssemblyDefinition().Name)
+                    .Equals("mscorlib", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            foreach (var handle in metadata.AssemblyReferences)
+            {
+                string name = metadata.GetString(metadata.GetAssemblyReference(handle).Name);
+                if (name.Equals("mscorlib", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (name.Equals("System.Runtime", StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
+        {
+            // Unreadable: fall back to the host's own framework, which is what this did before.
+        }
+
+        return false;
     }
 
     private static string CreateTempDir()

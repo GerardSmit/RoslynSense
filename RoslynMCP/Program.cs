@@ -18,6 +18,11 @@ class Program
 {
     static async Task<int> Main(string[] args)
     {
+        // Before anything else, including mode selection: a redirect hands the whole session over
+        // as it is, whatever mode the host asked for.
+        if (await RoslynMCP.DevBuildRedirect.TryRunAsync(args) is { } redirected)
+            return redirected;
+
         // CLI mode: roslyn-sense --cli [tool] [options]
         // Runs a single tool and prints the result, without starting the MCP server.
         if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
@@ -41,6 +46,9 @@ class Program
         if (args.Length > 0 && args[0].Equals("--host", StringComparison.OrdinalIgnoreCase))
         {
             string target = args.Length > 1 ? args[1] : Directory.GetCurrentDirectory();
+            // The daemon exists for exactly one solution; recording it means callers that need
+            // the solution's identity do not have to wait for a project to be loaded first.
+            WorkspaceService.BindSolution(target);
             return await RoslynMCP.Daemon.DaemonServer.RunHostAsync(target);
         }
 

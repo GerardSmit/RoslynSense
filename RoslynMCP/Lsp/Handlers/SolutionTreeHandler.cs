@@ -20,7 +20,11 @@ internal static class SolutionTreeHandler
     public static async Task<SolutionTreeNode[]> ChildrenAsync(
         SolutionTreeParams p, CancellationToken ct)
     {
-        string? solutionPath = WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        // The binding first: the tree reads the .sln from disk and needs only its path, which is
+        // known from startup. Waiting for a loaded workspace meant an empty Explorer until the
+        // user opened a file — and the daemon starts with nothing loaded at all.
+        string? solutionPath =
+            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
 
         var nodes = p.NodeId switch
         {

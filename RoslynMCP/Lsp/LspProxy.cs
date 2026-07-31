@@ -31,6 +31,9 @@ internal static class LspProxy
             ? Path.GetFullPath(solutionArg)
             : HostPaths.ResolveSolutionKey(startPath);
 
+        // Also on the in-process path, which serves the same requests when no daemon is reachable.
+        WorkspaceService.BindSolution(solutionKey);
+
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 

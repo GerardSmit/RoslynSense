@@ -25,6 +25,18 @@ internal static class DaemonSpawner
         if (pipe is not null)
             return pipe;
 
+        // A named mutex has thread affinity: it must be released by the thread that took it.
+        // Awaiting while holding one resumes the continuation on some other pool thread, and the
+        // release then throws "Object synchronization method was called from an unsynchronized
+        // block of code" — which was swallowed as "shared host unreachable", so every client
+        // silently fell back to an in-process workspace instead of sharing the daemon's.
+        // The whole guarded section therefore runs synchronously, on one thread of its own.
+        return await Task.Run(() => ConnectOrSpawnGuarded(solutionKey, pipeName, ct), ct);
+    }
+
+    private static NamedPipeClientStream? ConnectOrSpawnGuarded(
+        string solutionKey, string pipeName, CancellationToken ct)
+    {
         using var mutex = new Mutex(false, HostPaths.SpawnMutexName(solutionKey));
         bool owned = false;
         try
@@ -33,7 +45,7 @@ internal static class DaemonSpawner
             catch (AbandonedMutexException) { owned = true; }
 
             // Another client may have spawned it while we waited for the mutex.
-            pipe = await TryConnectAsync(pipeName, ct);
+            var pipe = TryConnect(pipeName, ct);
             if (pipe is not null)
                 return pipe;
 
@@ -44,16 +56,36 @@ internal static class DaemonSpawner
             var deadline = DateTime.UtcNow + SpawnWait;
             while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
             {
-                pipe = await TryConnectAsync(pipeName, ct);
+                pipe = TryConnect(pipeName, ct);
                 if (pipe is not null)
                     return pipe;
-                await Task.Delay(150, ct);
+                ct.WaitHandle.WaitOne(150);
             }
             return null;
         }
         finally
         {
             if (owned) mutex.ReleaseMutex();
+        }
+    }
+
+    /// <summary>The synchronous twin of <see cref="TryConnectAsync"/>, for use under the spawn
+    /// mutex where an await would move the release to another thread.</summary>
+    private static NamedPipeClientStream? TryConnect(string pipeName, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        try
+        {
+            client.Connect((int)ConnectProbe.TotalMilliseconds);
+            return client;
+        }
+        catch (Exception ex) when (ex is TimeoutException or IOException or OperationCanceledException)
+        {
+            client.Dispose();
+            if (ex is OperationCanceledException) throw;
+            return null;
         }
     }
 

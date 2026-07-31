@@ -28,9 +28,26 @@ internal static class HostPaths
         }
     }
 
+    /// <summary>
+    /// Identifies the build, so daemons of different builds never share a solution.
+    /// </summary>
+    /// <remarks>
+    /// A daemon is reached by a name derived from the solution alone, which meant whichever build
+    /// started first owned that solution and every later client silently got it — a development
+    /// build connecting to an installed one, answering with the capabilities of whatever happened
+    /// to run first. It surfaces as "no method by the name ..." for anything new, or worse, as old
+    /// behaviour that looks like the new code not working. Keying by build as well means each one
+    /// gets its own daemon and the question never arises.
+    /// </remarks>
+    /// The module id rather than the version: two builds of the same version are the normal case
+    /// during development, and they are exactly the ones that must not share.
+    private static readonly string s_buildTag =
+        typeof(HostPaths).Assembly.ManifestModule.ModuleVersionId.ToString("N");
+
     public static string Hash(string solutionKey)
     {
-        byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(solutionKey.ToLowerInvariant()));
+        byte[] bytes = SHA256.HashData(
+            Encoding.UTF8.GetBytes($"{solutionKey.ToLowerInvariant()}|{s_buildTag}"));
         return Convert.ToHexString(bytes, 0, 8).ToLowerInvariant(); // 16 hex chars
     }
 

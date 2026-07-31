@@ -15,6 +15,13 @@ internal static class DiagnosticsHandler
     /// <summary>Compiler diagnostics only — the fast pass.</summary>
     public static async Task<Protocol.Diagnostic[]> ComputeAsync(string filePath, CancellationToken ct)
     {
+        // Decompiled source is a reading aid, not a compilable file: it is a best-effort
+        // reconstruction that legitimately references internals and compiler-generated names, and
+        // squiggling it reports on the decompiler rather than on the user's code. Visual Studio
+        // and Rider do not diagnose it either.
+        if (Services.DecompiledSourceService.IsDecompiledPath(filePath))
+            return Array.Empty<Protocol.Diagnostic>();
+
         var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
         if (document is null)
             return Array.Empty<Protocol.Diagnostic>();
@@ -27,6 +34,13 @@ internal static class DiagnosticsHandler
     public static async Task<Protocol.Diagnostic[]> ComputeWithAnalyzersAsync(
         string filePath, CancellationToken ct)
     {
+        // Decompiled source is a reading aid, not a compilable file: it is a best-effort
+        // reconstruction that legitimately references internals and compiler-generated names, and
+        // squiggling it reports on the decompiler rather than on the user's code. Visual Studio
+        // and Rider do not diagnose it either.
+        if (Services.DecompiledSourceService.IsDecompiledPath(filePath))
+            return Array.Empty<Protocol.Diagnostic>();
+
         var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
         if (document is null)
             return Array.Empty<Protocol.Diagnostic>();

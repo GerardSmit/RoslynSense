@@ -27,7 +27,19 @@ internal static class SymbolHandlers
         return root.ChildNodes().SelectMany(n => WalkNode(n, text.Lines)).ToArray();
     }
 
-    private static IEnumerable<DocumentSymbol> WalkNode(SyntaxNode node, TextLineCollection lines)
+    /// <summary>
+    /// Outline entries for a node, with unnamed ones dropped.
+    /// </summary>
+    /// <remarks>
+    /// A missing identifier token parses as an empty name, which happens in any file that does not
+    /// fully parse — decompiled sources especially. The protocol requires a name, and the client
+    /// throws "name must not be falsy" on the whole response, so one artifact would cost the
+    /// entire outline. Dropping the artifact keeps the rest.
+    /// </remarks>
+    private static IEnumerable<DocumentSymbol> WalkNode(SyntaxNode node, TextLineCollection lines) =>
+        WalkNodeCore(node, lines).Where(symbol => !string.IsNullOrWhiteSpace(symbol.Name));
+
+    private static IEnumerable<DocumentSymbol> WalkNodeCore(SyntaxNode node, TextLineCollection lines)
     {
         switch (node)
         {
@@ -49,8 +61,10 @@ internal static class SymbolHandlers
 
             case EnumDeclarationSyntax en:
                 yield return Make(en.Identifier.Text, null, LspSymbolKind.Enum, en.Span, en.Identifier.Span,
-                    en.Members.Select(m => Make(m.Identifier.Text, null, LspSymbolKind.EnumMember,
-                        m.Span, m.Identifier.Span, Array.Empty<DocumentSymbol>(), lines)), lines);
+                    en.Members
+                        .Where(m => !string.IsNullOrWhiteSpace(m.Identifier.Text))
+                        .Select(m => Make(m.Identifier.Text, null, LspSymbolKind.EnumMember,
+                            m.Span, m.Identifier.Span, Array.Empty<DocumentSymbol>(), lines)), lines);
                 break;
 
             case DelegateDeclarationSyntax del:

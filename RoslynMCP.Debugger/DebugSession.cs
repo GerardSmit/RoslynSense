@@ -1495,7 +1495,28 @@ public sealed class DebugSession : IDebugSession
     {
         if (moduleName.Length == 0 || !IsUserModule(moduleName))
             return;
-        try { module.TrySetJITCompilerFlags(CorDebugJITCompilerFlags.CORDEBUG_JIT_ENABLE_ENC); } catch { }
+        // Whether this succeeded decides whether a later delta can be applied at all: a module
+        // JITted without the flag is not updatable, and ApplyChanges faults on it rather than
+        // failing. Swallowing the result is how that stays invisible until the crash, so it is
+        // recorded and only a flagged module is offered as a target.
+        var flagged = HRESULT.E_FAIL;
+        try { flagged = module.TrySetJITCompilerFlags(CorDebugJITCompilerFlags.CORDEBUG_JIT_ENABLE_ENC); }
+        catch (Exception ex)
+        {
+            Emit(DebugEventKind.Output,
+                $"EnC could not be enabled for {Path.GetFileName(moduleName)}: {ex.Message}",
+                string.Empty, 0);
+        }
+
+        if (flagged != HRESULT.S_OK)
+        {
+            Emit(DebugEventKind.Output,
+                $"EnC is unavailable for {Path.GetFileName(moduleName)} ({flagged}); " +
+                "hot reload cannot change it.",
+                string.Empty, 0);
+            return;
+        }
+
         var assemblyName = Path.GetFileNameWithoutExtension(moduleName);
         if (assemblyName.Length > 0)
             _encModules[assemblyName] = module;
@@ -1549,8 +1570,7 @@ public sealed class DebugSession : IDebugSession
     }
 
     /// Apply one EnC metadata+IL delta to a live module (by simple assembly name), marshalled
-    /// onto the session thread. ApplyChanges needs a synchronized process: stop, apply, resume
-    /// if it was running.
+    /// onto the session thread. Only legal from a real break state — see below.
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il)
         => InvokeAsync<(bool Ok, string Error)>(() =>
     {
@@ -1559,13 +1579,20 @@ public sealed class DebugSession : IDebugSession
         var process = _process;
         if (process is null)
             return (false, "no process");
-        var wasRunning = _stoppedThread is null;
+
+        // Applying to a running process is what faults. ICorDebug's async break leaves the CLR
+        // synchronized enough to read state, but not to rewrite a method: ApplyChanges walks into
+        // it and access-violates rather than returning a failing HRESULT. Visual Studio and Rider
+        // both only offer Apply Code Changes from a real break state, which is the same rule.
+        if (_stoppedThread is null)
+        {
+            return (false,
+                "the target is running; .NET Framework applies edits only while stopped at a " +
+                "breakpoint, so break first and apply from there");
+        }
+
         try
         {
-            if (wasRunning)
-            {
-                try { process.Stop(5000); } catch { }
-            }
             var metaPtr = System.Runtime.InteropServices.Marshal.AllocHGlobal(metadata.Length);
             var ilPtr = System.Runtime.InteropServices.Marshal.AllocHGlobal(il.Length);
             try
@@ -1586,13 +1613,6 @@ public sealed class DebugSession : IDebugSession
         catch (Exception ex)
         {
             return (false, ex.Message);
-        }
-        finally
-        {
-            if (wasRunning)
-            {
-                try { process.Continue(false); } catch { }
-            }
         }
     });
 

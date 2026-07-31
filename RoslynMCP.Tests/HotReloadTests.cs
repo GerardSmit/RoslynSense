@@ -87,12 +87,12 @@ public class HotReloadTests
     public async Task AConnectedAgentBecomesAnApplyTargetAndItsCapabilitiesAreReported()
     {
         var server = HotReloadAgentServer.Instance;
-        await using var agent = await ConnectAgentAsync(server.PipeName, 4321, "SampleApp",
+        await using var agent = await ConnectAgentAsync(server.PipeName, "SampleApp",
             "Baseline AddMethodToExistingType");
 
-        await WaitForTargetAsync(server, 4321);
+        await WaitForTargetAsync(server, "SampleApp");
 
-        Assert.Contains(server.Targets, t => t.ProcessId == 4321 && t.Name == "SampleApp");
+        Assert.Contains(server.Targets, t => t.Name == "SampleApp");
         Assert.Contains("Baseline", server.Capabilities());
     }
 
@@ -100,8 +100,8 @@ public class HotReloadTests
     public async Task ADeltaReachesTheAgentIntactAndItsAnswerIsReportedBack()
     {
         var server = HotReloadAgentServer.Instance;
-        await using var agent = await ConnectAgentAsync(server.PipeName, 4322, "DeltaApp", "Baseline");
-        await WaitForTargetAsync(server, 4322);
+        await using var agent = await ConnectAgentAsync(server.PipeName, "DeltaApp", "Baseline");
+        await WaitForTargetAsync(server, "DeltaApp");
 
         var moduleId = Guid.NewGuid();
         var delta = new HotReloadDelta(moduleId, [1, 2, 3], [4, 5], [6], [7]);
@@ -126,18 +126,18 @@ public class HotReloadTests
         var (applied, errors) = await server.ApplyAsync([delta]);
         await agentSide;
 
-        Assert.Contains(applied, a => a.Contains("4322"));
+        Assert.Contains(applied, a => a.Contains("DeltaApp"));
         // Scoped to this agent: the server is process-wide, so another test's target may still be
         // registered, and its failures are not this test's business.
-        Assert.DoesNotContain(errors, e => e.Contains("4322"));
+        Assert.DoesNotContain(errors, e => e.Contains("DeltaApp"));
     }
 
     [Fact]
     public async Task AnAgentThatRejectsTheUpdateIsReportedRatherThanCountedAsApplied()
     {
         var server = HotReloadAgentServer.Instance;
-        await using var agent = await ConnectAgentAsync(server.PipeName, 4323, "PickyApp", "Baseline");
-        await WaitForTargetAsync(server, 4323);
+        await using var agent = await ConnectAgentAsync(server.PipeName, "PickyApp", "Baseline");
+        await WaitForTargetAsync(server, "PickyApp");
 
         var agentSide = Task.Run(() =>
         {
@@ -158,19 +158,21 @@ public class HotReloadTests
             new HotReloadDelta(Guid.NewGuid(), [1], [2], [3], [])]);
         await agentSide;
 
-        Assert.DoesNotContain(applied, a => a.Contains("4323"));
+        Assert.DoesNotContain(applied, a => a.Contains("PickyApp"));
         Assert.Contains(errors, e => e.Contains("refused the update"));
     }
 
     private static async Task<NamedPipeClientStream> ConnectAgentAsync(
-        string pipeName, int processId, string name, string capabilities)
+        string pipeName, string name, string capabilities)
     {
         var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(10_000);
 
         var writer = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
         writer.Write(1);
-        writer.Write(processId);
+        // This process's own id: the server reaps agents whose process is gone, so a fabricated
+        // one would be dropped before the test could use it.
+        writer.Write(Environment.ProcessId);
         writer.Write(name);
         writer.Write(capabilities);
         writer.Flush();
@@ -180,15 +182,15 @@ public class HotReloadTests
 
     /// <summary>The server registers on its own accept loop, so the handshake lands slightly after
     /// the client's write returns.</summary>
-    private static async Task WaitForTargetAsync(HotReloadAgentServer server, int processId)
+    private static async Task WaitForTargetAsync(HotReloadAgentServer server, string name)
     {
         for (int attempt = 0; attempt < 100; attempt++)
         {
-            if (server.Targets.Any(t => t.ProcessId == processId))
+            if (server.Targets.Any(t => t.Name == name))
                 return;
             await Task.Delay(20);
         }
 
-        Assert.Fail($"The agent for pid {processId} never registered.");
+        Assert.Fail($"The agent '{name}' never registered.");
     }
 }

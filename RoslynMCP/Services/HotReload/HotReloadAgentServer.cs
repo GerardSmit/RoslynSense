@@ -32,11 +32,16 @@ internal sealed class HotReloadAgentServer : IDisposable
     private static HotReloadAgentServer? s_instance;
     private static readonly Lock s_gate = new();
 
+    /// <summary>Keyed by connection, not by process id: a registration is a connection, and
+    /// keying by pid would let a recycled id silently displace a live agent.</summary>
     private readonly ConcurrentDictionary<int, Agent> _agents = new();
+
     private readonly CancellationTokenSource _cts = new();
     private readonly string _pipeName;
+    private int _nextConnection;
 
     private sealed record Agent(
+        int Connection,
         int ProcessId,
         string Name,
         string[] Capabilities,
@@ -64,8 +69,49 @@ internal sealed class HotReloadAgentServer : IDisposable
 
     public string PipeName => _pipeName;
 
-    public IReadOnlyList<HotReloadTargetInfo> Targets =>
-        [.. _agents.Values.Select(a => new HotReloadTargetInfo(a.Name, a.ProcessId, "CoreCLR"))];
+    public IReadOnlyList<HotReloadTargetInfo> Targets
+    {
+        get
+        {
+            Reap();
+            return [.. _agents.Values.Select(a => new HotReloadTargetInfo(a.Name, a.ProcessId, "CoreCLR"))];
+        }
+    }
+
+    /// <summary>
+    /// Forgets agents whose process is gone.
+    /// </summary>
+    /// <remarks>
+    /// A registration outlives its process: the pipe break is only noticed when something writes
+    /// to it, so without this the first apply after an app exits reports a failure against a
+    /// target that simply is not there any more. An app that stopped is not an app that rejected
+    /// the edit, and saying so would send the user looking for a problem in their code.
+    /// </remarks>
+    private void Reap()
+    {
+        foreach (var agent in _agents.Values)
+        {
+            if (!IsAlive(agent.ProcessId))
+                Drop(agent);
+        }
+    }
+
+    private static bool IsAlive(int processId)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false; // no such process
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// What the connected runtimes will accept, which is what Roslyn must be told before it
@@ -96,6 +142,8 @@ internal sealed class HotReloadAgentServer : IDisposable
     {
         var applied = new List<string>();
         var errors = new List<string>();
+
+        Reap();
 
         foreach (var agent in _agents.Values)
         {
@@ -210,8 +258,9 @@ internal sealed class HotReloadAgentServer : IDisposable
             string[] capabilities = reader.ReadString()
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-            _agents[processId] = new Agent(
-                processId, name, capabilities, pipe, reader, writer, new SemaphoreSlim(1, 1));
+            int connection = Interlocked.Increment(ref _nextConnection);
+            _agents[connection] = new Agent(
+                connection, processId, name, capabilities, pipe, reader, writer, new SemaphoreSlim(1, 1));
         }
         catch (Exception ex) when (ex is IOException or EndOfStreamException)
         {
@@ -221,7 +270,7 @@ internal sealed class HotReloadAgentServer : IDisposable
 
     private void Drop(Agent agent)
     {
-        _agents.TryRemove(agent.ProcessId, out _);
+        _agents.TryRemove(agent.Connection, out _);
         try { agent.Pipe.Dispose(); } catch { }
     }
 

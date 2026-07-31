@@ -24,6 +24,31 @@ internal static class LspSessionRegistry
     public static bool HasSessions => !s_sessions.IsEmpty;
 
     /// <summary>
+    /// Routes a debug command from an LLM client into the editor's own debug session
+    /// (server→client request <c>roslynSense/editorDebugCommand</c>). First session that
+    /// executes it wins; <c>null</c> when no connected editor could handle it.
+    /// </summary>
+    public static async Task<string?> TryInvokeEditorDebugCommandAsync(
+        Protocol.EditorDebugCommandParams p, CancellationToken ct)
+    {
+        foreach (var rpc in s_sessions.Values)
+        {
+            try
+            {
+                var result = await rpc.InvokeWithParameterObjectAsync<string?>(
+                    "roslynSense/editorDebugCommand", p, ct);
+                if (result is not null)
+                    return result;
+            }
+            catch (Exception ex) when (ex is RemoteInvocationException or ConnectionLostException or ObjectDisposedException)
+            {
+                // Session gone or client has no debug session — try the others.
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Replaces the full content of <paramref name="filePath"/> in the editor(s) that have it
     /// open, via <c>workspace/applyEdit</c>. Returns true when an editor applied the edit (the
     /// editor will follow up with didChange, which refreshes the shared overlay). False when

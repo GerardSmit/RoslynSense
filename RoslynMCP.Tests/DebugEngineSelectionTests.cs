@@ -31,10 +31,10 @@ public class DebugEngineSelectionTests
         try
         {
             var legacy = DebugSessionManager.CreateSessionForProject(FixturePaths.LegacyProjectFile);
-            Assert.IsType<IcorDebugBackend>(legacy);
+            Assert.IsType<IcorDebugBackend>(Unwrap(legacy));
 
             var modern = DebugSessionManager.CreateSessionForProject(FixturePaths.SampleProjectFile);
-            Assert.IsType<DebuggerService>(modern);
+            Assert.IsType<DebuggerService>(Unwrap(modern));
         }
         finally
         {
@@ -67,7 +67,7 @@ public class DebugEngineSelectionTests
         var runtime = DebugRuntimeDetector.ForProcess(target.Process.Id);
 
         Assert.Equal(DebugRuntime.NetFramework, runtime);
-        Assert.IsType<IcorDebugBackend>(DebugSessionManager.CreateSession(runtime));
+        Assert.IsType<IcorDebugBackend>(Unwrap(DebugSessionManager.CreateSession(runtime)));
         DebugSessionManager.DisposeSession();
     }
 
@@ -79,7 +79,7 @@ public class DebugEngineSelectionTests
 
         try
         {
-            Assert.IsType<IcorDebugBackend>(session);
+            Assert.IsType<IcorDebugBackend>(Unwrap(session));
 
             var attached = await session.AttachToProcessAsync(
                 target.Process.Id, [(FxTargetProcess.SourcePath, FxTargetProcess.BreakpointLine)]);
@@ -100,6 +100,13 @@ public class DebugEngineSelectionTests
             DebugSessionManager.DisposeSession();
         }
     }
+
+    /// <summary>Sessions come wrapped in the state-publishing decorator; engine assertions
+    /// care about the engine inside.</summary>
+    private static IDebugBackend Unwrap(IDebugBackend session) =>
+        session is RoslynMCP.Services.Debugging.PublishingDebugBackend publishing
+            ? publishing.Inner
+            : session;
 
     private static async Task<bool> WaitForStopAsync(IDebugBackend session)
     {

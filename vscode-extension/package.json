@@ -53,6 +53,41 @@
       {
         "command": "roslynSense.showInheritance",
         "title": "RoslynSense: Show Inheritance"
+      },
+      {
+        "command": "roslynSense.showDebugSession",
+        "title": "RoslynSense: Show AI Debug Session"
+      },
+      {
+        "command": "roslynSense.openAiDebugSession",
+        "title": "RoslynSense: Open AI Debug Session in Debugger"
+      }
+    ],
+    "breakpoints": [
+      { "language": "csharp" }
+    ],
+    "debuggers": [
+      {
+        "type": "roslynsense-ai",
+        "label": "RoslynSense AI Session",
+        "languages": ["csharp"],
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "ownerPid": {
+                "type": "number",
+                "description": "PID of the chat process owning the debug session. Omit to attach to the first one."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "roslynsense-ai",
+            "request": "attach",
+            "name": "Attach to AI Debug Session"
+          }
+        ]
       }
     ],
     "menus": {

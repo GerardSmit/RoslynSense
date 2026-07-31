@@ -1,3 +1,5 @@
+using RoslynMCP.Services.Debugging;
+
 namespace RoslynMCP.Services;
 
 /// <summary>
@@ -7,10 +9,13 @@ namespace RoslynMCP.Services;
 /// Also picks the engine, which the caller never selects by hand: netcoredbg cannot attach to
 /// .NET Framework and ICorDebug is the only thing that can, so choosing wrong just fails. The
 /// runtime is inferred from the project being debugged, or from the target process when attaching.
+/// Sessions are wrapped so their state is mirrored to <see cref="DebugStateStore"/> and
+/// controllable from the editor via <see cref="DebugCommandPipeServer"/>.
 /// </remarks>
 internal static class DebugSessionManager
 {
     private static IDebugBackend? s_session;
+    private static DebugCommandPipeServer? s_pipeServer;
     private static readonly Lock s_lock = new();
 
     public static IDebugBackend? GetSession()
@@ -34,9 +39,10 @@ internal static class DebugSessionManager
         lock (s_lock)
         {
             s_session?.Dispose();
-            s_session = runtime == DebugRuntime.NetFramework
+            s_session = new PublishingDebugBackend(runtime == DebugRuntime.NetFramework
                 ? new IcorDebugBackend()
-                : new DebuggerService();
+                : new DebuggerService());
+            s_pipeServer ??= new DebugCommandPipeServer(GetSession);
             return s_session;
         }
     }
@@ -48,6 +54,8 @@ internal static class DebugSessionManager
             s_session?.Stop();
             s_session?.Dispose();
             s_session = null;
+            s_pipeServer?.Dispose();
+            s_pipeServer = null;
         }
     }
 }

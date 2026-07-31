@@ -54,6 +54,60 @@ function findNearestSolution(start) {
     }
 }
 
+// The editor's own debug session (written by the daemon on the extension's
+// roslynSense/editorDebugState notifications). Injected only when the state CHANGED since
+// the last injection — this hook fires on every prompt/tool call, and repeating "user is
+// paused at X" each time would drown the conversation.
+function editorDebugContext(key) {
+    const stateFile = path.join(os.tmpdir(), 'roslyn-sense', 'editor-debug', `${key}.json`);
+    let raw;
+    try {
+        raw = fs.readFileSync(stateFile, 'utf8');
+    } catch {
+        return null; // no editor debug session
+    }
+
+    let state;
+    try {
+        state = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+    if (!state || !state.Active) return null;
+
+    // Ignore stale leftovers (editor crashed without clearing the file).
+    const updated = Date.parse(state.UpdatedAtUtc || '');
+    if (!Number.isFinite(updated) || Date.now() - updated > 4 * 60 * 60 * 1000) return null;
+
+    const markerFile = stateFile + '.injected';
+    const fingerprint = `${state.ExecutionState}|${state.FilePath}|${state.Line}|${state.Reason}`;
+    try {
+        if (fs.readFileSync(markerFile, 'utf8') === fingerprint) return null; // already told
+    } catch {
+        /* no marker yet */
+    }
+    try {
+        fs.writeFileSync(markerFile, fingerprint);
+    } catch {
+        /* advisory */
+    }
+
+    if (state.ExecutionState === 'stopped' && state.FilePath) {
+        return (
+            `The user is debugging in the editor (session '${state.SessionName || 'unknown'}') and is ` +
+            `paused at ${state.FilePath}:${state.Line}` +
+            (state.Reason ? ` (reason: ${state.Reason})` : '') +
+            '. You can inspect and control this session with the debug tools: DebugEvaluate, ' +
+            'DebugStatus, DebugContinue (continue/step), DebugSetBreakpoint, DebugRunUntil. ' +
+            'Do not stop it — it belongs to the user.'
+        );
+    }
+    return (
+        `The user is debugging in the editor (session '${state.SessionName || 'unknown'}', currently running). ` +
+        'DebugStatus/DebugSetBreakpoint work against that session.'
+    );
+}
+
 function main(hook) {
     const cwd = hook.cwd || process.cwd();
     const solution = findNearestSolution(cwd);
@@ -69,7 +123,7 @@ function main(hook) {
     try {
         files = fs.readdirSync(queueDir).filter((f) => f.endsWith('.txt')).sort();
     } catch {
-        return; // no queue directory — nothing pending
+        // No queue directory — nothing queued, but editor-debug context below may still apply.
     }
 
     const messages = [];
@@ -82,6 +136,10 @@ function main(hook) {
             // Mid-write or drained by a concurrent chat — skip.
         }
     }
+
+    const debugMessage = editorDebugContext(key);
+    if (debugMessage) messages.push(debugMessage);
+
     if (messages.length === 0) return;
 
     // hookEventName must echo the event this invocation is for (the same script serves

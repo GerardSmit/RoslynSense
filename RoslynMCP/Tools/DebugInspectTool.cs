@@ -28,7 +28,11 @@ public static class DebugInspectTool
         {
             var session = DebugSessionManager.GetSession();
             if (session is null)
-                return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            {
+                var routed = await Services.Debugging.EditorDebugRouter.TryRouteAsync("evaluate",
+                    new Dictionary<string, string> { ["expression"] = expression }, cancellationToken);
+                return routed ?? "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            }
 
             // Auto-detect batch mode by semicolons
             var parts = expression.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -92,7 +96,20 @@ public static class DebugInspectTool
     {
         var session = DebugSessionManager.GetSession();
         if (session is null)
+        {
+            if (Services.Debugging.EditorDebugRouter.ActiveEditorSession() is { } editorState)
+            {
+                var routed = await Services.Debugging.EditorDebugRouter.TryRouteAsync(
+                    "status", ct: cancellationToken);
+                if (routed is not null)
+                    return routed;
+                return "The user is debugging in the editor: " +
+                    $"{editorState.ExecutionState} at {editorState.FilePath}:{editorState.Line}" +
+                    (editorState.Reason is null ? "" : $" ({editorState.Reason})") + "." +
+                    "\nUse DebugEvaluate/DebugContinue to inspect or resume that session.";
+            }
             return "No active debug session.";
+        }
 
         var sb = new StringBuilder();
         sb.Append(session.GetStatus());

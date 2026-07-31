@@ -29,7 +29,36 @@ public static class DebugBreakpointTool
         {
             var session = DebugSessionManager.GetSession();
             if (session is null)
-                return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            {
+                // Editor route: one command per breakpoint (batch input is split here).
+                var pairs = filePath.Contains(';')
+                    ? filePath.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Select(pair =>
+                        {
+                            int colonIdx = pair.LastIndexOf(':');
+                            return colonIdx > 0 && int.TryParse(pair[(colonIdx + 1)..], out int bpLine)
+                                ? (File: pair[..colonIdx].Trim(), Line: bpLine)
+                                : (File: pair, Line: 0);
+                        })
+                        .ToArray()
+                    : [(File: filePath, Line: line)];
+
+                var routedResults = new List<string>();
+                foreach (var (bpFile, bpLine) in pairs)
+                {
+                    var routed = await Services.Debugging.EditorDebugRouter.TryRouteAsync("set_breakpoint",
+                        new Dictionary<string, string>
+                        {
+                            ["file"] = bpFile,
+                            ["line"] = bpLine.ToString(),
+                            ["condition"] = condition ?? "",
+                        }, cancellationToken);
+                    if (routed is null)
+                        return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+                    routedResults.Add(routed);
+                }
+                return string.Join("\n", routedResults);
+            }
 
             // Detect batch mode: if filePath contains semicolons, parse as file:line pairs
             if (filePath.Contains(';'))
@@ -88,7 +117,13 @@ public static class DebugBreakpointTool
         {
             var session = DebugSessionManager.GetSession();
             if (session is null)
+            {
+                if (Services.Debugging.EditorDebugRouter.ActiveEditorSession() is not null)
+                    return "Breakpoint IDs belong to LLM-owned sessions; the user is debugging in the " +
+                        "editor, where breakpoints have no IDs. Ask the user to remove the breakpoint, " +
+                        "or use DebugSetBreakpoint/DebugContinue to work around it.";
                 return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            }
 
             // Batch mode
             if (!string.IsNullOrWhiteSpace(breakpointIds))

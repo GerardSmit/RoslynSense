@@ -44,9 +44,13 @@ public static class DebugStartTool
 
             // The engine follows the project: ICorDebug for .NET Framework, netcoredbg for CoreCLR.
             var session = DebugSessionManager.CreateSessionForProject(csprojPath);
-            var breakpoints = ParseBreakpoints(initialBreakpoints);
+            var (breakpoints, conditioned, sharedCount) =
+                MergeSharedBreakpoints(ParseBreakpoints(initialBreakpoints), csprojPath);
             var result = await session.StartTestSessionAsync(csprojPath, filter, breakpoints, cancellationToken);
+            await ApplyConditionedBreakpointsAsync(session, conditioned, cancellationToken);
             var sb = new StringBuilder(result);
+            if (sharedCount > 0)
+                sb.Append($"\n\n_Applied {sharedCount} breakpoint(s) from the editor's shared set._");
             fmt.AppendHints(sb,
                 "Use DebugSetBreakpoint to add breakpoints",
                 "Use DebugContinue to start execution");
@@ -83,9 +87,13 @@ public static class DebugStartTool
 
             // No project here, so the engine follows the CLR the target process actually loaded.
             var session = DebugSessionManager.CreateSessionForProcess(pid);
-            var breakpoints = ParseBreakpoints(initialBreakpoints);
+            var (breakpoints, conditioned, sharedCount) = MergeSharedBreakpoints(
+                ParseBreakpoints(initialBreakpoints), Directory.GetCurrentDirectory());
             var result = await session.AttachToProcessAsync(pid, breakpoints, cancellationToken);
+            await ApplyConditionedBreakpointsAsync(session, conditioned, cancellationToken);
             var sb = new StringBuilder(result);
+            if (sharedCount > 0)
+                sb.Append($"\n\n_Applied {sharedCount} breakpoint(s) from the editor's shared set._");
             fmt.AppendHints(sb,
                 "Use DebugSetBreakpoint to add breakpoints",
                 "Use DebugContinue to start execution");
@@ -94,6 +102,53 @@ public static class DebugStartTool
         catch (Exception ex)
         {
             return $"Error: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Folds the editor's shared per-solution breakpoint set (<see cref="SharedBreakpointStore"/>)
+    /// into the session's initial breakpoints, so a session started by the chat honors what the
+    /// user placed (or removed) in the editor — even with no editor open right now.
+    /// Conditioned breakpoints can't ride the initial list (tuples only) and are applied
+    /// individually after start.
+    /// </summary>
+    private static (List<(string file, int line)>? Initial,
+        List<Services.Debugging.SharedBreakpointStore.Breakpoint> Conditioned, int SharedCount)
+        MergeSharedBreakpoints(List<(string file, int line)>? explicitBreakpoints, string anchorPath)
+    {
+        var shared = Services.Debugging.SharedBreakpointStore.ReadNearest(anchorPath);
+        if (shared.Count == 0)
+            return (explicitBreakpoints, [], 0);
+
+        var initial = explicitBreakpoints ?? [];
+        var conditioned = new List<Services.Debugging.SharedBreakpointStore.Breakpoint>();
+        int added = 0;
+        foreach (var bp in shared)
+        {
+            if (!string.IsNullOrWhiteSpace(bp.Condition))
+            {
+                conditioned.Add(bp);
+                added++;
+            }
+            else if (!initial.Any(e => e.line == bp.Line &&
+                string.Equals(Path.GetFullPath(e.file), bp.File, StringComparison.OrdinalIgnoreCase)))
+            {
+                initial.Add((bp.File, bp.Line));
+                added++;
+            }
+        }
+        return (initial.Count > 0 ? initial : null, conditioned, added);
+    }
+
+    private static async Task ApplyConditionedBreakpointsAsync(
+        Services.IDebugBackend session,
+        List<Services.Debugging.SharedBreakpointStore.Breakpoint> conditioned,
+        CancellationToken ct)
+    {
+        foreach (var bp in conditioned)
+        {
+            try { await session.SetBreakpointAsync(bp.File, bp.Line, bp.Condition, ct); }
+            catch { /* best effort — the unconditioned set already covers the main flow */ }
         }
     }
 

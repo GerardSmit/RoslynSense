@@ -42,27 +42,46 @@ internal static class LspProxy
 
         if (settings.SharedHost && solutionKey is not null)
         {
-            var pipe = await DaemonSpawner.ConnectOrSpawnAsync(solutionKey, cts.Token);
-            if (pipe is not null)
+            // Never let a daemon hiccup kill the language server: any failure before the
+            // first byte has flowed falls through to the in-process fallback below. Once
+            // traffic flowed, the editor's own restart handling owns recovery.
+            bool proxied = false;
+            try
             {
-                await using (pipe)
+                var pipe = await DaemonSpawner.ConnectOrSpawnAsync(solutionKey, cts.Token);
+                if (pipe is not null)
                 {
-                    // Handshake: tell the daemon this connection is a long-lived LSP session,
-                    // not a one-shot tool call. After this frame the pipe carries raw LSP
-                    // JSON-RPC (Content-Length framed) in both directions.
-                    var handshake = new DaemonRequest(
-                        Guid.NewGuid().ToString("N"), Tool: "", Args: new(), Format: "", Kind: "lsp");
-                    await IpcProtocol.WriteMessageAsync(pipe, handshake, cts.Token);
+                    await using (pipe)
+                    {
+                        // Handshake: tell the daemon this connection is a long-lived LSP session,
+                        // not a one-shot tool call. After this frame the pipe carries raw LSP
+                        // JSON-RPC (Content-Length framed) in both directions.
+                        var handshake = new DaemonRequest(
+                            Guid.NewGuid().ToString("N"), Tool: "", Args: new(), Format: "", Kind: "lsp");
+                        await IpcProtocol.WriteMessageAsync(pipe, handshake, cts.Token);
 
-                    Console.Error.WriteLine($"[Lsp] Proxying to shared host for '{solutionKey}'.");
-                    var stdinToPipe = PumpAsync(stdin, pipe, cts.Token);
-                    var pipeToStdout = PumpAsync(pipe, stdout, cts.Token);
-                    await Task.WhenAny(stdinToPipe, pipeToStdout);
-                    cts.Cancel();
+                        Console.Error.WriteLine($"[Lsp] Proxying to shared host for '{solutionKey}'.");
+                        proxied = true;
+                        var stdinToPipe = PumpAsync(stdin, pipe, cts.Token);
+                        var pipeToStdout = PumpAsync(pipe, stdout, cts.Token);
+                        await Task.WhenAny(stdinToPipe, pipeToStdout);
+                        cts.Cancel();
+                    }
+                    return 0;
                 }
-                return 0;
             }
-            Console.Error.WriteLine("[Lsp] Shared host unreachable; running LSP in-process.");
+            catch (OperationCanceledException)
+            {
+                return 0; // editor closed us during connect — clean exit
+            }
+            catch (Exception ex)
+            {
+                if (proxied)
+                    return 0; // session already ran over the pipe; nothing to fall back to
+                Console.Error.WriteLine($"[Lsp] Shared host connection failed ({ex.Message}); running LSP in-process.");
+            }
+            if (!proxied)
+                Console.Error.WriteLine("[Lsp] Shared host unreachable; running LSP in-process.");
         }
 
         // In-process fallback: host the workspace and the LSP session in this process.

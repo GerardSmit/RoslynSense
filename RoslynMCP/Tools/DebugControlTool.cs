@@ -26,7 +26,12 @@ public static class DebugControlTool
         {
             var session = DebugSessionManager.GetSession();
             if (session is null)
-                return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            {
+                // The user may be debugging in the editor — route the command there.
+                var routed = await Services.Debugging.EditorDebugRouter.TryRouteAsync(
+                    action.ToLowerInvariant(), ct: cancellationToken);
+                return routed ?? "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            }
 
             var result = action.ToLowerInvariant() switch
             {
@@ -60,7 +65,13 @@ public static class DebugControlTool
     {
         var session = DebugSessionManager.GetSession();
         if (session is null)
-            return "No active debug session.";
+        {
+            // Never stop the editor's session from here: it belongs to the user.
+            return Services.Debugging.EditorDebugRouter.ActiveEditorSession() is not null
+                ? "No LLM-owned debug session. The user is debugging in the editor — that session " +
+                  "is theirs to stop. Use DebugContinue/DebugEvaluate to work with it instead."
+                : "No active debug session.";
+        }
 
         var result = session.Stop();
         DebugSessionManager.DisposeSession();
@@ -89,7 +100,16 @@ public static class DebugControlTool
         {
             var session = DebugSessionManager.GetSession();
             if (session is null)
-                return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            {
+                var routed = await Services.Debugging.EditorDebugRouter.TryRouteAsync("run_until",
+                    new Dictionary<string, string>
+                    {
+                        ["file"] = filePath,
+                        ["line"] = line.ToString(),
+                        ["condition"] = condition ?? "",
+                    }, cancellationToken);
+                return routed ?? "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+            }
 
             // Set temporary breakpoint
             var (setMessage, bpId) = await session.SetBreakpointAsync(filePath, line, condition, cancellationToken);

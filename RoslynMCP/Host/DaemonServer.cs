@@ -157,7 +157,9 @@ internal sealed class DaemonServer
                     return;
                 }
 
-                var response = await DispatchAsync(request, ct);
+                var response = string.Equals(request.Kind, "editor-debug", StringComparison.Ordinal)
+                    ? await RelayEditorDebugAsync(request, ct)
+                    : await DispatchAsync(request, ct);
                 await IpcProtocol.WriteMessageAsync(pipe, response, ct);
                 if (OperatingSystem.IsWindows())
                 {
@@ -177,6 +179,31 @@ internal sealed class DaemonServer
         {
             _lifecycle.OnConnectionClosed();
         }
+    }
+
+    /// <summary>
+    /// Relays a debug command from an MCP client into the editor's own debug session: the
+    /// chat-owned debugger lives in the client process, but the editor's debugger belongs to
+    /// VSCode — only a connected LSP session can drive it (DAP requests via the extension).
+    /// </summary>
+    private static async Task<DaemonResponse> RelayEditorDebugAsync(DaemonRequest request, CancellationToken ct)
+    {
+        if (!Lsp.LspSessionRegistry.HasSessions)
+            return new DaemonResponse(request.Id, false, null,
+                "No editor is connected to the shared host.");
+
+        var p = new Lsp.Protocol.EditorDebugCommandParams(
+            request.Tool,
+            request.Args.GetValueOrDefault("expression"),
+            request.Args.GetValueOrDefault("file"),
+            int.TryParse(request.Args.GetValueOrDefault("line"), out int line) ? line : 0,
+            request.Args.GetValueOrDefault("condition"));
+
+        string? result = await Lsp.LspSessionRegistry.TryInvokeEditorDebugCommandAsync(p, ct);
+        return result is null
+            ? new DaemonResponse(request.Id, false, null,
+                "The editor did not handle the debug command (no active debug session in the editor).")
+            : new DaemonResponse(request.Id, true, result, null);
     }
 
     private async Task<DaemonResponse> DispatchAsync(DaemonRequest request, CancellationToken ct)

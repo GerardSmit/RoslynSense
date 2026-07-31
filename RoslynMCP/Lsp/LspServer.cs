@@ -320,6 +320,23 @@ internal sealed class LspServer : IDisposable
     public string KillProcess(KillProcessParams p) =>
         Services.Run.RunningProcessRegistry.Kill(p.Pid);
 
+    // ---- Debug bridge ----------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/debugSessions")]
+    public DebugSessionInfo[] DebugSessions() => Handlers.DebugBridgeHandler.Sessions();
+
+    [JsonRpcMethod("roslynSense/debugCommand", UseSingleObjectParameterDeserialization = true)]
+    public Task<DebugCommandResult> DebugCommand(DebugCommandParams p, CancellationToken ct) =>
+        Handlers.DebugBridgeHandler.CommandAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/editorDebugState", UseSingleObjectParameterDeserialization = true)]
+    public void EditorDebugState(EditorDebugStateParams p) =>
+        Handlers.DebugBridgeHandler.EditorState(p);
+
+    [JsonRpcMethod("roslynSense/syncBreakpoints", UseSingleObjectParameterDeserialization = true)]
+    public void SyncBreakpoints(SyncBreakpointsParams p) =>
+        Handlers.DebugBridgeHandler.SyncBreakpoints(p);
+
     public void Dispose()
     {
         LspSessionRegistry.Unregister(SessionId);

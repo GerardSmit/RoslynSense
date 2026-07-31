@@ -1580,10 +1580,12 @@ public sealed class DebugSession : IDebugSession
         if (process is null)
             return (false, "no process");
 
-        // Applying to a running process is what faults. ICorDebug's async break leaves the CLR
-        // synchronized enough to read state, but not to rewrite a method: ApplyChanges walks into
-        // it and access-violates rather than returning a failing HRESULT. Visual Studio and Rider
-        // both only offer Apply Code Changes from a real break state, which is the same rule.
+        // Pause-apply-resume does not work here, and not for want of trying. An async break
+        // (ICorDebugProcess::Stop) synchronizes the process, and adopting a thread with a live
+        // frame gives it a managed stop context too — both were measured, and ApplyChanges
+        // access-violates either way, with no HRESULT and no managed exception. The desktop CLR
+        // wants a stop that arrived through a debug event, which is why Visual Studio and Rider
+        // only offer Apply Code Changes from break mode rather than breaking on your behalf.
         if (_stoppedThread is null)
         {
             return (false,

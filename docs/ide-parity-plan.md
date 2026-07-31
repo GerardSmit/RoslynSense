@@ -979,13 +979,19 @@ Three pieces:
    Getting there cost two real bugs, both worth recording because neither announced itself:
 
    - **Applying while the target was running faulted the process.** The original code
-     async-interrupted a running debuggee (`ICorDebugProcess::Stop`), applied, and resumed. An
-     async break leaves the CLR synchronized enough to *read* state but not to rewrite a method:
-     `ApplyChanges` walked into it and access-violated, with no HRESULT and no managed exception —
-     the host simply died. Visual Studio and Rider both enforce the same rule from the other side,
-     by only offering Apply Code Changes while paused; Rider's `ApplyEncChangesSync` asserts the
-     debugger session's main thread and runs off a paused session. The engine now refuses when the
-     target is running and says why.
+     async-interrupted a running debuggee (`ICorDebugProcess::Stop`), applied, and resumed.
+     `ApplyChanges` access-violated — no HRESULT, no managed exception, the host simply died.
+
+     Pause-apply-resume was then tried properly, on the theory that the missing ingredient was a
+     managed stop context rather than the stop itself: break in, walk the app domains for a thread
+     with a live `ActiveFrame`, adopt it, apply, resume. **It faulted identically.** So the desktop
+     CLR does not want a synchronized process with a thread selected; it wants a stop that arrived
+     through a debug event. That is why Visual Studio and Rider require you to already be in break
+     mode rather than breaking on your behalf — Rider's `ApplyEncChangesSync` asserts the debugger
+     session's main thread and runs off a paused session.
+
+     The engine therefore refuses while the target is running and says why. The refusal is the
+     feature: the alternative to that message is a dead process.
    - **`TrySetJITCompilerFlags(CORDEBUG_JIT_ENABLE_ENC)` had its result thrown away.** A module
      that fails to flag is not updatable, and `ApplyChanges` faults on it rather than failing, so
      the one signal that predicts a crash was being discarded. The HRESULT is now checked and an

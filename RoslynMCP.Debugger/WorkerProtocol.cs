@@ -50,6 +50,7 @@ public sealed class WorkerRequest
     /// they are small (one method's IL), so the encoding cost does not matter.</summary>
     public string? MetadataDelta { get; set; }
     public string? IlDelta { get; set; }
+    public string? PdbDelta { get; set; }
 }
 
 public sealed class WorkerResponse

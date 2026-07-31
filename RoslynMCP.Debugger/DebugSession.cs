@@ -30,6 +30,10 @@ public sealed class DebugSession : IDebugSession
     private readonly BlockingCollection<Action> _commands = new();
     private readonly ManualResetEventSlim _ready = new();
     /// PDB readers are expensive to create; one per module path, session-thread only.
+    /// Set when an ApplyChanges fails: the runtime and the debugger's metadata view may now
+    /// disagree, and there is no rollback, so no further edit is accepted.
+    private bool _encPoisoned;
+
     private readonly Dictionary<string, SymbolReader?> _readers = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<CorDebugStepper> _steppers = new();
     private CorDebug? _corDebug;
@@ -1571,9 +1575,12 @@ public sealed class DebugSession : IDebugSession
 
     /// Apply one EnC metadata+IL delta to a live module (by simple assembly name), marshalled
     /// onto the session thread. Only legal from a real break state — see below.
-    public Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il)
+    public Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb)
         => InvokeAsync<(bool Ok, string Error)>(() =>
     {
+        if (_encPoisoned)
+            return (false, "a previous edit failed to apply; this session can no longer be edited");
         if (!_encModules.TryGetValue(assemblyName, out var module))
             return (false, $"module '{assemblyName}' is not loaded in the debuggee");
         var process = _process;
@@ -1603,13 +1610,21 @@ public sealed class DebugSession : IDebugSession
                 System.Runtime.InteropServices.Marshal.Copy(il, 0, ilPtr, il.Length);
                 var hr = module.TryApplyChanges(metadata.Length, metaPtr, il.Length, ilPtr);
                 if (hr != HRESULT.S_OK)
+                {
+                    // A half-applied edit leaves the runtime's metadata and the debugger's view
+                    // disagreeing, and there is no way to roll it back. Further edits would build
+                    // on that, so the session stops accepting them.
+                    _encPoisoned = true;
                     return (false, $"ApplyChanges failed: {hr}");
+                }
             }
             finally
             {
                 System.Runtime.InteropServices.Marshal.FreeHGlobal(metaPtr);
                 System.Runtime.InteropServices.Marshal.FreeHGlobal(ilPtr);
             }
+
+            RefreshSymbolsAfterEdit(assemblyName, pdb);
             return (true, string.Empty);
         }
         catch (Exception ex)
@@ -1617,6 +1632,80 @@ public sealed class DebugSession : IDebugSession
             return (false, ex.Message);
         }
     });
+
+    /// <summary>
+    /// Brings the debugger's own view back in line with the edit the runtime just took.
+    /// </summary>
+    /// <remarks>
+    /// <c>ApplyChanges</c> updates the runtime and nothing else. Line numbers, sequence points and
+    /// local scopes for the edited method live in the debugger's symbol reader, which still holds
+    /// the pre-edit PDB — so without this every breakpoint and every reported location in that
+    /// method silently points at the old source. The unmanaged reader takes the delta directly
+    /// (this is what MDbg's ApplyEdit does); a portable reader has no equivalent, so its cache is
+    /// dropped instead and the stale entry is at least not kept.
+    /// </remarks>
+    private void RefreshSymbolsAfterEdit(string assemblyName, byte[] pdb)
+    {
+        foreach (var (path, reader) in _readers.ToArray())
+        {
+            if (!string.Equals(
+                    Path.GetFileNameWithoutExtension(path), assemblyName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            bool updated = false;
+            if (reader?.Unmanaged is { } unmanaged && pdb.Length > 0)
+            {
+                // By file rather than by IStream: the reader accepts a path, and it keeps the
+                // COM plumbing out of a path that already has enough ways to fail.
+                string temporary = Path.Combine(
+                    Path.GetTempPath(), $"roslyn-sense-enc-{Guid.NewGuid():N}.pdb");
+                try
+                {
+                    File.WriteAllBytes(temporary, pdb);
+                    updated = unmanaged.TryUpdateSymbolStore(temporary, null) == HRESULT.S_OK;
+                }
+                catch (Exception ex)
+                {
+                    Emit(DebugEventKind.Output,
+                        $"the symbol store could not be updated after the edit: {ex.Message}",
+                        string.Empty, 0);
+                }
+                finally
+                {
+                    try { File.Delete(temporary); } catch { }
+                }
+            }
+
+            if (!updated)
+            {
+                _readers.Remove(path);
+                reader?.Dispose();
+                Emit(DebugEventKind.Output,
+                    $"line information for {assemblyName} is stale after the edit; " +
+                    "breakpoints in changed methods may bind to the wrong line.",
+                    string.Empty, 0);
+            }
+        }
+
+        // A method token alone no longer identifies code: the edited method has a new version, and
+        // bindings made against the old one would resolve to it. Dropping them returns the
+        // affected breakpoints to pending, and the specs survive, so they rebind.
+        foreach (var pair in _boundModule.ToArray())
+        {
+            if (!string.Equals(
+                    Path.GetFileNameWithoutExtension(pair.Value), assemblyName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            _boundModule.TryRemove(pair.Key, out _);
+            _bound.TryRemove(pair.Key, out _);
+            _boundSpecs.TryRemove(pair.Key, out _);
+        }
+    }
 
     // --- breakpoints ----------------------------------------------------------------------------
 

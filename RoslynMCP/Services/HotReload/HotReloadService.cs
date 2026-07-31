@@ -213,7 +213,7 @@ internal sealed class HotReloadService
             if (icor is not null)
             {
                 var (ok, error) = await icor.ApplyDeltaAsync(
-                    assemblyName, delta.MetadataDelta, delta.IlDelta, cancellationToken);
+                    assemblyName, delta.MetadataDelta, delta.IlDelta, delta.PdbDelta, cancellationToken);
                 Record(assemblyName, ok, error);
                 continue;
             }
@@ -224,7 +224,8 @@ internal sealed class HotReloadService
                     "apply_delta",
                     AssemblyName: assemblyName,
                     MetadataDelta: Convert.ToBase64String(delta.MetadataDelta),
-                    IlDelta: Convert.ToBase64String(delta.IlDelta)), cancellationToken);
+                    IlDelta: Convert.ToBase64String(delta.IlDelta),
+                    PdbDelta: Convert.ToBase64String(delta.PdbDelta)), cancellationToken);
 
                 Record(assemblyName, response.Ok && response.Result?.StartsWith("Error") != true,
                     response.Error ?? response.Result ?? "");

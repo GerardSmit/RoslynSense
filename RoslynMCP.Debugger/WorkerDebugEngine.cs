@@ -263,7 +263,8 @@ public sealed class WorkerDebugEngine : IDebugEngine
         }
     }
 
-    public async Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il)
+    public async Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb)
     {
         try
         {
@@ -273,6 +274,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
                 Name = assemblyName,
                 MetadataDelta = Convert.ToBase64String(metadata),
                 IlDelta = Convert.ToBase64String(il),
+                PdbDelta = Convert.ToBase64String(pdb),
             });
 
             return (true, "");

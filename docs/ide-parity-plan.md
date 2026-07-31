@@ -1003,6 +1003,26 @@ Three pieces:
    disposable process — may make it. That guard is what turned the second reproduction of the
    crash from an outage into a reported error.
 
+   Three further things the runtime does *not* do for you, all now handled — `ApplyChanges` takes
+   metadata and IL and updates the runtime, and nothing else:
+
+   - **The PDB delta goes to the debugger's own symbol reader.** It was being discarded, which
+     left every line number, sequence point and local scope in an edited method pointing at
+     pre-edit source. `SymUnmanagedReader.UpdateSymbolStore` takes the delta directly, which is
+     what MDbg's `ApplyEdit` does. A portable reader has no equivalent, so its cache is dropped
+     and the staleness is reported rather than hidden.
+   - **Breakpoint bindings are invalidated for the edited module.** After an edit a method token
+     no longer identifies one piece of code — the edited method has a new version, and a binding
+     made against the old one resolves to it. Dropping the bindings returns those breakpoints to
+     pending; the specs survive, so they rebind.
+   - **A failed apply poisons the session.** There is no rollback, so the runtime's metadata and
+     the debugger's view can disagree from that point on. Further edits would build on that, so
+     they are refused.
+
+   Not handled, deliberately: `FunctionRemapOpportunity` / `ICorDebugILFrame2::RemapFunction`.
+   Frames already executing an edited method finish on the old version and the next call gets the
+   new one, which is the documented first-version behavior.
+
    `RoslynMCP.Tests/FrameworkHotReloadTests.cs` proves the whole path: an MSBuild-built `net48`
    x86 target, launched under the worker, broken at a breakpoint, edited, applied, resumed, and
    observed returning the new value. Gated behind `ROSLYNSENSE_TEST_FX_HOTRELOAD=1` — it drives a

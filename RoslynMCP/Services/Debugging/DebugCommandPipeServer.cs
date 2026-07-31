@@ -24,7 +24,8 @@ internal sealed record DebugPipeRequest(
     DataBreakpointSpec[]? DataBreakpoints = null,
     string? AssemblyName = null,
     string? MetadataDelta = null,
-    string? IlDelta = null);
+    string? IlDelta = null,
+    string? PdbDelta = null);
 
 internal sealed record DebugPipeResponse(bool Ok, string? Result, string? Error);
 
@@ -186,6 +187,7 @@ internal sealed class DebugCommandPipeServer : IDisposable
             request.AssemblyName!,
             Convert.FromBase64String(request.MetadataDelta ?? ""),
             Convert.FromBase64String(request.IlDelta ?? ""),
+            Convert.FromBase64String(request.PdbDelta ?? ""),
             ct);
 
         return ok ? "Applied." : $"Error: {error}";

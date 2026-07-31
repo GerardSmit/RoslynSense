@@ -44,7 +44,8 @@ public interface IDebugSession
     Task<List<DebugScope>> ScopesAsync(uint frameIndex);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(uint frameIndex, string name, string value);
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
-    Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il);
+    Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb);
     Task<(bool Ok, string Error)> DetachAsync();
     void Terminate();
 }

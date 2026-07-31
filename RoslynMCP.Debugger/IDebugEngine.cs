@@ -49,7 +49,11 @@ public interface IDebugEngine : IDisposable
     /// no debugger at all; the desktop runtime has only <c>ICorDebugModule2::ApplyChanges</c>, so
     /// the app must already be under this engine for an edit to land.
     /// </remarks>
-    Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il);
+    /// <param name="pdb">The PDB delta. The runtime never sees it — <c>ApplyChanges</c> takes
+    /// metadata and IL only — but the debugger's own symbol reader has to be updated with it or
+    /// every line number in the edited method is stale from that point on.</param>
+    Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb);
 
     void Terminate();
 }

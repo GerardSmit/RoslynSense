@@ -51,7 +51,8 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
     /// <see cref="WorkerDebugEngine"/> runs the same call in a separate process, where the blast
     /// radius is one disposable worker, so that is the only path allowed to make it.
     /// </remarks>
-    public Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il) =>
+    public Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb) =>
         Task.FromResult((false,
             "Hot reload on .NET Framework is applied out of process. ICorDebug's ApplyChanges " +
             "faults on a malformed delta instead of failing, which would take this process with " +

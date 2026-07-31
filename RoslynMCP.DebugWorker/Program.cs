@@ -180,7 +180,8 @@ internal static class Program
                     var (ok, error) = await session.ApplyDeltaAsync(
                         request.Name ?? "",
                         Convert.FromBase64String(request.MetadataDelta ?? ""),
-                        Convert.FromBase64String(request.IlDelta ?? ""));
+                        Convert.FromBase64String(request.IlDelta ?? ""),
+                        Convert.FromBase64String(request.PdbDelta ?? ""));
                     response.Ok = ok;
                     response.Error = error;
                     break;

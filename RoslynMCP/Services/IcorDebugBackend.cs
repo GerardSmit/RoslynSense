@@ -459,12 +459,13 @@ internal sealed class IcorDebugBackend : IDebugBackend
     /// at all — a module JITted without them refuses the change.
     /// </remarks>
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(
-        string assemblyName, byte[] metadata, byte[] il, CancellationToken cancellationToken = default)
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb,
+        CancellationToken cancellationToken = default)
     {
         if (_engine is null)
             return Task.FromResult((false, "No .NET Framework debug session is attached."));
 
-        return _engine.ApplyDeltaAsync(assemblyName, metadata, il);
+        return _engine.ApplyDeltaAsync(assemblyName, metadata, il, pdb);
     }
 
     /// <summary>Reads the type out of a <c>Type: message</c> event line.</summary>

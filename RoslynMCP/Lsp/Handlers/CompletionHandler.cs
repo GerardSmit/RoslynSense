@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
 using CompletionItem = RoslynMCP.Lsp.Protocol.CompletionItem;
 using CompletionList = RoslynMCP.Lsp.Protocol.CompletionList;
@@ -17,6 +18,11 @@ namespace RoslynMCP.Lsp.Handlers;
 /// - Document.WithFrozenPartialSemantics: completion binds against whatever compilation
 ///   state exists instead of forcing a full bind; slow binds starve Roslyn's per-provider
 ///   time budgets and collapse the list to locals/keywords.
+///
+/// Roslyn decides <em>what</em> is in scope; ordering is ours (see
+/// <see cref="RoslynMCP.Lsp.Completion.CompletionRanker"/>): a CamelHumps match feeds a 64-bit
+/// relevance word whose bit order is the ranking, so locals beat members beat types, obsolete
+/// and unimported items sink, and the whole thing is re-decided per keystroke.
 /// </summary>
 internal static class CompletionHandler
 {
@@ -65,53 +71,72 @@ internal static class CompletionHandler
         // The span Roslyn wants replaced by the committed item (usually the partial word).
         var defaultRange = LspConverters.ToRange(text.Lines, completions.Span);
 
-        // The client re-queries an isIncomplete list as the user types, but plain
-        // Take(MaxItems) on an alphabetical list makes everything after the cap unreachable
-        // ("StringBuilder" never surfaces from 592 type items). Rank by the typed prefix
-        // (CamelHumps-aware via Roslyn's PatternMatcher) before capping.
-        IEnumerable<Microsoft.CodeAnalysis.Completion.CompletionItem> ordered = completions.ItemsList;
         string prefix = completions.Span.Length > 0 && completions.Span.End <= text.Length
             ? text.ToString(completions.Span)
             : "";
-        if (completions.ItemsList.Count > MaxItems && prefix.Length > 0)
-        {
-            ordered = completions.ItemsList
-                .OrderBy(item => MatchRank(item.FilterText, prefix))
-                .ThenBy(item => item.SortText, StringComparer.OrdinalIgnoreCase);
-        }
+        string contextId = CompletionRanker.ContextId(text, completions.Span);
 
-        var cachedItems = ordered.Take(MaxItems).ToList();
+        // Declaring types and the nearest local — the two ranking inputs a completion item does
+        // not carry. One pass over the type being completed on, not a symbol resolve per item.
+        var semantics = await CompletionSemanticContext.CreateAsync(document, completions.Span.Start, ct);
+
+        var ranked = CompletionRanker.Rank(completions.ItemsList, prefix, contextId, MaxItems, semantics);
+        if (ranked.Items.Count == 0)
+            return new CompletionList(false, Array.Empty<CompletionItem>());
+
+        var cachedItems = ranked.Items.Select(r => r.Item).ToList();
         long cacheId = cache.StoreCompletions(document, cachedItems);
 
-        var items = cachedItems
-            .Select((item, index) => new CompletionItem(
-                item.DisplayText,
-                ToLspKind(item),
-                Detail(item),
-                item.SortText,
-                item.FilterText,
-                // Symbol items store their real commit text in Properties (e.g. generic
-                // types commit "List" while displaying "List<>").
-                new TextEdit(defaultRange,
-                    item.Properties.TryGetValue("InsertionText", out string? insertion)
-                        ? insertion
-                        : item.DisplayText))
+        var items = ranked.Items
+            .Select((entry, index) =>
             {
-                Data = new CompletionItemData(cacheId, index),
-                Preselect = item.Rules.MatchPriority == MatchPriority.Preselect ? true : null,
+                var item = entry.Item;
+                return new CompletionItem(
+                    item.DisplayText,
+                    ToLspKind(item),
+                    Detail(item),
+                    entry.SortText(index),
+                    FilterText(item, prefix),
+                    // Symbol items store their real commit text in Properties (e.g. generic
+                    // types commit "List" while displaying "List<>").
+                    new TextEdit(defaultRange,
+                        item.Properties.TryGetValue("InsertionText", out string? insertion)
+                            ? insertion
+                            : item.DisplayText))
+                {
+                    Data = new CompletionItemData(cacheId, index),
+                    Preselect = item.Rules.MatchPriority == MatchPriority.Preselect ? true : null,
+                    Command = new Command(
+                        "",
+                        ExecuteCommandHandler.CompletionAcceptedCommand,
+                        [contextId, CompletionStatistics.Identity(item)]),
+                };
             })
             .ToArray();
 
-        return new CompletionList(completions.ItemsList.Count > MaxItems, items);
+        // Ranking (and the typo tier) depends on the typed prefix, so a narrowed list is not a
+        // subset the client can compute on its own — ask for a fresh request per keystroke.
+        return new CompletionList(ranked.Truncated || prefix.Length > 0, items);
     }
 
-    private static int MatchRank(string candidate, string pattern)
+    /// <summary>
+    /// Hands the client a filter text that begins with exactly what the user typed, so that its
+    /// own fuzzy score is the same for every item and cannot re-order the list.
+    /// </summary>
+    /// <remarks>
+    /// VS Code sorts by <c>score → wordDistance → index-in-sortText-order</c>, and the score is
+    /// computed against filterText: leaving the plain name there lets the client's notion of a
+    /// good match override the ranking computed here (a camel-hump hit scores below a literal
+    /// prefix hit however relevant it is). Prepending the typed text equalises the score, which
+    /// hands the decision back to sortText. Highlighting survives because the client rescores the
+    /// <em>label</em> separately for highlight positions. The rest of the name stays in the filter
+    /// text so the item still matches while the next keystroke's request is in flight, instead of
+    /// the list blanking out between requests.
+    /// </remarks>
+    private static string FilterText(Microsoft.CodeAnalysis.Completion.CompletionItem item, string prefix)
     {
-        if (candidate.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
-            return 0;
-        if (candidate.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-            return 1;
-        return 2;
+        string filterText = string.IsNullOrEmpty(item.FilterText) ? item.DisplayText : item.FilterText;
+        return prefix.Length == 0 ? filterText : prefix + filterText;
     }
 
     private static string? Detail(Microsoft.CodeAnalysis.Completion.CompletionItem item)

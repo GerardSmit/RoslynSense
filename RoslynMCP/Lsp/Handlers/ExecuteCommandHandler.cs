@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Text.Json;
+using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 
@@ -13,7 +15,11 @@ internal static class ExecuteCommandHandler
     public const string ReloadCommand = "roslynSense.reloadWorkspace";
     public const string BuildCommand = "roslynSense.build";
 
-    public static readonly string[] Commands = [RestoreCommand, ReloadCommand, BuildCommand];
+    /// <summary>Sent by the client right after a completion item is inserted: [contextId, itemIdentity].</summary>
+    public const string CompletionAcceptedCommand = "roslynSense.completionAccepted";
+
+    public static readonly string[] Commands =
+        [RestoreCommand, ReloadCommand, BuildCommand, CompletionAcceptedCommand];
 
     public static async Task<object> ExecuteAsync(ExecuteCommandParams p, CancellationToken ct)
     {
@@ -24,6 +30,10 @@ internal static class ExecuteCommandHandler
 
             case BuildCommand:
                 return await BuildAsync(p, ct);
+
+            case CompletionAcceptedCommand:
+                RecordCompletionAccepted(p);
+                return "";
 
             case ReloadCommand:
                 await using (await ProgressReporter.BeginAsync("Reloading workspace", ct))
@@ -37,6 +47,17 @@ internal static class ExecuteCommandHandler
             default:
                 return $"Unknown command '{p.Command}'.";
         }
+    }
+
+    private static void RecordCompletionAccepted(ExecuteCommandParams p)
+    {
+        if (p.Arguments is not { Length: >= 2 })
+            return;
+
+        string? contextId = p.Arguments[0].ValueKind == JsonValueKind.String ? p.Arguments[0].GetString() : null;
+        string? identity = p.Arguments[1].ValueKind == JsonValueKind.String ? p.Arguments[1].GetString() : null;
+        if (contextId is not null && identity is not null)
+            CompletionStatistics.Record(contextId, identity);
     }
 
     /// <summary>Builds before a debug launch. Returns structured diagnostics so the client can

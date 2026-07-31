@@ -35,6 +35,10 @@ public sealed record CompletionItem(
 
     [JsonPropertyName("preselect")] public bool? Preselect { get; init; }
 
+    /// <summary>Runs after the item is inserted. Carries the accept signal that feeds
+    /// completion usage statistics — the client forwards it back as workspace/executeCommand.</summary>
+    [JsonPropertyName("command")] public Command? Command { get; init; }
+
     [JsonPropertyName("commitCharacters")] public string[]? CommitCharacters { get; init; }
 
     /// <summary>1 = plain text, 2 = snippet. Snippets carry tab stops, which is what puts the

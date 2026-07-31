@@ -26,8 +26,9 @@ public sealed class WorkerRequest
 {
     public int Id { get; set; }
 
-    /// <summary>One of: attach, launch, addBreakpoint, removeBreakpoint, continue, step,
-    /// stackTrace, variables, evaluate, setVariable, applyDelta, terminate.</summary>
+    /// <summary>One of: attach, launch, addBreakpoint, removeBreakpoint, continue, pause, step,
+    /// stackTrace, variables, evaluate, setVariable, applyDelta, runToLocation, setNextStatement,
+    /// modules, detach, exceptionPolicy, terminate.</summary>
     public string Op { get; set; } = "";
 
     public int Pid { get; set; }
@@ -51,6 +52,9 @@ public sealed class WorkerRequest
     public string? MetadataDelta { get; set; }
     public string? IlDelta { get; set; }
     public string? PdbDelta { get; set; }
+
+    public bool Flag { get; set; }
+    public bool Force { get; set; }
 }
 
 public sealed class WorkerResponse
@@ -67,4 +71,7 @@ public sealed class WorkerResponse
     public DebugVariable? Variable { get; set; }
     public string? Value { get; set; }
     public bool Removed { get; set; }
+    public List<DebugModule>? Modules { get; set; }
+    public RunToLocationResponse? RunToLocation { get; set; }
+    public SetNextStatementResponse? SetNextStatement { get; set; }
 }

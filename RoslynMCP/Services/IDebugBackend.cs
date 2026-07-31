@@ -97,6 +97,34 @@ internal interface IDebugBackend : IDisposable
     Task<string> SetExceptionFiltersAsync(
         ExceptionFilters filters, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Runs to a source line without leaving a breakpoint behind — "Run to Cursor".
+    /// </summary>
+    /// <remarks>
+    /// Distinct from setting a breakpoint and continuing: this one is gone once it fires, so the
+    /// next lap round a loop does not stop again.
+    /// </remarks>
+    Task<string> RunToLocationAsync(
+        string filePath, int line, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Moves the instruction pointer within the current frame — "Set Next Statement".
+    /// </summary>
+    /// <remarks>
+    /// The one debugger operation that changes what happens rather than observing it: re-run a
+    /// block after fixing a variable, or step over a call that is about to throw.
+    /// </remarks>
+    Task<string> SetNextStatementAsync(
+        string filePath, int line, CancellationToken cancellationToken = default);
+
+    /// <summary>Loaded modules and whether each has symbols — the actionable answer to "my
+    /// breakpoint never binds".</summary>
+    Task<IReadOnlyList<ModuleInfo>> GetModulesAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Stops debugging but leaves the target running, for a process that was only being
+    /// inspected and should not die with the session.</summary>
+    Task<string> DetachAsync(CancellationToken cancellationToken = default);
+
     string GetStatus();
     string Stop();
 }

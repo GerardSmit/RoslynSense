@@ -85,17 +85,75 @@ public class FrameworkHotReloadTests : IDisposable
     public Task ARoslynDeltaIsAcceptedByTheDesktopClrAndChangesALiveProcess() => RunAsync();
 
     /// <summary>
-    /// A running target is refused rather than applied to.
+    /// Break All, then apply — the case that settles whether the desktop CLR needs a stop that
+    /// arrived through a debug event, or merely a stop with a real context behind it.
     /// </summary>
     /// <remarks>
-    /// Pause-apply-resume was tried twice and measured to fault both ways: an async break alone,
-    /// and an async break plus a thread with a live frame adopted as the stop context. The desktop
-    /// CLR wants a stop that came through a debug event, and gives no HRESULT when it does not get
-    /// one — it access-violates. The refusal is therefore the feature, and this pins it, because
-    /// the alternative to a clear message here is a dead process.
+    /// Earlier attempts applied after <c>ICorDebugProcess::Stop</c> alone and after adopting a
+    /// thread ad hoc, and both faulted. This one goes through the engine's own Break All, which
+    /// suspends, adopts a user-code thread as the stop context, and emits a stop the session
+    /// state machine sees — the same shape a breakpoint produces.
     /// </remarks>
     [FrameworkHotReloadFact]
-    public async Task ARunningTargetIsRefusedRatherThanFaulted()
+    public async Task AnEditAppliesAfterBreakingIntoARunningTarget()
+    {
+        Directory.CreateDirectory(_root);
+        string csproj = Path.Combine(_root, "FxHotReloadTarget.csproj");
+        string sourcePath = Path.Combine(_root, "Program.cs");
+        string log = Path.Combine(_root, "values.txt");
+
+        await File.WriteAllTextAsync(csproj, Project);
+        await File.WriteAllTextAsync(sourcePath, BaselineSource);
+        Assert.True(await BuildAsync(csproj), "The .NET Framework target did not build.");
+
+        string exe = Path.Combine(_root, "bin", "Debug", "net48", "FxHotReloadTarget.exe");
+        var backend = (RoslynMCP.Services.Debugging.PublishingDebugBackend)
+            DebugSessionManager.CreateSession(Services.DebugRuntime.NetFramework);
+
+        try
+        {
+            Assert.DoesNotContain("Error:", await backend.LaunchAsync(
+                exe, [log], null, Path.GetDirectoryName(exe)));
+
+            _ = backend.ContinueAsync();
+            Assert.True(await WaitForLastLineAsync(log, "6"), "The target never started.");
+
+            string paused = await backend.InterruptAsync();
+            Assert.DoesNotContain("cannot suspend", paused);
+            Assert.NotNull(backend.CurrentFrame);
+
+            var (session, _) = await HotReloadService.StartAsync(csproj);
+            await File.WriteAllTextAsync(sourcePath, BaselineSource.Replace("input * 2", "input * 10"));
+
+            var outcome = await session!.ApplyAsync();
+
+            Assert.True(outcome.Ok,
+                $"{outcome.Summary}\n" + string.Join("\n", outcome.Errors) +
+                "\n--- engine ---\n" + backend.GetStatus());
+
+            _ = backend.ContinueAsync();
+            Assert.True(await WaitForLastLineAsync(log, "30"),
+                "The delta was applied from a pause but the process kept returning the old value.");
+        }
+        finally
+        {
+            HotReloadService.Get(csproj)?.Stop();
+            DebugSessionManager.DisposeSession();
+        }
+    }
+
+    /// <summary>
+    /// A running target is broken into, edited, and resumed, without the caller pausing first.
+    /// </summary>
+    /// <remarks>
+    /// This is the case the whole investigation was about. It faulted for as long as the apply
+    /// followed a bare <c>ICorDebugProcess::Stop</c>; it works now that the engine performs a real
+    /// Break All — suspend, adopt a user-code thread, report the stop — before applying. The
+    /// engine still refuses an apply to a running target, as a backstop for anything reaching
+    /// past the backend.
+    /// </remarks>
+    [FrameworkHotReloadFact]
+    public async Task AnEditAppliesToARunningTargetWithoutTheCallerPausingIt()
     {
         Directory.CreateDirectory(_root);
         string csproj = Path.Combine(_root, "FxHotReloadTarget.csproj");
@@ -123,10 +181,14 @@ public class FrameworkHotReloadTests : IDisposable
 
             var outcome = await session!.ApplyAsync();
 
-            Assert.False(outcome.Ok);
-            Assert.Contains(outcome.Errors, e => e.Contains("stopped at a breakpoint"));
-            // Still alive: the point of the guard is that the tool survives to say this.
-            Assert.Contains("ICorDebug", backend.GetStatus());
+            Assert.True(outcome.Ok,
+                $"{outcome.Summary}\n" + string.Join("\n", outcome.Errors) +
+                "\n--- engine ---\n" + backend.GetStatus());
+
+            // Resumed by the apply itself: a hot reload that leaves the app suspended looks like
+            // a hot reload that hung it.
+            Assert.True(await WaitForLastLineAsync(log, "30"),
+                "The edit was applied but the process did not carry on with the new code.");
         }
         finally
         {
@@ -164,7 +226,6 @@ public class FrameworkHotReloadTests : IDisposable
             Assert.DoesNotContain("Error:", launched);
 
             // The apply happens from a real break state, which is the only kind the desktop CLR
-            // accepts — see ARunningTargetIsRefusedRatherThanFaulted for the other half.
             string stopped = await backend.ContinueAsync();
             Assert.DoesNotContain("still running", stopped);
             Assert.NotNull(backend.CurrentFrame);

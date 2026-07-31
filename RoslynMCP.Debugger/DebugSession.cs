@@ -30,6 +30,10 @@ public sealed class DebugSession : IDebugSession
     private readonly BlockingCollection<Action> _commands = new();
     private readonly ManualResetEventSlim _ready = new();
     /// PDB readers are expensive to create; one per module path, session-thread only.
+    /// How long Break All waits for the CLR to reach a point where it can suspend. Zero would
+    /// return before the process is actually stopped, which is what a pause has to guarantee.
+    private const int PauseTimeoutMs = 5000;
+
     /// Set when an ApplyChanges fails: the runtime and the debugger's metadata view may now
     /// disagree, and there is no rollback, so no further edit is accepted.
     private bool _encPoisoned;
@@ -241,16 +245,76 @@ public sealed class DebugSession : IDebugSession
         try { _process?.Continue(false); } catch { }
     });
 
+    /// <summary>
+    /// Break All: suspends the debuggee and establishes the same stop state a breakpoint would.
+    /// </summary>
+    /// <remarks>
+    /// The suspend is the easy half. What makes a stop usable is the context that comes with it —
+    /// a current thread, a frame, a source location — and <c>ICorDebugProcess::Stop</c> supplies
+    /// none of that on its own. Without adopting a thread here, everything that reads
+    /// <c>_stoppedThread</c> (stacks, locals, evaluation, stepping, Edit and Continue) sees a
+    /// process that is stopped but has nothing to look at, which is how this previously reported
+    /// a pause with no location and refused every follow-up.
+    /// </remarks>
     public void Pause() => Enqueue(() =>
     {
+        var process = _process;
+        if (process is null)
+            return;
+
         try
         {
-            _process?.Stop(0);
-            _stoppedThread = null;
-            Emit(DebugEventKind.Paused, "paused", string.Empty, 0);
+            process.Stop(PauseTimeoutMs);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Emit(DebugEventKind.Output, $"the target could not be suspended: {ex.Message}", string.Empty, 0);
+            return;
+        }
+
+        var thread = FindThreadForBreak();
+        _stoppedThread = thread;
+
+        if (thread is null)
+        {
+            // Suspended, but every thread is in native code — there is no managed frame to show.
+            Emit(DebugEventKind.Paused, "paused (no managed code is executing)", string.Empty, 0);
+            return;
+        }
+
+        var (file, line, column) = ThreadLocation(thread);
+        Emit(DebugEventKind.Paused, "paused", MethodOf(thread), ThreadId(thread), file, line, column);
     });
+
+    /// <summary>
+    /// Picks the thread a break should land on: user code first, then any managed frame.
+    /// </summary>
+    /// <remarks>
+    /// Breaking into a framework or runtime thread is technically a stop and practically useless —
+    /// the user pressed pause to see their own code. A thread whose active frame maps to a source
+    /// file is theirs; the rest are a fallback so a break still produces something.
+    /// </remarks>
+    private CorDebugThread? FindThreadForBreak()
+    {
+        CorDebugThread? fallback = null;
+
+        foreach (var appDomain in Safe(() => _process?.AppDomains) ?? Array.Empty<CorDebugAppDomain>())
+        {
+            foreach (var thread in Safe(() => appDomain.Threads) ?? Array.Empty<CorDebugThread>())
+            {
+                if (Safe(() => thread.ActiveFrame) is null)
+                    continue;
+
+                var (file, _, _) = ThreadLocation(thread);
+                if (file.Length > 0)
+                    return thread;
+
+                fallback ??= thread;
+            }
+        }
+
+        return fallback;
+    }
 
     /// First-chance exception stop policy (unhandled exceptions always stop).
     public void SetExceptionPolicy(bool breakOnFirstChance) => _breakOnFirstChance = breakOnFirstChance;

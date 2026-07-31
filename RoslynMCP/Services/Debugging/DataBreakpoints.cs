@@ -18,6 +18,16 @@ internal sealed record DataBreakpointSpec(
     string? Condition = null,
     string? HitCondition = null);
 
+/// <summary>One module loaded in the debuggee.</summary>
+/// <param name="SymbolsLoaded">Whether a PDB was found. Without one, breakpoints in this module
+/// never bind — which is the question this record exists to answer.</param>
+internal sealed record ModuleInfo(
+    string Name,
+    string Path,
+    bool SymbolsLoaded,
+    string SymbolPath,
+    string Runtime);
+
 /// <summary>Whether a requested watch could be armed, and why not when it could not.</summary>
 internal sealed record DataBreakpointStatus(string DataId, bool Verified, string Message);
 

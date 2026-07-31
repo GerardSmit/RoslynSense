@@ -26,6 +26,8 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
 
     public void Continue() => _session.Continue();
 
+    public void Pause() => _session.Pause();
+
     public void Step(StepKind kind) => _session.Step(kind);
 
     public Task<List<StackFrame>> StackTraceAsync() => _session.StackTraceAsync();
@@ -57,6 +59,19 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
             "Hot reload on .NET Framework is applied out of process. ICorDebug's ApplyChanges " +
             "faults on a malformed delta instead of failing, which would take this process with " +
             "it, so the in-process engine refuses it."));
+
+    public Task<RunToLocationResponse> RunToLocationAsync(RunToLocationRequest request) =>
+        _session.RunToLocationAsync(request);
+
+    public Task<SetNextStatementResponse> SetNextStatementAsync(SetNextStatementRequest request) =>
+        _session.SetNextStatementAsync(request);
+
+    public Task<List<DebugModule>> ModulesAsync() => _session.ModulesAsync();
+
+    public Task<(bool Ok, string Error)> DetachAsync() => _session.DetachAsync();
+
+    public void SetExceptionPolicy(bool breakOnFirstChance) =>
+        _session.SetExceptionPolicy(breakOnFirstChance);
 
     public void Terminate() => _session.Terminate();
 

@@ -218,6 +218,20 @@ internal sealed class PublishingDebugBackend : IDebugBackend
         ExceptionFilters filters, CancellationToken cancellationToken = default) =>
         _inner.SetExceptionFiltersAsync(filters, cancellationToken);
 
+    public Task<string> RunToLocationAsync(
+        string filePath, int line, CancellationToken cancellationToken = default) =>
+        PublishAfter(_inner.RunToLocationAsync(filePath, line, cancellationToken));
+
+    public Task<string> SetNextStatementAsync(
+        string filePath, int line, CancellationToken cancellationToken = default) =>
+        PublishAfter(_inner.SetNextStatementAsync(filePath, line, cancellationToken));
+
+    public Task<IReadOnlyList<ModuleInfo>> GetModulesAsync(CancellationToken cancellationToken = default) =>
+        _inner.GetModulesAsync(cancellationToken);
+
+    public Task<string> DetachAsync(CancellationToken cancellationToken = default) =>
+        PublishAfter(_inner.DetachAsync(cancellationToken));
+
     public string GetStatus() => _inner.GetStatus();
 
     public string Stop()

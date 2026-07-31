@@ -439,15 +439,90 @@ internal sealed class IcorDebugBackend : IDebugBackend
             typeName, CurrentFrame.ExceptionMessage ?? "", StackTrace: null, BreakMode: "always"));
     }
 
+    /// <summary>
+    /// Applies the exception filters. Unhandled exceptions always stop; the choice is whether
+    /// first-chance ones do too, which is what the <c>all</c> filter means here.
+    /// </summary>
     public Task<string> SetExceptionFiltersAsync(
-        ExceptionFilters filters, CancellationToken cancellationToken = default) =>
-        Task.FromResult(
-            "The .NET Framework engine always breaks on unhandled exceptions; the filters cannot " +
-            "be changed.");
+        ExceptionFilters filters, CancellationToken cancellationToken = default)
+    {
+        if (_engine is null)
+            return Task.FromResult("Error: No debug session is active.");
 
+        _engine.SetExceptionPolicy(filters.All);
+
+        return Task.FromResult(filters.All
+            ? "Breaking on every thrown exception, handled or not."
+            : "Breaking on unhandled exceptions only.");
+    }
+
+    public async Task<string> RunToLocationAsync(
+        string filePath, int line, CancellationToken cancellationToken = default)
+    {
+        if (_state == DebuggerService.DebugState.NotStarted)
+            return "Error: No debug session is active.";
+
+        var response = await Engine.RunToLocationAsync(new RunToLocationRequest
+        {
+            Location = new SourceRange { FilePath = filePath, Line = (uint)Math.Max(0, line) },
+        });
+
+        if (!response.Ok)
+            return $"Error: {response.Error}";
+
+        // The engine sets a one-shot breakpoint and resumes; the stop arrives on the event pump
+        // like any other, so the wait is the same one Continue uses.
+        return await ResumeAsync(() => { }, cancellationToken);
+    }
+
+    public async Task<string> SetNextStatementAsync(
+        string filePath, int line, CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null)
+            return "Error: The instruction pointer can only be moved while the target is stopped.";
+
+        var response = await Engine.SetNextStatementAsync(new SetNextStatementRequest
+        {
+            FrameIndex = (uint)_selectedFrame,
+            Location = new SourceRange { FilePath = filePath, Line = (uint)Math.Max(0, line) },
+        });
+
+        if (!response.Ok)
+            return $"Error: {response.Error}";
+
+        int actual = (int)(response.Actual?.Line ?? (uint)line);
+        return $"The next statement is now {Path.GetFileName(filePath)}:{actual}.";
+    }
+
+    public async Task<IReadOnlyList<ModuleInfo>> GetModulesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_state == DebuggerService.DebugState.NotStarted)
+            return [];
+
+        return [.. (await Engine.ModulesAsync()).Select(m =>
+            new ModuleInfo(m.Name, m.Path, m.SymbolsLoaded, m.SymbolPath, m.Runtime))];
+    }
+
+    public async Task<string> DetachAsync(CancellationToken cancellationToken = default)
+    {
+        if (_engine is null)
+            return "Error: No debug session is active.";
+
+        var (ok, error) = await _engine.DetachAsync();
+        if (!ok)
+            return $"Error: {error}";
+
+        _state = DebuggerService.DebugState.NotStarted;
+        return "Detached. The process is still running.";
+    }
+
+    /// <summary>
+    /// Break All. Waits for the stop rather than returning as soon as the request is sent, so the
+    /// caller gets a position instead of a promise.
+    /// </summary>
     public Task<string> InterruptAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult(
-            "The .NET Framework engine cannot suspend a running target. Set a breakpoint instead.");
+        ResumeAsync(() => Engine.Pause(), cancellationToken);
 
     /// <summary>
     /// Applies one hot reload delta to a module loaded in the debuggee.
@@ -458,14 +533,37 @@ internal sealed class IcorDebugBackend : IDebugBackend
     /// enabled EnC JIT flags on every module as it loaded, which is what makes the apply possible
     /// at all — a module JITted without them refuses the change.
     /// </remarks>
-    public Task<(bool Ok, string Error)> ApplyDeltaAsync(
+    public async Task<(bool Ok, string Error)> ApplyDeltaAsync(
         string assemblyName, byte[] metadata, byte[] il, byte[] pdb,
         CancellationToken cancellationToken = default)
     {
         if (_engine is null)
-            return Task.FromResult((false, "No .NET Framework debug session is attached."));
+            return (false, "No .NET Framework debug session is attached.");
 
-        return _engine.ApplyDeltaAsync(assemblyName, metadata, il, pdb);
+        // An edit needs the target stopped, so a running one is broken into first and resumed
+        // afterwards — the user asked to apply an edit, not to be told to go and press pause.
+        // It has to be a full Break All rather than a bare suspend: applying immediately after
+        // ICorDebugProcess::Stop faults inside ApplyChanges instead of failing.
+        bool paused = false;
+        if (CurrentFrame is null)
+        {
+            string result = await InterruptAsync(cancellationToken);
+            if (CurrentFrame is null)
+                return (false, $"the target could not be suspended to apply the edit: {result}");
+            paused = true;
+        }
+
+        try
+        {
+            return await _engine.ApplyDeltaAsync(assemblyName, metadata, il, pdb);
+        }
+        finally
+        {
+            // Back to where it was. A hot reload that silently leaves the app suspended looks
+            // exactly like a hot reload that hung it.
+            if (paused)
+                _ = ContinueAsync(CancellationToken.None);
+        }
     }
 
     /// <summary>Reads the type out of a <c>Type: message</c> event line.</summary>

@@ -215,6 +215,86 @@ internal sealed partial class DebuggerService
             : $"Breaking on: {string.Join(", ", enabled)}.";
     }
 
+    /// <summary>
+    /// Run to Cursor, as a one-shot breakpoint plus a continue.
+    /// </summary>
+    /// <remarks>
+    /// MI's own <c>-exec-until</c> only moves within the current frame, which is not what the
+    /// command means to a user pointing at a line elsewhere. A temporary breakpoint is what the
+    /// gesture actually is, and netcoredbg deletes it on hit.
+    /// </remarks>
+    public async Task<string> RunToLocationAsync(
+        string filePath, int line, CancellationToken cancellationToken = default)
+    {
+        if (_netcoredbgProcess is null or { HasExited: true })
+            return "Error: no debug session is active.";
+
+        string response = await SendCommandAsync(
+            $"-break-insert -t \"{Path.GetFullPath(filePath).Replace("\\", "/")}:{line}\"",
+            cancellationToken);
+
+        if (IsError(response))
+            return $"Error: {ExtractMiField(response, "msg")}";
+
+        return await ContinueAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Not available on CoreCLR through netcoredbg.
+    /// </summary>
+    /// <remarks>
+    /// MI has no set-next-statement, and netcoredbg exposes none of ICorDebug's
+    /// <c>SetIP</c> equivalent. Saying so is better than a command that appears to work: moving
+    /// the instruction pointer is the one operation whose silent failure changes what the program
+    /// does next.
+    /// </remarks>
+    public Task<string> SetNextStatementAsync(
+        string filePath, int line, CancellationToken cancellationToken = default) =>
+        Task.FromResult(
+            "Moving the next statement is not supported on CoreCLR: netcoredbg exposes no way to " +
+            "set the instruction pointer. It is available when debugging .NET Framework.");
+
+    public async Task<IReadOnlyList<ModuleInfo>> GetModulesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (_netcoredbgProcess is null or { HasExited: true })
+            return [];
+
+        var response = await SendCommandAsync("-file-list-shared-libraries", cancellationToken);
+        if (IsError(response))
+            return [];
+
+        var modules = new List<ModuleInfo>();
+        foreach (string entry in SplitMiTuples(response))
+        {
+            string path = ExtractMiField(entry, "target-name");
+            if (path.Length == 0)
+                continue;
+
+            // netcoredbg reports symbol state as "Yes"/"No" in symbols-loaded.
+            bool symbols = ExtractMiField(entry, "symbols-loaded")
+                .StartsWith("y", StringComparison.OrdinalIgnoreCase);
+
+            modules.Add(new ModuleInfo(
+                Path.GetFileName(path), path, symbols, ExtractMiField(entry, "symbols-path"), "CoreCLR"));
+        }
+
+        return modules;
+    }
+
+    public async Task<string> DetachAsync(CancellationToken cancellationToken = default)
+    {
+        if (_netcoredbgProcess is null or { HasExited: true })
+            return "Error: no debug session is active.";
+
+        var response = await SendCommandAsync("-target-detach", cancellationToken);
+        if (IsError(response))
+            return $"Error: {ExtractMiField(response, "msg")}";
+
+        _state = DebugState.NotStarted;
+        return "Detached. The process is still running.";
+    }
+
     public async Task<string> InterruptAsync(CancellationToken cancellationToken = default)
     {
         if (_state == DebugState.Stopped)

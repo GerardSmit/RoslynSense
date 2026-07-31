@@ -24,6 +24,10 @@ internal sealed class DapServer
     private int _sequence;
     private bool _running = true;
 
+    /// <summary>The file the last <c>gotoTargets</c> asked about. DAP's <c>goto</c> carries only a
+    /// target id, so the source has to be remembered from the request that produced it.</summary>
+    private string? _gotoSource;
+
     /// <summary>DAP frame ids are opaque; the backend's are stack indices, so scopes carry the
     /// frame in their reference and variable references pass through untouched.</summary>
     private const int ScopeBase = 1;
@@ -204,6 +208,42 @@ internal sealed class DapServer
                     }
 
                     await RespondAsync(message, new JsonObject { ["breakpoints"] = verified });
+                    break;
+                }
+
+                case "gotoTargets":
+                {
+                    // DAP asks which lines are legal before offering the jump. The engine decides
+                    // that when the move is attempted, so the requested line is offered and a
+                    // refusal comes back from `goto` rather than being predicted here.
+                    string? file = arguments?["source"]?["path"]?.GetValue<string>();
+                    int line = arguments?["line"]?.GetValue<int>() ?? 0;
+
+                    await RespondAsync(message, new JsonObject
+                    {
+                        ["targets"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["id"] = line,
+                                ["label"] = $"{Path.GetFileName(file ?? "")}:{line}",
+                                ["line"] = line,
+                            },
+                        },
+                    });
+                    _gotoSource = file;
+                    break;
+                }
+
+                case "goto":
+                {
+                    int line = arguments?["targetId"]?.GetValue<int>() ?? 0;
+                    string result = await _backend.SetNextStatementAsync(_gotoSource ?? "", line, ct);
+                    bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+
+                    await RespondAsync(message, null, ok, ok ? null : result);
+                    if (ok)
+                        await ReportStopAsync("goto");
                     break;
                 }
 
@@ -530,6 +570,9 @@ internal sealed class DapServer
         ["supportsHitConditionalBreakpoints"] = true,
         ["supportsLogPoints"] = true,
         ["supportsDataBreakpoints"] = true,
+        // Set Next Statement and Run to Cursor, which the ICorDebug engine has always had.
+        ["supportsGotoTargetsRequest"] = true,
+        ["supportsStepBack"] = false,
         ["exceptionBreakpointFilters"] = new JsonArray
         {
             new JsonObject { ["filter"] = "all", ["label"] = "All Exceptions" },

@@ -215,6 +215,8 @@ public sealed class WorkerDebugEngine : IDebugEngine
 
     public void Continue() => Send(new WorkerRequest { Op = "continue" });
 
+    public void Pause() => Send(new WorkerRequest { Op = "pause" });
+
     public void Step(StepKind kind) => Send(new WorkerRequest { Op = "step", Step = kind });
 
     public async Task<List<StackFrame>> StackTraceAsync() =>
@@ -284,6 +286,65 @@ public sealed class WorkerDebugEngine : IDebugEngine
             return (false, ex.Message);
         }
     }
+
+    public async Task<RunToLocationResponse> RunToLocationAsync(RunToLocationRequest request)
+    {
+        try
+        {
+            var response = await SendAsync(new WorkerRequest
+            {
+                Op = "runToLocation",
+                FilePath = request.Location?.FilePath,
+                Line = (int)(request.Location?.Line ?? 0),
+                Force = request.Force,
+            });
+
+            return response.RunToLocation ?? new RunToLocationResponse { Ok = true };
+        }
+        catch (Exception ex)
+        {
+            return new RunToLocationResponse { Ok = false, Error = ex.Message };
+        }
+    }
+
+    public async Task<SetNextStatementResponse> SetNextStatementAsync(SetNextStatementRequest request)
+    {
+        try
+        {
+            var response = await SendAsync(new WorkerRequest
+            {
+                Op = "setNextStatement",
+                FrameIndex = request.FrameIndex,
+                FilePath = request.Location?.FilePath,
+                Line = (int)(request.Location?.Line ?? 0),
+            });
+
+            return response.SetNextStatement ?? new SetNextStatementResponse { Ok = true };
+        }
+        catch (Exception ex)
+        {
+            return new SetNextStatementResponse { Ok = false, Error = ex.Message };
+        }
+    }
+
+    public async Task<List<DebugModule>> ModulesAsync() =>
+        (await SendAsync(new WorkerRequest { Op = "modules" })).Modules ?? [];
+
+    public async Task<(bool Ok, string Error)> DetachAsync()
+    {
+        try
+        {
+            await SendAsync(new WorkerRequest { Op = "detach" });
+            return (true, "");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    public void SetExceptionPolicy(bool breakOnFirstChance) =>
+        Send(new WorkerRequest { Op = "exceptionPolicy", Flag = breakOnFirstChance });
 
     public void Terminate()
     {

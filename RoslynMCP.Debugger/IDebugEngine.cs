@@ -33,6 +33,11 @@ public interface IDebugEngine : IDisposable
     void AddBreakpoint(BreakpointSpec spec);
     bool RemoveBreakpoint(string filePath, int line);
     void Continue();
+
+    /// <summary>Break All: suspends the target and establishes a stop context, so what follows can
+    /// read a stack, evaluate, and step — a suspend on its own gives none of that.</summary>
+    void Pause();
+
     void Step(StepKind kind);
 
     Task<List<StackFrame>> StackTraceAsync();
@@ -54,6 +59,30 @@ public interface IDebugEngine : IDisposable
     /// every line number in the edited method is stale from that point on.</param>
     Task<(bool Ok, string Error)> ApplyDeltaAsync(
         string assemblyName, byte[] metadata, byte[] il, byte[] pdb);
+
+    /// <summary>Runs to a source location without leaving a breakpoint behind — "Run to Cursor".</summary>
+    Task<RunToLocationResponse> RunToLocationAsync(RunToLocationRequest request);
+
+    /// <summary>
+    /// Moves the instruction pointer within the current frame — "Set Next Statement".
+    /// </summary>
+    /// <remarks>
+    /// The one debugger operation that rewrites history rather than observing it: it re-runs a
+    /// block after changing a variable, or skips a call that would fail. The runtime refuses moves
+    /// it cannot make safely (across frames, into a different scope), which the response reports.
+    /// </remarks>
+    Task<SetNextStatementResponse> SetNextStatementAsync(SetNextStatementRequest request);
+
+    /// <summary>Loaded modules and whether each has symbols — the actionable answer to "why does
+    /// my breakpoint never bind".</summary>
+    Task<List<DebugModule>> ModulesAsync();
+
+    /// <summary>Detaches, leaving the target running. The alternative to killing an app that was
+    /// only being inspected.</summary>
+    Task<(bool Ok, string Error)> DetachAsync();
+
+    /// <summary>Whether first-chance exceptions stop. Unhandled ones always do.</summary>
+    void SetExceptionPolicy(bool breakOnFirstChance);
 
     void Terminate();
 }

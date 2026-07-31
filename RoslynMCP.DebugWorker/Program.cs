@@ -144,6 +144,10 @@ internal static class Program
                     session.Continue();
                     break;
 
+                case "pause":
+                    session.Pause();
+                    break;
+
                 case "step":
                     session.Step(request.Step);
                     break;
@@ -186,6 +190,46 @@ internal static class Program
                     response.Error = error;
                     break;
                 }
+
+                case "runToLocation":
+                    response.RunToLocation = await session.RunToLocationAsync(new RunToLocationRequest
+                    {
+                        Location = new SourceRange
+                        {
+                            FilePath = request.FilePath ?? "",
+                            Line = (uint)Math.Max(0, request.Line),
+                        },
+                        Force = request.Force,
+                    });
+                    break;
+
+                case "setNextStatement":
+                    response.SetNextStatement = await session.SetNextStatementAsync(new SetNextStatementRequest
+                    {
+                        FrameIndex = request.FrameIndex,
+                        Location = new SourceRange
+                        {
+                            FilePath = request.FilePath ?? "",
+                            Line = (uint)Math.Max(0, request.Line),
+                        },
+                    });
+                    break;
+
+                case "modules":
+                    response.Modules = await session.ModulesAsync();
+                    break;
+
+                case "detach":
+                {
+                    var (ok, error) = await session.DetachAsync();
+                    response.Ok = ok;
+                    response.Error = error;
+                    break;
+                }
+
+                case "exceptionPolicy":
+                    session.SetExceptionPolicy(request.Flag);
+                    break;
 
                 case "terminate":
                     session.Terminate();

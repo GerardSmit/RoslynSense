@@ -363,6 +363,20 @@ public class DapServerTests
             ExceptionFilters filters, CancellationToken cancellationToken = default) =>
             Task.FromResult("ok");
 
+        public Task<string> RunToLocationAsync(
+            string filePath, int line, CancellationToken cancellationToken = default) =>
+            Task.FromResult("ran to location");
+
+        public Task<string> SetNextStatementAsync(
+            string filePath, int line, CancellationToken cancellationToken = default) =>
+            Task.FromResult("moved");
+
+        public Task<IReadOnlyList<ModuleInfo>> GetModulesAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<ModuleInfo>>([]);
+
+        public Task<string> DetachAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult("detached");
+
         public string GetStatus() => "status";
 
         public string Stop()

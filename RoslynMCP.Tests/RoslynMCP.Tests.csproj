@@ -57,6 +57,18 @@
       <Copy SourceFiles="@(_HotReloadAgentForTests)" DestinationFolder="$(OutputPath)hotreload" SkipUnchangedFiles="true" />
     </Target>
 
+    <!--
+      The bitness-matched debug workers, when they were built. ICorDebug's ApplyChanges can fault
+      the process it runs in, so the Framework hot reload path deliberately requires a worker —
+      which means the tests that exercise it need one on disk beside them.
+    -->
+    <Target Name="CopyDebugWorkersForTests" AfterTargets="Build" Condition="'$(BuildDebugWorkers)' == 'true'">
+      <ItemGroup>
+        <_TestDebugWorker Include="$(MSBuildThisFileDirectory)..\RoslynMCP\bin\$(Configuration)\net10.0\workers\**\*" />
+      </ItemGroup>
+      <Copy SourceFiles="@(_TestDebugWorker)" DestinationFiles="@(_TestDebugWorker->'$(OutputPath)workers\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    </Target>
+
     <Target Name="PrepareFixtureProjects" BeforeTargets="BeforeBuild">
         <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />

@@ -4,6 +4,7 @@ using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.ExternalAccess.UnitTesting.Api;
+using Microsoft.CodeAnalysis.Text;
 
 namespace RoslynMCP.Services.HotReload;
 
@@ -60,6 +61,9 @@ internal sealed class HotReloadService
     private readonly UnitTestingHotReloadService _encService;
     private readonly string _projectPath;
 
+    /// <summary>Per-document file stamps, so an apply re-reads only what actually changed.</summary>
+    private readonly Dictionary<DocumentId, (DateTime Written, long Length)> _stamps = [];
+
     private HotReloadService(UnitTestingHotReloadService encService, string projectPath)
     {
         _encService = encService;
@@ -104,6 +108,7 @@ internal sealed class HotReloadService
             project.Solution, [.. capabilities], cancellationToken);
 
         var session = new HotReloadService(service, projectPath);
+        session.RecordStamps(project.Solution);
         s_sessions[projectPath] = session;
 
         return (session, $"Hot reload session open with {capabilities.Count} runtime capabilities.");
@@ -123,8 +128,13 @@ internal sealed class HotReloadService
         var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
             _projectPath, cancellationToken: cancellationToken);
 
+        // The whole input to a hot reload is "what changed since the build", and the cached
+        // snapshot refreshes only the one file a request names — which is no file at all here.
+        // Without this, Roslyn diffs the loaded solution against itself and emits nothing.
+        var solution = RefreshFromDisk(project.Solution);
+
         var (updates, diagnostics) = await _encService.EmitSolutionUpdateAsync(
-            project.Solution, commitUpdates: true, cancellationToken);
+            solution, commitUpdates: true, cancellationToken);
 
         var reported = diagnostics.Select(Describe).ToList();
 
@@ -147,7 +157,7 @@ internal sealed class HotReloadService
         var (applied, errors) = await HotReloadAgentServer.Instance.ApplyAsync(deltas, cancellationToken);
 
         var (frameworkApplied, frameworkErrors) = await ApplyToFrameworkSessionAsync(
-            project.Solution, deltas, cancellationToken);
+            solution, deltas, cancellationToken);
 
         applied = [.. applied, .. frameworkApplied];
         errors = [.. errors, .. frameworkErrors];
@@ -286,6 +296,73 @@ internal sealed class HotReloadService
         }
 
         return names;
+    }
+
+    /// <summary>
+    /// Pulls edited files back into the snapshot, so the diff is against what the user has now
+    /// rather than against what was loaded.
+    /// </summary>
+    /// <remarks>
+    /// Stamps rather than content: re-reading every file in a solution on every save would make
+    /// apply-on-save cost proportional to the solution, not to the edit. An open editor buffer is
+    /// skipped because the snapshot already carries it and disk says nothing about unsaved text.
+    /// </remarks>
+    private Solution RefreshFromDisk(Solution solution)
+    {
+        foreach (var project in solution.Projects)
+        {
+            foreach (var document in project.Documents)
+            {
+                if (document.FilePath is not { Length: > 0 } path || OpenDocumentStore.IsOpen(path))
+                    continue;
+
+                if (Stamp(path) is not { } stamp)
+                    continue;
+
+                if (_stamps.TryGetValue(document.Id, out var known) && known == stamp)
+                    continue;
+
+                _stamps[document.Id] = stamp;
+
+                if (Read(path) is { } text)
+                    solution = solution.WithDocumentText(document.Id, text);
+            }
+        }
+
+        return solution;
+    }
+
+    private void RecordStamps(Solution solution)
+    {
+        foreach (var project in solution.Projects)
+        {
+            foreach (var document in project.Documents)
+            {
+                if (document.FilePath is { Length: > 0 } path && Stamp(path) is { } stamp)
+                    _stamps[document.Id] = stamp;
+            }
+        }
+    }
+
+    private static (DateTime Written, long Length)? Stamp(string path)
+    {
+        var info = new FileInfo(path);
+        return info.Exists ? (info.LastWriteTimeUtc, info.Length) : null;
+    }
+
+    /// <summary>Reads a document with an explicit encoding: a <see cref="SourceText"/> without one
+    /// cannot have debug information emitted for it, and no PDB means no delta.</summary>
+    private static SourceText? Read(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            return SourceText.From(stream, System.Text.Encoding.UTF8);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     internal static Guid? ReadModuleId(string assemblyPath)

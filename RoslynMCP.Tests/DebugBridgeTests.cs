@@ -217,14 +217,26 @@ public class DebugBridgeTests
             CancellationToken cancellationToken = default) => Task.FromResult("attached");
 
         public Task<(string Message, int? BreakpointId)> SetBreakpointAsync(string filePath, int line,
-            string? condition = null, CancellationToken cancellationToken = default) =>
+            string? condition = null, string? hitCondition = null, string? logMessage = null,
+            CancellationToken cancellationToken = default) =>
             Task.FromResult(($"bp {filePath}:{line}", (int?)1));
 
         public Task<string> RemoveBreakpointAsync(int breakpointId, CancellationToken cancellationToken = default) =>
             Task.FromResult("removed");
 
-        public Task<string> ContinueAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult("continued");
+        /// <summary>Counts resumes so emulated hit conditions and logpoints can be observed.</summary>
+        public int Continues;
+
+        /// <summary>Frames the session reports as it is resumed, one per stop.</summary>
+        public Queue<DebuggerService.StoppedFrame> StopSequence = new();
+
+        public Task<string> ContinueAsync(CancellationToken cancellationToken = default)
+        {
+            Continues++;
+            if (StopSequence.TryDequeue(out var next))
+                Frame = next;
+            return Task.FromResult("continued");
+        }
 
         public Task<string> StepInAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult("stepped");
@@ -243,6 +255,39 @@ public class DebugBridgeTests
 
         public Task<string> GetStackTraceAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult("stack");
+
+        public Task<string> InterruptAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult("interrupted");
+
+        public IReadOnlyList<StackFrameInfo> Frames = [];
+        public IReadOnlyList<VariableInfo> Variables = [];
+
+        public Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
+            CancellationToken cancellationToken = default) => Task.FromResult(Frames);
+
+        public Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(
+            int frameId, CancellationToken cancellationToken = default) => Task.FromResult(Variables);
+
+        public Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
+            int variablesReference, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<VariableInfo>>([]);
+
+        public Task<(bool Ok, string Value, string Error)> SetVariableAsync(
+            string name, string value, int frameId = 0, CancellationToken cancellationToken = default) =>
+            Task.FromResult((true, value, ""));
+
+        public Task<string> SelectFrameAsync(int frameId, CancellationToken cancellationToken = default) =>
+            Task.FromResult($"frame {frameId}");
+
+        public Task<IReadOnlyList<ThreadInfo>> GetThreadsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<ThreadInfo>>([new ThreadInfo(1, "Main", "stopped")]);
+
+        public Task<ExceptionDetail?> GetExceptionInfoAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<ExceptionDetail?>(null);
+
+        public Task<string> SetExceptionFiltersAsync(
+            ExceptionFilters filters, CancellationToken cancellationToken = default) =>
+            Task.FromResult("filters set");
 
         public string GetStatus() => "status";
         public string Stop() => "stopped";

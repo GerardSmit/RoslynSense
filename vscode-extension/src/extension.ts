@@ -1070,6 +1070,38 @@ function registerDebugBridge(context: vscode.ExtensionContext): void {
 // full path (from the state store); deeper frames only have file names, so they render
 // without sources.
 
+/// Scope references are frame ids offset into their own band so a scope is never mistaken for
+/// a variable handle (the backend hands those out from 1000).
+const SCOPE_BASE = 1;
+const SCOPE_RANGE = 999;
+
+interface StructuredFrame {
+    id: number;
+    name: string;
+    filePath: string;
+    line: number;
+    column: number;
+    isExternal: boolean;
+}
+
+interface StructuredVariable {
+    name: string;
+    value: string;
+    type: string;
+    variablesReference: number;
+    namedChildCount: number;
+    indexedChildCount: number;
+    evaluable: boolean;
+}
+
+function parseJson<T>(text: string): T | undefined {
+    try {
+        return JSON.parse(text) as T;
+    } catch {
+        return undefined;
+    }
+}
+
 class AiDebugAdapter implements vscode.DebugAdapter {
     private readonly emitter = new vscode.EventEmitter<vscode.DebugProtocolMessage>();
     readonly onDidSendMessage = this.emitter.event;
@@ -1077,7 +1109,6 @@ class AiDebugAdapter implements vscode.DebugAdapter {
     private seq = 1;
     private ownerPid: number | undefined;
     private lastState: string | undefined;
-    private lastLocals: { name: string; value: string }[] = [];
     private pollTimer: NodeJS.Timeout | undefined;
     private disposed = false;
 
@@ -1123,6 +1154,13 @@ class AiDebugAdapter implements vscode.DebugAdapter {
         });
     }
 
+    /// Runs a command whose result is a JSON payload, returning undefined when it failed or
+    /// came back as something other than JSON.
+    private async structured<T>(action: string, extra?: Record<string, unknown>): Promise<T | undefined> {
+        const result = await this.command(action, extra);
+        return result.ok ? parseJson<T>(result.result) : undefined;
+    }
+
     private async currentSession(): Promise<DebugSessionInfo | undefined> {
         if (!client) {
             return undefined;
@@ -1154,8 +1192,19 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.respond(request, {
                     supportsConfigurationDoneRequest: true,
                     supportsEvaluateForHovers: true,
-                    supportsSetVariable: false,
-                    supportsTerminateRequest: false,
+                    supportsSetVariable: true,
+                    supportsTerminateRequest: true,
+                    supportTerminateDebuggee: false,
+                    supportsConditionalBreakpoints: true,
+                    // Both are emulated server-side; neither engine implements them.
+                    supportsHitConditionalBreakpoints: true,
+                    supportsLogPoints: true,
+                    supportsExceptionInfoRequest: true,
+                    supportsExceptionFilterOptions: true,
+                    exceptionBreakpointFilters: [
+                        { filter: 'all', label: 'All Exceptions', default: false },
+                        { filter: 'user-unhandled', label: 'User-Unhandled Exceptions', default: true },
+                    ],
                 });
                 this.event('initialized');
                 return;
@@ -1186,70 +1235,131 @@ class AiDebugAdapter implements vscode.DebugAdapter {
             }
 
             case 'configurationDone':
-            case 'setExceptionBreakpoints':
                 this.respond(request);
                 return;
 
-            case 'threads':
-                this.respond(request, { threads: [{ id: 1, name: 'AI Debug Session' }] });
+            case 'setExceptionBreakpoints': {
+                const filters: string[] = request.arguments?.filters ??
+                    (request.arguments?.filterOptions ?? []).map((o: { filterId: string }) => o.filterId);
+                const result = await this.command('exception_filters', { filters });
+                this.respond(request, undefined, result.ok, result.ok ? undefined : result.result);
                 return;
+            }
+
+            case 'threads': {
+                const threads = await this.structured<{ id: number; name: string }[]>('threads');
+                this.respond(request, {
+                    threads: threads?.length
+                        ? threads.map((t) => ({ id: t.id, name: t.name }))
+                        : [{ id: 1, name: 'AI Debug Session' }],
+                });
+                return;
+            }
 
             case 'stackTrace': {
+                const frames = await this.structured<StructuredFrame[]>('frames');
+                if (frames?.length) {
+                    this.respond(request, {
+                        stackFrames: frames.map((f) => ({
+                            id: f.id,
+                            name: f.name,
+                            source: f.filePath
+                                ? { name: f.filePath.split(/[\\/]/).pop(), path: f.filePath }
+                                : undefined,
+                            line: f.line,
+                            column: f.column || 1,
+                            presentationHint: f.isExternal ? 'subtle' : undefined,
+                        })),
+                        totalFrames: frames.length,
+                    });
+                    return;
+                }
+
+                // No structured stack (an engine that cannot walk it, or a session that just
+                // exited) — the published stop location is still worth showing.
                 const session = await this.currentSession();
-                const frames: unknown[] = [];
+                const fallback: unknown[] = [];
                 if (session?.state === 'stopped' && session.filePath) {
-                    frames.push({
-                        id: 1,
+                    fallback.push({
+                        id: 0,
                         name: session.function ?? 'current frame',
                         source: { name: session.filePath.split(/[\\/]/).pop(), path: session.filePath },
                         line: session.line,
                         column: 1,
                     });
                 }
-                const stack = await this.command('stacktrace');
-                if (stack.ok) {
-                    // "  #N Func at File.cs:12" — deeper frames carry file names only.
-                    for (const line of stack.result.split('\n')) {
-                        const match = /^\s+#(\d+)\s+(.*?)(?:\s+at\s+(\S+):(\d+))?\s*$/.exec(line);
-                        if (!match || match[1] === '0') {
-                            continue;
-                        }
-                        frames.push({
-                            id: Number(match[1]) + 1,
-                            name: match[2],
-                            line: match[4] ? Number(match[4]) : 0,
-                            column: 0,
-                            presentationHint: 'subtle',
-                        });
-                    }
-                }
-                this.respond(request, { stackFrames: frames, totalFrames: frames.length });
+                this.respond(request, { stackFrames: fallback, totalFrames: fallback.length });
                 return;
             }
 
             case 'scopes':
+                // Frame ids are the backend's own frame indices, so the scope reference has to
+                // carry the frame with it; SCOPE_BASE keeps it clear of variable references.
                 this.respond(request, {
-                    scopes: [{ name: 'Locals', variablesReference: 1, expensive: false }],
+                    scopes: [{
+                        name: 'Locals',
+                        variablesReference: SCOPE_BASE + (request.arguments?.frameId ?? 0),
+                        expensive: false,
+                    }],
                 });
                 return;
 
             case 'variables': {
-                const locals = await this.command('locals');
-                this.lastLocals = [];
-                if (locals.ok) {
-                    for (const line of locals.result.split('\n')) {
-                        const match = /^\s{2}(\S+)\s=\s(.*)$/.exec(line);
-                        if (match) {
-                            this.lastLocals.push({ name: match[1], value: match[2] });
-                        }
-                    }
-                }
+                const reference: number = request.arguments?.variablesReference ?? SCOPE_BASE;
+                const variables = reference >= SCOPE_BASE && reference < SCOPE_BASE + SCOPE_RANGE
+                    ? await this.structured<StructuredVariable[]>('variables', {
+                        frameId: reference - SCOPE_BASE,
+                    })
+                    : await this.structured<StructuredVariable[]>('children', {
+                        variablesReference: reference,
+                    });
+
                 this.respond(request, {
-                    variables: this.lastLocals.map((v) => ({
+                    variables: (variables ?? []).map((v) => ({
                         name: v.name,
                         value: v.value,
-                        variablesReference: 0,
+                        type: v.type || undefined,
+                        variablesReference: v.variablesReference,
+                        namedVariables: v.namedChildCount || undefined,
+                        indexedVariables: v.indexedChildCount || undefined,
+                        evaluateName: v.name,
                     })),
+                });
+                return;
+            }
+
+            case 'setVariable': {
+                const result = await this.command('set_variable', {
+                    expression: request.arguments?.name,
+                    value: request.arguments?.value,
+                    frameId: 0,
+                });
+                if (!result.ok) {
+                    this.respond(request, undefined, false, result.result);
+                    return;
+                }
+                const parsed = parseJson<{ ok: boolean; value: string; error: string }>(result.result);
+                this.respond(
+                    request,
+                    { value: parsed?.value ?? request.arguments?.value },
+                    parsed?.ok !== false,
+                    parsed?.ok === false ? parsed.error : undefined);
+                return;
+            }
+
+            case 'exceptionInfo': {
+                const detail = await this.structured<{
+                    typeName: string; message: string; breakMode: string;
+                }>('exception_info');
+                if (!detail) {
+                    this.respond(request, undefined, false, 'The session did not stop on an exception.');
+                    return;
+                }
+                this.respond(request, {
+                    exceptionId: detail.typeName,
+                    description: detail.message,
+                    breakMode: detail.breakMode,
+                    details: { message: detail.message, typeName: detail.typeName },
                 });
                 return;
             }
@@ -1294,8 +1404,12 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 // server's list so a breakpoint removed in this UI is removed in the chat's
                 // debugger too (and other editors' glyphs follow on their next poll).
                 const source = request.arguments?.source;
-                const wanted: { line: number; condition?: string }[] =
-                    request.arguments?.breakpoints ?? [];
+                const wanted: {
+                    line: number;
+                    condition?: string;
+                    hitCondition?: string;
+                    logMessage?: string;
+                }[] = request.arguments?.breakpoints ?? [];
                 const filePath: string | undefined = source?.path;
                 const existing = (await this.currentSession())?.breakpoints?.filter(
                     (b) => filePath && b.file.toLowerCase() === filePath.toLowerCase()
@@ -1308,7 +1422,9 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 }
                 const verified: unknown[] = [];
                 for (const bp of wanted) {
-                    if (existing.some((e) => e.line === bp.line)) {
+                    // A hit condition or log message has to reach the backend even when the line
+                    // already carries a breakpoint, since that is where both are emulated.
+                    if (existing.some((e) => e.line === bp.line) && !bp.hitCondition && !bp.logMessage) {
                         verified.push({ verified: true, line: bp.line });
                         continue;
                     }
@@ -1316,6 +1432,8 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                         file: filePath,
                         line: bp.line,
                         condition: bp.condition,
+                        hitCondition: bp.hitCondition,
+                        logMessage: bp.logMessage,
                     });
                     verified.push({ verified: result.ok, line: bp.line });
                 }
@@ -1323,10 +1441,23 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 return;
             }
 
-            case 'pause':
-                this.respond(request, undefined, false,
-                    'The AI debugger cannot pause a running target; set a breakpoint instead.');
+            case 'pause': {
+                const result = await this.command('pause');
+                this.respond(request, undefined, result.ok, result.ok ? undefined : result.result);
+                if (result.ok) {
+                    this.lastState = 'stopped';
+                    this.event('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true });
+                }
                 return;
+            }
+
+            case 'terminate': {
+                // The chat's session is the chat's to keep, but the user asked for this one.
+                const result = await this.command('stop');
+                this.respond(request, undefined, result.ok, result.ok ? undefined : result.result);
+                this.event('terminated');
+                return;
+            }
 
             case 'disconnect':
                 // Leave the chat's session alive — disconnecting the UI must not kill it.
@@ -1347,6 +1478,12 @@ class AiDebugAdapter implements vscode.DebugAdapter {
             const session = await this.currentSession();
             if (this.disposed) {
                 return;
+            }
+
+            // Logpoints are resumed through server-side, so their output only surfaces here.
+            const log = await this.structured<string[]>('drain_log');
+            for (const line of log ?? []) {
+                this.event('output', { category: 'console', output: line + '\n' });
             }
             if (!session || session.state === 'exited') {
                 this.event('terminated');

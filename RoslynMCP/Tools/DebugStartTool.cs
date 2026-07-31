@@ -147,7 +147,7 @@ public static class DebugStartTool
     {
         foreach (var bp in conditioned)
         {
-            try { await session.SetBreakpointAsync(bp.File, bp.Line, bp.Condition, ct); }
+            try { await session.SetBreakpointAsync(bp.File, bp.Line, bp.Condition, cancellationToken: ct); }
             catch { /* best effort — the unconditioned set already covers the main flow */ }
         }
     }

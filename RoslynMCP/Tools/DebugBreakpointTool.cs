@@ -74,7 +74,7 @@ public static class DebugBreakpointTool
                         continue;
                     }
                     var bpFile = pair[..colonIdx].Trim();
-                    var (msg, _) = await session.SetBreakpointAsync(bpFile, bpLine, condition, cancellationToken);
+                    var (msg, _) = await session.SetBreakpointAsync(bpFile, bpLine, condition, cancellationToken: cancellationToken);
                     sb.AppendLine(msg);
                 }
                 fmt.AppendHints(sb,
@@ -84,7 +84,7 @@ public static class DebugBreakpointTool
             }
 
             {
-                var singleResult = (await session.SetBreakpointAsync(filePath, line, condition, cancellationToken)).Message;
+                var singleResult = (await session.SetBreakpointAsync(filePath, line, condition, cancellationToken: cancellationToken)).Message;
                 var sbSingle = new StringBuilder(singleResult);
                 fmt.AppendHints(sbSingle,
                     "Use DebugContinue to run to the breakpoint",

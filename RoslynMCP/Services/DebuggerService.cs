@@ -209,7 +209,7 @@ internal sealed partial class DebuggerService : IDebugBackend
                 if (!_breakpoints.Values.Any(bp =>
                     bp.FilePath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) && bp.Line == line))
                 {
-                    await SetBreakpointAsync(file, line, condition: null, cancellationToken);
+                    await SetBreakpointAsync(file, line, condition: null, cancellationToken: cancellationToken);
                 }
             }
         }
@@ -303,8 +303,13 @@ internal sealed partial class DebuggerService : IDebugBackend
         return null;
     }
 
-    public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(string filePath, int line, string? condition = null, CancellationToken cancellationToken = default)
+    public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
+        string filePath, int line, string? condition = null, string? hitCondition = null,
+        string? logMessage = null, CancellationToken cancellationToken = default)
     {
+        // hitCondition and logMessage are emulated a layer up; netcoredbg has no MI for either.
+        _ = (hitCondition, logMessage);
+
         if (_state == DebugState.NotStarted)
             return ("Error: No active debug session.", null);
 
@@ -397,7 +402,7 @@ internal sealed partial class DebuggerService : IDebugBackend
 
             var value = ExtractMiField(response, "value");
             if (value is not null)
-                return UnescapeMiString(value);
+                return value;
 
             if (response.Contains("^error", StringComparison.Ordinal))
                 return $"Error: {ExtractError(response)}";
@@ -730,6 +735,10 @@ internal sealed partial class DebuggerService : IDebugBackend
             else if (parseLine.StartsWith("*stopped", StringComparison.Ordinal))
             {
                 _currentFrame = ParseStoppedFrame(parseLine);
+                // Variable references name objects that only exist for this stop; carrying them
+                // over would answer an expansion with a different object's fields.
+                _handles.Reset();
+                _selectedFrame = 0;
                 // Distinguish exit from actual stop
                 var reason = ExtractMiField(parseLine, "reason");
                 _state = reason is "exited" or "exited-normally" or "exited-signalled"
@@ -987,7 +996,11 @@ internal sealed partial class DebuggerService : IDebugBackend
         var bpNoStr = ExtractMiField(line, "bkptno") ?? "0";
         int.TryParse(bpNoStr, out var bpNo);
 
-        return new StoppedFrame(reason, func, file, lineNum, bpNo);
+        return new StoppedFrame(
+            reason, func, file, lineNum, bpNo,
+            ExceptionName: ExtractMiField(line, "exception-name"),
+            ExceptionMessage: ExtractMiField(line, "exception"),
+            ExceptionStage: ExtractMiField(line, "exception-stage"));
     }
 
     internal static string FormatLocals(string response)
@@ -995,46 +1008,17 @@ internal sealed partial class DebuggerService : IDebugBackend
         if (response.Contains("^error", StringComparison.Ordinal))
             return $"Error: {ExtractError(response)}";
 
+        // netcoredbg's -stack-list-variables answers with variables=[]; plain MI uses locals=[].
+        if (!response.Contains("variables=[", StringComparison.Ordinal) &&
+            !response.Contains("locals=[", StringComparison.Ordinal))
+        {
+            return "No local variables.";
+        }
+
         var sb = new StringBuilder();
         sb.AppendLine("**Local Variables:**");
-
-        // Parse locals=[...] or variables=[...] (netcoredbg uses -stack-list-variables)
-        var localsStart = response.IndexOf("variables=[", StringComparison.Ordinal);
-        if (localsStart >= 0)
-            localsStart += 11; // "variables=[".Length
-        else
-        {
-            localsStart = response.IndexOf("locals=[", StringComparison.Ordinal);
-            if (localsStart >= 0)
-                localsStart += 8; // "locals=[".Length
-        }
-
-        if (localsStart < 0)
-            return "No local variables.";
-
-        var content = response[localsStart..];
-        var depth = 0;
-        var current = new StringBuilder();
-
-        foreach (var ch in content)
-        {
-            if (ch == '{') { depth++; current.Clear(); continue; }
-            if (ch == '}')
-            {
-                depth--;
-                if (depth <= 0)
-                {
-                    // Parse the name/value from current
-                    var entry = current.ToString();
-                    var entryName = ExtractMiField(entry, "name") ?? "?";
-                    var entryValue = ExtractMiField(entry, "value") ?? "?";
-                    if (entryName is not "?" and not "")
-                        sb.AppendLine($"  {entryName} = {UnescapeMiString(entryValue)}");
-                }
-                continue;
-            }
-            if (depth > 0) current.Append(ch);
-        }
+        foreach (var (name, value) in ParseNameValueList(response))
+            sb.AppendLine($"  {name} = {value}");
 
         return sb.ToString();
     }
@@ -1047,43 +1031,27 @@ internal sealed partial class DebuggerService : IDebugBackend
         var sb = new StringBuilder();
         sb.AppendLine("**Call Stack:**");
 
-        // Parse stack=[frame={level="0",func="...",file="...",line="..."},...]
-        var framePattern = StackFrameRegex();
-        var matches = framePattern.Matches(response);
         var skippedCount = 0;
 
-        foreach (Match match in matches)
+        foreach (var frame in ParseStackFrames(response))
         {
-            var content = match.Groups[1].Value;
-            var level = ExtractMiField(content, "level") ?? "?";
-            var func = ExtractMiField(content, "func") ?? "";
-            var file = ExtractMiField(content, "file") ?? "";
-            var line = ExtractMiField(content, "line") ?? "?";
-
-            // Skip frames with no useful information (no function name and no file)
-            if (string.IsNullOrEmpty(func) && string.IsNullOrEmpty(file))
+            // Frames with nothing to say, and runtime transitions, collapse into a count.
+            if (frame.IsExternal)
             {
                 skippedCount++;
                 continue;
             }
 
-            // Collapse native/framework transition frames
-            if (func is "[Native Frames]")
-            {
-                skippedCount++;
-                continue;
-            }
-
-            // Flush skipped frame counter
             if (skippedCount > 0)
             {
                 sb.AppendLine($"  ... ({skippedCount} framework frame{(skippedCount == 1 ? "" : "s")})");
                 skippedCount = 0;
             }
 
-            var funcDisplay = string.IsNullOrEmpty(func) ? "unknown" : func;
-            var fileDisplay = string.IsNullOrEmpty(file) ? "" : $" at {Path.GetFileName(file.Replace('\\', '/'))}:{line}";
-            sb.AppendLine($"  #{level} {funcDisplay}{fileDisplay}");
+            var fileDisplay = string.IsNullOrEmpty(frame.FilePath)
+                ? ""
+                : $" at {Path.GetFileName(frame.FilePath.Replace('\\', '/'))}:{frame.Line}";
+            sb.AppendLine($"  #{frame.Id} {frame.Name}{fileDisplay}");
         }
 
         if (skippedCount > 0)
@@ -1103,7 +1071,21 @@ internal sealed partial class DebuggerService : IDebugBackend
         var escaped = false;
         for (var i = start; i < text.Length; i++)
         {
-            if (escaped) { sb.Append(text[i]); escaped = false; continue; }
+            if (escaped)
+            {
+                // Translate the escape rather than merely dropping the backslash: a Windows path
+                // read as a control character, or a newline read as the letter n, is a value the
+                // caller cannot tell apart from one the target really holds.
+                sb.Append(text[i] switch
+                {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    var other => other,
+                });
+                escaped = false;
+                continue;
+            }
             if (text[i] == '\\') { escaped = true; continue; }
             if (text[i] == '"') break;
             sb.Append(text[i]);
@@ -1232,5 +1214,13 @@ internal sealed partial class DebuggerService : IDebugBackend
     }
 
     public sealed record BreakpointInfo(int Id, string FilePath, int Line);
-    public sealed record StoppedFrame(string Reason, string Function, string FilePath, int Line, int BreakpointNumber);
+    public sealed record StoppedFrame(
+        string Reason,
+        string Function,
+        string FilePath,
+        int Line,
+        int BreakpointNumber,
+        string? ExceptionName = null,
+        string? ExceptionMessage = null,
+        string? ExceptionStage = null);
 }

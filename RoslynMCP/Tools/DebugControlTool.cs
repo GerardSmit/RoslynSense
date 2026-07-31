@@ -112,7 +112,7 @@ public static class DebugControlTool
             }
 
             // Set temporary breakpoint
-            var (setMessage, bpId) = await session.SetBreakpointAsync(filePath, line, condition, cancellationToken);
+            var (setMessage, bpId) = await session.SetBreakpointAsync(filePath, line, condition, cancellationToken: cancellationToken);
 
             if (bpId is null)
                 return $"Error setting temporary breakpoint: {setMessage}";

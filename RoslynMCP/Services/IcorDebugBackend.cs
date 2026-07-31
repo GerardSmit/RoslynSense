@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using RoslynMCP.Debugger;
+using RoslynMCP.Services.Debugging;
 using DebuggerEngine = RoslynMCP.Debugger.DebugSession;
 using EngineRuntime = RoslynMCP.Debugger.DebugRuntime;
 
@@ -30,6 +31,10 @@ internal sealed class IcorDebugBackend : IDebugBackend
     private DebuggerService.DebugState _state = DebuggerService.DebugState.NotStarted;
     private Task? _pump;
     private int _nextBreakpointId = 1;
+
+    /// <summary>The frame Evaluate and locals read from; the user walks the stack with
+    /// DebugSelectFrame.</summary>
+    private int _selectedFrame;
     private bool _exited;
 
     public DebuggerService.StoppedFrame? CurrentFrame
@@ -101,8 +106,12 @@ internal sealed class IcorDebugBackend : IDebugBackend
     }
 
     public Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
-        string filePath, int line, string? condition = null, CancellationToken cancellationToken = default)
+        string filePath, int line, string? condition = null, string? hitCondition = null,
+        string? logMessage = null, CancellationToken cancellationToken = default)
     {
+        // Emulated a layer up, in PublishingDebugBackend.
+        _ = (hitCondition, logMessage);
+
         if (_state == DebuggerService.DebugState.NotStarted)
             return Task.FromResult<(string, int?)>(("Error: No debug session is active.", null));
 
@@ -207,7 +216,7 @@ internal sealed class IcorDebugBackend : IDebugBackend
     public Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default) =>
         RequireStopped(async () =>
         {
-            var (ok, value, error) = await Engine.EvaluateAsync(0, expression);
+            var (ok, value, error) = await Engine.EvaluateAsync((uint)_selectedFrame, expression);
             return ok
                 ? $"`{expression}` = {value}"
                 // The engine resolves argument/local paths and fields, but not computed
@@ -218,7 +227,7 @@ internal sealed class IcorDebugBackend : IDebugBackend
     public Task<string> GetLocalsAsync(CancellationToken cancellationToken = default) =>
         RequireStopped(async () =>
         {
-            var variables = await Engine.VariablesAsync(0);
+            var variables = await Engine.VariablesAsync((uint)_selectedFrame);
             if (variables.Count == 0)
                 return "No locals in scope.";
 
@@ -247,6 +256,148 @@ internal sealed class IcorDebugBackend : IDebugBackend
             }
             return sb.ToString();
         });
+
+    // --- Structured views ---
+
+    public async Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null)
+            return [];
+
+        try
+        {
+            var frames = await Engine.StackTraceAsync();
+            return frames
+                .Select(f => new StackFrameInfo(
+                    (int)f.Index,
+                    string.IsNullOrEmpty(f.Method) ? "unknown" : f.Method,
+                    f.FilePath,
+                    (int)f.Line,
+                    (int)f.Column,
+                    IsExternal: string.IsNullOrEmpty(f.FilePath)))
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    public async Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(
+        int frameId, CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null)
+            return [];
+
+        try
+        {
+            var variables = await Engine.VariablesAsync((uint)Math.Max(0, frameId));
+            return variables
+                .Select(v => new VariableInfo(
+                    v.Name,
+                    v.Value,
+                    Type: "",
+                    // ICorDebug reaches members by dotted path rather than by handle, so there is
+                    // nothing to expand into until the engine grows a child enumerator.
+                    VariablesReference: 0,
+                    NamedChildCount: 0,
+                    IndexedChildCount: 0,
+                    Evaluable: v.Settable))
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    /// <summary>Always empty: the ICorDebug engine resolves member paths but does not enumerate
+    /// an object's children. Expand by evaluating <c>parent.member</c> instead.</summary>
+    public Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
+        int variablesReference, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<VariableInfo>>([]);
+
+    public async Task<string> SelectFrameAsync(int frameId, CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null)
+            return "Error: the target is running. It must be stopped first.";
+        if (frameId < 0)
+            return "Error: frame numbers start at 0 (the innermost frame).";
+
+        var frames = await GetStackFramesAsync(cancellationToken);
+        if (frames.Count > 0 && frameId >= frames.Count)
+            return $"Error: the stack has {frames.Count} frames; #{frameId} does not exist.";
+
+        _selectedFrame = frameId;
+        var frame = frames.FirstOrDefault(f => f.Id == frameId);
+
+        return frame is null
+            ? $"Selected frame #{frameId}."
+            : $"Selected frame #{frameId}: {frame.Name}" +
+              (frame.FilePath.Length == 0 ? "" : $" at {Path.GetFileName(frame.FilePath)}:{frame.Line}");
+    }
+
+    public async Task<(bool Ok, string Value, string Error)> SetVariableAsync(
+        string name, string value, int frameId = 0, CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null)
+            return (false, "", "The target is running. It must be stopped first.");
+
+        try
+        {
+            var (ok, variable, error) = await Engine.SetVariableAsync((uint)Math.Max(0, frameId), name, value);
+            return ok ? (true, variable?.Value ?? value, "") : (false, "", error);
+        }
+        catch (Exception ex)
+        {
+            return (false, "", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// One thread, the stopped one. The engine surface exposes no thread list, and inventing ids
+    /// for threads the tools cannot then select would be worse than reporting only what works.
+    /// </summary>
+    public Task<IReadOnlyList<ThreadInfo>> GetThreadsAsync(CancellationToken cancellationToken = default)
+    {
+        if (_state is DebuggerService.DebugState.NotStarted or DebuggerService.DebugState.Exited)
+            return Task.FromResult<IReadOnlyList<ThreadInfo>>([]);
+
+        string state = CurrentFrame is null ? "running" : "stopped";
+        return Task.FromResult<IReadOnlyList<ThreadInfo>>([new ThreadInfo(1, "Main Thread", state)]);
+    }
+
+    public Task<ExceptionDetail?> GetExceptionInfoAsync(CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame?.ExceptionName is not { Length: > 0 } typeName)
+            return Task.FromResult<ExceptionDetail?>(null);
+
+        return Task.FromResult<ExceptionDetail?>(new ExceptionDetail(
+            typeName, CurrentFrame.ExceptionMessage ?? "", StackTrace: null, BreakMode: "always"));
+    }
+
+    public Task<string> SetExceptionFiltersAsync(
+        ExceptionFilters filters, CancellationToken cancellationToken = default) =>
+        Task.FromResult(
+            "The .NET Framework engine always breaks on unhandled exceptions; the filters cannot " +
+            "be changed.");
+
+    public Task<string> InterruptAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(
+            "The .NET Framework engine cannot suspend a running target. Set a breakpoint instead.");
+
+    /// <summary>Reads the type out of a <c>Type: message</c> event line.</summary>
+    private static string ExceptionTypeOf(string message)
+    {
+        int colon = message.IndexOf(':');
+        if (colon <= 0)
+            return message;
+
+        string candidate = message[..colon].Trim();
+        // A type name, not a sentence that happens to contain a colon.
+        return candidate.Contains(' ') ? message : candidate;
+    }
 
     private async Task<string> RequireStopped(Func<Task<string>> action)
     {
@@ -357,8 +508,16 @@ internal sealed class IcorDebugBackend : IDebugBackend
                                 Function: e.MethodName,
                                 FilePath: e.FilePath,
                                 Line: (int)e.Line,
-                                BreakpointNumber: int.TryParse(e.BreakpointId, out var id) ? id : 0);
+                                BreakpointNumber: int.TryParse(e.BreakpointId, out var id) ? id : 0,
+                                // The engine reports the exception as the event message; a
+                                // "Type: message" prefix is the only type information available.
+                                ExceptionName: e.Kind == DebugEventKind.Exception
+                                    ? ExceptionTypeOf(e.Message)
+                                    : null,
+                                ExceptionMessage: e.Kind == DebugEventKind.Exception ? e.Message : null,
+                                ExceptionStage: e.Kind == DebugEventKind.Exception ? "throw" : null);
                         }
+                        _selectedFrame = 0;
                         _state = DebuggerService.DebugState.Stopped;
                         _stopped.Release();
                         break;

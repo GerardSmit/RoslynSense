@@ -24,7 +24,9 @@ internal static class DebugBridgeHandler
     {
         var response = await DebugCommandPipeServer.SendAsync(
             p.OwnerPid,
-            new DebugPipeRequest(p.Action, p.Expression, p.File, p.Line, p.Condition, p.BreakpointId),
+            new DebugPipeRequest(
+                p.Action, p.Expression, p.File, p.Line, p.Condition, p.BreakpointId,
+                p.HitCondition, p.LogMessage, p.FrameId, p.VariablesReference, p.Value, p.Filters),
             ct);
         return response.Ok
             ? new DebugCommandResult(true, response.Result ?? "")

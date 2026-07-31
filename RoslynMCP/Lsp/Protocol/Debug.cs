@@ -29,7 +29,13 @@ public sealed record DebugCommandParams(
     [property: JsonPropertyName("file")] string? File = null,
     [property: JsonPropertyName("line")] int Line = 0,
     [property: JsonPropertyName("condition")] string? Condition = null,
-    [property: JsonPropertyName("breakpointId")] int BreakpointId = 0);
+    [property: JsonPropertyName("breakpointId")] int BreakpointId = 0,
+    [property: JsonPropertyName("hitCondition")] string? HitCondition = null,
+    [property: JsonPropertyName("logMessage")] string? LogMessage = null,
+    [property: JsonPropertyName("frameId")] int FrameId = 0,
+    [property: JsonPropertyName("variablesReference")] int VariablesReference = 0,
+    [property: JsonPropertyName("value")] string? Value = null,
+    [property: JsonPropertyName("filters")] string[]? Filters = null);
 
 public sealed record DebugCommandResult(
     [property: JsonPropertyName("ok")] bool Ok,

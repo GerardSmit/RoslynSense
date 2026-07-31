@@ -76,7 +76,13 @@ deliberately out of scope here.
 | T2.5 build tasks | Done (task provider + `$msCompile`); build-error DiagnosticCollection ships with T1.2's launch path |
 | T2.7 file rename fixups | Done (`workspace/willRenameFiles` renames the matching type and its references) |
 | TM.3 editor context | Done (`EditorContextStore`, `roslynSense/editorContext`, `get_editor_context`) |
-| T2.6 workspace diagnostics, T2.11, T2.12, Tier 3, TM.2/TM.4/TM.5 | Not started |
+| T2.6 workspace diagnostics | Done (`workspace/diagnostic`, scoped off/openProjects/solution, analyzers cache-only) |
+| T3.1 structured debug data | Done (`StackFrameInfo`/`VariableInfo`/`ThreadInfo`, lazy child expansion, both engines) |
+| T3.2 AI mirror fidelity | Done (real stacks, variable trees, pause, terminate, setVariable, exception filters and info) |
+| T3.3 hit counts and logpoints | Done — emulated in `PublishingDebugBackend`; unavailable in the native session, as netcoredbg advertises neither |
+| T3.4 data breakpoints | Out of scope by decision |
+| TM.5 debugger tools | Done (`debug_pause`, `debug_select_frame`, `debug_expand`, `debug_set_variable`) |
+| T2.11, T2.12, T3.5, TM.2/TM.4 | Not started |
 
 Notes from implementation, kept because they change what the remaining work can assume:
 

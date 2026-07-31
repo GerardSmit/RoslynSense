@@ -5,13 +5,21 @@ namespace RoslynMCP.Services.Debugging;
 
 /// <summary>One editor-issued command against the chat-owned debug session.</summary>
 internal sealed record DebugPipeRequest(
-    string Action,          // continue | step_in | step_over | step_out | evaluate | locals |
-                            // stacktrace | status | stop | set_breakpoint | remove_breakpoint
+    string Action,          // continue | step_in | step_over | step_out | pause | evaluate |
+                            // locals | stacktrace | status | stop | set_breakpoint |
+                            // remove_breakpoint | frames | variables | children | set_variable |
+                            // threads | exception_info | exception_filters | drain_log
     string? Expression = null,
     string? File = null,
     int Line = 0,
     string? Condition = null,
-    int BreakpointId = 0);
+    int BreakpointId = 0,
+    string? HitCondition = null,
+    string? LogMessage = null,
+    int FrameId = 0,
+    int VariablesReference = 0,
+    string? Value = null,
+    string[]? Filters = null);
 
 internal sealed record DebugPipeResponse(bool Ok, string? Result, string? Error);
 
@@ -114,12 +122,30 @@ internal sealed class DebugCommandPipeServer : IDisposable
                 "step_out" => await session.StepOutAsync(ct),
                 "evaluate" when !string.IsNullOrWhiteSpace(request.Expression) =>
                     await session.EvaluateAsync(request.Expression!, ct),
+                "pause" => await session.InterruptAsync(ct),
                 "locals" => await session.GetLocalsAsync(ct),
                 "stacktrace" => await session.GetStackTraceAsync(ct),
                 "status" => session.GetStatus(),
                 "stop" => StopSession(),
                 "set_breakpoint" when request.File is not null =>
-                    (await session.SetBreakpointAsync(request.File, request.Line, request.Condition, ct)).Message,
+                    (await session.SetBreakpointAsync(
+                        request.File, request.Line, request.Condition,
+                        request.HitCondition, request.LogMessage, ct)).Message,
+
+                // Structured actions answer with JSON so the editor's views get real data rather
+                // than a regex reading the markdown surface back apart.
+                "frames" => Json(await session.GetStackFramesAsync(ct)),
+                "variables" => Json(await session.GetVariablesAsync(request.FrameId, ct)),
+                "children" => Json(await session.GetVariableChildrenAsync(request.VariablesReference, ct)),
+                "threads" => Json(await session.GetThreadsAsync(ct)),
+                "exception_info" => Json(await session.GetExceptionInfoAsync(ct)),
+                "set_variable" when request.Expression is not null =>
+                    Json(await session.SetVariableAsync(
+                        request.Expression, request.Value ?? "", request.FrameId, ct)),
+                "exception_filters" => await session.SetExceptionFiltersAsync(
+                    ExceptionFilters.FromIds(request.Filters ?? []), ct),
+                "drain_log" => Json(
+                    (session as PublishingDebugBackend)?.DrainLog() ?? (IReadOnlyList<string>)[]),
                 "remove_breakpoint" when request.BreakpointId > 0 =>
                     await session.RemoveBreakpointAsync(request.BreakpointId, ct),
                 _ => throw new ArgumentException($"Unknown or malformed action '{request.Action}'."),
@@ -131,6 +157,9 @@ internal sealed class DebugCommandPipeServer : IDisposable
             return new DebugPipeResponse(false, null, ex.Message);
         }
     }
+
+    private static string Json<T>(T value) =>
+        System.Text.Json.JsonSerializer.Serialize(value, DebugJson.Options);
 
     private string StopSession()
     {

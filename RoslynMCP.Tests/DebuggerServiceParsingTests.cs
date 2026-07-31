@@ -66,10 +66,8 @@ public class DebuggerServiceParsingTests
     [Fact]
     public void ExtractQuotedString_WithEscapes()
     {
-        // ExtractMiField strips the escape character, so \n becomes n
-        // The full unescape (e.g. \n → newline) is done by UnescapeMiString separately
         var result = DebuggerService.ExtractQuotedString(@"""line1\nline2""");
-        Assert.Equal("line1nline2", result);
+        Assert.Equal("line1\nline2", result);
     }
 
     [Fact]

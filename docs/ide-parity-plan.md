@@ -71,7 +71,7 @@ deliberately out of scope here.
 | T1.2 native F5 (netcoredbg DAP) | Done |
 | T1.3 Test Explorer | Done |
 | T2.8–T2.10 snippets, token modifiers, user-visible messages | Done |
-| T2.1 Solution Explorer | Done — search and reveal endpoints, drag-and-drop, add/delete/rename from the tree; generated-file nodes wait on T2.12 |
+| T2.1 Solution Explorer | Done — search and reveal endpoints, drag-and-drop, add/delete/rename from the tree, generated-file nodes |
 | T2.2 NuGet panel | Done — webview plus `NuGetService` (real NuGet.config sources, search/versions/installed/updates/consolidations, CLI-backed mutations, icon proxy) |
 | T2.5 build tasks | Done (task provider + `$msCompile`); build-error DiagnosticCollection ships with T1.2's launch path |
 | T2.7 file rename fixups | Done (`workspace/willRenameFiles` renames the matching type and its references) |
@@ -84,7 +84,10 @@ deliberately out of scope here.
 | TM.5 debugger tools | Done (`debug_pause`, `debug_select_frame`, `debug_expand`, `debug_set_variable`) |
 | TM.2 project and package mutation | Done (packages via `NuGetService`; references, add/delete file, create project, add to solution via `ProjectMutationService`) |
 | TM.4 structured tests and formatting | Done (`get_test_failures` over a recorded run history, `format_document`, `rename_file`) |
-| T2.11, T2.12, T3.5 | Not started |
+| T2.11 multi-root | Done — solution bound per workspace folder, one client per solution, binding follows the focused editor |
+| T2.12 metadata as source | Done — one `roslynSense/virtualDocument` resolver behind `roslynsense-generated:` and `roslynsense-metadata:`, plus generated-file nodes in the tree |
+| T3.5 .NET Framework debugging | Done — `roslyn-sense --dap` serves DAP over the ICorDebug backend; the extension selects it for Framework targets |
+| T3.6 Hot Reload | Deferred by decision: `dotnet watch`, not EnC against netcoredbg |
 
 Notes from implementation, kept because they change what the remaining work can assume:
 

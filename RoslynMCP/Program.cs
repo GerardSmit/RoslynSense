@@ -29,6 +29,12 @@ class Program
         if (args.Length > 0 && args[0].Equals("--lsp", StringComparison.OrdinalIgnoreCase))
             return await RoslynMCP.Lsp.LspProxy.RunAsync(args[1..]);
 
+        // DAP mode: roslyn-sense --dap
+        // A debug adapter for .NET Framework targets, backed by ICorDebug. netcoredbg speaks DAP
+        // natively but only debugs CoreCLR, so this is what gives the editor F5 on Framework.
+        if (args.Length > 0 && args[0].Equals("--dap", StringComparison.OrdinalIgnoreCase))
+            return await RoslynMCP.Services.Debugging.DapServer.RunAsync(args[1..]);
+
         // Shared-host daemon mode: roslyn-sense --host <solution>
         // Long-lived process that owns the Roslyn workspaces for one solution and serves tool
         // calls forwarded by thin MCP-client processes over a named pipe.

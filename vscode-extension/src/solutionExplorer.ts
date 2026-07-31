@@ -111,6 +111,14 @@ export function registerSolutionExplorer(
                     arguments: [item.resourceUri],
                 };
             }
+            if (node.kind === 'generatedFile' && node.resourceUri) {
+                // Generated output has no file to open; it is fetched from the compilation.
+                item.command = {
+                    command: 'roslynSense.openVirtualDocument',
+                    title: 'Open',
+                    arguments: [node.resourceUri],
+                };
+            }
             if (node.dimmed) {
                 item.description = node.description ?? 'not in project';
             }

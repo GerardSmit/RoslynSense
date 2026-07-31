@@ -11,6 +11,7 @@ import {
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
 import { registerTestController, runTestById } from './testController';
 import { registerSolutionExplorer } from './solutionExplorer';
+import { registerVirtualDocuments } from './virtualDocuments';
 import { registerNuGetPanel } from './nugetPanel';
 import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
@@ -38,6 +39,44 @@ function code2Protocol(uri: vscode.Uri): string {
 
 function protocol2Code(value: string): vscode.Uri {
     return vscode.Uri.parse(value);
+}
+
+/**
+ * One client per bound solution, keyed by solution path (or by workspace folder when the server
+ * resolves the solution itself). A multi-root workspace with two solutions gets two daemons —
+ * which is what already happens on the server side, since the daemon is per solution.
+ */
+const clientsBySolution = new Map<string, LanguageClient>();
+
+/** Which solution each workspace folder is bound to, resolved once per folder. */
+const solutionByFolder = new Map<string, string | undefined>();
+
+/** Finds the solution a file belongs to: the setting for its folder, else the nearest one. */
+async function solutionForFolder(folder: vscode.WorkspaceFolder): Promise<string | undefined> {
+    const key = folder.uri.fsPath;
+    if (solutionByFolder.has(key)) {
+        return solutionByFolder.get(key);
+    }
+
+    // Folder-scoped so each root of a multi-root workspace can name its own solution.
+    const configured = vscode.workspace
+        .getConfiguration('roslynSense', folder.uri)
+        .get<string>('solutionPath', '');
+
+    let resolved: string | undefined = configured || undefined;
+    if (!resolved) {
+        const found = await vscode.workspace.findFiles(
+            new vscode.RelativePattern(folder, '**/*.{sln,slnx}'),
+            '**/{node_modules,bin,obj,artifacts}/**',
+            2
+        );
+        // Exactly one is unambiguous; more than one is the pickSolution case, which only runs
+        // for the folder the user is actually working in.
+        resolved = found.length === 1 ? found[0].fsPath : undefined;
+    }
+
+    solutionByFolder.set(key, resolved);
+    return resolved;
 }
 
 async function pickSolution(): Promise<string | undefined> {
@@ -86,10 +125,13 @@ async function pickSolution(): Promise<string | undefined> {
     return picked.fsPath;
 }
 
-async function startClient(context: vscode.ExtensionContext): Promise<void> {
+async function startClient(
+    context: vscode.ExtensionContext,
+    binding?: { solutionPath?: string; folder?: vscode.WorkspaceFolder }
+): Promise<void> {
     const config = vscode.workspace.getConfiguration('roslynSense');
     const serverPath = config.get<string>('serverPath', 'roslyn-sense');
-    const solutionPath = await pickSolution();
+    const solutionPath = binding ? binding.solutionPath : await pickSolution();
     activeSolutionPath = solutionPath;
 
     const args = ['--lsp'];
@@ -97,7 +139,9 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
         args.push('--solution', solutionPath);
     }
 
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    // The working directory is how the server resolves the solution when none was named, so a
+    // second root has to start its client in its own folder.
+    const cwd = binding?.folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     const serverOptions: ServerOptions = {
         command: serverPath,
@@ -161,6 +205,7 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     };
 
     client = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
+    clientsBySolution.set(bindingKey(solutionPath, binding?.folder), client);
     wireEditorDebugCommandHandler(client);
     client.onDidChangeState((e) => {
         if (!statusItem) {
@@ -209,20 +254,72 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     }
 }
 
+function bindingKey(solutionPath: string | undefined, folder: vscode.WorkspaceFolder | undefined): string {
+    return solutionPath ?? folder?.uri.fsPath ?? '<default>';
+}
+
 async function stopClient(): Promise<void> {
-    if (!client) {
+    const running = [...clientsBySolution.values()];
+    clientsBySolution.clear();
+    solutionByFolder.clear();
+    client = undefined; // clear first: a failed stop must not wedge future restarts
+
+    for (const current of running) {
+        try {
+            if (current.needsStop()) {
+                await current.stop();
+            } else {
+                await current.dispose();
+            }
+        } catch {
+            // Already stopped or never started — nothing to do.
+        }
+    }
+}
+
+/**
+ * Points `client` at the solution owning the focused editor, starting that solution's client the
+ * first time it is needed.
+ *
+ * A multi-root workspace with two solutions has two daemons — the server side is per solution
+ * already — so the only question is which one a command should talk to. The answer is whichever
+ * one owns the file the user is looking at.
+ */
+async function bindActiveEditor(
+    context: vscode.ExtensionContext,
+    document: vscode.TextDocument | undefined
+): Promise<void> {
+    if (document?.uri.scheme !== 'file') {
         return;
     }
-    const current = client;
-    client = undefined; // clear first: a failed stop must not wedge future restarts
-    try {
-        if (current.needsStop()) {
-            await current.stop();
-        } else {
-            await current.dispose();
+    const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+    if (!folder) {
+        return;
+    }
+
+    const solutionPath = await solutionForFolder(folder);
+    const key = bindingKey(solutionPath, folder);
+    const existing = clientsBySolution.get(key);
+
+    if (existing) {
+        if (client !== existing) {
+            client = existing;
+            activeSolutionPath = solutionPath;
+            updateStatusText(solutionPath);
         }
-    } catch {
-        // Already stopped or never started — nothing to do.
+        return;
+    }
+
+    // Only the first root starts eagerly; the rest start when the user opens something in them,
+    // so a workspace with five roots does not spawn five daemons on activation.
+    await startClient(context, { solutionPath, folder });
+}
+
+function updateStatusText(solutionPath: string | undefined): void {
+    if (statusItem) {
+        statusItem.text = solutionPath
+            ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
+            : 'RoslynSense: running';
     }
 }
 
@@ -1798,6 +1895,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerDebugLaunch(context, () => client);
     registerTestController(context, () => client);
     registerSolutionExplorer(context, () => client);
+    registerVirtualDocuments(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
     registerEditorContext(
@@ -1807,6 +1905,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
 
     await startClient(context);
+
+    // Multi-root: follow the focused editor to whichever solution owns it.
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor((editor) =>
+            void bindActiveEditor(context, editor?.document)),
+        vscode.workspace.onDidChangeWorkspaceFolders(() => solutionByFolder.clear())
+    );
 }
 
 export async function deactivate(): Promise<void> {

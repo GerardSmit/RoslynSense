@@ -172,6 +172,11 @@
         "command": "roslynSense.solutionExplorer.delete",
         "title": "Delete",
         "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.runWithHotReload",
+        "title": "Run with Hot Reload",
+        "category": "RoslynSense"
       }
     ],
     "viewsContainers": {

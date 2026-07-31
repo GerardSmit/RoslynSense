@@ -20,6 +20,7 @@ interface TaskDefinition extends vscode.TaskDefinition {
 interface LaunchTarget {
     projectPath: string;
     projectName: string;
+    runnable: boolean;
 }
 
 export function registerTaskProvider(
@@ -55,6 +56,16 @@ export function registerTaskProvider(
                             `clean ${project.projectName}`,
                             ['clean', project.projectPath, '--nologo'])
                     );
+
+                    // Hot reload for the ASP.NET inner loop. Real Edit-and-Continue is not on
+                    // offer: netcoredbg has no EnC support at all, so `dotnet watch` is the
+                    // honest version of this feature.
+                    if (project.runnable) {
+                        tasks.push(makeTask(
+                            { type: TASK_TYPE, task: 'watch', project: project.projectPath },
+                            `watch ${project.projectName}`,
+                            ['watch', '--project', project.projectPath, 'run']));
+                    }
                 }
                 return tasks;
             },
@@ -82,6 +93,38 @@ export function registerTaskProvider(
                     args[definition.task].filter((arg) => arg.length > 0)
                 );
             },
+        }),
+
+        vscode.commands.registerCommand('roslynSense.runWithHotReload', async () => {
+            const client = getClient();
+            if (!client) {
+                return;
+            }
+
+            let projects: LaunchTarget[] = [];
+            try {
+                projects = (await client.sendRequest<LaunchTarget[]>(
+                    'roslynSense/launchTargets', { configuration: null })).filter((p) => p.runnable);
+            } catch {
+                projects = [];
+            }
+            if (projects.length === 0) {
+                void vscode.window.showWarningMessage('No runnable project was found in the solution.');
+                return;
+            }
+
+            const picked = projects.length === 1
+                ? projects[0]
+                : (await vscode.window.showQuickPick(
+                    projects.map((p) => ({ label: p.projectName, description: p.projectPath, project: p })),
+                    { title: 'Run with Hot Reload' }))?.project;
+
+            if (picked) {
+                await vscode.tasks.executeTask(makeTask(
+                    { type: TASK_TYPE, task: 'watch', project: picked.projectPath },
+                    `watch ${picked.projectName}`,
+                    ['watch', '--project', picked.projectPath, 'run']));
+            }
         })
     );
 }

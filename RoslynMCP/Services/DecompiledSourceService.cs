@@ -219,6 +219,35 @@ internal static class DecompiledSourceService
         }
     }
 
+    /// <summary>
+    /// Decompiles one type by name, for callers that already know which assembly to look in —
+    /// the editor opening a <c>roslynsense-metadata:</c> document, rather than a symbol
+    /// navigation that has to work out the assembly first.
+    /// </summary>
+    /// <returns>The source, or <c>null</c> when the assembly or type cannot be read.</returns>
+    public static async Task<string?> TryDecompileTypeAsync(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        string resolved = ReferenceAssemblyRedirector.RedirectToImplementation(
+            assemblyPath, reflectionTypeName);
+
+        try
+        {
+            return await Task.Run(
+                () => DecompileType(resolved, reflectionTypeName, cancellationToken), cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not decompile '{reflectionTypeName}' from '{Path.GetFileName(resolved)}': {ex.Message}",
+                key: $"decompile:{resolved}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
     private static string DecompileType(
         string assemblyPath,
         string reflectionTypeName,

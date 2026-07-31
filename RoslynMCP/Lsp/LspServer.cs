@@ -234,6 +234,13 @@ internal sealed class LspServer : IDisposable
     public Task<SolutionTreeEditResult> SolutionTreeEdit(SolutionTreeEditParams p, CancellationToken ct) =>
         Handlers.SolutionTreeEditHandler.EditAsync(p, ct);
 
+    // ---- Virtual documents (generated and decompiled sources) ----------------------------
+
+    [JsonRpcMethod("roslynSense/virtualDocument", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.VirtualDocumentResult?> VirtualDocument(
+        Handlers.VirtualDocumentParams p, CancellationToken ct) =>
+        Handlers.VirtualDocumentHandler.ResolveAsync(p, ct);
+
     // ---- Packages -----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/nuget/search", UseSingleObjectParameterDeserialization = true)]

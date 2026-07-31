@@ -90,7 +90,17 @@ export function registerDebugLaunch(
 
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
-            async createDebugAdapterDescriptor() {
+            async createDebugAdapterDescriptor(session: vscode.DebugSession) {
+                // .NET Framework needs ICorDebug; netcoredbg only speaks to CoreCLR. The server
+                // ships that adapter itself, in --dap mode.
+                if (session.configuration.isNetFramework === true ||
+                    (await isFrameworkTarget(getClient(), session.configuration.projectPath))) {
+                    return new vscode.DebugAdapterExecutable(
+                        vscode.workspace.getConfiguration('roslynSense')
+                            .get<string>('serverPath', 'roslyn-sense'),
+                        ['--dap']);
+                }
+
                 const configured = vscode.workspace
                     .getConfiguration('roslynSense')
                     .get<string>('debuggerPath');
@@ -235,6 +245,18 @@ export function registerDebugLaunch(
             },
         })
     );
+}
+
+/** Whether a project targets .NET Framework, which decides the adapter. */
+async function isFrameworkTarget(
+    client: LanguageClient | undefined,
+    projectPath: string | undefined
+): Promise<boolean> {
+    if (!client || !projectPath) {
+        return false;
+    }
+    const targets = await fetchTargets(client);
+    return targets.some((t) => samePath(t.projectPath, projectPath) && t.isNetFramework);
 }
 
 async function fetchTargets(

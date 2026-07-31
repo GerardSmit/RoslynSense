@@ -153,6 +153,17 @@ internal static class SolutionTreeHandler
                 ContextValue: SolutionNodeKind.Framework));
         }
 
+        // Generated files hang off Dependencies rather than the project's folders, because they
+        // have no folder — they exist only inside the compilation.
+        var generated = await VirtualDocumentHandler.ListGeneratedAsync(projectPath, ct);
+        if (generated.Length > 0)
+        {
+            groups.Add(new SolutionTreeNode(
+                $"group:{SolutionNodeKind.Generator}|{projectPath}", SolutionNodeKind.Generator,
+                "Source Generators", $"{generated.Length} files", ResourceUri: null,
+                HasChildren: true, ContextValue: SolutionNodeKind.Generator));
+        }
+
         Add(SolutionNodeKind.Packages, "Packages", evaluation.PackageReferences.Count);
         Add(SolutionNodeKind.Projects, "Projects", evaluation.ProjectReferences.Count);
         Add(SolutionNodeKind.Assemblies, "Assemblies", evaluation.AssemblyReferences.Count);
@@ -170,6 +181,20 @@ internal static class SolutionTreeHandler
 
         string kind = parts[0];
         string projectPath = parts[1];
+
+        if (kind == SolutionNodeKind.Generator)
+        {
+            return (await VirtualDocumentHandler.ListGeneratedAsync(projectPath, ct))
+                .Select(file => new SolutionTreeNode(
+                    Id: $"generated:{file.Uri}",
+                    Kind: SolutionNodeKind.GeneratedFile,
+                    Label: file.HintName,
+                    Description: file.Generator,
+                    ResourceUri: file.Uri,
+                    HasChildren: false,
+                    ContextValue: SolutionNodeKind.GeneratedFile))
+                .ToArray();
+        }
 
         var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
         if (evaluation is null)

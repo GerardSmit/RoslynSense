@@ -48,6 +48,29 @@ already-loaded solution (no separate `--list-tests` process) and refreshes when 
 Run, Debug, and Coverage profiles are all available; Debug attaches to a suspended test host so
 breakpoints in the first test are reliable, and Coverage paints the built-in gutters.
 
+## Solution Explorer and packages
+
+The RoslynSense activity-bar view shows the solution's logical structure — solution folders,
+per-project Dependencies (Imports, target frameworks, Packages, Projects, Assemblies,
+Analyzers), and files nested under the file they belong to (`Form1.cs` owns its designer and
+resx). `Ctrl+F` filters the tree, `Ctrl+T` jumps to a node, and Show All Files reveals files
+that are on disk but not in the project, dimmed.
+
+"Manage NuGet Packages" opens a panel with Browse / Installed / Updates / Consolidate. Sources
+come from your `NuGet.config` chain, so private feeds and credential providers work exactly as
+they do on the command line; installs go through `dotnet add package`, which keeps Central
+Package Management correct.
+
+Build, rebuild, clean, test, and watch tasks are contributed per project and use the built-in
+`$msCompile` problem matcher, so they work as `preLaunchTask` and with `Ctrl+Shift+B`.
+
+## Editor context for AI chats
+
+With `roslynSense.shareEditorContext` on (the default), the extension tells connected AI chats
+which file and symbol you are looking at, your selection, and the diagnostics already visible —
+so asking "why does this fail?" resolves to what is on your screen. It sends paths, the cursor,
+the selection, and those diagnostics; never whole file contents. Turn it off in settings.
+
 ## Coexistence with the C# extension / C# Dev Kit
 
 The Microsoft C# extension (`ms-dotnettools.csharp`) runs its own language server. Running

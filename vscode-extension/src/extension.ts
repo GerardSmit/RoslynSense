@@ -13,6 +13,7 @@ import { registerTestController, runTestById } from './testController';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerNuGetPanel } from './nugetPanel';
 import { registerTaskProvider } from './taskProvider';
+import { registerEditorContext } from './editorContext';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -1662,6 +1663,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerSolutionExplorer(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
+    registerEditorContext(
+        context,
+        () => client,
+        () => activeSolutionPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    );
 
     await startClient(context);
 }

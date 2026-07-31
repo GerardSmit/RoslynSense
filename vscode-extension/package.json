@@ -454,6 +454,11 @@
           "default": "",
           "description": "Path to netcoredbg. When empty, the server locates it (PATH, common install locations) and downloads it if needed."
         },
+        "roslynSense.shareEditorContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tell connected AI chats which file and symbol you are looking at, so they can resolve 'this method' or 'this error'. Sends paths, the cursor position, the current selection, and diagnostics already visible in the editor — never whole file contents."
+        },
         "roslynSense.trace.server": {
           "type": "string",
           "enum": ["off", "messages", "verbose"],

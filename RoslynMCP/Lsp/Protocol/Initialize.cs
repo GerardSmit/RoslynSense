@@ -77,7 +77,25 @@ public sealed record ServerCapabilities
     [JsonPropertyName("codeLensProvider")] public CodeLensOptions? CodeLensProvider { get; init; }
     [JsonPropertyName("executeCommandProvider")] public ExecuteCommandOptions? ExecuteCommandProvider { get; init; }
     [JsonPropertyName("inlayHintProvider")] public InlayHintOptions? InlayHintProvider { get; init; }
+    [JsonPropertyName("workspace")] public WorkspaceServerCapabilities? Workspace { get; init; }
 }
+
+public sealed record WorkspaceServerCapabilities(
+    [property: JsonPropertyName("fileOperations")] FileOperationsServerCapabilities FileOperations);
+
+public sealed record FileOperationsServerCapabilities(
+    [property: JsonPropertyName("willRename")] FileOperationRegistration WillRename);
+
+public sealed record FileOperationRegistration(
+    [property: JsonPropertyName("filters")] FileOperationFilter[] Filters);
+
+public sealed record FileOperationFilter(
+    [property: JsonPropertyName("scheme")] string Scheme,
+    [property: JsonPropertyName("pattern")] FileOperationPattern Pattern);
+
+public sealed record FileOperationPattern(
+    [property: JsonPropertyName("glob")] string Glob,
+    [property: JsonPropertyName("matches")] string? Matches = null);
 
 public sealed record TextDocumentSyncOptions(
     [property: JsonPropertyName("openClose")] bool OpenClose,

@@ -138,6 +138,12 @@ internal sealed class LspServer : IDisposable
             CodeLensProvider = new CodeLensOptions(ResolveProvider: true),
             ExecuteCommandProvider = new ExecuteCommandOptions(Handlers.ExecuteCommandHandler.Commands),
             InlayHintProvider = new InlayHintOptions(ResolveProvider: false),
+            // Renaming a .cs file should rename the type inside it. Returning the edit from
+            // willRename puts it in the same undo step as the rename itself.
+            Workspace = new WorkspaceServerCapabilities(
+                new FileOperationsServerCapabilities(
+                    new FileOperationRegistration(
+                        [new FileOperationFilter("file", new FileOperationPattern("**/*.cs", "file"))]))),
         };
 
         string? version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3);
@@ -275,6 +281,14 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/testCoverage", UseSingleObjectParameterDeserialization = true)]
     public FileCoverageInfo[] TestCoverage(TestCoverageParams p) =>
         Handlers.TestHandler.Coverage(p);
+
+    [JsonRpcMethod("roslynSense/editorContext", UseSingleObjectParameterDeserialization = true)]
+    public void EditorContext(Handlers.EditorContextParams p) =>
+        Handlers.EditorContextHandler.Report(p);
+
+    [JsonRpcMethod("workspace/willRenameFiles", UseSingleObjectParameterDeserialization = true)]
+    public Task<WorkspaceEdit?> WillRenameFiles(Handlers.RenameFilesParams p, CancellationToken ct) =>
+        Handlers.FileOperationsHandler.WillRenameAsync(p, ct);
 
     [JsonRpcMethod("workspace/didChangeWatchedFiles", UseSingleObjectParameterDeserialization = true)]
     public void DidChangeWatchedFiles(DidChangeWatchedFilesParams p) =>

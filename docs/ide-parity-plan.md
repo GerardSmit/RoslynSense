@@ -82,7 +82,9 @@ deliberately out of scope here.
 | T3.3 hit counts and logpoints | Done — emulated in `PublishingDebugBackend`; unavailable in the native session, as netcoredbg advertises neither |
 | T3.4 data breakpoints | Out of scope by decision |
 | TM.5 debugger tools | Done (`debug_pause`, `debug_select_frame`, `debug_expand`, `debug_set_variable`) |
-| T2.11, T2.12, T3.5, TM.2/TM.4 | Not started |
+| TM.2 project and package mutation | Done (packages via `NuGetService`; references, add/delete file, create project, add to solution via `ProjectMutationService`) |
+| TM.4 structured tests and formatting | Done (`get_test_failures` over a recorded run history, `format_document`, `rename_file`) |
+| T2.11, T2.12, T3.5 | Not started |
 
 Notes from implementation, kept because they change what the remaining work can assume:
 

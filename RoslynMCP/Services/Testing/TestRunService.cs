@@ -9,7 +9,9 @@ public sealed record TestRunOutcome(
     int ExitCode,
     IReadOnlyList<TestResult> Results,
     string Output,
-    string? Error)
+    string? Error,
+    /// <summary>Identifies this run in <see cref="TestRunStore"/>; empty when nothing ran.</summary>
+    string RunId = "")
 {
     public bool TimedOut => Error is not null && Error.Contains("timed out", StringComparison.OrdinalIgnoreCase);
 }
@@ -80,11 +82,18 @@ public static partial class TestRunService
         var results = TrxParser.Parse(trxPath);
         TryDelete(trxPath);
 
+        // Recorded here rather than in the callers so every surface that runs tests — the MCP
+        // tool, the Test Explorer, a CodeLens click — leaves the same trail to ask about later.
+        string runId = "";
+        if (results.Count > 0 && PathHelper.FindNearestSolution(csprojPath) is { } solution)
+            runId = TestRunStore.Record(solution, csprojPath, results);
+
         return new TestRunOutcome(
             process.ExitCode,
             results,
             stdout.ToString(),
-            results.Count == 0 && process.ExitCode != 0 ? FirstBuildError(stdout.ToString(), stderr.ToString()) : null);
+            results.Count == 0 && process.ExitCode != 0 ? FirstBuildError(stdout.ToString(), stderr.ToString()) : null,
+            runId);
     }
 
     /// <summary>

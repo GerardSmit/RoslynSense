@@ -141,6 +141,7 @@ public static class RunTestsTool
                 try
                 {
                     result = FormatTrxOutput(trxPath, process.ExitCode, fmt);
+                    RecordRun(csprojPath, trxPath);
                 }
                 catch
                 {
@@ -210,7 +211,7 @@ public static class RunTestsTool
         string result;
         if (File.Exists(trxPath))
         {
-            try { result = FormatTrxOutput(trxPath, exitCode, fmt); }
+            try { result = FormatTrxOutput(trxPath, exitCode, fmt); RecordRun(csprojPath, trxPath); }
             catch { result = FormatTestOutput(stdout, stderr, exitCode, fmt); }
             finally { try { File.Delete(trxPath); } catch { } }
         }
@@ -339,6 +340,19 @@ public static class RunTestsTool
             fmt.AppendHints(sb, "Use GetRoslynDiagnostics to check for compilation errors");
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Keeps the run's structured results so get_test_failures can answer about it later —
+    /// this tool's markdown is for reading, not for re-parsing.
+    /// </summary>
+    private static void RecordRun(string csprojPath, string trxPath)
+    {
+        var results = Services.Testing.TrxParser.Parse(trxPath);
+        if (results.Count == 0 || PathHelper.FindNearestSolution(csprojPath) is not { } solution)
+            return;
+
+        Services.Testing.TestRunStore.Record(solution, csprojPath, results);
     }
 
     internal static string FormatTrxOutput(string trxPath, int exitCode, IOutputFormatter fmt)

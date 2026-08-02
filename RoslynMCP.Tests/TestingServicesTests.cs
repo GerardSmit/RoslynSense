@@ -7,6 +7,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>The services behind both the MCP test tools and the editor's Test Explorer:
 /// Roslyn discovery, TRX parsing, and filter construction.</summary>
+[Collection(SharedState.Name)]
 public class TestingServicesTests
 {
     [Fact]

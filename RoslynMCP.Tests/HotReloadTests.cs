@@ -10,6 +10,7 @@ namespace RoslynMCP.Tests;
 /// Edit-and-Continue: the launch preparation that has to happen before a process starts, the
 /// module identity a delta is addressed by, and the wire protocol to the in-process agent.
 /// </summary>
+[Collection(SharedState.Name)]
 public class HotReloadTests
 {
     // === Launch preparation ===
@@ -118,6 +119,11 @@ public class HotReloadTests
             Assert.Equal(new byte[] { 4, 5 }, reader.ReadBytes(reader.ReadInt32()));
             Assert.Equal(new byte[] { 6 }, reader.ReadBytes(reader.ReadInt32()));
 
+            // The updated-type tokens drive the MetadataUpdateHandler pass in the agent; a delta
+            // without them applies the IL but leaves framework caches stale.
+            Assert.Equal(1, reader.ReadInt32());
+            Assert.Equal(7, reader.ReadInt32());
+
             writer.Write(true);
             writer.Write("");
             writer.Flush();
@@ -148,6 +154,8 @@ public class HotReloadTests
             reader.ReadBytes(16);
             for (int block = 0; block < 3; block++)
                 reader.ReadBytes(reader.ReadInt32());
+            for (int tokens = reader.ReadInt32(); tokens > 0; tokens--)
+                reader.ReadInt32();
 
             writer.Write(false);
             writer.Write("the runtime refused the update");
@@ -169,7 +177,7 @@ public class HotReloadTests
         await pipe.ConnectAsync(10_000);
 
         var writer = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
-        writer.Write(1);
+        writer.Write(2); // protocol version, in lockstep with HotReloadAgent.ProtocolVersion
         // This process's own id: the server reaps agents whose process is gone, so a fabricated
         // one would be dropped before the test could use it.
         writer.Write(Environment.ProcessId);

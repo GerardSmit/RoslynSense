@@ -11,6 +11,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>Completion snippets and semantic token modifiers — the two places where the
 /// protocol carried less information than Roslyn actually had.</summary>
+[Collection(SharedState.Name)]
 public class LspPolishTests
 {
     [Fact]

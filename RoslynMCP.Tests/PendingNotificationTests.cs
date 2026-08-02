@@ -6,6 +6,7 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>Per-solution pending message queue + parity with the plugin's node drain hook.</summary>
+[Collection(SharedState.Name)]
 public class PendingNotificationTests
 {
     [Fact]

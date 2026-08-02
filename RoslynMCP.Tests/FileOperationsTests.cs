@@ -7,6 +7,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>workspace/willRenameFiles: renaming a file renames the type it declares, and the
 /// references that go with it.</summary>
+[Collection(SharedState.Name)]
 public class FileOperationsTests : IAsyncLifetime
 {
     private string _typePath = "";

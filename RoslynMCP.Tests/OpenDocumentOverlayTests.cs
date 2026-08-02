@@ -4,6 +4,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public class OpenDocumentOverlayTests
 {
     [Fact]

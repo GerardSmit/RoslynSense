@@ -143,6 +143,30 @@ public class RefactoringTests
         Assert.Contains("class Calculator", remaining);
     }
 
+    [Fact]
+    public async Task ApplyingARefactoringDoesNotPersistUnrelatedOverlayEdits()
+    {
+        // The document handed to a refactoring comes from a snapshot that overlays every open
+        // editor buffer. Applying that snapshot wholesale used to flush the unsaved buffer of
+        // every OTHER open file into the workspace as a side effect of the refactoring.
+        using var workspace = CreateWorkspace(("Calculator.cs", Library), ("Consumer.cs", Caller));
+
+        var consumerId = workspace.CurrentSolution.Projects.Single().Documents
+            .Single(d => d.Name == "Consumer.cs").Id;
+        var overlaid = workspace.CurrentSolution.WithDocumentText(
+            consumerId, SourceText.From("// unsaved buffer content", System.Text.Encoding.UTF8));
+
+        var document = overlaid.Projects.Single().Documents.Single(d => d.Name == "Calculator.cs");
+
+        var result = await RefactoringService.MoveTypeToFileAsync(
+            document, await PositionOfAsync(document, "class Doubler"));
+
+        Assert.True(result.Ok, result.Message);
+        Assert.DoesNotContain("class Doubler", await TextOfAsync(workspace, "Calculator.cs"));
+        // The overlay must not have been applied along with the refactoring.
+        Assert.Contains("class Consumer", await TextOfAsync(workspace, "Consumer.cs"));
+    }
+
     // === helpers ===
 
     private static AdhocWorkspace CreateWorkspace(params (string Name, string Text)[] files)

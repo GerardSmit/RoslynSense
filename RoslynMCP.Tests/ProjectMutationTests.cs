@@ -8,6 +8,7 @@ namespace RoslynMCP.Tests;
 /// Structural edits and the test-run history — the operations the AI otherwise performs by
 /// shelling out, behind the daemon's back.
 /// </summary>
+[Collection(SharedState.Name)]
 public class ProjectMutationTests : IDisposable
 {
     private readonly string _root = Path.Combine(

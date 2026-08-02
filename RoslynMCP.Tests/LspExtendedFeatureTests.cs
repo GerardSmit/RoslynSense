@@ -8,6 +8,7 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>foldingRange, rangeFormatting, call/type hierarchy, semanticTokens handlers.</summary>
+[Collection(SharedState.Name)]
 public class LspExtendedFeatureTests
 {
     [Fact]

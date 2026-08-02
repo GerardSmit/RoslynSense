@@ -9,6 +9,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>signatureHelp, pull-diagnostics resultId versioning, metadata inheritance
 /// target resolution (decompile on demand).</summary>
+[Collection(SharedState.Name)]
 public class LspSignatureAndPullTests
 {
     [Fact]

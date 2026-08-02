@@ -18,6 +18,7 @@ namespace RoslynMCP.Tests;
 /// decides what comes first — CamelHumps matching, the relevance bit word, the typo tier and the
 /// deliberately weak usage statistics.
 /// </summary>
+[Collection(SharedState.Name)]
 public class CompletionRankingTests
 {
     // --- matcher ---

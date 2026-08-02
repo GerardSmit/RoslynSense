@@ -123,6 +123,24 @@ public class CoreClrHotReloadTests : IDisposable
                 "The delta was reported as applied but the process kept returning the old value.");
 
             Assert.False(target.HasExited, "The process restarted; that would not be hot reload.");
+
+            // --- a second edit, against the same session ---
+
+            // The second apply is the regression that bit here: the workspace snapshot never
+            // learns about the first edit, so a diff that forgets it would emit a delta
+            // REVERTING it. The value must move forward to 60, not back to 6.
+            await File.WriteAllTextAsync(sourcePath, BaselineSource.Replace("input * 2", "input * 20"));
+
+            var second = await session!.ApplyAsync();
+            Assert.True(second.Ok,
+                $"{second.Summary}\n" +
+                string.Join("\n", second.Diagnostics.Select(d => $"{d.Severity} {d.Id}: {d.Message}")) +
+                string.Join("\n", second.Errors));
+            Assert.Contains(second.AppliedTo, a => a.Contains(target.Id.ToString()));
+
+            Assert.True(await WaitForLastLineAsync(log, "60"),
+                "The second delta was reported as applied but the process kept the first edit's value.");
+            Assert.False(target.HasExited, "The process restarted on the second apply.");
         }
         finally
         {

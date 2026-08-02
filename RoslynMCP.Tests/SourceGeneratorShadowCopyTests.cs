@@ -25,6 +25,7 @@ namespace RoslynMCP.Tests;
 /// in-process generator output stays pinned to whatever was first loaded.
 /// </para>
 /// </summary>
+[Collection(SharedState.Name)]
 public class SourceGeneratorShadowCopyTests
 {
     [Fact]

@@ -63,6 +63,16 @@ public class HostPathsTests
         Assert.Contains(hash, HostPaths.SpawnMutexName(Solution));
     }
 
+    [Fact]
+    public void SolutionScopedStoresShareTheirKeyWithTheHookScript()
+    {
+        // The hook script derives this key in JavaScript from the solution path alone — it cannot
+        // know an MVID. Salting it with the build (as the daemon names are) breaks the contract:
+        // the stores write under one key and the hook reads under another, and notifications and
+        // editor-debug context silently stop arriving.
+        Assert.Equal(ExpectedHashOf(Solution.ToLowerInvariant()), HostPaths.SolutionHash(Solution));
+    }
+
     private static string ExpectedHashOf(string value)
     {
         byte[] bytes = System.Security.Cryptography.SHA256.HashData(

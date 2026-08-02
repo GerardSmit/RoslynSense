@@ -5,6 +5,7 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>The AI-facing tools that change files: formatting and file rename.</summary>
+[Collection(SharedState.Name)]
 public class McpMutationToolsTests
 {
     [Fact]

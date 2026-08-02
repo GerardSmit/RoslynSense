@@ -5,6 +5,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public sealed class DatabaseToolTests
 {
     private static readonly IOutputFormatter s_fmt = new MarkdownFormatter();

@@ -9,6 +9,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>workspace/diagnostic: the Problems panel without opening every file, scoped so a
 /// large solution is not swept on every request.</summary>
+[Collection(SharedState.Name)]
 public class WorkspaceDiagnosticsTests : IDisposable
 {
     private readonly string _scope = LspFeatureOptions.WorkspaceDiagnosticsScope;

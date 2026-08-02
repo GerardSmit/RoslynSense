@@ -9,6 +9,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>Pull diagnostics, codeLens (test/references/inheritance), onAutoInsert,
 /// executeCommand handlers.</summary>
+[Collection(SharedState.Name)]
 public class LspPullAndLensTests
 {
     [Fact]

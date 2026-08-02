@@ -10,6 +10,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>Analyzer diagnostics on the editor path: the per-document pass, .editorconfig
 /// severity handling, and the version-keyed cache that keeps it off the typing loop.</summary>
+[Collection(SharedState.Name)]
 public class AnalyzerDiagnosticsTests
 {
     [Fact]

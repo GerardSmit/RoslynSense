@@ -5,6 +5,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public class ProjectIndexCacheServiceTests
 {
     private static Compilation CreateMinimalCompilation()

@@ -8,6 +8,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>workspace/didChangeWatchedFiles: external changes must reach the loaded workspace
 /// without a manual reload, and a burst must not reload once per event.</summary>
+[Collection(SharedState.Name)]
 public class WatchedFilesTests
 {
     [Fact]

@@ -7,6 +7,7 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>Debug bridge: state stores, publishing decorator, command pipe, hook context.</summary>
+[Collection(SharedState.Name)]
 public class DebugBridgeTests
 {
     [Fact]

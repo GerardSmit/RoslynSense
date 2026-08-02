@@ -6,6 +6,7 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>Lazy resolve endpoints: codeAction/resolve and completionItem/resolve.</summary>
+[Collection(SharedState.Name)]
 public class LspResolveTests
 {
     [Fact]

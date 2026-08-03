@@ -136,6 +136,26 @@ export function registerTestController(
     activeController = controller;
     activeGetClient = getClient;
 
+    // Discovery is driven by the client becoming available, not only by the view being opened.
+    // resolveHandler runs once when the Testing view first appears, which on a cold start is
+    // before the server has connected — it returned empty and was never asked again, so the
+    // panel sat on "No tests have been found in this workspace yet" forever.
+    onClientReady(context, getClient, (client) => {
+        void discoverProjects(client, controller, projectItems).catch(() => undefined);
+    });
+
+    // The refresh button in the Testing view, which previously did nothing.
+    controller.refreshHandler = async () => {
+        const client = getClient();
+        if (!client) {
+            return;
+        }
+        await discoverProjects(client, controller, projectItems);
+        for (const [projectPath, item] of projectItems) {
+            await discoverTests(client, controller, item, projectPath, testData).catch(() => undefined);
+        }
+    };
+
     controller.resolveHandler = async (item) => {
         const client = getClient();
         if (!client) {
@@ -426,30 +446,47 @@ function trackRun(
     return { reported, dispose: () => liveRuns.delete(runId) };
 }
 
+/**
+ * Calls back once for each language client that appears — at startup, after a restart, and on
+ * a multi-root binding change.
+ *
+ * The client is created asynchronously and replaced on restart, so anything that needs one has
+ * to wait for it rather than read it once. Polling because the client object itself does not
+ * exist yet to subscribe to.
+ */
+function onClientReady(
+    context: vscode.ExtensionContext,
+    getClient: () => LanguageClient | undefined,
+    callback: (client: LanguageClient) => void
+): void {
+    let seen: LanguageClient | undefined;
+
+    const check = () => {
+        const client = getClient();
+        if (!client || client === seen) {
+            return;
+        }
+        seen = client;
+        callback(client);
+    };
+
+    check();
+    const timer = setInterval(check, 2000);
+    context.subscriptions.push({ dispose: () => clearInterval(timer) });
+}
+
 /** Wires the server's run events into whichever run they belong to. */
 function registerRunEvents(
     context: vscode.ExtensionContext,
     getClient: () => LanguageClient | undefined
 ): void {
-    let subscribed: LanguageClient | undefined;
-
-    const subscribe = () => {
-        const client = getClient();
-        if (!client || client === subscribed) {
-            return;
-        }
-        subscribed = client;
+    onClientReady(context, getClient, (client) => {
         context.subscriptions.push(
             client.onNotification('roslynSense/testRunEvent', (event: TestRunEvent) => {
                 liveRuns.get(event.runId)?.(event);
             })
         );
-    };
-
-    subscribe();
-    // The client is replaced on restart and on a multi-root binding change.
-    const timer = setInterval(subscribe, 2000);
-    context.subscriptions.push({ dispose: () => clearInterval(timer) });
+    });
 }
 
 /**

@@ -42,6 +42,8 @@ internal static class SolutionTreeHandler
                     await ProjectChildrenAsync(id["project:".Length..], p, ct),
                 var id when id.StartsWith("slnfolder:", StringComparison.Ordinal) =>
                     SolutionFolderChildren(solutionPath, id["slnfolder:".Length..]),
+                var id when id.StartsWith("solution:", StringComparison.Ordinal) =>
+                    SolutionChildren(id["solution:".Length..]),
                 _ => [],
             };
         }
@@ -60,11 +62,38 @@ internal static class SolutionTreeHandler
         return Filter(nodes, p.Filter);
     }
 
+    /// <summary>
+    /// The solution itself, as one node with everything beneath it.
+    /// </summary>
+    /// <remarks>
+    /// Visual Studio and Rider both root the tree at the solution rather than at its top-level
+    /// contents, and it is not only cosmetic: without a node for the solution there is nothing
+    /// to right-click to act on it, so adding a solution folder or opening the <c>.sln</c> had
+    /// no home in the tree.
+    /// </remarks>
     private static SolutionTreeNode[] Roots(string? solutionPath)
     {
         if (solutionPath is null)
             return [];
 
+        var all = SolutionFileService.Read(solutionPath);
+        int projects = all.Count(n => !n.IsFolder);
+
+        return
+        [
+            new SolutionTreeNode(
+                Id: $"solution:{solutionPath}",
+                Kind: SolutionNodeKind.Solution,
+                Label: Path.GetFileNameWithoutExtension(solutionPath),
+                Description: projects == 1 ? "1 project" : $"{projects} projects",
+                ResourceUri: LspConverters.PathToUri(solutionPath),
+                HasChildren: all.Count > 0,
+                ContextValue: SolutionNodeKind.Solution),
+        ];
+    }
+
+    private static SolutionTreeNode[] SolutionChildren(string solutionPath)
+    {
         var all = SolutionFileService.Read(solutionPath);
         var roots = all.Where(n => n.ParentId is null).ToList();
 
@@ -118,7 +147,12 @@ internal static class SolutionTreeHandler
             Description: null,
             ResourceUri: node.Path is null ? null : LspConverters.PathToUri(node.Path),
             HasChildren: true,
-            ContextValue: SolutionNodeKind.Project);
+            // The context value carries runnability so the row's Run and Debug actions are
+            // shown only where they would do something. Classification is a file scan with an
+            // mtime cache, which keeps the root listing free of MSBuild evaluation.
+            ContextValue: node.Path is { Length: > 0 } path && ProjectClassifier.Classify(path).IsRunnable
+                ? SolutionNodeKind.RunnableProject
+                : SolutionNodeKind.Project);
     }
 
     /// <summary>Projects anywhere beneath a solution folder — the count Rider shows next to it.</summary>

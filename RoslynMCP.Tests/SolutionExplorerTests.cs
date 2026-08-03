@@ -1,3 +1,4 @@
+using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
@@ -214,6 +215,64 @@ public class SolutionExplorerTests
         {
             Directory.Delete(dir, recursive: true);
         }
+    }
+
+    [Fact]
+    public void ASolutionFolderCanBeAddedToBothFormats()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), $"addfolder-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        string sln = Path.Combine(dir, "App.sln");
+        File.WriteAllText(sln, """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Services", "Services", "{11111111-1111-1111-1111-111111111111}"
+            EndProject
+            Global
+            EndGlobal
+            """);
+
+        string slnx = Path.Combine(dir, "App.slnx");
+        File.WriteAllText(slnx, """
+            <Solution>
+              <Folder Name="/Services/" />
+            </Solution>
+            """);
+
+        try
+        {
+            // Root level in .sln.
+            Assert.True(Add(sln, "Benchmark", parent: null).Ok);
+            var slnNodes = SolutionFileService.Read(sln);
+            var benchmark = slnNodes.Single(n => n.Name == "Benchmark");
+            Assert.True(benchmark.IsFolder);
+            Assert.Null(benchmark.ParentId);
+
+            // Nested in .sln, which also needs the NestedProjects section creating.
+            Assert.True(Add(sln, "Inner", parent: "{11111111-1111-1111-1111-111111111111}").Ok);
+            var nested = SolutionFileService.Read(sln).Single(n => n.Name == "Inner");
+            Assert.Equal("{11111111-1111-1111-1111-111111111111}", nested.ParentId);
+
+            // Root level and nested in .slnx.
+            Assert.True(Add(slnx, "Benchmark", parent: null).Ok);
+            Assert.True(Add(slnx, "Inner", parent: "/Services").Ok);
+            var slnxNodes = SolutionFileService.Read(slnx);
+            Assert.Null(slnxNodes.Single(n => n.Name == "Benchmark").ParentId);
+            Assert.Equal("/Services", slnxNodes.Single(n => n.Name == "Inner").ParentId);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+
+        static SolutionTreeEditResult Add(string solution, string name, string? parent) =>
+            SolutionTreeEditHandler.EditAsync(
+                new SolutionTreeEditParams(
+                    Action: "addSolutionFolder",
+                    TargetUri: LspConverters.PathToUri(solution),
+                    ProjectPath: parent,
+                    Name: name),
+                default).GetAwaiter().GetResult();
     }
 
     [Fact]

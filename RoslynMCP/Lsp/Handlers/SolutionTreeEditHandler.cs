@@ -27,6 +27,7 @@ internal static class SolutionTreeEditHandler
                 "rename" => await RenameAsync(p, ct),
                 "move" => await MoveAsync(p, ct),
                 "copy" => await CopyAsync(p, ct),
+                "addSolutionFolder" => AddSolutionFolder(p),
                 _ => new SolutionTreeEditResult(false, $"Unknown action '{p.Action}'."),
             };
         }
@@ -127,6 +128,120 @@ internal static class SolutionTreeEditHandler
             return new SolutionTreeEditResult(false, "Could not tell where to move it.");
 
         return await MoveOrRenameAsync(source, Path.Combine(directory, Path.GetFileName(source)), ct);
+    }
+
+    /// <summary>
+    /// Adds a solution folder — a grouping that exists in the solution file and not on disk.
+    /// </summary>
+    /// <remarks>
+    /// The two formats express it differently enough to be worth writing out: <c>.sln</c> needs
+    /// a <c>Project(...)</c> block under the solution-folder type GUID, and a nested one also
+    /// needs an entry in <c>NestedProjects</c>; <c>.slnx</c> needs one element. Neither is a
+    /// directory, which is why this is a separate action from "new folder" rather than the same
+    /// one pointed at the solution.
+    /// </remarks>
+    private static SolutionTreeEditResult AddSolutionFolder(SolutionTreeEditParams p)
+    {
+        if (p.Name is not { Length: > 0 } name)
+            return new SolutionTreeEditResult(false, "A folder name is required.");
+        if (p.TargetUri is null || LspConverters.UriToPath(p.TargetUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to add to.");
+        if (!File.Exists(solutionPath))
+            return new SolutionTreeEditResult(false, "The solution file no longer exists.");
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            return new SolutionTreeEditResult(false, $"'{name}' is not a valid folder name.");
+
+        try
+        {
+            if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+                AddSlnxFolder(solutionPath, name, p.ProjectPath);
+            else
+                AddSlnFolder(solutionPath, name, p.ProjectPath);
+        }
+        catch (Exception ex)
+        {
+            return new SolutionTreeEditResult(false, $"Could not add the folder: {ex.Message}");
+        }
+
+        return new SolutionTreeEditResult(true, $"Added solution folder {name}.");
+    }
+
+    private static void AddSlnxFolder(string solutionPath, string name, string? parentFolderId)
+    {
+        var document = System.Xml.Linq.XDocument.Load(solutionPath);
+        var root = document.Root
+            ?? throw new InvalidOperationException("The solution file has no root element.");
+
+        // parentFolderId is the "/Outer/Inner" id the tree hands back, which is also how the
+        // format spells nesting — so a nested folder is one element under the matching parent.
+        var parent = root;
+        if (parentFolderId is { Length: > 0 })
+        {
+            foreach (string segment in parentFolderId.Split('/', StringSplitOptions.RemoveEmptyEntries))
+            {
+                parent = parent.Elements()
+                    .FirstOrDefault(e =>
+                        e.Name.LocalName.Equals("Folder", StringComparison.OrdinalIgnoreCase)
+                        && (e.Attribute("Name")?.Value ?? "").Trim('/', '\\')
+                            .Equals(segment, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException($"Could not find the folder '{segment}'.");
+            }
+        }
+
+        parent.Add(new System.Xml.Linq.XElement("Folder",
+            new System.Xml.Linq.XAttribute("Name", $"/{name}/")));
+        document.Save(solutionPath);
+    }
+
+    /// <summary>The project type GUID every solution folder carries.</summary>
+    private const string SolutionFolderTypeGuid = "{2150E333-8FDC-42A3-9474-1A3956D46DE8}";
+
+    private static void AddSlnFolder(string solutionPath, string name, string? parentFolderGuid)
+    {
+        var lines = File.ReadAllLines(solutionPath).ToList();
+        string guid = $"{{{Guid.NewGuid().ToString().ToUpperInvariant()}}}";
+
+        int insertAt = lines.FindLastIndex(l =>
+            l.StartsWith("EndProject", StringComparison.Ordinal));
+        insertAt = insertAt >= 0
+            ? insertAt + 1
+            : Math.Max(0, lines.FindIndex(l => l.StartsWith("Global", StringComparison.Ordinal)));
+
+        lines.Insert(insertAt,
+            $"Project(\"{SolutionFolderTypeGuid}\") = \"{name}\", \"{name}\", \"{guid}\"");
+        lines.Insert(insertAt + 1, "EndProject");
+
+        if (parentFolderGuid is { Length: > 0 })
+            NestUnder(lines, guid, parentFolderGuid);
+
+        File.WriteAllLines(solutionPath, lines);
+    }
+
+    /// <summary>
+    /// Records the parent link in <c>NestedProjects</c>, creating the section when the solution
+    /// has never had a nested item before.
+    /// </summary>
+    private static void NestUnder(List<string> lines, string childGuid, string parentGuid)
+    {
+        int section = lines.FindIndex(l =>
+            l.Trim().StartsWith("GlobalSection(NestedProjects)", StringComparison.Ordinal));
+
+        if (section >= 0)
+        {
+            lines.Insert(section + 1, $"\t\t{childGuid} = {parentGuid}");
+            return;
+        }
+
+        int endGlobal = lines.FindLastIndex(l => l.StartsWith("EndGlobal", StringComparison.Ordinal));
+        if (endGlobal < 0)
+            return;
+
+        lines.InsertRange(endGlobal,
+        [
+            "\tGlobalSection(NestedProjects) = preSolution",
+            $"\t\t{childGuid} = {parentGuid}",
+            "\tEndGlobalSection",
+        ]);
     }
 
     /// <summary>

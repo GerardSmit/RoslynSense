@@ -10,6 +10,13 @@ public static class SolutionNodeKind
     public const string SolutionFolder = "solutionFolder";
     public const string SolutionItem = "solutionItem";
     public const string Project = "project";
+
+    /// <summary>
+    /// A project that can actually be started — a console app, a desktop app, or a web app.
+    /// Only the context value differs from <see cref="Project"/>; the node kind stays
+    /// <c>project</c> so icons and the rest of the menu are unaffected.
+    /// </summary>
+    public const string RunnableProject = "projectRunnable";
     public const string Dependencies = "dependencies";
     public const string Imports = "imports";
     public const string Import = "import";

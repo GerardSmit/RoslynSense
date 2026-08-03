@@ -69,6 +69,16 @@ export function registerSolutionExplorer(
     const changeEmitter = new vscode.EventEmitter<SolutionTreeNode | undefined>();
     const nodesById = new Map<string, SolutionTreeNode>();
 
+    /** The solution the tree is showing, learned from its root node. */
+    const solutionUriOf = (): string | undefined => {
+        for (const id of nodesById.keys()) {
+            if (id.startsWith('solution:')) {
+                return vscode.Uri.file(id.slice('solution:'.length)).toString();
+            }
+        }
+        return undefined;
+    };
+
     async function fetchChildren(nodeId: string | null): Promise<SolutionTreeNode[]> {
         const client = getClient();
         if (!client) {
@@ -309,50 +319,9 @@ export function registerSolutionExplorer(
             setToggle('fileNesting', !state.fileNesting)
         ),
 
-        vscode.commands.registerCommand('roslynSense.solutionExplorer.search', async () => {
-            const query = await vscode.window.showInputBox({
-                title: 'Filter the solution',
-                prompt: 'Show only matching nodes',
-                value: filter,
-            });
-            filter = query?.trim() ? query.trim() : undefined;
-            view.message = filter ? `Filtering by “${filter}”` : undefined;
-            refresh();
-        }),
-        vscode.commands.registerCommand('roslynSense.solutionExplorer.clearSearch', () => {
-            filter = undefined;
-            view.message = undefined;
-            refresh();
-        }),
-
-        vscode.commands.registerCommand('roslynSense.solutionExplorer.goToNode', async () => {
-            const client = getClient();
-            if (!client) {
-                return;
-            }
-            const query = await vscode.window.showInputBox({
-                title: 'Go to node',
-                prompt: 'Project, folder, file, or package name',
-            });
-            if (!query) {
-                return;
-            }
-            const matches = await client.sendRequest<SolutionTreeNode[]>(
-                'roslynSense/solutionTreeSearch',
-                { query, limit: 50 }
-            );
-            const picked = await vscode.window.showQuickPick(
-                matches.map((node) => ({
-                    label: node.label,
-                    description: node.description ?? node.kind,
-                    node,
-                })),
-                { title: `${matches.length} match(es)` }
-            );
-            if (picked) {
-                await view.reveal(picked.node, { select: true, focus: true, expand: true });
-            }
-        }),
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.goToNode', () =>
+            searchSolution(getClient, view)
+        ),
 
         vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.revealInExplorer',
@@ -419,6 +388,38 @@ export function registerSolutionExplorer(
                 if (result?.ok && result.uri) {
                     await vscode.window.showTextDocument(vscode.Uri.parse(result.uri));
                 }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.newSolutionFolder',
+            async (node: SolutionTreeNode) => {
+                const name = await vscode.window.showInputBox({
+                    title: 'New solution folder',
+                    prompt: 'A grouping inside the solution file — not a directory on disk',
+                });
+                if (!name) {
+                    return;
+                }
+
+                // Both ids carry what the server needs: the solution path for a root-level
+                // folder, and the parent folder's own id when nesting one inside another.
+                const solutionUri = node.id.startsWith('solution:')
+                    ? vscode.Uri.file(node.id.slice('solution:'.length)).toString()
+                    : solutionUriOf();
+                const parentId = node.id.startsWith('slnfolder:')
+                    ? node.id.slice('slnfolder:'.length)
+                    : undefined;
+
+                if (!solutionUri) {
+                    return;
+                }
+                await edit({
+                    action: 'addSolutionFolder',
+                    targetUri: solutionUri,
+                    projectPath: parentId,
+                    name,
+                });
+                refresh();
             }
         ),
         vscode.commands.registerCommand(
@@ -611,6 +612,84 @@ export function registerSolutionExplorer(
             }
         })
     );
+}
+
+/**
+ * Searches the whole solution, showing matches as they are typed.
+ *
+ * Results come from the server, so this reaches every project, folder, file, package and
+ * generator in the solution rather than only the rows the tree has loaded. Typing inside the
+ * tree itself filters what is on screen — that is VS Code's own find widget, and the two answer
+ * different questions.
+ */
+async function searchSolution(
+    getClient: () => LanguageClient | undefined,
+    view: vscode.TreeView<SolutionTreeNode>
+): Promise<void> {
+    const client = getClient();
+    if (!client) {
+        return;
+    }
+
+    const picker = vscode.window.createQuickPick<vscode.QuickPickItem & { node: SolutionTreeNode }>();
+    picker.title = 'Search the solution';
+    picker.placeholder = 'Project, folder, file, package or generator';
+    // Results are already ranked by the server; letting the picker re-sort by its own fuzzy
+    // score would undo that.
+    picker.matchOnDescription = false;
+
+    let pending: NodeJS.Timeout | undefined;
+    let sequence = 0;
+
+    const search = (query: string) => {
+        clearTimeout(pending);
+        if (!query.trim()) {
+            picker.items = [];
+            picker.busy = false;
+            return;
+        }
+
+        picker.busy = true;
+        pending = setTimeout(async () => {
+            const mine = ++sequence;
+            try {
+                const matches = await client.sendRequest<SolutionTreeNode[]>(
+                    'roslynSense/solutionTreeSearch',
+                    { query: query.trim(), limit: 50 }
+                );
+                // A slower earlier request must not overwrite a newer one's results.
+                if (mine !== sequence) {
+                    return;
+                }
+                picker.items = matches.map((node) => ({
+                    label: node.label,
+                    description: node.description ?? node.kind,
+                    node,
+                }));
+            } catch {
+                picker.items = [];
+            } finally {
+                if (mine === sequence) {
+                    picker.busy = false;
+                }
+            }
+        }, 120);
+    };
+
+    picker.onDidChangeValue(search);
+    picker.onDidAccept(async () => {
+        const picked = picker.selectedItems[0];
+        picker.hide();
+        if (picked) {
+            await view.reveal(picked.node, { select: true, focus: true, expand: true });
+        }
+    });
+    picker.onDidHide(() => {
+        clearTimeout(pending);
+        picker.dispose();
+    });
+
+    picker.show();
 }
 
 /** The files behind a click, honouring a multi-selection when there is one. */

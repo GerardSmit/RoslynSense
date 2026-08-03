@@ -116,7 +116,8 @@ internal static class SolutionTreeSearchHandler
         if (owner?.Path is null)
             return Task.FromResult(new SolutionTreeRevealResult([]));
 
-        var chain = new List<string>();
+        // The tree is rooted at the solution, so every chain starts there.
+        var chain = new List<string> { $"solution:{solutionPath}" };
 
         // Solution folders above the project, outermost first.
         var ancestors = new List<string>();

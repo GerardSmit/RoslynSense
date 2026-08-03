@@ -1,7 +1,7 @@
 {
   "name": "roslyn-sense",
   "displayName": "RoslynSense",
-  "description": "C# language server backed by the RoslynSense shared daemon — the same loaded solution your MCP-connected AI assistant uses.",
+  "description": "C# language server backed by the RoslynSense shared daemon \u2014 the same loaded solution your MCP-connected AI assistant uses.",
   "version": "0.2.0",
   "publisher": "roslyn-sense",
   "license": "MIT",
@@ -103,21 +103,10 @@
         "icon": "$(target)"
       },
       {
-        "command": "roslynSense.solutionExplorer.search",
-        "title": "Filter Solution",
+        "command": "roslynSense.solutionExplorer.goToNode",
+        "title": "Search Solution",
         "category": "RoslynSense",
         "icon": "$(search)"
-      },
-      {
-        "command": "roslynSense.solutionExplorer.clearSearch",
-        "title": "Clear Filter",
-        "category": "RoslynSense",
-        "icon": "$(clear-all)"
-      },
-      {
-        "command": "roslynSense.solutionExplorer.goToNode",
-        "title": "Go to Node in Solution",
-        "category": "RoslynSense"
       },
       {
         "command": "roslynSense.solutionExplorer.revealInExplorer",
@@ -148,24 +137,24 @@
       },
       {
         "command": "roslynSense.manageNuGetForProject",
-        "title": "Manage NuGet Packages…",
+        "title": "Manage NuGet Packages\u2026",
         "category": "RoslynSense"
       },
       {
         "command": "roslynSense.solutionExplorer.newFile",
-        "title": "New File…",
+        "title": "New File\u2026",
         "category": "RoslynSense",
         "icon": "$(new-file)"
       },
       {
         "command": "roslynSense.solutionExplorer.newFolder",
-        "title": "New Folder…",
+        "title": "New Folder\u2026",
         "category": "RoslynSense",
         "icon": "$(new-folder)"
       },
       {
         "command": "roslynSense.solutionExplorer.rename",
-        "title": "Rename…",
+        "title": "Rename\u2026",
         "category": "RoslynSense"
       },
       {
@@ -210,7 +199,7 @@
       },
       {
         "command": "roslynSense.solutionExplorer.newItem",
-        "title": "New…",
+        "title": "New\u2026",
         "category": "RoslynSense"
       },
       {
@@ -240,6 +229,12 @@
         "title": "Debug Project",
         "category": "RoslynSense",
         "icon": "$(debug-alt)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newSolutionFolder",
+        "title": "New Solution Folder",
+        "category": "RoslynSense",
+        "icon": "$(new-folder)"
       }
     ],
     "viewsContainers": {
@@ -459,6 +454,10 @@
         {
           "command": "roslynSense.solutionExplorer.debugProject",
           "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newSolutionFolder",
+          "when": "false"
         }
       ],
       "editor/context": [
@@ -469,11 +468,6 @@
         }
       ],
       "view/title": [
-        {
-          "command": "roslynSense.solutionExplorer.search",
-          "when": "view == roslynSense.solutionExplorer",
-          "group": "navigation@1"
-        },
         {
           "command": "roslynSense.solutionExplorer.showAllFiles",
           "when": "view == roslynSense.solutionExplorer && !roslynSense.showAllFiles",
@@ -508,42 +502,47 @@
           "command": "roslynSense.solutionExplorer.toggleFileNesting",
           "when": "view == roslynSense.solutionExplorer",
           "group": "navigation@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToNode",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
         {
           "command": "roslynSense.solutionExplorer.buildProject",
-          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
           "group": "inline@3"
         },
         {
           "command": "roslynSense.solutionExplorer.openProjectFile",
-          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
           "group": "1_edit"
         },
         {
           "command": "roslynSense.solutionExplorer.findInFolder",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(folder|project|solutionFolder)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(folder|project|projectRunnable|solutionFolder)$/",
           "group": "2_search"
         },
         {
           "command": "roslynSense.solutionExplorer.revealInExplorer",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder|project)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder|project|projectRunnable)$/",
           "group": "3_os"
         },
         {
           "command": "roslynSense.manageNuGetForProject",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|dependencies|packages)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|dependencies|packages)$/",
           "group": "1_edit"
         },
         {
           "command": "roslynSense.solutionExplorer.newFile",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
           "group": "2_modify@1"
         },
         {
           "command": "roslynSense.solutionExplorer.newFolder",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
           "group": "2_modify@2"
         },
         {
@@ -558,7 +557,7 @@
         },
         {
           "command": "roslynSense.solutionExplorer.newItem",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
           "group": "2_modify@0"
         },
         {
@@ -573,7 +572,7 @@
         },
         {
           "command": "roslynSense.solutionExplorer.paste",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder|file)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder|file)$/",
           "group": "4_clipboard@3"
         },
         {
@@ -583,7 +582,7 @@
         },
         {
           "command": "roslynSense.solutionExplorer.startupAndDebug",
-          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
           "group": "1_edit@2"
         },
         {
@@ -593,13 +592,18 @@
         },
         {
           "command": "roslynSense.solutionExplorer.runProject",
-          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
           "group": "inline@1"
         },
         {
           "command": "roslynSense.solutionExplorer.debugProject",
-          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
           "group": "inline@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newSolutionFolder",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder)$/",
+          "group": "2_modify@0"
         }
       ]
     },
@@ -667,7 +671,9 @@
     "configurationDefaults": {
       "[csharp]": {
         "editor.formatOnType": true
-      }
+      },
+      "workbench.list.defaultFindMode": "filter",
+      "workbench.list.typeNavigationMode": "automatic"
     },
     "configuration": {
       "title": "RoslynSense",
@@ -690,7 +696,7 @@
         "roslynSense.shareEditorContext": {
           "type": "boolean",
           "default": true,
-          "description": "Tell connected AI chats which file and symbol you are looking at, so they can resolve 'this method' or 'this error'. Sends paths, the cursor position, the current selection, and diagnostics already visible in the editor — never whole file contents."
+          "description": "Tell connected AI chats which file and symbol you are looking at, so they can resolve 'this method' or 'this error'. Sends paths, the cursor position, the current selection, and diagnostics already visible in the editor \u2014 never whole file contents."
         },
         "roslynSense.trace.server": {
           "type": "string",
@@ -722,7 +728,7 @@
           "default": 15,
           "minimum": 1,
           "maximum": 300,
-          "description": "How long one document’s analyzer pass may take before reporting what it has. A slow analyzer delays squiggles, never typing."
+          "description": "How long one document\u2019s analyzer pass may take before reporting what it has. A slow analyzer delays squiggles, never typing."
         },
         "roslynSense.workspaceDiagnostics": {
           "type": "string",
@@ -755,7 +761,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` — for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
+          "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` \u2014 for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
         }
       }
     }

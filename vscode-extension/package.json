@@ -228,6 +228,18 @@
         "title": "Toggle File Nesting",
         "category": "RoslynSense",
         "icon": "$(list-tree)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.runProject",
+        "title": "Run Project",
+        "category": "RoslynSense",
+        "icon": "$(play)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.debugProject",
+        "title": "Debug Project",
+        "category": "RoslynSense",
+        "icon": "$(debug-alt)"
       }
     ],
     "viewsContainers": {
@@ -439,6 +451,14 @@
         {
           "command": "roslynSense.solutionExplorer.packageDetails",
           "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.runProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugProject",
+          "when": "false"
         }
       ],
       "editor/context": [
@@ -494,7 +514,7 @@
         {
           "command": "roslynSense.solutionExplorer.buildProject",
           "when": "view == roslynSense.solutionExplorer && viewItem == project",
-          "group": "inline"
+          "group": "inline@3"
         },
         {
           "command": "roslynSense.solutionExplorer.openProjectFile",
@@ -570,6 +590,16 @@
           "command": "roslynSense.solutionExplorer.packageDetails",
           "when": "view == roslynSense.solutionExplorer && viewItem == package",
           "group": "1_edit"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.runProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "group": "inline@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "group": "inline@2"
         }
       ]
     },
@@ -578,16 +608,6 @@
         "command": "roslynSense.showInheritance",
         "key": "ctrl+alt+u",
         "when": "editorTextFocus && editorLangId == csharp"
-      },
-      {
-        "command": "roslynSense.solutionExplorer.search",
-        "key": "ctrl+f",
-        "when": "focusedView == roslynSense.solutionExplorer"
-      },
-      {
-        "command": "roslynSense.solutionExplorer.clearSearch",
-        "key": "escape",
-        "when": "focusedView == roslynSense.solutionExplorer"
       },
       {
         "command": "roslynSense.solutionExplorer.openProjectFile",

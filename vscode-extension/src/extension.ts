@@ -213,7 +213,13 @@ async function startClient(
         ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
     }
     const clientOptions: LanguageClientOptions = {
-        documentSelector: [{ scheme: 'file', language: 'csharp' }],
+        // Source-generated documents are C# too. Without them here VS Code sends the server
+        // nothing for a generated file, so it opens as an inert buffer — no hover, no
+        // navigation, no diagnostics — which is worse than not offering to open it at all.
+        documentSelector: [
+            { scheme: 'file', language: 'csharp' },
+            { scheme: 'roslynsense-generated', language: 'csharp' },
+        ],
         uriConverters: { code2Protocol, protocol2Code },
         // Sent at initialize so the very first analyzer pass already runs under the user's
         // settings; changes afterwards go through workspace/didChangeConfiguration.

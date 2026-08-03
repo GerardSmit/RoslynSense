@@ -55,6 +55,10 @@ internal static class VirtualDocumentHandler
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(projectPath, cancellationToken: ct);
             var documents = await project.GetSourceGeneratedDocumentsAsync(ct);
 
+            // Listing them in the tree is the cheapest moment to learn their URIs, so a later
+            // "find all references" that lands in generated code already knows where to point.
+            GeneratedDocumentRegistry.Register(projectPath, documents);
+
             return documents
                 .Select(document => new GeneratedFileInfo(
                     HintName(document),
@@ -106,6 +110,9 @@ internal static class VirtualDocumentHandler
         // The owner is a path with separators and a drive letter, so it goes in the query rather
         // than the path, where the client's URI parser would rewrite it.
         $"{scheme}:/{Uri.EscapeDataString(name)}?{Uri.EscapeDataString(owner)}";
+
+    public static bool TryParseUri(string uri, out string scheme, out string owner, out string name) =>
+        TryParse(uri, out scheme, out owner, out name);
 
     private static bool TryParse(string uri, out string scheme, out string owner, out string name)
     {

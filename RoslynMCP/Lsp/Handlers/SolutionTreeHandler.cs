@@ -26,21 +26,36 @@ internal static class SolutionTreeHandler
         string? solutionPath =
             WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
 
-        var nodes = p.NodeId switch
+        SolutionTreeNode[] nodes;
+        try
         {
-            null or "" => Roots(solutionPath),
-            var id when id.StartsWith("folder:", StringComparison.Ordinal) =>
-                await FolderChildrenAsync(id["folder:".Length..], p, ct),
-            var id when id.EndsWith(DependenciesSuffix, StringComparison.Ordinal) =>
-                await DependencyGroupsAsync(id[..^DependenciesSuffix.Length], ct),
-            var id when id.StartsWith("group:", StringComparison.Ordinal) =>
-                await GroupChildrenAsync(id["group:".Length..], ct),
-            var id when id.StartsWith("project:", StringComparison.Ordinal) =>
-                await ProjectChildrenAsync(id["project:".Length..], p, ct),
-            var id when id.StartsWith("slnfolder:", StringComparison.Ordinal) =>
-                SolutionFolderChildren(solutionPath, id["slnfolder:".Length..]),
-            _ => [],
-        };
+            nodes = p.NodeId switch
+            {
+                null or "" => Roots(solutionPath),
+                var id when id.StartsWith("folder:", StringComparison.Ordinal) =>
+                    await FolderChildrenAsync(id["folder:".Length..], p, ct),
+                var id when id.EndsWith(DependenciesSuffix, StringComparison.Ordinal) =>
+                    await DependencyGroupsAsync(id[..^DependenciesSuffix.Length], ct),
+                var id when id.StartsWith("group:", StringComparison.Ordinal) =>
+                    await GroupChildrenAsync(id["group:".Length..], ct),
+                var id when id.StartsWith("project:", StringComparison.Ordinal) =>
+                    await ProjectChildrenAsync(id["project:".Length..], p, ct),
+                var id when id.StartsWith("slnfolder:", StringComparison.Ordinal) =>
+                    SolutionFolderChildren(solutionPath, id["slnfolder:".Length..]),
+                _ => [],
+            };
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            // The client cannot tell a failed request from an empty node, so a crash in here
+            // reads as "this project has nothing in it". Saying so out loud is the difference
+            // between a bug report and a mystery.
+            ServiceLog.Warn(
+                $"Could not list '{p.NodeId ?? "the solution"}': {ex.Message}",
+                key: $"solution-tree:{p.NodeId}");
+            return [];
+        }
 
         return Filter(nodes, p.Filter);
     }
@@ -259,6 +274,43 @@ internal static class SolutionTreeHandler
         return await FolderContentsAsync(parts[0], parts[1], p, ct);
     }
 
+    /// <summary>
+    /// The project's visible items keyed by path, keeping the entry that says the most when a
+    /// file evaluates more than once.
+    /// </summary>
+    /// <remarks>
+    /// One path with several items is ordinary MSBuild, not a broken project: an explicit
+    /// <c>&lt;None Include="Fixtures\**\*"&gt;</c> overlaps the SDK's default glob and the file
+    /// evaluates twice. Building this with <c>ToDictionary</c> threw on the duplicate, and
+    /// because the tree request has no error path of its own the client read the failure as
+    /// "this project contains nothing" — an empty node, no message, on every project with an
+    /// overlapping include.
+    /// </remarks>
+    private static Dictionary<string, ProjectItemInfo> ByPath(IReadOnlyList<ProjectItemInfo>? items)
+    {
+        var map = new Dictionary<string, ProjectItemInfo>(StringComparer.OrdinalIgnoreCase);
+        if (items is null)
+            return map;
+
+        foreach (var item in items)
+        {
+            if (!item.Visible)
+                continue;
+
+            // DependentUpon is the one piece of metadata the tree acts on, so an item carrying
+            // it wins over one that does not; otherwise the first evaluated wins.
+            if (map.TryGetValue(item.FullPath, out var existing)
+                && (existing.DependentUpon is not null || item.DependentUpon is null))
+            {
+                continue;
+            }
+
+            map[item.FullPath] = item;
+        }
+
+        return map;
+    }
+
     /// <summary>Directories and nested files directly under one directory of a project.</summary>
     private static async Task<SolutionTreeNode[]> FolderContentsAsync(
         string projectPath, string directory, SolutionTreeParams p, CancellationToken ct)
@@ -267,10 +319,7 @@ internal static class SolutionTreeHandler
             return [];
 
         var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
-        var projectFiles = evaluation?.Items
-            .Where(i => i.Visible)
-            .ToDictionary(i => i.FullPath, i => i, StringComparer.OrdinalIgnoreCase)
-            ?? [];
+        var projectFiles = ByPath(evaluation?.Items);
 
         var nodes = new List<SolutionTreeNode>();
 
@@ -298,9 +347,9 @@ internal static class SolutionTreeHandler
             .Where(f => p.ShowIgnored || !IsHidden(Path.GetFileName(f)))
             .ToList();
 
-        var dependentUpon = projectFiles.Values
-            .Where(i => i.DependentUpon is not null)
-            .ToDictionary(i => i.FullPath, i => i.DependentUpon!, StringComparer.OrdinalIgnoreCase);
+        var dependentUpon = projectFiles
+            .Where(pair => pair.Value.DependentUpon is not null)
+            .ToDictionary(pair => pair.Key, pair => pair.Value.DependentUpon!, StringComparer.OrdinalIgnoreCase);
 
         foreach (var nested in FileNestingService.Nest(files, dependentUpon, p.FileNesting))
         {

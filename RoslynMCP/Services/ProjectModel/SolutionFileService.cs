@@ -139,7 +139,17 @@ public static class SolutionFileService
                 {
                     string name = (child.Attribute("Name")?.Value ?? "").Trim('/', '\\');
                     string id = parentId is null ? $"/{name}" : $"{parentId}/{name}";
-                    nodes.Add(new SolutionNode(id, parentId, name, null, IsFolder: true, Files: []));
+
+                    // Solution items: what the .sln format calls ProjectSection(SolutionItems),
+                    // written as <File Path="..."/> children here.
+                    var files = child.Elements()
+                        .Where(e => e.Name.LocalName.Equals("File", StringComparison.OrdinalIgnoreCase))
+                        .Select(e => e.Attribute("Path")?.Value)
+                        .Where(path => !string.IsNullOrWhiteSpace(path))
+                        .Select(path => Path.GetFullPath(Path.Combine(solutionDir, path!)))
+                        .ToList();
+
+                    nodes.Add(new SolutionNode(id, parentId, name, null, IsFolder: true, Files: files));
                     Walk(child, id);
                 }
                 else if (child.Name.LocalName.Equals("Project", StringComparison.OrdinalIgnoreCase) &&

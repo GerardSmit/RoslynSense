@@ -100,6 +100,45 @@ public class SolutionExplorerTests
         Assert.Equal(designer, other.Children[0].FullPath);
     }
 
+    [Fact]
+    public async Task AProjectWithOverlappingIncludesStillListsItsFiles()
+    {
+        // An explicit include that overlaps the SDK's default glob evaluates the same file
+        // twice. Keying the item map with ToDictionary threw on that, and since the tree
+        // request had no error path the client read the failure as an empty project — no
+        // files, no folders, no message, and unchanged by Show All Files.
+        string dir = Path.Combine(Path.GetTempPath(), $"dupe-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(dir, "Assets"));
+        File.WriteAllText(Path.Combine(dir, "Assets", "logo.png"), "");
+        File.WriteAllText(Path.Combine(dir, "Program.cs"), "class Program { static void Main() { } }");
+
+        string project = Path.Combine(dir, "Dupe.csproj");
+        File.WriteAllText(project, """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+              </PropertyGroup>
+              <ItemGroup>
+                <None Include="Assets\**\*" CopyToOutputDirectory="PreserveNewest" />
+              </ItemGroup>
+            </Project>
+            """);
+
+        try
+        {
+            var nodes = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: $"project:{project}"), default);
+
+            Assert.Contains(nodes, n => n.Kind == SolutionNodeKind.Dependencies);
+            Assert.Contains(nodes, n => n.Label == "Program.cs");
+            Assert.Contains(nodes, n => n.Kind == SolutionNodeKind.Folder && n.Label == "Assets");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
     // ---- Solution structure ------------------------------------------------------------
 
     [Fact]
@@ -170,6 +209,46 @@ public class SolutionExplorerTests
             Assert.Equal("Services", folder.Name);
             var project = nodes.Single(n => !n.IsFolder);
             Assert.Equal(folder.Id, project.ParentId);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SlnxSolutionItemsAreRead()
+    {
+        // The .slnx equivalent of ProjectSection(SolutionItems). Folders were read from this
+        // format from the start; the files attached to them were not, so a .slnx solution
+        // showed its structure with everything hanging off it missing.
+        string dir = Path.Combine(Path.GetTempPath(), $"slnx-items-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(dir, "App"));
+        string solutionPath = Path.Combine(dir, "App.slnx");
+        File.WriteAllText(solutionPath, """
+            <Solution>
+              <Folder Name="/Solution Items/">
+                <File Path="Directory.Build.props" />
+                <File Path="docs/README.md" />
+              </Folder>
+              <Folder Name="/Services/">
+                <Project Path="App/App.csproj" />
+              </Folder>
+            </Solution>
+            """);
+
+        try
+        {
+            var nodes = SolutionFileService.Read(solutionPath);
+
+            var items = nodes.Single(n => n.Name == "Solution Items");
+            Assert.Equal(2, items.Files.Count);
+            Assert.Contains(items.Files, f => Path.GetFileName(f) == "Directory.Build.props");
+            Assert.Contains(items.Files, f => Path.GetFileName(f) == "README.md");
+            Assert.All(items.Files, f => Assert.True(Path.IsPathFullyQualified(f)));
+
+            // A folder holding only projects still reports none.
+            Assert.Empty(nodes.Single(n => n.Name == "Services").Files);
         }
         finally
         {

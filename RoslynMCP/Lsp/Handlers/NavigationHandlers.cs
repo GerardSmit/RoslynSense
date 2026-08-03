@@ -36,7 +36,7 @@ internal static class NavigationHandlers
 
         // Aliases and partials: prefer the definition part(s) in source.
         symbol = symbol.OriginalDefinition;
-        var locations = HandlerHelpers.ToLocations(symbol.Locations);
+        var locations = await HandlerHelpers.ToLocationsAsync(symbol.Locations, document.Project, ct);
         if (locations.Length > 0)
             return locations;
 
@@ -82,7 +82,7 @@ internal static class NavigationHandlers
             locations.AddRange(referenced.Locations.Select(r => r.Location));
         }
 
-        return HandlerHelpers.ToLocations(locations);
+        return await HandlerHelpers.ToLocationsAsync(locations, document.Project, ct);
     }
 
     public static async Task<LspLocation[]> ImplementationAsync(TextDocumentPositionParams p, CancellationToken ct)
@@ -118,7 +118,8 @@ internal static class NavigationHandlers
         if (results.Count == 0)
             results.Add(symbol); // e.g. invoking on a concrete member — jump to it
 
-        return HandlerHelpers.ToLocations(results.SelectMany(s => s.Locations).Where(l => l.IsInSource));
+        return await HandlerHelpers.ToLocationsAsync(
+            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), document.Project, ct);
     }
 
     public static async Task<DocumentHighlight[]> DocumentHighlightAsync(

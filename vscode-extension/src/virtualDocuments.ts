@@ -25,6 +25,9 @@ export function registerVirtualDocuments(
 ): void {
     const changeEmitter = new vscode.EventEmitter<vscode.Uri>();
 
+    /** What each open virtual document is, shown on open instead of inside the text. */
+    const descriptions = new Map<string, string>();
+
     const provider: vscode.TextDocumentContentProvider = {
         onDidChange: changeEmitter.event,
 
@@ -43,9 +46,16 @@ export function registerVirtualDocuments(
                 if (!document) {
                     return `// Could not load ${uri.path}.\n// The generator may no longer produce it, or the assembly could not be read.`;
                 }
-                // A banner rather than a read-only flag: the scheme is already read-only, and
-                // what the reader actually needs is to know why the file has no path.
-                return `// ${document.description}\n\n${document.text}`;
+
+                descriptions.set(uri.toString(), document.description);
+
+                // Generated documents exchange positions with the server, so their text has to
+                // be exactly what the compilation holds — a banner would shift every line by
+                // two and put go-to-definition and diagnostics on the wrong ones. Decompiled
+                // metadata is read-only prose with no such traffic, so it keeps its header.
+                return uri.scheme === GENERATED_SCHEME
+                    ? document.text
+                    : `// ${document.description}\n\n${document.text}`;
             } catch (err) {
                 return `// Could not load ${uri.path}: ${String(err)}`;
             }
@@ -64,6 +74,11 @@ export function registerVirtualDocuments(
                 const document = await vscode.workspace.openTextDocument(parsed);
                 await vscode.languages.setTextDocumentLanguage(document, 'csharp');
                 await vscode.window.showTextDocument(document, { preview: true });
+
+                const description = descriptions.get(parsed.toString());
+                if (description) {
+                    vscode.window.setStatusBarMessage(description, 6000);
+                }
             }
         ),
 

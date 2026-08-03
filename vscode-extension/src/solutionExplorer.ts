@@ -246,6 +246,32 @@ export function registerSolutionExplorer(
         return false;
     }
 
+    /**
+     * Starts a project, with or without the debugger attached.
+     *
+     * Both go through the same debug configuration: `noDebug` is what VS Code's own
+     * "Run Without Debugging" sets, so the launch target, build step and launch profile are
+     * resolved identically either way rather than by a second, parallel code path.
+     */
+    async function launch(node: SolutionTreeNode, options: { debug: boolean }): Promise<void> {
+        const projectPath = projectPathOf(node);
+        if (!projectPath) {
+            return;
+        }
+
+        await context.workspaceState.update('roslynSense.startupProject', projectPath);
+        await vscode.debug.startDebugging(
+            undefined,
+            {
+                type: 'roslynsense',
+                request: 'launch',
+                name: `C#: ${Path.basename(projectPath, Path.extname(projectPath))}`,
+                projectPath,
+            },
+            { noDebug: !options.debug }
+        );
+    }
+
     const setToggle = async (key: keyof ViewState, value: boolean) => {
         state[key] = value;
         await context.workspaceState.update(`roslynSense.${key}`, value);
@@ -527,19 +553,15 @@ export function registerSolutionExplorer(
         ),
         vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.startupAndDebug',
-            async (node: SolutionTreeNode) => {
-                const projectPath = projectPathOf(node);
-                if (!projectPath) {
-                    return;
-                }
-                await context.workspaceState.update('roslynSense.startupProject', projectPath);
-                await vscode.debug.startDebugging(undefined, {
-                    type: 'roslynsense',
-                    request: 'launch',
-                    name: `C#: ${Path.basename(projectPath, Path.extname(projectPath))}`,
-                    projectPath,
-                });
-            }
+            (node: SolutionTreeNode) => launch(node, { debug: true })
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.debugProject',
+            (node: SolutionTreeNode) => launch(node, { debug: true })
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.runProject',
+            (node: SolutionTreeNode) => launch(node, { debug: false })
         ),
         vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.packageDetails',

@@ -13,7 +13,21 @@ internal static class LspConverters
 {
     public static string PathToUri(string path) => new Uri(PathHelper.NormalizePath(path)).AbsoluteUri;
 
-    public static string UriToPath(string uri) => PathHelper.NormalizePath(new Uri(uri).LocalPath);
+    /// <summary>
+    /// The file behind a document URI — or the URI itself, when there is no file.
+    /// </summary>
+    /// <remarks>
+    /// A source-generated document exists only inside the compilation, and its URI carries the
+    /// project and hint name in a shape <c>Uri.LocalPath</c> would throw away. Passing it
+    /// through unchanged lets <see cref="LspDocumentResolver"/> recognise it, which is what
+    /// gives generated files the same language features as any other.
+    /// </remarks>
+    public static string UriToPath(string uri) =>
+        IsVirtual(uri) ? uri : PathHelper.NormalizePath(new Uri(uri).LocalPath);
+
+    private static bool IsVirtual(string uri) =>
+        uri.StartsWith(Handlers.VirtualDocumentHandler.GeneratedScheme + ":", StringComparison.Ordinal)
+        || uri.StartsWith(Handlers.VirtualDocumentHandler.MetadataScheme + ":", StringComparison.Ordinal);
 
     public static Position ToPosition(LinePosition p) => new(p.Line, p.Character);
 
@@ -36,6 +50,17 @@ internal static class LspConverters
     {
         if (!location.IsInSource || location.SourceTree?.FilePath is not { Length: > 0 } path)
             return null;
+
+        // Generated code has a synthetic path; converting it to a file URI produces a link to
+        // a file that does not exist. The registry knows the URI that does open it.
+        if (GeneratedDocumentRegistry.TryGetUri(path, out string generated))
+            return new LspLocation(generated, ToRange(location.GetLineSpan().Span));
+
+        // An unregistered synthetic path would become a broken file:// link; dropping it keeps
+        // a results list honest rather than filling it with entries that open nothing.
+        if (GeneratedDocumentRegistry.LooksGenerated(path))
+            return null;
+
         return new LspLocation(PathToUri(path), ToRange(location.GetLineSpan().Span));
     }
 

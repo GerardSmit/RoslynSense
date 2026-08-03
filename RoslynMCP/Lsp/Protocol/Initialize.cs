@@ -8,7 +8,13 @@ public sealed record InitializeParams(
     [property: JsonPropertyName("processId")] int? ProcessId,
     [property: JsonPropertyName("rootUri")] string? RootUri,
     [property: JsonPropertyName("workspaceFolders")] WorkspaceFolder[]? WorkspaceFolders,
-    [property: JsonPropertyName("capabilities")] ClientCapabilities? Capabilities);
+    [property: JsonPropertyName("capabilities")] ClientCapabilities? Capabilities,
+    /// <summary>The client's <c>roslynSense.*</c> settings, so the first analyzer pass already
+    /// runs under them rather than under the defaults until the first change notification.</summary>
+    [property: JsonPropertyName("initializationOptions")] System.Text.Json.JsonElement? InitializationOptions = null);
+
+public sealed record DidChangeConfigurationParams(
+    [property: JsonPropertyName("settings")] System.Text.Json.JsonElement? Settings);
 
 public sealed record ClientCapabilities(
     [property: JsonPropertyName("textDocument")] TextDocumentClientCapabilities? TextDocument,
@@ -77,6 +83,9 @@ public sealed record ServerCapabilities
     [JsonPropertyName("codeLensProvider")] public CodeLensOptions? CodeLensProvider { get; init; }
     [JsonPropertyName("executeCommandProvider")] public ExecuteCommandOptions? ExecuteCommandProvider { get; init; }
     [JsonPropertyName("inlayHintProvider")] public InlayHintOptions? InlayHintProvider { get; init; }
+    [JsonPropertyName("selectionRangeProvider")] public bool SelectionRangeProvider { get; init; }
+    [JsonPropertyName("linkedEditingRangeProvider")] public bool LinkedEditingRangeProvider { get; init; }
+    [JsonPropertyName("inlineValueProvider")] public bool InlineValueProvider { get; init; }
     [JsonPropertyName("workspace")] public WorkspaceServerCapabilities? Workspace { get; init; }
 }
 
@@ -84,7 +93,9 @@ public sealed record WorkspaceServerCapabilities(
     [property: JsonPropertyName("fileOperations")] FileOperationsServerCapabilities FileOperations);
 
 public sealed record FileOperationsServerCapabilities(
-    [property: JsonPropertyName("willRename")] FileOperationRegistration WillRename);
+    [property: JsonPropertyName("willRename")] FileOperationRegistration WillRename,
+    [property: JsonPropertyName("didCreate")] FileOperationRegistration? DidCreate = null,
+    [property: JsonPropertyName("didDelete")] FileOperationRegistration? DidDelete = null);
 
 public sealed record FileOperationRegistration(
     [property: JsonPropertyName("filters")] FileOperationFilter[] Filters);

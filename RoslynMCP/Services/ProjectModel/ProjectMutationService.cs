@@ -248,6 +248,84 @@ public static class ProjectMutationService
         return new MutationResult(true, $"Deleted {Path.GetFileName(full)}.");
     }
 
+    /// <summary>
+    /// Fills in a <c>.cs</c> file that already exists but is empty, and makes sure the project
+    /// compiles it. Returns the text that belongs in it, or null when there is nothing to do.
+    /// </summary>
+    /// <remarks>
+    /// The editor's own explorer creates a bare, empty file — no namespace, no type — so a
+    /// class made that way starts in the global namespace and every analyzer complains. This is
+    /// the same scaffolding <see cref="AddFileAsync"/> writes, applied after the fact. The text
+    /// is returned rather than written so the caller can put it in the editor's buffer, which is
+    /// where the file is at that moment.
+    /// </remarks>
+    public static async Task<string?> ScaffoldNewFileAsync(
+        string filePath, CancellationToken ct = default)
+    {
+        if (!File.Exists(filePath) || new FileInfo(filePath).Length > 0)
+            return null;
+        if (!filePath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (FindOwningProject(Path.GetFullPath(filePath)) is not { } project)
+            return null;
+
+        string full = Path.GetFullPath(filePath);
+        string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(project))!;
+
+        // A generated or designer file gets its content from whatever generates it.
+        string name = Path.GetFileName(full);
+        if (name.Contains(".Designer.", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        EnsureCompileItem(project, projectDirectory, full);
+        await InvalidateAsync(ct, project);
+
+        return Scaffold(project, projectDirectory, full, FileKind.Class);
+    }
+
+    /// <summary>
+    /// Makes sure a file that already exists on disk is one the project compiles.
+    /// </summary>
+    /// <remarks>
+    /// Only legacy projects need this — an SDK-style project globs its sources — but the caller
+    /// cannot tell them apart, and <see cref="EnsureCompileItem"/> already declines when the
+    /// glob covers it.
+    /// </remarks>
+    public static async Task IncludeExistingFileAsync(
+        string projectPath, string filePath, CancellationToken ct = default)
+    {
+        string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+        EnsureCompileItem(projectPath, projectDirectory, Path.GetFullPath(filePath));
+        await InvalidateAsync(ct, projectPath);
+    }
+
+    /// <summary>
+    /// Drops a file that has already been deleted from its project's item list.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DeleteFileAsync"/> does the deleting itself and so refuses a path that is
+    /// already gone. This is the other half: the editor deleted the file and only tells us
+    /// afterwards, and a legacy project still carrying a <c>&lt;Compile&gt;</c> for it will not
+    /// build.
+    /// </remarks>
+    public static async Task ForgetDeletedFileAsync(string filePath, CancellationToken ct = default)
+    {
+        string full = Path.GetFullPath(filePath);
+        if (FindOwningProject(full) is { } owner)
+        {
+            RemoveCompileItem(owner, full);
+            await InvalidateAsync(ct, owner);
+        }
+        else
+        {
+            await InvalidateAsync(ct);
+        }
+    }
+
     public static async Task<MutationResult> CreateProjectAsync(
         string template, string name, string directory, string? targetFramework = null,
         bool addToSolution = true, CancellationToken ct = default)

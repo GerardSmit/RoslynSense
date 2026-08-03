@@ -17,24 +17,44 @@ public sealed record TestRunOutcome(
 }
 
 /// <summary>
+/// Something worth reporting while a run is still going.
+/// </summary>
+/// <param name="Kind">
+/// <c>output</c> for a line of console output, or <c>passed</c>/<c>failed</c>/<c>skipped</c>
+/// for a test that has just finished.
+/// </param>
+public sealed record TestProgress(
+    string Kind,
+    string? FullyQualifiedName = null,
+    string? Message = null,
+    double DurationMs = 0);
+
+/// <summary>
 /// Runs tests through `dotnet test` with a TRX logger and returns structured results.
 /// Shared by the MCP tool (which formats markdown from this) and the editor's Test Explorer
 /// (which maps it onto test items), so both agree on what ran and what it did.
 /// </summary>
 public static partial class TestRunService
 {
+    /// <param name="onProgress">
+    /// Called as the run happens, on the process's output thread. The TRX is still the source
+    /// of truth for the final results — this only exists so a long run is not a blank screen
+    /// until it ends, which is what a test explorer that reports nothing until the last test
+    /// amounts to.
+    /// </param>
     public static async Task<TestRunOutcome> RunAsync(
         string csprojPath,
         string? filter = null,
         bool build = true,
         int timeoutSeconds = 300,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action<TestProgress>? onProgress = null)
     {
         // `dotnet test` cannot run a .NET Framework test project: it drives a non-SDK project it
         // cannot build, and the test host it starts targets the wrong runtime. Those projects go
         // through MSBuild and vstest instead.
         if (ProjectClassifier.Classify(csprojPath).DebugRuntime == DebugRuntime.NetFramework)
-            return await RunFrameworkAsync(csprojPath, filter, build, timeoutSeconds, cancellationToken);
+            return await RunFrameworkAsync(csprojPath, filter, build, timeoutSeconds, cancellationToken, onProgress);
 
         string trxPath = Path.Combine(Path.GetTempPath(), $"roslyn-sense-{Guid.NewGuid():N}.trx");
 
@@ -42,6 +62,9 @@ public static partial class TestRunService
         args.Append('"').Append(csprojPath).Append('"');
         args.Append(" --verbosity normal");
         args.Append($" --logger \"trx;LogFileName={trxPath}\"");
+        // The console logger's verbosity is its own, not MSBuild's: without this it prints
+        // failures only, and a run of passing tests reports nothing until it ends.
+        args.Append(" --logger \"console;verbosity=normal\"");
         if (!build)
             args.Append(" --no-build");
         if (!string.IsNullOrWhiteSpace(filter))
@@ -61,7 +84,13 @@ public static partial class TestRunService
         using var process = new Process { StartInfo = startInfo };
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is null)
+                return;
+            stdout.AppendLine(e.Data);
+            Report(onProgress, e.Data);
+        };
         process.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
 
         process.Start();
@@ -77,10 +106,16 @@ public static partial class TestRunService
 
             await process.WaitForExitAsync(timeoutCts?.Token ?? cancellationToken);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
+            // Killed on either kind of cancellation. Letting it run on after a cancel leaves a
+            // test host holding the output assembly, which the next build then cannot write.
             try { process.Kill(entireProcessTree: true); } catch { }
             TryDelete(trxPath);
+
+            if (cancellationToken.IsCancellationRequested)
+                return new TestRunOutcome(-1, [], stdout.ToString(), "Test run cancelled.");
+
             return new TestRunOutcome(-1, [], stdout.ToString(),
                 $"Test run timed out after {timeoutSeconds} seconds.");
         }
@@ -108,7 +143,7 @@ public static partial class TestRunService
     /// </summary>
     private static async Task<TestRunOutcome> RunFrameworkAsync(
         string csprojPath, string? filter, bool build, int timeoutSeconds,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, Action<TestProgress>? onProgress = null)
     {
         string? msbuild = MsBuildLocator.FindMsBuild();
         if (msbuild is null)
@@ -159,6 +194,7 @@ public static partial class TestRunService
         if (!string.IsNullOrWhiteSpace(filter))
             args.Append(" /TestCaseFilter:\"").Append(filter.Replace("\"", "\\\"")).Append('"');
         args.Append($" /logger:\"trx;LogFileName={trxPath}\"");
+        args.Append(" /logger:\"console;verbosity=normal\"");
 
         var startInfo = new ProcessStartInfo("dotnet", args.ToString())
         {
@@ -171,7 +207,13 @@ public static partial class TestRunService
 
         using var process = new Process { StartInfo = startInfo };
         var stdout = new StringBuilder();
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is null)
+                return;
+            stdout.AppendLine(e.Data);
+            Report(onProgress, e.Data);
+        };
         process.ErrorDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
 
         process.Start();
@@ -186,10 +228,14 @@ public static partial class TestRunService
             timeout?.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             await process.WaitForExitAsync(timeout?.Token ?? cancellationToken);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             try { process.Kill(entireProcessTree: true); } catch { }
             TryDelete(trxPath);
+
+            if (cancellationToken.IsCancellationRequested)
+                return new TestRunOutcome(-1, [], stdout.ToString(), "Test run cancelled.");
+
             return new TestRunOutcome(-1, [], stdout.ToString(),
                 $"Test run timed out after {timeoutSeconds} seconds.");
         }
@@ -332,6 +378,50 @@ public static partial class TestRunService
         }
     }
 
+    /// <summary>
+    /// Turns one line of console output into a progress event.
+    /// </summary>
+    /// <remarks>
+    /// vstest prints an outcome line as each test finishes, so the run can be reported live
+    /// without a second logger or a streaming protocol. The TRX is still parsed at the end and
+    /// still decides the result — this is a preview of it, and a line that does not parse is
+    /// simply passed through as output rather than guessed at.
+    /// </remarks>
+    /// <summary>Drives <see cref="Report"/> over one line, for tests.</summary>
+    internal static void ReportForTests(Action<TestProgress> onProgress, string line) =>
+        Report(onProgress, line);
+
+    private static void Report(Action<TestProgress>? onProgress, string line)
+    {
+        if (onProgress is null)
+            return;
+
+        var match = OutcomeLine().Match(line);
+        if (!match.Success)
+        {
+            if (line.Trim().Length > 0)
+                onProgress(new TestProgress("output", Message: line));
+            return;
+        }
+
+        double duration = 0;
+        if (match.Groups[3].Success
+            && double.TryParse(match.Groups[3].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double value))
+        {
+            duration = match.Groups[4].Value switch
+            {
+                "s" => value * 1000,
+                "m" => value * 60_000,
+                _ => value,
+            };
+        }
+
+        onProgress(new TestProgress(
+            match.Groups[1].Value.ToLowerInvariant(), match.Groups[2].Value, DurationMs: duration));
+    }
+
     private static string? FirstBuildError(string stdout, string stderr)
     {
         var match = BuildError().Match(stdout + "\n" + stderr);
@@ -345,6 +435,16 @@ public static partial class TestRunService
 
     [GeneratedRegex(@"Process Id:\s*(\d+)")]
     private static partial Regex TestHostPid();
+
+    /// <summary>
+    /// One finished test: "  Passed Some.Test.Method [12 ms]".
+    /// </summary>
+    /// <remarks>
+    /// The summary lines this must not match are excluded by the whitespace after the outcome:
+    /// "Passed!  - Failed: 0, …" has "!" there and "     Failed: 1" has ":".
+    /// </remarks>
+    [GeneratedRegex(@"^\s*(Passed|Failed|Skipped)\s+([^\s!][^\s]*)(?:\s+\[\s*(?:<\s*)?([\d.,]+)\s*(ms|s|m)\s*\])?\s*$")]
+    private static partial Regex OutcomeLine();
 
     [GeneratedRegex(@"^.*: error [A-Za-z]+\d+:.*$", RegexOptions.Multiline)]
     private static partial Regex BuildError();

@@ -73,6 +73,10 @@ internal sealed class LspServer : IDisposable
         }
     }
 
+    /// <summary>Every file operation the server registers for is a C# file.</summary>
+    private static readonly FileOperationRegistration CSharpFileOperations =
+        new([new FileOperationFilter("file", new FileOperationPattern("**/*.cs", "file"))]);
+
     public LspServer(IServiceProvider services) => _services = services;
 
     public void Attach(JsonRpc rpc)
@@ -96,6 +100,9 @@ internal sealed class LspServer : IDisposable
         _clientRefreshesInlayHints = p.Capabilities?.Workspace?.InlayHint?.RefreshSupport ?? false;
         LspClientState.SnippetSupport =
             p.Capabilities?.TextDocument?.Completion?.CompletionItem?.SnippetSupport ?? false;
+
+        // Before the capabilities are built: workspaceDiagnostics decides one of them.
+        Handlers.ConfigurationHandler.Apply(p.InitializationOptions);
 
         var capabilities = new ServerCapabilities
         {
@@ -129,23 +136,32 @@ internal sealed class LspServer : IDisposable
             FoldingRangeProvider = true,
             CallHierarchyProvider = true,
             TypeHierarchyProvider = true,
+            // Delta and range both matter on a large file: an edit otherwise re-sends every
+            // token in it, and opening one classifies the whole file before anything paints.
             SemanticTokensProvider = new SemanticTokensOptions(
                 new SemanticTokensLegend(
                     Handlers.SemanticTokensHandler.TokenTypes,
                     Handlers.SemanticTokensHandler.TokenModifiers),
-                Full: true),
+                Full: new SemanticTokensFullOptions(Delta: true),
+                Range: true),
             DiagnosticProvider = new DiagnosticOptions(
                 InterFileDependencies: true,
                 WorkspaceDiagnostics: LspFeatureOptions.WorkspaceDiagnosticsScope != "off"),
             CodeLensProvider = new CodeLensOptions(ResolveProvider: true),
             ExecuteCommandProvider = new ExecuteCommandOptions(Handlers.ExecuteCommandHandler.Commands),
             InlayHintProvider = new InlayHintOptions(ResolveProvider: false),
+            SelectionRangeProvider = true,
+            LinkedEditingRangeProvider = true,
+            InlineValueProvider = true,
             // Renaming a .cs file should rename the type inside it. Returning the edit from
-            // willRename puts it in the same undo step as the rename itself.
+            // willRename puts it in the same undo step as the rename itself. Create and delete
+            // are after-the-fact: a new file needs its namespace, a deleted one needs to leave
+            // its project's item list.
             Workspace = new WorkspaceServerCapabilities(
                 new FileOperationsServerCapabilities(
-                    new FileOperationRegistration(
-                        [new FileOperationFilter("file", new FileOperationPattern("**/*.cs", "file"))]))),
+                    WillRename: CSharpFileOperations,
+                    DidCreate: CSharpFileOperations,
+                    DidDelete: CSharpFileOperations)),
         };
 
         string? version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3);
@@ -322,6 +338,9 @@ internal sealed class LspServer : IDisposable
     public Task<TestDebugResult> TestDebug(TestDebugParams p, CancellationToken ct) =>
         Handlers.TestHandler.DebugAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/testCancel", UseSingleObjectParameterDeserialization = true)]
+    public void TestCancel(TestCancelParams p) => Handlers.TestHandler.Cancel(p);
+
     [JsonRpcMethod("roslynSense/testCoverage", UseSingleObjectParameterDeserialization = true)]
     public FileCoverageInfo[] TestCoverage(TestCoverageParams p) =>
         Handlers.TestHandler.Coverage(p);
@@ -339,9 +358,21 @@ internal sealed class LspServer : IDisposable
     public Task<WorkspaceEdit?> WillRenameFiles(Handlers.RenameFilesParams p, CancellationToken ct) =>
         Handlers.FileOperationsHandler.WillRenameAsync(p, ct);
 
+    [JsonRpcMethod("workspace/didChangeConfiguration", UseSingleObjectParameterDeserialization = true)]
+    public Task DidChangeConfiguration(DidChangeConfigurationParams p, CancellationToken ct) =>
+        Handlers.ConfigurationHandler.HandleAsync(p, ct);
+
     [JsonRpcMethod("workspace/didChangeWatchedFiles", UseSingleObjectParameterDeserialization = true)]
     public void DidChangeWatchedFiles(DidChangeWatchedFilesParams p) =>
         Handlers.WatchedFilesHandler.Handle(p);
+
+    [JsonRpcMethod("workspace/didCreateFiles", UseSingleObjectParameterDeserialization = true)]
+    public Task DidCreateFiles(CreateFilesParams p, CancellationToken ct) =>
+        Handlers.FileOperationsHandler.DidCreateAsync(p, ct);
+
+    [JsonRpcMethod("workspace/didDeleteFiles", UseSingleObjectParameterDeserialization = true)]
+    public Task DidDeleteFiles(DeleteFilesParams p, CancellationToken ct) =>
+        Handlers.FileOperationsHandler.DidDeleteAsync(p, ct);
 
     [JsonRpcMethod("textDocument/didClose", UseSingleObjectParameterDeserialization = true)]
     public void DidClose(DidCloseTextDocumentParams p)
@@ -455,7 +486,27 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/semanticTokens/full", UseSingleObjectParameterDeserialization = true)]
     public Task<SemanticTokens> SemanticTokensFull(SemanticTokensParams p, CancellationToken ct) =>
-        Handlers.SemanticTokensHandler.SemanticTokensFullAsync(p, ct);
+        Handlers.SemanticTokensHandler.SemanticTokensFullAsync(SessionId, p, ct);
+
+    [JsonRpcMethod("textDocument/semanticTokens/full/delta", UseSingleObjectParameterDeserialization = true)]
+    public Task<object> SemanticTokensDelta(SemanticTokensDeltaParams p, CancellationToken ct) =>
+        Handlers.SemanticTokensHandler.SemanticTokensDeltaAsync(SessionId, p, ct);
+
+    [JsonRpcMethod("textDocument/semanticTokens/range", UseSingleObjectParameterDeserialization = true)]
+    public Task<SemanticTokens> SemanticTokensRange(SemanticTokensRangeParams p, CancellationToken ct) =>
+        Handlers.SemanticTokensHandler.SemanticTokensRangeAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/selectionRange", UseSingleObjectParameterDeserialization = true)]
+    public Task<Protocol.SelectionRange[]> SelectionRange(SelectionRangeParams p, CancellationToken ct) =>
+        Handlers.SelectionRangeHandler.SelectionRangesAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/linkedEditingRange", UseSingleObjectParameterDeserialization = true)]
+    public Task<LinkedEditingRanges?> LinkedEditingRange(TextDocumentPositionParams p, CancellationToken ct) =>
+        Handlers.LinkedEditingHandler.RangesAsync(p, ct);
+
+    [JsonRpcMethod("textDocument/inlineValue", UseSingleObjectParameterDeserialization = true)]
+    public Task<object[]> InlineValue(InlineValueParams p, CancellationToken ct) =>
+        Handlers.InlineValueHandler.InlineValuesAsync(p, ct);
 
     [JsonRpcMethod("textDocument/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<object> Diagnostic(DocumentDiagnosticParams p, CancellationToken ct) =>
@@ -523,6 +574,7 @@ internal sealed class LspServer : IDisposable
     {
         LspSessionRegistry.Unregister(SessionId);
         OpenDocumentStore.CloseSession(SessionId);
+        Handlers.SemanticTokensHandler.Forget(SessionId);
         _diagnostics?.Dispose();
         _refreshDebounce?.Cancel();
     }

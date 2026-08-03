@@ -25,7 +25,23 @@ public sealed record TestInfo(
 public sealed record TestRunParams(
     [property: JsonPropertyName("projectPath")] string ProjectPath,
     [property: JsonPropertyName("fullyQualifiedNames")] string[]? FullyQualifiedNames = null,
-    [property: JsonPropertyName("collectCoverage")] bool CollectCoverage = false);
+    [property: JsonPropertyName("collectCoverage")] bool CollectCoverage = false,
+    /// <summary>Client-chosen id, used to route progress events back and to cancel the run.</summary>
+    [property: JsonPropertyName("runId")] string? RunId = null);
+
+public sealed record TestCancelParams(
+    [property: JsonPropertyName("runId")] string RunId);
+
+/// <summary>
+/// Server-to-client notification while a run is going: one per finished test, plus the console
+/// output as it arrives.
+/// </summary>
+public sealed record TestRunEvent(
+    [property: JsonPropertyName("runId")] string RunId,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("fullyQualifiedName")] string? FullyQualifiedName,
+    [property: JsonPropertyName("message")] string? Message,
+    [property: JsonPropertyName("durationMs")] double DurationMs);
 
 public sealed record TestResultInfo(
     [property: JsonPropertyName("fullyQualifiedName")] string FullyQualifiedName,
@@ -49,6 +65,12 @@ public sealed record FileCoverageInfo(
     [property: JsonPropertyName("filePath")] string FilePath,
     [property: JsonPropertyName("lines")] LineCoverageInfo[] Lines);
 
+/// <summary>
+/// One covered line. The branch counts are 0 for a line with no conditions in it, which is how
+/// the client tells a plain statement from an <c>if</c> whose else-path never ran.
+/// </summary>
 public sealed record LineCoverageInfo(
     [property: JsonPropertyName("line")] int Line,
-    [property: JsonPropertyName("hits")] int Hits);
+    [property: JsonPropertyName("hits")] int Hits,
+    [property: JsonPropertyName("coveredBranches")] int CoveredBranches = 0,
+    [property: JsonPropertyName("totalBranches")] int TotalBranches = 0);

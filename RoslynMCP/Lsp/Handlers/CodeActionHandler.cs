@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CodeRefactorings;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using CodeAction = Microsoft.CodeAnalysis.CodeActions.CodeAction;
@@ -20,6 +21,17 @@ internal static class CodeActionHandler
     /// so the range budget is wider than the compiler-only original.</summary>
     private const int MaxDiagnosticsPerRange = 25;
 
+    /// <summary>
+    /// Slots that fixes and refactorings cannot take, held for suppress and configure.
+    /// </summary>
+    /// <remarks>
+    /// Without a reservation these lose every time: they are computed last, and a diagnostic
+    /// with several fixes fills the budget before they are reached. Losing them is the specific
+    /// failure that matters — a rule you cannot turn off from the editor is one you disable
+    /// globally instead.
+    /// </remarks>
+    private const int ReservedForConfiguration = 6;
+
     public static async Task<LspCodeAction[]> CodeActionsAsync(
         CodeActionParams p, LspResolveCache cache, CancellationToken ct)
     {
@@ -31,7 +43,9 @@ internal static class CodeActionHandler
         var text = await document.GetTextAsync(ct);
         var span = LspConverters.ToTextSpan(text, p.Range);
 
-        var actions = new List<(CodeAction Action, string Kind)>();
+        var actions = new List<Offered>();
+        var configuration = new List<Offered>();
+        int fixBudget = MaxActions - ReservedForConfiguration;
 
         // Quick fixes for diagnostics intersecting the range. Analyzer diagnostics come from
         // cache only — computing them inside a lightbulb request would stall the UI, and the
@@ -54,7 +68,7 @@ internal static class CodeActionHandler
             {
                 foreach (var provider in CodeFixCatalog.GetCodeFixProviders(document.Project.Solution.Workspace))
                 {
-                    if (actions.Count >= MaxActions)
+                    if (actions.Count >= fixBudget)
                         break;
                     if (!provider.FixableDiagnosticIds.Contains(diagnostic.Id))
                         continue;
@@ -65,15 +79,17 @@ internal static class CodeActionHandler
                     catch (OperationCanceledException) { throw; }
                     catch { /* provider crashed — skip */ }
 
-                    actions.AddRange(collected.Select(a => (a, "quickfix")));
+                    actions.AddRange(collected.Select(a => new Offered(a, "quickfix", a.Title)));
                 }
             }
+
+            configuration.AddRange(await ConfigurationActionsAsync(document, span, diagnostics, ct));
         }
 
         // Refactorings at the selection.
         foreach (var provider in CodeFixCatalog.GetRefactoringProviders(document.Project.Solution.Workspace))
         {
-            if (actions.Count >= MaxActions)
+            if (actions.Count >= fixBudget)
                 break;
 
             var collected = new List<CodeAction>();
@@ -82,16 +98,73 @@ internal static class CodeActionHandler
             catch (OperationCanceledException) { throw; }
             catch { /* provider crashed — skip */ }
 
-            actions.AddRange(collected.Select(a => (a, "refactor")));
+            actions.AddRange(collected.Select(a => new Offered(a, "refactor", a.Title)));
         }
 
-        return actions.Take(MaxActions)
-            .Select(a => new LspCodeAction(a.Action.Title, a.Kind, Edit: null)
+        return actions.Take(fixBudget)
+            .Concat(configuration.Take(MaxActions - Math.Min(actions.Count, fixBudget)))
+            .Select(a => new LspCodeAction(a.Title, a.Kind, Edit: null)
             {
                 Data = new CodeActionData(cache.StoreAction(a.Action, document.Project.Solution)),
             })
             .ToArray();
     }
+
+    /// <summary>
+    /// "Suppress <c>SA1600</c>", "Configure <c>SA1600</c> severity" and the rest of Roslyn's
+    /// configuration fixes for the diagnostics under the cursor.
+    /// </summary>
+    /// <remarks>
+    /// These arrive as one grouping action per diagnostic with the real choices nested inside
+    /// it. LSP has no nested code actions, so the group is flattened and its title folded into
+    /// the child's — "Suppress SA1600 • in Suppression File" — which is also how the group reads
+    /// in Visual Studio's own submenu.
+    /// </remarks>
+    private static async Task<List<Offered>> ConfigurationActionsAsync(
+        Document document, TextSpan span,
+        List<Microsoft.CodeAnalysis.Diagnostic> diagnostics, CancellationToken ct)
+    {
+        var results = new List<Offered>();
+        if (diagnostics.Count == 0)
+            return results;
+
+        foreach (var provider in CodeFixCatalog.GetConfigurationFixProviders(document.Project.Solution.Workspace))
+        {
+            if (results.Count >= ReservedForConfiguration)
+                break;
+
+            var fixable = diagnostics.Where(provider.IsFixableDiagnostic).ToList();
+            if (fixable.Count == 0)
+                continue;
+
+            try
+            {
+                var fixes = await provider.GetFixesAsync(document, span, fixable, ct);
+                foreach (var fix in fixes)
+                    results.AddRange(Flatten(fix.Action));
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* provider crashed — skip */ }
+        }
+
+        return results;
+    }
+
+    private static IEnumerable<Offered> Flatten(CodeAction action)
+    {
+        var nested = action.NestedActions;
+        if (nested.IsDefaultOrEmpty)
+            return [new Offered(action, "quickfix", action.Title)];
+
+        return nested.Select(child =>
+            new Offered(child, "quickfix", $"{action.Title} • {child.Title}"));
+    }
+
+    /// <summary>
+    /// One entry in the lightbulb. <see cref="Title"/> is separate from the action's own so a
+    /// flattened child can carry its group's name without wrapping the action itself.
+    /// </summary>
+    private readonly record struct Offered(CodeAction Action, string Kind, string Title);
 
     /// <summary>codeAction/resolve: computes the workspace edit for one cached action.</summary>
     public static async Task<LspCodeAction> ResolveAsync(

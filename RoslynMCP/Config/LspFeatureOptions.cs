@@ -31,6 +31,12 @@ public static class LspFeatureOptions
     public static TimeSpan AnalyzerTimeout { get; set; } =
         TimeSpan.FromSeconds(EnvInt("ROSLYNMCP_ANALYZER_TIMEOUT_SECONDS", 15));
 
+    /// <summary>
+    /// Fetch a dependency's real source when its PDB says where to get it, instead of
+    /// decompiling. Off means navigation never reaches the network.
+    /// </summary>
+    public static bool SourceLink { get; set; } = EnvFlag("ROSLYNMCP_SOURCE_LINK", true);
+
     private static bool EnvFlag(string name, bool fallback) =>
         Environment.GetEnvironmentVariable(name) switch
         {

@@ -126,6 +126,50 @@ async function pickSolution(): Promise<string | undefined> {
     return picked.fsPath;
 }
 
+/**
+ * The `roslynSense.*` settings the server reads.
+ *
+ * Listed explicitly rather than passing the whole configuration object: `getConfiguration`
+ * returns every contributed key plus VS Code's own bookkeeping, and the server should be told
+ * what it is meant to act on rather than handed everything and left to guess.
+ */
+function serverSettings(): Record<string, unknown> {
+    const config = vscode.workspace.getConfiguration('roslynSense');
+    return {
+        analyzerDiagnostics: config.get('analyzerDiagnostics'),
+        codeStyleDiagnostics: config.get('codeStyleDiagnostics'),
+        analyzerTimeoutSeconds: config.get('analyzerTimeoutSeconds'),
+        workspaceDiagnostics: config.get('workspaceDiagnostics'),
+        sourceLink: config.get('sourceLink'),
+        fileNesting: { rules: config.get('fileNesting.rules') },
+    };
+}
+
+/**
+ * Pushes changed settings to every running server.
+ *
+ * Sent by hand rather than through `synchronize.configurationSection`, which is deprecated in
+ * vscode-languageclient 9 and sends the raw configuration tree; this sends the same shape the
+ * server already received at initialize.
+ */
+function registerConfigurationSync(context: vscode.ExtensionContext): void {
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (!event.affectsConfiguration('roslynSense')) {
+                return;
+            }
+            const settings = serverSettings();
+            for (const running of clientsBySolution.values()) {
+                void running
+                    .sendNotification('workspace/didChangeConfiguration', {
+                        settings: { roslynSense: settings },
+                    })
+                    .catch(() => undefined);
+            }
+        })
+    );
+}
+
 async function startClient(
     context: vscode.ExtensionContext,
     binding?: { solutionPath?: string; folder?: vscode.WorkspaceFolder }
@@ -171,6 +215,9 @@ async function startClient(
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'csharp' }],
         uriConverters: { code2Protocol, protocol2Code },
+        // Sent at initialize so the very first analyzer pass already runs under the user's
+        // settings; changes afterwards go through workspace/didChangeConfiguration.
+        initializationOptions: serverSettings(),
         // Content changes to open files arrive via didChange; these watchers cover what the
         // editor never sees — files created, deleted, or rewritten outside it (git checkout,
         // scaffolding, another agent). The server coalesces the burst a branch switch produces.
@@ -1938,6 +1985,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             await startClient(context);
         })
     );
+    registerConfigurationSync(context);
     registerLensCommands(context);
     registerOnAutoInsert(context);
     registerProcessStatusBar(context);

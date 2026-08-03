@@ -37,6 +37,17 @@ interface TestProject {
 interface LineCoverage {
     line: number;
     hits: number;
+    coveredBranches: number;
+    totalBranches: number;
+}
+
+/** A test finishing, or a line of console output, while the run is still going. */
+interface TestRunEvent {
+    runId: string;
+    kind: 'output' | 'passed' | 'failed' | 'skipped';
+    fullyQualifiedName: string | null;
+    message: string | null;
+    durationMs: number;
 }
 
 interface FileCoverage {
@@ -117,6 +128,7 @@ export function registerTestController(
 ): void {
     const controller = vscode.tests.createTestController('roslynSense', 'C# Tests');
     context.subscriptions.push(controller);
+    registerRunEvents(context, getClient);
 
     // projectPath for project-level items, DiscoveredTest for leaves.
     const projectItems = new Map<string, vscode.TestItem>();
@@ -321,13 +333,27 @@ async function runTests(
 
             items.forEach((item) => run.started(item));
 
-            const results = await client.sendRequest<TestResult[]>('roslynSense/testRun', {
-                projectPath,
-                fullyQualifiedNames: names,
-                collectCoverage: mode === 'coverage',
+            // The run id is how progress events and cancellation find their way back to this
+            // run: the request itself does not return until every test has finished.
+            const runId = `${Date.now()}-${runCounter++}`;
+            const live = trackRun(runId, run, items, testData);
+            const cancelled = token.onCancellationRequested(() => {
+                void client.sendNotification('roslynSense/testCancel', { runId });
             });
 
-            applyResults(run, items, testData, results);
+            try {
+                const results = await client.sendRequest<TestResult[]>('roslynSense/testRun', {
+                    projectPath,
+                    fullyQualifiedNames: names,
+                    collectCoverage: mode === 'coverage',
+                    runId,
+                });
+
+                applyResults(run, items, testData, results, live.reported);
+            } finally {
+                live.dispose();
+                cancelled.dispose();
+            }
 
             if (mode === 'coverage') {
                 await applyCoverage(client, run, projectPath);
@@ -338,6 +364,92 @@ async function runTests(
     } finally {
         run.end();
     }
+}
+
+let runCounter = 0;
+
+/** Live listeners keyed by run id, so one run's events never land in another's. */
+const liveRuns = new Map<string, (event: TestRunEvent) => void>();
+
+/**
+ * Routes `roslynSense/testRunEvent` into a run: console output goes to the Test Results
+ * terminal, and each outcome marks its item as soon as it is known.
+ *
+ * Marking early matters for a long run — without it every test sits spinning until the last one
+ * finishes, which is indistinguishable from the run being stuck. The final results still arrive
+ * over the request and still win; `reported` records what was already shown so they are not
+ * written twice.
+ */
+function trackRun(
+    runId: string,
+    run: vscode.TestRun,
+    items: vscode.TestItem[],
+    testData: Map<string, DiscoveredTest>
+): { reported: Set<string>; dispose: () => void } {
+    const reported = new Set<string>();
+    const byName = new Map<string, vscode.TestItem>();
+    for (const item of items) {
+        const test = testData.get(item.id);
+        if (test) {
+            byName.set(test.fullyQualifiedName, item);
+        }
+    }
+
+    liveRuns.set(runId, (event) => {
+        if (event.kind === 'output') {
+            run.appendOutput((event.message ?? '') + '\r\n');
+            return;
+        }
+
+        const name = event.fullyQualifiedName;
+        // vstest prints the display name, which for a [Theory] carries its arguments; the
+        // item is keyed by the method it came from.
+        const item = name
+            ? byName.get(name) ?? byName.get(name.split('(')[0])
+            : undefined;
+        if (!item || reported.has(item.id)) {
+            return;
+        }
+
+        reported.add(item.id);
+        if (event.kind === 'passed') {
+            run.passed(item, event.durationMs);
+        } else if (event.kind === 'failed') {
+            // The assertion text is only in the TRX; this marks it failed now and the final
+            // pass replaces the message with the real one.
+            run.failed(item, new vscode.TestMessage('Failed'), event.durationMs);
+        } else {
+            run.skipped(item);
+        }
+    });
+
+    return { reported, dispose: () => liveRuns.delete(runId) };
+}
+
+/** Wires the server's run events into whichever run they belong to. */
+function registerRunEvents(
+    context: vscode.ExtensionContext,
+    getClient: () => LanguageClient | undefined
+): void {
+    let subscribed: LanguageClient | undefined;
+
+    const subscribe = () => {
+        const client = getClient();
+        if (!client || client === subscribed) {
+            return;
+        }
+        subscribed = client;
+        context.subscriptions.push(
+            client.onNotification('roslynSense/testRunEvent', (event: TestRunEvent) => {
+                liveRuns.get(event.runId)?.(event);
+            })
+        );
+    };
+
+    subscribe();
+    // The client is replaced on restart and on a multi-root binding change.
+    const timer = setInterval(subscribe, 2000);
+    context.subscriptions.push({ dispose: () => clearInterval(timer) });
 }
 
 /**
@@ -388,7 +500,8 @@ function applyResults(
     run: vscode.TestRun,
     items: vscode.TestItem[],
     testData: Map<string, DiscoveredTest>,
-    results: TestResult[]
+    results: TestResult[],
+    liveReported?: Set<string>
 ): void {
     const byName = new Map(results.map((result) => [result.fullyQualifiedName, result]));
 
@@ -396,7 +509,11 @@ function applyResults(
         const test = testData.get(item.id);
         const result = test ? byName.get(test.fullyQualifiedName) : undefined;
         if (!result) {
-            run.skipped(item);
+            // A test the TRX never mentioned: skipped, unless the live pass already saw it —
+            // a cancelled run has real outcomes for the tests that got as far as running.
+            if (!liveReported?.has(item.id)) {
+                run.skipped(item);
+            }
             continue;
         }
 
@@ -446,17 +563,37 @@ async function applyCoverage(
         });
         for (const file of files) {
             const uri = vscode.Uri.file(file.filePath);
-            const detailed = file.lines.map(
-                (line) =>
-                    new vscode.StatementCoverage(
-                        line.hits,
-                        new vscode.Position(Math.max(0, line.line - 1), 0)
-                    )
-            );
+            let totalBranches = 0;
+            let coveredBranches = 0;
+
+            const detailed = file.lines.map((line) => {
+                const position = new vscode.Position(Math.max(0, line.line - 1), 0);
+                if (line.totalBranches <= 0) {
+                    return new vscode.StatementCoverage(line.hits, position);
+                }
+
+                totalBranches += line.totalBranches;
+                coveredBranches += line.coveredBranches;
+
+                // One BranchCoverage per condition. Cobertura reports how many of a line's
+                // branches were taken but not which, so they are reported as the first N
+                // covered — the count is what paints the "1 of 2 branches" gutter, and
+                // claiming to know which arm ran would be inventing detail.
+                const branches = Array.from(
+                    { length: line.totalBranches },
+                    (_, index) =>
+                        new vscode.BranchCoverage(index < line.coveredBranches, position)
+                );
+                return new vscode.StatementCoverage(line.hits, position, branches);
+            });
+
             const covered = detailed.filter((statement) => Number(statement.executed) > 0).length;
             const coverage = new vscode.FileCoverage(
                 uri,
-                new vscode.TestCoverageCount(covered, detailed.length)
+                new vscode.TestCoverageCount(covered, detailed.length),
+                totalBranches > 0
+                    ? new vscode.TestCoverageCount(coveredBranches, totalBranches)
+                    : undefined
             );
             (coverage as { detailedCoverage?: vscode.StatementCoverage[] }).detailedCoverage = detailed;
             run.addCoverage(coverage);

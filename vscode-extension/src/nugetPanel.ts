@@ -42,14 +42,18 @@ export function registerNuGetPanel(
 ): void {
     let panel: vscode.WebviewPanel | undefined;
 
-    const open = (scopeProject?: string) => {
+    const open = (scopeProject?: string, selectPackage?: string) => {
         if (panel) {
             panel.reveal();
         } else {
             panel = createPanel(context, getClient, () => (panel = undefined));
         }
         if (scopeProject) {
-            void panel.webview.postMessage({ type: 'scope', projectPath: scopeProject });
+            void panel.webview.postMessage({
+                type: 'scope',
+                projectPath: scopeProject,
+                selectPackage: selectPackage ?? null,
+            });
         }
     };
 
@@ -57,8 +61,11 @@ export function registerNuGetPanel(
         vscode.commands.registerCommand('roslynSense.manageNuGet', () => open()),
         vscode.commands.registerCommand(
             'roslynSense.manageNuGetForProject',
-            (node: { id?: string }) =>
-                open(node?.id?.startsWith('project:') ? node.id.slice('project:'.length) : undefined)
+            (node: { id?: string }, selectPackage?: string) =>
+                open(
+                    node?.id?.startsWith('project:') ? node.id.slice('project:'.length) : undefined,
+                    selectPackage
+                )
         ),
         vscode.window.registerWebviewPanelSerializer(VIEW_TYPE, {
             async deserializeWebviewPanel(restored) {
@@ -253,7 +260,7 @@ function html(webview: vscode.Webview): string {
 </main>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
-const state = { tab: 'browse', packages: [], projects: [], selected: null, versions: {} };
+const state = { tab: 'browse', packages: [], projects: [], selected: null, versions: {}, pendingSelect: null };
 
 const el = (id) => document.getElementById(id);
 const post = (message) => vscode.postMessage(message);
@@ -364,6 +371,13 @@ function scopeProjects() {
   return value ? [value] : state.projects.map((p) => p.projectPath);
 }
 
+function applyPendingSelection() {
+  if (!state.pendingSelect) return;
+  const index = state.packages.findIndex((p) => p.id.toLowerCase() === state.pendingSelect.toLowerCase());
+  state.pendingSelect = null;
+  if (index >= 0) select(index);
+}
+
 function switchTab(tab) {
   state.tab = tab;
   document.querySelectorAll('nav button').forEach((b) =>
@@ -411,7 +425,14 @@ window.addEventListener('message', (event) => {
     if (state.tab === 'installed') {
       state.packages = message.projects.flatMap((p) => p.packages);
       render();
+      applyPendingSelection();
     }
+  } else if (message.type === 'scope') {
+    // Opened from a Dependencies or package node in the Solution Explorer: scope to that
+    // project, and open on the package that was clicked if there was one.
+    state.pendingSelect = message.selectPackage || null;
+    el('scope').value = message.projectPath || '';
+    switchTab(message.selectPackage ? 'installed' : state.tab);
   } else if (message.type === 'versions') {
     state.versions[message.id] = message.versions;
     const pkg = state.packages[state.selected];

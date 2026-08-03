@@ -40,6 +40,13 @@ interface ViewState {
     showAllFiles: boolean;
     showIgnored: boolean;
     revealActiveFile: boolean;
+    fileNesting: boolean;
+}
+
+/** What `Ctrl+C` / `Ctrl+X` put down, until a paste picks it up. */
+interface Clipboard {
+    uris: string[];
+    cut: boolean;
 }
 
 export function registerSolutionExplorer(
@@ -50,9 +57,14 @@ export function registerSolutionExplorer(
         showAllFiles: context.workspaceState.get('roslynSense.showAllFiles', false),
         showIgnored: context.workspaceState.get('roslynSense.showIgnored', false),
         revealActiveFile: context.workspaceState.get('roslynSense.revealActiveFile', false),
+        fileNesting: context.workspaceState.get(
+            'roslynSense.fileNesting',
+            vscode.workspace.getConfiguration('roslynSense').get('solutionExplorer.fileNesting', true)
+        ),
     };
 
     let filter: string | undefined;
+    let clipboard: Clipboard | undefined;
 
     const changeEmitter = new vscode.EventEmitter<SolutionTreeNode | undefined>();
     const nodesById = new Map<string, SolutionTreeNode>();
@@ -70,6 +82,7 @@ export function registerSolutionExplorer(
                     showAllFiles: state.showAllFiles,
                     showIgnored: state.showIgnored,
                     filter: filter ?? null,
+                    fileNesting: state.fileNesting,
                 }
             );
             children.forEach((child) => nodesById.set(child.id, child));
@@ -245,6 +258,8 @@ export function registerSolutionExplorer(
     void vscode.commands.executeCommand('setContext', 'roslynSense.showIgnored', state.showIgnored);
     void vscode.commands.executeCommand(
         'setContext', 'roslynSense.revealActiveFile', state.revealActiveFile);
+    void vscode.commands.executeCommand(
+        'setContext', 'roslynSense.fileNesting', state.fileNesting);
 
     context.subscriptions.push(
         vscode.commands.registerCommand('roslynSense.solutionExplorer.refresh', refresh),
@@ -263,6 +278,9 @@ export function registerSolutionExplorer(
         ),
         vscode.commands.registerCommand('roslynSense.solutionExplorer.revealActiveFile', () =>
             setToggle('revealActiveFile', !state.revealActiveFile)
+        ),
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.toggleFileNesting', () =>
+            setToggle('fileNesting', !state.fileNesting)
         ),
 
         vscode.commands.registerCommand('roslynSense.solutionExplorer.search', async () => {
@@ -344,7 +362,7 @@ export function registerSolutionExplorer(
         ),
         vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.newFile',
-            async (node: SolutionTreeNode) => {
+            async (node: SolutionTreeNode, preselectedKind?: string) => {
                 const name = await vscode.window.showInputBox({
                     title: 'New file',
                     prompt: 'File name, with or without an extension',
@@ -353,11 +371,13 @@ export function registerSolutionExplorer(
                 if (!name) {
                     return;
                 }
-                const kind = Path.extname(name) && Path.extname(name) !== '.cs'
-                    ? 'empty'
-                    : await vscode.window.showQuickPick(
-                        ['class', 'interface', 'record', 'enum', 'empty'],
-                        { title: 'What should it contain?' });
+                const kind =
+                    preselectedKind ??
+                    (Path.extname(name) && Path.extname(name) !== '.cs'
+                        ? 'empty'
+                        : await vscode.window.showQuickPick(
+                            ['class', 'interface', 'record', 'enum', 'empty'],
+                            { title: 'What should it contain?' }));
                 if (!kind) {
                     return;
                 }
@@ -433,6 +453,110 @@ export function registerSolutionExplorer(
             }
         ),
         vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.copy',
+            (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
+                const uris = urisOf(node, selected);
+                if (uris.length > 0) {
+                    clipboard = { uris, cut: false };
+                    view.message = `${describeCount(uris.length)} copied.`;
+                }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.cut',
+            (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
+                const uris = urisOf(node, selected);
+                if (uris.length > 0) {
+                    clipboard = { uris, cut: true };
+                    view.message = `${describeCount(uris.length)} cut.`;
+                }
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.paste',
+            async (node: SolutionTreeNode) => {
+                const destination = containerUriOf(node);
+                if (!clipboard || !destination) {
+                    return;
+                }
+                // A cut is a move, which carries the namespace fixups with it; a copy is not,
+                // because the copy is a second type with the original's name and renaming it is
+                // the user's next step rather than ours to guess.
+                for (const uri of clipboard.uris) {
+                    await edit({
+                        action: clipboard.cut ? 'move' : 'copy',
+                        targetUri: uri,
+                        destinationUri: destination,
+                    });
+                }
+                if (clipboard.cut) {
+                    clipboard = undefined;
+                }
+                view.message = undefined;
+                refresh();
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.duplicate',
+            async (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
+                for (const uri of urisOf(node, selected)) {
+                    // Duplicate is a paste back into the folder the file is already in.
+                    await edit({ action: 'copy', targetUri: uri, destinationUri: uri });
+                }
+                refresh();
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.newItem',
+            async (node: SolutionTreeNode) => {
+                const kind = await vscode.window.showQuickPick(
+                    ['class', 'interface', 'record', 'enum', 'empty file', 'folder'],
+                    { title: 'New' }
+                );
+                if (!kind) {
+                    return;
+                }
+                await vscode.commands.executeCommand(
+                    kind === 'folder'
+                        ? 'roslynSense.solutionExplorer.newFolder'
+                        : 'roslynSense.solutionExplorer.newFile',
+                    node,
+                    kind === 'empty file' ? 'empty' : kind
+                );
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.startupAndDebug',
+            async (node: SolutionTreeNode) => {
+                const projectPath = projectPathOf(node);
+                if (!projectPath) {
+                    return;
+                }
+                await context.workspaceState.update('roslynSense.startupProject', projectPath);
+                await vscode.debug.startDebugging(undefined, {
+                    type: 'roslynsense',
+                    request: 'launch',
+                    name: `C#: ${Path.basename(projectPath, Path.extname(projectPath))}`,
+                    projectPath,
+                });
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.packageDetails',
+            (node: SolutionTreeNode) => {
+                // Package nodes are "package:<projectPath>|<id>"; the panel takes the project
+                // and opens with that package selected.
+                const [projectPath, packageId] = node.id.startsWith('package:')
+                    ? node.id.slice('package:'.length).split('|')
+                    : [undefined, undefined];
+                void vscode.commands.executeCommand(
+                    'roslynSense.manageNuGetForProject',
+                    projectPath ? { id: `project:${projectPath}` } : node,
+                    packageId
+                );
+            }
+        ),
+        vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.buildProject',
             async (node: SolutionTreeNode) => {
                 const client = getClient();
@@ -465,6 +589,17 @@ export function registerSolutionExplorer(
             }
         })
     );
+}
+
+/** The files behind a click, honouring a multi-selection when there is one. */
+function urisOf(node: SolutionTreeNode, selected?: SolutionTreeNode[]): string[] {
+    return (selected?.length ? selected : [node])
+        .map((n) => n.resourceUri)
+        .filter((uri): uri is string => Boolean(uri));
+}
+
+function describeCount(count: number): string {
+    return count === 1 ? '1 item' : `${count} items`;
 }
 
 /** Where a "new file here" lands: the node's own folder, or the folder its file sits in. */

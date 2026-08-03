@@ -187,6 +187,47 @@
         "command": "roslynSense.stopHotReload",
         "title": "Stop Hot Reload Session",
         "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.copy",
+        "title": "Copy",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.cut",
+        "title": "Cut",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.paste",
+        "title": "Paste",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.duplicate",
+        "title": "Duplicate",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newItem",
+        "title": "New…",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.startupAndDebug",
+        "title": "Set as Startup and Debug",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.packageDetails",
+        "title": "Package Details",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.toggleFileNesting",
+        "title": "Toggle File Nesting",
+        "category": "RoslynSense",
+        "icon": "$(list-tree)"
       }
     ],
     "viewsContainers": {
@@ -370,6 +411,34 @@
         {
           "command": "roslynSense.openLocation",
           "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.copy",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.cut",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.paste",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.duplicate",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newItem",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.startupAndDebug",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.packageDetails",
+          "when": "false"
         }
       ],
       "editor/context": [
@@ -414,6 +483,11 @@
           "command": "roslynSense.solutionExplorer.hideIgnored",
           "when": "view == roslynSense.solutionExplorer && roslynSense.showIgnored",
           "group": "1_toggles"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.toggleFileNesting",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -461,6 +535,41 @@
           "command": "roslynSense.solutionExplorer.delete",
           "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
           "group": "2_modify@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newItem",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder)$/",
+          "group": "2_modify@0"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.cut",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "4_clipboard@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.copy",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "4_clipboard@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.paste",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|folder|file)$/",
+          "group": "4_clipboard@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.duplicate",
+          "when": "view == roslynSense.solutionExplorer && viewItem == file",
+          "group": "4_clipboard@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.startupAndDebug",
+          "when": "view == roslynSense.solutionExplorer && viewItem == project",
+          "group": "1_edit@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.packageDetails",
+          "when": "view == roslynSense.solutionExplorer && viewItem == package",
+          "group": "1_edit"
         }
       ]
     },
@@ -498,6 +607,40 @@
       {
         "command": "roslynSense.solutionExplorer.goToNode",
         "key": "ctrl+t",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.copy",
+        "key": "ctrl+c",
+        "mac": "cmd+c",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.cut",
+        "key": "ctrl+x",
+        "mac": "cmd+x",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.paste",
+        "key": "ctrl+v",
+        "mac": "cmd+v",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.duplicate",
+        "key": "ctrl+d",
+        "mac": "cmd+d",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newItem",
+        "key": "alt+insert",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.startupAndDebug",
+        "key": "f5",
         "when": "focusedView == roslynSense.solutionExplorer"
       }
     ],
@@ -543,6 +686,56 @@
           "type": "boolean",
           "default": false,
           "description": "Apply saved C# edits to the running application without restarting it. Rude edits (signature changes, new generic methods) are reported instead and still need a restart."
+        },
+        "roslynSense.analyzerDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the project's analyzers (StyleCop, Roslynator, in-house) for editor diagnostics. Off leaves compiler diagnostics only."
+        },
+        "roslynSense.codeStyleDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include Roslyn's built-in IDE code-style rules (IDE0xxx). These are the rules most likely to be noisy on a repo with no .editorconfig."
+        },
+        "roslynSense.analyzerTimeoutSeconds": {
+          "type": "integer",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 300,
+          "description": "How long one document’s analyzer pass may take before reporting what it has. A slow analyzer delays squiggles, never typing."
+        },
+        "roslynSense.workspaceDiagnostics": {
+          "type": "string",
+          "enum": [
+            "off",
+            "openProjects",
+            "solution"
+          ],
+          "enumDescriptions": [
+            "Only files you have open report to Problems.",
+            "Projects owning an open file, plus what they reference.",
+            "The whole solution. Expensive on a large one."
+          ],
+          "default": "openProjects",
+          "description": "How much of the solution is swept for the Problems panel."
+        },
+        "roslynSense.sourceLink": {
+          "type": "boolean",
+          "default": true,
+          "description": "When navigating into a package or framework type, fetch the source it was compiled from if its PDB says where to get it. Off decompiles instead and never reaches the network. Downloads are checksum-verified against the PDB."
+        },
+        "roslynSense.solutionExplorer.fileNesting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nest generated and companion files under the file they belong to (Form1.Designer.cs under Form1.cs)."
+        },
+        "roslynSense.fileNesting.rules": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` — for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
         }
       }
     }

@@ -132,7 +132,7 @@ public class LspExtendedFeatureTests
     {
         string uri = LspConverters.PathToUri(FixturePaths.CalculatorFile);
         var tokens = await SemanticTokensHandler.SemanticTokensFullAsync(
-            new SemanticTokensParams(new TextDocumentIdentifier(uri)), default);
+            "session", new SemanticTokensParams(new TextDocumentIdentifier(uri)), default);
 
         Assert.True(tokens.Data.Length > 0);
         Assert.Equal(0, tokens.Data.Length % 5);

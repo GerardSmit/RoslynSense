@@ -26,6 +26,7 @@ internal static class CodeFixCatalog
     private static HostServices? s_cachedHost;
     private static IReadOnlyList<CodeFixProvider> s_fixProviders = Array.Empty<CodeFixProvider>();
     private static IReadOnlyList<CodeRefactoringProvider> s_refactoringProviders = Array.Empty<CodeRefactoringProvider>();
+    private static IReadOnlyList<IConfigurationFixProvider> s_configurationProviders = Array.Empty<IConfigurationFixProvider>();
 
     public static IReadOnlyList<CodeFixProvider> GetCodeFixProviders(Workspace workspace)
     {
@@ -39,6 +40,22 @@ internal static class CodeFixCatalog
         return s_refactoringProviders;
     }
 
+    /// <summary>
+    /// The providers behind "Suppress with #pragma", "Suppress in Suppressions.cs" and
+    /// "Configure severity in .editorconfig".
+    /// </summary>
+    /// <remarks>
+    /// A separate export from ordinary code fixes because these do not fix anything — they
+    /// change what the analyzer reports. Without them there is no way out of a noisy rule from
+    /// inside the editor, which is the state an unconfigured repo with StyleCop installed starts
+    /// in.
+    /// </remarks>
+    public static IReadOnlyList<IConfigurationFixProvider> GetConfigurationFixProviders(Workspace workspace)
+    {
+        EnsureLoaded(workspace);
+        return s_configurationProviders;
+    }
+
     private static void EnsureLoaded(Workspace workspace)
     {
         var host = workspace.Services.HostServices;
@@ -49,6 +66,7 @@ internal static class CodeFixCatalog
 
             s_fixProviders = LoadExports<CodeFixProvider>(host);
             s_refactoringProviders = LoadExports<CodeRefactoringProvider>(host);
+            s_configurationProviders = LoadExports<IConfigurationFixProvider>(host);
             s_cachedHost = host;
         }
     }

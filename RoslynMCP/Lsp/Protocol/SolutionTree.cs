@@ -32,7 +32,8 @@ public sealed record SolutionTreeParams(
     [property: JsonPropertyName("nodeId")] string? NodeId = null,
     [property: JsonPropertyName("showAllFiles")] bool ShowAllFiles = false,
     [property: JsonPropertyName("showIgnored")] bool ShowIgnored = false,
-    [property: JsonPropertyName("filter")] string? Filter = null);
+    [property: JsonPropertyName("filter")] string? Filter = null,
+    [property: JsonPropertyName("fileNesting")] bool FileNesting = true);
 
 /// <summary>
 /// One node. <see cref="HasChildren"/> drives lazy expansion, which is what keeps a
@@ -61,10 +62,10 @@ public sealed record SolutionTreeRevealParams(
 public sealed record SolutionTreeRevealResult(
     [property: JsonPropertyName("path")] string[] Path);
 
-/// <summary>An edit made from the tree: new file or folder, delete, rename, or a drag-and-drop
-/// move.</summary>
+/// <summary>An edit made from the tree: new file or folder, delete, rename, copy, or a
+/// drag-and-drop move.</summary>
 public sealed record SolutionTreeEditParams(
-    [property: JsonPropertyName("action")] string Action,   // addFile | addFolder | delete | rename | move
+    [property: JsonPropertyName("action")] string Action,   // addFile | addFolder | delete | rename | move | copy
     [property: JsonPropertyName("targetUri")] string? TargetUri = null,
     [property: JsonPropertyName("projectPath")] string? ProjectPath = null,
     [property: JsonPropertyName("name")] string? Name = null,

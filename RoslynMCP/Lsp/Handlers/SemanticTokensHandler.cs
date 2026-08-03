@@ -1,11 +1,18 @@
+using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis.Classification;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 
 namespace RoslynMCP.Lsp.Handlers;
 
-/// <summary>textDocument/semanticTokens/full via Roslyn's Classifier. Tokens are split at
+/// <summary>textDocument/semanticTokens via Roslyn's Classifier. Tokens are split at
 /// line boundaries (no multiline token support assumed) and delta-encoded per the LSP spec.</summary>
+/// <remarks>
+/// Three shapes of the same computation: <c>/full</c> classifies the document, <c>/range</c>
+/// classifies only what is on screen, and <c>/full/delta</c> classifies the document but answers
+/// with the difference from the array the client already holds. The last one is what keeps a
+/// large file affordable to edit — a one-character change otherwise re-sends every token in it.
+/// </remarks>
 internal static class SemanticTokensHandler
 {
     /// <summary>Legend advertised in server capabilities. Indexes into this array are the
@@ -84,17 +91,119 @@ internal static class SemanticTokensHandler
         [ClassificationTypeNames.LabelName] = "label",
     };
 
+    /// <summary>
+    /// The last full result handed to each client, so a delta request has something to diff
+    /// against. Keyed by session as well as document: two editors on one daemon ask
+    /// independently and would otherwise each invalidate the other's baseline.
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, (string ResultId, int[] Data)> s_previous =
+        new(StringComparer.Ordinal);
+
+    private static int s_resultCounter;
+
+    /// <summary>Keeps the baseline cache from growing with every file ever opened.</summary>
+    private const int MaxCachedResults = 256;
+
     public static async Task<SemanticTokens> SemanticTokensFullAsync(
-        SemanticTokensParams p, CancellationToken ct)
+        string sessionId, SemanticTokensParams p, CancellationToken ct)
     {
-        var document = await LspDocumentResolver.ResolveAsync(
-            LspConverters.UriToPath(p.TextDocument.Uri), ct);
+        int[] data = await ComputeAsync(p.TextDocument.Uri, window: null, ct);
+        return new SemanticTokens(data, Remember(sessionId, p.TextDocument.Uri, data));
+    }
+
+    /// <summary>
+    /// Tokens for one range. No result id: a partial array is not a baseline any delta could be
+    /// applied to, and the spec lets the server omit it.
+    /// </summary>
+    public static async Task<SemanticTokens> SemanticTokensRangeAsync(
+        SemanticTokensRangeParams p, CancellationToken ct) =>
+        new(await ComputeAsync(p.TextDocument.Uri, p.Range, ct));
+
+    /// <summary>
+    /// The difference from what the client already has. Falls back to a full result when the
+    /// baseline is unknown — evicted, or from before a restart — which the protocol allows and
+    /// clients handle.
+    /// </summary>
+    public static async Task<object> SemanticTokensDeltaAsync(
+        string sessionId, SemanticTokensDeltaParams p, CancellationToken ct)
+    {
+        int[] data = await ComputeAsync(p.TextDocument.Uri, window: null, ct);
+
+        string key = CacheKey(sessionId, p.TextDocument.Uri);
+        bool known = s_previous.TryGetValue(key, out var previous)
+            && previous.ResultId == p.PreviousResultId;
+
+        string resultId = Remember(sessionId, p.TextDocument.Uri, data);
+        if (!known)
+            return new SemanticTokens(data, resultId);
+
+        return new SemanticTokensDelta(resultId, [.. Diff(previous.Data, data)]);
+    }
+
+    /// <summary>
+    /// One replacement covering everything between the common prefix and the common suffix.
+    /// A finer diff would need the token identity the encoding deliberately throws away, and
+    /// the win over one edit is small: an edit is local, so the unchanged prefix and suffix are
+    /// nearly always the bulk of the file.
+    /// </summary>
+    private static SemanticTokensEdit[] Diff(int[] before, int[] after)
+    {
+        int prefix = 0;
+        int max = Math.Min(before.Length, after.Length);
+        while (prefix < max && before[prefix] == after[prefix])
+            prefix++;
+
+        int suffix = 0;
+        while (suffix < max - prefix
+            && before[before.Length - 1 - suffix] == after[after.Length - 1 - suffix])
+        {
+            suffix++;
+        }
+
+        int deleteCount = before.Length - prefix - suffix;
+        int insertCount = after.Length - prefix - suffix;
+        if (deleteCount == 0 && insertCount == 0)
+            return [];
+
+        return [new SemanticTokensEdit(prefix, deleteCount, after[prefix..(prefix + insertCount)])];
+    }
+
+    private static string CacheKey(string sessionId, string uri) => sessionId + " " + uri;
+
+    private static string Remember(string sessionId, string uri, int[] data)
+    {
+        string resultId = Interlocked.Increment(ref s_resultCounter).ToString();
+
+        if (s_previous.Count > MaxCachedResults)
+            s_previous.Clear();
+
+        s_previous[CacheKey(sessionId, uri)] = (resultId, data);
+        return resultId;
+    }
+
+    /// <summary>Drops the baselines of a session that has gone away.</summary>
+    public static void Forget(string sessionId)
+    {
+        string prefix = sessionId + " ";
+        foreach (var key in s_previous.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal))
+                s_previous.TryRemove(key, out _);
+        }
+    }
+
+    private static async Task<int[]> ComputeAsync(
+        string uri, Protocol.Range? window, CancellationToken ct)
+    {
+        var document = await LspDocumentResolver.ResolveAsync(LspConverters.UriToPath(uri), ct);
         if (document is null)
-            return new SemanticTokens(Array.Empty<int>());
+            return Array.Empty<int>();
 
         var text = await document.GetTextAsync(ct);
-        var spans = await Classifier.GetClassifiedSpansAsync(
-            document, new TextSpan(0, text.Length), ct);
+        var classified = window is null
+            ? new TextSpan(0, text.Length)
+            : LspConverters.ToTextSpan(text, window);
+        var spans = await Classifier.GetClassifiedSpansAsync(document, classified, ct);
 
         // Classifier returns overlapping syntactic + semantic + additive results; keep only
         // mapped types, then resolve overlaps by span start (semantic names win over the
@@ -150,6 +259,6 @@ internal static class SemanticTokensHandler
             prevLine = line;
             prevChar = ch;
         }
-        return new SemanticTokens(data);
+        return data;
     }
 }

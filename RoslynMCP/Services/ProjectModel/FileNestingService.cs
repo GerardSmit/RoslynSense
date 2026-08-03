@@ -114,13 +114,58 @@ public static partial class FileNestingService
             .ToList();
     }
 
+    /// <summary>
+    /// Extra rules from <c>roslynSense.fileNesting.rules</c>, tried before the built-in set so
+    /// a project can override a default it disagrees with.
+    /// </summary>
+    private static (Regex Pattern, string ParentExtension)[] s_customRules = [];
+
+    /// <summary>
+    /// Replaces the user's nesting rules, in VS Code's own
+    /// <c>explorer.fileNesting.patterns</c> shape: <c>{"*.cs": "${capture}.Designer.cs"}</c>.
+    /// </summary>
+    /// <remarks>
+    /// Only the subset that this nests by is honored — a parent of <c>*.ext</c> and children
+    /// of <c>${capture}.suffix</c>. Anything else is dropped rather than approximated, because
+    /// a rule that silently nests the wrong file is harder to notice than one that does nothing.
+    /// Returns the number of rules accepted.
+    /// </remarks>
+    public static int SetCustomRules(IEnumerable<KeyValuePair<string, string>> rules)
+    {
+        var parsed = new List<(Regex, string)>();
+
+        foreach (var (parentPattern, childPatterns) in rules)
+        {
+            if (!parentPattern.StartsWith("*.", StringComparison.Ordinal))
+                continue;
+
+            string parentExtension = parentPattern[1..];
+            foreach (string child in childPatterns.Split(',', StringSplitOptions.RemoveEmptyEntries
+                                                              | StringSplitOptions.TrimEntries))
+            {
+                const string Capture = "${capture}";
+                if (!child.StartsWith(Capture, StringComparison.Ordinal))
+                    continue;
+
+                string suffix = child[Capture.Length..];
+                if (suffix.Length == 0)
+                    continue;
+
+                parsed.Add((SuffixRule(Regex.Escape(suffix)), parentExtension));
+            }
+        }
+
+        s_customRules = [.. parsed];
+        return parsed.Count;
+    }
+
     /// <summary>The file name this one should nest under, or null.</summary>
     internal static string? InferParentName(string fileName)
     {
         if (s_exactPairs.TryGetValue(fileName, out string? exact))
             return exact;
 
-        foreach (var (pattern, parentExtension) in s_rules)
+        foreach (var (pattern, parentExtension) in s_customRules.Concat(s_rules))
         {
             var match = pattern.Match(fileName);
             if (match.Success)

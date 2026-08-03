@@ -26,6 +26,7 @@ internal static class SolutionTreeEditHandler
                 "delete" => await DeleteAsync(p, ct),
                 "rename" => await RenameAsync(p, ct),
                 "move" => await MoveAsync(p, ct),
+                "copy" => await CopyAsync(p, ct),
                 _ => new SolutionTreeEditResult(false, $"Unknown action '{p.Action}'."),
             };
         }
@@ -126,6 +127,68 @@ internal static class SolutionTreeEditHandler
             return new SolutionTreeEditResult(false, "Could not tell where to move it.");
 
         return await MoveOrRenameAsync(source, Path.Combine(directory, Path.GetFileName(source)), ct);
+    }
+
+    /// <summary>
+    /// Copies a file into a folder, giving it a free name when one is taken.
+    /// </summary>
+    /// <remarks>
+    /// Paste and duplicate are the same operation — duplicate just pastes back into the folder
+    /// the file came from, which is why both land here rather than each getting an action.
+    /// The copy keeps the original's type name, so it does not compile until it is renamed;
+    /// that is what Visual Studio does too, and renaming it afterwards runs the type fixups.
+    /// </remarks>
+    private static async Task<SolutionTreeEditResult> CopyAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (LspConverters.UriToPath(p.TargetUri ?? "") is not { } source)
+            return new SolutionTreeEditResult(false, "Nothing to copy.");
+        if (DirectoryOf(p.DestinationUri) is not { } directory)
+            return new SolutionTreeEditResult(false, "Could not tell where to copy it.");
+        if (!File.Exists(source))
+            return new SolutionTreeEditResult(false, $"{Path.GetFileName(source)} no longer exists.");
+
+        string destination = FreeName(directory, Path.GetFileName(source));
+
+        try
+        {
+            Directory.CreateDirectory(directory);
+            File.Copy(source, destination);
+        }
+        catch (Exception ex)
+        {
+            return new SolutionTreeEditResult(false, $"Could not copy it: {ex.Message}");
+        }
+
+        if (FindProject(destination) is { } project)
+        {
+            await ProjectMutationService.IncludeExistingFileAsync(project, destination, ct);
+            ProjectEvaluationService.Evict(project);
+        }
+        await WorkspaceService.EvictAllAsync(ct);
+
+        return new SolutionTreeEditResult(
+            true, $"Copied to {Path.GetFileName(destination)}.",
+            LspConverters.PathToUri(destination));
+    }
+
+    /// <summary>Appends " copy", " copy 2", … until the name is free.</summary>
+    private static string FreeName(string directory, string fileName)
+    {
+        string stem = Path.GetFileNameWithoutExtension(fileName);
+        string extension = Path.GetExtension(fileName);
+
+        string candidate = Path.Combine(directory, fileName);
+        if (!File.Exists(candidate) && !Directory.Exists(candidate))
+            return candidate;
+
+        for (int i = 1; ; i++)
+        {
+            string suffix = i == 1 ? " copy" : $" copy {i}";
+            candidate = Path.Combine(directory, stem + suffix + extension);
+            if (!File.Exists(candidate) && !Directory.Exists(candidate))
+                return candidate;
+        }
     }
 
     /// <summary>

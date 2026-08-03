@@ -119,6 +119,7 @@ public class LspPolishTests
         var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.CalculatorFile);
 
         var tokens = await SemanticTokensHandler.SemanticTokensFullAsync(
+            "polish-session",
             new SemanticTokensParams(new TextDocumentIdentifier(
                 LspConverters.PathToUri(document.FilePath!))), default);
 

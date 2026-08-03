@@ -40,8 +40,20 @@ internal static class NavigationHandlers
         if (locations.Length > 0)
             return locations;
 
-        // Metadata symbol (framework/package type): decompile the containing type so
-        // go-to-definition lands in generated source instead of failing.
+        // Metadata symbol (framework/package type). Its own source first, if the assembly says
+        // where to get it: Source Link gives the file the author wrote, comments and all, where
+        // decompilation gives a faithful but stripped reconstruction of it.
+        if (await Services.SourceLinkService.TryResolveAsync(symbol, document.Project, ct) is { } linked)
+        {
+            var line = Math.Max(0, linked.Line - 1);
+            return
+            [
+                new LspLocation(
+                    LspConverters.PathToUri(linked.FilePath),
+                    new Protocol.Range(new Position(line, 0), new Position(line, 0))),
+            ];
+        }
+
         var decompiled = await Services.DecompiledSourceService.TryDecompileSymbolAsync(
             symbol, document.Project, ct);
         var location = decompiled?.Locations.FirstOrDefault(l => l.IsInSource);

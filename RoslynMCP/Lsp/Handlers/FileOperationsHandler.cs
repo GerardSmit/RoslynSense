@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Rename;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Services.ProjectModel;
 
 namespace RoslynMCP.Lsp.Handlers;
 
@@ -133,6 +134,91 @@ internal static class FileOperationsHandler
                 key: $"rename-failed:{filePath}");
             return [];
         }
+    }
+
+    /// <summary>
+    /// workspace/didCreateFiles: a <c>.cs</c> file made through the editor's own explorer
+    /// arrives empty, so it gets the namespace and type the Solution Explorer's "New file"
+    /// would have given it, and its project gets a compile item if it needs one.
+    /// </summary>
+    /// <remarks>
+    /// This is <em>did</em>Create rather than <em>will</em>Create on purpose: an edit against a
+    /// URI that does not exist yet is not something a client is obliged to apply, and VS Code
+    /// does not. Sending it afterwards through <c>workspace/applyEdit</c> lands in the buffer
+    /// the user is already looking at, and in their undo stack.
+    /// </remarks>
+    public static async Task DidCreateAsync(CreateFilesParams p, CancellationToken ct)
+    {
+        foreach (var file in p.Files)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            string path = LspConverters.UriToPath(file.Uri);
+            string? scaffold;
+            try
+            {
+                scaffold = await ProjectMutationService.ScaffoldNewFileAsync(path, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn($"Could not set up '{Path.GetFileName(path)}': {ex.Message}",
+                    key: $"scaffold-failed:{path}");
+                continue;
+            }
+
+            if (scaffold is not { Length: > 0 })
+                continue;
+
+            // The editor owns the buffer; writing the file underneath it would be overwritten
+            // by the next save. Fall back to disk only when no session took the edit.
+            if (!await LspSessionRegistry.TryApplyFullTextEditAsync(
+                    path, scaffold, $"Set up {Path.GetFileName(path)}", ct))
+            {
+                try { await File.WriteAllTextAsync(path, scaffold, ct); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    ServiceLog.Warn($"Could not write '{Path.GetFileName(path)}': {ex.Message}",
+                        key: $"scaffold-write-failed:{path}");
+                }
+            }
+        }
+
+        await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, ct);
+    }
+
+    /// <summary>
+    /// workspace/didDeleteFiles: drops the file from its project's item list and from the
+    /// loaded workspace, so a legacy project does not keep a <c>&lt;Compile&gt;</c> pointing at
+    /// nothing and the next navigation does not resolve into a file that is gone.
+    /// </summary>
+    public static async Task DidDeleteAsync(DeleteFilesParams p, CancellationToken ct)
+    {
+        bool touched = false;
+        foreach (var file in p.Files)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            string path = LspConverters.UriToPath(file.Uri);
+            if (!path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                await ProjectMutationService.ForgetDeletedFileAsync(path, ct);
+                touched = true;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn($"Could not clean up after '{Path.GetFileName(path)}': {ex.Message}",
+                    key: $"delete-cleanup-failed:{path}");
+            }
+        }
+
+        if (touched)
+            await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, ct);
     }
 
     private static bool IsIdentifier(string name) =>

@@ -1,0 +1,154 @@
+using System.Text.Json;
+using RoslynMCP.Config;
+using RoslynMCP.Lsp.Handlers;
+using RoslynMCP.Services.ProjectModel;
+using Xunit;
+
+namespace RoslynMCP.Tests;
+
+/// <summary>
+/// The settings path: what the editor sends at initialize and on change, and what it changes.
+/// </summary>
+/// <remarks>
+/// These write process-wide statics, so they restore what they found. They are in the shared
+/// collection for the same reason — a parallel test computing diagnostics under a flipped
+/// analyzer switch would be measuring the wrong thing.
+/// </remarks>
+[Collection(SharedState.Name)]
+public class LspConfigurationTests
+{
+    [Fact]
+    public void SettingsApplyFromTheClientsOwnSection()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        bool codeStyle = LspFeatureOptions.CodeStyleDiagnostics;
+        var timeout = LspFeatureOptions.AnalyzerTimeout;
+        string scope = LspFeatureOptions.WorkspaceDiagnosticsScope;
+        bool sourceLink = LspFeatureOptions.SourceLink;
+
+        try
+        {
+            bool changed = ConfigurationHandler.Apply(Settings("""
+                {
+                  "analyzerDiagnostics": false,
+                  "codeStyleDiagnostics": false,
+                  "analyzerTimeoutSeconds": 42,
+                  "workspaceDiagnostics": "solution",
+                  "sourceLink": false
+                }
+                """));
+
+            Assert.True(changed);
+            Assert.False(LspFeatureOptions.AnalyzerDiagnostics);
+            Assert.False(LspFeatureOptions.CodeStyleDiagnostics);
+            Assert.Equal(TimeSpan.FromSeconds(42), LspFeatureOptions.AnalyzerTimeout);
+            Assert.Equal("solution", LspFeatureOptions.WorkspaceDiagnosticsScope);
+            Assert.False(LspFeatureOptions.SourceLink);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+            LspFeatureOptions.CodeStyleDiagnostics = codeStyle;
+            LspFeatureOptions.AnalyzerTimeout = timeout;
+            LspFeatureOptions.WorkspaceDiagnosticsScope = scope;
+            LspFeatureOptions.SourceLink = sourceLink;
+        }
+    }
+
+    [Fact]
+    public void SettingsApplyWhenWrappedInTheirSectionName()
+    {
+        // didChangeConfiguration carries the section name; initializationOptions does not.
+        bool sourceLink = LspFeatureOptions.SourceLink;
+        try
+        {
+            ConfigurationHandler.Apply(Settings("""{"roslynSense": {"sourceLink": false}}"""));
+            Assert.False(LspFeatureOptions.SourceLink);
+        }
+        finally
+        {
+            LspFeatureOptions.SourceLink = sourceLink;
+        }
+    }
+
+    [Fact]
+    public void UnchangedSettingsDoNotInvalidateAnything()
+    {
+        // The return value is what decides whether every cached analyzer result is thrown away;
+        // saying "changed" for a no-op change would re-run analyzers on every settings save.
+        bool changed = ConfigurationHandler.Apply(Settings($$"""
+            {
+              "analyzerDiagnostics": {{(LspFeatureOptions.AnalyzerDiagnostics ? "true" : "false")}},
+              "analyzerTimeoutSeconds": 5
+            }
+            """));
+
+        Assert.False(changed);
+    }
+
+    [Fact]
+    public void MalformedSettingsAreIgnored()
+    {
+        Assert.False(ConfigurationHandler.Apply(null));
+        Assert.False(ConfigurationHandler.Apply(Settings("\"not an object\"")));
+        Assert.False(ConfigurationHandler.Apply(Settings("""{"analyzerDiagnostics": "yes please"}""")));
+    }
+
+    [Fact]
+    public void CustomFileNestingRulesNestWhatTheBuiltInsDoNot()
+    {
+        try
+        {
+            int accepted = FileNestingService.SetCustomRules([
+                new("*.bicep", "${capture}.bicepparam, ${capture}.parameters.json"),
+            ]);
+            Assert.Equal(2, accepted);
+
+            var nested = FileNestingService.Nest([
+                @"C:\repo\main.bicep",
+                @"C:\repo\main.bicepparam",
+                @"C:\repo\main.parameters.json",
+            ]);
+
+            var parent = Assert.Single(nested);
+            Assert.Equal(@"C:\repo\main.bicep", parent.FullPath);
+            Assert.Equal(2, parent.Children.Count);
+        }
+        finally
+        {
+            FileNestingService.SetCustomRules([]);
+        }
+    }
+
+    [Fact]
+    public void RulesThatCannotBeHonouredAreDroppedRatherThanApproximated()
+    {
+        try
+        {
+            int accepted = FileNestingService.SetCustomRules([
+                new("main.bicep", "${capture}.bicepparam"),   // parent is not *.ext
+                new("*.bicep", "*.bicepparam"),               // child has no ${capture}
+                new("*.bicep", "${capture}"),                 // child adds no suffix
+            ]);
+
+            Assert.Equal(0, accepted);
+        }
+        finally
+        {
+            FileNestingService.SetCustomRules([]);
+        }
+    }
+
+    [Fact]
+    public void NestingCanBeTurnedOff()
+    {
+        var flat = FileNestingService.Nest(
+            [@"C:\repo\Form1.cs", @"C:\repo\Form1.Designer.cs"], enabled: false);
+
+        Assert.Equal(2, flat.Count);
+        Assert.All(flat, f => Assert.Empty(f.Children));
+    }
+
+    private static JsonElement Settings(string json) =>
+        JsonDocument.Parse(json).RootElement.Clone();
+}

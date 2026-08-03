@@ -302,7 +302,7 @@ internal static class SolutionTreeHandler
             .Where(i => i.DependentUpon is not null)
             .ToDictionary(i => i.FullPath, i => i.DependentUpon!, StringComparer.OrdinalIgnoreCase);
 
-        foreach (var nested in FileNestingService.Nest(files, dependentUpon))
+        foreach (var nested in FileNestingService.Nest(files, dependentUpon, p.FileNesting))
         {
             nodes.Add(FileNode(projectPath, nested, projectFiles.ContainsKey(nested.FullPath)));
         }

@@ -56,11 +56,16 @@ public class RunTestsToolTests
     [Fact]
     public async Task WhenRunningTestProjectWithInvalidFilterThenReturnsNoTests()
     {
-        var testProjectPath = FindTestProjectPath();
-        if (testProjectPath is null) return;
+        // The small fixture, not this suite. Pointing at RoslynMCP.Tests.csproj made this one
+        // test restore and build every project in the solution and then run `dotnet test` on the
+        // very assembly hosting it — five minutes, and the self-nesting trap the test two above
+        // documents. A filter that matches nothing proves the same thing against 3 tests as
+        // against 1300.
+        if (!File.Exists(FixturePaths.DebugTestProjectFile))
+            return; // fixture not present
 
         var result = await RunTestsTool.RunTests(
-            testProjectPath,
+            FixturePaths.DebugTestProjectFile,
             new MarkdownFormatter(),
             new BackgroundTaskStore(),
             new BuildWarningsStore(),
@@ -70,23 +75,6 @@ public class RunTestsToolTests
         Assert.NotNull(result);
     }
 
-    private static string? FindTestProjectPath()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null)
-        {
-            var csproj = Path.Combine(dir.FullName, "RoslynMCP.Tests", "RoslynMCP.Tests.csproj");
-            if (File.Exists(csproj)) return csproj;
-            var sln = Path.Combine(dir.FullName, "RoslynMCP.sln");
-            if (File.Exists(sln))
-            {
-                csproj = Path.Combine(dir.FullName, "RoslynMCP.Tests", "RoslynMCP.Tests.csproj");
-                if (File.Exists(csproj)) return csproj;
-            }
-            dir = dir.Parent;
-        }
-        return null;
-    }
 
     [Fact]
     public void WhenFormattingFailedTestOutputThenIncludesErrorMessage()

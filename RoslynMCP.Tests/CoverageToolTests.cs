@@ -4,9 +4,52 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
-[Collection(SharedState.Name)]
-public class CoverageToolTests
+/// <summary>
+/// One real coverage run, shared by every test in the class.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Eight tests used to call <c>RunCoverageAsync</c> on the same fixture and then assert against
+/// the cache it fills — eight <c>dotnet test</c> runs with a collector attached, to observe one
+/// result.
+/// </para>
+/// <para>
+/// A class fixture rather than <see cref="IAsyncLifetime"/> on the test class itself: xUnit
+/// constructs a new instance of a test class for every test method, so per-instance setup would
+/// have run the collection once per test and made this worse rather than better.
+/// </para>
+/// </remarks>
+public sealed class CoverageFixture : IAsyncLifetime
 {
+    public CoverageResult Result { get; private set; } = null!;
+
+    public async Task InitializeAsync() =>
+        Result = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
+
+    /// <summary>
+    /// Re-collects only if a test emptied the cache.
+    /// </summary>
+    /// <remarks>
+    /// Several tests here clear it deliberately, to exercise the "run RunCoverage first" paths,
+    /// and xUnit promises no ordering — so a test that reads the cache has to ask for one rather
+    /// than assume the fixture's run is still sitting in it.
+    /// </remarks>
+    public async Task EnsureCachedAsync()
+    {
+        if (CoverageService.FindClassCoverage("Calculator").Count == 0)
+            Result = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
+    }
+
+    public Task DisposeAsync() => Task.CompletedTask;
+}
+
+[Collection(SharedState.Name)]
+public class CoverageToolTests : IClassFixture<CoverageFixture>
+{
+    private readonly CoverageFixture _fixture;
+
+    public CoverageToolTests(CoverageFixture fixture) => _fixture = fixture;
+
     // --- RunCoverage error handling ---
 
     [Fact]
@@ -227,7 +270,7 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenRunCoverageOnDebugTestProjectThenReturnsCoverageReport()
     {
-        var result = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
+        var result = _fixture.Result;
 
         Assert.True(result.Success, $"Coverage collection failed: {result.Message}");
         Assert.Contains("Coverage Report", result.Message);
@@ -251,9 +294,8 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenGetCoverageAfterRunThenReturnsMethodData()
     {
-        // Run coverage first
-        var runResult = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
-        Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
+        await _fixture.EnsureCachedAsync();
+        Assert.True(_fixture.Result.Success, $"Coverage failed: {_fixture.Result.Message}");
 
         // Query method coverage
         var methods = CoverageService.FindMethodCoverage("Add");
@@ -267,9 +309,8 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenGetCoverageAfterRunThenReturnsClassData()
     {
-        // Run coverage first
-        var runResult = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
-        Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
+        await _fixture.EnsureCachedAsync();
+        Assert.True(_fixture.Result.Success, $"Coverage failed: {_fixture.Result.Message}");
 
         // Query class coverage
         var classes = CoverageService.FindClassCoverage("Calculator");
@@ -295,9 +336,8 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenGetCoverageWithoutFiltersThenReturnsProjectOverview()
     {
-        // Run coverage first
-        var runResult = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
-        Assert.True(runResult.Success, $"Coverage failed: {runResult.Message}");
+        await _fixture.EnsureCachedAsync();
+        Assert.True(_fixture.Result.Success, $"Coverage failed: {_fixture.Result.Message}");
 
         // Query project-wide coverage (no filters)
         var result = await GetCoverageTool.GetCoverage(new MarkdownFormatter());
@@ -426,8 +466,8 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenGetMethodCoverageAfterRunThenShowsPerLineCoverage()
     {
-        var runResult = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
-        Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
+        await _fixture.EnsureCachedAsync();
+        Assert.True(_fixture.Result.Success, $"Coverage failed: {_fixture.Result.Message}");
 
         var result = await GetMethodCoverageTool.GetMethodCoverage(
             new MarkdownFormatter(), methodName: "Add");
@@ -441,8 +481,8 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenGetMethodCoverageAndFileUnchangedThenNoStalenessWarning()
     {
-        var runResult = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
-        Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
+        await _fixture.EnsureCachedAsync();
+        Assert.True(_fixture.Result.Success, $"Coverage failed: {_fixture.Result.Message}");
 
         // filePath narrows to Calculator.cs specifically — "CalculatorTests.cs" does not contain "Calculator.cs"
         var result = await GetMethodCoverageTool.GetMethodCoverage(
@@ -535,8 +575,8 @@ public class CoverageToolTests
     [Fact]
     public async Task WhenGetMethodCoverageAndFileUnchangedThenNoMethodChangedWarning()
     {
-        var runResult = await CoverageService.RunCoverageAsync(FixturePaths.DebugTestProjectFile);
-        Assert.True(runResult.Success, $"Coverage collection failed: {runResult.Message}");
+        await _fixture.EnsureCachedAsync();
+        Assert.True(_fixture.Result.Success, $"Coverage failed: {_fixture.Result.Message}");
 
         // filePath narrows to Calculator.cs specifically — "CalculatorTests.cs" does not contain "Calculator.cs"
         var result = await GetMethodCoverageTool.GetMethodCoverage(

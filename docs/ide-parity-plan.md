@@ -13,7 +13,9 @@ This plan covers the three tiers identified in the gap audit:
 | 3 | Debugger depth | Debugging feels like Rider, both for the user and for the AI mirror |
 
 Tier 4 (Razor/Blazor/XAML/WinForms designers, Source Link, code-style settings UI) is
-deliberately out of scope here.
+deliberately out of scope here. Razor and WebForms have since grown server-side language services
+anyway, though only the MCP surface can reach them — see
+[Gaps against VS and Rider](#gaps-against-vs-and-rider).
 
 ---
 
@@ -61,35 +63,115 @@ deliberately out of scope here.
 
 ---
 
+# Contents
+
+- [0. Ground rules](#0-ground-rules) · [Verified facts this plan depends on](#verified-facts-this-plan-depends-on)
+- [**Status**](#status) — [Tier 1](#tier-1-status) · [Tier 2](#tier-2-status) · [Tier 3](#tier-3-status) · [Tier M](#tier-m-status) · [Beyond the plan](#beyond-the-plan) · [Implementation notes](#implementation-notes)
+- [**What is still missing**](#what-is-still-missing) — [Debugger surface asymmetries](#debugger-surface-asymmetries) · [Gaps against VS and Rider](#gaps-against-vs-and-rider) · [Deliberately out of scope](#deliberately-out-of-scope)
+- [Tier 1 — Blockers](#tier-1--blockers)
+  - [T1.1 Analyzer diagnostics in the LSP surface](#t11-analyzer-diagnostics-in-the-lsp-surface)
+  - [T1.2 Real debugging (F5) without ms-dotnettools.csharp](#t12-real-debugging-f5-without-ms-dotnettoolscsharp)
+  - [T1.3 Test Explorer](#t13-test-explorer)
+  - [T1.4 `workspace/didChangeWatchedFiles`](#t14-workspacedidchangewatchedfiles)
+- [Tier 2 — Parity](#tier-2--parity)
+  - [T2.1 Solution Explorer (Rider-grade)](#t21-solution-explorer-rider-grade)
+  - [T2.2 NuGet management (WebView, Rider-style)](#t22-nuget-management-webview-rider-style)
+  - [T2.3 Progress reporting (`$/progress`)](#t23-progress-reporting-progress)
+  - [T2.4 Refresh fan-out for lenses and hints](#t24-refresh-fan-out-for-lenses-and-hints)
+  - [T2.5 Build tasks and problem matcher](#t25-build-tasks-and-problem-matcher)
+  - [T2.6 Workspace-wide diagnostics](#t26-workspace-wide-diagnostics)
+  - [T2.7 File rename → symbol and namespace fixups](#t27-file-rename--symbol-and-namespace-fixups)
+  - [T2.8 Completion snippets](#t28-completion-snippets) · [T2.9 Semantic token modifiers](#t29-semantic-token-modifiers) · [T2.10 User-visible server messages](#t210-user-visible-server-messages)
+  - [T2.11 Multi-root and multiple solutions](#t211-multi-root-and-multiple-solutions)
+  - [T2.12 Metadata as source](#t212-metadata-as-source)
+- [Tier 3 — Debugger depth](#tier-3--debugger-depth)
+  - [T3.1 Structured debug data in the backend](#t31-structured-debug-data-in-the-backend)
+  - [T3.2 AI mirror adapter fidelity](#t32-ai-mirror-adapter-fidelity)
+  - [T3.3 Hit counts and logpoints](#t33-hit-counts-and-logpoints)
+  - [T3.4 Data breakpoints — implemented by emulation](#t34-data-breakpoints--implemented-by-emulation)
+  - [T3.5 .NET Framework native debugging](#t35-net-framework-native-debugging)
+  - [T3.6 Hot Reload — implemented as real Edit-and-Continue](#t36-hot-reload--implemented-as-real-edit-and-continue)
+- [Tier M — MCP surface](#tier-m--mcp-surface)
+  - [TM.1 Analyzer diagnostics on the MCP path](#tm1-analyzer-diagnostics-on-the-mcp-path-rides-t11) · [TM.2 Project and package mutation](#tm2-project-and-package-mutation) · [TM.3 Editor context](#tm3-editor-context)
+  - [TM.4 Structured tests and formatting](#tm4-structured-tests-and-formatting) · [TM.5 Debugger tools](#tm5-debugger-tools-for-the-structured-backend-rides-t31) · [TM.6 Symmetry checklist](#tm6-symmetry-checklist)
+- [Sequencing](#sequencing) · [Cross-cutting acceptance test](#cross-cutting-acceptance-test)
+
+---
+
 # Status
 
-| Item | State |
-| --- | --- |
-| T1.1 analyzer diagnostics (+ TM.1 MCP fixes) | Done |
-| T1.4 watched files | Done |
-| T2.3 `$/progress` · T2.4 refresh fan-out | Done |
-| T1.2 native F5 (netcoredbg DAP) | Done |
-| T1.3 Test Explorer | Done |
-| T2.8–T2.10 snippets, token modifiers, user-visible messages | Done |
-| T2.1 Solution Explorer | Done — search and reveal endpoints, drag-and-drop, add/delete/rename from the tree, generated-file nodes |
-| T2.2 NuGet panel | Done — webview plus `NuGetService` (real NuGet.config sources, search/versions/installed/updates/consolidations, CLI-backed mutations, icon proxy) |
-| T2.5 build tasks | Done (task provider + `$msCompile`); build-error DiagnosticCollection ships with T1.2's launch path |
-| T2.7 file rename fixups | Done (`workspace/willRenameFiles` renames the matching type and its references) |
-| TM.3 editor context | Done (`EditorContextStore`, `roslynSense/editorContext`, `get_editor_context`) |
-| T2.6 workspace diagnostics | Done (`workspace/diagnostic`, scoped off/openProjects/solution, analyzers cache-only) |
-| T3.1 structured debug data | Done (`StackFrameInfo`/`VariableInfo`/`ThreadInfo`, lazy child expansion, both engines) |
-| T3.2 AI mirror fidelity | Done (real stacks, variable trees, pause, terminate, setVariable, exception filters and info) |
-| T3.3 hit counts and logpoints | Done — emulated in `PublishingDebugBackend`; unavailable in the native session, as netcoredbg advertises neither |
-| T3.4 data breakpoints | Done — emulated by step-and-compare in `DataBreakpointWatcher`, on both runtimes; `write` access only |
-| TM.5 debugger tools | Done (`debug_pause`, `debug_select_frame`, `debug_expand`, `debug_set_variable`) |
-| TM.2 project and package mutation | Done (packages via `NuGetService`; references, add/delete file, create project, add to solution via `ProjectMutationService`) |
-| TM.4 structured tests and formatting | Done (`get_test_failures` over a recorded run history, `format_document`, `rename_file`) |
-| T2.11 multi-root | Done — solution bound per workspace folder, one client per solution, binding follows the focused editor |
-| T2.12 metadata as source | Done — one `roslynSense/virtualDocument` resolver behind `roslynsense-generated:` and `roslynsense-metadata:`, plus generated-file nodes in the tree |
-| T3.5 .NET Framework debugging | Done — `roslyn-sense --dap` serves DAP over the ICorDebug backend; the extension selects it for Framework targets |
-| T3.6 Hot Reload | Done on both runtimes — CoreCLR in-process via `RoslynMCP.HotReloadAgent`, .NET Framework via `ICorDebugModule2::ApplyChanges` from a break state. Each proven end to end against a live process |
+Every numbered item in this plan is implemented as designed. What follows records **how** each one
+landed, and what shipped beyond it.
 
-Notes from implementation, kept because they change what the remaining work can assume:
+## Tier 1 status
+
+| Item | State | Delivered as |
+| --- | --- | --- |
+| T1.1 analyzer diagnostics | Done | `AnalyzerService.RunDocumentAnalyzersAsync`, `AnalyzerDiagnosticCache`, two-phase `DiagnosticsPublisher`, IDE analyzers reflected out of the Features assemblies, and Roslyn's `IConfigurationFixProvider` exports for suppress/configure — with reserved lightbulb slots so they cannot be crowded out |
+| T1.2 native F5 | Done | `LaunchHandler` (`launchTargets`, `attachTargets`, `debuggerPath`), `debugLaunch.ts`; netcoredbg `--interpreter=vscode` for CoreCLR, `roslyn-sense --dap` for Framework |
+| T1.3 Test Explorer | Done | `TestDiscoveryService`/`TrxParser`/`TestRunService` + `TestHandler` + `testController.ts`, with run, debug and coverage profiles; `roslynSense/testRunEvent` reports each test as it finishes and streams console output, `roslynSense/testCancel` kills the test host, and coverage carries branch counts |
+| T1.4 watched files | Done | `WatchedFilesHandler` with 500 ms coalescing, rename pairing, project/`.editorconfig` eviction; `synchronize.fileEvents` on the client. `workspace/didCreateFiles` scaffolds a file made through the editor's own explorer; `didDeleteFiles` drops it from its project |
+
+## Tier 2 status
+
+| Item | State | Delivered as |
+| --- | --- | --- |
+| T2.1 Solution Explorer | Done | `SolutionFileService`, `ProjectEvaluationService`, `FileNestingService`, three tree handlers, `solutionExplorer.ts` — solution folders, Dependencies subtree, show-all-files, filter, go-to-node, reveal, drag-and-drop, add/delete/rename, cut/copy/paste/duplicate, `Alt+Insert` new item, `F5` set-as-startup-and-debug, package details, and a nesting toggle with user-defined rules |
+| T2.2 NuGet panel | Done | `NuGetService` (real NuGet.config chain, search/versions/installed/updates/consolidations, `dotnet`-backed mutations, icon proxy) + `nugetPanel.ts`; `PackagesConfigService` covers legacy projects |
+| T2.3 `$/progress` | Done | `LspProgress` + `ProgressReporter`, on solution load, restore, reload, debugger provisioning, test runs |
+| T2.4 refresh fan-out | Done | `RefreshKind` flags through `ScheduleClientRefresh`; diagnostics, code lens and inlay hints all re-request |
+| T2.5 build tasks | Done | `taskProvider.ts` + `$msCompile`; build errors reach Problems through T1.2's launch path |
+| T2.6 workspace diagnostics | Done | `WorkspaceDiagnosticsHandler`, scoped `off`/`openProjects`/`solution`, analyzers read cache-only |
+| T2.7 file rename fixups | Done | `FileOperationsHandler` on `workspace/willRenameFiles` — renames the matching type and its references |
+| T2.8–T2.10 snippets, token modifiers, messages | Done | `InsertTextFormat` with real placeholders; ten semantic token modifiers; `LspLog` fanning `logMessage`/`showMessage` |
+| — settings | Done | `analyzerDiagnostics`, `codeStyleDiagnostics`, `analyzerTimeoutSeconds`, `workspaceDiagnostics`, `sourceLink`, `solutionExplorer.fileNesting` and `fileNesting.rules` are contributed to VS Code and applied through `workspace/didChangeConfiguration` without a restart |
+| T2.11 multi-root | Done | Solution bound per workspace folder, one client per solution, binding follows the focused editor |
+| T2.12 metadata as source | Done | One `roslynSense/virtualDocument` resolver behind `roslynsense-generated:` and `roslynsense-metadata:`; `LspDocumentResolver` accepts both so hover and navigation work inside them |
+
+## Tier 3 status
+
+| Item | State | Delivered as |
+| --- | --- | --- |
+| T3.1 structured debug data | Done | `StackFrameInfo`/`VariableInfo`/`ThreadInfo`, lazy child expansion, both engines |
+| T3.2 AI mirror fidelity | Done | Real stacks, variable trees, pause, terminate, `setVariable`, exception filters and `exceptionInfo` |
+| T3.3 hit counts and logpoints | Done | Emulated in `PublishingDebugBackend`; reaches the MCP tools, the AI mirror and the Framework DAP — **not** the netcoredbg session |
+| T3.4 data breakpoints | Done | Step-and-compare in `DataBreakpointWatcher`, both runtimes, `write` access only, one statement late |
+| T3.5 .NET Framework debugging | Done | `roslyn-sense --dap` over the ICorDebug backend; the extension selects it whenever the target is Framework |
+| T3.6 Hot Reload | Done | CoreCLR in-process via `RoslynMCP.HotReloadAgent`; Framework via `ICorDebugModule2::ApplyChanges` from a break state. Each proven end to end against a live process |
+| — run to cursor, set next statement, modules, detach | Done | Widened `IDebugEngine`; `DebugNavigationTool` for the AI, `gotoTargets`/`goto` in the Framework DAP. **Not surfaced in the AI mirror adapter** |
+| — Framework exception settings | Done | `ExceptionFilters` honored by the ICorDebug backend; the Framework DAP advertises the `all` filter |
+
+## Tier M status
+
+| Item | State | Delivered as |
+| --- | --- | --- |
+| TM.1 analyzer diagnostics on MCP | Done | `AnalyzerOptions` fix, project-scope analyzers, `get_solution_diagnostics` |
+| TM.2 project and package mutation | Done | `ProjectMutationService` + `NuGetService`; packages, references, add/delete file, create project, add to solution |
+| TM.3 editor context | Done | `EditorContextStore`, `roslynSense/editorContext`, `get_editor_context`, prompt-hook injection |
+| TM.4 structured tests and formatting | Done | `get_test_failures` over a recorded run history, `format_document`, `rename_file` |
+| TM.5 debugger tools | Done | `debug_pause`, `debug_select_frame`, `debug_expand`, `debug_set_variable`, plus the navigation tools above |
+
+## Beyond the plan
+
+Shipped since the plan was written, and not tracked by any item in it:
+
+| Capability | Delivered as |
+| --- | --- |
+| .NET Framework across the whole tool surface | `NetFxToolchain`, `ReferenceAssemblyRedirector`, legacy project mutation, `packages.config` management, Framework test runs |
+| Classic ASP.NET F5 under IIS Express | Launch targets of kind `aspnetClassic`, plus WebForms `.aspx` source mapping |
+| Change Signature and Move Type to File | `RefactoringService`, exposed through `RefactorTool` |
+| Relevance-ranked completion | `RoslynMCP/Lsp/Completion/` — ordering by match quality rather than alphabetically |
+| Per-build daemon keying | `HostPaths` salts the solution key with the server assembly's MVID, so a rebuilt server never reuses a stale daemon |
+| Profiling, memory and database tooling | `ProfileTool`, `MemoryTool`, `DatabaseTool` and their services — an MCP-only surface with no editor counterpart |
+| Razor and WebForms language services | `Tools/Razor/*`, `Tools/WebForms/*` — **MCP-only**, see [gaps](#gaps-against-vs-and-rider) |
+| Source Link | `SourceLinkService` reads the Source Link map out of a dependency's portable PDB, resolves the declaring document, downloads it, and verifies it against the checksum the PDB recorded before go-to-definition lands in it. Decompilation is the fallback for every failure — no PDB, no map, unreachable host, checksum mismatch |
+| Inline debug values | `textDocument/inlineValue` — locals, parameters and field accesses in the stopped frame's own method, up to the stopped line. The server says *what* to resolve and the client resolves it against whichever session is stopped, so it works on all three debug surfaces without any of them knowing |
+| Expand selection, linked editing | `textDocument/selectionRange` walks the syntax tree outward; `textDocument/linkedEditingRange` covers locals, parameters, range variables, labels and method type parameters — the symbols whose every reference is provably in the file |
+| Semantic tokens on large files | `semanticTokens/range` for what is on screen, and `semanticTokens/full/delta` against a per-session baseline, so an edit sends the changed span rather than every token in the file |
+
+## Implementation notes
+
+Kept because they change what the remaining work can assume:
 
 - `AnalyzerService.RunAnalyzersAsync` now takes a nullable `filePath` (null = whole project) and
   passes `project.AnalyzerOptions`. Both were bugs: project-scope requests ran no analyzers, and
@@ -103,6 +185,54 @@ Notes from implementation, kept because they change what the remaining work can 
 - Test discovery resolves attributes semantically. Writing a `FactAttribute` into a project's own
   namespace shadows Xunit's for that whole namespace — which is correct behavior, and worth
   remembering when adding fixtures.
+
+---
+
+# What is still missing
+
+Every numbered item in the plan is now implemented as designed. What remains is in two groups:
+where the three debug surfaces disagree with each other, and where the product is behind Visual
+Studio and Rider on ground the plan never covered.
+
+## Debugger surface asymmetries
+
+Three DAP surfaces exist and they are not equivalent. This is the single largest source of "it
+works for the AI but not for me", so it is worth stating flatly.
+
+| Capability | Native F5, CoreCLR (netcoredbg) | Native F5, Framework (`--dap`) | AI mirror adapter |
+| --- | --- | --- | --- |
+| Conditional breakpoints | yes | yes | yes |
+| Hit-count breakpoints | **no** | yes (emulated) | yes (emulated) |
+| Logpoints | **no** | yes (emulated) | yes (emulated) |
+| Data breakpoints | **no** | yes (emulated) | yes (emulated) |
+| Run to cursor / set next statement | **no** | yes | **no** |
+| Modules view | **no** | **no** (engine has it; no DAP `modules` request) | **no** |
+| Exception filters | `all`, `user-unhandled` | `all` only | `all`, `user-unhandled` |
+| Hot Reload | yes, and without a debugger at all | yes, from a break state only | via the MCP tools |
+| `setVariable`, `evaluate`, variable trees | yes | yes | yes |
+
+The netcoredbg column is not ours to fix: those rows are absent from its `initialize` response and
+the emulation in `PublishingDebugBackend` sits behind our own backend, which that session does not
+use. Closing it means either an adapter of our own in front of netcoredbg, or routing the CoreCLR
+F5 session through `PublishingDebugBackend` the way the Framework one already is. The other two
+columns are ours: `modules` and `gotoTargets` in the AI adapter are small, contained additions.
+
+## Gaps against VS and Rider
+
+Ground the plan never covered, ordered by how often it would be noticed.
+
+| Gap | Detail |
+| --- | --- |
+| **Razor, Blazor and WebForms get no editor features.** `Tools/Razor/*` and `Tools/WebForms/*` implement go-to-definition, rename, outline, find-usages and diagnostics for `.razor` and `.aspx` — but only for MCP. The LSP `documentSelector` is `[{ scheme: 'file', language: 'csharp' }]`, so opening a `.razor` file in VS Code gets nothing. The server-side work is done; the wiring is not |
+| **Which branch ran is unknown.** Cobertura records how many of a line's branches were taken, not which. The coverage view therefore reports "1 of 2" correctly but cannot colour the arms; naming one would be inventing detail the format does not carry |
+| **Source Link resolves by name, not by token.** There is no public map from an `ISymbol` to a metadata token, so a method is matched by name and every overload resolves to the same declaration line. They are always in one file, so navigation lands correctly; the line can be a sibling overload's |
+
+## Deliberately out of scope
+
+Unchanged from the original Tier 4 decision, and still not planned: XAML and WinForms visual
+designers, a code-style settings UI, and anything that would need a design surface rather than a
+text buffer. Designer *regeneration* is supported for `.aspx` and `.dbml`
+(`Services/Designers/`) — that is code generation, not a designer.
 
 ---
 
@@ -1147,6 +1277,10 @@ New capability lands with a deliberate answer for both surfaces:
 ---
 
 # Sequencing
+
+Historical — every step below has shipped. Kept because the order it was built in explains why
+several things depend on each other, and because the reasoning still applies to the items in
+[What is still missing](#what-is-still-missing).
 
 Ordered by value per unit of risk. Each numbered step is independently shippable and testable.
 

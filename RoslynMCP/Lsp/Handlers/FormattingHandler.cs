@@ -13,36 +13,39 @@ internal static class FormattingHandler
     public static Task<TextEdit[]> FormatRangeAsync(DocumentRangeFormattingParams p, CancellationToken ct) =>
         FormatCoreAsync(p.TextDocument, p.Range, ct);
 
-    /// <summary>textDocument/onTypeFormatting: after ";" or "}" formats the enclosing
-    /// statement/member; after newline re-indents the previous and current line. This is
-    /// what gives fresh lines the correct indentation as you type.</summary>
+    /// <summary>
+    /// textDocument/onTypeFormatting: after ";" or "}", formats the enclosing statement or
+    /// member.
+    /// </summary>
+    /// <remarks>
+    /// Newline is deliberately not a trigger. Roslyn's formatter indents lines that contain a
+    /// token, and the line under the caret after Enter contains none — so formatting a span
+    /// that reaches into it removes the indentation the editor had just inserted and the caret
+    /// jumps to column zero. Indenting a line that has nothing on it yet is a different service
+    /// from formatting one that does, which is why Roslyn's own IDE keeps them apart and why
+    /// its language server does not register newline either. The editor's bracket-based
+    /// auto-indent handles Enter correctly on its own.
+    /// </remarks>
     public static async Task<TextEdit[]> FormatOnTypeAsync(
         DocumentOnTypeFormattingParams p, CancellationToken ct)
     {
+        // Defensive: a client that triggers on newline anyway gets nothing rather than an edit
+        // that unindents it.
+        if (p.Character is not (";" or "}"))
+            return Array.Empty<TextEdit>();
+
         var resolved = await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct);
         if (resolved is not var (document, text, offset))
             return Array.Empty<TextEdit>();
 
-        TextSpan span;
-        if (p.Character == "\n")
-        {
-            int startLine = Math.Max(0, p.Position.Line - 1);
-            span = TextSpan.FromBounds(
-                text.Lines[startLine].Start,
-                text.Lines[Math.Min(p.Position.Line, text.Lines.Count - 1)].End);
-        }
-        else
-        {
-            var root = await document.GetSyntaxRootAsync(ct);
-            var node = root?.FindToken(Math.Max(0, offset - 1)).Parent?
-                .AncestorsAndSelf()
-                .FirstOrDefault(n => n is StatementSyntax or MemberDeclarationSyntax);
-            if (node is null)
-                return Array.Empty<TextEdit>();
-            span = node.Span;
-        }
+        var root = await document.GetSyntaxRootAsync(ct);
+        var node = root?.FindToken(Math.Max(0, offset - 1)).Parent?
+            .AncestorsAndSelf()
+            .FirstOrDefault(n => n is StatementSyntax or MemberDeclarationSyntax);
+        if (node is null)
+            return Array.Empty<TextEdit>();
 
-        var formatted = await Formatter.FormatAsync(document, span, cancellationToken: ct);
+        var formatted = await Formatter.FormatAsync(document, node.Span, cancellationToken: ct);
         var changes = await formatted.GetTextChangesAsync(document, ct);
         return changes
             .Select(c => new TextEdit(LspConverters.ToRange(text.Lines, c.Span), c.NewText ?? ""))

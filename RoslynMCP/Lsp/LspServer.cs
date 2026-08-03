@@ -130,9 +130,11 @@ internal sealed class LspServer : IDisposable
             CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
             DocumentRangeFormattingProvider = true,
+            // Not newline: see FormatOnTypeAsync. Registering it made Enter unindent the line
+            // it had just created.
             DocumentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions(
                 FirstTriggerCharacter: ";",
-                MoreTriggerCharacter: ["}", "\n"]),
+                MoreTriggerCharacter: ["}"]),
             FoldingRangeProvider = true,
             CallHierarchyProvider = true,
             TypeHierarchyProvider = true,

@@ -56,6 +56,22 @@ internal static class ProtoNavigationHandler
         if (!typeDefinition && hit.IsReference && DeclarationLocation(hit) is { } declared)
             return [declared];
 
+        // The hand-written code first. A caret on a service or an rpc is asking where the contract
+        // is honoured, and protoc's answer to that is an abstract method with no body — a file the
+        // next build rewrites, which is what F12 kept landing in. Go-to-implementation gives the
+        // same answer for these two on purpose: with an implementation in the solution there is no
+        // second destination worth offering, and where there is none the fall-through below still
+        // reaches the generated class rather than leaving the key dead.
+        if (!typeDefinition && view.Project is { } project)
+        {
+            var implementations =
+                await ProtoReferenceService.FindImplementationsAsync(
+                    hit, view.Index, project, ct, ProtoReferenceService.ExplicitSearchBudget);
+
+            if (implementations.Length > 0)
+                return await SymbolLocationsAsync(implementations, project, ct);
+        }
+
         return await GeneratedLocationsAsync(view, hit, typeDefinition, ct);
     }
 
@@ -75,7 +91,8 @@ internal static class ProtoNavigationHandler
         // and an rpc have implementations; sending a caret on a message to the generated class it is
         // already bound to would dress an empty answer up as a result.
         return await SymbolLocationsAsync(
-            await ProtoReferenceService.FindImplementationsAsync(hit, view.Index, project, ct),
+            await ProtoReferenceService.FindImplementationsAsync(
+                hit, view.Index, project, ct, ProtoReferenceService.ExplicitSearchBudget),
             project, ct);
     }
 
@@ -107,7 +124,8 @@ internal static class ProtoNavigationHandler
         }
 
         return await UsageLocationsAsync(
-            await ProtoReferenceService.FindUsagesAsync(hit, view.Index, project, ct),
+            await ProtoReferenceService.FindUsagesAsync(
+                hit, view.Index, project, ct, ProtoReferenceService.ExplicitSearchBudget),
             project, p.Context.IncludeDeclaration, ct);
     }
 

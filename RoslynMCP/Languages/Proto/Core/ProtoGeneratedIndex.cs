@@ -70,6 +70,31 @@ internal sealed class ProtoGeneratedIndex
     private readonly Dictionary<ISymbol, ProtoDeclarationRef> _reverse =
         new(SymbolEqualityComparer.Default);
 
+    /// <summary>
+    /// The same map again, keyed by something that survives leaving the compilation the index was
+    /// built from.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Not redundancy. A <c>.proto</c> lives in a contracts project and the caret asking about it
+    /// sits in a consumer, and a consumer does not see the contract's <em>source</em> symbols: for a
+    /// project reference Roslyn hands it a metadata or retargeting assembly instead, whose members
+    /// compare unequal to the source members under every comparer including
+    /// <see cref="SymbolEqualityComparer"/>, which only ever claimed to answer within one
+    /// compilation. Keying on the symbols themselves therefore works in exactly the layout that
+    /// never occurs — a caret beside its own generated code — and misses every real one, which
+    /// presents as F12 landing in <c>obj</c> with the pack apparently switched off.
+    /// </para>
+    /// <para>
+    /// The key is the documentation comment id, which names a member by its declaration rather than
+    /// by its instance and so reads the same from either side, qualified by the assembly so that two
+    /// projects declaring the same fully-qualified name cannot answer for each other. The symbol map
+    /// stays and is tried first because it is the cheaper lookup and it covers the symbols this
+    /// index built itself.
+    /// </para>
+    /// </remarks>
+    private readonly Dictionary<string, ProtoDeclarationRef> _reverseByKey = new(StringComparer.Ordinal);
+
     private readonly HashSet<DocumentId> _generated = [];
 
     private readonly HashSet<string> _generatedPaths = new(StringComparer.OrdinalIgnoreCase);
@@ -199,8 +224,19 @@ internal sealed class ProtoGeneratedIndex
     {
         var definition = symbol.OriginalDefinition;
 
-        if (_reverse.TryGetValue(definition, out var found))
-            return found;
+        if (Exact(definition) is { } direct)
+            return direct;
+
+        // `new Widget()` binds to the constructor protoc emitted, not to the class — and a
+        // constructor stands for no proto declaration of its own, so without this the most ordinary
+        // caret in a consumer is the one the pack declines to answer for. Constructors only: every
+        // other member of a generated class stands for something, and walking out to the containing
+        // type would answer "the message" for a caret on one of its fields.
+        if (definition is IMethodSymbol { MethodKind: MethodKind.Constructor, ContainingType: { } owner }
+            && Exact(owner.OriginalDefinition) is { } declaring)
+        {
+            return declaring;
+        }
 
         if (!includeInherited)
             return null;
@@ -213,20 +249,45 @@ internal sealed class ProtoGeneratedIndex
              method is not null;
              method = method.OverriddenMethod)
         {
-            if (_reverse.TryGetValue(method.OriginalDefinition, out found))
-                return found;
+            if (Exact(method.OriginalDefinition) is { } inherited)
+                return inherited;
         }
 
         for (var type = (definition as INamedTypeSymbol)?.BaseType;
              type is not null;
              type = type.BaseType)
         {
-            if (_reverse.TryGetValue(type.OriginalDefinition, out found))
-                return found;
+            if (Exact(type.OriginalDefinition) is { } inherited)
+                return inherited;
         }
 
         return null;
     }
+
+    /// <summary>One symbol, looked up both ways round.</summary>
+    private ProtoDeclarationRef? Exact(ISymbol definition)
+    {
+        if (_reverse.TryGetValue(definition, out var found))
+            return found;
+
+        return ReverseKey(definition) is { } key && _reverseByKey.TryGetValue(key, out found)
+            ? found
+            : null;
+    }
+
+    /// <summary>
+    /// A symbol's identity as a string, or <c>null</c> when it has none worth keying on.
+    /// </summary>
+    /// <remarks>
+    /// The assembly is part of the key rather than an afterthought: the caret's own project is a
+    /// candidate index of last resort, so without it a project that happened to declare a type of
+    /// the same fully-qualified name as a generated one would be answered for by a
+    /// <c>.proto</c> it has nothing to do with.
+    /// </remarks>
+    private static string? ReverseKey(ISymbol symbol) =>
+        symbol.GetDocumentationCommentId() is { Length: > 0 } id
+            ? $"{symbol.ContainingAssembly?.Name} {id}"
+            : null;
 
     private ServiceBinding? Binding(ProtoService service) =>
         _services.TryGetValue(service.FullName, out var found) ? found : null;
@@ -1366,7 +1427,14 @@ internal sealed class ProtoGeneratedIndex
     /// declaration it was generated from, which is what a caret in C# asks.</summary>
     private void Record(ISymbol? symbol, ProtoFile file, ProtoDeclaration declaration)
     {
-        if (symbol is not null)
-            _reverse.TryAdd(symbol, new ProtoDeclarationRef(file.FilePath, declaration.FullName, declaration.Kind));
+        if (symbol is null)
+            return;
+
+        var reference = new ProtoDeclarationRef(file.FilePath, declaration.FullName, declaration.Kind);
+
+        _reverse.TryAdd(symbol, reference);
+
+        if (ReverseKey(symbol) is { } key)
+            _reverseByKey.TryAdd(key, reference);
     }
 }

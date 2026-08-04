@@ -16,13 +16,14 @@ namespace RoslynMCP.Languages.Proto.Tools;
 /// front-end has to choose. This one chooses by what would move the caller: a <b>reference</b>
 /// names something written elsewhere, so the <c>message</c> or <c>enum</c> it points at is the
 /// answer and the generated class is a footnote; a <b>declaration name</b> is already sitting on
-/// the proto definition, so the only answer that goes anywhere is the C# protoc built from it.
+/// the proto definition, so the answer is the C# on the other end of it — the hand-written
+/// implementation where there is one, and what protoc built otherwise.
 /// </para>
 /// <para>
 /// That second case is handed to <see cref="GoToDefinitionSnippetTool.FormatDefinitionAsync"/>
 /// rather than formatted here, so navigating from <c>service WidgetService</c> produces the same
-/// report a C# caret on the generated class would — including the member table, which is the list
-/// of rpcs an implementer has to override.
+/// report a C# caret on the class would — including the member table, which is the list of rpcs an
+/// implementer has to override.
 /// </para>
 /// </remarks>
 internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandler
@@ -51,10 +52,32 @@ internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandle
         if (hit is null)
             return $"No proto declaration or reference found for '{markup!.MarkedText}'.";
 
-        if (hit.TypeRef is null && hit.Symbol is { } symbol && view.Project is { } project)
+        if (hit.TypeRef is null && view.Project is { } project)
         {
-            return await GoToDefinitionSnippetTool.FormatDefinitionAsync(
-                symbol, project, contextLines, fmt, cancellationToken);
+            // The hand-written code first, exactly as the editor's F12 does. A caret on a service or
+            // an rpc is asking where the contract is honoured, and protoc's answer to that is an
+            // abstract method with no body in a file the next build rewrites.
+            var implementations = await ProtoReferenceService.FindImplementationsAsync(
+                hit, view.Index, project, cancellationToken, ProtoReferenceService.ExplicitSearchBudget);
+
+            if (implementations.FirstOrDefault() is { } implementation)
+            {
+                string report = await GoToDefinitionSnippetTool.FormatDefinitionAsync(
+                    implementation, project, contextLines, fmt, cancellationToken);
+
+                // Said rather than silently dropped: this tool reports one definition, and a service
+                // implemented twice is a fact the caller has to hear from somewhere.
+                return implementations.Length == 1
+                    ? report
+                    : $"{report}{Environment.NewLine}_{implementations.Length} implementations; the " +
+                      $"first is shown. Use `find_implementations` for the rest._{Environment.NewLine}";
+            }
+
+            if (hit.Symbol is { } symbol)
+            {
+                return await GoToDefinitionSnippetTool.FormatDefinitionAsync(
+                    symbol, project, contextLines, fmt, cancellationToken);
+            }
         }
 
         return hit.Kind switch

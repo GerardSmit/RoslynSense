@@ -148,11 +148,13 @@ public class ProtoToolsTests : IDisposable
             typeDefinition: false,
             default);
 
-        // The caret is already on the declaration, so the only answer that goes anywhere is the C#
-        // protoc built from it — the virtual method a server implementation overrides.
+        // The caret is already on the declaration, so the answer is the code on the other end of it:
+        // the hand-written override, not the abstract method protoc wrote into a file the next build
+        // rewrites. Asserted here as well as in the LSP tests because an AI session and the editor
+        // reading one caret differently is the drift the shared core exists to prevent.
         var location = Assert.Single(editor);
         Assert.EndsWith(
-            "WidgetsGrpc.cs",
+            "WidgetGrpcService.cs",
             LspConverters.UriToPath(location.Uri),
             StringComparison.OrdinalIgnoreCase);
 

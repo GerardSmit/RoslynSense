@@ -63,7 +63,8 @@ internal class ProtoFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
         if (hit is null)
             return $"No proto declaration or reference found for '{markup!.MarkedText}'.";
 
-        var usages = await ProtoReferenceService.FindUsagesAsync(hit, view.Index, project, cancellationToken);
+        var usages = await ProtoReferenceService.FindUsagesAsync(
+            hit, view.Index, project, cancellationToken, ProtoReferenceService.ExplicitSearchBudget);
 
         return await FormatAsync(
             view, hit, markup!, usages, systemPath, project, maxResults, cancellationToken);

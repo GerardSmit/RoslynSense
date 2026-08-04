@@ -81,13 +81,24 @@ internal static class ProtoReferenceService
     /// an rpc's set includes the overrides of its virtual method for the same reason. Both are
     /// declarations in other projects, so neither can be read off the index.
     /// </remarks>
+    public static Task<ImmutableArray<ISymbol>> SymbolSetForAsync(
+        ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct) =>
+        SymbolSetForAsync(hit.Target, hit.Symbol, index, project, ct);
+
+    /// <summary>
+    /// The same set for a declaration reached without a caret in the <c>.proto</c>.
+    /// </summary>
+    /// <param name="target">The declaration the search is about.</param>
+    /// <param name="fallback">What to search when the declaration is of a kind with no set of its
+    /// own, which is the caret's own symbol when there was a caret.</param>
     public static async Task<ImmutableArray<ISymbol>> SymbolSetForAsync(
-        ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct)
+        ProtoDeclaration? target, ISymbol? fallback, ProtoGeneratedIndex index, Project project,
+        CancellationToken ct, TimeSpan? budget = null)
     {
         var symbols = ImmutableArray.CreateBuilder<ISymbol>();
-        var solution = await SearchScopeAsync(project, ct);
+        var solution = await SearchScopeAsync(project, ct, budget);
 
-        switch (hit.Target)
+        switch (target)
         {
             case ProtoService service:
             {
@@ -182,7 +193,7 @@ internal static class ProtoReferenceService
                 break;
 
             default:
-                Add(symbols, hit.Symbol);
+                Add(symbols, fallback);
                 break;
         }
 
@@ -231,14 +242,71 @@ internal static class ProtoReferenceService
     /// the base above it is — filtering there would delete the pack's best answer.
     /// </para>
     /// </remarks>
-    public static async Task<ImmutableArray<ProtoUsage>> FindUsagesAsync(
-        ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct)
+    /// <param name="budget">
+    /// How long this caller may wait for the contract's consumers to be loaded. Left at nothing by
+    /// the incidental callers — a code lens, a hover — and set only by the gesture a user made on
+    /// purpose. See <see cref="SearchScopeAsync"/>.
+    /// </param>
+    public static Task<ImmutableArray<ProtoUsage>> FindUsagesAsync(
+        ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct,
+        TimeSpan? budget = null) =>
+        FindUsagesAsync(hit.Target, hit.Symbol, index, project, ct, budget);
+
+    /// <summary>
+    /// What a deliberate find-usages or go-to-implementation is willing to wait for the contract's
+    /// consumers: all of it.
+    /// </summary>
+    /// <remarks>
+    /// A capped budget was tried and is wrong. Cross-project find-usages is the one answer this
+    /// pack exists to give, and a cap turns "no callers" and "the callers are in projects that had
+    /// not finished loading" into the same empty list — with nothing on screen to tell them apart.
+    /// A search that takes a while is a search; a search that quietly under-reports is a bug the
+    /// user acts on. The wait is bounded by the request's own cancellation token instead, so the
+    /// editor can still abandon it, and it only ever runs for a gesture the user made on purpose:
+    /// the incidental paths — a code lens resolving as the view scrolls, a hover — pass no budget
+    /// at all and never start the load.
+    /// </remarks>
+    public static readonly TimeSpan ExplicitSearchBudget = Timeout.InfiniteTimeSpan;
+
+    /// <summary>
+    /// The same sweep for a caret that started in C#: every use of the whole contract behind the
+    /// symbol, not only of the one member Roslyn bound.
+    /// </summary>
+    /// <remarks>
+    /// This is what a caret on a hand-written <c>override</c> is asking. One rpc is several C#
+    /// symbols — the base's virtual, the client's four overloads and every override — and the
+    /// callers of a service call the <em>client</em>, so a search from the server's override finds
+    /// nobody: the call site and the method it implements have no C# relationship at all, and only
+    /// the <c>.proto</c> knows they are the same rpc. Without this, find-references from the
+    /// implementation reports the schema line and stops, which reads as "nothing calls this".
+    /// </remarks>
+    public static async Task<ImmutableArray<ProtoUsage>> UsagesOfAsync(
+        ISymbol symbol, Project project, CancellationToken ct, TimeSpan? budget = null)
     {
-        var symbols = await SymbolSetForAsync(hit, index, project, ct);
+        foreach (var candidate in CandidateProjects(symbol, project))
+        {
+            var index = await ProtoGeneratedIndex.GetAsync(candidate, ct);
+
+            if (DeclarationOf(index, symbol, includeInherited: true) is not { } reference)
+                continue;
+
+            // The declaring project and not the caret's, so the sweep runs over the solution the
+            // contract's consumers were loaded into.
+            return await FindUsagesAsync(reference.Declaration, symbol, index, candidate, ct, budget);
+        }
+
+        return [];
+    }
+
+    private static async Task<ImmutableArray<ProtoUsage>> FindUsagesAsync(
+        ProtoDeclaration? target, ISymbol? fallback, ProtoGeneratedIndex index, Project project,
+        CancellationToken ct, TimeSpan? budget = null)
+    {
+        var symbols = await SymbolSetForAsync(target, fallback, index, project, ct, budget);
         if (symbols.IsEmpty)
             return [];
 
-        var solution = await SearchScopeAsync(project, ct);
+        var solution = await SearchScopeAsync(project, ct, budget);
         var seen = new HashSet<(DocumentId, TextSpan)>();
         var declared = new HashSet<(string, TextSpan)>();
         var indexes = new Dictionary<ProjectId, ProtoGeneratedIndex>();
@@ -349,12 +417,47 @@ internal static class ProtoReferenceService
     /// truthful result rather than a gap.
     /// </remarks>
     public static async Task<ImmutableArray<ISymbol>> FindImplementationsAsync(
-        ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct)
+        ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct,
+        TimeSpan? budget = null) =>
+        await ImplementationsForAsync(
+            hit.Target, index, await SearchScopeAsync(project, ct, budget), ct);
+
+    /// <summary>
+    /// The same answer for a caret that started in C#: the hand-written code implementing whatever
+    /// <c>.proto</c> declaration the symbol was generated from.
+    /// </summary>
+    /// <remarks>
+    /// What makes F12 on a generated client call useful rather than merely correct. The
+    /// <c>.proto</c> line says what the contract is; this says where it is honoured, which is the
+    /// file the user was looking for and the one place neither Roslyn nor the schema can point at
+    /// on its own. Resolved through the same nearest-first project walk as
+    /// <see cref="ProtoReferencesToAsync"/>, so the declaration behind the symbol and the
+    /// implementation of that declaration are found in one index rather than two that could
+    /// disagree.
+    /// </remarks>
+    public static async Task<ImmutableArray<ISymbol>> ImplementationsOfAsync(
+        ISymbol symbol, Project project, CancellationToken ct, TimeSpan? budget = null)
+    {
+        foreach (var candidate in CandidateProjects(symbol, project))
+        {
+            var index = await ProtoGeneratedIndex.GetAsync(candidate, ct);
+
+            if (DeclarationOf(index, symbol, includeInherited: true) is not { } reference)
+                continue;
+
+            return await ImplementationsForAsync(
+                reference.Declaration, index, await SearchScopeAsync(candidate, ct, budget), ct);
+        }
+
+        return [];
+    }
+
+    private static async Task<ImmutableArray<ISymbol>> ImplementationsForAsync(
+        ProtoDeclaration? target, ProtoGeneratedIndex index, Solution solution, CancellationToken ct)
     {
         var results = ImmutableArray.CreateBuilder<ISymbol>();
-        var solution = await SearchScopeAsync(project, ct);
 
-        switch (hit.Target)
+        switch (target)
         {
             case ProtoService service when index.ServiceBaseFor(service) is { } @base:
                 foreach (var derived in await SymbolFinder.FindDerivedClassesAsync(
@@ -543,34 +646,107 @@ internal static class ProtoReferenceService
     /// every navigation from every <c>.proto</c> in the project would otherwise re-read the
     /// solution to be told so.
     /// </para>
+    /// <para>
+    /// Whether it runs at all is the caller's decision, and most callers say no. A contract is
+    /// consumed by however many projects consume it — for a shared one that is the entire solution,
+    /// fifty design-time builds serialized behind a single load gate — and this used to run to
+    /// completion before the first answer came back. A code lens resolving as the user scrolls a
+    /// <c>.proto</c> asked for it, so scrolling loaded the solution.
+    /// </para>
+    /// <para>
+    /// So an incidental caller passes no budget and no load is started: it searches what is open,
+    /// and a call site in a project nobody has opened is not found. Deliberately not a background
+    /// load either — one would still be fifty design-time builds against the machine the user is
+    /// typing on, bought by a gutter number nobody read. The gesture that needs the complete answer
+    /// asks for it, and waits.
+    /// </para>
     /// </remarks>
-    private static async Task<Solution> SearchScopeAsync(Project project, CancellationToken ct)
+    /// <param name="budget">
+    /// How long the caller may wait for the consumers to load, or <see langword="null"/> — the same
+    /// as <see cref="TimeSpan.Zero"/> — to search only what is already open and start nothing.
+    /// </param>
+    private static async Task<Solution> SearchScopeAsync(
+        Project project, CancellationToken ct, TimeSpan? budget = null)
     {
         if (project.FilePath is not { Length: > 0 } path)
             return project.Solution;
 
-        try
-        {
-            await s_consumers.GetOrAdd(path, key => LoadConsumersAsync(key, ct));
-        }
-        catch
-        {
-            // Nothing was loaded, so the next caller has to try again rather than await a task
-            // that was abandoned before it finished. Un-memoising on every failure and not only on
-            // cancellation, because a faulted task left in the cache is awaited by every later
-            // navigation from this project and re-throws the same failure for the life of the
-            // process — one bad load would silently disable proto navigation until a restart.
-            s_consumers.TryRemove(path, out _);
-            throw;
-        }
-
         var (workspace, _) = await WorkspaceService.GetOrOpenProjectAsync(
             path, diagnosticWriter: TextWriter.Null, cancellationToken: ct);
+
+        // Only a caller that asked for it loads anything. Everything else — a code lens resolving
+        // as the user scrolls, a hover, a go-to-definition — searches what is already open, which
+        // is why scrolling a .proto no longer loads a solution.
+        if (budget is { } wait && wait != TimeSpan.Zero)
+        {
+            // Memoized against the workspace it loaded into, not against the path. The workspace is
+            // evicted after an idle timeout or by the LRU cap, and a memo that outlived its
+            // workspace would report the consumers as loaded into a snapshot that no longer holds
+            // them — narrowing every later search for the life of the process, silently.
+            var consumers = ConsumerLoadFor(path, workspace);
+
+            try
+            {
+                await consumers.WaitAsync(wait, ct);
+            }
+            catch (TimeoutException)
+            {
+                // Answer with what is loaded. The rest arrives on a later request.
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Un-memoised on failure: a faulted task left in the cache is awaited by every
+                // later navigation from this project and re-throws the same failure for the life
+                // of the process.
+                s_consumers.TryRemove(path, out _);
+            }
+
+            // Re-read: the load added projects to the workspace, and the snapshot taken above
+            // predates them.
+            (workspace, _) = await WorkspaceService.GetOrOpenProjectAsync(
+                path, diagnosticWriter: TextWriter.Null, cancellationToken: ct);
+        }
 
         return workspace.CurrentSolution;
     }
 
-    private static readonly ConcurrentDictionary<string, Task> s_consumers =
+    /// <summary>
+    /// The consumer-loading task for this project in this workspace, started if there is not one
+    /// already, and restarted when the workspace it was started against has been replaced.
+    /// </summary>
+    private static Task ConsumerLoadFor(string path, Workspace workspace)
+    {
+        while (true)
+        {
+            if (s_consumers.TryGetValue(path, out var existing))
+            {
+                if (ReferenceEquals(existing.Workspace, workspace))
+                    return existing.Load;
+
+                // Stale: the workspace this was loaded into is gone. Drop it and fall through to
+                // start a fresh one. A racing caller that gets there first wins, and this loop
+                // then sees its entry.
+                if (!s_consumers.TryRemove(new KeyValuePair<string, ConsumerLoad>(path, existing)))
+                    continue;
+            }
+
+            // Detached from the caller's token deliberately: a load abandoned half way leaves the
+            // workspace in the state the next caller would have to redo, and this task outlives
+            // any one request by design.
+            var started = new ConsumerLoad(workspace, LoadConsumersAsync(path, CancellationToken.None));
+
+            if (s_consumers.TryAdd(path, started))
+                return started.Load;
+        }
+    }
+
+    private sealed record ConsumerLoad(Workspace Workspace, Task Load);
+
+    private static readonly ConcurrentDictionary<string, ConsumerLoad> s_consumers =
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>

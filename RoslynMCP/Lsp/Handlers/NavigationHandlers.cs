@@ -204,8 +204,12 @@ internal static class NavigationHandlers
         if (symbol is null)
             return Array.Empty<LspLocation>();
 
+        // The one caller that may wait: a user pressed Shift+F12 and is looking at a progress
+        // indicator, so a pack whose complete answer needs projects the workspace has not loaded
+        // may go and load them.
         return await AllReferencesAsync(
-            symbol, document.Project, p.Context.IncludeDeclaration, ct, languages);
+            symbol, document.Project, p.Context.IncludeDeclaration, ct, languages,
+            waitForCompleteScope: true);
     }
 
     /// <summary>
@@ -218,9 +222,14 @@ internal static class NavigationHandlers
     /// started from either side gives the same answer. On a solution with no markup each
     /// contributor declines after one metadata lookup.
     /// </remarks>
+    /// <param name="waitForCompleteScope">
+    /// Whether a pack may block to widen the search — see
+    /// <see cref="ILanguageReferenceContributor.ReferencesAsync"/>. False by default because the
+    /// other caller of this method is a code lens, which runs on every scroll.
+    /// </param>
     public static async Task<LspLocation[]> AllReferencesAsync(
         ISymbol symbol, Project project, bool includeDeclaration, CancellationToken ct,
-        LanguageSession? languages = null)
+        LanguageSession? languages = null, bool waitForCompleteScope = false)
     {
         var locations = new List<Microsoft.CodeAnalysis.Location>();
 
@@ -239,7 +248,8 @@ internal static class NavigationHandlers
         foreach (var contributor in LanguageScope.Of(languages).Contributors<ILanguageReferenceContributor>())
         {
             int before = contributed.Count;
-            contributed.AddRange(await contributor.ReferencesAsync(symbol, project, ct));
+            contributed.AddRange(
+                await contributor.ReferencesAsync(symbol, project, ct, waitForCompleteScope));
 
             if (contributed.Count > before)
                 answered.Add(contributor);
@@ -307,11 +317,34 @@ internal static class NavigationHandlers
                 break;
         }
 
-        if (results.Count == 0)
-            results.Add(symbol); // e.g. invoking on a concrete member — jump to it
+        var contributed = new List<LspLocation>();
+        var answered = new List<ILanguageImplementationContributor>();
 
-        return await HandlerHelpers.ToLocationsAsync(
-            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), document.Project, ct);
+        foreach (var contributor in
+                 LanguageScope.Of(languages).Contributors<ILanguageImplementationContributor>())
+        {
+            int before = contributed.Count;
+            contributed.AddRange(await contributor.ImplementationsAsync(symbol, document.Project, ct));
+
+            if (contributed.Count > before)
+                answered.Add(contributor);
+        }
+
+        // Only when nobody could answer. The fallback exists so Ctrl+F12 on a concrete member goes
+        // somewhere rather than nowhere, but landing on the caret it was pressed on is the weakest
+        // answer there is — and a pack that found the hand-written implementation of a generated
+        // member has a better one.
+        if (results.Count == 0 && contributed.Count == 0)
+            results.Add(symbol);
+
+        var locations = new List<LspLocation>(await HandlerHelpers.ToLocationsAsync(
+            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), document.Project, ct));
+
+        if (answered.Count > 0)
+            locations.RemoveAll(location => answered.Any(pack => pack.Supersedes(location)));
+
+        locations.AddRange(contributed);
+        return locations.Distinct().ToArray();
     }
 
     public static async Task<DocumentHighlight[]> DocumentHighlightAsync(

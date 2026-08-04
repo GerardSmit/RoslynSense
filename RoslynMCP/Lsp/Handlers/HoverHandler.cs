@@ -23,7 +23,8 @@ internal static class HoverHandler
                 SymbolDisplayParameterOptions.IncludeParamsRefOut |
                 SymbolDisplayParameterOptions.IncludeDefaultValue);
 
-    public static async Task<Hover?> HoverAsync(TextDocumentPositionParams p, CancellationToken ct)
+    public static async Task<Hover?> HoverAsync(
+        TextDocumentPositionParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         if (await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct) is not
             var (document, text, offset) || document is null)
@@ -49,7 +50,18 @@ internal static class HoverHandler
         if (token is { } t && t.Span.Contains(Math.Min(offset, Math.Max(0, text.Length - 1))))
             range = LspConverters.ToRange(text.Lines, t.Span);
 
-        return new Hover(new MarkupContent("markdown", Describe(symbol, ct)), range);
+        var markdown = new StringBuilder(Describe(symbol, ct));
+
+        // Appended rather than merged, and after Roslyn's own description: what the pack knows is
+        // where the symbol came from, which reads as provenance under the signature rather than in
+        // place of it.
+        foreach (var contributor in LanguageScope.Of(languages).Contributors<ILanguageHoverContributor>())
+        {
+            if (await contributor.HoverMarkdownAsync(symbol, document.Project, ct) is { Length: > 0 } extra)
+                markdown.Append("\n\n---\n\n").Append(extra);
+        }
+
+        return new Hover(new MarkupContent("markdown", markdown.ToString()), range);
     }
 
     /// <summary>The signature-plus-summary markdown shown for a symbol. Shared with the markup

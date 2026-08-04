@@ -118,6 +118,52 @@ public class ProtoLspTests
         Assert.Contains("WidgetClientCaller.cs", files);
     }
 
+    // ---- F12 on a declaration, which answers the same as Ctrl+F12 where it can ----------------
+
+    [Fact]
+    public async Task GoToDefinitionOnAnRpcLandsOnTheOverrideAndNotOnProtocsOutput()
+    {
+        var locations = await Definition(
+            FixturePaths.WidgetsProtoFile, "rpc GetWidgetsById", "rpc ".Length, typeDefinition: false);
+
+        // What protoc wrote for this rpc is an abstract method with no body, in a file the next
+        // build rewrites. F12 landing there was the report; the code that runs is the answer.
+        var location = Assert.Single(locations);
+        AssertFile(FixturePaths.WidgetGrpcServiceFile, location.Uri);
+
+        string line = LineAt(FixturePaths.WidgetGrpcServiceFile, location.Range.Start.Line);
+        Assert.Contains("override", line);
+        Assert.Contains("GetWidgetsById(", line);
+    }
+
+    [Fact]
+    public async Task GoToDefinitionOnAServiceLandsOnTheHandWrittenServerClass()
+    {
+        var locations = await Definition(
+            FixturePaths.WidgetsProtoFile, "service WidgetService", "service ".Length,
+            typeDefinition: false);
+
+        var location = Assert.Single(locations);
+        AssertFile(FixturePaths.WidgetGrpcServiceFile, location.Uri);
+        Assert.Contains(
+            "class WidgetGrpcService",
+            LineAt(FixturePaths.WidgetGrpcServiceFile, location.Range.Start.Line));
+    }
+
+    [Fact]
+    public async Task GoToDefinitionOnAMessageStillReachesTheGeneratedClass()
+    {
+        var locations = await Definition(
+            FixturePaths.WidgetsProtoFile, "message GetWidgetsByIdReply", "message ".Length,
+            typeDefinition: false);
+
+        // Nothing derives from a generated message, so there is no hand-written answer to prefer and
+        // the generated class is the only C# there is. Leaving the key dead instead would be a
+        // worse answer than the one file that does declare the type.
+        var location = Assert.Single(locations);
+        AssertFile(FixturePaths.WidgetsGeneratedFile, location.Uri);
+    }
+
     // ---- The rest of the navigation table ---------------------------------------------------
 
     [Fact]
@@ -487,7 +533,8 @@ public class ProtoLspTests
                 PositionOf(FixturePaths.WidgetsProtoFile, "service WidgetService", "service ".Length)),
             default);
 
-        var lens = await ResolvedLensOn(FixturePaths.WidgetsProtoFile, "service WidgetService");
+        var lens = await ResolvedLensOn(
+            FixturePaths.WidgetsProtoFile, "service WidgetService", "implementations");
 
         // A gutter count that disagrees with the peek window behind it is worse than either alone:
         // the number is the only thing on screen, and the list is what a click opens.
@@ -517,23 +564,78 @@ public class ProtoLspTests
     }
 
     [Fact]
-    public async Task EveryServiceAndEveryRpcGetsALensAndNothingElseDoes()
+    public async Task TheServiceAlsoCountsItsUsagesAndNotOnlyItsImplementations()
+    {
+        var references = await References(
+            FixturePaths.WidgetsProtoFile, "service WidgetService", "service ".Length,
+            includeDeclaration: false);
+
+        var lens = await ResolvedLensOn(
+            FixturePaths.WidgetsProtoFile, "service WidgetService", "references");
+
+        Assert.Equal(references.Length, Count(lens));
+
+        // The client is injected and called from a hand-written caller, so the count is a real one
+        // rather than a zero that would make the second lens noise.
+        Assert.NotEmpty(references);
+    }
+
+    [Fact]
+    public async Task TheFieldLensCountsWhatFindReferencesFinds()
+    {
+        var references = await References(
+            FixturePaths.WidgetsProtoFile, "repeated Widget widgets = 1;", "repeated Widget ".Length,
+            includeDeclaration: false);
+
+        var lens = await ResolvedLensOn(FixturePaths.WidgetsProtoFile, "repeated Widget widgets = 1;");
+
+        Assert.Equal(references.Length, Count(lens));
+        Assert.NotEmpty(references);
+    }
+
+    [Fact]
+    public async Task EveryDeclarationThatBindsGetsALensAndAOneofDoesNot()
     {
         var lenses = await Pack().CodeLensAsync(
             new CodeLensParams(Doc(FixturePaths.WidgetsProtoFile)), default);
 
-        int[] lines = [.. lenses.Select(l => l.Range.Start.Line).Order()];
+        var lines = lenses.Select(l => l.Range.Start.Line).ToHashSet();
 
-        int[] expected =
+        // A message is a class a consumer constructs and a field is a property it reads, so "who
+        // uses this" is a question about the schema — and the one question the gutter can answer
+        // without the reader having to know the C# name protoc chose.
+        string[] headers =
         [
-            .. new[] { "service WidgetService", "rpc GetWidgetsById", "rpc GetMembersForGroups", "rpc WatchWidgets" }
-                .Select(header => LineOf(FixturePaths.WidgetsProtoFile, header))
-                .Order(),
+            "service WidgetService",
+            "rpc GetWidgetsById",
+            "rpc WatchWidgets",
+            "message GetWidgetsByIdReply",
+            "repeated Widget widgets = 1;",
+            "map<int64, GroupMemberList> group_members = 1;",
+            "enum Kind",
+            "KIND_CREATED = 1;",
+
+            // A oneof member, which binds to a property of its own even though the group above it
+            // binds to nothing.
+            "Widget widget = 3;",
         ];
 
-        // A message is a generated class nothing derives from and a field is a generated property,
-        // so neither has an answer worth a line in the gutter.
-        Assert.Equal(expected, lines);
+        foreach (string header in headers)
+            Assert.Contains(LineOf(FixturePaths.WidgetsProtoFile, header), lines);
+
+        // The one declaration deliberately left out. A oneof leaves protoc no anchor — no descriptor
+        // index, no …FieldNumber constant, no OriginalName attribute — so nothing binds back to it
+        // and the lens could only ever read zero.
+        Assert.DoesNotContain(LineOf(FixturePaths.WidgetsProtoFile, "oneof payload"), lines);
+
+        // A service earns both counts, and they are different questions: who derives from the base,
+        // and who injects, registers or calls the client. Offering only the first made the second
+        // look answered.
+        int service = LineOf(FixturePaths.WidgetsProtoFile, "service WidgetService");
+        Assert.Equal(2, lenses.Count(l => l.Range.Start.Line == service));
+        Assert.Equal(
+            ["implementations", "references"],
+            lenses.Where(l => l.Range.Start.Line == service).Select(l => l.Data!.Kind));
 
         // Counting is deferred: codeLens is re-requested on every edit and every scroll, and each
         // count is a solution-wide SymbolFinder sweep.
@@ -558,14 +660,20 @@ public class ProtoLspTests
                 new ReferenceContext(includeDeclaration)),
             default);
 
-    /// <summary>The command a lens on <paramref name="header"/>'s line resolves to.</summary>
-    private static async Task<Command> ResolvedLensOn(string path, string header)
+    /// <summary>
+    /// The command a lens on <paramref name="header"/>'s line resolves to. A line carrying more than
+    /// one lens — a service, which counts implementations and usages separately — is disambiguated
+    /// by <paramref name="kind"/>.
+    /// </summary>
+    private static async Task<Command> ResolvedLensOn(string path, string header, string? kind = null)
     {
         var pack = Pack();
         var lenses = await pack.CodeLensAsync(new CodeLensParams(Doc(path)), default);
 
         int line = LineOf(path, header);
-        var lens = Assert.Single(lenses, l => l.Range.Start.Line == line);
+        var lens = Assert.Single(
+            lenses,
+            l => l.Range.Start.Line == line && (kind is null || l.Data?.Kind == kind));
 
         var resolved = await pack.ResolveCodeLensAsync(lens, default);
         Assert.NotNull(resolved.Command);

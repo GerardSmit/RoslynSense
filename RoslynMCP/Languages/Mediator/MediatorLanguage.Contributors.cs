@@ -48,7 +48,7 @@ internal sealed partial class MediatorLanguage :
     /// nobody was looking for.
     /// </summary>
     public async Task<IReadOnlyList<LspLocation>> ReferencesAsync(
-        ISymbol symbol, Project project, CancellationToken ct)
+        ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false)
     {
         var sites = await SitesForAsync(symbol, project, ct);
         return sites.Count == 0

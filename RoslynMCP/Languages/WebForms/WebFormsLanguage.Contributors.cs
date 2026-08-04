@@ -12,7 +12,7 @@ internal sealed partial class WebFormsLanguage :
     ILanguageRenameContributor
 {
     public async Task<IReadOnlyList<LspLocation>> ReferencesAsync(
-        ISymbol symbol, Project project, CancellationToken ct)
+        ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false)
     {
         var results = new List<LspLocation>();
 

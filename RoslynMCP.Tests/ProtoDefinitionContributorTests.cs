@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages;
@@ -67,6 +68,138 @@ public class ProtoDefinitionContributorTests
         Assert.Equal("GetWidgetsById", TextAt(location));
     }
 
+    /// <summary>
+    /// The other question, on the other key: where the rpc is actually implemented.
+    /// </summary>
+    /// <remarks>
+    /// Roslyn cannot answer this one at all. The caret is on the generated <em>client</em> and the
+    /// server derives from the generated <em>base</em>, so every arm of Roslyn's implementation
+    /// search comes back empty and the handler falls through to the fallback that lands Ctrl+F12 on
+    /// the caret it was pressed on — asserted below, because "the answer is not the caret" is the
+    /// whole of what the contribution buys.
+    /// </remarks>
+    [Fact]
+    public async Task GoToImplementationFromAConsumerReachesTheServerOverride()
+    {
+        PublishProtoPack();
+
+        var locations = await NavigationHandlers.ImplementationAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.ProtoClientCallerFile),
+                PositionOf(FixturePaths.ProtoClientCallerFile, ClientCallNeedle, ClientCallOffset)),
+            default);
+
+        var location = Assert.Single(locations);
+        AssertFile(FixturePaths.ProtoServerServiceFile, location.Uri);
+
+        // The override for this rpc, not the class and not one of its siblings.
+        Assert.Equal("GetWidgetsById", TextAt(location));
+        Assert.Contains(
+            "override", LineAt(FixturePaths.ProtoServerServiceFile, location.Range.Start.Line));
+    }
+
+    /// <summary>
+    /// And F12 on the same caret stays a jump rather than becoming a menu.
+    /// </summary>
+    [Fact]
+    public async Task DefinitionOnThatCaretOffersTheContractAlone()
+    {
+        PublishProtoPack();
+
+        var location = Assert.Single(await DefinitionAsync(ClientCallNeedle, ClientCallOffset));
+        AssertFile(FixturePaths.ProtoSolutionWidgetsProtoFile, location.Uri);
+    }
+
+    /// <summary>
+    /// The caret already standing on the implementation, which must not be offered its own line
+    /// back.
+    /// </summary>
+    [Fact]
+    public async Task ACaretOnTheOverrideIsNotOfferedItself()
+    {
+        PublishProtoPack();
+
+        var position = PositionOf(
+            FixturePaths.ProtoServerServiceFile,
+            "override Task<GetWidgetsByIdReply> GetWidgetsById",
+            "override Task<GetWidgetsByIdReply> ".Length + 2);
+
+        var locations = await NavigationHandlers.DefinitionAsync(
+            new TextDocumentPositionParams(Doc(FixturePaths.ProtoServerServiceFile), position),
+            typeDefinition: false,
+            default);
+
+        // Roslyn's own answer — the declaration the caret is on — plus the .proto line behind it.
+        Assert.Equal(2, locations.Length);
+
+        var declaration = Assert.Single(
+            locations,
+            candidate => LspConverters.UriToPath(candidate.Uri)
+                .EndsWith(".proto", StringComparison.OrdinalIgnoreCase));
+
+        Assert.Equal("GetWidgetsById", TextAt(declaration));
+
+        // And Ctrl+F12 there answers with the one implementation there is, which is this one — so
+        // the contribution has to withdraw rather than list it twice.
+        var implementations = await NavigationHandlers.ImplementationAsync(
+            new TextDocumentPositionParams(Doc(FixturePaths.ProtoServerServiceFile), position),
+            default);
+
+        var self = Assert.Single(implementations);
+        AssertFile(FixturePaths.ProtoServerServiceFile, self.Uri);
+    }
+
+    /// <summary>
+    /// The defect underneath the report: the consumer does not see the contract's <em>source</em>
+    /// symbols.
+    /// </summary>
+    /// <remarks>
+    /// A project reference reaches Roslyn as a metadata or retargeting assembly often enough that
+    /// this is the normal case rather than an edge one, and its members compare unequal to the
+    /// source members under every comparer — so an index keyed on symbol instances answered for the
+    /// layout that never occurs and missed every real one. The compilation below is built by hand
+    /// against <c>Contracts.dll</c> so the metadata reading is guaranteed rather than incidental:
+    /// whether the workspace hands out one or the other for the same fixture depends on how the
+    /// projects were loaded, which is exactly the accident that let this through.
+    /// </remarks>
+    [Fact]
+    public async Task TheContractSeenThroughMetadataStillBindsToTheProto()
+    {
+        var contracts = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.ProtoContractsProjectFile);
+        var compilation = await contracts.GetCompilationAsync();
+        Assert.NotNull(compilation);
+
+        Assert.True(
+            File.Exists(contracts.OutputFilePath),
+            $"Contracts has not been built to {contracts.OutputFilePath}");
+
+        var external = CSharpCompilation.Create(
+            "MetadataProbe",
+            references: [.. compilation!.References, MetadataReference.CreateFromFile(contracts.OutputFilePath!)]);
+
+        var client = external.GetTypeByMetadataName("ProtoSolution.Widgets.WidgetService+WidgetServiceClient");
+        Assert.NotNull(client);
+
+        var method = client!.GetMembers("GetWidgetsByIdAsync").OfType<IMethodSymbol>().First();
+
+        // The premise. If these ever compared equal the assertion below would hold without the
+        // key that makes it hold.
+        var source = compilation
+            .GetTypeByMetadataName("ProtoSolution.Widgets.WidgetService+WidgetServiceClient")!
+            .GetMembers("GetWidgetsByIdAsync").OfType<IMethodSymbol>().First();
+
+        Assert.False(
+            SymbolEqualityComparer.Default.Equals(method, source),
+            "the hand-built compilation resolved the contract to its source symbols, so this test no "
+            + "longer reproduces what a consumer sees");
+
+        var index = await ProtoGeneratedIndex.GetAsync(contracts, default);
+        var reference = index.DeclarationFor(method, includeInherited: true);
+
+        Assert.True(reference.HasValue, "a metadata view of the generated client bound to no rpc");
+        Assert.Equal("widgets.WidgetService.GetWidgetsById", reference!.Value.FullName);
+    }
+
     // ---- The suppression -----------------------------------------------------------------------
 
     [Fact]
@@ -92,7 +225,7 @@ public class ProtoDefinitionContributorTests
 
         // One target rather than two. Asserted separately from the file names because the complaint
         // was not only about where F12 went — a second entry makes the editor ask which one, and
-        // the answer it offers alongside is a file the next build overwrites.
+        // the answer it offered alongside was a file the next build overwrites.
         Assert.Single(locations);
     }
 
@@ -134,10 +267,33 @@ public class ProtoDefinitionContributorTests
     [Fact]
     public async Task TheSameHoldsForACaretOnAGeneratedMessageType()
     {
-        // `Widget widget = call.ResponseStream.Current;` — a type reference rather than a `new`,
-        // because a caret inside `new Widget()` binds to the constructor protoc emitted, which
-        // stands for no proto declaration of its own.
+        // `Widget widget = call.ResponseStream.Current;` — a plain type reference.
         await AssertReachesOnlyTheContractAsync("Widget widget = call", 2, "Widget");
+    }
+
+    /// <summary>
+    /// The same caret in the spelling a consumer actually writes.
+    /// </summary>
+    /// <remarks>
+    /// <c>new GetWidgetsByIdRequest()</c> binds to the constructor protoc emitted, and a constructor
+    /// stands for no proto declaration — so the most ordinary caret in a consumer was the one the
+    /// pack declined to answer for, and F12 there landed in <c>obj</c> while the identical question
+    /// asked of the type beside it did not.
+    /// </remarks>
+    [Fact]
+    public async Task TheSameHoldsForACaretOnAConstructorOfAGeneratedMessage()
+    {
+        await AssertReachesOnlyTheContractAsync(
+            "new GetWidgetsByIdRequest()", "new ".Length + 2, "GetWidgetsByIdRequest");
+    }
+
+    [Fact]
+    public async Task AnObjectInitialiserOnAGeneratedMessageReachesTheContractToo()
+    {
+        // The other shape of the same thing, and the one where Roslyn binds the caret to the
+        // constructor even though no argument list was written.
+        await AssertReachesOnlyTheContractAsync(
+            "new RenameWidgetRequest {", "new ".Length + 2, "RenameWidgetRequest");
     }
 
     [Fact]
@@ -146,6 +302,61 @@ public class ProtoDefinitionContributorTests
         // `widget.Label`, which is the `string label = 2;` in the message — the field name, in the
         // spelling the author of the .proto wrote rather than the one protoc derived.
         await AssertReachesOnlyTheContractAsync("widget.Label", 8, "label");
+    }
+
+    // ---- Hover -----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// The comment a schema author wrote, read from C#.
+    /// </summary>
+    /// <remarks>
+    /// The generated file in this fixture carries no XML doc for the field — which is also the state
+    /// of a real one between writing a comment and running a build, and the state the report was
+    /// made in.
+    /// </remarks>
+    [Fact]
+    public async Task HoverOnAGeneratedPropertyShowsTheProtoFieldAndItsComment()
+    {
+        PublishProtoPack();
+
+        var hover = await HoverHandler.HoverAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.ProtoClientCallerFile),
+                PositionOf(FixturePaths.ProtoClientCallerFile, "widget.Label", 8)),
+            default);
+
+        Assert.NotNull(hover);
+        string markdown = hover!.Contents.Value;
+
+        // Roslyn's own description is still first and still whole: this appends, it does not replace.
+        Assert.StartsWith("```csharp", markdown);
+        Assert.Contains("Label", markdown);
+
+        // The field as the schema declares it, its proto name, and the file it is in.
+        Assert.Contains("string label = 2;", markdown);
+        Assert.Contains("widgets.Widget.label", markdown);
+        Assert.Contains("widgets.proto", markdown);
+
+        // The reason for the whole feature.
+        Assert.Contains("The name shown to a user. Never parsed.", markdown);
+    }
+
+    [Fact]
+    public async Task HoverInAProjectWithNoProtobufSaysNothingExtra()
+    {
+        PublishProtoPack();
+
+        var hover = await HoverHandler.HoverAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.ProtoUnrelatedLookupFile),
+                PositionOf(FixturePaths.ProtoUnrelatedLookupFile, "List<Widget> GetWidgetsById", 5)),
+            default);
+
+        Assert.NotNull(hover);
+
+        // Unrelated spells the contract's names and references neither it nor the runtime, so the
+        // separator the contribution is appended behind must not be there at all.
+        Assert.DoesNotContain("```proto", hover!.Contents.Value);
     }
 
     // ---- Find references, from the same project ------------------------------------------------
@@ -176,6 +387,48 @@ public class ProtoDefinitionContributorTests
         Assert.DoesNotContain(
             locations,
             location => SamePath(location.Uri, FixturePaths.ProtoSolutionWidgetsGrpcGeneratedFile));
+    }
+
+    /// <summary>
+    /// The direction with no C# relationship in it at all.
+    /// </summary>
+    /// <remarks>
+    /// A caller of a gRPC service calls the generated client; the server implements the generated
+    /// base. The two symbols never meet, so Roslyn's answer for a caret on the <c>override</c> is
+    /// the override and nothing else — which reads as "nothing calls this" for a method the whole
+    /// solution goes through.
+    /// </remarks>
+    [Fact]
+    public async Task FindReferencesFromTheServerOverrideReachesTheClientCallSite()
+    {
+        PublishProtoPack();
+
+        var locations = await NavigationHandlers.ReferencesAsync(
+            new ReferenceParams(
+                Doc(FixturePaths.ProtoServerServiceFile),
+                PositionOf(
+                    FixturePaths.ProtoServerServiceFile,
+                    "override Task<GetWidgetsByIdReply> GetWidgetsById",
+                    "override Task<GetWidgetsByIdReply> ".Length + 2),
+                new ReferenceContext(IncludeDeclaration: true)),
+            default);
+
+        var call = Assert.Single(
+            locations, location => SamePath(location.Uri, FixturePaths.ProtoClientCallerFile));
+
+        Assert.Contains(
+            "GetWidgetsByIdAsync",
+            LineAt(FixturePaths.ProtoClientCallerFile, call.Range.Start.Line));
+
+        // The schema line is still there beside it.
+        Assert.Contains(
+            locations,
+            location => SamePath(location.Uri, FixturePaths.ProtoSolutionWidgetsProtoFile));
+
+        // And none of the ten mentions protoc writes for the same method.
+        var index = await ContractsIndexAsync();
+        Assert.DoesNotContain(
+            locations, location => index.IsGenerated(LspConverters.UriToPath(location.Uri)));
     }
 
     // ---- That the withdrawal did not overreach -------------------------------------------------

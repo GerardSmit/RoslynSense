@@ -20,12 +20,22 @@ internal sealed partial class ProtoLanguage : ILanguageCodeLensProvider
     private const string ReferencesKind = "references";
 
     /// <summary>
-    /// A count over every <c>service</c> and every <c>rpc</c> — the two declarations in a
-    /// <c>.proto</c> that hand-written code is on the other end of. A message is a generated class
-    /// nothing derives from and a field is a generated property, so neither has an answer worth a
-    /// line in the gutter.
+    /// A count over every declaration a <c>.proto</c> generates code for: implementations for a
+    /// <c>service</c>, and call sites for an <c>rpc</c>, a <c>message</c>, a field, an <c>enum</c>
+    /// and an enum value.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// A message and a field earn a lens for the same reason an rpc does. The class protoc writes
+    /// for a message is what a consumer constructs and the property it writes for a field is what a
+    /// consumer reads, so "who uses this" is a question about the schema and not about the
+    /// generated file — and it is the one question the gutter can answer without the user having to
+    /// know the C# name protoc chose.
+    /// </para>
+    /// <para>
+    /// A <c>oneof</c> is left out on purpose: its generated members carry none of protoc's anchors,
+    /// so nothing binds back to it and the lens could only ever read zero.
+    /// </para>
     /// <para>
     /// Nothing is produced when the project has not been built. Every lens would read "0
     /// implementations" over a contract that is implemented, and a wrong number is worse than no
@@ -51,18 +61,44 @@ internal sealed partial class ProtoLanguage : ILanguageCodeLensProvider
         var lines = view.Text.Lines;
         var lenses = new List<LspCodeLens>();
 
-        foreach (var service in view.Parse.Services)
+        // Flattened, so a message nested three deep and a field inside a oneof are reached on the
+        // same walk as a top-level service.
+        foreach (var declaration in view.Parse.AllDeclarations)
         {
             ct.ThrowIfCancellationRequested();
 
-            lenses.Add(UnresolvedLens(uri, lines, service.Name.Span, ImplementationsKind));
-
-            foreach (var rpc in service.Rpcs)
-                lenses.Add(UnresolvedLens(uri, lines, rpc.Name.Span, ReferencesKind));
+            foreach (string kind in LensKindsFor(declaration.Kind))
+                lenses.Add(UnresolvedLens(uri, lines, declaration.Name.Span, kind));
         }
 
         return [.. lenses];
     }
+
+    private static readonly string[] s_serviceKinds = [ImplementationsKind, ReferencesKind];
+    private static readonly string[] s_referenceKind = [ReferencesKind];
+
+    /// <summary>
+    /// A service earns both counts, in the order C# puts them: who implements the contract, and
+    /// who uses it.
+    /// </summary>
+    /// <remarks>
+    /// Implementations alone was the reported gap. A service is the one declaration whose two
+    /// questions have different answers — the server deriving from its base, and every place the
+    /// generated client is injected, registered or called — and offering only the first makes the
+    /// second look like it was answered.
+    /// </remarks>
+    private static string[] LensKindsFor(ProtoDeclarationKind kind) => kind switch
+    {
+        ProtoDeclarationKind.Service => s_serviceKinds,
+
+        ProtoDeclarationKind.Rpc
+            or ProtoDeclarationKind.Message
+            or ProtoDeclarationKind.Field
+            or ProtoDeclarationKind.Enum
+            or ProtoDeclarationKind.EnumValue => s_referenceKind,
+
+        _ => [],
+    };
 
     /// <summary>
     /// Counts one visible lens: the implementations of a service, or the call sites of an rpc.

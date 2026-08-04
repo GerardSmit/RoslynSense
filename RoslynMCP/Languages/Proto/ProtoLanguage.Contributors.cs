@@ -1,5 +1,7 @@
+using System.Text;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.Proto.Core;
+using RoslynMCP.Languages.Proto.Lsp;
 using RoslynMCP.Lsp;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
@@ -30,15 +32,131 @@ namespace RoslynMCP.Languages.Proto;
 /// </remarks>
 internal sealed partial class ProtoLanguage :
     ILanguageDefinitionContributor,
-    ILanguageReferenceContributor
+    ILanguageImplementationContributor,
+    ILanguageReferenceContributor,
+    ILanguageHoverContributor
 {
     /// <summary>
-    /// F12 on generated code, or on the <c>override</c> in a hand-written service implementation,
-    /// reaching the declaration that produced it.
+    /// The schema behind a generated symbol, under the C# signature: the declaration as it is
+    /// written, its fully-qualified proto name, and the comment above it.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The comment is the point. protoc does copy leading comments into its output as XML doc, so
+    /// this is not filling a permanent gap — but it is filling the one that matters, because the
+    /// generated file is only as current as the last build and a comment is at its most useful in
+    /// the minutes after it is written. Reading it out of the <c>.proto</c> makes it visible from C#
+    /// as soon as it is saved.
+    /// </para>
+    /// <para>
+    /// The documentation is dropped when the symbol's own XML summary already carries it, which is
+    /// what a build makes true. The signature and the proto name stay either way: neither is in the
+    /// XML doc, and where the declaration lives is the other half of what this answers.
+    /// </para>
+    /// </remarks>
+    public async Task<string?> HoverMarkdownAsync(ISymbol symbol, Project project, CancellationToken ct)
+    {
+        if (!InterestingSymbolKinds.Contains(symbol.Kind))
+            return null;
+
+        if (!await ProtoReferenceService.HostsProtobufAsync(project, ct))
+            return null;
+
+        if ((await ProtoReferenceService.ProtoReferencesToAsync(symbol, project, ct))
+            .FirstOrDefault() is not { Declaration: { } declaration } reference)
+        {
+            return null;
+        }
+
+        var markdown = new StringBuilder("```proto\n")
+            .Append(ProtoDeclarationText.Signature(declaration))
+            .Append("\n```\n\n`")
+            .Append(declaration.FullName)
+            .Append("` — ")
+            .Append(Path.GetFileName(reference.FilePath));
+
+        if (declaration.Documentation is { Length: > 0 } documentation
+            && !AlreadyDocumented(symbol, documentation, ct))
+        {
+            markdown.Append("\n\n").Append(documentation);
+        }
+
+        return markdown.ToString();
+    }
+
+    /// <summary>Whether the generated symbol already says what the <c>.proto</c> says, which it does
+    /// once a build has copied the comment across.</summary>
+    private static bool AlreadyDocumented(ISymbol symbol, string documentation, CancellationToken ct) =>
+        symbol.GetDocumentationCommentXml(cancellationToken: ct) is { Length: > 0 } xml
+        && xml.Contains(documentation.Trim(), StringComparison.Ordinal);
+
+    /// <summary>
+    /// F12 on generated code, or on the <c>override</c> in a hand-written service implementation:
+    /// the declaration that produced it.
+    /// </summary>
+    /// <remarks>
+    /// The schema line and nothing else, which is what makes F12 a jump rather than a picker. The
+    /// other thing a caret on <c>client.UpdateWidgetAsync(…)</c> might be asking — where the rpc is
+    /// actually implemented — is a different question and has its own key;
+    /// <see cref="ImplementationsAsync"/> answers it. Offering both here meant every F12 on
+    /// generated code opened a menu, and the entry the user wanted was a coin toss.
+    /// </remarks>
     public Task<IReadOnlyList<LspLocation>> DefinitionsAsync(
         ISymbol symbol, Project project, CancellationToken ct) =>
         DeclaringLinesAsync(symbol, project, ct);
+
+    /// <summary>
+    /// Ctrl+F12 on generated code: the hand-written code honouring the contract behind it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Roslyn cannot answer this one at all. A caller calls the generated <em>client</em> and the
+    /// server derives from the generated <em>base</em>, so a search from the client method finds no
+    /// implementations, no overrides and no derived types — it falls through to the fallback that
+    /// lands Ctrl+F12 on the caret it was pressed on. Crossing from one to the other needs the
+    /// <c>.proto</c>, which is the one thing that says they are the same rpc.
+    /// </para>
+    /// <para>
+    /// The caret's own symbol is dropped: a caret already on the <c>override</c> is offered the
+    /// other implementations of the rpc, not the line it is sitting on.
+    /// </para>
+    /// </remarks>
+    public async Task<IReadOnlyList<LspLocation>> ImplementationsAsync(
+        ISymbol symbol, Project project, CancellationToken ct)
+    {
+        if (!InterestingSymbolKinds.Contains(symbol.Kind))
+            return [];
+
+        if (!await ProtoReferenceService.HostsProtobufAsync(project, ct))
+            return [];
+
+        var implementations =
+            (await ProtoReferenceService.ImplementationsOfAsync(
+                symbol, project, ct, ProtoReferenceService.ExplicitSearchBudget))
+            .Where(implementation => !IsSelf(implementation, symbol))
+            .ToArray();
+
+        return implementations.Length == 0
+            ? []
+            : await ProtoNavigationHandler.SymbolLocationsAsync(implementations, project, ct);
+    }
+
+    /// <summary>
+    /// Whether an implementation is the symbol the caret is on.
+    /// </summary>
+    /// <remarks>
+    /// By documentation comment id rather than by <see cref="SymbolEqualityComparer"/>: the
+    /// implementation search runs against the solution the contract's project belongs to, which is
+    /// not always the snapshot the caret's symbol came from, and symbols do not compare equal across
+    /// compilations.
+    /// </remarks>
+    private static bool IsSelf(ISymbol implementation, ISymbol symbol) =>
+        implementation.OriginalDefinition.GetDocumentationCommentId() is { Length: > 0 } id
+        && string.Equals(id, symbol.OriginalDefinition.GetDocumentationCommentId(), StringComparison.Ordinal)
+        && string.Equals(
+            implementation.ContainingAssembly?.Name,
+            symbol.ContainingAssembly?.Name,
+            StringComparison.Ordinal);
 
     /// <summary>
     /// Everything protoc wrote, withdrawn once the <c>.proto</c> line behind it has been offered.
@@ -64,19 +182,49 @@ internal sealed partial class ProtoLanguage :
         ProtoGeneratedIndex.IsKnownGenerated(LspConverters.UriToPath(location.Uri));
 
     /// <summary>
-    /// The same line, folded into find-references.
+    /// The <c>.proto</c> line, and every call site of the contract it declares.
     /// </summary>
     /// <remarks>
-    /// Not a duplicate of the definition contribution, because from C#'s point of view the
-    /// <c>.proto</c> line is not the symbol's declaration — the generated class is — but the place
-    /// the symbol is written about. Contributing it whichever way <c>includeDeclaration</c> was set
-    /// is therefore right, and it is what makes the two directions agree: find-usages started in
-    /// the <c>.proto</c> already lists the C#, so without this the same pair of files reports a
-    /// relationship in one direction only.
+    /// <para>
+    /// The line is not a duplicate of the definition contribution: from C#'s point of view the
+    /// <c>.proto</c> is not the symbol's declaration — the generated class is — but the place the
+    /// symbol is written about. Contributing it whichever way <c>includeDeclaration</c> was set is
+    /// therefore right.
+    /// </para>
+    /// <para>
+    /// The call sites are the half that cannot be got any other way. A caller of a gRPC service
+    /// calls the generated <em>client</em>, so a search started from the hand-written
+    /// <c>override</c> on the server finds nobody — the two have no C# relationship, and only the
+    /// <c>.proto</c> knows they are the same rpc. Reporting the schema line alone reads as "nothing
+    /// calls this", which is the opposite of true. Definitions are left out because Roslyn has
+    /// already reported the one the caret is on, and the ones it has not are what
+    /// go-to-implementation is for.
+    /// </para>
     /// </remarks>
-    public Task<IReadOnlyList<LspLocation>> ReferencesAsync(
-        ISymbol symbol, Project project, CancellationToken ct) =>
-        DeclaringLinesAsync(symbol, project, ct);
+    public async Task<IReadOnlyList<LspLocation>> ReferencesAsync(
+        ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false)
+    {
+        var declaring = await DeclaringLinesAsync(symbol, project, ct);
+        if (declaring.Count == 0)
+            return declaring;
+
+        // Only when the user asked. This method is reached both by textDocument/references and by
+        // a C# code lens resolving as the view scrolls, and the second must not wait for a
+        // contract's consumers to load — that is a solution-wide load behind a gutter number.
+        var usages = await ProtoReferenceService.UsagesOfAsync(
+            symbol,
+            project,
+            ct,
+            waitForCompleteScope ? ProtoReferenceService.ExplicitSearchBudget : null);
+        if (usages.IsEmpty)
+            return declaring;
+
+        var results = new List<LspLocation>(declaring);
+        results.AddRange(await ProtoNavigationHandler.UsageLocationsAsync(
+            usages, project, includeDefinitions: false, ct));
+
+        return results;
+    }
 
     /// <summary>
     /// The <c>.proto</c> declaration behind a C# symbol, as a location, or nothing at all.

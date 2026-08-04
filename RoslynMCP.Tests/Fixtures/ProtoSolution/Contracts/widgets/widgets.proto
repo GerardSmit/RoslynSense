@@ -12,6 +12,8 @@ service WidgetService {
 
 message Widget {
   int64 id = 1;
+
+  // The name shown to a user. Never parsed.
   string label = 2;
 }
 

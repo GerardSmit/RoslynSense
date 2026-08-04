@@ -123,8 +123,54 @@ internal interface ILanguageDefinitionContributor : ILanguageSupersedingContribu
 /// </remarks>
 internal interface ILanguageReferenceContributor : ILanguageSupersedingContributor
 {
+    /// <param name="waitForCompleteScope">
+    /// Whether the caller is a gesture the user made on purpose and can therefore afford a wait,
+    /// or something incidental that must answer now.
+    /// </param>
+    /// <remarks>
+    /// The distinction is not cosmetic, because one request reaches this method by two very
+    /// different routes: <c>textDocument/references</c>, which a user pressed a key for, and a code
+    /// lens resolving as the view scrolls. A pack whose answer needs projects the workspace has not
+    /// loaded may block the first and must not block the second — a lens that loads a solution is
+    /// how an editor stops responding on a large repository.
+    /// </remarks>
     Task<IReadOnlyList<LspLocation>> ReferencesAsync(
+        ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false);
+}
+
+/// <summary>
+/// Hand-written implementations of a contract a pack owns, folded into
+/// <c>textDocument/implementation</c> on a C# symbol.
+/// </summary>
+/// <remarks>
+/// The counterpart of <see cref="ILanguageDefinitionContributor"/>, and what lets the two verbs
+/// answer the two questions instead of one of them answering both. A caller of a gRPC service calls
+/// the generated client, and the server implements the generated base: the two have no C#
+/// relationship, so Roslyn's answer for Ctrl+F12 on a client call is the client call — it falls
+/// through every arm of the search and lands back on the caret. Only the pack can cross from one to
+/// the other, because only the <c>.proto</c> says they are the same rpc.
+/// </remarks>
+internal interface ILanguageImplementationContributor : ILanguageSupersedingContributor
+{
+    Task<IReadOnlyList<LspLocation>> ImplementationsAsync(
         ISymbol symbol, Project project, CancellationToken ct);
+}
+
+/// <summary>
+/// What a pack has to say about a C# symbol it generated, appended to <c>textDocument/hover</c>.
+/// </summary>
+/// <remarks>
+/// A generated declaration carries none of the intent behind it. The comment above
+/// <c>CHANNEL_ALPHA = 1;</c> in a <c>.proto</c> is the only documentation the enum member has, and
+/// a reader hovering <c>Channel.Alpha</c> in C# sees a bare qualified name — worse, the two are out
+/// of step for as long as the build is, so the comment stays invisible exactly while it is being
+/// written. Returning the schema's own line and its comment is what closes that, and it is the same
+/// text the pack shows for a caret in its own file.
+/// </remarks>
+internal interface ILanguageHoverContributor
+{
+    /// <summary>Markdown to append, or <c>null</c> when the pack does not recognise the symbol.</summary>
+    Task<string?> HoverMarkdownAsync(ISymbol symbol, Project project, CancellationToken ct);
 }
 
 /// <summary>

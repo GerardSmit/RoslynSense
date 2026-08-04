@@ -136,7 +136,24 @@ let redactingTrace: vscode.OutputChannel | undefined;
 const solutionByFolder = new Map<string, string | undefined>();
 
 /** Finds the solution a file belongs to: the setting for its folder, else the nearest one. */
-async function solutionForFolder(folder: vscode.WorkspaceFolder): Promise<string | undefined> {
+/**
+ * What a repository checks out beside its own source and is never the solution being worked on:
+ * package caches, build output, and the worktrees agent tooling leaves behind — each of which
+ * holds a *copy* of the very solution being looked for.
+ */
+const SOLUTION_SEARCH_EXCLUDE = '**/{node_modules,bin,obj,artifacts,.git,.claude,.worktrees}/**';
+
+/**
+ * The solution a root belongs to.
+ *
+ * @param allowPrompt Whether an ambiguous root may ask the user. True only for the root being
+ * opened: a background binding must not put a dialog on screen. When it is false and the answer is
+ * ambiguous the caller gets nothing, which leaves the server to resolve from its working directory.
+ */
+async function solutionForFolder(
+    folder: vscode.WorkspaceFolder,
+    allowPrompt = false
+): Promise<string | undefined> {
     const key = folder.uri.fsPath;
     if (solutionByFolder.has(key)) {
         return solutionByFolder.get(key);
@@ -151,12 +168,15 @@ async function solutionForFolder(folder: vscode.WorkspaceFolder): Promise<string
     if (!resolved) {
         const found = await vscode.workspace.findFiles(
             new vscode.RelativePattern(folder, '**/*.{sln,slnx}'),
-            '**/{node_modules,bin,obj,artifacts}/**',
+            SOLUTION_SEARCH_EXCLUDE,
             2
         );
-        // Exactly one is unambiguous; more than one is the pickSolution case, which only runs
-        // for the folder the user is actually working in.
-        resolved = found.length === 1 ? found[0].fsPath : undefined;
+
+        // Exactly one is unambiguous. More than one has to be chosen, and choosing is why the
+        // answer is cached: the binding key every later client is matched against is built from
+        // it, so resolving it twice and differently starts a second client over the same files.
+        resolved =
+            found.length === 1 ? found[0].fsPath : allowPrompt ? await pickSolution() : undefined;
     }
 
     solutionByFolder.set(key, resolved);
@@ -171,7 +191,7 @@ async function pickSolution(): Promise<string | undefined> {
     }
 
     const solutions = await vscode.workspace.findFiles(
-        '**/*.{sln,slnx}', '**/{node_modules,bin,obj,artifacts}/**', 25);
+        '**/*.{sln,slnx}', SOLUTION_SEARCH_EXCLUDE, 25);
     if (solutions.length === 0) {
         return undefined; // server resolves the nearest solution from cwd
     }
@@ -216,10 +236,17 @@ async function pickSolution(): Promise<string | undefined> {
  * returns every contributed key plus VS Code's own bookkeeping, and the server should be told
  * what it is meant to act on rather than handed everything and left to guess.
  */
-function serverSettings(): Record<string, unknown> {
+function serverSettings(registerCommands = true): Record<string, unknown> {
     const config = vscode.workspace.getConfiguration('roslynSense');
     const enabled = enabledLanguages();
     return {
+        // Whether this connection may advertise the server's executeCommand ids. Exactly one
+        // client per window may: vscode-languageclient turns every id the server advertises into
+        // a VS Code command, and registering an id twice throws — which killed the second client
+        // outright and reported itself as a missing server binary. Answered at initialize rather
+        // than by suppressing the registration here, because the feature that does the
+        // registering is built into the client and reads the capability directly.
+        registerCommands,
         analyzerDiagnostics: config.get('analyzerDiagnostics'),
         codeStyleDiagnostics: config.get('codeStyleDiagnostics'),
         analyzerTimeoutSeconds: config.get('analyzerTimeoutSeconds'),
@@ -314,6 +341,10 @@ async function startClient(
     const solutionPath = binding ? binding.solutionPath : await pickSolution();
     activeSolutionPath = solutionPath;
 
+    // Claimed before the client is built and released when it leaves the map, so the second
+    // solution in a window connects without its server commands rather than failing to connect.
+    const ownsCommands = clientsBySolution.size === 0;
+
     const args = ['--lsp'];
     if (solutionPath) {
         args.push('--solution', solutionPath);
@@ -356,21 +387,24 @@ async function startClient(
         // Source-generated documents are C# too. Without them here VS Code sends the server
         // nothing for a generated file, so it opens as an inert buffer — no hover, no
         // navigation, no diagnostics — which is worse than not offering to open it at all.
+        // Narrowed to the client's own root when it has one. Two clients whose selectors both
+        // match a file both answer every request for it, and VS Code merges the answers rather
+        // than picking one — two identical code lenses on a line, two entries in a definition
+        // picker. Only a client with no root of its own claims everything.
         documentSelector: [
-            { scheme: 'file', language: 'csharp' },
-            { scheme: 'roslynsense-generated', language: 'csharp' },
+            fileFilter('csharp', binding?.folder),
+            // Not folder-scoped: a generated document has no path under any root, and only one
+            // client can serve the scheme, so it belongs to whichever client came first.
+            ...(ownsCommands ? [{ scheme: 'roslynsense-generated', language: 'csharp' }] : []),
             // The other languages the same server serves — WebForms markup, whose controls,
             // properties and event handlers are C# symbols, and whose <% %> blocks are C#.
             // A language switched off still highlights, it just answers nothing.
-            ...enabledFileLanguages().map((language) => ({
-                scheme: 'file',
-                language: language.id,
-            })),
+            ...enabledFileLanguages().map((language) => fileFilter(language.id, binding?.folder)),
         ],
         uriConverters: { code2Protocol, protocol2Code },
         // Sent at initialize so the very first analyzer pass already runs under the user's
         // settings; changes afterwards go through workspace/didChangeConfiguration.
-        initializationOptions: serverSettings(),
+        initializationOptions: serverSettings(ownsCommands),
         // Verbose tracing logs server→client requests and their responses, and one of those
         // responses is a NuGet feed password.
         traceOutputChannel: redactingTrace ??= createRedactingTraceChannel(),
@@ -446,17 +480,38 @@ async function startClient(
         sendBreakpointSnapshot();
     } catch (err) {
         // A client that failed to start cannot be stop()ed later — drop it here so
-        // restart/pick-solution paths start clean instead of rejecting forever.
+        // restart/pick-solution paths start clean instead of rejecting forever. Out of the map as
+        // well as out of `client`: a dead entry left in it holds the executeCommand claim above,
+        // so every later client in the window would connect without its commands.
+        clientsBySolution.delete(bindingKey(solutionPath, binding?.folder));
         void client.dispose().then(undefined, () => undefined);
         client = undefined;
         statusItem.busy = false;
         statusItem.severity = vscode.LanguageStatusSeverity.Error;
         statusItem.text = 'RoslynSense: failed to start';
+
+        // The install advice only fits a spawn failure. Printing it for every failure sends the
+        // reader to check their PATH for a problem that is in the extension.
         void vscode.window.showErrorMessage(
-            `RoslynSense failed to start: ${err}. Install with: dotnet tool install -g RoslynSense, ` +
-            `or set roslynSense.serverPath.`
+            /ENOENT|spawn|not recognized|cannot find/i.test(String(err))
+                ? `RoslynSense failed to start: ${err}. Install with: dotnet tool install -g ` +
+                  `RoslynSense, or set roslynSense.serverPath.`
+                : `RoslynSense failed to start: ${err}`
         );
     }
+}
+
+/**
+ * A document filter for one language, confined to the client's own root when it has one.
+ *
+ * The protocol's own filter takes a glob string rather than a `RelativePattern`, so the root is
+ * spelled into the glob — with forward slashes, which is what the matcher expects on every
+ * platform.
+ */
+function fileFilter(language: string, folder: vscode.WorkspaceFolder | undefined) {
+    return folder
+        ? { scheme: 'file', language, pattern: `${folder.uri.fsPath.replace(/\\/g, '/')}/**/*` }
+        : { scheme: 'file', language };
 }
 
 function bindingKey(solutionPath: string | undefined, folder: vscode.WorkspaceFolder | undefined): string {
@@ -2181,7 +2236,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         () => activeSolutionPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
     );
 
-    await startClient(context);
+    // Bound to the first root rather than started loose. bindingKey() is what decides whether a
+    // client already exists for a document's folder, and a loose client is keyed on whatever
+    // pickSolution() happened to return — so when that disagreed with solutionForFolder() the
+    // first file opened started a *second* client over the same files. Both then answered every
+    // request, which is two of every code lens, two definitions, two of everything.
+    const firstRoot = vscode.workspace.workspaceFolders?.[0];
+    await startClient(
+        context,
+        firstRoot
+            ? { solutionPath: await solutionForFolder(firstRoot, true), folder: firstRoot }
+            : undefined
+    );
 
     // Multi-root: follow the focused editor to whichever solution owns it.
     context.subscriptions.push(

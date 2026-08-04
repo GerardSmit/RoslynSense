@@ -57,6 +57,36 @@ public static class ProjectEvaluationService
 
     private sealed record CacheEntry(ProjectEvaluation Evaluation, IReadOnlyDictionary<string, DateTime> Stamps);
 
+    /// <summary>
+    /// The evaluation if one is already cached and still current, without evaluating anything.
+    /// </summary>
+    /// <remarks>
+    /// For callers that must answer now. An MSBuild evaluation is not fast and, worse, it queues:
+    /// <see cref="s_gate"/> admits a few at a time process-wide, and a solution load is holding
+    /// MSBuild busy for minutes on a large repo. Anything on an interactive path — the Solution
+    /// Explorer expanding a node — has to be able to say "no evaluation yet" and show what it can
+    /// rather than wait behind that.
+    /// </remarks>
+    public static ProjectEvaluation? TryGetCached(string projectPath)
+    {
+        string key = Path.GetFullPath(projectPath);
+        return s_cache.TryGetValue(key, out var cached) && IsFresh(cached.Stamps)
+            ? cached.Evaluation
+            : null;
+    }
+
+    /// <summary>
+    /// Starts an evaluation and does not wait for it, so a later caller finds it cached.
+    /// </summary>
+    public static void Prime(string projectPath)
+    {
+        _ = Task.Run(async () =>
+        {
+            try { await EvaluateAsync(projectPath, CancellationToken.None); }
+            catch { /* a warmer that fails costs the next caller a wait, nothing more */ }
+        });
+    }
+
     public static async Task<ProjectEvaluation?> EvaluateAsync(
         string projectPath, CancellationToken cancellationToken = default)
     {

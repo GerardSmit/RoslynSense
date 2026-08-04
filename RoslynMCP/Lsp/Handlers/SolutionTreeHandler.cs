@@ -531,11 +531,14 @@ internal static class SolutionTreeHandler
         if (directory is null || FindOwningProject(directory) is not { } projectPath)
             return [];
 
-        var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
+        // Cached-only, for the reason on FolderContentsAsync: the parent above this node was
+        // listed without waiting for MSBuild, so its children must not wait either.
+        var evaluation = ProjectEvaluationService.TryGetCached(projectPath);
         var projectFiles = ByPath(evaluation?.Items);
+        bool showAll = p.ShowAllFiles || evaluation is null;
 
         var files = Directory.EnumerateFiles(directory)
-            .Where(f => p.ShowAllFiles || projectFiles.ContainsKey(f))
+            .Where(f => showAll || projectFiles.ContainsKey(f))
             .Where(f => p.ShowIgnored || !IsHidden(Path.GetFileName(f)))
             .ToList();
 
@@ -570,14 +573,38 @@ internal static class SolutionTreeHandler
     }
 
     /// <summary>Directories and nested files directly under one directory of a project.</summary>
+    /// <summary>
+    /// One directory's worth of the project, from the file system.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The MSBuild evaluation says which files are items, which is what separates a project's
+    /// contents from everything else in its directory — but it is taken only if it is already
+    /// cached. Waiting for one is what made expanding a project spin forever on a large solution:
+    /// evaluations queue a few at a time process-wide, and a solution load holds MSBuild for
+    /// minutes, so the node sat on a request that could not be served while the load it was
+    /// waiting behind was the thing filling the cache.
+    /// </para>
+    /// <para>
+    /// Without it every file in the directory is listed, which is the same view the "Show All
+    /// Files" toggle gives — wider than the truth for a moment, and the answer arrives. An
+    /// evaluation is started in the background so the next expand is exact.
+    /// </para>
+    /// </remarks>
     private static async Task<SolutionTreeNode[]> FolderContentsAsync(
         string projectPath, string directory, SolutionTreeParams p, CancellationToken ct)
     {
         if (!Directory.Exists(directory))
             return [];
 
-        var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
+        var evaluation = ProjectEvaluationService.TryGetCached(projectPath);
+        if (evaluation is null)
+            ProjectEvaluationService.Prime(projectPath);
+
         var projectFiles = ByPath(evaluation?.Items);
+
+        // Nothing to filter against yet, so filtering would answer "this project is empty".
+        bool showAll = p.ShowAllFiles || evaluation is null;
 
         var nodes = new List<SolutionTreeNode>();
 
@@ -586,7 +613,7 @@ internal static class SolutionTreeHandler
             string name = Path.GetFileName(subdirectory);
             if (IsHidden(name) && !p.ShowIgnored)
                 continue;
-            if (!p.ShowAllFiles && !HasProjectContent(subdirectory, projectFiles))
+            if (!showAll && !HasProjectContent(subdirectory, projectFiles))
                 continue;
 
             nodes.Add(new SolutionTreeNode(
@@ -600,7 +627,7 @@ internal static class SolutionTreeHandler
         }
 
         var files = Directory.EnumerateFiles(directory)
-            .Where(f => p.ShowAllFiles || projectFiles.ContainsKey(f))
+            .Where(f => showAll || projectFiles.ContainsKey(f))
             .Where(f => p.ShowIgnored || !IsHidden(Path.GetFileName(f)))
             .ToList();
 

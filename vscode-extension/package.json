@@ -743,7 +743,7 @@
         "command": "roslynSense.searchEverywhere",
         "key": "ctrl+t",
         "mac": "cmd+t",
-        "when": "!inQuickOpen"
+        "when": "!inQuickOpen && focusedView != roslynSense.solutionExplorer"
       },
       {
         "command": "roslynSense.showInheritance",

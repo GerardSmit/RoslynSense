@@ -115,6 +115,21 @@ internal static class ConfigurationHandler
     }
 
     /// <summary>
+    /// Whether this connection wants the server's commands advertised to it.
+    /// </summary>
+    /// <remarks>
+    /// Per connection and never applied process-wide, for a reason that only shows up with two
+    /// windows or two solutions: an LSP client turns every id in <c>executeCommandProvider</c>
+    /// into an editor command, and an editor has one command table — so the second client to
+    /// connect from the same window fails outright on a duplicate id, taking its whole connection
+    /// with it. The client that already owns the ids keeps them and the rest ask for none. Absent
+    /// means yes, which is what a client too old to send it gets and what every single-connection
+    /// editor wants.
+    /// </remarks>
+    public static bool ReadRegisterCommands(JsonElement? settings) =>
+        !TrySection(settings, out var section) || Bool(section, "registerCommands") is not false;
+
+    /// <summary>
     /// Unwraps the settings block. The client may send the whole settings tree or just our
     /// section, and both <c>initialize</c> and <c>didChangeConfiguration</c> take either.
     /// </summary>

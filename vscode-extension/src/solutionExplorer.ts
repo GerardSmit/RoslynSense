@@ -1,6 +1,8 @@
 import * as Path from 'path';
 import * as vscode from 'vscode';
+import { State } from 'vscode-languageclient/node';
 import type { LanguageClient } from 'vscode-languageclient/node';
+import { onClientReady } from './clientReady';
 
 /**
  * Solution Explorer: the solution's *logical* structure, the way Visual Studio and Rider show
@@ -88,6 +90,8 @@ export function registerSolutionExplorer(
 
     const changeEmitter = new vscode.EventEmitter<SolutionTreeNode | undefined>();
     const nodesById = new Map<string, SolutionTreeNode>();
+    const log = vscode.window.createOutputChannel('RoslynSense Solution Explorer');
+    context.subscriptions.push(log);
 
     /// Who listed each node, which is the only record of the parent for ids that do not encode it.
     const parentById = new Map<string, string>();
@@ -102,9 +106,48 @@ export function registerSolutionExplorer(
         return undefined;
     };
 
+    /**
+     * Waits for a client that is still starting.
+     *
+     * The tree is built at activation and asks for its roots straight away, which is before the
+     * client has connected — and a request sent to a starting client is rejected outright.
+     * Answering empty instead is what left the view blank, because a `TreeDataProvider` is never
+     * asked again unless it says something changed, and refreshing on the state transition is a
+     * race against the transition having already happened. Waiting has neither problem.
+     */
+    function whenRunning(client: LanguageClient): Promise<boolean> {
+        if (client.state === State.Running) {
+            return Promise.resolve(true);
+        }
+
+        return new Promise<boolean>((resolve) => {
+            const subscription = client.onDidChangeState((e) => {
+                if (e.newState === State.Running) {
+                    subscription.dispose();
+                    clearTimeout(timer);
+                    resolve(true);
+                }
+            });
+
+            // A client that never starts must not leave the view spinning forever.
+            const timer = setTimeout(() => {
+                subscription.dispose();
+                resolve(false);
+            }, 60_000);
+        });
+    }
+
     async function fetchChildren(nodeId: string | null): Promise<SolutionTreeNode[]> {
+        const label = nodeId ?? '<roots>';
         const client = getClient();
+
         if (!client) {
+            log.appendLine(`solutionTree(${label}): no client`);
+            return [];
+        }
+
+        if (!(await whenRunning(client))) {
+            log.appendLine(`solutionTree(${label}): client never reached Running`);
             return [];
         }
         try {
@@ -126,7 +169,16 @@ export function registerSolutionExplorer(
                 }
             });
             return children;
-        } catch {
+        } catch (error) {
+            // Silently returning [] made a failed request indistinguishable from an empty node,
+            // which is how the whole view could vanish on a collapse-and-reopen with nothing
+            // anywhere to say why. VS Code shows nothing for a rejected getChildren either, so
+            // the log is the only place this can be said.
+            log.appendLine(
+                `solutionTree(${nodeId ?? '<roots>'}) failed: ${
+                    error instanceof Error ? error.message : String(error)
+                }`
+            );
             return [];
         }
     }
@@ -230,6 +282,27 @@ export function registerSolutionExplorer(
     /// Refreshing one node re-fetches only its branch, and collapses whatever was open inside it —
     /// which is also the only way to collapse a subtree, since VS Code exposes no collapse API.
     const refresh = (node?: SolutionTreeNode) => changeEmitter.fire(node);
+
+    // The view is built at activation and asked for its roots straight away, which is before the
+    // client exists — so the first fetch answered empty, and a TreeDataProvider is never asked
+    // again unless it says something changed. That is the whole reason the Solution Explorer came
+    // up blank and stayed blank: not slowness, no answer. The roots themselves cost a .sln parse
+    // on the server and no MSBuild at all, so this is one cheap re-ask as soon as there is
+    // somebody to ask.
+    onClientReady(context, getClient, (client) => {
+        refresh();
+
+        // And again on every transition into Running. Binding to another solution, or a restart,
+        // puts the client through Starting — during which fetchChildren has nothing to ask and
+        // answers empty. Without this the view stays empty until the user touches it.
+        context.subscriptions.push(
+            client.onDidChangeState((e) => {
+                if (e.newState === State.Running) {
+                    refresh();
+                }
+            })
+        );
+    });
 
     /**
      * The nodes a command should act on.

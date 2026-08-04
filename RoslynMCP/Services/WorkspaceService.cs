@@ -64,6 +64,17 @@ internal static class WorkspaceService
             ? mw : 4;
 
     /// <summary>
+    /// Test seam, not a feature: counts how many times <see cref="EnsureProjectLoadedAsync"/> has
+    /// actually pulled a new project into an already-cached workspace, for the life of the
+    /// process. Nothing in production reads it. It exists so an out-of-process test driving the
+    /// real <c>--lsp</c> server can assert that an incidental gesture — a code lens resolving as
+    /// the editor scrolls, a hover, a completion — never silently expands the loaded workspace,
+    /// which is exactly the mechanism a wall of phantom CS0012s on a large solution traced back to.
+    /// Exposed over LSP by <c>roslynSense/diagnosticsCounters</c>.
+    /// </summary>
+    public static int IncrementalLoadCount;
+
+    /// <summary>
     /// Reflection handle for <c>Workspace.SetCurrentSolution(Solution)</c> (protected,
     /// instance, returns Solution). Used to atomically swap a workspace's current
     /// solution to the analyzer-ref-rebound copy WITHOUT going through
@@ -593,6 +604,36 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// The first frame outside this file, which is the feature that wanted the project.
+    /// </summary>
+    private static string LoadOrigin()
+    {
+        try
+        {
+            var trace = new System.Diagnostics.StackTrace(fNeedFileInfo: false);
+
+            for (int i = 0; i < trace.FrameCount; i++)
+            {
+                if (trace.GetFrame(i)?.GetMethod() is not { DeclaringType: { } type } method)
+                    continue;
+
+                string name = type.FullName ?? type.Name;
+                if (name.StartsWith("RoslynMCP", StringComparison.Ordinal)
+                    && !name.StartsWith("RoslynMCP.Services.WorkspaceService", StringComparison.Ordinal))
+                {
+                    return $"{type.Name}.{method.Name}";
+                }
+            }
+        }
+        catch
+        {
+            // A diagnostic that throws is worse than one that says nothing.
+        }
+
+        return "an unknown caller";
+    }
+
+    /// <summary>
     /// Removes the in-flight entry for <paramref name="normalizedPath"/> under the
     /// cache lock and then signals the TCS so waiters can retry or propagate the error.
     /// When <paramref name="ex"/> is <c>null</c> the TCS is cancelled; otherwise it is faulted.
@@ -626,6 +667,11 @@ internal static class WorkspaceService
         if (entry.Workspace is not MSBuildWorkspace ws)
             return;
 
+        // Taken before the gate, where the caller's frames are still on the stack. A load is
+        // minutes of MSBuild on a large solution, so which feature asked for one is the difference
+        // between "the solution is big" and a feature quietly walking every project in it.
+        string origin = LoadOrigin();
+
         await entry.LoadGate.WaitAsync(cancellationToken);
         try
         {
@@ -654,9 +700,11 @@ internal static class WorkspaceService
                 RegisterProjectMappingsLocked(entry.CacheKey, normalizedProjectPath, ws);
                 if (dirs is { Count: > 0 })
                     RegisterShadowDirsLocked(entry.CacheKey, dirs);
+                Interlocked.Increment(ref IncrementalLoadCount);
                 Console.Error.WriteLine(
                     $"[WorkspaceService] Incrementally loaded '{Path.GetFileName(normalizedProjectPath)}' into " +
-                    $"'{Path.GetFileName(entry.CacheKey)}' (+{newIds.Count} project(s); {entry.ProjectIds.Count} loaded).");
+                    $"'{Path.GetFileName(entry.CacheKey)}' (+{newIds.Count} project(s); {entry.ProjectIds.Count} loaded) " +
+                    $"for {origin}.");
             }
             finally
             {

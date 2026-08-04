@@ -129,6 +129,8 @@ internal sealed class LspServer : IDisposable
         // Resolved through the registry rather than as a bare collection: constructing it is also
         // what publishes it to the handlers that run outside DI. A server built without services
         // — every test that constructs one directly — gets pure C#.
+        bool registerCommands = Handlers.ConfigurationHandler.ReadRegisterCommands(p.InitializationOptions);
+
         var activation = Handlers.ConfigurationHandler.ReadLanguages(p.InitializationOptions);
         _languages = new LanguageSession(
             (_services.GetService(typeof(LanguageRegistry)) as LanguageRegistry ?? LanguageRegistry.Empty).Packs,
@@ -195,12 +197,16 @@ internal sealed class LspServer : IDisposable
                 WorkspaceDiagnostics: LspFeatureOptions.WorkspaceDiagnosticsScope != "off"),
             CodeLensProvider = new CodeLensOptions(ResolveProvider: true),
             // A command the client can see is a command it can put on a menu, so a pack's commands
-            // are advertised only while that pack is enabled.
-            ExecuteCommandProvider = new ExecuteCommandOptions(
-                [
-                    .. Handlers.ExecuteCommandHandler.Commands,
-                    .. _languages.Packs.SelectMany(pack => pack.Capabilities.Commands),
-                ]),
+            // are advertised only while that pack is enabled — and only to the connection that
+            // asked for them, since an editor has one command table and a duplicate id fails the
+            // whole connection.
+            ExecuteCommandProvider = registerCommands
+                ? new ExecuteCommandOptions(
+                    [
+                        .. Handlers.ExecuteCommandHandler.Commands,
+                        .. _languages.Packs.SelectMany(pack => pack.Capabilities.Commands),
+                    ])
+                : null,
             InlayHintProvider = new InlayHintOptions(ResolveProvider: false),
             SelectionRangeProvider = true,
             LinkedEditingRangeProvider = true,
@@ -502,6 +508,15 @@ internal sealed class LspServer : IDisposable
         WorkspaceDiagnosticParams p, CancellationToken ct) =>
         Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct, _languages);
 
+    /// <summary>
+    /// A test seam, not a feature a real editor calls: exposes
+    /// <see cref="Services.WorkspaceService.IncrementalLoadCount"/> so an out-of-process test can
+    /// assert that a gesture it did not deliberately trigger — a code lens resolving as the user
+    /// scrolls, for instance — never silently pulls another project into the workspace.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/diagnosticsCounters")]
+    public DiagnosticsCounters DiagnosticsCounters() => new(Services.WorkspaceService.IncrementalLoadCount);
+
     [JsonRpcMethod("roslynSense/searchEverywhere", UseSingleObjectParameterDeserialization = true)]
     public Task<SearchEverywhereResult> SearchEverywhere(SearchEverywhereParams p, CancellationToken ct) =>
         Handlers.SearchEverywhereHandler.SearchAsync(p, ct);
@@ -591,7 +606,7 @@ internal sealed class LspServer : IDisposable
     public Task<Hover?> Hover(TextDocumentPositionParams p, CancellationToken ct) =>
         Route<ILanguageHoverProvider, Hover?>(p.TextDocument,
             l => l.HoverAsync(p, ct),
-            () => Handlers.HoverHandler.HoverAsync(p, ct));
+            () => Handlers.HoverHandler.HoverAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/documentHighlight", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentHighlight[]> DocumentHighlight(TextDocumentPositionParams p, CancellationToken ct) =>

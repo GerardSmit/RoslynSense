@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
+import { onClientReady } from './clientReady';
 import { DEBUG_TYPE } from './debugLaunch';
 
 /**
@@ -156,8 +157,15 @@ export function registerTestController(
         }
     };
 
+    // Projects only, and that is the whole of the eager work. Listing them comes off the .sln,
+    // but discovering the tests inside one pulls that project into the Roslyn workspace — which
+    // is serialized behind a single load gate on the server and runs a `dotnet restore` for any
+    // project whose obj/ is cold. On a solution with forty test projects the loop below therefore
+    // ran forty restores back to back before anything else in the editor could be answered, and
+    // the Solution Explorer sat empty behind them. The tests themselves are filled in when a
+    // project node is expanded, and before a run by activeEnsureDiscovered.
     onClientReady(context, getClient, (client) => {
-        void discoverAll(client).catch(() => undefined);
+        void discoverProjects(client, controller, projectItems).catch(() => undefined);
     });
 
     // Also consulted by a run, so starting one before discovery has finished waits for it rather
@@ -477,35 +485,6 @@ function trackRun(
     });
 
     return { reported, dispose: () => liveRuns.delete(runId) };
-}
-
-/**
- * Calls back once for each language client that appears — at startup, after a restart, and on
- * a multi-root binding change.
- *
- * The client is created asynchronously and replaced on restart, so anything that needs one has
- * to wait for it rather than read it once. Polling because the client object itself does not
- * exist yet to subscribe to.
- */
-function onClientReady(
-    context: vscode.ExtensionContext,
-    getClient: () => LanguageClient | undefined,
-    callback: (client: LanguageClient) => void
-): void {
-    let seen: LanguageClient | undefined;
-
-    const check = () => {
-        const client = getClient();
-        if (!client || client === seen) {
-            return;
-        }
-        seen = client;
-        callback(client);
-    };
-
-    check();
-    const timer = setInterval(check, 2000);
-    context.subscriptions.push({ dispose: () => clearInterval(timer) });
 }
 
 /** Wires the server's run events into whichever run they belong to. */

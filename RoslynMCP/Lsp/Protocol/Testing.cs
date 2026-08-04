@@ -33,6 +33,19 @@ public sealed record TestCancelParams(
     [property: JsonPropertyName("runId")] string RunId);
 
 /// <summary>
+/// What a run produced, and why it produced nothing when it did.
+/// </summary>
+/// <remarks>
+/// The results alone cannot distinguish "this test did not run" from "nothing ran, because
+/// MSBuild is missing / the build failed / the run timed out". Returning only the results meant a
+/// .NET Framework project whose run never started reported every test as skipped, with the actual
+/// reason going to the server's stderr where nobody sees it.
+/// </remarks>
+public sealed record TestRunResponse(
+    [property: JsonPropertyName("results")] TestResultInfo[] Results,
+    [property: JsonPropertyName("error")] string? Error = null);
+
+/// <summary>
 /// Server-to-client notification while a run is going: one per finished test, plus the console
 /// output as it arrives.
 /// </summary>

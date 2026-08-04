@@ -29,6 +29,12 @@ interface TestResult {
     stackTrace: string | null;
 }
 
+/** Results plus, when nothing ran, the reason — which is not the same as everything being skipped. */
+interface TestRunResponse {
+    results: TestResult[];
+    error: string | null;
+}
+
 interface TestProject {
     projectPath: string;
     projectName: string;
@@ -140,19 +146,38 @@ export function registerTestController(
     // resolveHandler runs once when the Testing view first appears, which on a cold start is
     // before the server has connected — it returned empty and was never asked again, so the
     // panel sat on "No tests have been found in this workspace yet" forever.
+    // Down to the tests, not just the projects. "Run Tests" runs whatever the tree holds, and a
+    // tree of unexpanded project nodes holds nothing — so a run before the first manual refresh
+    // reported "no tests" against a panel that was visibly listing test projects.
+    const discoverAll = async (client: LanguageClient) => {
+        await discoverProjects(client, controller, projectItems);
+        for (const [projectPath, item] of projectItems) {
+            await discoverTests(client, controller, item, projectPath, testData).catch(() => undefined);
+        }
+    };
+
     onClientReady(context, getClient, (client) => {
-        void discoverProjects(client, controller, projectItems).catch(() => undefined);
+        void discoverAll(client).catch(() => undefined);
     });
+
+    // Also consulted by a run, so starting one before discovery has finished waits for it rather
+    // than running an empty tree.
+    activeEnsureDiscovered = async () => {
+        const client = getClient();
+        const unresolved = [...enumerate(controller.items)].some(
+            ([, item]) => item.canResolveChildren && item.children.size === 0
+        );
+        if (client && unresolved) {
+            await discoverAll(client).catch(() => undefined);
+        }
+    };
+    context.subscriptions.push({ dispose: () => (activeEnsureDiscovered = undefined) });
 
     // The refresh button in the Testing view, which previously did nothing.
     controller.refreshHandler = async () => {
         const client = getClient();
-        if (!client) {
-            return;
-        }
-        await discoverProjects(client, controller, projectItems);
-        for (const [projectPath, item] of projectItems) {
-            await discoverTests(client, controller, item, projectPath, testData).catch(() => undefined);
+        if (client) {
+            await discoverAll(client);
         }
     };
 
@@ -316,6 +341,11 @@ async function runTests(
         return;
     }
 
+    // Run All against an unexpanded tree used to collect the project nodes themselves, find no
+    // test behind them, and mark each one skipped — which read as "these tests were skipped"
+    // rather than "nothing has been discovered yet".
+    await activeEnsureDiscovered?.();
+
     const run = controller.createTestRun(request);
     const queue = collectLeaves(controller, request);
 
@@ -362,14 +392,14 @@ async function runTests(
             });
 
             try {
-                const results = await client.sendRequest<TestResult[]>('roslynSense/testRun', {
+                const response = await client.sendRequest<TestRunResponse>('roslynSense/testRun', {
                     projectPath,
                     fullyQualifiedNames: names,
                     collectCoverage: mode === 'coverage',
                     runId,
                 });
 
-                applyResults(run, items, testData, results, live.reported);
+                applyResults(run, items, testData, response.results, live.reported, response.error);
             } finally {
                 live.dispose();
                 cancelled.dispose();
@@ -387,6 +417,9 @@ async function runTests(
 }
 
 let runCounter = 0;
+
+/** Resolves any project whose tests have not been discovered yet. Set while the view is alive. */
+let activeEnsureDiscovered: (() => Promise<void>) | undefined;
 
 /** Live listeners keyed by run id, so one run's events never land in another's. */
 const liveRuns = new Map<string, (event: TestRunEvent) => void>();
@@ -538,7 +571,8 @@ function applyResults(
     items: vscode.TestItem[],
     testData: Map<string, DiscoveredTest>,
     results: TestResult[],
-    liveReported?: Set<string>
+    liveReported?: Set<string>,
+    error?: string | null
 ): void {
     const byName = new Map(results.map((result) => [result.fullyQualifiedName, result]));
 
@@ -546,9 +580,17 @@ function applyResults(
         const test = testData.get(item.id);
         const result = test ? byName.get(test.fullyQualifiedName) : undefined;
         if (!result) {
-            // A test the TRX never mentioned: skipped, unless the live pass already saw it —
-            // a cancelled run has real outcomes for the tests that got as far as running.
-            if (!liveReported?.has(item.id)) {
+            if (liveReported?.has(item.id)) {
+                // A cancelled run has real outcomes for the tests that got as far as running.
+                continue;
+            }
+
+            // "Skipped" is what a test framework says about a test it chose not to run. A run
+            // that never started — no MSBuild, a failed build, a timeout — is a different thing,
+            // and reporting it as skipped hid the reason behind an innocuous grey icon.
+            if (error) {
+                run.errored(item, new vscode.TestMessage(error));
+            } else {
                 run.skipped(item);
             }
             continue;

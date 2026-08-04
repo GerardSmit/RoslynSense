@@ -198,9 +198,17 @@ internal sealed class DebugCommandPipeServer : IDisposable
 
     private string StopSession()
     {
+        var managed = DebugSessionManager.GetSession();
+        if (managed is null)
+        {
+            // A DAP-hosted session owns its backend directly and was never registered with the
+            // manager, so the manager path would report success while stopping nothing.
+            return _sessionProvider()?.Stop() ?? "No active debug session.";
+        }
+
         // Route through the manager so the pipe server + published state are torn down with
         // the session, exactly as the DebugStop tool does.
-        var result = DebugSessionManager.GetSession()?.Stop() ?? "No active debug session.";
+        var result = managed.Stop();
         DebugSessionManager.DisposeSession();
         return result;
     }

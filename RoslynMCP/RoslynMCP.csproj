@@ -19,9 +19,9 @@
       <PackageReference Include="JsonPath.Net" Version="2.1.1" />
       <PackageReference Include="Microsoft.AspNetCore.Razor.Language" Version="6.0.36" />
       <PackageReference Include="Microsoft.Build.Framework" Version="17.11.48" ExcludeAssets="runtime" PrivateAssets="all" />
-      <!-- Item-model evaluation (DependentUpon, PackageReference, imports) and .sln parsing for
-           the Solution Explorer. Runtime assets excluded so it binds to the MSBuild that
-           Microsoft.Build.Locator registered, exactly like Build.Framework above. -->
+      <!-- Item-model evaluation: DependentUpon, PackageReference, imports. Runtime assets
+           excluded so it binds to the MSBuild that Microsoft.Build.Locator registered, exactly
+           like Build.Framework above. -->
       <PackageReference Include="Microsoft.Build" Version="17.11.48" ExcludeAssets="runtime" PrivateAssets="all" />
       <PackageReference Include="Microsoft.Build.Locator" Version="1.11.2" />
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="5.6.0" />
@@ -31,6 +31,10 @@
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.6.0" />
       <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.6.0" />
+      <!-- Reads and writes .sln and .slnx. The same library Visual Studio and `dotnet sln` use,
+           which is the point: solution folders, nesting and solution items are format details
+           worth getting from the implementation that defines them rather than reimplementing. -->
+      <PackageReference Include="Microsoft.VisualStudio.SolutionPersistence" Version="1.0.52" />
       <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
       <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
       <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
@@ -40,10 +44,14 @@
       <!-- Package management. Protocol pulls Configuration/Packaging/Versioning/Frameworks;
            going through the real NuGet client is what makes NuGet.config sources, private
            feeds, and credential providers work the same as they do on the command line. -->
-      <PackageReference Include="NuGet.Protocol" Version="6.14.0" />
+      <PackageReference Include="NuGet.Protocol" Version="6.14.3" />
+      <!-- The credential provider chain NuGet itself uses: NuGet.config credentials first, then
+           the plugin providers Azure Artifacts and friends install. Without it a private feed
+           answers 401 and the panel has nothing to say about why. -->
+      <PackageReference Include="NuGet.Credentials" Version="6.14.3" />
       <!-- MSBuild owns NuGet.Frameworks at runtime (MSBL001); the located MSBuild supplies it,
            exactly as with Microsoft.NET.StringTools above. -->
-      <PackageReference Include="NuGet.Frameworks" Version="6.14.0" ExcludeAssets="runtime" PrivateAssets="all" />
+      <PackageReference Include="NuGet.Frameworks" Version="6.14.3" ExcludeAssets="runtime" PrivateAssets="all" />
       <!-- Direct pin: Microsoft.Data.Sqlite still resolves 2.1.11, which carries GHSA-2m69-gcr7-jv3q. -->
       <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
       <PackageReference Include="StreamJsonRpc" Version="2.25.29" />

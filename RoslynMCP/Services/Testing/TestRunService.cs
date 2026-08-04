@@ -50,10 +50,12 @@ public static partial class TestRunService
         CancellationToken cancellationToken = default,
         Action<TestProgress>? onProgress = null)
     {
-        // `dotnet test` cannot run a .NET Framework test project: it drives a non-SDK project it
-        // cannot build, and the test host it starts targets the wrong runtime. Those projects go
-        // through MSBuild and vstest instead.
-        if (ProjectClassifier.Classify(csprojPath).DebugRuntime == DebugRuntime.NetFramework)
+        // On the project's shape, not its target framework. What the dotnet CLI cannot handle is a
+        // *legacy* project — it has no SDK to resolve and needs full MSBuild. An SDK-style project
+        // targeting net48 is the dotnet CLI's job and always was: sending it to Visual Studio's
+        // MSBuild made it fail to resolve Microsoft.NET.Sdk, or load the .NET SDK's targets into
+        // Framework MSBuild and die inside ResolvePackageAssets.
+        if (ProjectClassifier.Classify(csprojPath).BuildTool == BuildTool.VisualStudioMsBuild)
             return await RunFrameworkAsync(csprojPath, filter, build, timeoutSeconds, cancellationToken, onProgress);
 
         string trxPath = Path.Combine(Path.GetTempPath(), $"roslyn-sense-{Guid.NewGuid():N}.trx");
@@ -312,13 +314,13 @@ public static partial class TestRunService
     public static async Task<(int ProcessId, string? Error)> StartForDebugAsync(
         string csprojPath, string? filter, CancellationToken cancellationToken = default)
     {
-        bool isNetFramework =
-            ProjectClassifier.Classify(csprojPath).DebugRuntime == DebugRuntime.NetFramework;
+        bool isLegacy =
+            ProjectClassifier.Classify(csprojPath).BuildTool == BuildTool.VisualStudioMsBuild;
 
         var args = new StringBuilder();
-        if (isNetFramework)
+        if (isLegacy)
         {
-            // A Framework test project has to be built by MSBuild and run from its assembly;
+            // A legacy test project has to be built by MSBuild and run from its assembly;
             // VSTEST_HOST_DEBUG then suspends the *host*, which is what gets attached to.
             var (assembly, error) = await BuildFrameworkTestAssemblyAsync(csprojPath, cancellationToken);
             if (assembly is null)

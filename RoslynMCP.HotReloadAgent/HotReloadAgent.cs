@@ -26,7 +26,7 @@ internal static class HotReloadAgent
     /// <summary>Names the pipe to connect back to. Absent means "not launched for hot reload".</summary>
     public const string PipeVariable = "ROSLYNSENSE_HOTRELOAD_PIPE";
 
-    public const int ProtocolVersion = 1;
+    public const int ProtocolVersion = 2;
 
     private const int OpApplyUpdate = 1;
 
@@ -104,6 +104,7 @@ internal static class HotReloadAgent
         byte[] metadata = ReadBlock(reader);
         byte[] il = ReadBlock(reader);
         byte[] pdb = ReadBlock(reader);
+        int[] updatedTypes = ReadTokens(reader);
 
         try
         {
@@ -112,12 +113,97 @@ internal static class HotReloadAgent
                 return (false, $"no loaded assembly has module id {moduleId}");
 
             MetadataUpdater.ApplyUpdate(assembly, metadata, il, pdb);
+            NotifyUpdateHandlers(assembly, updatedTypes);
             return (true, "");
         }
         catch (Exception ex)
         {
             return (false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Runs every <see cref="MetadataUpdateHandlerAttribute"/> handler after an apply.
+    /// </summary>
+    /// <remarks>
+    /// The IL is already swapped by the time this runs, but frameworks cache what they derived
+    /// from the old metadata — ASP.NET's action descriptors, serialiser contracts, compiled
+    /// bindings. Without this pass the process runs the new code only where nothing cached the
+    /// old shape, which for a web app reads as the edit not taking. ClearCache for every handler
+    /// first, then UpdateApplication for every handler, matching the runtime's documented order.
+    /// </remarks>
+    private static void NotifyUpdateHandlers(Assembly updatedAssembly, int[] updatedTypeTokens)
+    {
+        Type[] updatedTypes;
+        try
+        {
+            var module = updatedAssembly.ManifestModule;
+            updatedTypes = updatedTypeTokens
+                .Select(token =>
+                {
+                    try { return module.ResolveType(token); }
+                    catch { return null; }
+                })
+                .Where(t => t is not null)
+                .ToArray()!;
+        }
+        catch
+        {
+            updatedTypes = Type.EmptyTypes;
+        }
+
+        var clearCache = new List<MethodInfo>();
+        var updateApplication = new List<MethodInfo>();
+
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            if (assembly.IsDynamic)
+                continue;
+
+            try
+            {
+                foreach (var attribute in assembly.GetCustomAttributes<MetadataUpdateHandlerAttribute>())
+                {
+                    var handler = attribute.HandlerType;
+                    const BindingFlags flags =
+                        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+                    if (handler.GetMethod("ClearCache", flags, null, [typeof(Type[])], null) is { } clear)
+                        clearCache.Add(clear);
+                    if (handler.GetMethod("UpdateApplication", flags, null, [typeof(Type[])], null) is { } update)
+                        updateApplication.Add(update);
+                }
+            }
+            catch
+            {
+                // A handler that cannot be inspected must not fail the apply that already landed.
+            }
+        }
+
+        foreach (var method in clearCache.Concat(updateApplication))
+        {
+            try
+            {
+                method.Invoke(null, [updatedTypes]);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[roslyn-sense] metadata update handler {method.DeclaringType?.Name}.{method.Name} failed: {ex.Message}");
+            }
+        }
+    }
+
+    private static int[] ReadTokens(BinaryReader reader)
+    {
+        int count = reader.ReadInt32();
+        if (count <= 0)
+            return [];
+
+        var tokens = new int[count];
+        for (int i = 0; i < count; i++)
+            tokens[i] = reader.ReadInt32();
+        return tokens;
     }
 
     private static byte[] ReadBlock(BinaryReader reader)
@@ -166,12 +252,15 @@ internal static class HotReloadAgent
     {
         try
         {
-            var method = typeof(System.Reflection.Metadata.AssemblyExtensions).GetMethod(
-                "GetMetadataUpdateCapabilities",
+            var method = typeof(MetadataUpdater).GetMethod(
+                "GetCapabilities",
                 BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
                 binder: null, types: Type.EmptyTypes, modifiers: null);
 
-            if (method?.Invoke(null, null) is string { Length: > 0 } capabilities)
+            // An empty string is an answer, not an absence: it is the runtime saying it accepts
+            // no edits at all, and reporting the fallback instead would have Roslyn emit deltas
+            // the runtime rejects one by one at apply time.
+            if (method?.Invoke(null, null) is string capabilities)
                 return capabilities.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         }
         catch

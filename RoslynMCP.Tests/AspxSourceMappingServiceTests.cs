@@ -2,9 +2,20 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using RoslynMCP.Services;
 using Xunit;
+using RoslynMCP.Languages.WebForms.Core;
+using RoslynMCP.Languages.WebForms.Tools;
 
 namespace RoslynMCP.Tests;
 
+/// <summary>
+/// Covers the parse half of the WebForms engine, and the caret-to-symbol resolution the MCP
+/// tools now share with the editor.
+/// </summary>
+/// <remarks>
+/// In the shared-state collection because resolving a caret loads the fixture project through
+/// <see cref="WorkspaceService"/>, which is a process-wide cache.
+/// </remarks>
+[Collection(SharedState.Name)]
 public class AspxSourceMappingServiceTests
 {
     private static Compilation CreateMinimalCompilation()
@@ -70,16 +81,13 @@ public class AspxSourceMappingServiceTests
     }
 
     [Fact]
-    public void FormatOutline_Aspx_ContainsExpectedSections()
+    public async Task Outline_Aspx_ContainsExpectedSections()
     {
-        var text = File.ReadAllText(FixturePaths.DefaultAspxFile);
-        var compilation = CreateMinimalCompilation();
-
-        var result = AspxSourceMappingService.Parse(FixturePaths.DefaultAspxFile, text, compilation);
-        var outline = AspxSourceMappingService.FormatOutline(result);
+        var outline = await AspxOutline.FormatAsync(FixturePaths.DefaultAspxFile, default);
 
         Assert.Contains("# ASPX File:", outline);
         Assert.Contains("Directives", outline);
+        Assert.Contains("Server Controls", outline);
     }
 
     [Fact]
@@ -190,16 +198,33 @@ public class AspxSourceMappingServiceTests
     }
 
     [Fact]
-    public void FormatOutline_Master_ContainsDirectives()
+    public async Task Outline_Master_ContainsDirectives()
     {
-        var text = File.ReadAllText(FixturePaths.SiteMasterFile);
-        var compilation = CreateMinimalCompilation();
-
-        var result = AspxSourceMappingService.Parse(FixturePaths.SiteMasterFile, text, compilation);
-        var outline = AspxSourceMappingService.FormatOutline(result);
+        var outline = await AspxOutline.FormatAsync(FixturePaths.SiteMasterFile, default);
 
         Assert.Contains("# ASPX File:", outline);
         Assert.Contains("Directives", outline);
+    }
+
+    [Fact]
+    public async Task Outline_NestsControlsInsideTheirParent()
+    {
+        // The outline is the editor's documentSymbol walk, so a control inside another control's
+        // body is indented under it. The flat listing this replaced could not express that.
+        var outline = await AspxOutline.FormatAsync(FixturePaths.RepeaterAspxFile, default);
+
+        var lines = outline.Split('\n');
+        int parent = Array.FindIndex(lines, l => l.Contains("**rptItems**", StringComparison.Ordinal));
+        Assert.True(parent >= 0, $"Expected rptItems in the outline:\n{outline}");
+
+        int parentIndent = Indent(lines[parent]);
+        var nested = lines
+            .Skip(parent + 1)
+            .TakeWhile(l => l.TrimStart().StartsWith("- ", StringComparison.Ordinal) && Indent(l) > parentIndent);
+
+        Assert.Contains(nested, l => l.Contains("btnAction", StringComparison.Ordinal));
+
+        static int Indent(string line) => line.Length - line.TrimStart().Length;
     }
 
     // --- .asmx (Web Service) tests ---
@@ -319,146 +344,116 @@ public class AspxSourceMappingServiceTests
         Assert.NotNull(result);
     }
 
-    // --- ASPX symbol resolution tests ---
+    // --- Caret resolution ---
+    //
+    // These used to run against AspxSourceMappingService.ResolveAspxSymbol, a second resolver
+    // that matched the marked text against control names. There is now one: the snippet is
+    // mapped to a file offset and handed to the same AspxSymbolResolver the editor uses.
 
-    private static Compilation CreateSystemWebCompilation()
+    private static async Task<AspxHit?> ResolveAsync(
+        string filePath, string markupSnippet, int? hintLine = null)
     {
-        // Include the System.Web stubs so the ASPX parser can resolve asp:* controls
-        var stubsText = File.ReadAllText(Path.Combine(FixturePaths.AspxProjectDir, "SystemWebStubs.cs"));
-        var stubsTree = CSharpSyntaxTree.ParseText(stubsText);
-        var runtimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
-        return CSharpCompilation.Create("TestWithSystemWeb",
-            [stubsTree],
-            [
-                MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
-                MetadataReference.CreateFromFile(Path.Combine(runtimeDir, "System.Runtime.dll")),
-            ],
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
-                assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default));
-    }
+        var document = await AspxDocumentService.GetAsync(filePath, default);
+        Assert.NotNull(document);
 
-    private static (AspxParseResult result, string text) ParseDefaultAspxWithSystemWeb()
-    {
-        var text = File.ReadAllText(FixturePaths.DefaultAspxFile);
-        var compilation = CreateSystemWebCompilation();
-        var result = AspxSourceMappingService.Parse(
-            FixturePaths.DefaultAspxFile, text, compilation,
-            rootDirectory: FixturePaths.AspxProjectDir);
-        return (result, text);
+        var markup = MarkupString.Parse(markupSnippet);
+        var marked = AspxSourceMappingService.FindMarkedSpan(document!.Text, markup, hintLine);
+        Assert.NotNull(marked);
+
+        return AspxSymbolResolver.ResolveAt(document, marked!.Value.Start);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_ControlTagName_ReturnsControlType()
+    public async Task ResolveAt_ControlTagName_ReturnsControlType()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("<[|asp:Label|] ID=\"lblTitle\"");
+        var hit = await ResolveAsync(FixturePaths.DefaultAspxFile, "<[|asp:Label|] ID=\"lblTitle\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.NotNull(symbol);
-        Assert.IsAssignableFrom<INamedTypeSymbol>(symbol);
+        Assert.Equal(AspxHitKind.ControlType, hit!.Kind);
+        var symbol = Assert.IsAssignableFrom<INamedTypeSymbol>(hit.Symbol);
         Assert.Equal("Label", symbol.Name);
         Assert.Contains("System.Web.UI.WebControls", symbol.ContainingNamespace.ToDisplayString());
     }
 
     [Fact]
-    public void ResolveAspxSymbol_EventHandlerValue_ReturnsCodeBehindMethod()
+    public async Task ResolveAt_EventHandlerValue_ReturnsCodeBehindMethod()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("OnClick=\"[|BtnSubmit_Click|]\"");
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
+        var hit = await ResolveAsync(FixturePaths.DefaultAspxFile, "OnClick=\"[|BtnSubmit_Click|]\"");
 
-        Assert.NotNull(symbol);
-        Assert.IsAssignableFrom<IMethodSymbol>(symbol);
+        Assert.Equal(AspxHitKind.EventHandler, hit!.Kind);
+        var symbol = Assert.IsAssignableFrom<IMethodSymbol>(hit.Symbol);
         Assert.Equal("BtnSubmit_Click", symbol.Name);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_EventName_ReturnsEventSymbol()
+    public async Task ResolveAt_EventName_ReturnsEventSymbol()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("[|OnClick|]=\"BtnSubmit_Click\"");
+        var hit = await ResolveAsync(FixturePaths.DefaultAspxFile, "[|OnClick|]=\"BtnSubmit_Click\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.NotNull(symbol);
-        Assert.IsAssignableFrom<IEventSymbol>(symbol);
+        Assert.Equal(AspxHitKind.EventName, hit!.Kind);
+        var symbol = Assert.IsAssignableFrom<IEventSymbol>(hit.Symbol);
         Assert.Equal("Click", symbol.Name);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_PropertyName_ReturnsPropertySymbol()
+    public async Task ResolveAt_PropertyName_ReturnsPropertySymbol()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("[|Text|]=\"Submit\"");
+        var hit = await ResolveAsync(FixturePaths.DefaultAspxFile, "[|Text|]=\"Submit\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.NotNull(symbol);
-        Assert.Equal("Text", symbol.Name);
+        Assert.Equal(AspxHitKind.PropertyName, hit!.Kind);
+        Assert.Equal("Text", hit.Symbol!.Name);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_InheritsDirective_ReturnsPageType()
+    public async Task ResolveAt_InheritsDirective_ReturnsPageType()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("Inherits=\"[|AspxProject.DefaultPage|]\"");
+        var hit = await ResolveAsync(
+            FixturePaths.DefaultAspxFile, "Inherits=\"[|AspxProject.DefaultPage|]\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.NotNull(symbol);
-        Assert.IsAssignableFrom<INamedTypeSymbol>(symbol);
+        Assert.Equal(AspxHitKind.Inherits, hit!.Kind);
+        var symbol = Assert.IsAssignableFrom<INamedTypeSymbol>(hit.Symbol);
         Assert.Equal("DefaultPage", symbol.Name);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_NoMatch_ReturnsNull()
+    public async Task ResolveAt_NoMatch_ReturnsNull()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
+        var document = await AspxDocumentService.GetAsync(FixturePaths.DefaultAspxFile, default);
         var markup = MarkupString.Parse("[|NonExistentThing|]");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.Null(symbol);
+        // Text that is not in the file has no offset to resolve at, which is the earlier of the
+        // two ways this returns nothing.
+        Assert.Null(AspxSourceMappingService.FindMarkedSpan(document!.Text, markup));
     }
 
     [Fact]
-    public void ResolveAspxSymbol_ControlIdValue_ReturnsCodeBehindField()
+    public async Task ResolveAt_ControlIdValue_ReturnsCodeBehindField()
     {
-        // Clicking on the value of ID="btnSubmit" should return the IFieldSymbol on DefaultPage
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("ID=\"[|btnSubmit|]\"");
+        var hit = await ResolveAsync(FixturePaths.DefaultAspxFile, "ID=\"[|btnSubmit|]\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.NotNull(symbol);
-        Assert.IsAssignableFrom<IFieldSymbol>(symbol);
+        Assert.Equal(AspxHitKind.ControlId, hit!.Kind);
+        var symbol = Assert.IsAssignableFrom<IFieldSymbol>(hit.Symbol);
         Assert.Equal("btnSubmit", symbol.Name);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_ControlIdValue_LabelField_ReturnsCodeBehindField()
+    public async Task ResolveAt_ControlIdValue_LabelField_ReturnsCodeBehindField()
     {
-        var (result, text) = ParseDefaultAspxWithSystemWeb();
-        var markup = MarkupString.Parse("ID=\"[|lblTitle|]\"");
+        var hit = await ResolveAsync(FixturePaths.DefaultAspxFile, "ID=\"[|lblTitle|]\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.NotNull(symbol);
-        Assert.IsAssignableFrom<IFieldSymbol>(symbol);
+        Assert.Equal(AspxHitKind.ControlId, hit!.Kind);
+        var symbol = Assert.IsAssignableFrom<IFieldSymbol>(hit.Symbol);
         Assert.Equal("lblTitle", symbol.Name);
     }
 
     [Fact]
-    public void ResolveAspxSymbol_TemplateNestedControlId_ReturnsNull()
+    public async Task ResolveAt_TemplateNestedControlId_ReturnsNoSymbol()
     {
-        // Controls inside a Repeater template have no code-behind field
-        var (result, text) = ParseRepeaterAspxWithSystemWeb();
-        var markup = MarkupString.Parse("ID=\"[|btnAction|]\"");
+        // Controls inside a Repeater template have no code-behind field, so the ID resolves to
+        // the attribute but to no symbol.
+        var hit = await ResolveAsync(FixturePaths.RepeaterAspxFile, "ID=\"[|btnAction|]\"");
 
-        var symbol = AspxSourceMappingService.ResolveAspxSymbol(result, text, markup);
-
-        Assert.Null(symbol);
+        Assert.Equal(AspxHitKind.ControlId, hit!.Kind);
+        Assert.Null(hit.Symbol);
     }
 
     [Fact]

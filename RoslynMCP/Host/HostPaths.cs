@@ -51,6 +51,23 @@ internal static class HostPaths
         return Convert.ToHexString(bytes, 0, 8).ToLowerInvariant(); // 16 hex chars
     }
 
+    /// <summary>
+    /// The build-independent solution key, for state shared across builds and with the hook
+    /// script.
+    /// </summary>
+    /// <remarks>
+    /// The build salt in <see cref="Hash"/> exists so daemons never cross builds — but the
+    /// on-disk stores (breakpoints, editor debug state, notifications) are the opposite case:
+    /// the editor extension, the hook script, and whichever build of this tool is running must
+    /// all find one another's files. The hook computes this derivation in JavaScript and cannot
+    /// know an MVID, so anything it reads must be keyed by the solution alone.
+    /// </remarks>
+    public static string SolutionHash(string solutionKey)
+    {
+        byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(solutionKey.ToLowerInvariant()));
+        return Convert.ToHexString(bytes, 0, 8).ToLowerInvariant(); // 16 hex chars
+    }
+
     public static string PipeName(string solutionKey) => $"roslyn-mcp-host-{Hash(solutionKey)}";
 
     public static string LockDirectory(string solutionKey) =>

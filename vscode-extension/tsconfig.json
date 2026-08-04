@@ -10,5 +10,8 @@
     "esModuleInterop": true,
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // The webview half runs in a browser, not in Node: it is compiled by tsconfig.webview.json,
+  // with the DOM library and a different module system.
+  "exclude": ["src/webview"]
 }

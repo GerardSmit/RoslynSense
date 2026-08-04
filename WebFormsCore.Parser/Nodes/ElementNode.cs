@@ -28,4 +28,11 @@ public class ElementNode : ContainerNode, IAttributeNode
     public virtual string? VariableName { get; set; }
 
     public Dictionary<TokenString, AttributeValue> Attributes { get; set; } = new(AttributeCompare.IgnoreCase);
+
+    /// <summary>
+    /// Every attribute as it was written, before the parser sorted it into a property, an event
+    /// or a passthrough attribute. Code generation never needs this; editor features do — it is
+    /// the only place the source range of a consumed or rejected attribute survives.
+    /// </summary>
+    public Dictionary<TokenString, AttributeValue> RawAttributes { get; set; } = new(AttributeCompare.IgnoreCase);
 }

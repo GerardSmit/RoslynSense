@@ -16,4 +16,5 @@ internal static class Descriptors
     public static readonly DiagnosticDescriptor InheritNotFound = new("WFC0005", "Inherit not found", "Could not detect the inherit attribute in file '{0}'", Category, DiagnosticSeverity.Warning, true);
     public static readonly DiagnosticDescriptor UnexpectedClosingTag = new("WFC0006", "Unexpected closing tag", "Expected closing tag for '{0}' but found '{1}'", Category, DiagnosticSeverity.Warning, true);
     public static readonly DiagnosticDescriptor TypeNotFoundInNamespace = new("WFC0007", "Type not found in namespace", "Could not find type '{0}' in namespace '{1}'", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor EventHandlerNotFound = new("WFC0008", "Event handler not found", "'{1}' does not contain a definition for '{0}'", Category, DiagnosticSeverity.Warning, true);
 }

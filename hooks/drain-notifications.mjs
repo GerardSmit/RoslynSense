@@ -4,7 +4,8 @@
 //
 // The queue directory is %TEMP%/roslyn-sense/notifications/<key>/ where <key> is the first
 // 8 bytes (16 hex chars) of SHA-256 over the lowercased absolute solution path — the same
-// derivation as HostPaths.Hash / PendingNotificationStore in the RoslynSense server. Solution
+// derivation as HostPaths.SolutionHash / PendingNotificationStore in the RoslynSense server.
+// Deliberately NOT the build-salted HostPaths.Hash: this script cannot know an MVID. Solution
 // discovery mirrors PathHelper.FindNearestSolution: walk up from cwd, .sln before .slnx.
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';

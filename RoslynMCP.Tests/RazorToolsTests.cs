@@ -128,7 +128,7 @@ public class RazorToolsTests
             <h1>Hello</h1>
             """;
 
-        var result = RoslynMCP.Tools.Razor.RazorRename.ReplaceInDirectives(text, "BlazorProject", "MyNewNamespace");
+        var result = RoslynMCP.Languages.Razor.Tools.RazorRename.ReplaceInDirectives(text, "BlazorProject", "MyNewNamespace");
         Assert.Contains("@using MyNewNamespace", result);
         Assert.Contains("@using Microsoft.AspNetCore.Components.Web", result);
     }
@@ -143,7 +143,7 @@ public class RazorToolsTests
             <h1>Test</h1>
             """;
 
-        var result = RoslynMCP.Tools.Razor.RazorRename.ReplaceInDirectives(text, "MyBaseComponent", "NewBaseComponent");
+        var result = RoslynMCP.Languages.Razor.Tools.RazorRename.ReplaceInDirectives(text, "MyBaseComponent", "NewBaseComponent");
         Assert.Contains("@inherits NewBaseComponent", result);
     }
 
@@ -158,7 +158,7 @@ public class RazorToolsTests
             <NotMyButton />
             """;
 
-        var result = RoslynMCP.Tools.Razor.RazorRename.ReplaceComponentTags(text, "MyButton", "NewButton");
+        var result = RoslynMCP.Languages.Razor.Tools.RazorRename.ReplaceComponentTags(text, "MyButton", "NewButton");
         Assert.Contains("<NewButton Label=\"Click me\" />", result);
         Assert.Contains("<NewButton>", result);
         Assert.Contains("</NewButton>", result);
@@ -175,7 +175,7 @@ public class RazorToolsTests
             </div>
             """;
 
-        var result = RoslynMCP.Tools.Razor.RazorRename.ReplaceComponentTags(text, "Counter", "ClickCounter");
+        var result = RoslynMCP.Languages.Razor.Tools.RazorRename.ReplaceComponentTags(text, "Counter", "ClickCounter");
         Assert.Contains("<ClickCounter @bind-Value=\"x\" />", result);
         // Text "Counter" in <p> is NOT a tag so it should remain
         Assert.Contains("Some text with Counter mentioned", result);
@@ -190,7 +190,7 @@ public class RazorToolsTests
             @using BlazorProject
             """;
 
-        var result = RoslynMCP.Tools.Razor.RazorRename.ReplaceInDirectives(text, "page", "newpage");
+        var result = RoslynMCP.Languages.Razor.Tools.RazorRename.ReplaceInDirectives(text, "page", "newpage");
         // @page content ("/test") doesn't contain "page" as a word-boundary match in the value
         Assert.Contains("@page", result);
     }
@@ -203,7 +203,7 @@ public class RazorToolsTests
             @inject MyService myService
             """;
 
-        var result = RoslynMCP.Tools.Razor.RazorRename.ReplaceInDirectives(text, "MyService", "MyNewService");
+        var result = RoslynMCP.Languages.Razor.Tools.RazorRename.ReplaceInDirectives(text, "MyService", "MyNewService");
         Assert.Contains("@inject MyNewService myService", result);
         // Should NOT change "myService" (lowercase) — it has different word boundaries
         Assert.Contains("myService", result);

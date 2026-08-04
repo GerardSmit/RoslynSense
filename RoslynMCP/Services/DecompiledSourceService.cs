@@ -48,7 +48,9 @@ internal static class DecompiledSourceService
     /// </summary>
     public static bool IsDecompiledPath(string? path) =>
         path is { Length: > 0 } &&
-        Path.GetFullPath(path).StartsWith(s_rootDirectory, StringComparison.OrdinalIgnoreCase);
+        // The separator keeps a sibling like "...\DecompiledExtra" from matching by prefix.
+        Path.GetFullPath(path).StartsWith(
+            s_rootDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
     public static string? TryGetGeneratedProjectPath(string filePath)
     {

@@ -3,7 +3,9 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Lsp.Search;
 using RoslynMCP.Services;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -135,8 +137,18 @@ internal static class SymbolHandlers
             LspConverters.ToRange(lines, selectionSpan),
             children.ToArray());
 
+    /// <summary>
+    /// Name search across the solution, in C# and in the enabled packs' files.
+    /// </summary>
+    /// <remarks>
+    /// The packs are not an either/or here the way a document request is: a query matches
+    /// whatever it matches, and a control <c>ID</c> declared in an <c>.aspx</c> is as much a
+    /// thing the user is looking for as a field declared in a <c>.cs</c>. Roslyn's declaration
+    /// search only ever sees its own compilations, so without this the markup half of a WebForms
+    /// solution is invisible to Ctrl+T.
+    /// </remarks>
     public static async Task<SymbolInformation[]> WorkspaceSymbolsAsync(
-        WorkspaceSymbolParams p, CancellationToken ct)
+        WorkspaceSymbolParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         if (string.IsNullOrWhiteSpace(p.Query))
             return Array.Empty<SymbolInformation>();
@@ -145,21 +157,27 @@ internal static class SymbolHandlers
         if (solution is null)
             return Array.Empty<SymbolInformation>();
 
-        var symbols = await SymbolFinder.FindSourceDeclarationsWithPatternAsync(
-            solution, p.Query, SymbolFilter.TypeAndMember, ct);
+        // Ranked, then capped — the other way round is how "StringBuilder" ends up unreachable
+        // behind 200 alphabetically-earlier types. Files are excluded: the protocol has no kind
+        // for them, and the extension's own Search Everywhere covers that.
+        var hits = await SearchEverywhere.SearchAsync(
+            solution, p.Query, maxResults: 200, ct, includeFiles: false);
 
-        return symbols
-            .Where(s => s.Locations.Any(l => l.IsInSource))
-            .Take(200)
-            .Select(s =>
-            {
-                var loc = LspConverters.ToLocation(s.Locations.First(l => l.IsInSource))!;
-                return new SymbolInformation(
-                    s.Name,
-                    LspConverters.ToLspSymbolKind(s),
-                    loc,
-                    s.ContainingType?.ToDisplayString() ?? s.ContainingNamespace?.ToDisplayString());
-            })
-            .ToArray();
+        var results = hits
+            .Select(hit => new SymbolInformation(
+                hit.Name,
+                hit.SymbolKind,
+                new Protocol.Location(
+                    LspConverters.PathToUri(hit.FilePath),
+                    new Protocol.Range(
+                        new Position(hit.Line, hit.Character),
+                        new Position(hit.EndLine, hit.EndCharacter))),
+                hit.Container))
+            .ToList();
+
+        foreach (var provider in LanguageScope.Of(languages).Contributors<ILanguageWorkspaceSymbolProvider>())
+            results.AddRange(await provider.WorkspaceSymbolsAsync(p.Query, solution, ct));
+
+        return results.ToArray();
     }
 }

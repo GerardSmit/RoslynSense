@@ -52,7 +52,7 @@ internal static class TestHandler
     private static readonly ConcurrentDictionary<string, CancellationTokenSource> s_runs =
         new(StringComparer.Ordinal);
 
-    public static async Task<TestResultInfo[]> RunAsync(TestRunParams p, CancellationToken ct)
+    public static async Task<TestRunResponse> RunAsync(TestRunParams p, CancellationToken ct)
     {
         string label = Path.GetFileNameWithoutExtension(p.ProjectPath);
         await using var progress = await ProgressReporter.BeginAsync($"Running tests in {label}", ct);
@@ -79,11 +79,15 @@ internal static class TestHandler
                 p.ProjectPath, filter, build: true, timeoutSeconds: 600, cancellation.Token,
                 onProgress: p.RunId is { Length: > 0 } id ? e => Publish(id, e) : null);
 
-            if (outcome.Error is not null)
-                Console.Error.WriteLine($"[Lsp] Test run: {outcome.Error}");
+            // Into the run's own output as well as back to the caller: the Test Results terminal
+            // is where someone looking at a run that did nothing will actually be looking.
+            if (outcome.Error is not null && p.RunId is { Length: > 0 } failed)
+                Publish(failed, new TestProgress("output", Message: outcome.Error));
 
-            return outcome.Results.Select(r => new TestResultInfo(
-                r.FullyQualifiedName, r.Outcome, r.DurationMs, r.ErrorMessage, r.StackTrace)).ToArray();
+            return new TestRunResponse(
+                [.. outcome.Results.Select(r => new TestResultInfo(
+                    r.FullyQualifiedName, r.Outcome, r.DurationMs, r.ErrorMessage, r.StackTrace))],
+                outcome.Error);
         }
         finally
         {

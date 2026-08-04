@@ -12,10 +12,22 @@ public sealed record ProjectItemInfo(
     string? Link,
     bool Visible);
 
+/// <summary>
+/// A package reference and where its version actually came from.
+/// </summary>
+/// <param name="VersionSource">
+/// The file whose XML carried the version. Under Central Package Management that is a
+/// Directory.Packages.props somewhere up the tree, which is the only useful answer to "where do
+/// I change this".
+/// </param>
 public sealed record PackageReferenceInfo(
     string Id,
     string? Version,
-    bool IsImplicit);
+    bool IsImplicit,
+    bool IsCentrallyManaged = false,
+    bool IsVersionOverride = false,
+    bool IsGlobalPackageReference = false,
+    string? VersionSource = null);
 
 /// <summary>The parts of a project's item model the tree renders.</summary>
 public sealed record ProjectEvaluation(
@@ -26,7 +38,8 @@ public sealed record ProjectEvaluation(
     IReadOnlyList<string> ProjectReferences,
     IReadOnlyList<string> AssemblyReferences,
     IReadOnlyList<string> Analyzers,
-    IReadOnlyList<string> Imports);
+    IReadOnlyList<string> Imports,
+    IReadOnlyDictionary<string, string> Properties);
 
 /// <summary>
 /// Evaluates a project's MSBuild item model. Roslyn's <see cref="Microsoft.CodeAnalysis.Project"/>
@@ -135,7 +148,8 @@ public static class ProjectEvaluationService
                     .Where(p => !string.IsNullOrEmpty(p))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                    .ToList());
+                    .ToList(),
+                Properties: ReadProperties(project));
 
             return (evaluation, stamps);
         }
@@ -205,16 +219,122 @@ public static class ProjectEvaluationService
         return items;
     }
 
-    private static IReadOnlyList<PackageReferenceInfo> ReadPackages(Project project) =>
-        project.GetItems("PackageReference")
-            .Select(item => new PackageReferenceInfo(
-                item.EvaluatedInclude,
-                Nullify(item.GetMetadataValue("Version")),
-                string.Equals(item.GetMetadataValue("IsImplicitlyDefined"), "true", StringComparison.OrdinalIgnoreCase)))
+    /// <summary>
+    /// Properties the package panel and the AI need to reason about a project, captured from a
+    /// fixed list rather than wholesale — an evaluated project carries roughly two thousand
+    /// properties, and every one of them would be cached and serialized with the tree.
+    /// </summary>
+    private static readonly string[] s_capturedProperties =
+    [
+        "ManagePackageVersionsCentrally", "CentralPackageTransitivePinningEnabled",
+        "CentralPackageVersionOverrideEnabled", "NuGetAudit", "NuGetAuditMode", "NuGetAuditLevel",
+        "RestorePackagesWithLockFile", "TargetFramework", "TargetFrameworks", "TargetFrameworkVersion",
+        "AssemblyName", "OutputType", "OutputPath",
+    ];
+
+    private static IReadOnlyDictionary<string, string> ReadProperties(Project project)
+    {
+        var properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string name in s_capturedProperties)
+        {
+            if (Nullify(project.GetPropertyValue(name)) is { } value)
+                properties[name] = value;
+        }
+        return properties;
+    }
+
+    /// <summary>
+    /// Package references with their versions resolved, including under Central Package Management.
+    /// </summary>
+    /// <remarks>
+    /// A centrally managed <c>PackageReference</c> carries no <c>Version</c> metadata at all —
+    /// NuGet joins it to a <c>PackageVersion</c> during restore, not during evaluation. Reading
+    /// only the reference's own metadata therefore yields empty strings, which is why the Updates
+    /// and Consolidate tabs used to come up silently empty on every CPM repo. The join is done
+    /// here instead: <c>Directory.Packages.props</c> is imported through <c>Microsoft.Common.props</c>,
+    /// so its items are already in the evaluation and already stamped for cache invalidation.
+    /// </remarks>
+    private static IReadOnlyList<PackageReferenceInfo> ReadPackages(Project project)
+    {
+        bool centrallyManaged = string.Equals(
+            project.GetPropertyValue("ManagePackageVersionsCentrally"), "true", StringComparison.OrdinalIgnoreCase);
+
+        // Include= and Update= forms both land in GetItems, so both are covered.
+        var central = new Dictionary<string, (string? Version, string? Source)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in project.GetItems("PackageVersion"))
+            central[item.EvaluatedInclude] = (Nullify(item.GetMetadataValue("Version")), DefiningFile(item));
+
+        // The SDK's NuGet.targets projects every GlobalPackageReference into a version-less
+        // PackageReference during evaluation, so the same package arrives twice. The global entry
+        // is the one that knows where its version lives.
+        var global = project.GetItems("GlobalPackageReference")
+            .Select(item => item.EvaluatedInclude)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var packages = new List<PackageReferenceInfo>();
+
+        foreach (var item in project.GetItems("PackageReference"))
+        {
+            string id = item.EvaluatedInclude;
+            bool implicitly = string.Equals(
+                item.GetMetadataValue("IsImplicitlyDefined"), "true", StringComparison.OrdinalIgnoreCase);
+
+            // A project can override a global reference's version for itself. That override lives
+            // in the csproj, so it has to win — skipping the reference first would report the
+            // central version and point any edit at the wrong file.
+            if (global.Contains(id) && Nullify(item.GetMetadataValue("VersionOverride")) is null)
+                continue;
+
+            if (Nullify(item.GetMetadataValue("VersionOverride")) is { } overridden)
+            {
+                packages.Add(new PackageReferenceInfo(
+                    id, overridden, implicitly, IsCentrallyManaged: centrallyManaged,
+                    IsVersionOverride: true, VersionSource: DefiningFile(item)));
+            }
+            else if (Nullify(item.GetMetadataValue("Version")) is { } inline)
+            {
+                packages.Add(new PackageReferenceInfo(
+                    id, inline, implicitly, VersionSource: DefiningFile(item)));
+            }
+            else if (centrallyManaged && central.TryGetValue(id, out var managed))
+            {
+                packages.Add(new PackageReferenceInfo(
+                    id, managed.Version, implicitly, IsCentrallyManaged: true, VersionSource: managed.Source));
+            }
+            else
+            {
+                packages.Add(new PackageReferenceInfo(id, null, implicitly));
+            }
+        }
+
+        // A GlobalPackageReference is a real, user-authored dependency of every project in the
+        // repo, so it is listed rather than treated as implicit — but flagged, because removing
+        // it from one project is not a thing that can be done.
+        foreach (var item in project.GetItems("GlobalPackageReference"))
+        {
+            string id = item.EvaluatedInclude;
+            var managed = central.GetValueOrDefault(id);
+            packages.Add(new PackageReferenceInfo(
+                id,
+                Nullify(item.GetMetadataValue("Version")) ?? managed.Version,
+                IsImplicit: false,
+                IsCentrallyManaged: true,
+                IsGlobalPackageReference: true,
+                VersionSource: managed.Source ?? DefiningFile(item)));
+        }
+
+        return packages
             .GroupBy(p => p.Id, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.First())
             .OrderBy(p => p.Id, StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static string? DefiningFile(ProjectItem item)
+    {
+        try { return Nullify(item.Xml?.ContainingProject?.FullPath); }
+        catch { return null; }
+    }
 
     private static IReadOnlyList<string> ReadPaths(Project project, string itemType, string projectDir) =>
         project.GetItems(itemType)

@@ -1,3 +1,4 @@
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 
@@ -21,9 +22,13 @@ internal static class WatchedFilesHandler
     private static CancellationTokenSource? s_debounce;
 
     /// <summary>What a batch of events did — returned for tests and logging.</summary>
-    internal sealed record Outcome(bool ReloadedWorkspace, IReadOnlyList<string> EvictedProjects)
+    internal sealed record Outcome(
+        bool ReloadedWorkspace,
+        IReadOnlyList<string> EvictedProjects,
+        IReadOnlyList<string>? InvalidatedMarkup = null)
     {
-        public bool DidAnything => ReloadedWorkspace || EvictedProjects.Count > 0;
+        public bool DidAnything =>
+            ReloadedWorkspace || EvictedProjects.Count > 0 || InvalidatedMarkup is { Count: > 0 };
     }
 
     public static void Handle(DidChangeWatchedFilesParams p)
@@ -73,6 +78,35 @@ internal static class WatchedFilesHandler
         if (paths.Count == 0)
             return new Outcome(false, []);
 
+        // A source or a credential changed. That needs the feed configuration reloaded, not the
+        // workspace — and on its own it is not a reason to reload anything else.
+        if (paths.Any(IsNuGetConfig))
+        {
+            Services.Packages.NuGetFeedContext.Invalidate();
+            Services.Packages.PackageUpdateService.Invalidate();
+        }
+
+        // A pack's file changed under us. Which paths those are, and what has to be dropped for
+        // one, is the pack's own business — a web.config is not markup but decides how every page
+        // in the project binds — so each path is offered to every pack rather than to the first
+        // one that claims it.
+        //
+        // The registered packs and not any one connection's enabled set: the caches behind this
+        // are process-wide, the debounce below batches events from every window at once, and a
+        // window that switched a pack off must not leave another window's editor reporting on
+        // markup that has since changed on disk.
+        var watchers = LanguageScope.Process.Contributors<ILanguageWatchedFileHandler>();
+        var invalidatedMarkup = new List<string>();
+        foreach (string path in paths)
+        {
+            bool invalidated = false;
+            foreach (var watcher in watchers)
+                invalidated |= watcher.Invalidate(path);
+
+            if (invalidated)
+                invalidatedMarkup.Add(path);
+        }
+
         // A project-shaping file changed: nothing short of a reload is correct, because
         // references, analyzers, and compile items all come from MSBuild evaluation.
         // Analyzer configuration changed: severities and analyzer options are baked into the
@@ -100,7 +134,7 @@ internal static class WatchedFilesHandler
         if (evicted.Count > 0)
             AnalyzerDiagnosticCache.Clear();
 
-        return new Outcome(false, evicted);
+        return new Outcome(false, evicted, invalidatedMarkup);
     }
 
     private static bool IsIgnored(string path)
@@ -117,6 +151,9 @@ internal static class WatchedFilesHandler
     private static bool IsProjectShaping(string path) =>
         Path.GetExtension(path).ToLowerInvariant() is
             ".csproj" or ".vbproj" or ".fsproj" or ".props" or ".targets" or ".sln" or ".slnx" or ".slnf";
+
+    private static bool IsNuGetConfig(string path) =>
+        Path.GetFileName(path).Equals("nuget.config", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsAnalyzerConfig(string path)
     {

@@ -53,7 +53,11 @@ public sealed class AppRunService(AppSessionStore store)
         foreach (var pair in spec.Environment)
             startInfo.Environment[pair.Key] = pair.Value;
 
-        if (hotReload && spec.DebugRuntime != DebugRuntime.NetFramework)
+        // A profile that turns hot reload off means it: the app is expected to run without the
+        // startup hook, and injecting one anyway changes what is being tested.
+        bool hotReloadInjected =
+            hotReload && spec.HotReloadEnabled != false &&
+            spec.DebugRuntime != DebugRuntime.NetFramework &&
             HotReload.HotReloadLauncher.Inject(startInfo);
 
         var session = new AppSession
@@ -91,6 +95,30 @@ public sealed class AppRunService(AppSessionStore store)
 
         store.Add(session);
         RunningProcessRegistry.Register(session);
+
+        if (hotReloadInjected)
+        {
+            // The edit session opens now, not at the first apply: this is the one moment the
+            // built output provably matches the source, so the baseline is captured before the
+            // user edits. A session opened lazily inside the apply would take the already-edited
+            // source as its baseline and report the edit as "no changes to apply".
+            try
+            {
+                await HotReload.HotReloadService.StartAsync(spec.ProjectPath, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                session.Append($"[roslyn-sense] Hot reload session did not open: {ex.Message}");
+            }
+        }
+        else if (hotReload)
+        {
+            session.Append(
+                "[roslyn-sense] Hot reload was requested but is not available: " +
+                (spec.DebugRuntime == DebugRuntime.NetFramework
+                    ? "on .NET Framework, edits apply through a debug session instead."
+                    : "the hot reload agent was not found beside the tool."));
+        }
 
         if (spec.Port is { } listenPort)
         {

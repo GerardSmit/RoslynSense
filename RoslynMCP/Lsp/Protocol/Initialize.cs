@@ -86,8 +86,14 @@ public sealed record ServerCapabilities
     [JsonPropertyName("selectionRangeProvider")] public bool SelectionRangeProvider { get; init; }
     [JsonPropertyName("linkedEditingRangeProvider")] public bool LinkedEditingRangeProvider { get; init; }
     [JsonPropertyName("inlineValueProvider")] public bool InlineValueProvider { get; init; }
+    [JsonPropertyName("documentLinkProvider")] public DocumentLinkOptions? DocumentLinkProvider { get; init; }
     [JsonPropertyName("workspace")] public WorkspaceServerCapabilities? Workspace { get; init; }
 }
+
+/// <summary>Nullable, unlike most of the provider flags: no language answers document links
+/// unconditionally, so the capability is omitted entirely rather than advertised as false.</summary>
+public sealed record DocumentLinkOptions(
+    [property: JsonPropertyName("resolveProvider")] bool ResolveProvider);
 
 public sealed record WorkspaceServerCapabilities(
     [property: JsonPropertyName("fileOperations")] FileOperationsServerCapabilities FileOperations);

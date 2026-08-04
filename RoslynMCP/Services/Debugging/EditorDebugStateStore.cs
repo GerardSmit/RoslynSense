@@ -8,7 +8,8 @@ namespace RoslynMCP.Services.Debugging;
 /// The extension tracks its debug adapter and reports transitions to the daemon, which writes
 /// them here; MCP debug tools and the plugin's prompt hook read the file to tell the LLM the
 /// user is paused at a breakpoint — and to route debug commands into the editor's session.
-/// Keyed by the same solution hash as the shared daemon (<see cref="HostPaths.Hash"/>).
+/// Keyed by the build-independent solution hash (<see cref="HostPaths.SolutionHash"/>), which
+/// the hook script derives in JavaScript.
 /// </summary>
 public static class EditorDebugStateStore
 {
@@ -73,5 +74,5 @@ public static class EditorDebugStateStore
 
     private static string FileFor(string solutionPath) =>
         Path.Combine(Path.GetTempPath(), "roslyn-sense", "editor-debug",
-            HostPaths.Hash(Path.GetFullPath(solutionPath)) + ".json");
+            HostPaths.SolutionHash(Path.GetFullPath(solutionPath)) + ".json");
 }

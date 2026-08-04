@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using LspCodeLens = RoslynMCP.Lsp.Protocol.CodeLens;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
@@ -28,7 +29,8 @@ internal static class CodeLensHandler
         "TestMethod", "DataTestMethod",         // MSTest
     };
 
-    public static async Task<LspCodeLens[]> CodeLensAsync(CodeLensParams p, CancellationToken ct)
+    public static async Task<LspCodeLens[]> CodeLensAsync(
+        CodeLensParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         var document = await LspDocumentResolver.ResolveAsync(
             LspConverters.UriToPath(p.TextDocument.Uri), ct);
@@ -107,13 +109,44 @@ internal static class CodeLensHandler
                     "Debug test", "roslynSense.debugTest", [fqn, projectPath ?? ""])));
             }
         }
+
+        // Lenses only a pack can count: a mediator handler is dispatched to from everywhere and
+        // referenced from nowhere, so nothing above this line has anything to say about it.
+        foreach (var contributor in
+                 LanguageScope.Of(languages).Contributors<ILanguageCodeLensContributor>())
+        {
+            lenses.AddRange(await contributor.CodeLensAsync(document, ct));
+        }
+
         return lenses.ToArray();
     }
 
     /// <summary>codeLens/resolve: computes the reference count (or inheritance-down count)
     /// for one visible lens.</summary>
-    public static async Task<LspCodeLens> ResolveAsync(LspCodeLens lens, CancellationToken ct)
+    public static async Task<LspCodeLens> ResolveAsync(
+        LspCodeLens lens, CancellationToken ct, LanguageSession? languages = null)
     {
+        // A contributed lens carries the id of the pack that emitted it, because the document is
+        // C# and so the URI cannot say whose it is. Checked first: the Kind below it is C#'s own
+        // vocabulary and a pack's means something else.
+        if (lens.Data is { PackId: { Length: > 0 } packId })
+        {
+            foreach (var contributor in
+                     LanguageScope.Of(languages).Contributors<ILanguageCodeLensContributor>())
+            {
+                if (contributor is ILanguagePack pack &&
+                    pack.Id.Equals(packId, StringComparison.OrdinalIgnoreCase) &&
+                    await contributor.ResolveCodeLensAsync(lens, ct) is { } resolvedByPack)
+                {
+                    return resolvedByPack;
+                }
+            }
+
+            // The pack that emitted it is switched off for this window, or declined. An
+            // unresolved lens with no command is what the protocol wants for "nothing here".
+            return lens;
+        }
+
         if (lens.Data is { Kind: "derived" or "implemented" or "overridden" } downData)
             return await ResolveInheritanceDownAsync(lens, downData, ct);
 
@@ -135,15 +168,11 @@ internal static class CodeLensHandler
         if (symbol is null)
             return lens with { Command = noReferences };
 
-        var references = await SymbolFinder.FindReferencesAsync(symbol, document.Project.Solution, ct);
-        var locations = references
-            .SelectMany(r => r.Locations)
-            .Where(l => l.Location.IsInSource)
-            .Select(l => LspConverters.ToLocation(l.Location))
-            .Where(l => l is not null)
-            .Select(l => l!)
-            .Distinct()
-            .ToArray();
+        // The search Shift+F12 runs, contributors included, rather than Roslyn's alone. A method
+        // a dozen mediator sends dispatch to has no C# references at all, and a gutter reading
+        // "0 references" above the peek that lists twelve is worse than no gutter.
+        var locations = await NavigationHandlers.AllReferencesAsync(
+            symbol, document.Project, includeDeclaration: false, ct, languages);
 
         string title = locations.Length == 1 ? "1 reference" : $"{locations.Length} references";
         return lens with

@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Config;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using RoslynDiagnostic = Microsoft.CodeAnalysis.Diagnostic;
 
@@ -13,7 +14,8 @@ namespace RoslynMCP.Lsp.Handlers;
 internal static class DiagnosticsHandler
 {
     /// <summary>Compiler diagnostics only — the fast pass.</summary>
-    public static async Task<Protocol.Diagnostic[]> ComputeAsync(string filePath, CancellationToken ct)
+    public static async Task<Protocol.Diagnostic[]> ComputeAsync(
+        string filePath, CancellationToken ct, LanguageSession? languages = null)
     {
         // Decompiled source is a reading aid, not a compilable file: it is a best-effort
         // reconstruction that legitimately references internals and compiler-generated names, and
@@ -21,18 +23,28 @@ internal static class DiagnosticsHandler
         // and Rider do not diagnose it either.
         if (Services.DecompiledSourceService.IsDecompiledPath(filePath))
             return Array.Empty<Protocol.Diagnostic>();
+
+        // A web.config belongs to no project in Roslyn's sense, so it has to be claimed before the
+        // document resolve that would otherwise return null and report nothing about it.
+        if (BindingRedirectHandler.IsConfigPath(filePath))
+            return await BindingRedirectHandler.DiagnosticsAsync(filePath, ct);
+
+        if (LanguageScope.Of(languages).Resolve<ILanguageDiagnosticProvider>(filePath) is { } pack)
+            return await pack.DiagnosticsAsync(filePath, ct);
 
         var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
         if (document is null)
             return Array.Empty<Protocol.Diagnostic>();
 
-        return ToProtocol(await CompilerDiagnosticsAsync(document, ct));
+        return WithEmbedded(
+            ToProtocol(await CompilerDiagnosticsAsync(document, ct)),
+            await EmbeddedDiagnosticsAsync(document, ct));
     }
 
     /// <summary>Compiler plus analyzer diagnostics, computing the analyzer pass if it is not
     /// already cached. The slow pass.</summary>
     public static async Task<Protocol.Diagnostic[]> ComputeWithAnalyzersAsync(
-        string filePath, CancellationToken ct)
+        string filePath, CancellationToken ct, LanguageSession? languages = null)
     {
         // Decompiled source is a reading aid, not a compilable file: it is a best-effort
         // reconstruction that legitimately references internals and compiler-generated names, and
@@ -40,6 +52,14 @@ internal static class DiagnosticsHandler
         // and Rider do not diagnose it either.
         if (Services.DecompiledSourceService.IsDecompiledPath(filePath))
             return Array.Empty<Protocol.Diagnostic>();
+
+        // A web.config belongs to no project in Roslyn's sense, so it has to be claimed before the
+        // document resolve that would otherwise return null and report nothing about it.
+        if (BindingRedirectHandler.IsConfigPath(filePath))
+            return await BindingRedirectHandler.DiagnosticsAsync(filePath, ct);
+
+        if (LanguageScope.Of(languages).Resolve<ILanguageDiagnosticProvider>(filePath) is { } pack)
+            return await pack.DiagnosticsAsync(filePath, ct);
 
         var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
         if (document is null)
@@ -47,8 +67,42 @@ internal static class DiagnosticsHandler
 
         var compiler = await CompilerDiagnosticsAsync(document, ct);
         var analyzer = await AnalyzerDiagnosticCache.GetOrComputeAsync(document, ct);
-        return ToProtocol(Merge(compiler, analyzer));
+        return WithEmbedded(
+            ToProtocol(Merge(compiler, analyzer)),
+            await EmbeddedDiagnosticsAsync(document, ct));
     }
+
+    /// <summary>
+    /// Problems reported by the languages that live inside string literals — a malformed route
+    /// template, an unparseable embedded query. Roslyn binds nothing inside a literal, so nobody
+    /// else has anything to say about one.
+    /// </summary>
+    /// <remarks>
+    /// The gate is the registered set, not the document: with no embedded language registered this
+    /// returns before the document is touched, which is what keeps a walk over every token off a
+    /// path that also runs on every keystroke. Beyond that gate the walk is the price of the
+    /// feature — the detector has to see each literal to know whether anyone claims it.
+    /// </remarks>
+    private static async Task<IReadOnlyList<Protocol.Diagnostic>> EmbeddedDiagnosticsAsync(
+        Document document, CancellationToken ct)
+    {
+        var embedded = RoslynEmbeddedLanguages.Current;
+        if (embedded.IsEmpty)
+            return [];
+
+        var results = new List<Protocol.Diagnostic>();
+        foreach (var context in await embedded.DetectAllAsync(document, ct))
+        {
+            if (context.Language is IEmbeddedDiagnosticProvider provider)
+                results.AddRange(await provider.DiagnosticsAsync(context, ct));
+        }
+
+        return results;
+    }
+
+    private static Protocol.Diagnostic[] WithEmbedded(
+        Protocol.Diagnostic[] diagnostics, IReadOnlyList<Protocol.Diagnostic> embedded) =>
+        embedded.Count == 0 ? diagnostics : [.. diagnostics, .. embedded];
 
     private static async Task<ImmutableArray<RoslynDiagnostic>> CompilerDiagnosticsAsync(
         Document document, CancellationToken ct)
@@ -85,9 +139,14 @@ internal static class DiagnosticsHandler
     /// immediately and computes in the background, then asks the client to re-pull. Blocking a
     /// pull on analyzers would make every first request feel like a hang.</summary>
     public static async Task<object> PullAsync(
-        DocumentDiagnosticParams p, CancellationToken ct)
+        DocumentDiagnosticParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
+
+        // A pack's diagnostics come from its own parser and are cheap enough to answer in full
+        // every time; there is no analyzer phase behind them to version against.
+        if (LanguageScope.Of(languages).Resolve<ILanguageDiagnosticProvider>(p.TextDocument.Uri) is { } pack)
+            return new FullDocumentDiagnosticReport("full", await pack.DiagnosticsAsync(path, ct));
 
         var document = await LspDocumentResolver.ResolveAsync(path, ct);
         if (document is null)
@@ -110,7 +169,11 @@ internal static class DiagnosticsHandler
         if (analyzersPending)
             ComputeAnalyzersInBackground(document);
 
-        return new FullDocumentDiagnosticReport("full", ToProtocol(Merge(compiler, analyzer)))
+        return new FullDocumentDiagnosticReport(
+            "full",
+            WithEmbedded(
+                ToProtocol(Merge(compiler, analyzer)),
+                await EmbeddedDiagnosticsAsync(document, ct)))
         {
             ResultId = resultId,
         };

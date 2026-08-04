@@ -218,8 +218,37 @@ internal static class MsBuildLocator
     /// MSBuild can resolve <c>$(VSToolsPath)</c> and related properties correctly
     /// when invoked outside of a VS Developer Command Prompt.
     /// </summary>
+    /// <summary>
+    /// Variables <c>MSBuildLocator.RegisterInstance</c> sets in this process so Roslyn's
+    /// <c>MSBuildWorkspace</c> can find the .NET SDK. A child process inherits them.
+    /// </summary>
+    private static readonly string[] SdkMsBuildVariables =
+    [
+        "MSBUILD_EXE_PATH",
+        "MSBuildExtensionsPath",
+        "MSBuildExtensionsPath32",
+        "MSBuildExtensionsPath64",
+        "MSBuildSDKsPath",
+    ];
+
+    /// <summary>
+    /// Prepares a child process to run Visual Studio's MSBuild.
+    /// </summary>
+    /// <remarks>
+    /// The clearing is the important half. Registering the .NET SDK for
+    /// <c>MSBuildWorkspace</c> sets <c>MSBuildExtensionsPath</c> and friends to the SDK's
+    /// directory, process-wide, and a spawned VS MSBuild inherits them — so it resolves
+    /// <c>$(MSBuildExtensionsPath)\Microsoft\Microsoft.NET.Build.Extensions\…</c> into the SDK
+    /// and fails to load a task that only ships with the SDK's own MSBuild. The error names an
+    /// SDK path while VS MSBuild is the one running, which is a confusing way to be told the
+    /// environment leaked. Removing them lets MSBuild compute its own, which is what it does
+    /// when launched from a developer prompt.
+    /// </remarks>
     public static void SetVsEnvironment(ProcessStartInfo startInfo, string msbuildPath)
     {
+        foreach (string variable in SdkMsBuildVariables)
+            startInfo.Environment.Remove(variable);
+
         var vsInstallDir = GetVsInstallDir(msbuildPath);
         if (vsInstallDir is null) return;
 

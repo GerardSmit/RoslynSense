@@ -130,5 +130,5 @@ public static partial class TestRunStore
     private static string FileFor(string solutionPath) =>
         Path.Combine(
             Path.GetTempPath(), "roslyn-sense", "test-runs",
-            Daemon.HostPaths.Hash(Path.GetFullPath(solutionPath)) + ".json");
+            Daemon.HostPaths.SolutionHash(Path.GetFullPath(solutionPath)) + ".json");
 }

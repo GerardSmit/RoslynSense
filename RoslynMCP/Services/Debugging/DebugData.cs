@@ -87,8 +87,9 @@ internal sealed class VariableHandles
     private readonly Dictionary<string, int> _byExpression = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
-    // Above any reference the adapter reserves for scopes.
-    private int _next = 1000;
+    // Above every reference the adapter reserves for scopes; overlapping them would make a
+    // variable's handle read as a frame's locals.
+    private int _next = DapServer.ScopeBase + DapServer.ScopeLimit;
 
     public int For(string expression)
     {

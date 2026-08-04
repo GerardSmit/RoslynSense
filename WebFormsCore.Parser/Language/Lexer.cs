@@ -455,6 +455,10 @@ public ref struct Lexer
         {
             type = TokenType.EvalExpression;
         }
+        else if (Consume('$'))
+        {
+            return ConsumeExpressionBuilder(start);
+        }
         else if (Consume('@'))
         {
             AddNode(TokenType.StartDirective, start);
@@ -469,6 +473,62 @@ public ref struct Lexer
         }
 
         return ConsumeUntil(_startStatement, end, type, start);
+    }
+
+    /// <summary>
+    /// Reads <c>&lt;%$ Prefix: Argument %&gt;</c> as two tokens. The argument gets its own token
+    /// because its range has to be exact: a builder may span a line, and slicing one token
+    /// afterwards can only add to a column.
+    /// </summary>
+    private bool ConsumeExpressionBuilder(TokenPosition start)
+    {
+        var prefix = ReadExpressionBuilderPart(stopAtColon: true);
+
+        var argument = Consume(':')
+            ? ReadExpressionBuilderPart(stopAtColon: false)
+            : CreateString(Position, Position);
+
+        // ReadAttribute resumes its value scan from wherever the offset lands, so stopping short
+        // of the closing %> folds the tail of the builder into the attribute value.
+        if (Peek(_end))
+        {
+            Forward(_end.Length);
+        }
+
+        var range = new TokenRange(File, start, Position);
+
+        AddNode(TokenType.ExpressionBuilderPrefix, range, prefix);
+        AddNode(TokenType.ExpressionBuilderArgument, range, argument);
+        return true;
+    }
+
+    private TokenString ReadExpressionBuilderPart(bool stopAtColon)
+    {
+        SkipWhiteSpace();
+
+        var start = Position;
+        var end = Position;
+
+        while (_offset < _input.Length && !Peek(_end))
+        {
+            if (stopAtColon && Peek(':'))
+            {
+                break;
+            }
+
+            // Only spaces and tabs are dropped from the end: a newline would move the end onto
+            // another line, and the position is tracked rather than recomputed.
+            var isPadding = Current is ' ' or '\t';
+
+            Forward();
+
+            if (!isPadding)
+            {
+                end = Position;
+            }
+        }
+
+        return CreateString(start, end);
     }
 
     private bool ConsumeInlineSkipWhiteSpace()

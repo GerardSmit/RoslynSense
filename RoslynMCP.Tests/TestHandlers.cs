@@ -1,7 +1,8 @@
 using RoslynMCP.Services;
 using RoslynMCP.Tools;
-using RoslynMCP.Tools.Razor;
-using RoslynMCP.Tools.WebForms;
+using RoslynMCP.Languages.Razor.Tools;
+using RoslynMCP.Languages.WebForms.Tools;
+using RoslynMCP.Languages;
 
 namespace RoslynMCP.Tests;
 

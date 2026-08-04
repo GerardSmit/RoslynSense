@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
 using CompletionItem = RoslynMCP.Lsp.Protocol.CompletionItem;
@@ -46,14 +47,45 @@ internal static class CompletionHandler
             var (document, text, offset) || document is null)
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
+        // A caret inside a string literal that Roslyn can tell holds another language — a route
+        // template, a GraphQL document — belongs to that language, not to C#: the C# pass has
+        // nothing to offer inside a literal anyway. Costs one syntax lookup when no embedded
+        // language is registered, and nothing at all when the caret is not in a literal.
+        if (await RoslynEmbeddedLanguages.Current.DetectAsync(document, offset, ct) is
+            { Language: IEmbeddedCompletionProvider embedded } embeddedContext)
+        {
+            return await embedded.CompletionAsync(embeddedContext, p, ct);
+        }
+
+        return await CompleteAsync(
+            document, text, offset, p.Context, cache,
+            span => LspConverters.ToRange(text.Lines, span), ct);
+    }
+
+    /// <summary>
+    /// The completion pass over an arbitrary document, with the span-to-range conversion left to
+    /// the caller. Markup files complete through here too: their C# lives in a projected
+    /// document, so every span Roslyn reports has to travel back to the file the user is in —
+    /// and <paramref name="toRange"/> returning <c>null</c> is how a span that has no place in
+    /// that file cancels the request.
+    /// </summary>
+    public static async Task<CompletionList> CompleteAsync(
+        Document document,
+        SourceText text,
+        int offset,
+        LspCompletionContext? context,
+        LspResolveCache cache,
+        Func<TextSpan, Protocol.Range?> toRange,
+        CancellationToken ct)
+    {
         document = document.WithFrozenPartialSemantics(ct);
 
         var service = CompletionService.GetService(document);
         if (service is null)
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
-        var trigger = p.Context is { TriggerKind: 2, TriggerCharacter.Length: > 0 } context
-            ? CompletionTrigger.CreateInsertionTrigger(context.TriggerCharacter[0])
+        var trigger = context is { TriggerKind: 2, TriggerCharacter.Length: > 0 } triggered
+            ? CompletionTrigger.CreateInsertionTrigger(triggered.TriggerCharacter[0])
             : CompletionTrigger.Invoke;
 
         // Let Roslyn's per-provider heuristics veto character triggers (e.g. "<" that is a
@@ -69,7 +101,8 @@ internal static class CompletionHandler
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
         // The span Roslyn wants replaced by the committed item (usually the partial word).
-        var defaultRange = LspConverters.ToRange(text.Lines, completions.Span);
+        if (toRange(completions.Span) is not { } defaultRange)
+            return new CompletionList(false, Array.Empty<CompletionItem>());
 
         string prefix = completions.Span.Length > 0 && completions.Span.End <= text.Length
             ? text.ToString(completions.Span)
@@ -153,7 +186,8 @@ internal static class CompletionHandler
     /// commit is more than "insert the label" (import completion adding a using, override
     /// stubs, …) get their extra edits as additionalTextEdits here.</summary>
     public static async Task<CompletionItem> ResolveAsync(
-        CompletionItem item, LspResolveCache cache, CancellationToken ct)
+        CompletionItem item, LspResolveCache cache, CancellationToken ct,
+        LanguageSession? languages = null)
     {
         if (item.Data is null || cache.GetCompletion(item.Data.CacheId, item.Data.Index) is not
             var (document, roslynItem) || document is null)
@@ -166,7 +200,12 @@ internal static class CompletionHandler
         // The real committed change: the using directive an import completion adds, and — for
         // override/interface completions — the generated member body, which is nothing like
         // the label the initial pass proposed.
-        if (roslynItem.IsComplexTextEdit || roslynItem.Flags.HasFlag(CompletionItemFlags.Expanded))
+        //
+        // Not for a language pack's projection: those spans are positions in a synthetic C#
+        // document, and applying them to the markup the user is actually editing would corrupt
+        // it. Only the documentation below survives, which is the part that is still true.
+        if ((roslynItem.IsComplexTextEdit || roslynItem.Flags.HasFlag(CompletionItemFlags.Expanded))
+            && !LanguageScope.Of(languages).IsProjectionPath(document.FilePath))
         {
             try
             {
@@ -191,8 +230,11 @@ internal static class CompletionHandler
         }
 
         var description = await service.GetDescriptionAsync(document, roslynItem, ct);
-        if (description is not null && !description.TaggedParts.IsEmpty)
-            item = item with { Documentation = new MarkupContent("markdown", description.Text) };
+        if (description is not null && !description.TaggedParts.IsEmpty
+            && TaggedTextMarkdown.ToMarkdown(description.TaggedParts) is { Length: > 0 } markdown)
+        {
+            item = item with { Documentation = new MarkupContent("markdown", markdown) };
+        }
 
         return item;
     }

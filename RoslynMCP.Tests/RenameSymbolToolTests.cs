@@ -146,7 +146,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceDirectiveAttribute_ReplacesInheritsValue()
     {
         var input = """<%@ Page Language="C#" Inherits="MyNamespace.OldPage" %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceDirectiveAttribute(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceDirectiveAttribute(
             input, "Inherits", "MyNamespace.OldPage", "MyNamespace.NewPage");
         Assert.Contains("MyNamespace.NewPage", result);
         Assert.DoesNotContain("OldPage", result);
@@ -156,7 +156,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceDirectiveAttribute_WhenNoMatchThenUnchanged()
     {
         var input = """<%@ Page Language="C#" Inherits="Other.Class" %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceDirectiveAttribute(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceDirectiveAttribute(
             input, "Inherits", "MyNamespace.OldPage", "MyNamespace.NewPage");
         Assert.Equal(input, result);
     }
@@ -165,7 +165,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceCodeBehindFileName_ReplacesFileName()
     {
         var input = """<%@ Page CodeBehind="Default.aspx.cs" Inherits="Default" %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceCodeBehindFileName(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceCodeBehindFileName(
             input, "Default", "HomePage");
         Assert.Contains("HomePage.aspx.cs", result);
     }
@@ -174,7 +174,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceCodeBehindFileName_WhenCodeFileThenAlsoReplaces()
     {
         var input = """<%@ Page CodeFile="Default.aspx.cs" %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceCodeBehindFileName(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceCodeBehindFileName(
             input, "Default", "HomePage");
         Assert.Contains("HomePage.aspx.cs", result);
     }
@@ -183,7 +183,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceInCodeBlocks_ReplacesWholeWordInExpressions()
     {
         var input = """<%= OldClass.GetValue() %> and <% OldClass.DoWork(); %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceInCodeBlocks(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceInCodeBlocks(
             input, "OldClass", "NewClass");
         Assert.Contains("NewClass.GetValue()", result);
         Assert.Contains("NewClass.DoWork()", result);
@@ -194,7 +194,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceInCodeBlocks_DoesNotReplacePartialMatches()
     {
         var input = """<%= OldClassName.GetValue() %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceInCodeBlocks(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceInCodeBlocks(
             input, "OldClass", "NewClass");
         // "OldClassName" should NOT be replaced because "OldClass" is not a whole word here
         Assert.Contains("OldClassName", result);
@@ -204,7 +204,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceInCodeBlocks_LeavesHtmlUnchanged()
     {
         var input = """<div class="OldClass">Hello</div>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceInCodeBlocks(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceInCodeBlocks(
             input, "OldClass", "NewClass");
         // Not inside <% %> blocks, so should be unchanged
         Assert.Equal(input, result);
@@ -284,7 +284,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceDirectiveAttribute_HandlesCaseInsensitiveMatch()
     {
         var input = """<%@ Page INHERITS="MyApp.OldClass" %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceDirectiveAttribute(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceDirectiveAttribute(
             input, "INHERITS", "MyApp.OldClass", "MyApp.NewClass");
         Assert.Contains("MyApp.NewClass", result);
     }
@@ -293,7 +293,7 @@ public class RenameSymbolToolTests : IDisposable
     public void ReplaceInCodeBlocks_HandlesBindingExpressions()
     {
         var input = """<%# OldClass.Eval("Name") %>""";
-        var result = RoslynMCP.Tools.WebForms.AspxRename.ReplaceInCodeBlocks(
+        var result = RoslynMCP.Languages.WebForms.Tools.AspxRename.ReplaceInCodeBlocks(
             input, "OldClass", "NewClass");
         Assert.Contains("NewClass.Eval", result);
     }

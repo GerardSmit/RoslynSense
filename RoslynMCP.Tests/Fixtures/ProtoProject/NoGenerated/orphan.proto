@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+option csharp_namespace = "ProtoFixture.NoGenerated";
+
+package orphan;
+
+service OrphanService {
+  rpc Ping(PingRequest) returns (PingReply);
+}
+
+message PingRequest {
+  string token = 1;
+}
+
+message PingReply {
+  bool ok = 1;
+  string detail = 2;
+  Verdict verdict = 3;
+}
+
+enum Verdict {
+  VERDICT_UNKNOWN = 0;
+  VERDICT_HEALTHY = 1;
+  VERDICT_DEGRADED = 2;
+}

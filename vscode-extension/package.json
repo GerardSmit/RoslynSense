@@ -15,14 +15,102 @@
   ],
   "activationEvents": [
     "onLanguage:csharp",
+    "onLanguage:webforms",
+    "onLanguage:resx",
+    "onLanguage:proto",
     "workspaceContains:**/*.{sln,slnx,csproj}"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "languages": [
+      {
+        "id": "cs-embedded",
+        "aliases": [
+          "Embedded C#"
+        ]
+      },
+      {
+        "id": "webforms",
+        "aliases": [
+          "WebForms",
+          "ASP.NET WebForms"
+        ],
+        "extensions": [
+          ".aspx",
+          ".ascx",
+          ".master",
+          ".asax",
+          ".ashx",
+          ".asmx"
+        ],
+        "firstLine": "^\\s*<%@",
+        "configuration": "./language-configuration/webforms.json"
+      },
+      {
+        "id": "resx",
+        "aliases": [
+          "RESX"
+        ],
+        "extensions": [
+          ".resx"
+        ],
+        "configuration": "./language-configuration/resx.json"
+      },
+      {
+        "id": "proto",
+        "aliases": [
+          "Protocol Buffers",
+          "protobuf"
+        ],
+        "extensions": [
+          ".proto"
+        ],
+        "configuration": "./language-configuration/proto.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cs-embedded",
+        "scopeName": "source.cs-embedded",
+        "path": "./syntaxes/csharpEmbedded.tmLanguage.json"
+      },
+      {
+        "language": "webforms",
+        "scopeName": "text.html.webforms",
+        "path": "./syntaxes/webforms.tmLanguage.json",
+        "embeddedLanguages": {
+          "text.html": "html",
+          "source.cs-embedded": "cs-embedded",
+          "source.sql": "sql",
+          "text.xml": "xml",
+          "source.js": "javascript",
+          "source.json": "json",
+          "source.css": "css"
+        }
+      },
+      {
+        "language": "resx",
+        "scopeName": "text.xml.resx",
+        "path": "./syntaxes/resx.tmLanguage.json"
+      },
+      {
+        "language": "proto",
+        "scopeName": "source.proto",
+        "path": "./syntaxes/proto.tmLanguage.json"
+      }
+    ],
     "commands": [
+      {
+        "command": "roslynSense.searchEverywhere",
+        "title": "RoslynSense: Search Everywhere"
+      },
       {
         "command": "roslynSense.openSolution",
         "title": "RoslynSense: Pick Solution"
+      },
+      {
+        "command": "roslynSense.pinLaunchUrl",
+        "title": "RoslynSense: Pin Launch URL to launchSettings.json"
       },
       {
         "command": "roslynSense.restartServer",
@@ -235,6 +323,18 @@
         "title": "New Solution Folder",
         "category": "RoslynSense",
         "icon": "$(new-folder)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.addProjectReference",
+        "title": "Add Project Reference\u2026",
+        "category": "RoslynSense",
+        "icon": "$(references)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newProject",
+        "title": "New Project\u2026",
+        "category": "RoslynSense",
+        "icon": "$(new-file)"
       }
     ],
     "viewsContainers": {
@@ -258,6 +358,9 @@
     "breakpoints": [
       {
         "language": "csharp"
+      },
+      {
+        "language": "webforms"
       }
     ],
     "taskDefinitions": [
@@ -289,6 +392,12 @@
         }
       }
     ],
+    "jsonValidation": [
+      {
+        "fileMatch": "**/Properties/launchSettings.json",
+        "url": "./schemas/launchSettings.schema.json"
+      }
+    ],
     "debuggers": [
       {
         "type": "roslynsense",
@@ -307,6 +416,10 @@
                 "type": "string",
                 "description": "Build configuration.",
                 "default": "Debug"
+              },
+              "launchProfile": {
+                "type": "string",
+                "description": "launchSettings.json profile to launch with. Omit to use the first Project profile."
               },
               "program": {
                 "type": "string",
@@ -458,6 +571,14 @@
         {
           "command": "roslynSense.solutionExplorer.newSolutionFolder",
           "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.addProjectReference",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newProject",
+          "when": "false"
         }
       ],
       "editor/context": [
@@ -604,10 +725,26 @@
           "command": "roslynSense.solutionExplorer.newSolutionFolder",
           "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder)$/",
           "group": "2_modify@0"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.addProjectReference",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(dependencies|projects)$/",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder)$/",
+          "group": "2_modify@1"
         }
       ]
     },
     "keybindings": [
+      {
+        "command": "roslynSense.searchEverywhere",
+        "key": "ctrl+t",
+        "mac": "cmd+t",
+        "when": "!inQuickOpen"
+      },
       {
         "command": "roslynSense.showInheritance",
         "key": "ctrl+alt+u",
@@ -750,6 +887,26 @@
           "default": true,
           "description": "When navigating into a package or framework type, fetch the source it was compiled from if its PDB says where to get it. Off decompiles instead and never reaches the network. Downloads are checksum-verified against the PDB."
         },
+        "roslynSense.languages.webforms": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.aspx`, `.ascx`, `.master` and their siblings: navigation between markup and code-behind, completion for server controls, and markup hits folded into find-references and rename. Off leaves these files to the grammar alone in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.resx": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.resx`: navigation from a generated designer property to the entry that produced it, and resource keys folded into find-references. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.proto": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.proto`: navigation from a `service` or `rpc` to the C# that implements and calls it, references for messages, fields and enums, and a warning on a type reference that resolves to nothing. protoc's generated C# is treated as a pass-through, so it never appears as a definition or a usage. Off leaves these files to the grammar alone in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.mediator": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Resolve `Send`, `Publish` and the generated mediator extension methods to the handler that runs, and count those calls as usages of the handler. Supports MediatR and Zapto.Mediator. Off leaves them resolving to the mediator interface in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
         "roslynSense.solutionExplorer.fileNesting": {
           "type": "boolean",
           "default": true,
@@ -769,6 +926,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "dev": "npm run compile && node scripts/dev.mjs",
     "package": "vsce package"
   },
   "dependencies": {

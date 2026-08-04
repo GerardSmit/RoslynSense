@@ -4,6 +4,16 @@
 // ReSharper disable CheckNamespace
 #pragma warning disable CS0067 // Event is never used
 
+namespace System.Web
+{
+    public class HttpContext
+    {
+        public static object GetGlobalResourceObject(string classKey, string resourceKey) => null!;
+
+        public static object GetLocalResourceObject(string virtualPath, string resourceKey) => null!;
+    }
+}
+
 namespace System.Web.UI
 {
     public interface ITemplate { }
@@ -19,6 +29,10 @@ namespace System.Web.UI
     {
         public string ID { get; set; } = "";
         public Control FindControl(string id) => null!;
+
+        /// <summary>Something a page can override from its markup, so that a member declared in a
+        /// script block is a real override rather than a new method that happens to compile.</summary>
+        protected virtual void OnLoad(EventArgs e) { }
     }
 
     public class Page : Control

@@ -11,8 +11,10 @@ import {
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
 import { registerTestController, runTestById } from './testController';
 import { registerSolutionExplorer } from './solutionExplorer';
+import { registerSearchEverywhere } from './searchEverywhere';
 import { registerVirtualDocuments } from './virtualDocuments';
-import { registerNuGetPanel } from './nugetPanel';
+import { registerNuGetPanel } from './nuget';
+import { createRedactingTraceChannel, wireNuGetCredentials } from './nuget/credentials';
 import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
@@ -42,12 +44,93 @@ function protocol2Code(value: string): vscode.Uri {
     return vscode.Uri.parse(value);
 }
 
+/** A language the server handles beyond C#, mirroring one language pack on the server side. */
+export interface ExtraLanguage {
+    /**
+     * The server's pack id, VS Code's language id and the `roslynSense.languages.<id>` setting
+     * key, deliberately all one string so a new language is one entry here and one contributed
+     * setting rather than a match to keep in step across three lists.
+     */
+    readonly id: string;
+    /**
+     * The file extensions the language owns, leading dot included. Both the watcher glob and the
+     * breakpoint filter derive from this rather than repeating it, because the two drifting apart
+     * means a file the server tracks that the gutter refuses, or the reverse.
+     */
+    readonly extensions: readonly string[];
+    /** Whether the gutter offers breakpoints in these documents. */
+    readonly breakpoints: boolean;
+}
+
+/** Files whose content the server tracks even while no editor has them open. */
+function watchGlob(language: ExtraLanguage): string {
+    return `**/*.{${language.extensions.map((extension) => extension.slice(1)).join(',')}}`;
+}
+
+/**
+ * The non-C# languages this extension activates. Adding one means adding a row here and
+ * contributing `roslynSense.languages.<id>`; the document selector, the file watchers and the
+ * settings sent to the server all read this table rather than repeating the list.
+ */
+export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
+    {
+        id: 'webforms',
+        extensions: ['.aspx', '.ascx', '.master', '.asax', '.ashx', '.asmx'],
+        breakpoints: true,
+    },
+    {
+        // Contributed as its own language rather than left as XML: without the `resx` id in
+        // `contributes.languages` VS Code opens the file as `xml`, the document selector below
+        // never matches it, and the server is never told the buffer was opened.
+        id: 'resx',
+        extensions: ['.resx'],
+        breakpoints: false,
+    },
+    {
+        // No breakpoints: a .proto declares shapes and service signatures, and the generated C#
+        // the debugger does bind to is a real compiled document Roslyn already owns.
+        id: 'proto',
+        extensions: ['.proto'],
+        breakpoints: false,
+    },
+    {
+        // No files of its own. A mediator send and the handler it reaches are both C#, which the
+        // selector already covers unconditionally, so this row exists only to carry the id into
+        // `serverSettings().languages` — the one thing that can switch the pack off for a window.
+        id: 'mediator',
+        extensions: [],
+        breakpoints: false,
+    },
+];
+
+/**
+ * The entries this window has switched on. Absent means on: the settings only ever narrow what
+ * the server registered, and a language the user has never had an opinion about should work.
+ */
+function enabledLanguages(): readonly ExtraLanguage[] {
+    const config = vscode.workspace.getConfiguration('roslynSense.languages');
+    return EXTRA_LANGUAGES.filter((language) => config.get<boolean>(language.id) !== false);
+}
+
+/**
+ * The enabled entries that own files. A pack contributing only to answers about C# has no document
+ * to select and no file to watch — it would contribute a language id VS Code has never heard of and
+ * a glob of `**\/*.{}` — but it still belongs in `serverSettings().languages`, which is what
+ * switches it off.
+ */
+function enabledFileLanguages(): readonly ExtraLanguage[] {
+    return enabledLanguages().filter((language) => language.extensions.length > 0);
+}
+
 /**
  * One client per bound solution, keyed by solution path (or by workspace folder when the server
  * resolves the solution itself). A multi-root workspace with two solutions gets two daemons —
  * which is what already happens on the server side, since the daemon is per solution.
  */
 const clientsBySolution = new Map<string, LanguageClient>();
+
+/** One trace channel for every client; created lazily so a session that never traces has none. */
+let redactingTrace: vscode.OutputChannel | undefined;
 
 /** Which solution each workspace folder is bound to, resolved once per folder. */
 const solutionByFolder = new Map<string, string | undefined>();
@@ -135,6 +218,7 @@ async function pickSolution(): Promise<string | undefined> {
  */
 function serverSettings(): Record<string, unknown> {
     const config = vscode.workspace.getConfiguration('roslynSense');
+    const enabled = enabledLanguages();
     return {
         analyzerDiagnostics: config.get('analyzerDiagnostics'),
         codeStyleDiagnostics: config.get('codeStyleDiagnostics'),
@@ -142,6 +226,12 @@ function serverSettings(): Record<string, unknown> {
         workspaceDiagnostics: config.get('workspaceDiagnostics'),
         sourceLink: config.get('sourceLink'),
         fileNesting: { rules: config.get('fileNesting.rules') },
+        // Which language packs this connection wants. Per connection on the server too: the
+        // daemon is shared, so another window — or an AI session on the same daemon — keeps
+        // whatever it asked for.
+        languages: Object.fromEntries(
+            EXTRA_LANGUAGES.map((language) => [language.id, enabled.includes(language)])
+        ),
     };
 }
 
@@ -155,6 +245,10 @@ function serverSettings(): Record<string, unknown> {
 function registerConfigurationSync(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('roslynSense.languages')) {
+                void promptReloadForLanguages();
+                return;
+            }
             if (!event.affectsConfiguration('roslynSense')) {
                 return;
             }
@@ -170,12 +264,53 @@ function registerConfigurationSync(context: vscode.ExtensionContext): void {
     );
 }
 
+/**
+ * Turning a language on or off takes a new connection, so offer one.
+ *
+ * Not a `didChangeConfiguration` like every other setting: the document selector is fixed when
+ * the client is constructed, and the server advertised this connection's capabilities — the
+ * markup trigger characters, its commands, the semantic-token legend — at initialize, where
+ * they cannot be withdrawn afterwards.
+ */
+async function promptReloadForLanguages(): Promise<void> {
+    const reload = 'Reload Window';
+    const choice = await vscode.window.showInformationMessage(
+        'RoslynSense language support changed. Reload the window to apply it.',
+        reload
+    );
+    if (choice === reload) {
+        await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
+}
+
+/**
+ * Which server binary to launch.
+ *
+ * An explicit `roslynSense.serverPath` wins. Otherwise `ROSLYNSENSE_SERVER` is honoured, which
+ * is the same variable the MCP entry point uses to redirect to a development build: without it,
+ * opening any folder that has no workspace setting silently falls back to the installed
+ * `roslyn-sense` on PATH, and a change you just built appears not to have happened.
+ */
+function resolveServerPath(config: vscode.WorkspaceConfiguration): string {
+    // inspect() rather than get(): get() returns the manifest's default when nothing is set,
+    // so it cannot tell "the user chose roslyn-sense" from "nobody chose anything" — and the
+    // environment variable would never get a look in.
+    const setting = config.inspect<string>('serverPath');
+    const chosen =
+        setting?.workspaceFolderValue ?? setting?.workspaceValue ?? setting?.globalValue;
+    if (chosen?.trim()) {
+        return chosen.trim();
+    }
+
+    return process.env.ROSLYNSENSE_SERVER?.trim() || 'roslyn-sense';
+}
+
 async function startClient(
     context: vscode.ExtensionContext,
     binding?: { solutionPath?: string; folder?: vscode.WorkspaceFolder }
 ): Promise<void> {
     const config = vscode.workspace.getConfiguration('roslynSense');
-    const serverPath = config.get<string>('serverPath', 'roslyn-sense');
+    const serverPath = resolveServerPath(config);
     const solutionPath = binding ? binding.solutionPath : await pickSolution();
     activeSolutionPath = solutionPath;
 
@@ -210,6 +345,11 @@ async function startClient(
             '**/*.cs',
             '**/*.{csproj,vbproj,fsproj,props,targets,sln,slnx,slnf}',
             '**/{.editorconfig,.globalconfig,Directory.Packages.props}',
+            // Not gated on the markup language being on for this window: web.config is a
+            // project file, and the tag prefixes it registers re-bind every control for the
+            // other sessions sharing this daemon.
+            '**/[wW]eb.config',
+            ...enabledFileLanguages().map(watchGlob),
         ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
     }
     const clientOptions: LanguageClientOptions = {
@@ -219,11 +359,21 @@ async function startClient(
         documentSelector: [
             { scheme: 'file', language: 'csharp' },
             { scheme: 'roslynsense-generated', language: 'csharp' },
+            // The other languages the same server serves — WebForms markup, whose controls,
+            // properties and event handlers are C# symbols, and whose <% %> blocks are C#.
+            // A language switched off still highlights, it just answers nothing.
+            ...enabledFileLanguages().map((language) => ({
+                scheme: 'file',
+                language: language.id,
+            })),
         ],
         uriConverters: { code2Protocol, protocol2Code },
         // Sent at initialize so the very first analyzer pass already runs under the user's
         // settings; changes afterwards go through workspace/didChangeConfiguration.
         initializationOptions: serverSettings(),
+        // Verbose tracing logs server→client requests and their responses, and one of those
+        // responses is a NuGet feed password.
+        traceOutputChannel: redactingTrace ??= createRedactingTraceChannel(),
         // Content changes to open files arrive via didChange; these watchers cover what the
         // editor never sees — files created, deleted, or rewritten outside it (git checkout,
         // scaffolding, another agent). The server coalesces the burst a branch switch produces.
@@ -261,6 +411,7 @@ async function startClient(
     client = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
     clientsBySolution.set(bindingKey(solutionPath, binding?.folder), client);
     wireEditorDebugCommandHandler(client);
+    wireNuGetCredentials(client, context);
     client.onDidChangeState((e) => {
         if (!statusItem) {
             return;
@@ -278,7 +429,7 @@ async function startClient(
     });
 
     statusItem ??= vscode.languages.createLanguageStatusItem(
-        'roslynSense.status', { language: 'csharp' });
+        'roslynSense.status', [{ language: 'csharp' }, { language: 'webforms' }]);
     statusItem.name = 'RoslynSense';
     statusItem.busy = true;
     statusItem.text = 'RoslynSense: starting';
@@ -909,6 +1060,22 @@ function applyPausedDecoration(session: DebugSessionInfo | undefined): void {
 // user toggles in the gutter are forwarded into the AI session. Suppression sets stop the
 // resulting onDidChangeBreakpoints echoes from bouncing back to the server.
 
+// Files the debugger can bind a breakpoint in. Markup belongs here because ASP.NET compiles a
+// page into generated C# whose #line directives point back at the markup, so the document the
+// PDB names — and the one the engine matches a breakpoint against — is the .aspx itself.
+//
+// Read per call and gated on the same setting as the document selector and the watchers: a
+// language switched off must not have its breakpoints persisted into the shared store, where
+// they would seed the next AI debug session for a pack this window never loaded.
+function breakpointExtensions(): readonly string[] {
+    return [
+        '.cs',
+        ...enabledLanguages()
+            .filter((language) => language.breakpoints)
+            .flatMap((language) => language.extensions),
+    ];
+}
+
 const suppressedAdds = new Set<string>();
 const suppressedRemovals = new Set<string>();
 let serverBpIds = new Map<string, number>(); // key -> server breakpoint id
@@ -993,9 +1160,9 @@ function syncNativeBreakpoints(sessions: DebugSessionInfo[]): void {
         [...serverBps].filter(([, bp]) => bp.id > 0).map(([key, bp]) => [key, bp.id]));
 }
 
-// Mirrors the editor's full C# breakpoint set to the server's per-solution store, so
-// breakpoint edits made with NO AI session running still shape the next session the chat
-// starts (DebugStartTool folds the store into its initial breakpoints).
+// Mirrors the editor's full breakpoint set to the server's per-solution store, so breakpoint
+// edits made with NO AI session running still shape the next session the chat starts
+// (DebugStartTool folds the store into its initial breakpoints).
 function sendBreakpointSnapshot(): void {
     if (!client) {
         return;
@@ -1005,11 +1172,13 @@ function sendBreakpointSnapshot(): void {
     if (!solutionPath) {
         return;
     }
+    const extensions = breakpointExtensions();
     const breakpoints = vscode.debug.breakpoints
         .filter((bp): bp is vscode.SourceBreakpoint =>
             bp instanceof vscode.SourceBreakpoint &&
             bp.location.uri.scheme === 'file' &&
-            bp.location.uri.fsPath.toLowerCase().endsWith('.cs'))
+            extensions.some(
+                (ext) => bp.location.uri.fsPath.toLowerCase().endsWith(ext)))
         .map((bp) => ({
             file: bp.location.uri.fsPath,
             line: bp.location.range.start.line + 1,
@@ -2002,6 +2171,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerTestController(context, () => client);
     registerSolutionExplorer(context, () => client);
     registerVirtualDocuments(context, () => client);
+    registerSearchEverywhere(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
     registerHotReload(context, () => client);

@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Services.ProjectModel;
 using RoslynMCP.Services.Run;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -49,25 +51,43 @@ internal static partial class LaunchHandler
     {
         string configuration = string.IsNullOrWhiteSpace(p.Configuration) ? "Debug" : p.Configuration;
 
-        var solution = WorkspaceService.TryGetMostRecentSolution();
-        var projectPaths = solution?.Projects
-            .Select(project => project.FilePath)
-            .Where(path => !string.IsNullOrEmpty(path))
-            .Select(path => path!)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList() ?? [];
+        // From the solution file as well as from Roslyn: a legacy project needs the
+        // out-of-process build host to load at all, so asking only what Roslyn holds meant F5
+        // on a WebForms project reported it was not in the solution it is plainly in.
+        var projectPaths = SolutionProjectIndex.ProjectPaths();
 
         var targets = new List<LaunchTarget>(projectPaths.Count);
         foreach (var projectPath in projectPaths)
         {
             ct.ThrowIfCancellationRequested();
-            targets.Add(Describe(projectPath, configuration));
+            targets.Add(Describe(projectPath, configuration, p.LaunchProfile));
         }
 
         return await Task.FromResult(targets
             .OrderByDescending(t => t.Runnable)
             .ThenBy(t => t.ProjectName, StringComparer.OrdinalIgnoreCase)
             .ToArray());
+    }
+
+    /// <summary>
+    /// The launch target for the project a file belongs to.
+    /// </summary>
+    /// <remarks>
+    /// What F5 needs to stop asking. The editor knows which file is in front of the user; the
+    /// project that owns it is nearly always the one they meant to run, and making them pick it
+    /// out of a list every time is the kind of question an IDE should answer for itself. Returns
+    /// <c>null</c> rather than guessing when the file belongs to no project, so the caller can
+    /// fall back to asking.
+    /// </remarks>
+    public static LaunchTarget? TargetForFile(TargetForFileParams p)
+    {
+        if (SolutionProjectIndex.ProjectForFile(p.FilePath ?? "") is not { } projectPath)
+            return null;
+
+        return Describe(
+            projectPath,
+            string.IsNullOrWhiteSpace(p.Configuration) ? "Debug" : p.Configuration,
+            p.LaunchProfile);
     }
 
     /// <summary>What the machine offers for .NET Framework work, so the client can pick MSBuild
@@ -78,11 +98,13 @@ internal static partial class LaunchHandler
         return new ToolchainInfo(info.MsBuildPath, info.DesktopClr, info.PreferredIisExpress);
     }
 
-    private static LaunchTarget Describe(string projectPath, string configuration)
+    private static LaunchTarget Describe(
+        string projectPath, string configuration, string? launchProfile = null)
     {
         var classification = ProjectClassifier.Classify(projectPath);
         string name = Path.GetFileNameWithoutExtension(projectPath);
         bool isNetFramework = classification.DebugRuntime == DebugRuntime.NetFramework;
+        var profiles = DescribeProfiles(projectPath);
 
         if (!classification.IsRunnable)
         {
@@ -92,24 +114,28 @@ internal static partial class LaunchHandler
                 Program: null, Args: [], Cwd: null, Env: [], Url: null,
                 Error: classification.IsTestProject
                     ? "Test project — run it from the Test Explorer."
-                    : "Produces a library, so there is nothing to launch.");
+                    : "Produces a library, so there is nothing to launch.",
+                LaunchProfiles: profiles);
         }
 
         // A Framework target is launchable, but by the ICorDebug adapter rather than netcoredbg —
         // the client picks between them on IsNetFramework. What it does need is the toolchain:
         // without MSBuild there is nothing to build, and the failure would otherwise surface as a
-        // missing executable.
-        if (isNetFramework && NetFxToolchain.Info.MsBuildPath.Length == 0)
+        // missing executable. Only a legacy project needs it, though — an SDK-style project on
+        // net48 is built by the dotnet CLI like any other.
+        if (classification.BuildTool == BuildTool.VisualStudioMsBuild &&
+            NetFxToolchain.Info.MsBuildPath.Length == 0)
         {
             return new LaunchTarget(
                 projectPath, name, classification.Kind.ToString(), classification.TargetFramework,
                 IsNetFramework: true, classification.IsTestProject, Runnable: false,
                 Program: null, Args: [], Cwd: null, Env: [], Url: null,
-                Error: "This is a .NET Framework project and Visual Studio's MSBuild was not found. " +
-                       "Install Visual Studio or the Build Tools to build and debug it.");
+                Error: "This is a legacy (non-SDK) project and Visual Studio's MSBuild was not found. " +
+                       "Install Visual Studio or the Build Tools to build and debug it.",
+                LaunchProfiles: profiles);
         }
 
-        var spec = RunConfigResolver.Resolve(projectPath, configuration);
+        var spec = RunConfigResolver.Resolve(projectPath, configuration, launchProfile);
         if (!spec.CanRun)
         {
             // Usually "not built yet" — still a target, because the launch flow builds first.
@@ -117,14 +143,33 @@ internal static partial class LaunchHandler
                 projectPath, name, classification.Kind.ToString(), classification.TargetFramework,
                 isNetFramework, classification.IsTestProject, Runnable: true,
                 Program: null, Args: [], Cwd: Path.GetDirectoryName(projectPath), Env: [],
-                Url: null, Error: spec.Error);
+                Url: null, Error: spec.Error, LaunchProfiles: profiles, LaunchProfile: launchProfile);
         }
 
         return new LaunchTarget(
             projectPath, name, classification.Kind.ToString(), classification.TargetFramework,
             isNetFramework, classification.IsTestProject, Runnable: true,
             spec.Executable, spec.Arguments.ToArray(), spec.WorkingDirectory,
-            new Dictionary<string, string>(spec.Environment), spec.Url, Error: null);
+            new Dictionary<string, string>(spec.Environment), spec.Url, Error: null,
+            LaunchProfiles: profiles, LaunchProfile: spec.ProfileName,
+            BrowseUrl: spec.BrowseUrl, LaunchBrowser: spec.LaunchBrowser);
+    }
+
+    /// <summary>
+    /// The project's launch profiles. Only the launchable ones: a profile the server cannot start
+    /// would appear in the client's run-configuration list and then fail when chosen.
+    /// </summary>
+    private static LaunchProfileDescriptor[] DescribeProfiles(string projectPath)
+    {
+        var projectDir = Path.GetDirectoryName(projectPath);
+        if (projectDir is null || LaunchSettings.Load(projectDir) is not { } settings)
+            return [];
+
+        return [.. settings.Profiles
+            .Where(p => p.IsLaunchable)
+            .Select(p => new LaunchProfileDescriptor(
+                p.Name, p.CommandName, p.ApplicationUrl, p.CommandLineArgs, p.LaunchBrowser,
+                p.LaunchUrl, new Dictionary<string, string>(p.EnvironmentVariables)))];
     }
 
     /// <summary>
@@ -183,32 +228,54 @@ internal static partial class LaunchHandler
     /// the Problems panel instead of dumping compiler output into a message box.
     /// </summary>
     public static async Task<BuildResult> BuildAsync(
-        string projectPath, string configuration, CancellationToken ct)
+        string projectPath, string configuration, CancellationToken ct) =>
+        await BuildAsync(projectPath, configuration, "build", ct);
+
+    /// <summary>
+    /// Builds, rebuilds or cleans a project or a whole solution.
+    /// </summary>
+    /// <param name="reportProgress">
+    /// False when the client is already showing progress for this build itself — which it does for
+    /// a launch, because that one has to carry a Cancel button — so the two do not stack up.
+    /// </param>
+    public static async Task<BuildResult> BuildAsync(
+        string projectPath, string configuration, string target, CancellationToken ct,
+        bool reportProgress = true)
     {
         if (!File.Exists(projectPath))
             return new BuildResult(false, $"Project '{projectPath}' not found.", [], []);
 
-        await using var progress = await ProgressReporter.BeginAsync(
-            $"Building {Path.GetFileNameWithoutExtension(projectPath)}", ct);
+        string verb = target switch
+        {
+            "rebuild" => "Rebuilding",
+            "clean" => "Cleaning",
+            _ => "Building",
+        };
+
+        await using var progress = reportProgress
+            ? await ProgressReporter.BeginAsync(
+                $"{verb} {Path.GetFileNameWithoutExtension(projectPath)}", ct)
+            : null;
 
         // The dotnet CLI cannot build a non-SDK project at all — it needs Visual Studio's MSBuild,
         // which also has to run with the VS environment set for the legacy targets to resolve.
-        bool isNetFramework =
-            ProjectClassifier.Classify(projectPath).DebugRuntime == DebugRuntime.NetFramework;
-        string? msbuild = isNetFramework ? MsBuildLocator.FindMsBuild() : null;
+        // The reverse is just as true: an SDK-style project targeting net48 belongs to the dotnet
+        // CLI, and handing it to VS MSBuild fails to resolve Microsoft.NET.Sdk.
+        bool isLegacy = NeedsVisualStudioMsBuild(projectPath);
+        string? msbuild = isLegacy ? MsBuildLocator.FindMsBuild() : null;
 
-        if (isNetFramework && msbuild is null)
+        if (isLegacy && msbuild is null)
         {
             return new BuildResult(false,
-                "This is a .NET Framework project and Visual Studio's MSBuild was not found. " +
+                "This is a legacy (non-SDK) project and Visual Studio's MSBuild was not found. " +
                 "Install Visual Studio or the Build Tools for Visual Studio.", [], []);
         }
 
         var startInfo = msbuild is not null
             ? new ProcessStartInfo(msbuild,
-                $"\"{projectPath}\" /nologo /v:minimal /p:Configuration={configuration}")
-            : new ProcessStartInfo("dotnet",
-                $"build \"{projectPath}\" -c {configuration} --nologo -consoleloggerparameters:NoSummary");
+                $"\"{projectPath}\" /nologo /v:minimal /p:Configuration={configuration} " +
+                $"/t:{MsBuildTarget(target)}")
+            : new ProcessStartInfo("dotnet", DotnetArguments(projectPath, configuration, target));
 
         startInfo.RedirectStandardOutput = true;
         startInfo.RedirectStandardError = true;
@@ -223,22 +290,118 @@ internal static partial class LaunchHandler
         if (process is null)
             return new BuildResult(false, "Failed to start the build.", [], []);
 
-        string stdout = await process.StandardOutput.ReadToEndAsync(ct);
-        string stderr = await process.StandardError.ReadToEndAsync(ct);
+        // Cancelling has to reach MSBuild itself: abandoning the read would leave a compiler
+        // running against the same output the next build wants to write.
+        await using var cancellation = ct.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Already gone, which is the state the cancellation wanted.
+            }
+        });
+
+        // Read line by line rather than to the end, so the progress notification says which
+        // project is compiling instead of sitting on one title until the build is over.
+        var output = new StringBuilder();
+        void Capture(string? line)
+        {
+            if (line is null)
+                return;
+
+            lock (output)
+                output.AppendLine(line);
+
+            if (DescribeBuildLine(line) is { } step)
+                progress?.Report(step);
+        }
+
+        process.OutputDataReceived += (_, e) => Capture(e.Data);
+        process.ErrorDataReceived += (_, e) => Capture(e.Data);
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
         await process.WaitForExitAsync(ct);
 
-        var messages = ParseBuildOutput(stdout + "\n" + stderr).ToList();
+        var messages = ParseBuildOutput(output.ToString()).ToList();
         var errors = messages.Where(m => m.IsError).Select(m => m.Message).ToArray();
         var warnings = messages.Where(m => !m.IsError).Select(m => m.Message).ToArray();
 
         bool success = process.ExitCode == 0;
+        string done = target switch
+        {
+            "rebuild" => "Rebuilt",
+            "clean" => "Cleaned",
+            _ => "Built",
+        };
+
         return new BuildResult(
             success,
             success
-                ? $"Built {Path.GetFileName(projectPath)} ({warnings.Length} warning(s))."
-                : $"Build failed with {errors.Length} error(s).",
+                ? $"{done} {Path.GetFileName(projectPath)} ({warnings.Length} warning(s))."
+                : $"{verb[..^3]} failed with {errors.Length} error(s).",
             errors,
             warnings);
+    }
+
+    /// <summary>
+    /// What a line of build output means for a progress notification, or null when it means
+    /// nothing the user needs to watch scroll past.
+    /// </summary>
+    private static string? DescribeBuildLine(string line)
+    {
+        var trimmed = line.Trim();
+        if (trimmed.Length == 0)
+            return null;
+
+        if (trimmed.StartsWith("Determining projects to restore", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("Restoring", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("Restored", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Restoring packages";
+        }
+
+        // MSBuild announces each finished assembly as "Project -> path\Project.dll".
+        int arrow = trimmed.IndexOf(" -> ", StringComparison.Ordinal);
+        return arrow > 0 ? $"Built {trimmed[..arrow].Trim()}" : null;
+    }
+
+    private static string MsBuildTarget(string target) => target switch
+    {
+        "rebuild" => "Rebuild",
+        "clean" => "Clean",
+        _ => "Build",
+    };
+
+    private static string DotnetArguments(string path, string configuration, string target) =>
+        target == "clean"
+            ? $"clean \"{path}\" -c {configuration} --nologo"
+            : $"build \"{path}\" -c {configuration} --nologo " +
+              $"-consoleloggerparameters:NoSummary" +
+              (target == "rebuild" ? " -t:Rebuild" : string.Empty);
+
+    /// <summary>
+    /// Whether a build target needs Visual Studio's MSBuild rather than the dotnet CLI.
+    /// </summary>
+    /// <remarks>
+    /// A solution has no build style of its own; it takes the strictest of its projects', because
+    /// one legacy project in it is enough for the dotnet CLI to fail on the whole thing.
+    /// </remarks>
+    private static bool NeedsVisualStudioMsBuild(string path)
+    {
+        if (path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
+        {
+            return SolutionFileService.Read(path).Any(node =>
+                node is { IsFolder: false, Path: { Length: > 0 } project } &&
+                ProjectClassifier.Classify(project).BuildTool == BuildTool.VisualStudioMsBuild);
+        }
+
+        return ProjectClassifier.Classify(path).BuildTool == BuildTool.VisualStudioMsBuild;
     }
 
     private static IEnumerable<(bool IsError, BuildMessage Message)> ParseBuildOutput(string output)

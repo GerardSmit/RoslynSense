@@ -1,5 +1,8 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using RoslynMCP.Lsp;
+using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services;
 using RoslynMCP.Services.Designers;
 using Xunit;
 
@@ -14,6 +17,7 @@ namespace RoslynMCP.Tests;
 /// declare the same partial-class members twice and change what regeneration legitimately emits.
 /// One end-to-end test still exercises the real service against the committed fixture.
 /// </remarks>
+[Collection(SharedState.Name)]
 public class DesignerGenerationTests
 {
     [Fact]
@@ -221,6 +225,101 @@ public class DesignerGenerationTests
         var absent = Path.Combine(Path.GetTempPath(), $"roslynsense-absent-{Guid.NewGuid():N}.designer.cs");
 
         Assert.Equal("alpha\r\nbeta\r\n", DesignerRegenerationService.MatchLineEndings("alpha\nbeta\n", absent));
+    }
+
+    [Fact]
+    public async Task WhenTheEditorInitializesThenAnAddedControlGetsItsFieldWithoutATool()
+    {
+        // The gap: regeneration was armed only by the MCP open_solution tool, so a control typed
+        // into markup in VS Code produced no field and stayed invisible to its code-behind.
+        string workingDirectory = Path.Combine(
+            Path.GetTempPath(), $"roslynsense-designer-watch-{Guid.NewGuid():N}");
+        System.IO.Directory.CreateDirectory(workingDirectory);
+
+        string markupPath = FixturePaths.DesignerAspxFile;
+        string designerPath = FixturePaths.DesignerAspxDesignerFile;
+        string originalMarkup = await File.ReadAllTextAsync(markupPath);
+        string originalDesigner = await File.ReadAllTextAsync(designerPath);
+        string? previousSolution = WorkspaceService.BoundSolutionPath;
+
+        var session = new SolutionSessionService(
+            new DesignerRegenerationService([new AspxDesignerGenerator()]));
+
+        try
+        {
+            // The watcher follows the solution this process is bound to, and the fixture project
+            // has none of its own.
+            string solution = Path.Combine(workingDirectory, "Watched.slnx");
+            await File.WriteAllTextAsync(
+                solution, $"""<Solution><Project Path="{FixturePaths.AspxProjectFile}" /></Solution>""");
+            WorkspaceService.BindSolution(solution);
+
+            using var server = new LspServer(new DesignerServices(session));
+            server.Initialize(new InitializeParams(
+                ProcessId: null, RootUri: null, WorkspaceFolders: null, Capabilities: null));
+
+            Assert.True(session.IsWatching, "initialize left the designer watcher off.");
+            Assert.Equal(Path.GetFullPath(solution), session.SolutionPath!, ignoreCase: true);
+
+            var regenerated = new TaskCompletionSource<WatchedRegeneration>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            session.Regenerated += entry => regenerated.TrySetResult(entry);
+
+            await File.WriteAllTextAsync(markupPath, originalMarkup.Replace(
+                "    </form>",
+                "        <asp:Label ID=\"lblWatcherAdded\" runat=\"server\" />\r\n    </form>"));
+
+            WatchedRegeneration reported;
+            try
+            {
+                // Generous: the first regeneration loads the project through MSBuild.
+                reported = await regenerated.Task.WaitAsync(TimeSpan.FromMinutes(2));
+            }
+            catch (TimeoutException)
+            {
+                Assert.Fail("No designer was rewritten. Watcher history: " + Describe(session));
+                throw;
+            }
+
+            Assert.Equal(DesignerOutcome.Updated, reported.Outcome);
+            Assert.Equal(
+                Path.GetFullPath(designerPath), Path.GetFullPath(reported.DesignerPath), ignoreCase: true);
+            Assert.Contains(
+                "protected global::System.Web.UI.WebControls.Label lblWatcherAdded;",
+                await File.ReadAllTextAsync(designerPath));
+        }
+        finally
+        {
+            // Stop watching before the fixture goes back, or restoring the markup regenerates
+            // over the designer we just restored.
+            session.Dispose();
+            await Task.Delay(TimeSpan.FromMilliseconds(750));
+
+            await File.WriteAllTextAsync(markupPath, originalMarkup);
+            await File.WriteAllTextAsync(designerPath, originalDesigner);
+
+            // Through the setter rather than BindSolution, which ignores a null by design: this
+            // temporary solution is about to be deleted, and leaving the process bound to it
+            // would change what every later solution-scoped query in the run resolves to.
+            typeof(WorkspaceService)
+                .GetProperty(nameof(WorkspaceService.BoundSolutionPath))!
+                .SetValue(null, previousSolution);
+
+            try { System.IO.Directory.Delete(workingDirectory, recursive: true); } catch { }
+        }
+    }
+
+    private static string Describe(SolutionSessionService session) =>
+        session.History.Count == 0
+            ? "(nothing was regenerated)"
+            : string.Join("; ", session.History.Select(entry =>
+                $"{Path.GetFileName(entry.SourcePath)} {entry.Outcome} {string.Join(",", entry.Errors)}"));
+
+    /// <summary>The one service <c>initialize</c> needs to start the watcher.</summary>
+    private sealed class DesignerServices(SolutionSessionService session) : IServiceProvider
+    {
+        public object? GetService(Type serviceType) =>
+            serviceType == typeof(SolutionSessionService) ? session : null;
     }
 
     private static int CountFields(string designerContent) =>

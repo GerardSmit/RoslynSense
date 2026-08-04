@@ -24,6 +24,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
     private readonly Lock _writeGate = new();
     private int _nextId;
     private int _disposed;
+    private int _detached;
 
     public ChannelReader<DebugEvent> Events => _events.Reader;
 
@@ -63,7 +64,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
         _worker.ErrorDataReceived += (_, e) =>
         {
             if (e.Data is { Length: > 0 })
-                _events.Writer.TryWrite(new DebugEvent { Kind = DebugEventKind.Output, Message = $"[worker] {e.Data}" });
+                _events.Writer.TryWrite(new DebugEvent { Kind = DebugEventKind.Diagnostic, Message = $"[worker] {e.Data}" });
         };
 
         _worker.Exited += (_, _) =>
@@ -149,11 +150,19 @@ public sealed class WorkerDebugEngine : IDebugEngine
             _worker.StandardInput.Flush();
         }
 
-        var response = await waiter.Task.WaitAsync(RequestTimeout);
-        return response.Ok
-            ? response
-            : throw new InvalidOperationException(
-                response.Error.Length > 0 ? response.Error : $"the worker rejected '{request.Op}'");
+        try
+        {
+            var response = await waiter.Task.WaitAsync(RequestTimeout);
+            return response.Ok
+                ? response
+                : throw new InvalidOperationException(
+                    response.Error.Length > 0 ? response.Error : $"the worker rejected '{request.Op}'");
+        }
+        finally
+        {
+            // A timed-out request is never answered, so nothing else would ever drop its waiter.
+            _pending.TryRemove(request.Id, out _);
+        }
     }
 
     /// <summary>Fire-and-forget for commands whose failure surfaces as a later event.</summary>
@@ -167,7 +176,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
         {
             _events.Writer.TryWrite(new DebugEvent
             {
-                Kind = DebugEventKind.Output,
+                Kind = DebugEventKind.Diagnostic,
                 Message = $"[worker] {request.Op} failed: {ex.Message}",
             });
         }
@@ -335,6 +344,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
         try
         {
             await SendAsync(new WorkerRequest { Op = "detach" });
+            Interlocked.Exchange(ref _detached, 1);
             return (true, "");
         }
         catch (Exception ex)
@@ -359,8 +369,22 @@ public sealed class WorkerDebugEngine : IDebugEngine
 
         try
         {
+            // The worker's only exit signal is end-of-input: one that was never sent 'terminate'
+            // blocks in ReadLineAsync until the wait below expires and it is killed.
+            if (!_worker.HasExited)
+                _worker.StandardInput.Close();
+        }
+        catch
+        {
+            // Already gone, or its input is already closed.
+        }
+
+        try
+        {
+            // Detach promised the debuggee would keep running, so after one the worker's tree is
+            // off limits and only the worker itself may be taken down.
             if (!_worker.WaitForExit(3000))
-                _worker.Kill(entireProcessTree: true);
+                _worker.Kill(entireProcessTree: Volatile.Read(ref _detached) == 0);
         }
         catch
         {

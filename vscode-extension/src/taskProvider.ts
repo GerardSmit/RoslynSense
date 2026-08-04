@@ -180,7 +180,7 @@ export function registerTaskProvider(
                 'dotnet',
                 ['run', '--project', picked.projectPath].map(
                     (arg) => ({ value: arg, quoting: vscode.ShellQuoting.Strong })),
-                { env: await withHotReloadEnvironment(client, {}) });
+                { env: await withHotReloadEnvironment(client, {}, picked.projectPath) });
 
             await vscode.tasks.executeTask(task);
         })

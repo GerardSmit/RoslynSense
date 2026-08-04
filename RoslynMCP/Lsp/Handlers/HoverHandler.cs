@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 
@@ -28,10 +29,33 @@ internal static class HoverHandler
             var (document, text, offset) || document is null)
             return null;
 
+        // Inside a string literal Roslyn binds to nothing, so a resource key would hover blank.
+        // Ask the embedded languages first; the check ends after a syntax lookup unless the caret
+        // really is in a literal, and before that when none are registered.
+        if (await RoslynEmbeddedLanguages.Current.DetectAsync(document, offset, ct) is
+            { Language: IEmbeddedHoverProvider embedded } embeddedContext)
+        {
+            return await embedded.HoverAsync(embeddedContext, ct);
+        }
+
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
         if (symbol is null)
             return null;
 
+        // Highlight the identifier token under the cursor when we can find it.
+        Protocol.Range? range = null;
+        var root = await document.GetSyntaxRootAsync(ct);
+        var token = root?.FindToken(Math.Min(offset, Math.Max(0, text.Length - 1)));
+        if (token is { } t && t.Span.Contains(Math.Min(offset, Math.Max(0, text.Length - 1))))
+            range = LspConverters.ToRange(text.Lines, t.Span);
+
+        return new Hover(new MarkupContent("markdown", Describe(symbol, ct)), range);
+    }
+
+    /// <summary>The signature-plus-summary markdown shown for a symbol. Shared with the markup
+    /// languages, whose symbols do not come from a syntax position.</summary>
+    public static string Describe(ISymbol symbol, CancellationToken ct)
+    {
         var sb = new StringBuilder();
         sb.Append("```csharp\n");
         sb.Append(symbol.ToDisplayString(s_displayFormat));
@@ -49,13 +73,6 @@ internal static class HoverHandler
                 sb.Append("\n\n**Returns:** ").Append(returns);
         }
 
-        // Highlight the identifier token under the cursor when we can find it.
-        Protocol.Range? range = null;
-        var root = await document.GetSyntaxRootAsync(ct);
-        var token = root?.FindToken(Math.Min(offset, Math.Max(0, text.Length - 1)));
-        if (token is { } t && t.Span.Contains(Math.Min(offset, Math.Max(0, text.Length - 1))))
-            range = LspConverters.ToRange(text.Lines, t.Span);
-
-        return new Hover(new MarkupContent("markdown", sb.ToString()), range);
+        return sb.ToString();
     }
 }

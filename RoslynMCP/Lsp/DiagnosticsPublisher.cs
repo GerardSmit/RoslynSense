@@ -25,6 +25,15 @@ internal sealed class DiagnosticsPublisher : IDisposable
 
     public DiagnosticsPublisher(JsonRpc rpc) => _rpc = rpc;
 
+    /// <summary>
+    /// The session's enabled languages, once <c>initialize</c> has read them. Settable rather than
+    /// a constructor argument because the publisher is created when the connection is attached,
+    /// which is before the client has told us which languages it wants. Until then it is null and
+    /// the handlers fall back to the registration gate — the same rule every other pre-initialize
+    /// path follows.
+    /// </summary>
+    public Languages.LanguageSession? Languages { get; set; }
+
     public void Schedule(string filePath, bool immediate)
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_disposed.Token);
@@ -53,7 +62,7 @@ internal sealed class DiagnosticsPublisher : IDisposable
             if (!immediate)
                 await Task.Delay(Debounce, ct);
 
-            var diagnostics = await Handlers.DiagnosticsHandler.ComputeAsync(filePath, ct);
+            var diagnostics = await Handlers.DiagnosticsHandler.ComputeAsync(filePath, ct, Languages);
 
             ct.ThrowIfCancellationRequested();
             await PublishAsync(filePath, diagnostics, ct);
@@ -74,7 +83,7 @@ internal sealed class DiagnosticsPublisher : IDisposable
     {
         await Task.Delay(AnalyzerDebounce, ct);
 
-        var merged = await Handlers.DiagnosticsHandler.ComputeWithAnalyzersAsync(filePath, ct);
+        var merged = await Handlers.DiagnosticsHandler.ComputeWithAnalyzersAsync(filePath, ct, Languages);
 
         ct.ThrowIfCancellationRequested();
         await PublishAsync(filePath, merged, ct);

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "RESX",
+  "scopeName": "text.xml.resx",
+  "comment": "A .resx is XML, and only the language id needs to be its own so the server is told the buffer opened. Everything about highlighting is delegated to the grammar VS Code already ships.",
+  "patterns": [
+    {
+      "include": "text.xml"
+    }
+  ]
+}

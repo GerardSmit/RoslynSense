@@ -13,9 +13,9 @@ This plan covers the three tiers identified in the gap audit:
 | 3 | Debugger depth | Debugging feels like Rider, both for the user and for the AI mirror |
 
 Tier 4 (Razor/Blazor/XAML/WinForms designers, Source Link, code-style settings UI) is
-deliberately out of scope here. Razor and WebForms have since grown server-side language services
-anyway, though only the MCP surface can reach them — see
-[Gaps against VS and Rider](#gaps-against-vs-and-rider).
+deliberately out of scope here. WebForms has since outgrown it entirely — `.aspx` and its siblings
+are a first-class LSP language now, not an MCP-only side surface. Razor's server-side services are
+still MCP-only, and deliberately so — see [Gaps against VS and Rider](#gaps-against-vs-and-rider).
 
 ---
 
@@ -117,7 +117,7 @@ landed, and what shipped beyond it.
 | Item | State | Delivered as |
 | --- | --- | --- |
 | T2.1 Solution Explorer | Done | `SolutionFileService`, `ProjectEvaluationService`, `FileNestingService`, three tree handlers, `solutionExplorer.ts` — solution folders, Dependencies subtree, show-all-files, filter, go-to-node, reveal, drag-and-drop, add/delete/rename, cut/copy/paste/duplicate, `Alt+Insert` new item, `F5` set-as-startup-and-debug, package details, and a nesting toggle with user-defined rules |
-| T2.2 NuGet panel | Done | `NuGetService` (real NuGet.config chain, search/versions/installed/updates/consolidations, `dotnet`-backed mutations, icon proxy) + `nugetPanel.ts`; `PackagesConfigService` covers legacy projects |
+| T2.2 NuGet panel | Done | `NuGetFeedContext` (NuGet.config chain, source mapping, per-feed outcomes, feed add/remove/reorder/enable, credential providers with an editor sign-in prompt) + `NuGetMetadataService` (README, license, deprecation, vulnerabilities, dependency groups), `PackageUpdateService` (version locks and batch update), `PackageAuditService`, `PackageFrameworkService`, `NuGetIconService`/`NuGetPayloadService`, `ProjectAssetsService`; Central Package Management resolves in `ProjectEvaluationService.ReadPackages`. Panel split into `src/nuget/` and a type-checked `src/webview/nuget/`. `PackagesConfigService` covers legacy projects |
 | T2.3 `$/progress` | Done | `LspProgress` + `ProgressReporter`, on solution load, restore, reload, debugger provisioning, test runs |
 | T2.4 refresh fan-out | Done | `RefreshKind` flags through `ScheduleClientRefresh`; diagnostics, code lens and inlay hints all re-request |
 | T2.5 build tasks | Done | `taskProvider.ts` + `$msCompile`; build errors reach Problems through T1.2's launch path |
@@ -163,7 +163,10 @@ Shipped since the plan was written, and not tracked by any item in it:
 | Relevance-ranked completion | `RoslynMCP/Lsp/Completion/` — ordering by match quality rather than alphabetically |
 | Per-build daemon keying | `HostPaths` salts the solution key with the server assembly's MVID, so a rebuilt server never reuses a stale daemon |
 | Profiling, memory and database tooling | `ProfileTool`, `MemoryTool`, `DatabaseTool` and their services — an MCP-only surface with no editor counterpart |
-| Razor and WebForms language services | `Tools/Razor/*`, `Tools/WebForms/*` — **MCP-only**, see [gaps](#gaps-against-vs-and-rider) |
+| Language packs | `Languages/` — a language beyond C# is one folder owning one engine and both front-ends, so an editor feature and the matching MCP tool cannot drift apart. `Languages/WebForms/` is the worked example; `Languages/Razor/` is MCP-only by choice. See [`RoslynMCP/Languages/README.md`](../RoslynMCP/Languages/README.md) |
+| WebForms as a first-class editor language | Navigation, references, rename across markup and code-behind, completion, diagnostics in and out of the editor, outline and folding, call and type hierarchy, workspace symbols, linked editing, document links, selection ranges, semantic tokens, auto-insert, event-handler generation, and breakpoints in markup — see the [WebForms section](../vscode-extension/README.md#webforms) of the extension README |
+| Embedded languages in C# strings | `Languages/Abstractions/EmbeddedStringLanguage.cs` and `RoslynEmbeddedLanguages` — a language claims `[StringSyntax]` identifiers and Roslyn's own `EmbeddedLanguageDetector` does the resolution, including `// lang=` comments. A language Roslyn's detector cannot be made to name implements `IConfiguredStringLanguage` and answers `Detect` itself, as one fallback in `DetectAtAsync`. Orthogonal to packs: a route template owns a span inside someone else's document, not a file |
+| Resource keys as a navigable thing | `Languages/Resources/` — `.resx` is a pack, and a resource key is navigable from C#, from `<%$ Resources: … %>` / `<%$ dnnLoc: … %>` and from `meta:resourcekey`. The unit is the *family* (every `.resx` sharing a base name in a directory), because which one wins at runtime depends on a portal, a thread culture and a database-stored fallback locale, none of which exists in an editor — so definition, hover, completion and rename answer with the family rather than a guess. Which call shapes carry a key is configurable (`resources.preset` / `lookups`), and confidence gates the features: rename is refused where the resource file could only be inferred from proximity. See [`RoslynMCP/Languages/README.md`](../RoslynMCP/Languages/README.md#resources-the-one-pack-whose-model-needs-explaining) |
 | Source Link | `SourceLinkService` reads the Source Link map out of a dependency's portable PDB, resolves the declaring document, downloads it, and verifies it against the checksum the PDB recorded before go-to-definition lands in it. Decompilation is the fallback for every failure — no PDB, no map, unreachable host, checksum mismatch |
 | Inline debug values | `textDocument/inlineValue` — locals, parameters and field accesses in the stopped frame's own method, up to the stopped line. The server says *what* to resolve and the client resolves it against whichever session is stopped, so it works on all three debug surfaces without any of them knowing |
 | Expand selection, linked editing | `textDocument/selectionRange` walks the syntax tree outward; `textDocument/linkedEditingRange` covers locals, parameters, range variables, labels and method type parameters — the symbols whose every reference is provably in the file |
@@ -194,6 +197,16 @@ Every numbered item in the plan is now implemented as designed. What remains is 
 where the three debug surfaces disagree with each other, and where the product is behind Visual
 Studio and Rider on ground the plan never covered.
 
+> **The second group is now measured rather than estimated.** A full audit catalogued 1,093
+> Rider/Visual Studio capabilities and checked every one against this repository: 362 are at parity,
+> 736 are open, and five are defects rather than gaps. The section below is the summary this plan
+> shipped with and is kept for history; it undercounts badly.
+>
+> - [ide-gap-analysis.md](ide-gap-analysis.md) — the verdict, the five defects, the platform
+>   question, the root causes and the fifteen highest-value small fixes
+> - [ide-gap-register.md](ide-gap-register.md) — all 736 open items with file-level evidence
+> - [ide-capability-catalog.md](ide-capability-catalog.md) — what Rider and VS actually provide
+
 ## Debugger surface asymmetries
 
 Three DAP surfaces exist and they are not equivalent. This is the single largest source of "it
@@ -223,9 +236,46 @@ Ground the plan never covered, ordered by how often it would be noticed.
 
 | Gap | Detail |
 | --- | --- |
-| **Razor, Blazor and WebForms get no editor features.** `Tools/Razor/*` and `Tools/WebForms/*` implement go-to-definition, rename, outline, find-usages and diagnostics for `.razor` and `.aspx` — but only for MCP. The LSP `documentSelector` is `[{ scheme: 'file', language: 'csharp' }]`, so opening a `.razor` file in VS Code gets nothing. The server-side work is done; the wiring is not |
+| **Razor and Blazor get no editor features of ours.** `Languages/Razor/` implements go-to-definition, rename, outline and diagnostics for `.razor` and `.cshtml`, but registers no LSP providers, so opening one in VS Code falls through to the C# handlers and gets nothing markup-aware. That is a decision rather than missing wiring: Razor's editor support comes from the C# Dev Kit's own Razor server, and the pack exists to give an AI session the tool surface it would otherwise lack. The seam is in place if the decision changes — implementing the provider interfaces on `RazorLanguage` is all it takes, and nothing in `LspServer` changes. Note the pack has no find-usages handler; `find_usages` on a `.razor` answers from Roslyn alone |
 | **Which branch ran is unknown.** Cobertura records how many of a line's branches were taken, not which. The coverage view therefore reports "1 of 2" correctly but cannot colour the arms; naming one would be inventing detail the format does not carry |
 | **Source Link resolves by name, not by token.** There is no public map from an `ISymbol` to a metadata token, so a method is matched by name and every overload resolves to the same declaration line. They are always in one file, so navigation lands correctly; the line can be a sibling overload's |
+| **A resource key can be found but not created.** Everything in `Languages/Resources/` reads: `ResxReader` produces spans for entries that exist, and every edit the pack emits — including a family-wide rename — is a `TextEdit` over one of those spans. There is no writer, so "move string literal to resource" and any other code action that would add a `<data name=…>` are not implemented, and the missing-key diagnostic points at a key you have to go and write yourself. The insertion side is the real work: the entry belongs in the family's neutral file, which may be neither the file the caret is in nor a file that exists yet |
+
+### What WebForms still does not do
+
+This entry has been a gap twice — first "WebForms is MCP-only", then "WebForms answers in the
+editor but Razor does not" — and it is neither now. `.aspx` and its siblings answer navigation,
+references, rename across both halves, completion, diagnostics with the file closed, outline and
+folding, call and type hierarchy, workspace symbols, linked editing, document links, selection
+ranges, semantic tokens, auto-insert, event-handler generation, and breakpoints in the gutter. What
+is left is short, and most of it is a decision rather than a backlog.
+
+**Markup formatting is deferred, not skipped.** `textDocument/formatting` and `rangeFormatting` on
+an `.aspx` currently do nothing — `WebFormsLanguage` does not implement
+`ILanguageFormattingProvider`, so the request falls through to the C# handler, which has no Roslyn
+document for a markup file and returns no edits. The interface exists and the shape of the work is
+known; it was pushed behind everything else because it is the largest single item in the pack and
+the one users would notice least, and because a formatter that reflows markup wrongly is worse than
+none. Anyone picking it up should treat attribute wrapping, embedded `<% %>` blocks, and the
+`<script>`/`<style>` islands as three separate problems.
+
+**`inlayHint` is skipped by choice.** Markup states its types: `<asp:Label ID="lblTotal">` names
+both the type and the identifier on the same line. There is nothing to infer that the text does not
+already say, so a hint would be redundant chrome rather than information.
+
+**`onTypeFormatting` is skipped by choice.** `roslynSense/onAutoInsert` covers what actually helps —
+`>` closing a tag, `<%--` completing its comment — without reflowing the document on every
+keystroke. C# keeps its `;` and `}` triggers; markup gets nothing, deliberately.
+
+**`inlineValue` returns nothing for markup, by construction.** It is advertised server-wide because
+C# needs it, but markup has no debug-time locals of its own — anything a `<% %>` block touches is a
+member of the page class and is already covered on the C# side.
+
+**One inconsistency is accepted.** The `codeLens` reference count over a C# member comes from
+Roslyn alone, while `textDocument/references` on the same member also lists the markup that names
+it. So a handler method can read "2 references" and produce three results. Making the two agree
+means running the markup contributor once per lens, which is far too expensive for something that
+renders above every member in the file. The lens under-counts; the reference list is the truth.
 
 ## Deliberately out of scope
 

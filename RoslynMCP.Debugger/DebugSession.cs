@@ -27,6 +27,10 @@ public sealed class DebugSession : IDebugSession
     /// point). Hit counters live beside them.
     private readonly ConcurrentDictionary<string, BreakpointSpec> _boundSpecs = new();
     private readonly ConcurrentDictionary<string, int> _hitCounts = new();
+    /// The requested SourceKey mapped to the key the breakpoint actually bound under. Binding
+    /// snaps to the next sequence point and rewrites the spec's line, so a removal issued for the
+    /// line the client asked about would otherwise match nothing and leave the breakpoint armed.
+    private readonly ConcurrentDictionary<string, string> _boundKeyByRequest = new();
     private readonly BlockingCollection<Action> _commands = new();
     private readonly ManualResetEventSlim _ready = new();
     /// PDB readers are expensive to create; one per module path, session-thread only.
@@ -128,25 +132,104 @@ public sealed class DebugSession : IDebugSession
     {
         lock (_specLock)
             _specs.Add(spec);
-        // Try binding into already-loaded modules; stopping the process is required to touch
-        // ICorDebug state, so ride the command queue while stopped or bind lazily on next stop.
-        Enqueue(() =>
+        // Binding touches ICorDebug state, which requires a synchronized process.
+        Enqueue(() => WhileSynchronized("set a breakpoint", () =>
         {
-            if (_process is null || _stoppedThread is null)
-                return; // running: LoadModule/next-stop rebind picks it up
             foreach (var module in LoadedModules())
                 TryBindBreakpoint(module, spec);
-        });
+        }));
+    }
+
+    /// <summary>
+    /// Runs work that touches ICorDebug breakpoint state, suspending a running target just long
+    /// enough to do it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Both arming and disarming a breakpoint need a synchronized process. Adding one used to
+    /// give up while the target ran, leaving a comment saying the next <c>LoadModule</c> or stop
+    /// would pick it up; neither happens for a server, whose assemblies load during startup and
+    /// which never stops on its own, so every breakpoint set after the app was up silently never
+    /// bound. Removing one had the mirror image of the bug: the deactivate failed unsynchronized
+    /// and was swallowed, so the native breakpoint stayed armed and the debuggee kept stopping at
+    /// a breakpoint the user had deleted.
+    /// </para>
+    /// <para>
+    /// The suspension is deliberately invisible: no <c>_stoppedThread</c>, no paused event, and
+    /// <c>Continue</c> in a finally so a failure cannot leave the debuggee frozen. <c>Stop</c> is
+    /// counted, so the pairing has to be exact — an unbalanced pair wedges every later resume.
+    /// </para>
+    /// </remarks>
+    private void WhileSynchronized(string what, Action work)
+    {
+        if (_process is not { } process)
+            return;
+
+        if (_stoppedThread is not null)
+        {
+            work();
+            return;
+        }
+
+        try
+        {
+            process.Stop(PauseTimeoutMs);
+        }
+        catch (Exception ex)
+        {
+            Emit(DebugEventKind.Diagnostic,
+                $"could not suspend the target to {what}: {ex.Message}", string.Empty, 0);
+            return;
+        }
+
+        try
+        {
+            work();
+        }
+        finally
+        {
+            try { process.Continue(false); }
+            catch (Exception ex)
+            {
+                Emit(DebugEventKind.Diagnostic,
+                    $"the target could not be resumed after trying to {what}: {ex.Message}",
+                    string.Empty, 0);
+            }
+        }
     }
 
     public bool RemoveBreakpoint(string filePath, int line)
     {
-        var key = SourceKey(filePath, line);
+        var requestedKey = SourceKey(filePath, line);
+        var key = _boundKeyByRequest.TryGetValue(requestedKey, out var actualKey) ? actualKey : requestedKey;
         lock (_specLock)
-            _specs.RemoveAll(s => s.FilePath.Length > 0 && SourceKey(s.FilePath, (int)s.Line) == key);
+        {
+            _specs.RemoveAll(s =>
+            {
+                if (s.FilePath.Length == 0)
+                    return false;
+                var specKey = SourceKey(s.FilePath, (int)s.Line);
+                return specKey == key || specKey == requestedKey;
+            });
+        }
+        _boundKeyByRequest.TryRemove(requestedKey, out _);
+        // Condition state and hit counts are keyed by the bound line; leaving them behind would
+        // let a re-added breakpoint inherit the removed one's counting.
+        _boundSpecs.TryRemove(key, out _);
+        _boundModule.TryRemove(key, out _);
+        _hitCounts.TryRemove(key, out _);
         if (!_bound.TryRemove(key, out var breakpoint))
             return false;
-        Enqueue(() => { try { breakpoint.Activate(false); } catch { } });
+        Enqueue(() => WhileSynchronized("remove a breakpoint", () =>
+        {
+            try { breakpoint?.Activate(false); }
+            catch (Exception ex)
+            {
+                Emit(DebugEventKind.Diagnostic,
+                    $"a removed breakpoint could not be disarmed and may still stop the target: {ex.Message}",
+                    string.Empty, 0);
+            }
+        }));
         return true;
     }
 
@@ -260,7 +343,22 @@ public sealed class DebugSession : IDebugSession
     {
         var process = _process;
         if (process is null)
+        {
+            // Silence here strands the caller: it waits for a stop event that can never arrive.
+            Emit(DebugEventKind.Paused, "there is no debuggee to suspend", string.Empty, 0);
             return;
+        }
+
+        // Stop is counted, so calling it on an already-stopped target leaves the count unbalanced
+        // and every later Continue short of it — the session wedges. Re-report the stop instead.
+        if (_stoppedThread is { } current)
+        {
+            var (currentFile, currentLine, currentColumn) = ThreadLocation(current);
+            Emit(
+                DebugEventKind.Paused, "paused", MethodOf(current), ThreadId(current),
+                currentFile, currentLine, currentColumn);
+            return;
+        }
 
         try
         {
@@ -268,7 +366,7 @@ public sealed class DebugSession : IDebugSession
         }
         catch (Exception ex)
         {
-            Emit(DebugEventKind.Output, $"the target could not be suspended: {ex.Message}", string.Empty, 0);
+            Emit(DebugEventKind.Diagnostic, $"the target could not be suspended: {ex.Message}", string.Empty, 0);
             return;
         }
 
@@ -1194,10 +1292,15 @@ public sealed class DebugSession : IDebugSession
                     try { e.Controller.Continue(false); } catch { }
                     return;
                 }
-                if (TryGetBoundSpec(file, line, out var spec) && spec.Temporary)
+                var bound = TryGetBoundSpec(file, line, out var spec);
+                if (bound && spec.Temporary)
                     RemoveBreakpoint(file, line);
                 _stoppedThread = e.Thread;
-                Emit(DebugEventKind.Breakpoint, "breakpoint hit", MethodOf(e.Thread), ThreadId(e.Thread), file, line, column);
+                // Without the id the client cannot tell which breakpoint stopped it, which is
+                // what hit conditions, logpoints and value watches are keyed by.
+                Emit(
+                    DebugEventKind.Breakpoint, "breakpoint hit", MethodOf(e.Thread), ThreadId(e.Thread),
+                    file, line, column, breakpointId: bound ? spec.Id : string.Empty);
             };
             callback.OnStepComplete += (_, e) =>
             {
@@ -1222,7 +1325,7 @@ public sealed class DebugSession : IDebugSession
                 }
                 else
                 {
-                    Emit(DebugEventKind.Output, $"first-chance exception in {MethodOf(e.Thread)}", string.Empty, 0);
+                    Emit(DebugEventKind.Diagnostic, $"first-chance exception in {MethodOf(e.Thread)}", string.Empty, 0);
                 }
             };
             callback.OnExitProcess += (_, _) =>
@@ -1571,14 +1674,14 @@ public sealed class DebugSession : IDebugSession
         try { flagged = module.TrySetJITCompilerFlags(CorDebugJITCompilerFlags.CORDEBUG_JIT_ENABLE_ENC); }
         catch (Exception ex)
         {
-            Emit(DebugEventKind.Output,
+            Emit(DebugEventKind.Diagnostic,
                 $"EnC could not be enabled for {Path.GetFileName(moduleName)}: {ex.Message}",
                 string.Empty, 0);
         }
 
         if (flagged != HRESULT.S_OK)
         {
-            Emit(DebugEventKind.Output,
+            Emit(DebugEventKind.Diagnostic,
                 $"EnC is unavailable for {Path.GetFileName(moduleName)} ({flagged}); " +
                 "hot reload cannot change it.",
                 string.Empty, 0);
@@ -1607,7 +1710,7 @@ public sealed class DebugSession : IDebugSession
                 return;
         }
         Emit(
-            DebugEventKind.Output,
+            DebugEventKind.Diagnostic,
             $"no symbols for {Path.GetFileName(moduleName)} — source breakpoints in it cannot bind",
             string.Empty, 0);
     }
@@ -1620,20 +1723,33 @@ public sealed class DebugSession : IDebugSession
         var assemblyName = Path.GetFileNameWithoutExtension(moduleName);
         if (assemblyName.Length > 0)
             _encModules.TryRemove(assemblyName, out _);
+
+        // The symbols went with it. Kept, they hold the PDB open for the rest of the session —
+        // one handle per app-domain recycle, which a site rebuilt all afternoon does often — and
+        // a module that reloads from the same path would be read through its predecessor's PDB.
+        lock (_readers)
+        {
+            if (_readers.Remove(moduleName, out var unloaded))
+                unloaded?.Dispose();
+        }
+        lock (_noSymbolsReported)
+            _noSymbolsReported.Remove(moduleName);
+
         foreach (var pair in _boundModule)
         {
             if (!string.Equals(pair.Value, moduleName, StringComparison.OrdinalIgnoreCase))
                 continue;
             _boundModule.TryRemove(pair.Key, out _);
             _bound.TryRemove(pair.Key, out _);
-            _boundSpecs.TryRemove(pair.Key, out _);
+            _boundSpecs.TryRemove(pair.Key, out var spec);
             // Source keys are "path|line"; entry keys have no separator (no gutter echo needed).
             var sep = pair.Key.LastIndexOf('|');
             if (sep > 0 && int.TryParse(pair.Key.AsSpan(sep + 1), out var line))
                 Emit(
                     DebugEventKind.BreakpointUnbound,
                     $"module unloaded: {Path.GetFileName(moduleName)}",
-                    string.Empty, 0, pair.Key[..sep], line);
+                    string.Empty, 0, pair.Key[..sep], line,
+                    breakpointId: spec?.Id ?? string.Empty);
         }
     }
 
@@ -1710,7 +1826,11 @@ public sealed class DebugSession : IDebugSession
     /// </remarks>
     private void RefreshSymbolsAfterEdit(string assemblyName, byte[] pdb)
     {
-        foreach (var (path, reader) in _readers.ToArray())
+        KeyValuePair<string, SymbolReader?>[] snapshot;
+        lock (_readers)
+            snapshot = [.. _readers];
+
+        foreach (var (path, reader) in snapshot)
         {
             if (!string.Equals(
                     Path.GetFileNameWithoutExtension(path), assemblyName, StringComparison.OrdinalIgnoreCase))
@@ -1732,7 +1852,7 @@ public sealed class DebugSession : IDebugSession
                 }
                 catch (Exception ex)
                 {
-                    Emit(DebugEventKind.Output,
+                    Emit(DebugEventKind.Diagnostic,
                         $"the symbol store could not be updated after the edit: {ex.Message}",
                         string.Empty, 0);
                 }
@@ -1744,9 +1864,10 @@ public sealed class DebugSession : IDebugSession
 
             if (!updated)
             {
-                _readers.Remove(path);
+                lock (_readers)
+                    _readers.Remove(path);
                 reader?.Dispose();
-                Emit(DebugEventKind.Output,
+                Emit(DebugEventKind.Diagnostic,
                     $"line information for {assemblyName} is stale after the edit; " +
                     "breakpoints in changed methods may bind to the wrong line.",
                     string.Empty, 0);
@@ -1756,6 +1877,7 @@ public sealed class DebugSession : IDebugSession
         // A method token alone no longer identifies code: the edited method has a new version, and
         // bindings made against the old one would resolve to it. Dropping them returns the
         // affected breakpoints to pending, and the specs survive, so they rebind.
+        var dropped = false;
         foreach (var pair in _boundModule.ToArray())
         {
             if (!string.Equals(
@@ -1766,9 +1888,37 @@ public sealed class DebugSession : IDebugSession
             }
 
             _boundModule.TryRemove(pair.Key, out _);
-            _bound.TryRemove(pair.Key, out _);
-            _boundSpecs.TryRemove(pair.Key, out _);
+            // Dropping the reference without deactivating leaks a live native breakpoint into the
+            // runtime, and a leaked breakpoint is what later makes detach fail.
+            if (_bound.TryRemove(pair.Key, out var breakpoint))
+            {
+                try { breakpoint?.Activate(false); } catch { }
+            }
+            _boundSpecs.TryRemove(pair.Key, out var unbound);
+            dropped = true;
+
+            // The rebind below usually puts these straight back, but it is allowed to fail — that
+            // is what the stale-symbols warning above is about. Announcing the unbind means a
+            // breakpoint that does not come back is drawn as pending rather than left looking
+            // armed, which is the one state the client cannot recover on its own.
+            var sep = pair.Key.LastIndexOf('|');
+            if (sep > 0 && int.TryParse(pair.Key.AsSpan(sep + 1), out var line))
+            {
+                Emit(
+                    DebugEventKind.BreakpointUnbound,
+                    $"rebinding after an edit to {assemblyName}",
+                    string.Empty, 0, pair.Key[..sep], line,
+                    breakpointId: unbound?.Id ?? string.Empty);
+            }
         }
+
+        // Nothing else would rebind them: the edited module does not raise LoadModule again. This
+        // runs on the session thread with the process stopped, which is what binding requires.
+        if (!dropped)
+            return;
+        foreach (var module in LoadedModules())
+            foreach (var spec in SpecsSnapshot())
+                TryBindBreakpoint(module, spec);
     }
 
     // --- breakpoints ----------------------------------------------------------------------------
@@ -1803,7 +1953,10 @@ public sealed class DebugSession : IDebugSession
         int Column,
         int EndLine,
         int EndColumn,
-        string FilePath);
+        string FilePath,
+        /// <summary>Where the next sequence point starts, so a source-level step knows how much IL
+        /// this line covers. <c>0</c> when the caller resolved a point rather than located one.</summary>
+        int NextOffset = 0);
 
     private readonly record struct ResolvedSequencePoint(mdMethodDef MethodToken, SequencePointMatch Match);
 
@@ -2240,16 +2393,35 @@ public sealed class DebugSession : IDebugSession
                 var points = method.GetSequencePoints(method.SequencePointCount);
                 for (var i = 0; i < points.offsets.Length; i++)
                 {
+                    if (IsHiddenSequencePoint(points.lines[i]))
+                        continue;
+
                     var start = points.offsets[i];
-                    var end = i + 1 < points.offsets.Length ? points.offsets[i + 1] : int.MaxValue;
-                    if (ip < start || ip >= end || IsHiddenSequencePoint(points.lines[i]))
+
+                    // Runs to the next point that is both visible and further along. Compiler
+                    // generated IL — a `using` close, an iterator's plumbing — belongs to the
+                    // statement it was generated for, so both the reported location and the step
+                    // range span it; ending at it instead leaves a step stopped on a line that
+                    // does not exist in the source. Points sharing an offset would otherwise give
+                    // an empty range, which degrades a step to a single IL instruction. The
+                    // portable reader gets both by dropping hidden points before it pairs offsets.
+                    var next = i + 1;
+                    while (next < points.offsets.Length &&
+                           (IsHiddenSequencePoint(points.lines[next]) || points.offsets[next] <= start))
+                    {
+                        next++;
+                    }
+
+                    var end = next < points.offsets.Length ? points.offsets[next] : int.MaxValue;
+                    if (ip < start || ip >= end)
                         continue;
                     var document = new SymUnmanagedDocument(points.documents[i]);
                     var file = Safe(() => document.URL) ?? string.Empty;
                     var column = i < points.columns.Length ? points.columns[i] : 0;
                     var endLine = i < points.endLines.Length && points.endLines[i] != 0 ? points.endLines[i] : points.lines[i];
                     var endColumn = i < points.endColumns.Length ? points.endColumns[i] : 0;
-                    return new SequencePointMatch(start, points.lines[i], column, endLine, endColumn, file);
+                    return new SequencePointMatch(
+                        start, points.lines[i], column, endLine, endColumn, file, end);
                 }
             }
             catch
@@ -2277,7 +2449,8 @@ public sealed class DebugSession : IDebugSession
                     point.StartColumn,
                     point.EndLine == 0 ? point.StartLine : point.EndLine,
                     point.EndColumn,
-                    PortableSequencePointFile(reader.Portable.Reader, method, point));
+                    PortableSequencePointFile(reader.Portable.Reader, method, point),
+                    end);
             }
         }
         catch
@@ -2518,6 +2691,7 @@ public sealed class DebugSession : IDebugSession
             _bound[actualKey] = breakpoint;
             _boundModule[actualKey] = moduleName;
             _boundSpecs[actualKey] = spec;
+            _boundKeyByRequest[requestedKey] = actualKey;
             if (requestedKey != actualKey)
                 _bound.TryRemove(requestedKey, out _);
             Emit(
@@ -2544,8 +2718,10 @@ public sealed class DebugSession : IDebugSession
     {
         var moduleName = Safe(() => module.Name) ?? string.Empty;
         var key = $"{moduleName}!{spec.TypeName}.{spec.MethodName}";
+        // The key is reserved before the search so two modules cannot bind the same entry point.
         if (!_bound.TryAdd(key, null!))
             return;
+        var created = false;
         try
         {
             var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(module);
@@ -2565,7 +2741,8 @@ public sealed class DebugSession : IDebugSession
                     breakpoint.Activate(true);
                     _bound[key] = breakpoint;
                     _boundModule[key] = moduleName;
-                    Emit(DebugEventKind.Output, $"bound breakpoint {typeProps.szTypeDef}.{methodProps.szMethod}", methodProps.szMethod, 0);
+                    created = true;
+                    Emit(DebugEventKind.Diagnostic, $"bound breakpoint {typeProps.szTypeDef}.{methodProps.szMethod}", methodProps.szMethod, 0);
                     return;
                 }
             }
@@ -2574,14 +2751,34 @@ public sealed class DebugSession : IDebugSession
         {
             Console.Error.WriteLine($"[debug] bind failed: {ex.Message}");
         }
+        finally
+        {
+            // A reservation left behind blocks every later attempt at this key and hands removal
+            // a null breakpoint.
+            if (!created)
+                _bound.TryRemove(key, out _);
+        }
     }
 
     // --- symbols --------------------------------------------------------------------------------
 
+    /// <summary>
+    /// The symbol reader for a module, opened once and cached.
+    /// </summary>
+    /// <remarks>
+    /// Locked because this is not session-thread-only, whatever the field's neighbours suggest:
+    /// the runtime's callback thread reaches it through <c>OnLoadModule</c> and through the
+    /// location lookup every stop does, while the session thread reaches it from the bind sweep
+    /// and from every stack, variable and module query. <see cref="Dictionary{K,V}"/> tears under
+    /// that, and diasymreader's readers are not free-threaded either.
+    /// </remarks>
     private SymbolReader? ReaderFor(CorDebugModule module, string moduleName)
     {
-        if (_readers.TryGetValue(moduleName, out var cached))
-            return cached;
+        lock (_readers)
+        {
+            if (_readers.TryGetValue(moduleName, out var cached))
+                return cached;
+        }
         SymbolReader? reader = null;
         try
         {
@@ -2592,7 +2789,19 @@ public sealed class DebugSession : IDebugSession
         {
             // No PDB for this module.
         }
-        _readers[moduleName] = reader;
+
+        lock (_readers)
+        {
+            // Another thread may have opened one while this was reading the PDB; theirs wins, so
+            // a single reader per module is handed out and this one is closed rather than leaked.
+            if (_readers.TryGetValue(moduleName, out var raced))
+            {
+                reader?.Dispose();
+                return raced;
+            }
+
+            _readers[moduleName] = reader;
+        }
         return reader;
     }
 
@@ -2722,10 +2931,13 @@ public sealed class DebugSession : IDebugSession
             var match = SequencePointAtOffset(reader, function.Token, frame.IP.pnOffset);
             if (match is not null)
             {
+                // The whole span of the statement, not one IL byte. StepRange runs until the IP
+                // leaves the range, so a one-byte range is a single IL instruction — which lands
+                // back on the line it started on, and is what made F10 look like it did nothing.
                 range = new COR_DEBUG_STEP_RANGE
                 {
                     startOffset = match.Value.Offset,
-                    endOffset = match.Value.Offset + 1,
+                    endOffset = EndOfStatement(function, match.Value),
                 };
                 return true;
             }
@@ -2734,6 +2946,22 @@ public sealed class DebugSession : IDebugSession
         {
         }
         return false;
+    }
+
+    /// <summary>
+    /// Where the statement at <paramref name="match"/> ends, in IL.
+    /// </summary>
+    /// <remarks>
+    /// The next sequence point, except on the last statement of a method, where there is none and
+    /// the statement runs to the end of the body. The method's IL size bounds it there, so the
+    /// range stays a real span rather than reaching past the code it belongs to.
+    /// </remarks>
+    private static int EndOfStatement(CorDebugFunction function, SequencePointMatch match)
+    {
+        int methodEnd = Safe(() => (int)function.ILCode.Size) is > 0 and var size ? size : int.MaxValue;
+        return match.NextOffset is > 0 and var next && next != int.MaxValue
+            ? Math.Min(next, methodEnd)
+            : methodEnd;
     }
 
     private (Dictionary<int, string> Args, Dictionary<int, string> Locals) FrameSymbolNames(CorDebugILFrame frame)

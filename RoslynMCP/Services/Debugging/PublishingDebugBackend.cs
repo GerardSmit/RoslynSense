@@ -8,7 +8,7 @@ namespace RoslynMCP.Services.Debugging;
 /// <see cref="DebugStateStore"/> — that file is what the editor polls to show the LLM's
 /// debug session (paused line, reason) without holding a second debugger on the process.
 /// </summary>
-internal sealed class PublishingDebugBackend : IDebugBackend
+internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
 {
     /// <summary>How many swallowed stops to resume through before giving up and surfacing one.</summary>
     private const int MaxEmulatedResumes = 10_000;
@@ -20,7 +20,10 @@ internal sealed class PublishingDebugBackend : IDebugBackend
 
     private readonly IDebugBackend _inner;
     private readonly DataBreakpointWatcher _watcher;
+    /// <summary>Mirrored breakpoints. DAP handlers run concurrently, so every mutation and the
+    /// snapshot <see cref="Publish"/> takes have to agree on one at a time.</summary>
     private readonly List<DebugStateStore.Breakpoint> _breakpoints = [];
+    private readonly Lock _breakpointGate = new();
     private readonly ConcurrentDictionary<int, EmulatedBreakpoint> _emulated = new();
     private readonly ConcurrentDictionary<int, int> _hits = new();
     private readonly ConcurrentQueue<string> _log = new();
@@ -36,6 +39,18 @@ internal sealed class PublishingDebugBackend : IDebugBackend
 
     /// <summary>The wrapped engine — for engine-selection assertions and diagnostics.</summary>
     public IDebugBackend Inner => _inner;
+
+    /// <summary>Passed straight through: notices are the engine's, and nothing here changes them.
+    /// An engine that reports none leaves this silent rather than absent, so a caller does not
+    /// have to know which engine it got.</summary>
+    public event Action<DebugNotice>? Notice
+    {
+        add { if (_inner is IDebugNoticeSource source) source.Notice += value; }
+        remove { if (_inner is IDebugNoticeSource source) source.Notice -= value; }
+    }
+
+    /// <inheritdoc />
+    public long StopSequence => _inner is IDebugNoticeSource source ? source.StopSequence : 0;
 
     /// <summary>The armed value watches. Empty unless the client set one, because watching costs a
     /// step per statement.</summary>
@@ -109,8 +124,11 @@ internal sealed class PublishingDebugBackend : IDebugBackend
 
         if (result.BreakpointId is { } id)
         {
-            _breakpoints.RemoveAll(b => b.Id == id);
-            _breakpoints.Add(new DebugStateStore.Breakpoint(id, Path.GetFullPath(filePath), line, condition));
+            lock (_breakpointGate)
+            {
+                _breakpoints.RemoveAll(b => b.Id == id);
+                _breakpoints.Add(new DebugStateStore.Breakpoint(id, Path.GetFullPath(filePath), line, condition));
+            }
 
             _hits.TryRemove(id, out _);
             if (hitCondition is { Length: > 0 } || logMessage is { Length: > 0 })
@@ -125,7 +143,8 @@ internal sealed class PublishingDebugBackend : IDebugBackend
     public async Task<string> RemoveBreakpointAsync(int breakpointId, CancellationToken cancellationToken = default)
     {
         var result = await _inner.RemoveBreakpointAsync(breakpointId, cancellationToken);
-        _breakpoints.RemoveAll(b => b.Id == breakpointId);
+        lock (_breakpointGate)
+            _breakpoints.RemoveAll(b => b.Id == breakpointId);
         _emulated.TryRemove(breakpointId, out _);
         _hits.TryRemove(breakpointId, out _);
         Publish();
@@ -290,6 +309,33 @@ internal sealed class PublishingDebugBackend : IDebugBackend
         }
     }
 
+    /// <summary>
+    /// Applies the emulation to a stop that no resume command asked for, resuming through it and
+    /// returning <c>true</c> when the user was never meant to see it.
+    /// </summary>
+    /// <remarks>
+    /// Hit counts and logpoints used to exist only inside <see cref="ResumeAsync"/>, so they
+    /// worked only for a stop that ended a command the adapter had issued. Every other stop — the
+    /// first hit after an attach, and every hit once a continue has timed out waiting on a server
+    /// — went round them: the logpoint suspended the app instead of logging, and its hit was
+    /// never counted.
+    /// </remarks>
+    public async Task<bool> ResumeThroughUnsolicitedStopAsync(CancellationToken cancellationToken = default)
+    {
+        if (!await ShouldResumeThroughAsync(cancellationToken))
+            return false;
+
+        try
+        {
+            await _inner.ContinueAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            Publish();
+        }
+    }
+
     /// <summary>Decides whether the current stop is one the emulation swallows, doing its
     /// logging and hit counting on the way.</summary>
     private async Task<bool> ShouldResumeThroughAsync(CancellationToken cancellationToken)
@@ -433,7 +479,19 @@ internal sealed class PublishingDebugBackend : IDebugBackend
             _kind, _target, state,
             frame?.Reason, frame?.Function, frame?.FilePath, frame?.Line ?? 0,
             DateTime.UtcNow,
-            _breakpoints.ToArray()));
+            Snapshot()));
+    }
+
+    /// <summary>The mirrored breakpoints, copied under the gate.</summary>
+    /// <remarks>
+    /// <see cref="List{T}.ToArray"/> reads Count and then the backing store; a concurrent Add can
+    /// land between the two and yield a torn array or throw. Publish runs from every state
+    /// transition while DAP handlers mutate the list, so this is the reader the gate exists for.
+    /// </remarks>
+    private DebugStateStore.Breakpoint[] Snapshot()
+    {
+        lock (_breakpointGate)
+            return [.. _breakpoints];
     }
 
     /// <summary>Initial breakpoints are set inside the backend during start, which never
@@ -441,6 +499,9 @@ internal sealed class PublishingDebugBackend : IDebugBackend
     private void TrackInitialBreakpoints(IEnumerable<(string file, int line)>? initialBreakpoints)
     {
         foreach (var (file, line) in initialBreakpoints ?? [])
-            _breakpoints.Add(new DebugStateStore.Breakpoint(0, Path.GetFullPath(file), line, null));
+        {
+            lock (_breakpointGate)
+                _breakpoints.Add(new DebugStateStore.Breakpoint(0, Path.GetFullPath(file), line, null));
+        }
     }
 }

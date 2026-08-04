@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Rename;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -11,11 +12,25 @@ namespace RoslynMCP.Lsp.Handlers;
 internal static class RenameHandler
 {
     public static async Task<PrepareRenameResult?> PrepareRenameAsync(
-        TextDocumentPositionParams p, CancellationToken ct)
+        TextDocumentPositionParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         if (await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct) is not
             var (document, text, offset) || document is null)
             return null;
+
+        string path = LspConverters.UriToPath(p.TextDocument.Uri);
+
+        // Before the symbol lookup, never after: a caret inside a string literal binds to nothing,
+        // so by the time a contributor would be reached this method has already returned null. What
+        // these providers rename is not an ISymbol at all — a resource key has no declaration
+        // Roslyn can bind to, and the pack that owns it performs the whole rename rather than
+        // adding edits to one Roslyn is already performing.
+        foreach (var provider in
+                 LanguageScope.Of(languages).Contributors<ISymbolFreeRenameProvider>())
+        {
+            if (await provider.PrepareAsync(path, offset, ct) is { } prepared)
+                return prepared;
+        }
 
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
         if (symbol is null || symbol.Locations.All(l => !l.IsInSource))
@@ -29,11 +44,22 @@ internal static class RenameHandler
         return new PrepareRenameResult(LspConverters.ToRange(text.Lines, t.Span), t.ValueText);
     }
 
-    public static async Task<WorkspaceEdit?> RenameAsync(RenameParams p, CancellationToken ct)
+    public static async Task<WorkspaceEdit?> RenameAsync(
+        RenameParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         if (await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct) is not
             var (document, _, offset) || document is null)
             return null;
+
+        string filePath = LspConverters.UriToPath(p.TextDocument.Uri);
+
+        // Ahead of the symbol lookup for the same reason prepareRename is.
+        foreach (var provider in
+                 LanguageScope.Of(languages).Contributors<ISymbolFreeRenameProvider>())
+        {
+            if (await provider.RenameAsync(filePath, offset, p.NewName, document.Project, ct) is { } edit)
+                return edit;
+        }
 
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
         if (symbol is null || symbol.Locations.All(l => !l.IsInSource))
@@ -43,7 +69,16 @@ internal static class RenameHandler
         var renamed = await Renamer.RenameSymbolAsync(
             solution, symbol, new SymbolRenameOptions(), p.NewName, ct);
 
-        var changes = new Dictionary<string, TextEdit[]>();
+        var changes = new Dictionary<string, List<TextEdit>>(StringComparer.OrdinalIgnoreCase);
+
+        void Add(string uri, TextEdit edit)
+        {
+            if (!changes.TryGetValue(uri, out var list))
+                changes[uri] = list = [];
+            if (!list.Contains(edit))
+                list.Add(edit);
+        }
+
         foreach (var projectChange in renamed.GetChanges(solution).GetProjectChanges())
         {
             foreach (var docId in projectChange.GetChangedDocuments())
@@ -54,15 +89,29 @@ internal static class RenameHandler
                     continue;
 
                 var oldText = await oldDoc.GetTextAsync(ct);
-                var textChanges = await newDoc.GetTextChangesAsync(oldDoc, ct);
-                var edits = textChanges
-                    .Select(c => new TextEdit(LspConverters.ToRange(oldText.Lines, c.Span), c.NewText ?? ""))
-                    .ToArray();
-                if (edits.Length > 0)
-                    changes[LspConverters.PathToUri(path)] = edits;
+                foreach (var c in await newDoc.GetTextChangesAsync(oldDoc, ct))
+                {
+                    Add(LspConverters.PathToUri(path),
+                        new TextEdit(LspConverters.ToRange(oldText.Lines, c.Span), c.NewText ?? ""));
+                }
             }
         }
 
-        return changes.Count == 0 ? null : new WorkspaceEdit(changes);
+        // The enabled packs' edits, for the same reason AllReferencesAsync asks them: an OnClick=
+        // naming this method is a reference Roslyn cannot see, and a rename that skips it leaves
+        // the attribute pointing at a method that no longer exists. On a project with no markup a
+        // contributor declines after one metadata lookup.
+        foreach (var contributor in LanguageScope.Of(languages).Contributors<ILanguageRenameContributor>())
+        {
+            foreach (var (uri, edit) in
+                     await contributor.RenameEditsAsync(symbol, document.Project, p.NewName, ct))
+            {
+                Add(uri, edit);
+            }
+        }
+
+        return changes.Count == 0
+            ? null
+            : new WorkspaceEdit(changes.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()));
     }
 }

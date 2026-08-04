@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+option csharp_namespace = "ProtoFixture.Widgets";
+
+package widgets;
+
+import "common/types.proto";
+import "widgets/types.proto";
+import "google/protobuf/timestamp.proto";
+
+service WidgetService {
+  rpc GetWidgetsById(GetWidgetsByIdRequest) returns (GetWidgetsByIdReply);
+  rpc GetMembersForGroups(GetMembersForGroupsRequest) returns (GetMembersForGroupsReply);
+  rpc WatchWidgets(WatchWidgetsRequest) returns (stream WidgetEvent);
+}
+
+message GetWidgetsByIdRequest {
+  repeated int64 ids = 1;
+}
+
+message GetWidgetsByIdReply {
+  repeated Widget widgets = 1;
+}
+
+message GetMembersForGroupsRequest {
+  repeated int64 group_ids = 1;
+}
+
+message GetMembersForGroupsReply {
+  map<int64, GroupMemberList> group_members = 1;
+}
+
+message WatchWidgetsRequest {
+  repeated int64 ids = 1;
+  common.Channel channel = 2;
+}
+
+message WidgetEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_CREATED = 1;
+    KIND_UPDATED = 2;
+    KIND_DELETED = 3;
+  }
+
+  Kind kind = 1;
+  google.protobuf.Timestamp occurred_at = 2;
+
+  oneof payload {
+    Widget widget = 3;
+    common.UUID deleted_uuid = 4;
+  }
+}

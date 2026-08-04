@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package contracts;
+
+option csharp_namespace = "ProtoNeverBuilt.Contracts";
+
+// A schema that is correct in every way, so the only thing there can ever be to report about
+// this file is that nothing has been generated from it yet.
+service LedgerService {
+  rpc GetEntry(GetEntryRequest) returns (GetEntryReply);
+}
+
+message GetEntryRequest {
+  int64 id = 1;
+}
+
+message GetEntryReply {
+  int64 id = 1;
+  string description = 2;
+}

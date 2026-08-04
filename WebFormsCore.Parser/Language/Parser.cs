@@ -61,6 +61,14 @@ public class Parser
 
     public RootNode Root => _container.Root;
 
+    /// <summary>Tag prefix → the namespaces it resolves against, from <c>@Register</c>
+    /// directives, web.config and the caller-supplied defaults.</summary>
+    public IReadOnlyDictionary<string, List<string>> TagPrefixes => _namespaces;
+
+    /// <summary>User-control registrations: prefix + tag name → the generated type and the
+    /// <c>.ascx</c> it came from.</summary>
+    public IReadOnlyDictionary<ControlKey, (string Type, string Path)> RegisteredControls => _controlTypes;
+
     public List<ReportedDiagnostic> Diagnostics { get; } = new();
 
     public void Parse(ref Lexer lexer)
@@ -86,6 +94,9 @@ public class Parser
                 break;
             case TokenType.Statement:
                 ConsumeStatement(token);
+                break;
+            case TokenType.ExpressionBuilderPrefix:
+                ConsumeExpressionBuilder(ref lexer, token);
                 break;
             case TokenType.TagOpen:
                 ConsumeOpenTag(ref lexer, token.Range.Start);
@@ -242,6 +253,24 @@ public class Parser
         _container.AddStatement(element);
     }
 
+    private void ConsumeExpressionBuilder(ref Lexer lexer, Token token)
+    {
+        TokenString argument = default;
+
+        if (lexer.Peek() is { Type: TokenType.ExpressionBuilderArgument } argumentNode)
+        {
+            lexer.Next();
+            argument = argumentNode.Text;
+        }
+
+        _container.AddExpressionBuilder(new ExpressionBuilderNode
+        {
+            Range = token.Range,
+            Prefix = token.Text,
+            Argument = argument
+        });
+    }
+
     private void ConsumeDirective(ref Lexer lexer, TokenPosition startPosition)
     {
         var element = new DirectiveNode
@@ -329,7 +358,8 @@ public class Parser
 
                         element.Properties.Add(new PropertyNode(member, kv.Value, null)
                         {
-                            Range = kv.Value.Range
+                            Range = kv.Value.Range,
+                            NameRange = kv.Key.Range
                         });
                     }
                 }
@@ -667,6 +697,7 @@ public class Parser
             };
         }
 
+        node.RawAttributes = attributes;
         node.VariableName = $"ctrl{_container.ControlId++}";
         node.StartTag =  new HtmlTagNode
         {
@@ -716,6 +747,18 @@ public class Parser
                     {
                         Range = attribute.Value.Range
                     });
+                    continue;
+                }
+
+                // A real event whose handler does not exist is a missing method, not a missing
+                // property. Reporting it on the handler name is what lets a quick fix generate it.
+                if (eventSymbol != null && _type != null)
+                {
+                    Diagnostics.Add(ReportedDiagnostic.Create(
+                        Descriptors.EventHandlerNotFound,
+                        value.Range,
+                        value.Value,
+                        _type.ToDisplayString()));
                     continue;
                 }
             }
@@ -803,8 +846,19 @@ public class Parser
 
             controlNode.Properties.Add(new PropertyNode(member, value, converter)
             {
-                Range = value.Range
+                Range = value.Range,
+                NameRange = key.Range
             });
+            return;
+        }
+
+        // No CLR member name contains a colon, so meta:resourcekey and friends can never be the
+        // property the author meant. DNN spells the same idea without a prefix. The lookup above
+        // still runs first, so a control that really declares ResourceKey keeps binding to it.
+        if (key.Value.Contains(':') ||
+            key.Value.Equals("resourcekey", StringComparison.OrdinalIgnoreCase))
+        {
+            controlNode.Attributes.Add(key, value);
             return;
         }
 
@@ -865,24 +919,42 @@ public class Parser
         {
             if (keyNode.Type == TokenType.Attribute)
             {
-                TokenString value = default;
-                var isCode = false;
+                var value = default(AttributeValue);
 
                 if (lexer.Peek() is { Type: TokenType.AttributeValue or TokenType.EvalExpression } valueNode)
                 {
-                    isCode = valueNode.Type == TokenType.EvalExpression;
                     lexer.Next();
-                    value = valueNode.Text;
+                    value = new AttributeValue(valueNode.Type == TokenType.EvalExpression, valueNode.Text);
+                }
+                else if (lexer.Peek() is { Type: TokenType.ExpressionBuilderPrefix } prefixNode)
+                {
+                    lexer.Next();
+
+                    TokenString argument = default;
+
+                    if (lexer.Peek() is { Type: TokenType.ExpressionBuilderArgument } argumentNode)
+                    {
+                        lexer.Next();
+                        argument = argumentNode.Text;
+                    }
+
+                    // Deliberately no node: the builder belongs to this attribute, and the control
+                    // it is written on has not been pushed yet.
+                    value = new AttributeValue(AttributeValueKind.ExpressionBuilder, argument)
+                    {
+                        Prefix = prefixNode.Text
+                    };
                 }
 
                 var key = keyNode.Text;
 
-                if (key.Value.Equals("itemtype", StringComparison.OrdinalIgnoreCase))
+                if (value.Kind is AttributeValueKind.Literal &&
+                    key.Value.Equals("itemtype", StringComparison.OrdinalIgnoreCase))
                 {
                     _itemType = value.Value;
                 }
 
-                attributes.Add(key, new AttributeValue(isCode, value));
+                attributes.Add(key, value);
             }
             else if (keyNode.Type == TokenType.TagSlashClose)
             {

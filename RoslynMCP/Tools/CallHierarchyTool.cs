@@ -3,6 +3,9 @@ using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using ModelContextProtocol.Server;
+using RoslynMCP.Languages.Mediator;
+using RoslynMCP.Languages.Mediator.Core;
+using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Services;
 
 namespace RoslynMCP.Tools;
@@ -61,6 +64,7 @@ public static class CallHierarchyTool
             if (showCallers)
             {
                 await AppendCallersAsync(sb, symbol, solution, ctx.ProjectDir, fmt, cancellationToken);
+                await AppendMediatorDispatchesAsync(sb, symbol, ctx.Project, fmt, cancellationToken);
             }
 
             if (showCallees)
@@ -76,6 +80,44 @@ public static class CallHierarchyTool
             Console.Error.WriteLine($"[CallHierarchy] Unhandled error: {ex}");
             return $"Error: {ex.Message}";
         }
+    }
+
+    /// <summary>
+    /// The callers <see cref="SymbolFinder.FindCallersAsync"/> cannot see, because the call goes
+    /// through a mediator and reaches the handler by type rather than by name.
+    /// </summary>
+    /// <remarks>
+    /// Its own section, and its own explicit call rather than the contributor loop the LSP hierarchy
+    /// uses: this tool never goes through <c>CallHierarchyHandler</c>, so there is no session here
+    /// to carry one. Gated on registration, which is the only switch an MCP session is behind.
+    /// </remarks>
+    private static async Task AppendMediatorDispatchesAsync(
+        StringBuilder sb,
+        ISymbol symbol,
+        Project project,
+        IOutputFormatter fmt,
+        CancellationToken cancellationToken)
+    {
+        if (!LanguageScope.Process.IsEnabled(MediatorLanguage.PackId))
+            return;
+
+        var dispatches = await MediatorReferenceService.FindAsync(symbol, project, cancellationToken);
+        if (dispatches.Count == 0)
+            return;
+
+        fmt.AppendHeader(sb, "Mediator Dispatches (Who sends this?)", 2);
+
+        var rows = new List<string[]>();
+        foreach (var dispatch in dispatches.Take(MaxCallers))
+        {
+            rows.Add([
+                dispatch.ContainingMember ?? "-",
+                Path.GetFileName(dispatch.FilePath),
+                $"{dispatch.Line}",
+                dispatch.Kind.ToString()]);
+        }
+
+        fmt.AppendTable(sb, "Mediator", ["Caller", "File", "Line", "Via"], rows);
     }
 
     private static async Task AppendCallersAsync(

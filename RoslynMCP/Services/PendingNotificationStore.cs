@@ -8,8 +8,8 @@ namespace RoslynMCP.Services;
 /// Claude Code plugin's PreToolUse hook drains the queue and injects the messages as
 /// additional context on the next tool call. One plain-text file per message — the hook is
 /// a small node script, so the format stays trivially parseable and needs no locking.
-/// The queue directory is keyed by the same solution hash as the shared daemon
-/// (<see cref="HostPaths.Hash"/>); the hook script mirrors the derivation.
+/// The queue directory is keyed by the build-independent solution hash
+/// (<see cref="HostPaths.SolutionHash"/>); the hook script mirrors the derivation.
 /// </summary>
 public static class PendingNotificationStore
 {
@@ -72,5 +72,5 @@ public static class PendingNotificationStore
 
     private static string DirectoryFor(string solutionPath) =>
         Path.Combine(Path.GetTempPath(), "roslyn-sense", "notifications",
-            HostPaths.Hash(Path.GetFullPath(solutionPath)));
+            HostPaths.SolutionHash(Path.GetFullPath(solutionPath)));
 }

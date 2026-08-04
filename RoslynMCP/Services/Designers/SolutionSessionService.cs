@@ -7,7 +7,14 @@ public sealed record WatchedRegeneration(
     string SourcePath,
     DesignerOutcome Outcome,
     DateTime AtUtc,
-    IReadOnlyList<string> Errors);
+    IReadOnlyList<string> Errors)
+{
+    /// <summary>
+    /// The generated file, so a subscriber knows which document changed without having to ask a
+    /// generator again. Empty when generation failed before it settled on one.
+    /// </summary>
+    public string DesignerPath { get; init; } = "";
+}
 
 /// <summary>
 /// Tracks the currently open solution and, optionally, watches it so generated designer files stay
@@ -45,6 +52,17 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
 
     /// <summary>Most recent watcher-driven regenerations, newest last.</summary>
     public IReadOnlyList<WatchedRegeneration> History => [.. _history];
+
+    /// <summary>
+    /// Raised after the watcher rewrote a designer file — the only outcome that changes what a
+    /// compilation, and therefore an editor, should be seeing.
+    /// </summary>
+    /// <remarks>
+    /// An event rather than a direct call into anything: writing generated files is this
+    /// service's whole job, and it has to keep doing it identically whether an editor is
+    /// connected, several are, or none is. Handlers run on the watcher's pool thread.
+    /// </remarks>
+    public event Action<WatchedRegeneration>? Regenerated;
 
     /// <summary>Number of regenerations queued but not yet applied.</summary>
     public int PendingCount => _pending.Count;
@@ -156,7 +174,10 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
             await Task.Delay(DebounceDelay, cts.Token);
 
             var result = await regeneration.RegenerateAsync(path, dryRun: false, cts.Token);
-            Record(new WatchedRegeneration(path, result.Outcome, DateTime.UtcNow, result.Errors));
+            Publish(new WatchedRegeneration(path, result.Outcome, DateTime.UtcNow, result.Errors)
+            {
+                DesignerPath = result.DesignerPath,
+            });
         }
         catch (OperationCanceledException)
         {
@@ -166,7 +187,7 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
         {
             // A watcher callback runs on a pool thread with nobody to catch for it; an escaping
             // exception would take the process down.
-            Record(new WatchedRegeneration(path, DesignerOutcome.Failed, DateTime.UtcNow, [ex.Message]));
+            Publish(new WatchedRegeneration(path, DesignerOutcome.Failed, DateTime.UtcNow, [ex.Message]));
         }
         finally
         {
@@ -174,6 +195,25 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
                 _pending.TryRemove(path, out _);
 
             try { cts.Dispose(); } catch { }
+        }
+    }
+
+    private void Publish(WatchedRegeneration entry)
+    {
+        Record(entry);
+
+        if (entry.Outcome != DesignerOutcome.Updated)
+            return;
+
+        try
+        {
+            Regenerated?.Invoke(entry);
+        }
+        catch (Exception ex)
+        {
+            // For the same reason the regeneration itself is wrapped: this is still the watcher's
+            // pool thread, and a subscriber's failure is not worth the process.
+            Console.Error.WriteLine($"[SolutionSession] A regeneration handler failed: {ex.Message}");
         }
     }
 

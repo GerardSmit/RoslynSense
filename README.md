@@ -1,6 +1,6 @@
 # RoslynSense
 
-A Model Context Protocol (MCP) server that provides C# code analysis, navigation, refactoring, testing, and debugging capabilities using the Roslyn compiler platform. Includes extensible support for WebForms (ASPX/ASCX) and Razor (.razor/.cshtml) files.
+A Model Context Protocol (MCP) server that provides C# code analysis, navigation, refactoring, testing, and debugging capabilities using the Roslyn compiler platform. Includes extensible support for WebForms (ASPX/ASCX), Razor (.razor/.cshtml) and Protobuf (.proto) files.
 
 Inspired by [egorpavlikhin/roslyn-mcp](https://github.com/egorpavlikhin/roslyn-mcp).
 
@@ -174,6 +174,8 @@ Use the following server configuration:
 |------|-------------|
 | `--no-webforms` | Disable WebForms (ASPX/ASCX) support. |
 | `--no-razor` | Disable Razor (.razor/.cshtml) support. |
+| `--no-proto` | Disable Protobuf/gRPC (.proto) support: no navigation between a `.proto` and the C# protoc generated from it. |
+| `--no-resources` | Disable `.resx` support: no resource catalog, no key navigation. |
 | `--no-debugger` | Disable all debugger tools (see [Debugging](#debugging)). |
 | `--no-profiling` | Disable all profiling tools (see [Profiling](#profiling)). |
 | `--toon` | Use TOON (Token-Optimized Object Notation) output format instead of markdown. Reduces token usage. |
@@ -205,9 +207,14 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
     "tools": {
         "webForms": true,
         "razor": true,
+        "proto": true,
+        "resources": true,
         "debugger": true,
         "profiling": true,
         "database": true
+    },
+    "resources": {
+        "preset": "dnn"
     },
     "database": {
         "autoDiscovery": null,
@@ -233,9 +240,15 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
 |------|------|---------|---------------------|
 | `tools.webForms` | bool | `true` | `--no-webforms` forces `false` |
 | `tools.razor` | bool | `true` | `--no-razor` forces `false` |
+| `tools.proto` | bool | `true` | `--no-proto` forces `false` |
+| `tools.resources` | bool | `true` | `--no-resources` forces `false` |
 | `tools.debugger` | bool | `true` | `--no-debugger` forces `false` |
 | `tools.profiling` | bool | `true` | `--no-profiling` forces `false` |
 | `tools.database` | bool | `true` | `--no-db` forces `false` |
+| `resources.preset` | string? | `null` | — (`webforms`, `dnn`, `dotnet`, `none`; omitted merges all three) |
+| `resources.include` / `.exclude` | string[] | `[]` | — (globs, discovery only) |
+| `resources.overrides` / `.conventions` / `.lookups` | object[] | preset | — (raw escape hatch; prefer `preset`) |
+| `resources.missingKeyDiagnostic` | bool | `false` | — (reports a key no file of its family declares; only where the resource file is known for certain) |
 | `database.autoDiscovery` | bool? | `null` | `--no-auto-db` forces `false` |
 | `database.connections` | object | `{}` | `--db` overrides matching alias |
 | `tableFormat` | string? | `null` | `--toon` forces `"toon"` |
@@ -255,6 +268,28 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
 - `null` (default) — auto-discovery runs **only when no explicit registrations exist** (CLI `--db` or config `connections`).
 - `true` — auto-discovery always runs in addition to explicit registrations. Explicit aliases still win on conflict.
 - `false` — auto-discovery skipped entirely.
+
+</details>
+
+<details>
+<summary>Resource presets</summary>
+
+`.resx` support answers "which resource files does this key live in?" — for F12, hover and rename on a key in C#, in `<%$ Resources: … %>` and in `meta:resourcekey`. To do that it has to know which call shapes carry a resource key and how a call site turns into a resx base name. A **preset** is one shipped answer to both.
+
+| Preset | Covers |
+|--------|--------|
+| `webforms` | Stock ASP.NET: `App_LocalResources` beside the page, `App_GlobalResources` at the app root, and the `Get*ResourceObject` methods that read them. |
+| `dnn` | DotNetNuke: the seven `Localization.GetString` overloads (told apart by parameter type — three of them take two arguments and only one carries a root), `PortalModuleBase.LocalizeText` / `LocalizeString`, the implicit `.Text` key suffix, and the `local` → `localShared` → `global` fallback chain DNN itself walks. |
+| `dotnet` | Modern .NET: `IStringLocalizer<T>` and the `ResourceManager` a `*.Designer.cs` wraps. |
+| `none` | Nothing but what `roslynsense.json` declares itself. |
+
+**Omitting `preset` merges all three, which is the recommended setting.** Every built-in lookup names a fully-qualified containing type, so the DNN set is inert in a solution with no DNN reference and the `IStringLocalizer` set is inert in a WebForms one — an unused preset costs one failed metadata lookup per containing type, once per compilation. Name a preset when you want to be explicit, or to keep another one's conventions from being offered.
+
+`overrides` is not part of a preset: the `.Portal-{id}` and `.Host` customization files DNN puts beside a base `.resx` are recognised whichever preset is in force, because grouping a directory's file names happens before any lookup does. The defaults are `Portal-*` at rank 2 and `Host` at rank 1 — explicit ranks, because sorting those two patterns alphabetically gets the precedence backwards.
+
+`conventions`, `lookups` and `overrides` layer on top of the preset, each with its own merge rule: lookups append, conventions merge by `id`, and overrides replace the preset's set wholesale (a rank scheme only means anything as a whole). A malformed entry is warned about and dropped rather than failing the load. The field shapes and the design behind them are in [`RoslynMCP/Languages/README.md`](RoslynMCP/Languages/README.md#resources-the-one-pack-whose-model-needs-explaining).
+
+`--no-resources` (or `"tools": { "resources": false }`) removes the whole feature from the daemon: the pack is never registered, no catalog is built, and every resource-key feature on both the MCP and LSP surfaces stops answering. Editors can also switch it off per window with `roslynSense.languages.resx`, which leaves the daemon — and any AI session attached to it — untouched.
 
 </details>
 
@@ -333,9 +368,11 @@ editor ──stdio──> roslyn-sense --lsp ──named pipe──> per-solutio
 
 The `--lsp` process is a thin proxy: it connects to (or spawns) the per-solution daemon and forwards LSP JSON-RPC over the daemon's pipe. Without a resolvable solution or reachable daemon it hosts the LSP session in-process.
 
-Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), diagnostics (push, or pull for LSP 3.17 clients), completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, semantic tokens, inlay hints (parameter names + implicit types), code lens (reference counts, override/implements links, run/debug test), watched-file sync (`workspace/didChangeWatchedFiles`), progress reporting (`$/progress`), workspace commands (`roslynSense.restore`, `roslynSense.reloadWorkspace`, `roslynSense.build`, `roslynSense.completionAccepted`), and doc-comment generation on `///` (custom `roslynSense/onAutoInsert`). Position encoding is UTF-16.
+Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), diagnostics (push, or pull for LSP 3.17 clients), completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, semantic tokens, inlay hints (parameter names + implicit types), code lens (reference counts, override/implements links, run/debug test), watched-file sync (`workspace/didChangeWatchedFiles`), progress reporting (`$/progress`), workspace commands (`roslynSense.restore`, `roslynSense.reloadWorkspace`, `roslynSense.build`, `roslynSense.completionAccepted`), doc-comment generation on `///` (custom `roslynSense/onAutoInsert`), and ranked one-box search (custom `roslynSense/searchEverywhere`). Position encoding is UTF-16.
 
 **Completion is ranked, not alphabetical.** Roslyn decides what is in scope; the order is computed here, ReSharper-style. What you type is matched with a CamelHumps matcher (`sb` → `StringBuilder`, `tolower` → `ToLowerInvariant`, one typo tolerated on longer words — and typo hits vanish the moment a clean one exists), and the match quality feeds a 64-bit relevance word whose bit order *is* the ranking: match quality first, then target-type fit, then kind (locals and parameters > fields and properties > methods > extension methods > keywords > types), then provenance: the type's own members beat inherited ones, `object`'s members (`ToString`, `GetHashCode`, …) sink below every real member, `[Obsolete]` sinks below its peers, and unimported items sink below everything already in scope. Among equals, the local declared nearest above the caret wins. Declaring types and that nearest local come from one pass over the type being completed on, not a symbol resolve per item. Unimported extension methods are offered too (`value.Shout` finds an extension in a namespace you have not imported) and commit adds the `using`, same as unimported types. Accepted items are remembered per context (`roslynSense.completionAccepted`) and promote one item inside its tier only, so usage never reorders across tiers. The order also survives the client: editors sort by their own fuzzy score before `sortText`, so each item's `filterText` is prefixed with the typed characters — every item then scores identically there and the server's ranking is what you see.
+
+**Search Everywhere (Ctrl+T).** One box over types, members and files, ranked server-side the way ReSharper's Go to Everything ranks: match quality feeds a tier, and one tier step outweighs every possible match score, so an exact type beats an exact member beats a fuzzy type, with the shorter name winning ties (`List` before `ListView`). `Namespace.Type.Member` and `dir/file` narrow — each word but the last must match a container segment — and `t:`, `m:`, `f:` restrict to types, members or files. Names are matched before symbols are materialised, so a query costs a pass over declaration names rather than a pass over symbols. The VSCode extension renders the list itself (`roslynSense/searchEverywhere`); the built-in picker re-sorts what a server sends and has nowhere to put files. `workspace/symbol` uses the same ranking, so clients without the extension get the order too.
 
 **Diagnostics include analyzers.** Project analyzers (StyleCop, Roslynator, in-house) and Roslyn's built-in `IDE0xxx` code-style rules run alongside compiler diagnostics, with `.editorconfig` / `.globalconfig` severities honored. They are computed off the typing loop: compiler squiggles publish after ~400 ms as before, analyzer results follow once typing pauses, cached per document version. Turn them off with `ROSLYNMCP_ANALYZER_DIAGNOSTICS=0` (all analyzers) or `ROSLYNMCP_CODE_STYLE_DIAGNOSTICS=0` (IDE rules only); `ROSLYNMCP_ANALYZER_TIMEOUT_SECONDS` caps a pass (default 15).
 

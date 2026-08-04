@@ -49,6 +49,11 @@ internal static class DaemonSpawner
             if (pipe is not null)
                 return pipe;
 
+            // Timed out waiting: someone else holds the spawn. Spawning anyway would race it —
+            // the loser exits on the daemon's lock file, but only after burning a process start.
+            if (!owned)
+                return null;
+
             if (!TrySpawnDaemon(solutionKey))
                 return null;
 

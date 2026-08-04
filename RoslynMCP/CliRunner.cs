@@ -8,9 +8,8 @@ using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
 using RoslynMCP.Services.Designers;
 using RoslynMCP.Services.Run;
-using RoslynMCP.Tools; // IFindUsagesHandler, IGoToDefinitionHandler, etc.
-using RoslynMCP.Tools.Razor;
-using RoslynMCP.Tools.WebForms;
+using RoslynMCP.Tools;
+using RoslynMCP.Languages;
 
 namespace RoslynMCP;
 
@@ -122,7 +121,7 @@ internal static class CliRunner
 
         try
         {
-            var result = await InvokeAsync(method, parsed, fmt, dbRegistry, cts.Token);
+            var result = await InvokeAsync(method, parsed, fmt, dbRegistry, settings, cts.Token);
             Console.WriteLine(result);
             return 0;
         }
@@ -182,14 +181,11 @@ internal static class CliRunner
 
     private static async Task<string> InvokeAsync(
         MethodInfo method, Dictionary<string, string> parsed,
-        IOutputFormatter fmt, DbConnectionRegistry dbRegistry, CancellationToken ct)
+        IOutputFormatter fmt, DbConnectionRegistry dbRegistry, EffectiveSettings settings,
+        CancellationToken ct)
     {
-        // Build lazily — only create handler instances we actually need
-        IFindUsagesHandler[]? findUsagesHandlers = null;
-        IGoToDefinitionHandler[]? goToDefHandlers = null;
-        IOutlineHandler[]? outlineHandlers = null;
-        IRenameHandler[]? renameHandlers = null;
-        IDiagnosticsHandler[]? diagnosticsHandlers = null;
+        // Build lazily — only create the language packs we actually need
+        LanguageRegistry? languages = null;
         BackgroundTaskStore? taskStore = null;
         BuildWarningsStore? warningsStore = null;
         ProfilingSessionStore? profilingStore = null;
@@ -238,7 +234,7 @@ internal static class CliRunner
             }
             if (pt == typeof(DesignerRegenerationService))
             {
-                values[i] = designerService ??= CreateDesignerService();
+                values[i] = designerService ??= CreateDesignerService(settings);
                 continue;
             }
             if (pt == typeof(AppSessionStore))
@@ -255,32 +251,32 @@ internal static class CliRunner
             {
                 // A CLI invocation is a single shot, so watching would never observe a change.
                 values[i] = solutionSession ??= new SolutionSessionService(
-                    designerService ??= CreateDesignerService());
+                    designerService ??= CreateDesignerService(settings));
                 continue;
             }
             if (pt == typeof(IEnumerable<IFindUsagesHandler>))
             {
-                values[i] = findUsagesHandlers ??= [new AspxFindUsages(fmt)];
+                values[i] = Languages(ref languages, settings, fmt).FindUsagesHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IGoToDefinitionHandler>))
             {
-                values[i] = goToDefHandlers ??= [new AspxGoToDefinition(fmt), new RazorGoToDefinition(fmt)];
+                values[i] = Languages(ref languages, settings, fmt).GoToDefinitionHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IOutlineHandler>))
             {
-                values[i] = outlineHandlers ??= [new AspxOutline(), new RazorOutline()];
+                values[i] = Languages(ref languages, settings, fmt).OutlineHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IRenameHandler>))
             {
-                values[i] = renameHandlers ??= [new AspxRename(), new RazorRename()];
+                values[i] = Languages(ref languages, settings, fmt).RenameHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IDiagnosticsHandler>))
             {
-                values[i] = diagnosticsHandlers ??= [new AspxDiagnostics(), new RazorDiagnostics()];
+                values[i] = Languages(ref languages, settings, fmt).DiagnosticsHandlers;
                 continue;
             }
             if (pt == typeof(DbConnectionRegistry))
@@ -498,8 +494,26 @@ internal static class CliRunner
         return t.Name;
     }
 
-    private static DesignerRegenerationService CreateDesignerService() =>
-        new([new AspxDesignerGenerator(), new DbmlDesignerGenerator()]);
+    /// <summary>
+    /// The designer generators enabled for this invocation. The aspx one is gated the same way the
+    /// MCP server and the shared host gate it, so <c>--no-webforms</c> means the same thing on every
+    /// entry point: nobody rewrites a <c>.designer.cs</c> behind the user's back.
+    /// </summary>
+    internal static DesignerRegenerationService CreateDesignerService(EffectiveSettings settings)
+    {
+        var generators = new List<IDesignerGenerator> { new DbmlDesignerGenerator() };
+        if (settings.WebForms)
+            generators.Add(new AspxDesignerGenerator());
+        return new DesignerRegenerationService(generators);
+    }
+
+    /// <summary>
+    /// The language packs enabled for this invocation, built once. The CLI has no container, so
+    /// the registry is constructed directly rather than resolved — same gate, same order.
+    /// </summary>
+    private static LanguageRegistry Languages(
+        ref LanguageRegistry? cached, EffectiveSettings settings, IOutputFormatter fmt) =>
+        cached ??= new LanguageRegistry(LanguagePackRegistration.Create(settings, fmt)).Publish();
 
     // -------------------------------------------------------------------------
     // Naming helpers

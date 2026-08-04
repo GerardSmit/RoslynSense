@@ -9,6 +9,7 @@ namespace RoslynMCP.Tests;
 
 /// <summary>The Solution Explorer's foundations: solution-folder parsing, MSBuild item-model
 /// evaluation, and file nesting.</summary>
+[Collection(SharedState.Name)]
 public class SolutionExplorerTests
 {
     // ---- File nesting ------------------------------------------------------------------
@@ -25,6 +26,11 @@ public class SolutionExplorerTests
     [InlineData("appsettings.Development.json", "appsettings.json")]
     [InlineData("package-lock.json", "package.json")]
     [InlineData("Directory.Build.targets", "Directory.Build.props")]
+    [InlineData("Strings.nl.resx", "Strings.resx")]
+    [InlineData("Properties.de-DE.resx", "Properties.resx")]
+    [InlineData("Global.ascx.de-DE.resx", "Global.ascx.resx")]
+    [InlineData("View.ascx.nl-NL.Portal-3.resx", "View.ascx.resx")]
+    [InlineData("View.ascx.Host.resx", "View.ascx.resx")]
     public void NestingRulesInferTheExpectedParent(string child, string expectedParent) =>
         Assert.Equal(expectedParent, FileNestingService.InferParentName(child));
 
@@ -32,6 +38,11 @@ public class SolutionExplorerTests
     [InlineData("Program.cs")]
     [InlineData("README.md")]
     [InlineData("appsettings.json")]
+    [InlineData("Global.ascx.resx")]
+    [InlineData("Properties.resx")]
+    // Company is a well-formed language subtag, so ICU hands back a neutral custom culture rather
+    // than throwing. Only the segment rules keep this a base file.
+    [InlineData("My.Company.Strings.resx")]
     public void StandaloneFilesInferNoParent(string fileName) =>
         Assert.Null(FileNestingService.InferParentName(fileName));
 
@@ -140,6 +151,114 @@ public class SolutionExplorerTests
         }
     }
 
+    [Fact]
+    public async Task AFolderCreatedFromTheTreeShowsUpImmediately()
+    {
+        // It starts empty, and "Project items" mode used to require project content in a
+        // directory before showing it — so a folder disappeared the moment it was created and
+        // looked like the command had failed.
+        string dir = Path.Combine(Path.GetTempPath(), $"newfolder-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "Program.cs"), "class Program { }");
+
+        string project = Path.Combine(dir, "App.csproj");
+        File.WriteAllText(project,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+
+        try
+        {
+            var created = await SolutionTreeEditHandler.EditAsync(
+                new SolutionTreeEditParams(
+                    Action: "addFolder",
+                    TargetUri: LspConverters.PathToUri(project),
+                    Name: "Handlers"),
+                default);
+            Assert.True(created.Ok, created.Message);
+
+            var nodes = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: $"project:{project}"), default);
+
+            Assert.Contains(nodes, n =>
+                n.Kind == SolutionNodeKind.Folder && n.Label == "Handlers");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AFolderHoldingOnlyExcludedFilesStaysHidden()
+    {
+        // The counterpart: showing empty folders must not turn into showing every folder.
+        string dir = Path.Combine(Path.GetTempPath(), $"excluded-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(dir, "Excluded"));
+        File.WriteAllText(Path.Combine(dir, "Excluded", "Old.cs"), "class Old { }");
+        File.WriteAllText(Path.Combine(dir, "Program.cs"), "class Program { }");
+
+        string project = Path.Combine(dir, "App.csproj");
+        File.WriteAllText(project, """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+              </PropertyGroup>
+              <ItemGroup>
+                <Compile Remove="Excluded\**" />
+                <None Remove="Excluded\**" />
+              </ItemGroup>
+            </Project>
+            """);
+
+        try
+        {
+            var nodes = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: $"project:{project}"), default);
+            Assert.DoesNotContain(nodes, n => n.Label == "Excluded");
+
+            var shown = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: $"project:{project}", ShowAllFiles: true), default);
+            Assert.Contains(shown, n => n.Label == "Excluded");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ANewSolutionFolderAppearsUnderTheSolution()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), $"slnfolder-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        string solutionPath = Path.Combine(dir, "App.sln");
+        File.WriteAllText(solutionPath, """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Global
+            EndGlobal
+            """);
+
+        try
+        {
+            var created = await SolutionTreeEditHandler.EditAsync(
+                new SolutionTreeEditParams(
+                    Action: "addSolutionFolder",
+                    TargetUri: LspConverters.PathToUri(solutionPath),
+                    Name: "Benchmark"),
+                default);
+            Assert.True(created.Ok, created.Message);
+
+            var children = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: $"solution:{solutionPath}"), default);
+
+            Assert.Contains(children, n =>
+                n.Kind == SolutionNodeKind.SolutionFolder && n.Label == "Benchmark");
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
     // ---- Solution structure ------------------------------------------------------------
 
     [Fact]
@@ -241,24 +360,19 @@ public class SolutionExplorerTests
 
         try
         {
-            // Root level in .sln.
-            Assert.True(Add(sln, "Benchmark", parent: null).Ok);
-            var slnNodes = SolutionFileService.Read(sln);
-            var benchmark = slnNodes.Single(n => n.Name == "Benchmark");
-            Assert.True(benchmark.IsFolder);
-            Assert.Null(benchmark.ParentId);
+            // A folder is identified by its path in both formats, which is what makes the two
+            // halves of this test identical apart from the file they run against.
+            foreach (string solution in new[] { sln, slnx })
+            {
+                Assert.True(Add(solution, "Benchmark", parent: null).Ok);
+                Assert.True(Add(solution, "Inner", parent: "/Services/").Ok);
 
-            // Nested in .sln, which also needs the NestedProjects section creating.
-            Assert.True(Add(sln, "Inner", parent: "{11111111-1111-1111-1111-111111111111}").Ok);
-            var nested = SolutionFileService.Read(sln).Single(n => n.Name == "Inner");
-            Assert.Equal("{11111111-1111-1111-1111-111111111111}", nested.ParentId);
-
-            // Root level and nested in .slnx.
-            Assert.True(Add(slnx, "Benchmark", parent: null).Ok);
-            Assert.True(Add(slnx, "Inner", parent: "/Services").Ok);
-            var slnxNodes = SolutionFileService.Read(slnx);
-            Assert.Null(slnxNodes.Single(n => n.Name == "Benchmark").ParentId);
-            Assert.Equal("/Services", slnxNodes.Single(n => n.Name == "Inner").ParentId);
+                var nodes = SolutionFileService.Read(solution);
+                var benchmark = nodes.Single(n => n.Name == "Benchmark");
+                Assert.True(benchmark.IsFolder);
+                Assert.Null(benchmark.ParentId);
+                Assert.Equal("/Services/", nodes.Single(n => n.Name == "Inner").ParentId);
+            }
         }
         finally
         {
@@ -436,5 +550,89 @@ public class SolutionExplorerTests
         Assert.All(filtered, n =>
             Assert.Contains("calc", n.Label, StringComparison.OrdinalIgnoreCase));
         Assert.All(filtered, n => Assert.NotNull(n.Highlights));
+    }
+
+    [Fact]
+    public async Task FilteringFromTheRootFindsProjectsAnywhereInTheSolution()
+    {
+        // The root holds one node — the solution's own name — so narrowing it by label emptied
+        // the tree for any term that was not the solution's name. A filter at the root has to
+        // mean "what in this solution matches", not "does the solution's name match".
+        string? previous = WorkspaceService.BoundSolutionPath;
+        try
+        {
+            WorkspaceService.BindSolution(FixturePaths.MultiSolutionFile);
+
+            var unfiltered = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(), default);
+            var root = Assert.Single(unfiltered);
+            Assert.Equal(SolutionNodeKind.Solution, root.Kind);
+            Assert.Equal("MultiSolution", root.Label);
+
+            // "ProjectA" is nowhere in the solution's own name, which is exactly the case that
+            // used to return nothing.
+            var matches = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: null, Filter: "ProjectA"), default);
+
+            Assert.NotEmpty(matches);
+            Assert.Contains(matches, n => n.Label == "ProjectA");
+        }
+        finally
+        {
+            WorkspaceService.BindSolution(previous);
+        }
+    }
+
+    /// <summary>
+    /// A file can be both a solution item and a file of the project that compiles it. The client
+    /// keys its tree items by id, and two nodes sharing one id makes the second branch fail to
+    /// render — so a solution item is not called what the project's own file is called.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ASolutionItemIsNotGivenTheSameIdAsAProjectFile(bool slnx)
+    {
+        string directory = Path.Combine(
+            Path.GetTempPath(), $"roslyn-sense-slnitem-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+
+        string? previous = WorkspaceService.BoundSolutionPath;
+        try
+        {
+            string solution = Path.Combine(directory, slnx ? "Test.slnx" : "Test.sln");
+            File.WriteAllText(solution, slnx
+                ? "<Solution />"
+                : """
+                    Microsoft Visual Studio Solution File, Format Version 12.00
+                    Global
+                    EndGlobal
+
+                    """);
+
+            string file = Path.Combine(directory, "README.md");
+            File.WriteAllText(file, "# Test");
+
+            SolutionFileWriter.AddFolder(solution, "Docs", null);
+            string folderId = SolutionFileService.Read(solution).Single(n => n.IsFolder).Id;
+            SolutionFileWriter.AddSolutionItem(solution, folderId, file);
+
+            WorkspaceService.BindSolution(solution);
+            var children = await SolutionTreeHandler.ChildrenAsync(
+                new SolutionTreeParams(NodeId: $"slnfolder:{folderId}"), default);
+
+            var item = Assert.Single(children);
+            Assert.Equal(SolutionNodeKind.SolutionItem, item.Kind);
+            Assert.NotEqual($"file:{file}", item.Id);
+
+            // The folder that listed it has to be recoverable from the id: detaching the item is
+            // the one operation that cannot work out for itself which folder it came from.
+            Assert.Contains(folderId, item.Id);
+        }
+        finally
+        {
+            WorkspaceService.BindSolution(previous);
+            try { Directory.Delete(directory, recursive: true); } catch { }
+        }
     }
 }

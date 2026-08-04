@@ -20,7 +20,14 @@ public sealed record ToolchainInfo(
     [property: JsonPropertyName("iisExpressPath")] string? IisExpressPath);
 
 public sealed record LaunchTargetsParams(
-    [property: JsonPropertyName("configuration")] string? Configuration = null);
+    [property: JsonPropertyName("configuration")] string? Configuration = null,
+    [property: JsonPropertyName("launchProfile")] string? LaunchProfile = null);
+
+/// <summary>Which project owns a file, so F5 can run what the user is looking at.</summary>
+public sealed record TargetForFileParams(
+    [property: JsonPropertyName("filePath")] string? FilePath,
+    [property: JsonPropertyName("configuration")] string? Configuration = null,
+    [property: JsonPropertyName("launchProfile")] string? LaunchProfile = null);
 
 /// <summary>One debuggable (or explicitly non-debuggable) project.</summary>
 public sealed record LaunchTarget(
@@ -36,7 +43,24 @@ public sealed record LaunchTarget(
     [property: JsonPropertyName("cwd")] string? Cwd,
     [property: JsonPropertyName("env")] Dictionary<string, string> Env,
     [property: JsonPropertyName("url")] string? Url,
-    [property: JsonPropertyName("error")] string? Error);
+    [property: JsonPropertyName("error")] string? Error,
+    // The launchSettings.json profiles this project offers, so the client can turn them into run
+    // configurations instead of making the user name one, and which one this target used.
+    [property: JsonPropertyName("launchProfiles")] LaunchProfileDescriptor[] LaunchProfiles,
+    [property: JsonPropertyName("launchProfile")] string? LaunchProfile = null,
+    // Where to open a browser: the app URL with the profile's launchUrl applied.
+    [property: JsonPropertyName("browseUrl")] string? BrowseUrl = null,
+    [property: JsonPropertyName("launchBrowser")] bool? LaunchBrowser = null);
+
+/// <summary>A launchSettings.json profile, as much of it as a client needs to show and pick it.</summary>
+public sealed record LaunchProfileDescriptor(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("commandName")] string CommandName,
+    [property: JsonPropertyName("applicationUrl")] string? ApplicationUrl,
+    [property: JsonPropertyName("commandLineArgs")] string? CommandLineArgs,
+    [property: JsonPropertyName("launchBrowser")] bool LaunchBrowser,
+    [property: JsonPropertyName("launchUrl")] string? LaunchUrl,
+    [property: JsonPropertyName("environmentVariables")] Dictionary<string, string> EnvironmentVariables);
 
 /// <summary>A .NET process the debugger can attach to. <see cref="ProjectName"/> is set for
 /// processes this server launched, which is what makes the picker readable.</summary>

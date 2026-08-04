@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -8,6 +9,12 @@ namespace RoslynMCP.Lsp.Handlers;
 /// <summary>textDocument/prepareCallHierarchy + callHierarchy/incomingCalls/outgoingCalls.
 /// Incoming uses <see cref="SymbolFinder.FindCallersAsync(ISymbol, Solution, CancellationToken)"/>;
 /// outgoing walks invocations in the symbol's declaration bodies.</summary>
+/// <remarks>
+/// Each request comes in two halves: one that resolves the position or the item against the
+/// workspace, and one that works from a symbol a caller has already resolved. Language packs use
+/// the second — they resolve their own positions through their projection — and pass the mapper
+/// that turns results in that projection back into their own files.
+/// </remarks>
 internal static class CallHierarchyHandler
 {
     public static async Task<HierarchyItem[]> PrepareAsync(
@@ -18,35 +25,73 @@ internal static class CallHierarchyHandler
             return Array.Empty<HierarchyItem>();
 
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
+        return Prepare(symbol, mapper: null);
+    }
+
+    /// <summary>The root item for an already-resolved symbol, empty for a symbol a call hierarchy
+    /// cannot be rooted at.</summary>
+    public static HierarchyItem[] Prepare(ISymbol? symbol, IHierarchySourceMapper? mapper)
+    {
         if (symbol is not (IMethodSymbol or IPropertySymbol or IEventSymbol or IFieldSymbol))
             return Array.Empty<HierarchyItem>();
 
-        var item = HierarchyItemFactory.ToItem(symbol);
+        var item = HierarchyItemFactory.ToItem(symbol, mapper);
         return item is null ? Array.Empty<HierarchyItem>() : [item];
     }
 
     public static async Task<CallHierarchyIncomingCall[]> IncomingCallsAsync(
-        CallHierarchyCallsParams p, CancellationToken ct)
+        CallHierarchyCallsParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         var (symbol, document) = await HierarchyItemFactory.ResolveSymbolAsync(p.Item, ct);
         if (symbol is null || document is null)
             return Array.Empty<CallHierarchyIncomingCall>();
 
-        var callers = await SymbolFinder.FindCallersAsync(symbol, document.Project.Solution, ct);
+        var calls = await IncomingCallsAsync(symbol, document.Project.Solution, mapper: null, ct);
+
+        // The same seam find-references has, for the same reason: a call written in markup is in
+        // no Roslyn document, so FindCallersAsync cannot see it and a code-behind method called
+        // only from a page would come back with no callers at all. On a solution with no markup
+        // each contributor declines after one metadata lookup.
+        var contributed = new List<CallHierarchyIncomingCall>();
+        foreach (var contributor in
+            LanguageScope.Of(languages).Contributors<ILanguageCallHierarchyContributor>())
+        {
+            contributed.AddRange(await contributor.IncomingCallsAsync(symbol, document.Project, ct));
+        }
+
+        return contributed.Count == 0 ? calls : [.. calls, .. contributed];
+    }
+
+    public static async Task<CallHierarchyIncomingCall[]> IncomingCallsAsync(
+        ISymbol symbol, Solution solution, IHierarchySourceMapper? mapper, CancellationToken ct)
+    {
+        var callers = await SymbolFinder.FindCallersAsync(symbol, solution, ct);
         var calls = new List<CallHierarchyIncomingCall>();
 
         foreach (var caller in callers.Where(c => c.IsDirect))
         {
-            var from = HierarchyItemFactory.ToItem(caller.CallingSymbol);
+            var sites = caller.Locations
+                .Where(l => l.IsInSource)
+                .Select(l => HierarchyItemFactory.ToSource(l, mapper))
+                .Where(s => s is not null)
+                .Select(s => s!.Value)
+                .ToList();
+            if (sites.Count == 0)
+                continue;
+
+            // A caller a projection invented — the method a code block was lifted into — has no
+            // declaration anyone can open, so the type it was lifted into stands in for it and is
+            // shown at the call itself.
+            var from = HierarchyItemFactory.ToItem(caller.CallingSymbol, mapper)
+                ?? (mapper is null ? null : Substitute(caller.CallingSymbol, sites[0]));
             if (from is null)
                 continue;
 
-            string fromPath = LspConverters.UriToPath(from.Uri);
-            var fromRanges = caller.Locations
-                .Where(l => l.IsInSource && string.Equals(
-                    Services.PathHelper.NormalizePath(l.SourceTree!.FilePath), fromPath,
-                    StringComparison.OrdinalIgnoreCase))
-                .Select(l => LspConverters.ToRange(l.GetLineSpan().Span))
+            // fromRanges are read against the caller's own file, so a partial type declared
+            // elsewhere would produce ranges pointing at the wrong one.
+            var fromRanges = sites
+                .Where(s => string.Equals(s.Uri, from.Uri, StringComparison.OrdinalIgnoreCase))
+                .Select(s => s.Range)
                 .ToArray();
             if (fromRanges.Length == 0)
                 continue;
@@ -63,16 +108,23 @@ internal static class CallHierarchyHandler
         if (symbol is null || document is null)
             return Array.Empty<CallHierarchyOutgoingCall>();
 
-        var solution = document.Project.Solution;
+        return await OutgoingCallsAsync(
+            symbol, document.Project.Solution, p.Item.Uri, mapper: null, ct);
+    }
+
+    public static async Task<CallHierarchyOutgoingCall[]> OutgoingCallsAsync(
+        ISymbol symbol, Solution solution, string itemUri, IHierarchySourceMapper? mapper,
+        CancellationToken ct)
+    {
         var byTarget = new Dictionary<ISymbol, List<Protocol.Range>>(SymbolEqualityComparer.Default);
-        string itemPath = LspConverters.UriToPath(p.Item.Uri);
+        string itemPath = LspConverters.UriToPath(itemUri);
 
         foreach (var syntaxRef in symbol.DeclaringSyntaxReferences)
         {
             // fromRanges are interpreted relative to the item's document — a partial type's
             // other files would produce ranges pointing at the wrong file.
-            if (!string.Equals(Services.PathHelper.NormalizePath(syntaxRef.SyntaxTree.FilePath),
-                    itemPath, StringComparison.OrdinalIgnoreCase))
+            if (DeclarationPath(syntaxRef, mapper) is not { } declarationPath
+                || !string.Equals(declarationPath, itemPath, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var declaration = await syntaxRef.GetSyntaxAsync(ct);
@@ -90,18 +142,41 @@ internal static class CallHierarchyHandler
                     || !target.Locations.Any(l => l.IsInSource))
                     continue;
 
+                if (HierarchyItemFactory.ToSource(node.GetLocation(), mapper) is not { } site)
+                    continue;
+
                 // Attribute the call to the user-facing symbol (property for accessors, etc.).
                 ISymbol display = target.AssociatedSymbol ?? target;
                 if (!byTarget.TryGetValue(display, out var ranges))
                     byTarget[display] = ranges = new List<Protocol.Range>();
-                ranges.Add(LspConverters.ToRange(node.GetLocation().GetLineSpan().Span));
+                ranges.Add(site.Range);
             }
         }
 
         return byTarget
-            .Select(kv => (Item: HierarchyItemFactory.ToItem(kv.Key), Ranges: kv.Value))
+            .Select(kv => (Item: HierarchyItemFactory.ToItem(kv.Key, mapper), Ranges: kv.Value))
             .Where(x => x.Item is not null)
             .Select(x => new CallHierarchyOutgoingCall(x.Item!, x.Ranges.ToArray()))
             .ToArray();
     }
+
+    /// <summary>The file a declaration is really in, or <c>null</c> when it is generated text
+    /// that maps to no file at all.</summary>
+    private static string? DeclarationPath(SyntaxReference syntaxRef, IHierarchySourceMapper? mapper)
+    {
+        string path = syntaxRef.SyntaxTree.FilePath;
+
+        if (mapper?.IsGenerated(path) != true)
+            return Services.PathHelper.NormalizePath(path);
+
+        return mapper.ToSource(path, syntaxRef.Span) is { } mapped
+            ? LspConverters.UriToPath(mapped.Uri)
+            : null;
+    }
+
+    private static HierarchyItem? Substitute(
+        ISymbol callingSymbol, (string Uri, Protocol.Range Range) site) =>
+        callingSymbol.ContainingType is { } owner
+            ? HierarchyItemFactory.At(owner, site.Uri, site.Range, site.Range)
+            : null;
 }

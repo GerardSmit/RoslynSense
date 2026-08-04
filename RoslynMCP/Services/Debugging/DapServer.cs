@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 
 namespace RoslynMCP.Services.Debugging;
 
@@ -22,22 +23,73 @@ internal sealed class DapServer
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     private int _sequence;
-    private bool _running = true;
+    /// <summary>Written by request handlers, read by the listen loop — different threads.</summary>
+    private volatile bool _running = true;
 
     /// <summary>The file the last <c>gotoTargets</c> asked about. DAP's <c>goto</c> carries only a
     /// target id, so the source has to be remembered from the request that produced it.</summary>
     private string? _gotoSource;
 
+    /// <summary>What the client currently has set per source, as line -> engine breakpoint.
+    /// <c>setBreakpoints</c> replaces a source's whole set, so the previous one has to be known
+    /// to tell an unchanged breakpoint from a new one and to remove the dropped ones.</summary>
+    private readonly Dictionary<string, Dictionary<int, TrackedBreakpoint>> _sourceBreakpoints =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _breakpointLock = new(1, 1);
+
+    /// <summary>Engine breakpoint id -> the line it actually bound at, under its own lock: the
+    /// notice pump must never queue behind a <c>setBreakpoints</c>, or a stop would reach the
+    /// client only once the breakpoint call it was stuck behind returned.</summary>
+    private readonly Dictionary<int, int> _boundLines = [];
+
+    /// <summary>How many resuming commands are in flight. A stop that ends one of them is
+    /// reported by that command; only a stop with none outstanding is the adapter's to announce.</summary>
+    private int _resuming;
+
+    /// <summary>The engine's own account of what it is doing, when it has one. Without it, "the
+    /// engine accepted it" is the only answer available about a breakpoint, and a resume that
+    /// returns without a stop cannot be told from a debuggee that ended.</summary>
+    private readonly IDebugNoticeSource? _engine;
+
+    /// <summary>The last stop announced to the client. A stop arrives twice — as the result of the
+    /// command that resumed into it and as a notice — so it is claimed once and skipped after.</summary>
+    private long _reportedStop;
+
+    /// <summary>Engine notices, drained in order by one writer. Fire-and-forget writes from the
+    /// engine's pump thread would interleave with each other and with stop events.</summary>
+    private readonly Channel<DebugNotice> _notices = Channel.CreateUnbounded<DebugNotice>(
+        new UnboundedChannelOptions { SingleReader = true });
+    private readonly Task _noticePump;
+
+    /// <summary>Completed once launch or attach has been answered. Requests are dispatched
+    /// concurrently, so configuration requests arrive while the launch is still in flight;
+    /// answering them against a session that does not exist yet drops the user's F5
+    /// breakpoints on the floor with no retry.</summary>
+    private readonly TaskCompletionSource _sessionStarted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private sealed record TrackedBreakpoint(int Id, string? Condition, string? HitCondition, string? LogMessage);
+
     /// <summary>DAP frame ids are opaque; the backend's are stack indices, so scopes carry the
     /// frame in their reference and variable references pass through untouched.</summary>
-    private const int ScopeBase = 1;
-    private const int ScopeLimit = 1000;
+    internal const int ScopeBase = 1;
+    internal const int ScopeLimit = 1000;
 
     public DapServer(IDebugBackend backend, Stream input, Stream output)
     {
         _backend = backend;
         _input = input;
         _output = output;
+
+        // Subscribed before anything can launch, so the module loads and bind results from
+        // startup — the ones that explain a breakpoint that never binds — are not missed.
+        if (backend is IDebugNoticeSource source)
+        {
+            _engine = source;
+            source.Notice += notice => _notices.Writer.TryWrite(notice);
+        }
+
+        _noticePump = Task.Run(PumpNoticesAsync);
     }
 
     public static async Task<int> RunAsync(string[] args, CancellationToken ct = default)
@@ -57,23 +109,37 @@ internal sealed class DapServer
 
     public async Task ListenAsync(CancellationToken ct)
     {
-        while (_running && !ct.IsCancellationRequested)
+        try
         {
-            JsonNode? message;
-            try
+            while (_running && !ct.IsCancellationRequested)
             {
-                message = await ReadMessageAsync(ct);
-            }
-            catch (Exception ex) when (ex is IOException or OperationCanceledException)
-            {
-                return;
-            }
-            if (message is null)
-                return;
+                JsonNode? message;
+                try
+                {
+                    message = await ReadMessageAsync(ct);
+                }
+                catch (Exception ex) when (ex is IOException or OperationCanceledException)
+                {
+                    return;
+                }
+                if (message is null)
+                    return;
 
-            // Requests are handled concurrently: a blocking `continue` must not stop the client
-            // from cancelling it or asking for state.
-            _ = HandleAsync(message, ct);
+                // Requests are handled concurrently: a blocking `continue` must not stop the client
+                // from cancelling it or asking for state.
+                _ = HandleAsync(message, ct);
+            }
+        }
+        finally
+        {
+            // Nothing can start a session any more, so whatever is still waiting for one is
+            // released to fail rather than to hang.
+            _sessionStarted.TrySetResult();
+
+            // Flush what the engine already said before the transport goes away, but do not wait
+            // on a handler that is wedged — the session is ending either way.
+            _notices.Writer.TryComplete();
+            await Task.WhenAny(_noticePump, Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
         }
     }
 
@@ -95,6 +161,7 @@ internal sealed class DapServer
                 {
                     string result = await LaunchAsync(arguments, ct);
                     bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+                    _sessionStarted.TrySetResult();
                     await RespondAsync(message, null, ok, ok ? null : result);
                     if (!ok)
                         await EventAsync("terminated", null);
@@ -106,11 +173,13 @@ internal sealed class DapServer
                     int pid = arguments?["processId"]?.GetValue<int>() ?? 0;
                     if (pid <= 0)
                     {
+                        _sessionStarted.TrySetResult();
                         await RespondAsync(message, null, false, "No process id to attach to.");
                         break;
                     }
                     string result = await _backend.AttachToProcessAsync(pid, null, ct);
                     bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+                    _sessionStarted.TrySetResult();
                     await RespondAsync(message, null, ok, ok ? null : result);
                     if (!ok)
                         await EventAsync("terminated", null);
@@ -118,32 +187,16 @@ internal sealed class DapServer
                 }
 
                 case "configurationDone":
+                    // The client has finished configuring; if no launch or attach ever came, the
+                    // queued configuration requests would otherwise wait forever.
+                    _sessionStarted.TrySetResult();
                     await RespondAsync(message, null);
                     break;
 
                 case "setBreakpoints":
                 {
-                    string? file = arguments?["source"]?["path"]?.GetValue<string>();
-                    var wanted = arguments?["breakpoints"]?.AsArray() ?? [];
-                    var verified = new JsonArray();
-
-                    foreach (var breakpoint in wanted)
-                    {
-                        int line = breakpoint?["line"]?.GetValue<int>() ?? 0;
-                        var (_, id) = await _backend.SetBreakpointAsync(
-                            file ?? "", line,
-                            breakpoint?["condition"]?.GetValue<string>(),
-                            breakpoint?["hitCondition"]?.GetValue<string>(),
-                            breakpoint?["logMessage"]?.GetValue<string>(),
-                            ct);
-
-                        verified.Add(new JsonObject
-                        {
-                            ["verified"] = id is not null,
-                            ["line"] = line,
-                        });
-                    }
-                    await RespondAsync(message, new JsonObject { ["breakpoints"] = verified });
+                    await _sessionStarted.Task;
+                    await ApplyBreakpointsAsync(message, arguments, ct);
                     break;
                 }
 
@@ -177,16 +230,22 @@ internal sealed class DapServer
 
                 case "setDataBreakpoints":
                 {
+                    await _sessionStarted.Task;
                     if (_backend is not PublishingDebugBackend watching)
                     {
                         await RespondAsync(message, null, false, "This adapter cannot watch values.");
                         break;
                     }
 
+                    var requested = arguments?["breakpoints"]?.AsArray() ?? [];
                     var specs = new List<DataBreakpointSpec>();
-                    foreach (var entry in arguments?["breakpoints"]?.AsArray() ?? [])
+                    // DAP wants one answer per requested breakpoint, so an entry with no data id
+                    // has to occupy its slot rather than shift every later answer up one.
+                    var armed = new List<bool>(requested.Count);
+                    foreach (var entry in requested)
                     {
                         string dataId = entry?["dataId"]?.GetValue<string>() ?? "";
+                        armed.Add(dataId.Length > 0);
                         if (dataId.Length == 0)
                             continue;
 
@@ -198,12 +257,25 @@ internal sealed class DapServer
                             entry?["hitCondition"]?.GetValue<string>()));
                     }
 
+                    var statuses = await watching.SetDataBreakpointsAsync(specs, ct);
                     var verified = new JsonArray();
-                    foreach (var status in await watching.SetDataBreakpointsAsync(specs, ct))
+                    int next = 0;
+                    foreach (bool hasId in armed)
                     {
-                        var result = new JsonObject { ["verified"] = status.Verified };
-                        if (!status.Verified)
-                            result["message"] = status.Message;
+                        if (!hasId)
+                        {
+                            verified.Add(new JsonObject
+                            {
+                                ["verified"] = false,
+                                ["message"] = "The breakpoint carried no data id.",
+                            });
+                            continue;
+                        }
+
+                        var status = next < statuses.Count ? statuses[next++] : null;
+                        var result = new JsonObject { ["verified"] = status?.Verified ?? false };
+                        if (status is null || !status.Verified)
+                            result["message"] = status?.Message ?? "The value could not be watched.";
                         verified.Add(result);
                     }
 
@@ -249,6 +321,7 @@ internal sealed class DapServer
 
                 case "setExceptionBreakpoints":
                 {
+                    await _sessionStarted.Task;
                     var ids = (arguments?["filters"]?.AsArray() ?? [])
                         .Select(f => f?.GetValue<string>() ?? "")
                         .ToList();
@@ -353,10 +426,17 @@ internal sealed class DapServer
 
                 case "setVariable":
                 {
+                    // The reference names the scope being edited, and a scope's reference carries
+                    // its frame — writing frame 0 regardless edits the wrong frame's local.
+                    int reference = arguments?["variablesReference"]?.GetValue<int>() ?? ScopeBase;
+                    int frameId = reference >= ScopeBase && reference < ScopeBase + ScopeLimit
+                        ? reference - ScopeBase
+                        : 0;
+
                     var (ok, stored, error) = await _backend.SetVariableAsync(
                         arguments?["name"]?.GetValue<string>() ?? "",
                         arguments?["value"]?.GetValue<string>() ?? "",
-                        0, ct);
+                        frameId, ct);
 
                     await RespondAsync(
                         message,
@@ -388,29 +468,45 @@ internal sealed class DapServer
                         ["allThreadsContinued"] = true,
                     });
 
-                    var resume = command switch
+                    Interlocked.Increment(ref _resuming);
+                    try
                     {
-                        "next" => _backend.StepOverAsync(ct),
-                        "stepIn" => _backend.StepInAsync(ct),
-                        "stepOut" => _backend.StepOutAsync(ct),
-                        _ => _backend.ContinueAsync(ct),
-                    };
-                    await resume;
+                        var resume = command switch
+                        {
+                            "next" => _backend.StepOverAsync(ct),
+                            "stepIn" => _backend.StepInAsync(ct),
+                            "stepOut" => _backend.StepOutAsync(ct),
+                            _ => _backend.ContinueAsync(ct),
+                        };
+                        await resume;
 
-                    await RespondAsync(
-                        message,
-                        command == "continue" ? new JsonObject { ["allThreadsContinued"] = true } : null);
-                    await ReportStopAsync(command == "continue" ? "breakpoint" : "step");
+                        await RespondAsync(
+                            message,
+                            command == "continue" ? new JsonObject { ["allThreadsContinued"] = true } : null);
+                        await ReportStopAsync(command == "continue" ? "breakpoint" : "step");
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _resuming);
+                    }
                     break;
                 }
 
                 case "pause":
                 {
-                    string result = await _backend.InterruptAsync(ct);
-                    bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
-                    await RespondAsync(message, null, ok, ok ? null : result);
-                    if (ok)
-                        await ReportStopAsync("pause");
+                    Interlocked.Increment(ref _resuming);
+                    try
+                    {
+                        string result = await _backend.InterruptAsync(ct);
+                        bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+                        await RespondAsync(message, null, ok, ok ? null : result);
+                        if (ok)
+                            await ReportStopAsync("pause");
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _resuming);
+                    }
                     break;
                 }
 
@@ -448,6 +544,261 @@ internal sealed class DapServer
         {
             await RespondAsync(message, null, false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Applies the client's breakpoints for one source as a replacement of what it had before.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// DAP has no "remove breakpoint" request: the client resends a source's whole set on every
+    /// change, and what is missing from it is meant to be gone. Adding only, as this did, left
+    /// deleted breakpoints armed and turned a resend of an unchanged list into a second engine
+    /// breakpoint on every line — so an unchanged breakpoint keeps its id and only genuinely new
+    /// or edited ones reach the engine.
+    /// </para>
+    /// <para>
+    /// Binding is asynchronous, so the answer reports what the engine has bound so far and the
+    /// rest arrives as <c>breakpoint</c> events. A bind that lands while this is still running is
+    /// therefore already in the response, and the event that follows it is a harmless repeat.
+    /// </para>
+    /// </remarks>
+    private async Task ApplyBreakpointsAsync(JsonNode request, JsonNode? arguments, CancellationToken ct)
+    {
+        string file = arguments?["source"]?["path"]?.GetValue<string>() ?? "";
+        var wanted = arguments?["breakpoints"]?.AsArray() ?? [];
+        var answered = new JsonArray();
+
+        await _breakpointLock.WaitAsync(ct);
+        try
+        {
+            var previous = _sourceBreakpoints.TryGetValue(file, out var existing)
+                ? existing
+                : [];
+            var current = new Dictionary<int, TrackedBreakpoint>();
+
+            var requested = new List<(int Line, string? Condition, string? HitCondition, string? LogMessage)>();
+            foreach (var breakpoint in wanted)
+            {
+                requested.Add((
+                    breakpoint?["line"]?.GetValue<int>() ?? 0,
+                    breakpoint?["condition"]?.GetValue<string>(),
+                    breakpoint?["hitCondition"]?.GetValue<string>(),
+                    breakpoint?["logMessage"]?.GetValue<string>()));
+            }
+
+            // Everything that is going is removed before anything new is set. The other order
+            // destroys a breakpoint whose condition was edited: the engine keys its breakpoints by
+            // file and line, so setting the replacement first cannot bind — the old one still owns
+            // that line — and removing the old one then takes the replacement with it, leaving the
+            // line with no breakpoint at all and nothing pending to rebind it.
+            foreach (var (line, dropped) in previous)
+            {
+                var kept = requested.FirstOrDefault(r => r.Line == line);
+                if (kept.Line == line &&
+                    kept.Condition == dropped.Condition &&
+                    kept.HitCondition == dropped.HitCondition &&
+                    kept.LogMessage == dropped.LogMessage)
+                {
+                    current[line] = dropped;
+                    continue;
+                }
+
+                await _backend.RemoveBreakpointAsync(dropped.Id, ct);
+                lock (_boundLines)
+                    _boundLines.Remove(dropped.Id);
+            }
+
+            foreach (var (line, condition, hitCondition, logMessage) in requested)
+            {
+                if (current.ContainsKey(line))
+                {
+                    answered.Add(Describe(current[line].Id, line, file));
+                    continue;
+                }
+
+                var (_, id) = await _backend.SetBreakpointAsync(
+                    file, line, condition, hitCondition, logMessage, ct);
+
+                if (id is { } assigned)
+                {
+                    current[line] = new TrackedBreakpoint(assigned, condition, hitCondition, logMessage);
+                    answered.Add(Describe(assigned, line, file));
+                }
+                else
+                {
+                    answered.Add(new JsonObject
+                    {
+                        ["verified"] = false,
+                        ["line"] = line,
+                        ["message"] = "The engine refused the breakpoint.",
+                    });
+                }
+            }
+
+            _sourceBreakpoints[file] = current;
+
+            await RespondAsync(request, new JsonObject { ["breakpoints"] = answered });
+        }
+        finally
+        {
+            _breakpointLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// One breakpoint as the client should draw it: solid at the line it bound to, hollow with a
+    /// reason while it is still pending.
+    /// </summary>
+    /// <remarks>
+    /// A breakpoint the engine accepted is not a breakpoint that will be hit — its module may not
+    /// have loaded, or may have shipped without a PDB. Reporting acceptance as verification, which
+    /// is what this did, drew a solid red dot on a breakpoint that could never fire and left the
+    /// user to conclude the debugger was broken.
+    /// </remarks>
+    private JsonObject Describe(int id, int requestedLine, string file)
+    {
+        bool bound;
+        int boundLine;
+        lock (_boundLines)
+            bound = _boundLines.TryGetValue(id, out boundLine);
+
+        var entry = new JsonObject
+        {
+            ["id"] = id,
+            ["verified"] = bound || _engine is null,
+            ["line"] = bound ? boundLine : requestedLine,
+        };
+
+        if (!bound && _engine is not null)
+            entry["message"] = "Pending — its module has not loaded, or was built without symbols.";
+        if (file.Length > 0)
+            entry["source"] = new JsonObject { ["name"] = Path.GetFileName(file), ["path"] = file };
+
+        return entry;
+    }
+
+    // --- Engine notices ---
+
+    /// <summary>
+    /// Relays what the engine says between stops: the debuggee's console, the engine's own
+    /// diagnostics, module loads, and breakpoints binding and unbinding.
+    /// </summary>
+    /// <remarks>
+    /// The engine has reported all of this from the start and nothing consumed it, so a
+    /// breakpoint that never bound was indistinguishable from code that never ran — the Debug
+    /// Console stayed empty and the gutter dot stayed red.
+    /// </remarks>
+    private async Task PumpNoticesAsync()
+    {
+        await foreach (var notice in _notices.Reader.ReadAllAsync())
+        {
+            try
+            {
+                await DeliverAsync(notice);
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+            {
+                return; // The client is gone; there is nobody left to tell.
+            }
+            catch
+            {
+                // A diagnostic that cannot be formatted must not stop the ones behind it.
+            }
+        }
+    }
+
+    private Task DeliverAsync(DebugNotice notice) => notice.Kind switch
+    {
+        DebugNoticeKind.Output => OutputAsync("stdout", notice.Message),
+        DebugNoticeKind.Diagnostic => OutputAsync("console", notice.Message),
+        DebugNoticeKind.Module => OutputAsync("console", $"Loaded '{notice.Message}'."),
+        DebugNoticeKind.Stopped => ReportUnaskedStopAsync(notice),
+        DebugNoticeKind.Exited => EndSessionAsync(),
+        _ => BreakpointChangedAsync(notice),
+    };
+
+    /// <summary>
+    /// Announces a stop the adapter did not ask for.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes a breakpoint visible at all in a server. <c>stopped</c> used to be sent
+    /// only as the tail of a resume this adapter had issued, so after F5 — where nothing is
+    /// outstanding — a request that hit a breakpoint suspended the process and the editor was
+    /// never told: the site hung with no call stack, no variables, and no highlighted line, which
+    /// looks exactly like a breakpoint that does not work.
+    /// </remarks>
+    private async Task ReportUnaskedStopAsync(DebugNotice notice)
+    {
+        // A stop that ends a resume is that command's to report, and the emulated hit counts and
+        // logpoints resume through stops the user must never see — all of which happen inside a
+        // command. Reporting those here would surface them twice, and surface the invisible ones.
+        if (Volatile.Read(ref _resuming) > 0)
+            return;
+
+        // A logpoint or an unmet hit count is a stop the user must never see, and outside a
+        // command nothing else applies that rule — the emulation lives in the resume path.
+        if (_backend is PublishingDebugBackend emulating &&
+            await emulating.ResumeThroughUnsolicitedStopAsync())
+        {
+            return;
+        }
+
+        await ReportStopAsync(notice.Message.Length > 0 ? notice.Message : "breakpoint");
+    }
+
+    /// <summary>The debuggee ended on its own — the site was stopped, or it crashed. Without this
+    /// the editor keeps a debug session alive against a process that no longer exists.</summary>
+    private async Task EndSessionAsync()
+    {
+        await EventAsync("exited", new JsonObject { ["exitCode"] = 0 });
+        await EventAsync("terminated", null);
+    }
+
+    private Task OutputAsync(string category, string text) =>
+        EventAsync("output", new JsonObject
+        {
+            ["category"] = category,
+            ["output"] = text.EndsWith('\n') ? text : text + "\n",
+        });
+
+    private async Task BreakpointChangedAsync(DebugNotice notice)
+    {
+        if (notice.BreakpointId <= 0)
+            return;
+
+        bool bound = notice.Kind == DebugNoticeKind.BreakpointBound;
+
+        lock (_boundLines)
+        {
+            if (bound)
+                _boundLines[notice.BreakpointId] = notice.Line;
+            else
+                _boundLines.Remove(notice.BreakpointId);
+        }
+
+        var breakpoint = new JsonObject
+        {
+            ["id"] = notice.BreakpointId,
+            ["verified"] = bound,
+            ["message"] = notice.Message,
+        };
+        if (notice.Line > 0)
+            breakpoint["line"] = notice.Line;
+        if (notice.FilePath.Length > 0)
+        {
+            breakpoint["source"] = new JsonObject
+            {
+                ["name"] = Path.GetFileName(notice.FilePath),
+                ["path"] = notice.FilePath,
+            };
+        }
+
+        await EventAsync("breakpoint", new JsonObject
+        {
+            ["reason"] = "changed",
+            ["breakpoint"] = breakpoint,
+        });
     }
 
     /// <summary>
@@ -584,10 +935,20 @@ internal sealed class DapServer
         var frame = _backend.CurrentFrame;
         if (frame is null)
         {
-            await EventAsync("terminated", null);
-            _running = false;
+            // No frame after a resume means the wait gave up, not that the process died — which
+            // is the ordinary outcome of continuing a web request that hits nothing else. Ending
+            // the session here killed it a minute after every such Continue. An engine that
+            // reports its own lifecycle announces a real exit as a notice instead.
+            if (_engine is null)
+            {
+                await EventAsync("terminated", null);
+                _running = false;
+            }
             return;
         }
+
+        if (!ClaimStop())
+            return;
 
         // A value change outranks the reason the resume was started with: the user pressed
         // Continue, but what actually stopped them is the watch.
@@ -603,6 +964,27 @@ internal sealed class DapServer
             ["description"] = dataHit?.Description,
             ["text"] = dataHit?.Description ?? frame.ExceptionMessage,
         });
+    }
+
+    /// <summary>
+    /// Takes ownership of announcing the current stop, or reports that someone already has.
+    /// </summary>
+    /// <remarks>
+    /// Both routes to a stop are legitimate — a command that resumed into it, and the engine
+    /// reporting it unprompted — and neither can be dropped: the first is the only one that fires
+    /// for a step, the second the only one that fires for a breakpoint hit in a running app.
+    /// Which of them gets there first is a scheduling race, so they are deduplicated by the
+    /// engine's stop number rather than by trying to order them. Left undeduplicated, a stop
+    /// reported twice put the editor back into the state it had just left, which is why a line
+    /// stayed highlighted after Continue.
+    /// </remarks>
+    private bool ClaimStop()
+    {
+        long sequence = _engine?.StopSequence ?? 0;
+        if (sequence == 0)
+            return true; // an engine that does not number its stops cannot report them twice
+
+        return Interlocked.Exchange(ref _reportedStop, sequence) != sequence;
     }
 
     // --- Wire format ---

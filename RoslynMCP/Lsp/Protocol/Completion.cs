@@ -102,6 +102,11 @@ public sealed record CodeAction(
     /// <summary>Server-defined resolve payload: id of the cached Roslyn action whose edit is
     /// computed lazily in codeAction/resolve.</summary>
     [JsonPropertyName("data")] public CodeActionData? Data { get; init; }
+
+    /// <summary>Runs after <see cref="Edit"/> is applied. Carries the part of the fix that is
+    /// too expensive to compute while merely listing actions, or that reaches a file the edit
+    /// cannot address.</summary>
+    [JsonPropertyName("command")] public Command? Command { get; init; }
 }
 
 public sealed record CodeActionData(

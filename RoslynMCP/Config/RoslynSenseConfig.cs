@@ -6,6 +6,7 @@ public sealed class RoslynSenseConfig
 {
     public ToolsConfig Tools { get; init; } = new();
     public DatabaseConfig Database { get; init; } = new();
+    public ResourcesConfig Resources { get; init; } = new();
     public string? TableFormat { get; init; }
     /// <summary>
     /// Paths to preload on startup (solution or project files).
@@ -30,6 +31,9 @@ public sealed class ToolsConfig
 {
     public bool WebForms { get; init; } = true;
     public bool Razor { get; init; } = true;
+    public bool Proto { get; init; } = true;
+    public bool Mediator { get; init; } = true;
+    public bool Resources { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;
     public bool Database { get; init; } = true;

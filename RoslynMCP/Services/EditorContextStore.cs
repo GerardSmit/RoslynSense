@@ -77,5 +77,5 @@ public static class EditorContextStore
 
     private static string FileFor(string solutionPath) =>
         Path.Combine(Path.GetTempPath(), "roslyn-sense", "editor-context",
-            HostPaths.Hash(Path.GetFullPath(solutionPath)) + ".json");
+            HostPaths.SolutionHash(Path.GetFullPath(solutionPath)) + ".json");
 }

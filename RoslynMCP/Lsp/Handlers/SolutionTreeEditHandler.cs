@@ -28,6 +28,19 @@ internal static class SolutionTreeEditHandler
                 "move" => await MoveAsync(p, ct),
                 "copy" => await CopyAsync(p, ct),
                 "addSolutionFolder" => AddSolutionFolder(p),
+                "renameSolutionFolder" => await RenameSolutionFolderAsync(p, ct),
+                "removeSolutionFolder" => await RemoveSolutionFolderAsync(p, ct),
+                "moveProject" => await MoveProjectAsync(p, ct),
+                "addSolutionItem" => await SolutionItemAsync(p, attach: true, ct),
+                "removeSolutionItem" => await SolutionItemAsync(p, attach: false, ct),
+                "addProjectReference" => await AddProjectReferenceAsync(p, ct),
+                "removeProjectReference" => await RemoveProjectReferenceAsync(p, ct),
+                "addProject" => await AddProjectAsync(p, ct),
+                "addExistingProject" => await AddExistingProjectAsync(p, ct),
+                "removeProject" => await RemoveProjectAsync(p, ct),
+                "includeExistingFile" => await IncludeExistingFileAsync(p, ct),
+                "excludeFile" => await ExcludeFileAsync(p, ct),
+                "addAssemblyReference" => await AddAssemblyReferenceAsync(p, ct),
                 _ => new SolutionTreeEditResult(false, $"Unknown action '{p.Action}'."),
             };
         }
@@ -131,6 +144,376 @@ internal static class SolutionTreeEditHandler
     }
 
     /// <summary>
+    /// References one project from another, from the Dependencies node.
+    /// </summary>
+    private static async Task<SolutionTreeEditResult> AddProjectReferenceAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.ProjectPath is not { Length: > 0 } project)
+            return new SolutionTreeEditResult(false, "Could not tell which project to add to.");
+        if (p.DestinationUri is null || LspConverters.UriToPath(p.DestinationUri) is not { } referenced)
+            return new SolutionTreeEditResult(false, "Could not tell which project to reference.");
+
+        var result = await ProjectMutationService.AddProjectReferenceAsync(project, referenced, ct);
+        if (result.Ok)
+            ProjectEvaluationService.Evict(project);
+
+        return new SolutionTreeEditResult(result.Ok, result.Message);
+    }
+
+    /// <summary>
+    /// Adds a .NET Framework assembly reference from the Dependencies node.
+    /// </summary>
+    private static async Task<SolutionTreeEditResult> AddAssemblyReferenceAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.ProjectPath is not { Length: > 0 } project)
+            return new SolutionTreeEditResult(false, "Could not tell which project to add to.");
+        if (p.Name is not { Length: > 0 } assembly)
+            return new SolutionTreeEditResult(false, "An assembly name is required.");
+
+        var result = await ProjectMutationService.AddAssemblyReferenceAsync(project, assembly, ct);
+        if (result.Ok)
+            ProjectEvaluationService.Evict(project);
+
+        return new SolutionTreeEditResult(result.Ok, result.Message);
+    }
+
+    /// <summary>
+    /// Creates a project from a <c>dotnet new</c> template and puts it in the solution — inside
+    /// a solution folder when that is where the command was invoked.
+    /// </summary>
+    /// <remarks>
+    /// <c>dotnet sln add</c> can place a project in a solution folder, but only by a path it
+    /// derives itself, so nesting is written here instead: the same two mechanisms the folder
+    /// itself uses, a <c>NestedProjects</c> entry for <c>.sln</c> and containment for
+    /// <c>.slnx</c>.
+    /// </remarks>
+    private static async Task<SolutionTreeEditResult> AddProjectAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.Name is not { Length: > 0 } name)
+            return new SolutionTreeEditResult(false, "A project name is required.");
+        if (p.Kind is not { Length: > 0 } template)
+            return new SolutionTreeEditResult(false, "A template is required.");
+        if (ResolveSolution(p.TargetUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to add to.");
+
+        // CreateProjectAsync appends the name itself, so this is the directory to create it in
+        // rather than the project's own.
+        string solutionDirectory = Path.GetDirectoryName(solutionPath)!;
+
+        // addToSolution: false because its own path picks the most recently loaded solution,
+        // which is not necessarily the one whose tree this came from.
+        var result = await ProjectMutationService.CreateProjectAsync(
+            template, name, solutionDirectory, p.TargetFramework, addToSolution: false, ct);
+        if (!result.Ok)
+            return new SolutionTreeEditResult(false, result.Message);
+
+        string projectDirectory = Path.Combine(solutionDirectory, name);
+        string? created = Directory.Exists(projectDirectory)
+            ? Directory.EnumerateFiles(projectDirectory, "*.*proj", SearchOption.TopDirectoryOnly)
+                .FirstOrDefault()
+            : null;
+
+        if (created is null)
+            return new SolutionTreeEditResult(false, $"{result.Message} No project file was produced.");
+
+        var added = await ProjectMutationService.AddProjectToSolutionAsync(created, solutionPath, ct);
+        if (!added.Ok)
+            return new SolutionTreeEditResult(false, $"{result.Message} {added.Message}");
+
+        // p.ProjectPath carries the solution folder to nest under, when there is one.
+        if (p.ProjectPath is { Length: > 0 } folderId)
+        {
+            try
+            {
+                SolutionFileWriter.MoveProject(solutionPath, created, folderId);
+            }
+            catch (Exception ex)
+            {
+                return new SolutionTreeEditResult(
+                    true, $"{result.Message} It could not be moved into the folder: {ex.Message}");
+            }
+        }
+
+        await WorkspaceService.EvictAllAsync(ct);
+
+        return new SolutionTreeEditResult(
+            true, $"{result.Message} {added.Message}", LspConverters.PathToUri(created));
+    }
+
+    /// <summary>
+    /// Adds a project that already exists on disk to the solution, optionally inside a folder.
+    /// </summary>
+    private static async Task<SolutionTreeEditResult> AddExistingProjectAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.DestinationUri is null || LspConverters.UriToPath(p.DestinationUri) is not { } project)
+            return new SolutionTreeEditResult(false, "Could not tell which project to add.");
+        if (!File.Exists(project))
+            return new SolutionTreeEditResult(false, $"{Path.GetFileName(project)} does not exist.");
+        if (ResolveSolution(p.TargetUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to add to.");
+
+        var added = await ProjectMutationService.AddProjectToSolutionAsync(project, solutionPath, ct);
+        if (!added.Ok)
+            return new SolutionTreeEditResult(false, added.Message);
+
+        if (p.ProjectPath is { Length: > 0 } folderId)
+        {
+            try
+            {
+                SolutionFileWriter.MoveProject(solutionPath, project, folderId);
+            }
+            catch (Exception ex)
+            {
+                return new SolutionTreeEditResult(
+                    true, $"{added.Message} It could not be moved into the folder: {ex.Message}");
+            }
+        }
+
+        await WorkspaceService.EvictAllAsync(ct);
+        return new SolutionTreeEditResult(true, added.Message, LspConverters.PathToUri(project));
+    }
+
+    /// <summary>
+    /// Takes a project out of the solution. The project and its files stay on disk — this is the
+    /// solution's list of members, not the files themselves.
+    /// </summary>
+    private static async Task<SolutionTreeEditResult> RemoveProjectAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (LspConverters.UriToPath(p.TargetUri ?? "") is not { } project)
+            return new SolutionTreeEditResult(false, "Could not tell which project to remove.");
+        if (ResolveSolution(p.DestinationUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to remove it from.");
+
+        var result = await ProjectMutationService.RemoveProjectFromSolutionAsync(
+            project, solutionPath, ct);
+        if (result.Ok)
+            await WorkspaceService.EvictAllAsync(ct);
+
+        return new SolutionTreeEditResult(result.Ok, result.Message);
+    }
+
+    /// <summary>
+    /// Moves a project between solution folders, or out to the solution root.
+    /// </summary>
+    /// <remarks>
+    /// Nothing on disk moves. A solution folder is a grouping written into the solution file, so
+    /// the project file stays where it is and only its parent link changes — which is also why
+    /// this cannot go through the drag-and-drop <c>move</c> action, whose whole job is to relocate
+    /// files.
+    /// </remarks>
+    private static async Task<SolutionTreeEditResult> MoveProjectAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (LspConverters.UriToPath(p.TargetUri ?? "") is not { } project)
+            return new SolutionTreeEditResult(false, "Could not tell which project to move.");
+        if (ResolveSolution(p.DestinationUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to edit.");
+
+        try
+        {
+            SolutionFileWriter.MoveProject(solutionPath, project, Folder(p.ProjectPath));
+        }
+        catch (Exception ex)
+        {
+            return new SolutionTreeEditResult(false, $"Could not move the project: {ex.Message}");
+        }
+
+        await WorkspaceService.EvictAllAsync(ct);
+
+        return new SolutionTreeEditResult(
+            true,
+            p.ProjectPath is { Length: > 0 }
+                ? $"Moved {Path.GetFileNameWithoutExtension(project)} into {p.Name ?? "the folder"}."
+                : $"Moved {Path.GetFileNameWithoutExtension(project)} to the solution root.");
+    }
+
+    /// <summary>Attaches or detaches a solution item — a file a solution folder carries.</summary>
+    private static async Task<SolutionTreeEditResult> SolutionItemAsync(
+        SolutionTreeEditParams p, bool attach, CancellationToken ct)
+    {
+        if (LspConverters.UriToPath(p.TargetUri ?? "") is not { } file)
+            return new SolutionTreeEditResult(false, "Could not tell which file.");
+        if (p.ProjectPath is not { Length: > 0 } folderId)
+            return new SolutionTreeEditResult(false, "Could not tell which solution folder.");
+        if (ResolveSolution(p.DestinationUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to edit.");
+        if (attach && Directory.Exists(file))
+            return new SolutionTreeEditResult(
+                false, "A solution folder can hold files, but not folders.");
+        if (attach && !File.Exists(file))
+            return new SolutionTreeEditResult(false, $"{Path.GetFileName(file)} does not exist.");
+
+        try
+        {
+            if (attach)
+                SolutionFileWriter.AddSolutionItem(solutionPath, folderId, file);
+            else
+                SolutionFileWriter.RemoveSolutionItem(solutionPath, folderId, file);
+        }
+        catch (Exception ex)
+        {
+            return new SolutionTreeEditResult(false, $"Could not edit the solution: {ex.Message}");
+        }
+
+        await WorkspaceService.EvictAllAsync(ct);
+
+        return new SolutionTreeEditResult(
+            true,
+            attach
+                ? $"Added {Path.GetFileName(file)} to the solution folder."
+                : $"Removed {Path.GetFileName(file)} from the solution folder.",
+            LspConverters.PathToUri(file));
+    }
+
+    private static async Task<SolutionTreeEditResult> RenameSolutionFolderAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.ProjectPath is not { Length: > 0 } folderId)
+            return new SolutionTreeEditResult(false, "Could not tell which solution folder.");
+        if (p.Name is not { Length: > 0 } name)
+            return new SolutionTreeEditResult(false, "A new name is required.");
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            return new SolutionTreeEditResult(false, $"'{name}' is not a valid folder name.");
+        if (ResolveSolution(p.TargetUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to edit.");
+
+        try
+        {
+            SolutionFileWriter.RenameFolder(solutionPath, folderId, name);
+        }
+        catch (Exception ex)
+        {
+            return new SolutionTreeEditResult(false, $"Could not rename the folder: {ex.Message}");
+        }
+
+        await WorkspaceService.EvictAllAsync(ct);
+        return new SolutionTreeEditResult(true, $"Renamed the folder to {name}.");
+    }
+
+    private static async Task<SolutionTreeEditResult> RemoveSolutionFolderAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.ProjectPath is not { Length: > 0 } folderId)
+            return new SolutionTreeEditResult(false, "Could not tell which solution folder.");
+        if (ResolveSolution(p.TargetUri) is not { } solutionPath)
+            return new SolutionTreeEditResult(false, "Could not tell which solution to edit.");
+
+        int detached;
+        try
+        {
+            detached = SolutionFileWriter.RemoveFolder(solutionPath, folderId);
+        }
+        catch (Exception ex)
+        {
+            return new SolutionTreeEditResult(false, $"Could not remove the folder: {ex.Message}");
+        }
+
+        await WorkspaceService.EvictAllAsync(ct);
+        return new SolutionTreeEditResult(
+            true,
+            detached == 0
+                ? "Removed the solution folder; what was inside it moved up a level."
+                : "Removed the solution folder; projects moved up a level and " +
+                  $"{(detached == 1 ? "1 solution item" : $"{detached} solution items")} " +
+                  "stopped being listed. The files are still on disk.");
+    }
+
+    /// <summary>Adds a file that is already on disk to the project that owns its directory.</summary>
+    private static async Task<SolutionTreeEditResult> IncludeExistingFileAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (LspConverters.UriToPath(p.TargetUri ?? "") is not { } file)
+            return new SolutionTreeEditResult(false, "Could not tell which file to add.");
+        if (!File.Exists(file))
+            return new SolutionTreeEditResult(false, $"{Path.GetFileName(file)} does not exist.");
+
+        string? project = p.ProjectPath ?? FindProject(file);
+        if (project is null)
+            return new SolutionTreeEditResult(false, "Could not tell which project the file belongs to.");
+
+        await ProjectMutationService.IncludeExistingFileAsync(project, file, ct);
+        ProjectEvaluationService.Evict(project);
+        await WorkspaceService.EvictAllAsync(ct);
+
+        return new SolutionTreeEditResult(
+            true, $"Added {Path.GetFileName(file)}.", LspConverters.PathToUri(file));
+    }
+
+    /// <summary>
+    /// Drops a file from its project without deleting it — Visual Studio's "Exclude From Project".
+    /// </summary>
+    private static async Task<SolutionTreeEditResult> ExcludeFileAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (LspConverters.UriToPath(p.TargetUri ?? "") is not { } file)
+            return new SolutionTreeEditResult(false, "Could not tell which file to exclude.");
+
+        string? project = p.ProjectPath ?? FindProject(file);
+        if (project is null)
+            return new SolutionTreeEditResult(false, "Could not tell which project the file belongs to.");
+
+        var result = await ProjectMutationService.ExcludeFileAsync(project, file, ct);
+        if (result.Ok)
+        {
+            ProjectEvaluationService.Evict(project);
+            await WorkspaceService.EvictAllAsync(ct);
+        }
+
+        return new SolutionTreeEditResult(result.Ok, result.Message);
+    }
+
+    /// <summary>Removes a project-to-project reference from the Dependencies node.</summary>
+    private static async Task<SolutionTreeEditResult> RemoveProjectReferenceAsync(
+        SolutionTreeEditParams p, CancellationToken ct)
+    {
+        if (p.ProjectPath is not { Length: > 0 } project)
+            return new SolutionTreeEditResult(false, "Could not tell which project to edit.");
+        if (p.DestinationUri is null || LspConverters.UriToPath(p.DestinationUri) is not { } referenced)
+            return new SolutionTreeEditResult(false, "Could not tell which reference to remove.");
+
+        var result = await ProjectMutationService.RemoveProjectReferenceAsync(project, referenced, ct);
+        if (result.Ok)
+        {
+            ProjectEvaluationService.Evict(project);
+            await WorkspaceService.EvictAllAsync(ct);
+        }
+
+        return new SolutionTreeEditResult(result.Ok, result.Message);
+    }
+
+    /// <summary>An empty folder id means the solution root, which the writer spells as null.</summary>
+    private static string? Folder(string? folderId) =>
+        folderId is { Length: > 0 } ? folderId : null;
+
+    /// <summary>
+    /// The solution to edit: the one the caller named, or the one that is open.
+    /// </summary>
+    /// <remarks>
+    /// The client should not have to know this at all — the server is what bound the solution in
+    /// the first place, and a tree node's id is only ever an echo of it. Trusting that echo made
+    /// "add solution folder" fail with "the solution file no longer exists" whenever the id and
+    /// the bound path disagreed, which the user cannot act on and cannot even see.
+    /// </remarks>
+    private static string? ResolveSolution(string? targetUri)
+    {
+        if (targetUri is { Length: > 0 } &&
+            LspConverters.UriToPath(targetUri) is { Length: > 0 } named &&
+            File.Exists(named))
+        {
+            return named;
+        }
+
+        return WorkspaceService.BoundSolutionPath is { Length: > 0 } bound && File.Exists(bound)
+            ? bound
+            : null;
+    }
+
+    /// <summary>
     /// Adds a solution folder — a grouping that exists in the solution file and not on disk.
     /// </summary>
     /// <remarks>
@@ -144,19 +527,19 @@ internal static class SolutionTreeEditHandler
     {
         if (p.Name is not { Length: > 0 } name)
             return new SolutionTreeEditResult(false, "A folder name is required.");
-        if (p.TargetUri is null || LspConverters.UriToPath(p.TargetUri) is not { } solutionPath)
-            return new SolutionTreeEditResult(false, "Could not tell which solution to add to.");
-        if (!File.Exists(solutionPath))
-            return new SolutionTreeEditResult(false, "The solution file no longer exists.");
+        if (ResolveSolution(p.TargetUri) is not { } solutionPath)
+        {
+            return new SolutionTreeEditResult(false,
+                p.TargetUri is { Length: > 0 } asked
+                    ? $"No solution file at '{LspConverters.UriToPath(asked)}', and none is open."
+                    : "Could not tell which solution to add to.");
+        }
         if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             return new SolutionTreeEditResult(false, $"'{name}' is not a valid folder name.");
 
         try
         {
-            if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
-                AddSlnxFolder(solutionPath, name, p.ProjectPath);
-            else
-                AddSlnFolder(solutionPath, name, p.ProjectPath);
+            SolutionFileWriter.AddFolder(solutionPath, name, Folder(p.ProjectPath));
         }
         catch (Exception ex)
         {
@@ -164,84 +547,6 @@ internal static class SolutionTreeEditHandler
         }
 
         return new SolutionTreeEditResult(true, $"Added solution folder {name}.");
-    }
-
-    private static void AddSlnxFolder(string solutionPath, string name, string? parentFolderId)
-    {
-        var document = System.Xml.Linq.XDocument.Load(solutionPath);
-        var root = document.Root
-            ?? throw new InvalidOperationException("The solution file has no root element.");
-
-        // parentFolderId is the "/Outer/Inner" id the tree hands back, which is also how the
-        // format spells nesting — so a nested folder is one element under the matching parent.
-        var parent = root;
-        if (parentFolderId is { Length: > 0 })
-        {
-            foreach (string segment in parentFolderId.Split('/', StringSplitOptions.RemoveEmptyEntries))
-            {
-                parent = parent.Elements()
-                    .FirstOrDefault(e =>
-                        e.Name.LocalName.Equals("Folder", StringComparison.OrdinalIgnoreCase)
-                        && (e.Attribute("Name")?.Value ?? "").Trim('/', '\\')
-                            .Equals(segment, StringComparison.OrdinalIgnoreCase))
-                    ?? throw new InvalidOperationException($"Could not find the folder '{segment}'.");
-            }
-        }
-
-        parent.Add(new System.Xml.Linq.XElement("Folder",
-            new System.Xml.Linq.XAttribute("Name", $"/{name}/")));
-        document.Save(solutionPath);
-    }
-
-    /// <summary>The project type GUID every solution folder carries.</summary>
-    private const string SolutionFolderTypeGuid = "{2150E333-8FDC-42A3-9474-1A3956D46DE8}";
-
-    private static void AddSlnFolder(string solutionPath, string name, string? parentFolderGuid)
-    {
-        var lines = File.ReadAllLines(solutionPath).ToList();
-        string guid = $"{{{Guid.NewGuid().ToString().ToUpperInvariant()}}}";
-
-        int insertAt = lines.FindLastIndex(l =>
-            l.StartsWith("EndProject", StringComparison.Ordinal));
-        insertAt = insertAt >= 0
-            ? insertAt + 1
-            : Math.Max(0, lines.FindIndex(l => l.StartsWith("Global", StringComparison.Ordinal)));
-
-        lines.Insert(insertAt,
-            $"Project(\"{SolutionFolderTypeGuid}\") = \"{name}\", \"{name}\", \"{guid}\"");
-        lines.Insert(insertAt + 1, "EndProject");
-
-        if (parentFolderGuid is { Length: > 0 })
-            NestUnder(lines, guid, parentFolderGuid);
-
-        File.WriteAllLines(solutionPath, lines);
-    }
-
-    /// <summary>
-    /// Records the parent link in <c>NestedProjects</c>, creating the section when the solution
-    /// has never had a nested item before.
-    /// </summary>
-    private static void NestUnder(List<string> lines, string childGuid, string parentGuid)
-    {
-        int section = lines.FindIndex(l =>
-            l.Trim().StartsWith("GlobalSection(NestedProjects)", StringComparison.Ordinal));
-
-        if (section >= 0)
-        {
-            lines.Insert(section + 1, $"\t\t{childGuid} = {parentGuid}");
-            return;
-        }
-
-        int endGlobal = lines.FindLastIndex(l => l.StartsWith("EndGlobal", StringComparison.Ordinal));
-        if (endGlobal < 0)
-            return;
-
-        lines.InsertRange(endGlobal,
-        [
-            "\tGlobalSection(NestedProjects) = preSolution",
-            $"\t\t{childGuid} = {parentGuid}",
-            "\tEndGlobalSection",
-        ]);
     }
 
     /// <summary>
@@ -341,7 +646,7 @@ internal static class SolutionTreeEditHandler
         string? project = FindProject(destination);
         if (project is not null)
         {
-            RewriteItem(project, source, destination);
+            await ProjectMutationService.RenameFileItemAsync(source, destination, ct);
             ProjectEvaluationService.Evict(project);
         }
         await WorkspaceService.EvictAllAsync(ct);
@@ -362,29 +667,6 @@ internal static class SolutionTreeEditHandler
 
         return new SolutionTreeEditResult(
             true, message + ".", LspConverters.PathToUri(destination), edit);
-    }
-
-    /// <summary>Points an explicit project item at the file's new path.</summary>
-    private static void RewriteItem(string projectPath, string oldPath, string newPath)
-    {
-        try
-        {
-            string text = File.ReadAllText(projectPath);
-            string directory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
-            string oldInclude = Path.GetRelativePath(directory, oldPath);
-            string newInclude = Path.GetRelativePath(directory, newPath);
-
-            if (!text.Contains(oldInclude, StringComparison.OrdinalIgnoreCase))
-                return;
-
-            File.WriteAllText(projectPath, text.Replace(oldInclude, newInclude, StringComparison.OrdinalIgnoreCase));
-        }
-        catch (Exception ex)
-        {
-            ServiceLog.Warn(
-                $"Could not update the item path in '{Path.GetFileName(projectPath)}': {ex.Message}",
-                key: $"item-rewrite:{projectPath}");
-        }
     }
 
     private static string? DirectoryOf(string? uri)

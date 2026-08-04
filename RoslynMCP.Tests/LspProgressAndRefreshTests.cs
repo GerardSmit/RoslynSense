@@ -13,6 +13,13 @@ namespace RoslynMCP.Tests;
 
 /// <summary>Server-initiated traffic: $/progress for long operations, and the refresh nudges
 /// that keep derived client data (diagnostics, lenses, hints) from going stale.</summary>
+/// <remarks>
+/// Serialized because <see cref="ProgressReporter.Factory"/> and the session registry are
+/// process-wide: progress is broadcast to every attached session, so any other test that opens a
+/// progress scope — a package audit, a bulk update — lands in this session's stream and is
+/// indistinguishable from the one under test.
+/// </remarks>
+[Collection(SharedState.Name)]
 public class LspProgressAndRefreshTests
 {
     [Fact]

@@ -1,0 +1,135 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "launchSettings.json",
+  "description": "How a .NET project is launched: profiles for the dotnet CLI, IIS Express and arbitrary executables.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "iisSettings": {
+      "type": "object",
+      "description": "Settings for the IIS and IIS Express hosts.",
+      "properties": {
+        "windowsAuthentication": {
+          "type": "boolean",
+          "default": false
+        },
+        "anonymousAuthentication": {
+          "type": "boolean",
+          "default": true
+        },
+        "iisExpress": {
+          "type": "object",
+          "properties": {
+            "applicationUrl": {
+              "type": "string",
+              "format": "uri",
+              "description": "The URL IIS Express binds to."
+            },
+            "sslPort": {
+              "type": "integer",
+              "description": "The HTTPS port. 0 disables HTTPS."
+            }
+          }
+        },
+        "iis": {
+          "type": "object",
+          "properties": {
+            "applicationUrl": {
+              "type": "string",
+              "format": "uri"
+            },
+            "sslPort": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "description": "The launch profiles, keyed by name. The first 'Project' profile is the default.",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "commandName"
+        ],
+        "properties": {
+          "commandName": {
+            "type": "string",
+            "description": "What to launch. 'Project' runs the project's own output.",
+            "enum": [
+              "Project",
+              "IISExpress",
+              "IIS",
+              "Executable",
+              "SPAProxy",
+              "DebugRoslynComponent"
+            ],
+            "default": "Project"
+          },
+          "applicationUrl": {
+            "type": "string",
+            "description": "Semicolon-separated URLs the app binds to. Sets ASPNETCORE_URLS. Pin this to keep the same port across runs."
+          },
+          "commandLineArgs": {
+            "type": "string",
+            "description": "Arguments passed to the app, as a single command line."
+          },
+          "executablePath": {
+            "type": "string",
+            "description": "The program to run, for a commandName of 'Executable'. Relative paths are resolved against the project directory."
+          },
+          "workingDirectory": {
+            "type": "string",
+            "description": "Working directory for the launched process. Defaults to the output directory."
+          },
+          "launchBrowser": {
+            "type": "boolean",
+            "description": "Open a browser once the app is listening.",
+            "default": false
+          },
+          "launchUrl": {
+            "type": "string",
+            "description": "Where to point that browser: a path under applicationUrl, or an absolute URL."
+          },
+          "environmentVariables": {
+            "type": "object",
+            "description": "Environment variables set for the launched process.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "useSSL": {
+            "type": "boolean",
+            "default": false
+          },
+          "hotReloadEnabled": {
+            "type": "boolean",
+            "description": "Whether to start the app so edits can be applied without a restart.",
+            "default": true
+          },
+          "dotnetRunMessages": {
+            "type": "boolean"
+          },
+          "nativeDebugging": {
+            "type": "boolean"
+          },
+          "sqlDebugging": {
+            "type": "boolean"
+          },
+          "targetProject": {
+            "type": "string",
+            "description": "The consuming project, for a 'DebugRoslynComponent' profile."
+          },
+          "inspectUri": {
+            "type": "string",
+            "description": "Blazor WebAssembly debugging proxy URI template."
+          }
+        }
+      }
+    }
+  }
+}

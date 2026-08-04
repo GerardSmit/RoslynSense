@@ -193,6 +193,233 @@ public class DapServerTests
     }
 
     [Fact]
+    public async Task EngineDiagnosticsReachTheDebugConsole()
+    {
+        // The engine has always said why a breakpoint cannot bind; nothing forwarded it, so the
+        // Debug Console stayed empty and the only symptom was a breakpoint that never hit.
+        var backend = new NoticeBackend();
+        backend.OnAttach = () => backend.Raise(new DebugNotice(
+            DebugNoticeKind.Diagnostic,
+            "no symbols for WebFormsApp.dll — source breakpoints in it cannot bind"));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "output"));
+
+        var body = messages.Single(m => m["event"]?.GetValue<string>() == "output")["body"]!;
+
+        Assert.Equal("console", body["category"]!.GetValue<string>());
+        Assert.Contains("no symbols", body["output"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task TheDebuggeesOwnOutputIsNotLabelledAsTheAdaptersOwn()
+    {
+        var backend = new NoticeBackend();
+        backend.OnAttach = () => backend.Raise(new DebugNotice(DebugNoticeKind.Output, "hello"));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "output"));
+
+        var body = messages.Single(m => m["event"]?.GetValue<string>() == "output")["body"]!;
+
+        Assert.Equal("stdout", body["category"]!.GetValue<string>());
+        Assert.Equal("hello\n", body["output"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task ABreakpointTheEngineHasNotBoundIsReportedAsPending()
+    {
+        // Accepting a breakpoint is not binding one: its module may not have loaded, or may have
+        // shipped without a PDB. Reporting acceptance as verification drew a solid red dot on a
+        // breakpoint that could never fire.
+        var messages = await ConverseUntilAsync(
+            new NoticeBackend(),
+            [
+                Request(1, "configurationDone"),
+                Request(2, "setBreakpoints", new JsonObject
+                {
+                    ["source"] = new JsonObject { ["path"] = @"C:\src\Default.aspx.cs" },
+                    ["breakpoints"] = new JsonArray { new JsonObject { ["line"] = 42 } },
+                }),
+            ],
+            m => m.Any(x => x["command"]?.GetValue<string>() == "setBreakpoints"));
+
+        var answered = messages
+            .Single(m => m["command"]?.GetValue<string>() == "setBreakpoints")["body"]!["breakpoints"]!
+            .AsArray()[0]!;
+
+        Assert.False(answered["verified"]!.GetValue<bool>());
+        Assert.Equal(42, answered["line"]!.GetValue<int>());
+        Assert.Contains("module", answered["message"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task BindingTellsTheClientWhereTheBreakpointActuallyLanded()
+    {
+        var backend = new NoticeBackend();
+        backend.OnSetBreakpoint = () => backend.Raise(new DebugNotice(
+            DebugNoticeKind.BreakpointBound, "bound at line 45 in WebFormsApp.dll",
+            @"C:\src\Default.aspx.cs", 45, 1));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [
+                Request(1, "configurationDone"),
+                Request(2, "setBreakpoints", new JsonObject
+                {
+                    ["source"] = new JsonObject { ["path"] = @"C:\src\Default.aspx.cs" },
+                    ["breakpoints"] = new JsonArray { new JsonObject { ["line"] = 42 } },
+                }),
+            ],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "breakpoint"));
+
+        var bound = messages
+            .Single(m => m["event"]?.GetValue<string>() == "breakpoint")["body"]!["breakpoint"]!;
+
+        Assert.Equal(1, bound["id"]!.GetValue<int>());
+        Assert.True(bound["verified"]!.GetValue<bool>());
+        // Bound to the nearest sequence point, which is not always the line that was asked for.
+        Assert.Equal(45, bound["line"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task EditingABreakpointsConditionDoesNotDestroyIt()
+    {
+        // The engine keys breakpoints by file and line. Setting the replacement before removing
+        // the original meant the replacement could not bind, and removing the original then took
+        // the replacement with it — leaving the line with no breakpoint and nothing pending.
+        var backend = new NoticeBackend();
+        var source = new JsonObject { ["path"] = @"C:\src\Order.cs" };
+
+        await ConverseUntilAsync(
+            backend,
+            [
+                Request(1, "configurationDone"),
+                Request(2, "setBreakpoints", new JsonObject
+                {
+                    ["source"] = source.DeepClone(),
+                    ["breakpoints"] = new JsonArray { new JsonObject { ["line"] = 42 } },
+                }),
+                Request(3, "setBreakpoints", new JsonObject
+                {
+                    ["source"] = source.DeepClone(),
+                    ["breakpoints"] = new JsonArray
+                    {
+                        new JsonObject { ["line"] = 42, ["condition"] = "total > 10" },
+                    },
+                }),
+            ],
+            m => m.Count(x => x["command"]?.GetValue<string>() == "setBreakpoints") == 2);
+
+        Assert.Equal("total > 10", backend.LastCondition);
+        // The old one goes before the new one is set, so the engine is never asked to hold two
+        // breakpoints on one line.
+        Assert.Equal([42, 0, 42], backend.BreakpointCalls);
+    }
+
+    [Fact]
+    public async Task AStopNobodyAskedForIsStillReported()
+    {
+        // The case F5 on a web app is made of: nothing is outstanding, a request comes in and hits
+        // a breakpoint. The adapter only ever reported stops that ended a resume it had issued, so
+        // the site hung suspended and the editor showed no stop at all.
+        var backend = new NoticeBackend
+        {
+            Frame = new DebuggerService.StoppedFrame(
+                "breakpoint", "Default.Page_Load", @"C:\src\Default.aspx.cs", 45, 1),
+        };
+        backend.OnAttach = () => backend.Raise(new DebugNotice(
+            DebugNoticeKind.Stopped, "breakpoint", @"C:\src\Default.aspx.cs", 45));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "stopped"));
+
+        var stopped = messages.Single(m => m["event"]?.GetValue<string>() == "stopped")["body"]!;
+
+        Assert.Equal("breakpoint", stopped["reason"]!.GetValue<string>());
+        Assert.True(stopped["allThreadsStopped"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task AStopIsAnnouncedOnceThoughBothRoutesReportIt()
+    {
+        var backend = new NoticeBackend
+        {
+            Frame = new DebuggerService.StoppedFrame(
+                "breakpoint", "Cart.Total", @"C:\src\Default.aspx.cs", 17, 1),
+        };
+        // One stop, two reporters: the engine announces it, and the resume it ended returns and
+        // announces it too. Sent twice, the editor re-entered the state it had just left — which
+        // left the stopped line highlighted after Continue.
+        backend.OnContinue = () => backend.Raise(new DebugNotice(
+            DebugNoticeKind.Stopped, "breakpoint", @"C:\src\Default.aspx.cs", 17));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "continue")],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "stopped"));
+
+        Assert.Equal(1, messages.Count(m => m["event"]?.GetValue<string>() == "stopped"));
+    }
+
+    [Fact]
+    public async Task ARunningTargetThatNeverStopsAgainKeepsItsSession()
+    {
+        // Continuing a web request that hits nothing else is the ordinary case: the resume gives
+        // up waiting and there is no frame. Reading that as an exit ended the session a minute
+        // after every such Continue.
+        var backend = new NoticeBackend { Frame = null };
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "continue")],
+            m => m.Any(x => x["command"]?.GetValue<string>() == "continue"));
+
+        Assert.DoesNotContain(messages, m => m["event"]?.GetValue<string>() == "terminated");
+    }
+
+    [Fact]
+    public async Task ADebuggeeThatEndsOnItsOwnEndsTheSession()
+    {
+        var backend = new NoticeBackend();
+        backend.OnAttach = () => backend.Raise(new DebugNotice(DebugNoticeKind.Exited, ""));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "terminated"));
+
+        Assert.Contains(messages, m => m["event"]?.GetValue<string>() == "exited");
+    }
+
+    [Fact]
+    public async Task AnEngineThatReportsNoBindsStillVerifiesWhatItAccepted()
+    {
+        // netcoredbg answers binding itself; leaving its breakpoints unverified would draw every
+        // one of them as pending for the whole session.
+        var messages = await ConverseAsync(new FakeBackend(), [
+            Request(1, "configurationDone"),
+            Request(2, "setBreakpoints", new JsonObject
+            {
+                ["source"] = new JsonObject { ["path"] = @"C:\src\Order.cs" },
+                ["breakpoints"] = new JsonArray { new JsonObject { ["line"] = 42 } },
+            }),
+        ]);
+
+        var answered = messages
+            .Single(m => m["command"]?.GetValue<string>() == "setBreakpoints")["body"]!["breakpoints"]!
+            .AsArray()[0]!;
+
+        Assert.True(answered["verified"]!.GetValue<bool>());
+    }
+
+    [Fact]
     public async Task AnUnknownRequestFailsByNameRatherThanSilently()
     {
         var responses = await ConverseAsync(new FakeBackend(), [Request(1, "reverseTime")]);
@@ -232,16 +459,7 @@ public class DapServerTests
     private static async Task<List<JsonNode>> ConverseAsync(
         IDebugBackend backend, IEnumerable<JsonObject> requests)
     {
-        var input = new MemoryStream();
-        foreach (var request in requests)
-        {
-            byte[] payload = Encoding.UTF8.GetBytes(request.ToJsonString());
-            byte[] header = Encoding.ASCII.GetBytes($"Content-Length: {payload.Length}\r\n\r\n");
-            input.Write(header);
-            input.Write(payload);
-        }
-        input.Position = 0;
-
+        var input = new MemoryStream(Frame(requests));
         var output = new MemoryStream();
         var server = new DapServer(backend, input, output);
 
@@ -256,29 +474,159 @@ public class DapServerTests
         return Parse(output.ToArray());
     }
 
+    /// <summary>
+    /// Feeds requests and holds the transport open until the adapter has sent what the test is
+    /// waiting for.
+    /// </summary>
+    /// <remarks>
+    /// Engine notices arrive on their own schedule rather than as a response, so a harness that
+    /// closes the input as soon as the last request is read races them and observes nothing.
+    /// </remarks>
+    private static async Task<List<JsonNode>> ConverseUntilAsync(
+        IDebugBackend backend, IEnumerable<JsonObject> requests, Func<List<JsonNode>, bool> until)
+    {
+        var input = new HeldStream(Frame(requests));
+        var output = new CollectingStream();
+        var server = new DapServer(backend, input, output);
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var listening = server.ListenAsync(timeout.Token);
+
+        while (!until(Parse(output.Snapshot())))
+        {
+            if (timeout.IsCancellationRequested)
+                throw new TimeoutException("the adapter never sent what the test was waiting for");
+            await Task.Delay(20, CancellationToken.None);
+        }
+
+        // Settle before snapshotting: a test asserting that something was sent once has to give a
+        // duplicate the chance to arrive, or it passes by reading too early.
+        await Task.Delay(150, CancellationToken.None);
+
+        input.Release();
+        await listening;
+        return Parse(output.Snapshot());
+    }
+
+    private static byte[] Frame(IEnumerable<JsonObject> requests)
+    {
+        var stream = new MemoryStream();
+        foreach (var request in requests)
+        {
+            byte[] payload = Encoding.UTF8.GetBytes(request.ToJsonString());
+            stream.Write(Encoding.ASCII.GetBytes($"Content-Length: {payload.Length}\r\n\r\n"));
+            stream.Write(payload);
+        }
+        return stream.ToArray();
+    }
+
+    /// <summary>
+    /// Reads framed messages out of the raw byte stream.
+    /// </summary>
+    /// <remarks>
+    /// Byte offsets rather than string ones: Content-Length counts bytes, so a single non-ASCII
+    /// character anywhere in a message desynchronises a reader that slices a decoded string. A
+    /// message that is only half written is left for the next read.
+    /// </remarks>
     private static List<JsonNode> Parse(byte[] raw)
     {
         var messages = new List<JsonNode>();
-        string text = Encoding.UTF8.GetString(raw);
         int index = 0;
 
-        while (true)
+        while (index < raw.Length)
         {
-            int headerEnd = text.IndexOf("\r\n\r\n", index, StringComparison.Ordinal);
+            int headerEnd = HeaderEnd(raw, index);
             if (headerEnd < 0)
                 break;
 
-            string header = text[index..headerEnd];
+            string header = Encoding.ASCII.GetString(raw, index, headerEnd - index);
             int length = int.Parse(header["Content-Length:".Length..].Trim());
             int bodyStart = headerEnd + 4;
+            if (bodyStart + length > raw.Length)
+                break;
 
-            messages.Add(JsonNode.Parse(text[bodyStart..(bodyStart + length)])!);
+            messages.Add(JsonNode.Parse(Encoding.UTF8.GetString(raw, bodyStart, length))!);
             index = bodyStart + length;
         }
         return messages;
     }
 
-    private sealed class FakeBackend : IDebugBackend
+    private static int HeaderEnd(byte[] raw, int from)
+    {
+        for (int i = from; i + 3 < raw.Length; i++)
+        {
+            if (raw[i] == '\r' && raw[i + 1] == '\n' && raw[i + 2] == '\r' && raw[i + 3] == '\n')
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Replays a fixed script, then blocks instead of reporting end-of-stream until the
+    /// test lets go.</summary>
+    private sealed class HeldStream : Stream
+    {
+        private readonly byte[] _data;
+        private readonly ManualResetEventSlim _released = new();
+        private int _position;
+
+        public HeldStream(byte[] data) => _data = data;
+
+        public void Release() => _released.Set();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_position < _data.Length)
+            {
+                int taken = Math.Min(count, _data.Length - _position);
+                Array.Copy(_data, _position, buffer, offset, taken);
+                _position += taken;
+                return taken;
+            }
+
+            _released.Wait();
+            return 0;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => _data.Length;
+        public override long Position { get => _position; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>Collects what the adapter writes while the test reads it from another thread.</summary>
+    private sealed class CollectingStream : Stream
+    {
+        private readonly List<byte> _written = [];
+
+        public byte[] Snapshot()
+        {
+            lock (_written)
+                return [.. _written];
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            lock (_written)
+                _written.AddRange(buffer.AsSpan(offset, count).ToArray());
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length { get { lock (_written) return _written.Count; } }
+        public override long Position { get => Length; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+
+    private class FakeBackend : IDebugBackend
     {
         public DebuggerService.StoppedFrame? Frame;
         public IReadOnlyList<StackFrameInfo> Frames = [];
@@ -286,7 +634,16 @@ public class DapServerTests
         public int LastChildReference = -1;
         public string? LastHitCondition;
         public string? LastLogMessage;
+        public string? LastCondition;
         public bool Stopped;
+
+        /// <summary>Every breakpoint call in order, as the line set or 0 for a removal.</summary>
+        public readonly List<int> BreakpointCalls = [];
+
+        /// <summary>Hooks for driving what the engine would report while the call is in flight.</summary>
+        public Action? OnAttach;
+        public Action? OnSetBreakpoint;
+        public Action? OnContinue;
 
         public DebuggerService.StoppedFrame? CurrentFrame => Frame;
 
@@ -296,7 +653,11 @@ public class DapServerTests
 
         public Task<string> AttachToProcessAsync(int pid,
             IEnumerable<(string file, int line)>? initialBreakpoints = null,
-            CancellationToken cancellationToken = default) => Task.FromResult("attached");
+            CancellationToken cancellationToken = default)
+        {
+            OnAttach?.Invoke();
+            return Task.FromResult("attached");
+        }
 
         public Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
             string filePath, int line, string? condition = null, string? hitCondition = null,
@@ -304,14 +665,25 @@ public class DapServerTests
         {
             LastHitCondition = hitCondition;
             LastLogMessage = logMessage;
+            LastCondition = condition;
+            lock (BreakpointCalls)
+                BreakpointCalls.Add(line);
+            OnSetBreakpoint?.Invoke();
             return Task.FromResult(("set", (int?)1));
         }
 
-        public Task<string> RemoveBreakpointAsync(int breakpointId, CancellationToken cancellationToken = default) =>
-            Task.FromResult("removed");
+        public Task<string> RemoveBreakpointAsync(int breakpointId, CancellationToken cancellationToken = default)
+        {
+            lock (BreakpointCalls)
+                BreakpointCalls.Add(0);
+            return Task.FromResult("removed");
+        }
 
-        public Task<string> ContinueAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult("continued");
+        public Task<string> ContinueAsync(CancellationToken cancellationToken = default)
+        {
+            OnContinue?.Invoke();
+            return Task.FromResult("continued");
+        }
         public Task<string> StepInAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult("stepped");
         public Task<string> StepOverAsync(CancellationToken cancellationToken = default) =>
@@ -386,5 +758,22 @@ public class DapServerTests
         }
 
         public void Dispose() { }
+    }
+
+    /// <summary>A backend that reports what happens between stops, as the ICorDebug engine does.</summary>
+    private sealed class NoticeBackend : FakeBackend, IDebugNoticeSource
+    {
+        private long _stops;
+
+        public event Action<DebugNotice>? Notice;
+
+        public long StopSequence => Interlocked.Read(ref _stops);
+
+        public void Raise(DebugNotice notice)
+        {
+            if (notice.Kind == DebugNoticeKind.Stopped)
+                Interlocked.Increment(ref _stops);
+            Notice?.Invoke(notice);
+        }
     }
 }

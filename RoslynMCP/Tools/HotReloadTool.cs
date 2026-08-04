@@ -39,6 +39,7 @@ public static class HotReloadTool
                 return $"Error: Could not find a .csproj for '{projectPath}'.";
 
             var session = HotReloadService.Get(resolved);
+            bool openedNow = session is null;
             if (session is null)
             {
                 var (started, message) = await HotReloadService.StartAsync(resolved, cancellationToken);
@@ -48,6 +49,22 @@ public static class HotReloadTool
             }
 
             var outcome = await session.ApplyAsync(cancellationToken);
+
+            // A session opened by this very call took the already-edited source as its baseline,
+            // so "no changes" is not a clean bill of health — it may mean the edit was swallowed
+            // into the baseline. Saying so beats a silent success that applied nothing.
+            if (openedNow && outcome.Ok && outcome.AppliedTo.Count == 0)
+            {
+                outcome = outcome with
+                {
+                    Summary = outcome.Summary +
+                        " Note: the hot reload session was opened by this call, so its baseline " +
+                        "is the source as it is now — an edit made before this call cannot be " +
+                        "detected. If the running app predates your edit, restart it with " +
+                        "RunProject (hotReload=true) and edit again.",
+                };
+            }
+
             return Describe(outcome, fmt);
         }
         catch (Exception ex)

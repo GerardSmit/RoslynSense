@@ -5,8 +5,7 @@ using RoslynMCP.Services.Database;
 using RoslynMCP.Services.Designers;
 using RoslynMCP.Services.Run;
 using RoslynMCP.Tools;
-using RoslynMCP.Tools.Razor;
-using RoslynMCP.Tools.WebForms;
+using RoslynMCP.Languages;
 
 namespace RoslynMCP.Daemon;
 
@@ -39,24 +38,20 @@ internal static class ToolHostServices
         services.AddSingleton<IDesignerGenerator, DbmlDesignerGenerator>();
 
         if (settings.WebForms)
-        {
             services.AddSingleton<IDesignerGenerator, AspxDesignerGenerator>();
-            services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
-            services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
-            services.AddSingleton<IOutlineHandler, AspxOutline>();
-            services.AddSingleton<IRenameHandler, AspxRename>();
-            services.AddSingleton<IDiagnosticsHandler, AspxDiagnostics>();
-        }
 
-        if (settings.Razor)
-        {
-            services.AddSingleton<IGoToDefinitionHandler, RazorGoToDefinition>();
-            services.AddSingleton<IOutlineHandler, RazorOutline>();
-            services.AddSingleton<IRenameHandler, RazorRename>();
-            services.AddSingleton<IDiagnosticsHandler, RazorDiagnostics>();
-        }
+        services.AddLanguagePacks(settings);
 
-        return services.BuildServiceProvider();
+        var provider = services.BuildServiceProvider();
+
+        // Resolved here rather than left to the first caller that wants it. LanguageRegistry
+        // publishes itself as it is constructed, and the only other thing that asks the container
+        // for one is the LSP server's initialize — so a daemon serving nothing but MCP tools would
+        // leave LanguageRegistry.Current empty, and every static that reads it would answer as
+        // though no pack were registered at all.
+        provider.GetRequiredService<LanguageRegistry>();
+
+        return provider;
     }
 
     private static IReadOnlyList<IDbProvider> ResolveDbProviders(EffectiveSettings settings, string workingDir)

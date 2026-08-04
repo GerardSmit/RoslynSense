@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.CodeAnalysis;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Languages;
 
 namespace RoslynMCP.Tools;
 

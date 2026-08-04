@@ -1,3 +1,4 @@
+using RoslynMCP.Languages.Resources;
 using RoslynMCP.Services.Database;
 
 namespace RoslynMCP.Config;
@@ -5,6 +6,8 @@ namespace RoslynMCP.Config;
 public sealed record EffectiveSettings(
     bool WebForms,
     bool Razor,
+    bool Proto,
+    bool Mediator,
     bool Debugger,
     bool Profiling,
     bool Database,
@@ -16,6 +19,16 @@ public sealed record EffectiveSettings(
     int HostIdleMinutes,
     int MaxWorkspaces)
 {
+    /// <summary>
+    /// The resources pack's gate and its resolved lookup set.
+    /// </summary>
+    /// <remarks>
+    /// An init-only property rather than one more positional parameter: the record already carries
+    /// thirteen, and the single construction site would have to grow another argument for a value
+    /// every other caller of this type ignores.
+    /// </remarks>
+    internal ResourceSettings Resources { get; init; } = ResourceSettings.Disabled;
+
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
         warnings = new List<string>();
@@ -40,6 +53,10 @@ public sealed record EffectiveSettings(
 
         bool webForms = !HasFlag("--no-webforms") && tools.WebForms;
         bool razor = !HasFlag("--no-razor") && tools.Razor;
+        bool proto = !HasFlag("--no-proto") && tools.Proto;
+        bool mediator = !HasFlag("--no-mediator") && tools.Mediator;
+        var resources = ResourceSettings.Resolve(
+            !HasFlag("--no-resources") && tools.Resources, config?.Resources, warnings);
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -89,9 +106,12 @@ public sealed record EffectiveSettings(
         IReadOnlyList<string>? preload = HasFlag("--no-preload") ? [] : config?.Preload;
 
         return new EffectiveSettings(
-            webForms, razor, debugger, profiling, database,
+            webForms, razor, proto, mediator, debugger, profiling, database,
             autoDiscover, tableFormat, explicitProviders,
-            preload, sharedHost, hostIdleMinutes, maxWorkspaces);
+            preload, sharedHost, hostIdleMinutes, maxWorkspaces)
+        {
+            Resources = resources,
+        };
     }
 
     public bool ShouldRunAutoDiscovery()

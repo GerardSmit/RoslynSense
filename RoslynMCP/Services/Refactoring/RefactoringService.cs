@@ -103,8 +103,8 @@ internal static class RefactoringService
                     : "The signature could not be changed.");
         }
 
-        return Describe(document.Project.Solution, result.UpdatedSolution,
-            $"Changed the signature of {succeeded.Symbol.Name}.");
+        return await DescribeAsync(document.Project.Solution, result.UpdatedSolution,
+            $"Changed the signature of {succeeded.Symbol.Name}.", cancellationToken);
     }
 
     /// <summary>
@@ -130,7 +130,8 @@ internal static class RefactoringService
                 "There is no type to move at that position, or it is already alone in its file.");
         }
 
-        return Describe(document.Project.Solution, updated, "Moved the type into its own file.");
+        return await DescribeAsync(
+            document.Project.Solution, updated, "Moved the type into its own file.", cancellationToken);
     }
 
     /// <summary>
@@ -141,32 +142,57 @@ internal static class RefactoringService
     /// sites across the solution, and a caller that cannot see where has to diff the working tree
     /// to find out what just happened.
     /// </remarks>
-    private static RefactoringResult Describe(Solution before, Solution after, string message)
+    private static async Task<RefactoringResult> DescribeAsync(
+        Solution before, Solution after, string message, CancellationToken cancellationToken)
     {
         var changed = new List<string>();
+
+        // Rebased onto the workspace's live solution rather than applied wholesale: `after` was
+        // computed against a snapshot that overlays every open editor buffer, and TryApplyChanges
+        // persists whatever differs from CurrentSolution — handing it `after` directly would flush
+        // every unsaved buffer to disk as an unreported side effect of the refactoring.
+        var target = after.Workspace.CurrentSolution;
 
         foreach (var projectChange in after.GetChanges(before).GetProjectChanges())
         {
             foreach (var id in projectChange.GetChangedDocuments())
             {
-                if (after.GetDocument(id)?.FilePath is { Length: > 0 } path)
+                if (after.GetDocument(id) is not { } document)
+                    continue;
+
+                if (document.FilePath is { Length: > 0 } path)
                     changed.Add(path);
+
+                if (target.ContainsDocument(id))
+                    target = target.WithDocumentText(id, await document.GetTextAsync(cancellationToken));
             }
 
             foreach (var id in projectChange.GetAddedDocuments())
             {
-                if (after.GetDocument(id)?.FilePath is { Length: > 0 } path)
+                if (after.GetDocument(id) is not { } document)
+                    continue;
+
+                if (document.FilePath is { Length: > 0 } path)
                     changed.Add($"{path} (new)");
+
+                var text = await document.GetTextAsync(cancellationToken);
+                target = target.AddDocument(DocumentInfo.Create(
+                    id, document.Name, document.Folders, SourceCodeKind.Regular,
+                    TextLoader.From(TextAndVersion.Create(text, VersionStamp.Create())),
+                    document.FilePath));
             }
 
             foreach (var id in projectChange.GetRemovedDocuments())
             {
                 if (before.GetDocument(id)?.FilePath is { Length: > 0 } path)
                     changed.Add($"{path} (removed)");
+
+                if (target.ContainsDocument(id))
+                    target = target.RemoveDocument(id);
             }
         }
 
-        if (!after.Workspace.TryApplyChanges(after))
+        if (!after.Workspace.TryApplyChanges(target))
             return RefactoringResult.Failed("The workspace refused the edit; nothing was changed.");
 
         return new RefactoringResult(true, message, changed);

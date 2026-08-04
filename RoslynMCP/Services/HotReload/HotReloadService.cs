@@ -64,6 +64,24 @@ internal sealed class HotReloadService
     /// <summary>Per-document file stamps, so an apply re-reads only what actually changed.</summary>
     private readonly Dictionary<DocumentId, (DateTime Written, long Length)> _stamps = [];
 
+    /// <summary>
+    /// Every text this session has read from disk, keyed by document.
+    /// </summary>
+    /// <remarks>
+    /// The workspace snapshot never learns about these edits, but the committed EnC baseline
+    /// does. Re-applying only what changed since the last apply would hand Roslyn the stale
+    /// snapshot text for everything applied earlier — which diffs against the committed baseline
+    /// as the user's edit being <em>reverted</em>, and emits a delta undoing it. So every apply
+    /// overlays the full set, and the stamps only decide what to re-read.
+    /// </remarks>
+    private readonly Dictionary<DocumentId, SourceText> _texts = [];
+
+    /// <summary>One apply at a time: the EnC service commits state per emit, and the stamp and
+    /// text tables are plain dictionaries.</summary>
+    private readonly SemaphoreSlim _applyGate = new(1, 1);
+
+    private static readonly SemaphoreSlim s_startGate = new(1, 1);
+
     private HotReloadService(UnitTestingHotReloadService encService, string projectPath)
     {
         _encService = encService;
@@ -88,30 +106,40 @@ internal sealed class HotReloadService
     public static async Task<(HotReloadService? Session, string Message)> StartAsync(
         string projectPath, CancellationToken cancellationToken = default)
     {
-        if (s_sessions.TryGetValue(projectPath, out var existing))
-            return (existing, "A hot reload session is already open for this project.");
-
-        var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, cancellationToken: cancellationToken);
-
-        if (project.OutputFilePath is not { Length: > 0 } output || !File.Exists(output))
+        // Serialised: two concurrent starts would each open a Roslyn EnC session, and the
+        // loser's would be overwritten in the table without ever being ended.
+        await s_startGate.WaitAsync(cancellationToken);
+        try
         {
-            return (null,
-                "The project has not been built, so there is no baseline to diff against. " +
-                "Build it and start again.");
+            if (s_sessions.TryGetValue(projectPath, out var existing))
+                return (existing, "A hot reload session is already open for this project.");
+
+            var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
+                projectPath, cancellationToken: cancellationToken);
+
+            if (project.OutputFilePath is not { Length: > 0 } output || !File.Exists(output))
+            {
+                return (null,
+                    "The project has not been built, so there is no baseline to diff against. " +
+                    "Build it and start again.");
+            }
+
+            var capabilities = ResolveCapabilities(project);
+
+            var service = new UnitTestingHotReloadService(workspace.Services);
+            await service.StartSessionAsync(
+                project.Solution, [.. capabilities], cancellationToken);
+
+            var session = new HotReloadService(service, projectPath);
+            session.RecordStamps(project.Solution);
+            s_sessions[projectPath] = session;
+
+            return (session, $"Hot reload session open with {capabilities.Count} runtime capabilities.");
         }
-
-        var capabilities = ResolveCapabilities(project);
-
-        var service = new UnitTestingHotReloadService(workspace.Services);
-        await service.StartSessionAsync(
-            project.Solution, [.. capabilities], cancellationToken);
-
-        var session = new HotReloadService(service, projectPath);
-        session.RecordStamps(project.Solution);
-        s_sessions[projectPath] = session;
-
-        return (session, $"Hot reload session open with {capabilities.Count} runtime capabilities.");
+        finally
+        {
+            s_startGate.Release();
+        }
     }
 
     /// <summary>
@@ -124,6 +152,19 @@ internal sealed class HotReloadService
     /// the whole accumulated change.
     /// </remarks>
     public async Task<HotReloadOutcome> ApplyAsync(CancellationToken cancellationToken = default)
+    {
+        await _applyGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await ApplyLockedAsync(cancellationToken);
+        }
+        finally
+        {
+            _applyGate.Release();
+        }
+    }
+
+    private async Task<HotReloadOutcome> ApplyLockedAsync(CancellationToken cancellationToken)
     {
         var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
             _projectPath, cancellationToken: cancellationToken);
@@ -238,8 +279,13 @@ internal sealed class HotReloadService
         {
             if (ok)
                 applied.Add($"{assemblyName} (debuggee)");
-            else if (!error.Contains("is not loaded", StringComparison.OrdinalIgnoreCase))
+            else if (!error.Contains("is not loaded", StringComparison.OrdinalIgnoreCase) &&
+                     !error.Contains("does not debug .NET Framework", StringComparison.OrdinalIgnoreCase))
+            {
+                // A CoreCLR session refusing a Framework-only route is a skip, not a failure:
+                // the fan-out reaches every published session, related to this edit or not.
                 errors.Add($"{assemblyName}: {error}");
+            }
         }
     }
 
@@ -261,23 +307,24 @@ internal sealed class HotReloadService
     /// </summary>
     private static IReadOnlyList<string> ResolveCapabilities(Project project)
     {
+        // The runtime is classified before any agent is asked: the agent server is process-wide,
+        // so an agent from an unrelated CoreCLR app must never decide what the desktop runtime
+        // accepts — a delta computed with CoreCLR capabilities is the documented way to crash
+        // ICorDebug's ApplyChanges rather than get an error from it.
+        if (project.FilePath is { Length: > 0 } path)
+        {
+            try
+            {
+                if (ProjectClassifier.Classify(path).DebugRuntime == DebugRuntime.NetFramework)
+                    return FrameworkCapabilities;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
         var fromAgents = HotReloadAgentServer.Instance.Capabilities();
-        if (fromAgents.Count > 0)
-            return fromAgents;
-
-        if (project.FilePath is not { Length: > 0 } path)
-            return DefaultCapabilities;
-
-        try
-        {
-            return ProjectClassifier.Classify(path).DebugRuntime == DebugRuntime.NetFramework
-                ? FrameworkCapabilities
-                : DefaultCapabilities;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return DefaultCapabilities;
-        }
+        return fromAgents.Count > 0 ? fromAgents : DefaultCapabilities;
     }
 
     /// <summary>Maps every built output in the solution to the simple assembly name ICorDebug
@@ -317,16 +364,18 @@ internal sealed class HotReloadService
                 if (document.FilePath is not { Length: > 0 } path || OpenDocumentStore.IsOpen(path))
                     continue;
 
-                if (Stamp(path) is not { } stamp)
-                    continue;
+                if (Stamp(path) is { } stamp &&
+                    (!_stamps.TryGetValue(document.Id, out var known) || known != stamp) &&
+                    Read(path) is { } text)
+                {
+                    _stamps[document.Id] = stamp;
+                    _texts[document.Id] = text;
+                }
 
-                if (_stamps.TryGetValue(document.Id, out var known) && known == stamp)
-                    continue;
-
-                _stamps[document.Id] = stamp;
-
-                if (Read(path) is { } text)
-                    solution = solution.WithDocumentText(document.Id, text);
+                // The full overlay, not just this round's re-reads: earlier applies are in the
+                // committed baseline but not in the workspace snapshot this fork starts from.
+                if (_texts.TryGetValue(document.Id, out var current))
+                    solution = solution.WithDocumentText(document.Id, current);
             }
         }
 

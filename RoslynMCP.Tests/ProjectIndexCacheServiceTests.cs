@@ -1,7 +1,9 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using RoslynMCP.Services;
+using RoslynMCP.Tools;
 using Xunit;
+using RoslynMCP.Languages.WebForms.Core;
 
 namespace RoslynMCP.Tests;
 
@@ -60,67 +62,64 @@ public class ProjectIndexCacheServiceTests
         Assert.Contains(".ashx", extensions);
     }
 
+    // --- Markup reference search ------------------------------------------------------------
+    //
+    // These replace the AspxSourceMappingService.FindSymbolReferences tests. That search matched
+    // the symbol's name as a substring of every expression and code block in the index, so it
+    // asserted things that were only ever true by accident: that "DateTime" is a reference
+    // because the word appears, that "return" has references at all. The MCP tools now go
+    // through the same bound search the editor uses, so what is asserted is what is actually a
+    // reference.
+
     [Fact]
-    public void WhenSymbolExistsInMultipleAspxFilesThenFindSymbolReferencesReturnsAll()
+    public async Task WhenSymbolIsUsedInInlineCodeThenOnlyRealMentionsAreReferences()
     {
-        // "DateTime" appears in Default.aspx (expression) and Site.master (expression)
-        var index = BuildTestIndex();
-        var refs = AspxSourceMappingService.FindSymbolReferences(index, "DateTime");
+        var document = await AspxDocumentService.GetAsync(FixturePaths.EventWiringAspxFile, default);
+        var total = document!.CodeBehind!.GetMembers("Total").Single();
 
-        Assert.True(refs.Count >= 2,
-            $"Expected DateTime refs in >= 2 locations, found {refs.Count}");
+        var references = await AspxReferenceService.FindAsync(total, document.Project, default);
 
-        var filesWithRefs = refs.Select(r => Path.GetFileName(r.FilePath)).Distinct().ToList();
-        Assert.Contains("Default.aspx", filesWithRefs);
-        Assert.Contains("Site.master", filesWithRefs);
+        var inPage = references
+            .Where(r => string.Equals(r.FilePath, FixturePaths.EventWiringAspxFile, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        // The call in <script runat="server"> and the one in <%= %>. The page also writes the
+        // word in a comment and in a string literal; the substring search counted both.
+        Assert.Equal(2, inPage.Count);
+        Assert.All(inPage, r => Assert.Equal("Total", r.Text.ToString(r.Span)));
     }
 
     [Fact]
-    public void WhenSymbolAppearsInCodeBlockThenFindSymbolReferencesReportsCodeBlock()
+    public async Task WhenSymbolIsNotMentionedThenNoReferencesAreFound()
     {
-        // "IsPostBack" appears in Default.aspx code block and HeaderControl.ascx code block
-        var index = BuildTestIndex();
-        var refs = AspxSourceMappingService.FindSymbolReferences(index, "IsPostBack");
+        var document = await AspxDocumentService.GetAsync(FixturePaths.EventWiringAspxFile, default);
+        var handler = document!.CodeBehind!.GetMembers("Existing_Click").Single();
 
-        Assert.True(refs.Count >= 2,
-            $"Expected IsPostBack refs in >= 2 locations, found {refs.Count}");
-        Assert.Contains(refs, r => r.LocationType == AspxCodeLocationType.CodeBlock);
+        var references = await AspxReferenceService.FindAsync(handler, document.Project, default);
+
+        // The OnClick attribute that names it, and nothing in Default.aspx or Site.master, which
+        // never mention it.
+        Assert.NotEmpty(references);
+        Assert.All(references, r =>
+            Assert.Equal(
+                Path.GetFileName(FixturePaths.EventWiringAspxFile),
+                Path.GetFileName(r.FilePath)));
     }
 
     [Fact]
-    public void WhenSymbolNotPresentThenFindSymbolReferencesReturnsEmpty()
+    public async Task WhenFindingUsagesOfAMarkupCalledMethodThenCommentsAndStringsAreNotReported()
     {
-        var index = BuildTestIndex();
-        var refs = AspxSourceMappingService.FindSymbolReferences(index, "XyzNonExistentSymbol12345");
+        var result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.EventWiringCodeBehindFile,
+            markupSnippet: "protected int [|Total|]() => 42;",
+            fmt: new MarkdownFormatter());
 
-        Assert.Empty(refs);
-    }
+        Assert.Contains("ASPX References", result);
+        Assert.Contains("2 reference(s) in ASPX/ASCX files", result);
 
-    [Fact]
-    public void WhenSymbolInExpressionThenFindSymbolReferencesReportsExpression()
-    {
-        var compilation = CreateMinimalCompilation();
-        var text = File.ReadAllText(FixturePaths.DefaultAspxFile);
-        var result = AspxSourceMappingService.Parse(FixturePaths.DefaultAspxFile, text, compilation);
-        var index = new AspxProjectIndex([result]);
-
-        var refs = AspxSourceMappingService.FindSymbolReferences(index, "DateTime");
-
-        Assert.NotEmpty(refs);
-        Assert.Contains(refs, r => r.LocationType == AspxCodeLocationType.Expression);
-        Assert.All(refs, r => Assert.Equal(FixturePaths.DefaultAspxFile, r.FilePath));
-    }
-
-    [Fact]
-    public void WhenCodeSnippetIsLongThenFindSymbolReferencesTruncatesSnippet()
-    {
-        // "return" appears in code blocks in DataService.asmx
-        var index = BuildTestIndex();
-        var refs = AspxSourceMappingService.FindSymbolReferences(index, "return");
-
-        Assert.NotEmpty(refs);
-        // All code snippets should be non-empty
-        Assert.All(refs, r => Assert.False(string.IsNullOrWhiteSpace(r.CodeSnippet)));
+        // The two lines the old substring search also reported. Their absence is the fix.
+        Assert.DoesNotContain("only mentioned here", result);
+        Assert.DoesNotContain("string note", result);
     }
 
     [Fact]

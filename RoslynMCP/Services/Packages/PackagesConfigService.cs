@@ -61,7 +61,8 @@ public static class PackagesConfigService
     }
 
     public static async Task<PackageOperationResult> InstallAsync(
-        string projectPath, string id, string? version, CancellationToken ct)
+        string projectPath, string id, string? version, CancellationToken ct,
+        PackageMutationScope? scope = null)
     {
         string? configPath = PathFor(projectPath);
         if (configPath is null)
@@ -93,15 +94,15 @@ public static class PackagesConfigService
         WriteReferences(projectPath, packagesRoot, folderName, assemblies);
         WriteConfigEntry(configPath, id, resolved.ToString(), targetFramework);
 
-        ProjectModel.ProjectEvaluationService.Evict(projectPath);
-        await WorkspaceService.EvictAllAsync(ct);
+        await TouchAsync(projectPath, scope, ct);
 
         return new PackageOperationResult(true,
             $"Installed {id} {resolved} into {Path.GetFileNameWithoutExtension(projectPath)}.");
     }
 
     public static async Task<PackageOperationResult> UninstallAsync(
-        string projectPath, string id, CancellationToken ct)
+        string projectPath, string id, CancellationToken ct,
+        PackageMutationScope? scope = null)
     {
         string? configPath = PathFor(projectPath);
         if (configPath is null)
@@ -115,13 +116,28 @@ public static class PackagesConfigService
         RemoveReferences(projectPath, $"{entry.Id}.{entry.Version}");
         RemoveConfigEntry(configPath, id);
 
-        ProjectModel.ProjectEvaluationService.Evict(projectPath);
-        await WorkspaceService.EvictAllAsync(ct);
+        await TouchAsync(projectPath, scope, ct);
 
         // The extracted package stays in the packages folder: other projects in the solution may
         // still reference it, and NuGet's own uninstall leaves it too.
         return new PackageOperationResult(true,
             $"Removed {id} from {Path.GetFileNameWithoutExtension(projectPath)}.");
+    }
+
+    /// <summary>
+    /// Records the change against the caller's batch when there is one. A bulk operation must not
+    /// reload the workspace once per package.
+    /// </summary>
+    private static async Task TouchAsync(string projectPath, PackageMutationScope? scope, CancellationToken ct)
+    {
+        if (scope is not null)
+        {
+            scope.Touch(projectPath);
+            return;
+        }
+
+        ProjectModel.ProjectEvaluationService.Evict(projectPath);
+        await WorkspaceService.EvictAllAsync(ct);
     }
 
     /// <summary>The solution-level <c>packages</c> folder every packages.config project shares.</summary>
@@ -141,8 +157,8 @@ public static class PackagesConfigService
         if (version is { Length: > 0 } && NuGetVersion.TryParse(version, out var parsed))
             return parsed;
 
-        var versions = await NuGetService.VersionsAsync(id, includePrerelease: false, ct);
-        return versions.Count > 0 && NuGetVersion.TryParse(versions[0], out var latest) ? latest : null;
+        var versions = await NuGetService.AllVersionsAsync(id, includePrerelease: false, refresh: false, ct);
+        return versions.Results.FirstOrDefault();
     }
 
     /// <returns><c>null</c> on success, or the reason it failed.</returns>
@@ -151,13 +167,14 @@ public static class PackagesConfigService
     {
         try
         {
-            var resource = await NuGetService.FindPackageResourceAsync(ct);
+            var resource = await NuGetService.FindPackageResourceAsync(id, ct);
             if (resource is null)
                 return "No NuGet feed is configured.";
 
+            using var cache = NuGetFeedContext.RentCache();
             using var stream = new MemoryStream();
             bool found = await resource.CopyNupkgToStreamAsync(
-                id, version, stream, NuGetService.Cache, NullLogger.Instance, ct);
+                id, version, stream, cache, NullLogger.Instance, ct);
 
             if (!found)
                 return $"{id} {version} was not found on the configured feeds.";
@@ -175,8 +192,13 @@ public static class PackagesConfigService
                     Path.Combine(packageDirectory, zipEntry.FullName.Replace('/', Path.DirectorySeparatorChar)));
 
                 // A crafted .nupkg can name an entry that climbs out of the extraction directory.
-                if (!destination.StartsWith(packageDirectory, StringComparison.OrdinalIgnoreCase))
+                // The separator matters: without it "packages\Foo.1.0" also prefixes
+                // "packages\Foo.1.0.evil", so a sibling directory would pass the check.
+                if (!destination.StartsWith(
+                        packageDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                {
                     continue;
+                }
 
                 Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
                 zipEntry.ExtractToFile(destination, overwrite: true);

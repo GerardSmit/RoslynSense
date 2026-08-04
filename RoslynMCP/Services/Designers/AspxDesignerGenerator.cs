@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.CodeAnalysis;
 using WebFormsCore.Nodes;
+using RoslynMCP.Languages.WebForms.Core;
 
 namespace RoslynMCP.Services.Designers;
 

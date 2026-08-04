@@ -1,12 +1,21 @@
 using Microsoft.CodeAnalysis;
+using RoslynMCP.Languages.Proto.Core;
+using RoslynMCP.Languages.Resources.Core;
+using RoslynMCP.Languages.WebForms.Core;
 
 namespace RoslynMCP.Services;
 
 /// <summary>
-/// Caches ASPX project indexes and Razor source maps per-project.
+/// Caches ASPX project indexes, Razor source maps, proto import graphs and resource catalogs
+/// per-project.
 /// Uses <see cref="FileSystemWatcher"/> to automatically invalidate
 /// the cache when relevant files change on disk.
 /// </summary>
+/// <remarks>
+/// This watcher is the MCP front end's only freshness mechanism — it has no editor sending
+/// <c>didChangeWatchedFiles</c> — so anything the LSP path invalidates has to be invalidated here
+/// too, or the tools answer from a snapshot the editor has already moved past.
+/// </remarks>
 internal static class ProjectIndexCacheService
 {
     private static readonly SemaphoreSlim s_lock = new(1, 1);
@@ -30,6 +39,8 @@ internal static class ProjectIndexCacheService
         [".aspx", ".ascx", ".asmx", ".asax", ".ashx", ".master"];
     private static readonly string[] s_razorExtensions =
         [".razor", ".cshtml"];
+    private static readonly string[] s_protoExtensions =
+        [".proto"];
 
     /// <summary>
     /// Disposes all cached entries (including their FileSystemWatchers).
@@ -170,6 +181,45 @@ internal static class ProjectIndexCacheService
     }
 
     /// <summary>
+    /// Returns a cached or freshly-built proto import graph — which <c>.proto</c> in the project
+    /// imports which, in both directions.
+    /// </summary>
+    /// <remarks>
+    /// The one thing the proto engine does not memoize for itself, and the reason it is worth a
+    /// third index kind here. <c>ProtoDocumentService</c> keys each parse on the file's checksum
+    /// and <c>ProtoGeneratedIndex</c> keys the bindings on the compilation plus the protos'
+    /// timestamps, so both notice a change without being told; the graph is assembled from every
+    /// file in the project on each call and nothing underneath it is a cache miss, so a caller
+    /// asking twice pays the whole walk twice. The watcher is what says when to walk again.
+    /// </remarks>
+    public static async Task<ProtoImportGraph> GetProtoImportGraphAsync(
+        Project project, CancellationToken cancellationToken = default)
+    {
+        var entry = await GetOrCreateEntryAsync(project, cancellationToken);
+
+        if (entry.ProtoImportGraph is { } cached && !entry.ProtoDirty)
+            return cached;
+
+        int genBefore;
+        await s_lock.WaitAsync(cancellationToken);
+        try { genBefore = entry.ProtoGeneration; }
+        finally { s_lock.Release(); }
+
+        var graph = await ProtoWorkspace.ImportGraphAsync(project, cancellationToken);
+
+        await s_lock.WaitAsync(cancellationToken);
+        try
+        {
+            entry.ProtoImportGraph = graph;
+            if (entry.ProtoGeneration == genBefore)
+                entry.ProtoDirty = false;
+        }
+        finally { s_lock.Release(); }
+
+        return graph;
+    }
+
+    /// <summary>
     /// Returns a cached or freshly-discovered list of wrapper methods that delegate
     /// a string parameter to <c>FindControl</c> (e.g. <c>SetText(control, id, value)</c>).
     /// The result is cached per-project and invalidated whenever a <c>.cs</c> file changes.
@@ -202,6 +252,47 @@ internal static class ProjectIndexCacheService
     }
 
     /// <summary>
+    /// Returns a cached or freshly-grouped resource catalog.
+    /// </summary>
+    /// <remarks>
+    /// The catalog itself lives in <see cref="ResourceCatalogService"/>, which the watcher
+    /// invalidates directly; what is cached here is the reference this project last saw, so a
+    /// caller that never edits a <c>.resx</c> pays nothing. Both flags matter: a layout change
+    /// replaces the catalog object, and a content change leaves it in place but drops the key
+    /// tables every family in it was handing out.
+    /// </remarks>
+    public static async Task<ResourceCatalog> GetResourceCatalogAsync(
+        Project project, ResourceDiscoveryOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var entry = await GetOrCreateEntryAsync(project, cancellationToken);
+
+        if (entry.Resources is { } cached && !entry.ResourceLayoutDirty && !entry.ResourceContentDirty)
+            return cached;
+
+        int genBefore;
+        await s_lock.WaitAsync(cancellationToken);
+        try { genBefore = entry.ResourceGeneration; }
+        finally { s_lock.Release(); }
+
+        var catalog = ResourceCatalogService.Get(project, options);
+
+        await s_lock.WaitAsync(cancellationToken);
+        try
+        {
+            entry.Resources = catalog;
+            if (entry.ResourceGeneration == genBefore)
+            {
+                entry.ResourceLayoutDirty = false;
+                entry.ResourceContentDirty = false;
+            }
+        }
+        finally { s_lock.Release(); }
+
+        return catalog;
+    }
+
+    /// <summary>
     /// Explicitly invalidates all cached data for a project.
     /// </summary>
     public static void InvalidateProject(string projectPath)
@@ -214,7 +305,10 @@ internal static class ProjectIndexCacheService
             {
                 entry.AspxDirty = true;
                 entry.RazorDirty = true;
+                entry.ProtoDirty = true;
                 entry.WrappersDirty = true;
+                entry.ResourceContentDirty = true;
+                entry.ResourceLayoutDirty = true;
             }
         }
         finally
@@ -263,13 +357,16 @@ internal static class ProjectIndexCacheService
                 EnableRaisingEvents = true
             };
 
-            watcher.Changed += (_, e) => OnFileChanged(entry, e.FullPath);
-            watcher.Created += (_, e) => OnFileChanged(entry, e.FullPath);
-            watcher.Deleted += (_, e) => OnFileChanged(entry, e.FullPath);
+            // The event kind is kept rather than collapsed: a resource family's membership is a
+            // function of the file names in a directory, so a create or a delete has to regroup
+            // where a write only has to re-read.
+            watcher.Changed += (_, e) => OnFileChanged(entry, e.FullPath, movedFiles: false);
+            watcher.Created += (_, e) => OnFileChanged(entry, e.FullPath, movedFiles: true);
+            watcher.Deleted += (_, e) => OnFileChanged(entry, e.FullPath, movedFiles: true);
             watcher.Renamed += (_, e) =>
             {
-                OnFileChanged(entry, e.OldFullPath);
-                OnFileChanged(entry, e.FullPath);
+                OnFileChanged(entry, e.OldFullPath, movedFiles: true);
+                OnFileChanged(entry, e.FullPath, movedFiles: true);
             };
 
             entry.Watcher = watcher;
@@ -280,7 +377,7 @@ internal static class ProjectIndexCacheService
         }
     }
 
-    private static void OnFileChanged(CachedProjectEntry entry, string filePath)
+    private static void OnFileChanged(CachedProjectEntry entry, string filePath, bool movedFiles)
     {
         var ext = Path.GetExtension(filePath);
         var fileName = Path.GetFileName(filePath);
@@ -304,7 +401,9 @@ internal static class ProjectIndexCacheService
 
         bool isAspx = s_aspxExtensions.Any(e => ext.Equals(e, StringComparison.OrdinalIgnoreCase));
         bool isRazor = s_razorExtensions.Any(e => ext.Equals(e, StringComparison.OrdinalIgnoreCase));
+        bool isProto = s_protoExtensions.Any(e => ext.Equals(e, StringComparison.OrdinalIgnoreCase));
         bool isCSharp = ext.Equals(".cs", StringComparison.OrdinalIgnoreCase);
+        bool isResx = ext.Equals(".resx", StringComparison.OrdinalIgnoreCase);
 
         if (isAspx || isCSharp)
         {
@@ -318,10 +417,41 @@ internal static class ProjectIndexCacheService
             Interlocked.Increment(ref entry.RazorGeneration);
         }
 
+        // The project file counts here and nowhere else: the graph spans the protos the project
+        // compiles, and `Protobuf` items are what say which those are. No .cs, though — generated
+        // code changing says nothing about an `import` line, and it lands under obj/ anyway.
+        if (isProto || ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            entry.ProtoDirty = true;
+            Interlocked.Increment(ref entry.ProtoGeneration);
+        }
+
+        // Pushed straight through rather than deferred, the way the resource catalog below is: the
+        // parse cache is a process-wide static shared with the LSP handlers, and it keys an entry
+        // on the text's checksum — which re-reads a rewritten file by itself, but leaves the entry
+        // for a file that is now gone sitting there until the process ends.
+        if (isProto && movedFiles)
+            ProtoDocumentService.Invalidate(filePath);
+
         if (isCSharp)
         {
             entry.WrappersDirty = true;
             Interlocked.Increment(ref entry.WrappersGeneration);
+        }
+
+        if (isResx)
+        {
+            entry.ResourceContentDirty = true;
+            entry.ResourceLayoutDirty |= movedFiles;
+            Interlocked.Increment(ref entry.ResourceGeneration);
+
+            // Pushed straight through rather than deferred to the next read: the catalog behind
+            // this entry is a process-wide static shared with the LSP handlers, and both
+            // operations are dictionary removals.
+            if (movedFiles)
+                ResourceCatalogService.InvalidateLayout(filePath);
+            else
+                ResourceCatalogService.InvalidateContent(filePath);
         }
     }
 
@@ -329,13 +459,26 @@ internal static class ProjectIndexCacheService
     {
         public AspxProjectIndex? AspxIndex { get; set; }
         public RazorSourceMap? RazorSourceMap { get; set; }
+        public ProtoImportGraph? ProtoImportGraph { get; set; }
         public IReadOnlyList<(string MethodName, int ParamIndex, bool IsExtension)>? FindControlWrappers { get; set; }
+        public ResourceCatalog? Resources { get; set; }
         public volatile bool AspxDirty = true;
         public volatile bool RazorDirty = true;
+        public volatile bool ProtoDirty = true;
         public volatile bool WrappersDirty = true;
+
+        /// <summary>A <c>.resx</c> was written. The families keep their members and lose their key
+        /// tables.</summary>
+        public volatile bool ResourceContentDirty = true;
+
+        /// <summary>A <c>.resx</c> was created, deleted or renamed, so which families exist — and
+        /// which files each one holds — has to be worked out again from the names on disk.</summary>
+        public volatile bool ResourceLayoutDirty = true;
         public int AspxGeneration;
         public int RazorGeneration;
+        public int ProtoGeneration;
         public int WrappersGeneration;
+        public int ResourceGeneration;
         public DateTime LastAccessedUtc { get; set; } = DateTime.UtcNow;
         public FileSystemWatcher? Watcher { get; set; }
 

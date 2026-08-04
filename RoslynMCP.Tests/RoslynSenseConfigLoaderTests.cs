@@ -212,6 +212,8 @@ public class RoslynSenseConfigLoaderTests : IDisposable
         var settings = EffectiveSettings.Resolve(Array.Empty<string>(), null, out var w);
         Assert.True(settings.WebForms);
         Assert.True(settings.Razor);
+        Assert.True(settings.Proto);
+        Assert.True(settings.Mediator);
         Assert.True(settings.Debugger);
         Assert.True(settings.Profiling);
         Assert.True(settings.Database);
@@ -227,6 +229,22 @@ public class RoslynSenseConfigLoaderTests : IDisposable
         var cfg = new RoslynSenseConfig { Tools = new ToolsConfig { Debugger = true } };
         var settings = EffectiveSettings.Resolve(new[] { "--no-debugger" }, cfg, out _);
         Assert.False(settings.Debugger);
+    }
+
+    [Fact]
+    public void EffectiveSettings_MediatorOffFromEitherSwitch()
+    {
+        // Both gates have to reach it: the config is what turns a pack off for a whole solution,
+        // and the flag is what turns it off for one invocation.
+        Assert.False(EffectiveSettings.Resolve(new[] { "--no-mediator" }, null, out _).Mediator);
+
+        var cfg = new RoslynSenseConfig { Tools = new ToolsConfig { Mediator = false } };
+        Assert.False(EffectiveSettings.Resolve(Array.Empty<string>(), cfg, out _).Mediator);
+
+        // And one flag is one language.
+        var settings = EffectiveSettings.Resolve(new[] { "--no-mediator" }, null, out _);
+        Assert.True(settings.WebForms);
+        Assert.True(settings.Proto);
     }
 
     [Fact]

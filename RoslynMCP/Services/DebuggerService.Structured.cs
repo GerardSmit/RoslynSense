@@ -267,16 +267,18 @@ internal sealed partial class DebuggerService
         var modules = new List<ModuleInfo>();
         foreach (string entry in SplitMiTuples(response))
         {
-            string path = ExtractMiField(entry, "target-name");
-            if (path.Length == 0)
+            // An absent field reads as null, not as an empty string — a module with no symbols
+            // simply has no symbols-path.
+            if (ExtractMiField(entry, "target-name") is not { Length: > 0 } path)
                 continue;
 
             // netcoredbg reports symbol state as "Yes"/"No" in symbols-loaded.
             bool symbols = ExtractMiField(entry, "symbols-loaded")
-                .StartsWith("y", StringComparison.OrdinalIgnoreCase);
+                ?.StartsWith("y", StringComparison.OrdinalIgnoreCase) ?? false;
 
             modules.Add(new ModuleInfo(
-                Path.GetFileName(path), path, symbols, ExtractMiField(entry, "symbols-path"), "CoreCLR"));
+                Path.GetFileName(path), path, symbols,
+                ExtractMiField(entry, "symbols-path") ?? "", "CoreCLR"));
         }
 
         return modules;

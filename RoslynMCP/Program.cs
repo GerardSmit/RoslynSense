@@ -10,8 +10,7 @@ using RoslynMCP.Services.Database;
 using RoslynMCP.Services.Designers;
 using RoslynMCP.Services.Run;
 using RoslynMCP.Tools;
-using RoslynMCP.Tools.Razor;
-using RoslynMCP.Tools.WebForms;
+using RoslynMCP.Languages;
 
 [ExcludeFromCodeCoverage]
 class Program
@@ -132,22 +131,9 @@ class Program
 
         // Register non-C# file type handlers conditionally
         if (settings.WebForms)
-        {
             builder.Services.AddSingleton<IDesignerGenerator, AspxDesignerGenerator>();
-            builder.Services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
-            builder.Services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
-            builder.Services.AddSingleton<IOutlineHandler, AspxOutline>();
-            builder.Services.AddSingleton<IRenameHandler, AspxRename>();
-            builder.Services.AddSingleton<IDiagnosticsHandler, AspxDiagnostics>();
-        }
 
-        if (settings.Razor)
-        {
-            builder.Services.AddSingleton<IGoToDefinitionHandler, RazorGoToDefinition>();
-            builder.Services.AddSingleton<IOutlineHandler, RazorOutline>();
-            builder.Services.AddSingleton<IRenameHandler, RazorRename>();
-            builder.Services.AddSingleton<IDiagnosticsHandler, RazorDiagnostics>();
-        }
+        builder.Services.AddLanguagePacks(settings);
 
         var toolTypes = typeof(Program).Assembly
             .GetTypes()

@@ -24,15 +24,23 @@ internal static class SignatureHelpHandler
         if (resolved is not var (document, _, offset))
             return null;
 
+        return await SignatureHelpAsync(document, offset, p.Context, ct);
+    }
+
+    /// <summary>The signature-help pass over an arbitrary document and offset. Markup files go
+    /// through here with the document and offset of their C# projection.</summary>
+    public static async Task<LspSignatureHelp?> SignatureHelpAsync(
+        Document document, int offset, SignatureHelpContext? triggerContext, CancellationToken ct)
+    {
         var service = GetService(document.Project.Solution.Workspace);
         if (service is null)
             return null;
 
         document = document.WithFrozenPartialSemantics(ct);
 
-        var triggerInfo = p.Context is { TriggerKind: 2, TriggerCharacter.Length: > 0 } context
+        var triggerInfo = triggerContext is { TriggerKind: 2, TriggerCharacter.Length: > 0 } typed
             ? new SignatureHelpTriggerInfo(
-                SignatureHelpTriggerReason.TypeCharCommand, context.TriggerCharacter[0])
+                SignatureHelpTriggerReason.TypeCharCommand, typed.TriggerCharacter[0])
             : new SignatureHelpTriggerInfo(SignatureHelpTriggerReason.InvokeSignatureHelpCommand);
 
         var (_, items) = await service.GetSignatureHelpAsync(document, offset, triggerInfo, ct);

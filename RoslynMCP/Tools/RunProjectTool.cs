@@ -191,10 +191,15 @@ public static class RunProjectTool
         sb.AppendLine($"- **Runtime**: {(session.DebugRuntime == DebugRuntime.NetFramework ? ".NET Framework" : "CoreCLR")}");
         if (hotReload)
         {
+            // IsRunning rather than the request flag: the launcher may not have found the agent,
+            // and claiming an apply path that is not there sends the user debugging their edit.
             sb.AppendLine(session.DebugRuntime == DebugRuntime.NetFramework
                 ? "- **Hot reload**: unavailable — .NET Framework applies edits through a debug " +
                   "session, so use DebugAttach and then ApplyHotReload"
-                : "- **Hot reload**: enabled — use ApplyHotReload after editing");
+                : Services.HotReload.HotReloadService.IsRunning(session.ProjectPath)
+                    ? "- **Hot reload**: enabled — use ApplyHotReload after editing"
+                    : "- **Hot reload**: requested, but no session opened — the hot reload agent " +
+                      "was not found beside the tool");
         }
         sb.AppendLine();
 

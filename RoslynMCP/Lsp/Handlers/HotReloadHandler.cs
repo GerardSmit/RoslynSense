@@ -31,6 +31,7 @@ internal static class HotReloadHandler
         // Applying without a session would diff against nothing and report the whole project as
         // changed, so the first apply opens one rather than refusing.
         var session = HotReloadService.Get(project);
+        bool openedNow = session is null;
         if (session is null)
         {
             var (started, message) = await HotReloadService.StartAsync(project, ct);
@@ -40,6 +41,19 @@ internal static class HotReloadHandler
         }
 
         var outcome = await session.ApplyAsync(ct);
+
+        // A lazily-opened session took the already-edited source as its baseline, so the edit
+        // that prompted this apply may be invisible to it. F5 opens the session at launch to
+        // avoid this; when that did not happen, say what "no changes" actually means.
+        if (openedNow && outcome.Ok && outcome.AppliedTo.Count == 0)
+        {
+            outcome = outcome with
+            {
+                Summary = outcome.Summary +
+                    " Note: the session was opened by this apply, so edits made before it " +
+                    "cannot be detected — restart the app if the edit did not land.",
+            };
+        }
 
         return new HotReloadResultDto(
             outcome.Ok,

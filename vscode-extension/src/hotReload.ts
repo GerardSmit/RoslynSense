@@ -100,19 +100,42 @@ export function registerHotReload(
 /// environment, or the original when the tool has no agent to inject.
 export async function withHotReloadEnvironment(
     client: LanguageClient,
-    env: Record<string, string>
+    env: Record<string, string>,
+    projectPath?: string
 ): Promise<Record<string, string>> {
     try {
         const settings = await client.sendRequest<HotReloadEnvironment>('roslynSense/hotReloadEnvironment');
         if (!settings.available) {
             return env;
         }
-        // The caller's own values win: a project that already sets a startup hook keeps it, and
-        // the server's value is appended by the launcher rather than replacing it here.
-        return { ...settings.variables, ...env };
+
+        // This path never reaches the server's launcher, so the append has to happen here: a
+        // project whose launchSettings sets its own startup hook must keep it AND get the agent,
+        // or F5 silently loses hot reload.
+        const merged: Record<string, string> = { ...settings.variables, ...env };
+        const agentHooks = settings.variables['DOTNET_STARTUP_HOOKS'];
+        const callerHooks = env['DOTNET_STARTUP_HOOKS'];
+        if (agentHooks && callerHooks && callerHooks !== agentHooks) {
+            merged['DOTNET_STARTUP_HOOKS'] = `${callerHooks}${pathDelimiter()}${agentHooks}`;
+        }
+
+        // Open the edit session now rather than at the first apply: this is the moment the built
+        // output matches the source, so the baseline predates the user's next edit. Failure is
+        // non-fatal — the first apply retries.
+        if (projectPath) {
+            void client
+                .sendRequest<HotReloadResult>('roslynSense/hotReloadStart', { projectPath })
+                .catch(() => undefined);
+        }
+
+        return merged;
     } catch {
         return env;
     }
+}
+
+function pathDelimiter(): string {
+    return process.platform === 'win32' ? ';' : ':';
 }
 
 async function apply(

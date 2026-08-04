@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+option csharp_namespace = "ProtoSolution.Widgets";
+
+package widgets;
+
+service WidgetService {
+  rpc GetWidgetsById(GetWidgetsByIdRequest) returns (GetWidgetsByIdReply);
+  rpc RenameWidget(RenameWidgetRequest) returns (Widget);
+  rpc WatchWidgets(WatchWidgetsRequest) returns (stream Widget);
+}
+
+message Widget {
+  int64 id = 1;
+  string label = 2;
+}
+
+message GetWidgetsByIdRequest {
+  repeated int64 ids = 1;
+}
+
+message GetWidgetsByIdReply {
+  repeated Widget widgets = 1;
+}
+
+message RenameWidgetRequest {
+  int64 id = 1;
+  string label = 2;
+}
+
+message WatchWidgetsRequest {
+  repeated int64 ids = 1;
+}

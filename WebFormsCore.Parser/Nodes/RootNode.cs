@@ -92,6 +92,16 @@ public class RootNode : ContainerNode
 
     public List<string> Namespaces { get; set; } = new();
 
+    /// <summary>Tag prefix → the namespaces it resolves against. Kept off the parser so
+    /// completion can offer the prefixes and tag names this file actually has in scope.</summary>
+    public IReadOnlyDictionary<string, List<string>> TagPrefixes { get; set; } =
+        new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>User-control registrations reachable from this file: prefix + tag name → the
+    /// generated type and the <c>.ascx</c> it came from.</summary>
+    public IReadOnlyDictionary<ControlKey, (string Type, string Path)> RegisteredControls { get; set; } =
+        new Dictionary<ControlKey, (string Type, string Path)>();
+
     public List<IncludeFile> IncludeFiles { get; set; } = new();
 
     public List<TokenString> ScriptBlocks { get; set; } = new();
@@ -142,6 +152,8 @@ public class RootNode : ContainerNode
             }
         }
 
+        parser.Root.TagPrefixes = parser.TagPrefixes;
+        parser.Root.RegisteredControls = parser.RegisteredControls;
         parser.Root.Path = fullPath;
         parser.Root.RelativePath = relativePath;
         parser.Root.ClassName = Regex.Replace(relativePath, "[^a-zA-Z0-9_]+", "_");

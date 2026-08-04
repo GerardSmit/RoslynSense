@@ -22,6 +22,13 @@ namespace RoslynMCP.Lsp.Handlers;
 /// trade for settings that describe a solution rather than a window, but it does mean a change
 /// made in one window takes effect in the other.
 /// </para>
+/// <para>
+/// <c>roslynSense.languages.*</c> is the exception, and is why <see cref="ReadLanguages"/>
+/// returns its answer instead of storing it: which packs are active is per connection, so it
+/// belongs on that session's <see cref="Languages.LanguageSession"/>. Applied process-wide it
+/// would let one editor window deactivate a pack under another window, and let an editor
+/// setting strip MCP tools from the AI sessions on the same daemon.
+/// </para>
 /// </remarks>
 internal static class ConfigurationHandler
 {
@@ -32,12 +39,7 @@ internal static class ConfigurationHandler
     /// </summary>
     public static bool Apply(JsonElement? settings)
     {
-        if (settings is not { ValueKind: JsonValueKind.Object } root)
-            return false;
-
-        // The client may send the whole settings tree or just our section.
-        var section = root.TryGetProperty("roslynSense", out var nested) ? nested : root;
-        if (section.ValueKind != JsonValueKind.Object)
+        if (!TrySection(settings, out var section))
             return false;
 
         bool analyzersChanged = false;
@@ -92,6 +94,42 @@ internal static class ConfigurationHandler
     }
 
     /// <summary>
+    /// Reads <c>roslynSense.languages</c> — the per-connection language-pack switches — out of
+    /// the same settings block. Absent or malformed means every registered pack is active, which
+    /// is also what a client too old to send the section gets.
+    /// </summary>
+    public static LanguageActivation ReadLanguages(JsonElement? settings)
+    {
+        if (!TrySection(settings, out var section)
+            || !section.TryGetProperty("languages", out var languages)
+            || languages.ValueKind != JsonValueKind.Object)
+        {
+            return LanguageActivation.All;
+        }
+
+        var disabled = languages.EnumerateObject()
+            .Where(entry => entry.Value.ValueKind == JsonValueKind.False)
+            .Select(entry => entry.Name);
+
+        return new LanguageActivation(disabled);
+    }
+
+    /// <summary>
+    /// Unwraps the settings block. The client may send the whole settings tree or just our
+    /// section, and both <c>initialize</c> and <c>didChangeConfiguration</c> take either.
+    /// </summary>
+    private static bool TrySection(JsonElement? settings, out JsonElement section)
+    {
+        section = default;
+
+        if (settings is not { ValueKind: JsonValueKind.Object } root)
+            return false;
+
+        section = root.TryGetProperty("roslynSense", out var nested) ? nested : root;
+        return section.ValueKind == JsonValueKind.Object;
+    }
+
+    /// <summary>
     /// Reads <c>roslynSense.fileNesting.rules</c>, which VS Code flattens to a
     /// <c>fileNesting</c> object with a <c>rules</c> member.
     /// </summary>
@@ -129,4 +167,29 @@ internal static class ConfigurationHandler
         section.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
+}
+
+/// <summary>
+/// Which language packs one editor connection wants, read from its <c>roslynSense.languages</c>
+/// block. Consumed once, when that connection's <see cref="Languages.LanguageSession"/> is built.
+/// </summary>
+/// <remarks>
+/// Stored as the set that was switched <em>off</em> rather than the set switched on, because a
+/// pack the client never mentions must stay active: the extension only sends the keys it
+/// contributes, and a pack added later — or a client that predates the section entirely — would
+/// otherwise arrive silently disabled. This gate can only ever narrow what
+/// <see cref="Languages.LanguageRegistry"/> already registered; it cannot add a pack the
+/// daemon's own settings turned off.
+/// </remarks>
+internal sealed class LanguageActivation
+{
+    /// <summary>Every registered pack is active.</summary>
+    public static LanguageActivation All { get; } = new([]);
+
+    private readonly HashSet<string> _disabled;
+
+    public LanguageActivation(IEnumerable<string> disabledIds) =>
+        _disabled = new HashSet<string>(disabledIds, StringComparer.OrdinalIgnoreCase);
+
+    public bool IsEnabled(string id) => !_disabled.Contains(id);
 }

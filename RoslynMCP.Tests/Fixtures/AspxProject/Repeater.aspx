@@ -6,7 +6,7 @@
         <asp:Repeater ID="rptItems" runat="server" OnItemDataBound="rpt_OnItemDataBound">
             <ItemTemplate>
                 <asp:Button ID="btnAction" runat="server" Text="Click" />
-                <asp:Label ID="lblName" runat="server" Text="Name" />
+                <asp:Label ID="lblName" runat="server" Text='<%# PageHelper.FormatDate(System.DateTime.Now) %>' />
             </ItemTemplate>
         </asp:Repeater>
     </form>

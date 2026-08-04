@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Rename;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Languages;
 
 namespace RoslynMCP.Tools;
 

@@ -288,6 +288,106 @@ public static class ProjectMutationService
     }
 
     /// <summary>
+    /// The framework assemblies a project could reference — <c>System.Xml</c>,
+    /// <c>System.ServiceModel</c> and the rest of what Visual Studio's "Add Reference" lists
+    /// under Assemblies.
+    /// </summary>
+    /// <remarks>
+    /// Read from the reference-assembly directory for the project's own target framework rather
+    /// than from a fixed list, so a project on net472 is not offered something that only exists
+    /// on net48. Only .NET Framework targets have these: on modern .NET the framework arrives as
+    /// a package reference and there is nothing to add.
+    /// </remarks>
+    public static IReadOnlyList<string> AvailableAssemblyReferences(string projectPath)
+    {
+        string? targetFramework = ReadProperty(projectPath, "TargetFrameworkVersion")
+            ?? ReadProperty(projectPath, "TargetFramework");
+        if (targetFramework is null || !targetFramework.Contains("4", StringComparison.Ordinal))
+            return [];
+
+        // "v4.8" in a legacy project, "net48" in an SDK-style one.
+        string version = targetFramework.StartsWith('v')
+            ? targetFramework
+            : "v" + string.Join('.', targetFramework["net".Length..].ToCharArray());
+
+        string root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            "Reference Assemblies", "Microsoft", "Framework", ".NETFramework");
+        if (!Directory.Exists(root))
+            return [];
+
+        // Fall back to the newest installed reference assemblies when the exact version is
+        // absent; they are backwards compatible and the alternative is offering nothing.
+        string directory = Path.Combine(root, version);
+        if (!Directory.Exists(directory))
+        {
+            directory = Directory.EnumerateDirectories(root)
+                .OrderByDescending(d => d, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault() ?? "";
+        }
+
+        if (!Directory.Exists(directory))
+            return [];
+
+        return
+        [
+            .. Directory.EnumerateFiles(directory, "*.dll", SearchOption.TopDirectoryOnly)
+                .Select(Path.GetFileNameWithoutExtension)
+                .Where(name => name is { Length: > 0 })
+                .Select(name => name!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase),
+        ];
+    }
+
+    /// <summary>
+    /// Adds a plain <c>&lt;Reference&gt;</c> to a project — the .NET Framework equivalent of a
+    /// package reference, and the one kind of dependency the tree could not add.
+    /// </summary>
+    public static async Task<MutationResult> AddAssemblyReferenceAsync(
+        string projectPath, string assemblyName, CancellationToken ct = default)
+    {
+        if (!File.Exists(projectPath))
+            return new MutationResult(false, $"Project not found: {projectPath}");
+        if (string.IsNullOrWhiteSpace(assemblyName))
+            return new MutationResult(false, "An assembly name is required.");
+
+        try
+        {
+            var document = XDocument.Load(projectPath, LoadOptions.PreserveWhitespace);
+            if (document.Root is not { } root)
+                return new MutationResult(false, "The project file is empty.");
+
+            var ns = root.Name.Namespace;
+
+            bool already = root.Descendants(ns + "Reference").Any(r =>
+                (r.Attribute("Include")?.Value ?? "")
+                    .Split(',')[0]
+                    .Trim()
+                    .Equals(assemblyName, StringComparison.OrdinalIgnoreCase));
+            if (already)
+                return new MutationResult(true, $"{assemblyName} is already referenced.");
+
+            // Beside the other assembly references when there are any, so the file keeps the
+            // grouping its author gave it.
+            var group = root.Descendants(ns + "Reference").FirstOrDefault()?.Parent
+                ?? new XElement(ns + "ItemGroup");
+            if (group.Parent is null)
+                root.Add(group);
+
+            group.Add(new XElement(ns + "Reference", new XAttribute("Include", assemblyName)));
+            document.Save(projectPath);
+        }
+        catch (Exception ex)
+        {
+            return new MutationResult(false, $"Could not add the reference: {ex.Message}");
+        }
+
+        await InvalidateAsync(ct, projectPath);
+        return new MutationResult(true, $"Added a reference to {assemblyName}.");
+    }
+
+    /// <summary>
     /// Makes sure a file that already exists on disk is one the project compiles.
     /// </summary>
     /// <remarks>
@@ -323,6 +423,170 @@ public static class ProjectMutationService
         else
         {
             await InvalidateAsync(ct);
+        }
+    }
+
+    /// <summary>
+    /// Points a project's items at a file's new path when that file is renamed or moved.
+    /// </summary>
+    /// <remarks>
+    /// A legacy project lists every file explicitly, so a rename that only touches disk leaves an
+    /// item naming a path that is gone and the project stops building. An SDK-style project globs
+    /// instead and has no item to move, which is why finding nothing is success rather than an
+    /// error — the caller cannot tell the two apart and should not have to.
+    ///
+    /// The <c>DependentUpon</c> metadata that nests <c>Default.aspx.cs</c> under
+    /// <c>Default.aspx</c> names its parent relative to the item's own folder rather than the
+    /// project's, so it is resolved to a path before being compared.
+    /// </remarks>
+    public static async Task RenameFileItemAsync(
+        string oldPath, string newPath, CancellationToken ct = default)
+    {
+        string oldFull = Path.GetFullPath(oldPath);
+        string newFull = Path.GetFullPath(newPath);
+        if (oldFull.Equals(newFull, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        string? owner = TryFindOwningProject(newFull) ?? TryFindOwningProject(oldFull);
+        if (owner is null)
+        {
+            await InvalidateAsync(ct);
+            return;
+        }
+
+        RewriteItemPath(owner, oldFull, newFull);
+
+        // A move that crosses a project boundary leaves the file listed by a project that no
+        // longer contains it, which breaks that project just as surely as the stale path would.
+        if (TryFindOwningProject(oldFull) is { } previous &&
+            !PathHelper.NormalizePath(previous).Equals(
+                PathHelper.NormalizePath(owner), StringComparison.OrdinalIgnoreCase))
+        {
+            RemoveCompileItem(previous, oldFull);
+            await InvalidateAsync(ct, previous);
+        }
+
+        await InvalidateAsync(ct, owner);
+    }
+
+    /// <summary>
+    /// Points every explicit item at a file's new path, metadata included. When the thing that
+    /// moved is a folder, every item beneath it moves with it — a legacy project lists each page
+    /// individually, so a folder rename that only fixed the folder's own item would leave all of
+    /// them naming a path that no longer exists.
+    /// </summary>
+    private static void RewriteItemPath(string projectPath, string oldFull, string newFull)
+    {
+        // The move has already happened on disk by the time this runs, so the old path is gone and
+        // only the destination can answer what kind of thing it was.
+        bool movedFolder = Directory.Exists(newFull);
+        string oldPrefix = oldFull.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+        try
+        {
+            // Nothing here rewrites structure, so the file keeps the formatting its author gave
+            // it and the change reads as the one-line move it is.
+            var document = XDocument.Load(projectPath, LoadOptions.PreserveWhitespace);
+            if (document.Root is null)
+                return;
+
+            string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+            string newInclude = Path.GetRelativePath(projectDirectory, newFull);
+            bool changed = false;
+
+            foreach (var item in document.Root.Descendants())
+            {
+                // Remove is in there because an excluded file that gets renamed would otherwise
+                // fall back into the glob it was taken out of.
+                var attribute = item.Attribute("Include")
+                    ?? item.Attribute("Update")
+                    ?? item.Attribute("Remove");
+                if (attribute is null || !NamesOneFile(attribute.Value))
+                    continue;
+
+                string itemPath = ResolveAgainst(projectDirectory, attribute.Value);
+
+                // DependentUpon is relative to the item's own folder, and for the item being
+                // renamed that folder is the one it is moving to.
+                string itemDirectory = Path.GetDirectoryName(itemPath)!;
+
+                if (itemPath.Equals(oldFull, StringComparison.OrdinalIgnoreCase))
+                {
+                    attribute.Value = newInclude;
+                    itemDirectory = Path.GetDirectoryName(newFull)!;
+                    changed = true;
+                }
+                else if (movedFolder && itemPath.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    string moved = Path.Combine(newFull, itemPath[oldPrefix.Length..]);
+                    attribute.Value = Path.GetRelativePath(projectDirectory, moved);
+                    // DependentUpon is relative to the item's own folder, and the whole folder
+                    // moved together, so those values stay correct — but the folder they resolve
+                    // against is the new one.
+                    itemDirectory = Path.GetDirectoryName(moved)!;
+                    changed = true;
+                }
+
+                changed |= RewriteDependentUpon(item, itemDirectory, oldFull, newFull);
+            }
+
+            if (changed)
+                document.Save(projectPath);
+        }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not move the item for '{Path.GetFileName(oldFull)}' in " +
+                $"'{Path.GetFileName(projectPath)}': {ex.Message}",
+                key: $"item-rename:{projectPath}");
+        }
+    }
+
+    /// <returns>Whether the metadata was pointing at the renamed file and now points at it.</returns>
+    private static bool RewriteDependentUpon(
+        XElement item, string itemDirectory, string oldFull, string newFull)
+    {
+        var metadata = item.Element(item.Name.Namespace + "DependentUpon");
+        string? value = metadata?.Value.Trim() ?? item.Attribute("DependentUpon")?.Value;
+        if (value is null || !NamesOneFile(value))
+            return false;
+
+        if (!ResolveAgainst(itemDirectory, value).Equals(oldFull, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string updated = Path.GetRelativePath(itemDirectory, newFull);
+        if (metadata is not null)
+            metadata.Value = updated;
+        else
+            item.SetAttributeValue("DependentUpon", updated);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Whether an item's value is a plain path rather than a glob, a property reference or a
+    /// list — the only form that can be compared against a file on disk without evaluating the
+    /// project.
+    /// </summary>
+    private static bool NamesOneFile(string value) =>
+        value.Length > 0 && value.IndexOfAny(['*', '?', '$', '%', '@', ';']) < 0;
+
+    private static string ResolveAgainst(string directory, string relative) =>
+        Path.GetFullPath(Path.Combine(
+            directory,
+            relative.Replace('\\', Path.DirectorySeparatorChar)
+                .Replace('/', Path.DirectorySeparatorChar)));
+
+    /// <summary>The owning project, or null when the folder went away with the file.</summary>
+    private static string? TryFindOwningProject(string path)
+    {
+        try
+        {
+            return FindOwningProject(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 
@@ -382,6 +646,104 @@ public static class ProjectMutationService
             $"Added {Path.GetFileNameWithoutExtension(projectPath)} to " +
             $"{Path.GetFileName(solutionPath)}.");
     }
+
+    public static async Task<MutationResult> RemoveProjectFromSolutionAsync(
+        string projectPath, string? solutionPath = null, CancellationToken ct = default)
+    {
+        solutionPath ??= WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        if (string.IsNullOrEmpty(solutionPath) || !File.Exists(solutionPath))
+            return new MutationResult(false, "No solution is open.");
+
+        var (exitCode, output) = await RunDotnetAsync(
+            ["sln", solutionPath, "remove", projectPath], ct);
+
+        if (exitCode != 0)
+            return new MutationResult(false, FirstError(output));
+
+        await InvalidateAsync(ct);
+        return new MutationResult(true,
+            $"Removed {Path.GetFileNameWithoutExtension(projectPath)} from " +
+            $"{Path.GetFileName(solutionPath)}. The files are still on disk.");
+    }
+
+    /// <summary>
+    /// Drops a file from its project's item list without deleting it — Visual Studio's
+    /// "Exclude From Project".
+    /// </summary>
+    /// <remarks>
+    /// The two project styles need opposite edits. A legacy project lists every file, so removing
+    /// the item is enough. An SDK-style project globs them, so there is no item to remove and the
+    /// exclusion has to be stated: a <c>Remove</c> item that subtracts the file from the glob.
+    /// </remarks>
+    public static async Task<MutationResult> ExcludeFileAsync(
+        string projectPath, string filePath, CancellationToken ct = default)
+    {
+        string full = Path.GetFullPath(filePath);
+        string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+        string include = Path.GetRelativePath(projectDirectory, full);
+
+        try
+        {
+            var document = XDocument.Load(projectPath);
+            if (document.Root is null)
+                return new MutationResult(false, "The project file could not be read.");
+
+            RemoveCompileItem(projectPath, full);
+
+            bool sdkStyle = document.Root.Attribute("Sdk") is not null ||
+                            document.Root.Elements().Any(e => e.Name.LocalName == "Sdk");
+            string? enableDefaults = ReadProperty(projectPath, "EnableDefaultCompileItems");
+            bool globbed = sdkStyle &&
+                !string.Equals(enableDefaults, "false", StringComparison.OrdinalIgnoreCase);
+
+            if (globbed)
+            {
+                // Reloaded: RemoveCompileItem may have written the file out from under us.
+                document = XDocument.Load(projectPath);
+                var ns = document.Root!.Name.Namespace;
+
+                var missing = DefaultGlobsFor(full)
+                    .Where(item => !document.Descendants(ns + item).Any(e => string.Equals(
+                        e.Attribute("Remove")?.Value, include, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+
+                if (missing.Count > 0)
+                {
+                    document.Root.Add(new XElement(ns + "ItemGroup",
+                        missing.Select(item =>
+                            new XElement(ns + item, new XAttribute("Remove", include)))));
+                    document.Save(projectPath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            return new MutationResult(false, $"Could not edit the project file: {ex.Message}");
+        }
+
+        await InvalidateAsync(ct, projectPath);
+        return new MutationResult(true,
+            $"Excluded {Path.GetFileName(full)} from " +
+            $"{Path.GetFileNameWithoutExtension(projectPath)}. The file is still on disk.");
+    }
+
+    /// <summary>
+    /// The item types whose default glob would pick a file up, and which therefore have to be
+    /// told not to.
+    /// </summary>
+    /// <remarks>
+    /// Which glob claims a file depends on the SDK: the base SDK globs <c>None</c> for anything
+    /// it does not compile, while the Web SDK globs <c>Content</c> for the same files. Rather
+    /// than work out which SDK is in play, both are excluded — a <c>Remove</c> for an item type
+    /// nothing matched costs nothing, and guessing wrong leaves the file in the build.
+    /// </remarks>
+    private static string[] DefaultGlobsFor(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".cs" or ".vb" or ".fs" => ["Compile"],
+            ".resx" => ["EmbeddedResource"],
+            _ => ["None", "Content"],
+        };
 
     // --- File scaffolding ---
 

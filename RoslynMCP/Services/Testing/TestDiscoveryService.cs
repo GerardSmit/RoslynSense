@@ -111,21 +111,13 @@ public static class TestDiscoveryService
     public static async Task<IReadOnlyList<(string ProjectPath, string ProjectName)>> FindTestProjectsAsync(
         CancellationToken cancellationToken = default)
     {
-        var solution = WorkspaceService.TryGetMostRecentSolution();
-        if (solution is null)
-            return [];
-
         var projects = new List<(string, string)>();
-        foreach (var project in solution.Projects)
+
+        foreach (var (path, name) in ProjectModel.SolutionProjectIndex.Projects())
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            if (project.FilePath is not { Length: > 0 } path)
-                continue;
-            if (!ProjectClassifier.Classify(path).IsTestProject)
-                continue;
-
-            projects.Add((path, project.Name));
+            if (ProjectClassifier.Classify(path).IsTestProject)
+                projects.Add((path, name));
         }
 
         return projects

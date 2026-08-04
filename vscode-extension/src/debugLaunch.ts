@@ -15,6 +15,16 @@ import { withHotReloadEnvironment } from './hotReload';
 
 export const DEBUG_TYPE = 'roslynsense';
 
+interface LaunchProfileDescriptor {
+    name: string;
+    commandName: string;
+    applicationUrl: string | null;
+    commandLineArgs: string | null;
+    launchBrowser: boolean;
+    launchUrl: string | null;
+    environmentVariables: Record<string, string>;
+}
+
 interface LaunchTarget {
     projectPath: string;
     projectName: string;
@@ -29,6 +39,10 @@ interface LaunchTarget {
     env: Record<string, string>;
     url: string | null;
     error: string | null;
+    launchProfiles: LaunchProfileDescriptor[];
+    launchProfile: string | null;
+    browseUrl: string | null;
+    launchBrowser: boolean | null;
 }
 
 interface DebuggerPathResult {
@@ -89,6 +103,47 @@ export function registerDebugLaunch(
         })
     );
 
+    // Turns the address a project happens to run on into one it states, so it survives a restart
+    // and everyone on the team gets the same one.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('roslynSense.pinLaunchUrl', async () => {
+            const client = getClient();
+            if (!client) {
+                void vscode.window.showErrorMessage('RoslynSense is not running.');
+                return;
+            }
+
+            const target = await pickTarget(context, client);
+            if (!target) {
+                return;
+            }
+
+            const url = await vscode.window.showInputBox({
+                title: `Launch URL for ${target.projectName}`,
+                value: target.url ?? 'http://localhost:5000',
+                prompt: 'Written to launchSettings.json as the profile\'s applicationUrl.',
+                validateInput: (value) =>
+                    /^https?:\/\/\S+$/.test(value.split(';')[0] ?? '')
+                        ? undefined
+                        : 'Enter an absolute http(s) URL.',
+            });
+            if (!url) {
+                return;
+            }
+
+            const profile =
+                target.launchProfiles.length > 0 ? await pickProfile(target) : target.projectName;
+
+            const result = await client.sendRequest<string>('workspace/executeCommand', {
+                command: 'roslynSense.setLaunchUrl',
+                arguments: profile
+                    ? [target.projectPath, url, profile]
+                    : [target.projectPath, url],
+            });
+            void vscode.window.showInformationMessage(`RoslynSense: ${result}`);
+        })
+    );
+
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
             async createDebugAdapterDescriptor(session: vscode.DebugSession) {
@@ -139,13 +194,28 @@ export function registerDebugLaunch(
                         },
                     ];
                 }
-                return targets.map((target) => ({
-                    type: DEBUG_TYPE,
-                    request: 'launch',
-                    name: `C#: ${target.projectName}`,
-                    projectPath: target.projectPath,
-                    stopAtEntry: false,
-                }));
+                // One configuration per launch profile, the way Rider imports them: a project with
+                // profiles has already said how it wants to be run, more than once.
+                return targets.flatMap((target) =>
+                    target.launchProfiles.length > 0
+                        ? target.launchProfiles.map((profile) => ({
+                              type: DEBUG_TYPE,
+                              request: 'launch',
+                              name: `C#: ${target.projectName} (${profile.name})`,
+                              projectPath: target.projectPath,
+                              launchProfile: profile.name,
+                              stopAtEntry: false,
+                          }))
+                        : [
+                              {
+                                  type: DEBUG_TYPE,
+                                  request: 'launch',
+                                  name: `C#: ${target.projectName}`,
+                                  projectPath: target.projectPath,
+                                  stopAtEntry: false,
+                              },
+                          ]
+                );
             },
 
             // F5 with no launch.json arrives here with an essentially empty config.
@@ -161,12 +231,23 @@ export function registerDebugLaunch(
                 }
 
                 if (!config.projectPath) {
+                    // The file in front of the user answers "which project" nearly every time,
+                    // so asking is the fallback rather than the first move.
+                    const active = await targetForActiveFile(getClient(), config.configuration);
+                    if (active?.runnable) {
+                        config.projectPath = active.projectPath;
+                        config.name = `C#: ${active.projectName}`;
+                        config.launchProfile = config.launchProfile ?? (await pickProfile(active));
+                        return config;
+                    }
+
                     const target = await pickTarget(context, getClient());
                     if (!target) {
                         // Undefined aborts silently; the picker was already dismissed by the user.
                         return undefined;
                     }
                     config.projectPath = target.projectPath;
+                    config.launchProfile = config.launchProfile ?? (await pickProfile(target));
                 }
                 return config;
             },
@@ -185,14 +266,46 @@ export function registerDebugLaunch(
                 }
 
                 const configuration = config.configuration ?? 'Debug';
-                const build = await vscode.window.withProgress(
-                    { location: vscode.ProgressLocation.Window, title: 'Building…' },
-                    () =>
-                        client.sendRequest<BuildResult>('workspace/executeCommand', {
-                            command: 'roslynSense.build',
-                            arguments: [config.projectPath, configuration],
-                        })
-                );
+                const projectName = basename(config.projectPath);
+
+                // A notification rather than the status bar, and cancellable: a build with no
+                // visible sign of life reads as a hung editor, and the way out of a long one
+                // should not be killing the window.
+                const cancellation = new vscode.CancellationTokenSource();
+                let build: BuildResult;
+                try {
+                    build = await vscode.window.withProgress(
+                        {
+                            location: vscode.ProgressLocation.Notification,
+                            title: `Building ${projectName}`,
+                            cancellable: true,
+                        },
+                        (progress, token) => {
+                            token.onCancellationRequested(() => cancellation.cancel());
+                            progress.report({ message: configuration });
+                            return client.sendRequest<BuildResult>(
+                                'workspace/executeCommand',
+                                {
+                                    // The last argument turns off the server's own progress: this
+                                    // notification is already showing the same build.
+                                    command: 'roslynSense.build',
+                                    arguments: [config.projectPath, configuration, 'build', false],
+                                },
+                                cancellation.token
+                            );
+                        }
+                    );
+                } catch {
+                    // The only way this rejects is the cancellation above; the server kills the
+                    // build with it, so there is nothing to clean up here.
+                    void vscode.window.setStatusBarMessage(
+                        `RoslynSense: build of ${projectName} cancelled.`,
+                        5000
+                    );
+                    return undefined;
+                } finally {
+                    cancellation.dispose();
+                }
 
                 publishBuildDiagnostics(buildDiagnostics, build);
                 if (!build.success) {
@@ -212,9 +325,9 @@ export function registerDebugLaunch(
                     return undefined;
                 }
 
-                const target = (await fetchTargets(client, configuration)).find(
-                    (t) => samePath(t.projectPath, config.projectPath)
-                );
+                const target = (
+                    await fetchTargets(client, configuration, config.launchProfile)
+                ).find((t) => samePath(t.projectPath, config.projectPath));
                 if (!target) {
                     void vscode.window.showErrorMessage(
                         `'${config.projectPath}' is not a project in the loaded solution.`
@@ -237,15 +350,25 @@ export function registerDebugLaunch(
                 // when unused, so it is on unless the configuration turns it off. Not for .NET
                 // Framework: there the edit goes through the debugger, not a startup hook.
                 if (config.hotReload !== false && !target.isNetFramework) {
-                    config.env = await withHotReloadEnvironment(client, config.env);
+                    config.env = await withHotReloadEnvironment(client, config.env, target.projectPath);
                 }
 
                 // Web apps: open the browser once Kestrel announces its address, matching what
-                // the standard C# extension does.
-                if (target.url && !config.serverReadyAction) {
+                // the standard C# extension does. A profile that says launchBrowser: false is
+                // asking for the opposite, and gets it.
+                // Between the build finishing and the debugger's own UI appearing there is a gap
+                // with nothing in it, which is the part that reads as "nothing is happening".
+                void vscode.window.setStatusBarMessage(
+                    `Starting ${projectName}${target.url ? ` on ${target.url.split(';')[0]}` : ''}…`,
+                    8000
+                );
+
+                if (target.url && !config.serverReadyAction && target.launchBrowser !== false) {
                     config.serverReadyAction = {
                         pattern: 'Now listening on:\\s+(https?://\\S+)',
-                        uriFormat: '%s',
+                        // The profile's launchUrl is a path under whichever address the app
+                        // actually announced, so it is appended rather than substituted.
+                        uriFormat: `%s${launchPath(target)}`,
                         action: 'openExternally',
                     };
                 }
@@ -267,9 +390,36 @@ async function isFrameworkTarget(
     return targets.some((t) => samePath(t.projectPath, projectPath) && t.isNetFramework);
 }
 
-async function fetchTargets(
+/**
+ * The launch target for the project owning the active editor's file.
+ *
+ * Resolved by the server rather than by comparing paths here: it knows about linked files, and
+ * about projects the workspace has not loaded, neither of which a directory prefix gets right.
+ */
+async function targetForActiveFile(
     client: LanguageClient | undefined,
     configuration?: string
+): Promise<LaunchTarget | undefined> {
+    const document = vscode.window.activeTextEditor?.document;
+    if (!client || document?.uri.scheme !== 'file') {
+        return undefined;
+    }
+
+    try {
+        const target = await client.sendRequest<LaunchTarget | null>('roslynSense/targetForFile', {
+            filePath: document.uri.fsPath,
+            configuration: configuration ?? null,
+        });
+        return target ?? undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function fetchTargets(
+    client: LanguageClient | undefined,
+    configuration?: string,
+    launchProfile?: string
 ): Promise<LaunchTarget[]> {
     if (!client) {
         return [];
@@ -277,10 +427,32 @@ async function fetchTargets(
     try {
         return await client.sendRequest<LaunchTarget[]>('roslynSense/launchTargets', {
             configuration: configuration ?? null,
+            launchProfile: launchProfile ?? null,
         });
     } catch {
         return [];
     }
+}
+
+/**
+ * The profile to launch with, when the project offers more than one and the configuration did
+ * not name one. A single profile is not worth a question.
+ */
+async function pickProfile(target: LaunchTarget): Promise<string | undefined> {
+    if (target.launchProfiles.length < 2) {
+        return target.launchProfiles[0]?.name;
+    }
+
+    const picked = await vscode.window.showQuickPick(
+        target.launchProfiles.map((profile) => ({
+            label: profile.name,
+            description: profile.commandName,
+            detail: profile.applicationUrl ?? profile.commandLineArgs ?? undefined,
+            profile,
+        })),
+        { title: `Launch profile for ${target.projectName}` }
+    );
+    return picked?.profile.name;
 }
 
 async function pickTarget(
@@ -359,6 +531,26 @@ function publishBuildDiagnostics(
     for (const [file, diagnostics] of byFile) {
         collection.set(vscode.Uri.file(file), diagnostics);
     }
+}
+
+function basename(filePath: string | undefined): string {
+    if (!filePath) {
+        return 'project';
+    }
+    const name = filePath.replace(/\\/g, '/').split('/').pop() ?? filePath;
+    return name.replace(/\.[^.]+$/, '');
+}
+
+/**
+ * The path part of the profile's launchUrl, as a suffix to append to the address the running app
+ * reports. Empty when the profile browses the root, or names an absolute URL of its own.
+ */
+function launchPath(target: LaunchTarget): string {
+    const base = target.url?.split(';')[0]?.replace(/\/$/, '');
+    if (!base || !target.browseUrl || !target.browseUrl.startsWith(base)) {
+        return '';
+    }
+    return target.browseUrl.slice(base.length);
 }
 
 function samePath(a: string | undefined | null, b: string | undefined | null): boolean {

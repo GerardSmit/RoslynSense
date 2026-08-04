@@ -17,6 +17,17 @@ internal static class StartupHook
         if (string.IsNullOrEmpty(pipeName))
             return;
 
+        // `dotnet run` and the MSBuild nodes it spawns are managed apps too, and they inherit
+        // the environment. Registering them would send deltas to processes that do not host the
+        // edited module, and their runtimes would join the capability vote for an app they are
+        // not. The real target is the apphost child, which passes this check.
+        string host = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
+        if (host.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
+            host.StartsWith("MSBuild", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         // Applying a delta to a module the runtime did not prepare for it silently does nothing,
         // so say so once here rather than let every apply look like it worked.
         if (Environment.GetEnvironmentVariable("DOTNET_MODIFIABLE_ASSEMBLIES") is not "debug")

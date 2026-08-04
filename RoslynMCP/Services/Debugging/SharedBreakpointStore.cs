@@ -59,5 +59,5 @@ public static class SharedBreakpointStore
 
     private static string FileFor(string solutionPath) =>
         Path.Combine(Path.GetTempPath(), "roslyn-sense", "breakpoints",
-            HostPaths.Hash(Path.GetFullPath(solutionPath)) + ".json");
+            HostPaths.SolutionHash(Path.GetFullPath(solutionPath)) + ".json");
 }

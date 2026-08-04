@@ -26,6 +26,7 @@ namespace RoslynMCP.Tests;
 public class CoreClrHotReloadTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"hotreload-e2e-{Guid.NewGuid():N}");
+    private readonly System.Text.StringBuilder _targetOutput = new();
 
     private static readonly string Project = $"""
         <Project Sdk="Microsoft.NET.Sdk">
@@ -96,10 +97,10 @@ public class CoreClrHotReloadTests : IDisposable
         {
             Assert.True(await WaitAsync(() => HotReloadAgentServer.Instance.Targets
                     .Any(t => t.ProcessId == target.Id)),
-                "The hot reload agent never connected; nothing could have been applied.");
+                "The hot reload agent never connected; nothing could have been applied." + Diagnose(target));
 
             Assert.True(await WaitForLastLineAsync(log, "6"),
-                "The target never produced its baseline value.");
+                "The target never produced its baseline value." + Diagnose(target));
 
             // --- the edit ---
 
@@ -120,9 +121,9 @@ public class CoreClrHotReloadTests : IDisposable
 
             // The claim under test: the process that is already running now returns something else.
             Assert.True(await WaitForLastLineAsync(log, "30"),
-                "The delta was reported as applied but the process kept returning the old value.");
+                "The delta was reported as applied but the process kept returning the old value." + Diagnose(target));
 
-            Assert.False(target.HasExited, "The process restarted; that would not be hot reload.");
+            Assert.False(target.HasExited, "The process restarted; that would not be hot reload." + Diagnose(target));
 
             // --- a second edit, against the same session ---
 
@@ -139,8 +140,8 @@ public class CoreClrHotReloadTests : IDisposable
             Assert.Contains(second.AppliedTo, a => a.Contains(target.Id.ToString()));
 
             Assert.True(await WaitForLastLineAsync(log, "60"),
-                "The second delta was reported as applied but the process kept the first edit's value.");
-            Assert.False(target.HasExited, "The process restarted on the second apply.");
+                "The second delta was reported as applied but the process kept the first edit's value." + Diagnose(target));
+            Assert.False(target.HasExited, "The process restarted on the second apply." + Diagnose(target));
         }
         finally
         {
@@ -149,7 +150,7 @@ public class CoreClrHotReloadTests : IDisposable
         }
     }
 
-    private static Process Launch(string exe, string log)
+    private Process Launch(string exe, string log)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -166,7 +167,45 @@ public class CoreClrHotReloadTests : IDisposable
         // work for hot reload to be reachable at all.
         Assert.True(HotReloadLauncher.Inject(startInfo), "The hot reload agent was not found.");
 
-        return Process.Start(startInfo)!;
+        var process = Process.Start(startInfo)!;
+
+        // Both streams are redirected, so both must be read. A redirected pipe nobody drains fills
+        // at about four kilobytes and then blocks the writer inside its next Console call — the
+        // target stops looping, the log stops growing, and every wait below times out on a process
+        // that is alive and stuck rather than slow. The agent writes to stderr on any apply it
+        // cannot complete, which is why this only ever bit under load.
+        process.OutputDataReceived += (_, e) => Capture(e.Data);
+        process.ErrorDataReceived += (_, e) => Capture(e.Data);
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
+        return process;
+    }
+
+    private void Capture(string? line)
+    {
+        if (line is null)
+            return;
+
+        lock (_targetOutput)
+            _targetOutput.AppendLine(line);
+    }
+
+    /// <summary>What the target had to say, so a wait that expires says why rather than just that
+    /// it did.</summary>
+    private string Diagnose(Process target)
+    {
+        string captured;
+        lock (_targetOutput)
+            captured = _targetOutput.ToString();
+
+        string state = target.HasExited
+            ? $"The target exited with code {target.ExitCode}."
+            : "The target was still running.";
+
+        return captured.Length == 0
+            ? $"\n{state} It wrote nothing."
+            : $"\n{state} It wrote:\n{captured}";
     }
 
     private static async Task<bool> BuildAsync(string csproj)

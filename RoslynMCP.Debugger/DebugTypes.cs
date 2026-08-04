@@ -43,6 +43,11 @@ public enum DebugEventKind
     /// <summary>A bound breakpoint lost its module (unload or app-domain recycle) and is pending
     /// again until the module reloads.</summary>
     BreakpointUnbound,
+
+    /// <summary>The engine talking about itself — symbols it could not find, a breakpoint it could
+    /// not bind, an edit the runtime refused. Split from <see cref="Output"/>, which is the
+    /// debuggee's own console, so a client can route the two to different places.</summary>
+    Diagnostic,
 }
 
 /// <summary>A span of source, used to report where a breakpoint was requested versus where it bound.</summary>

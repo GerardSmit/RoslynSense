@@ -1,15 +1,15 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Text.Json;
 using NuGet.Common;
-using NuGet.Configuration;
-using NuGet.Protocol;
 using NuGet.Protocol.Core.Types;
 using NuGet.Versioning;
 using RoslynMCP.Services.ProjectModel;
 
 namespace RoslynMCP.Services.Packages;
 
+/// <param name="InstalledVersion">
+/// The highest version installed anywhere in the solution, or <c>null</c> when the package is not
+/// installed. <paramref name="InstalledVersions"/> carries the rest when projects disagree.
+/// </param>
 public sealed record PackageSummary(
     string Id,
     string Version,
@@ -19,7 +19,12 @@ public sealed record PackageSummary(
     string? IconUrl,
     bool Deprecated,
     bool Vulnerable,
-    string? InstalledVersion);
+    string? InstalledVersion,
+    IReadOnlyList<string>? InstalledVersions = null,
+    bool IsCentrallyManaged = false,
+    bool IsGlobalPackageReference = false,
+    string? VersionSource = null,
+    string? SourceName = null);
 
 public sealed record ProjectPackages(
     string ProjectPath,
@@ -39,115 +44,113 @@ public sealed record PackageOperationResult(bool Success, string Message);
 /// NuGet.config credentials and credential providers, which a webview cannot supply and should
 /// never see. Mutations shell the dotnet CLI so that authentication, Central Package
 /// Management, and lock files behave exactly as they do on the command line.
+///
+/// Feed access itself is <see cref="NuGetFeedContext"/>'s job, so that source mapping, per-source
+/// failure reporting and credentials are decided in one place rather than per call site.
 /// </summary>
 public static class NuGetService
 {
-    private static readonly SourceCacheContext s_cache = new();
-    private static readonly ConcurrentDictionary<string, SourceRepository> s_repositories = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Configured sources for the loaded solution, disabled ones included.</summary>
+    public static IReadOnlyList<PackageSourceInfo> Sources() => NuGetFeedContext.Sources();
 
-    /// <summary>Configured, enabled sources for the loaded solution.</summary>
-    public static IReadOnlyList<string> Sources()
-    {
-        try
-        {
-            var settings = LoadSettings();
-            return new PackageSourceProvider(settings)
-                .LoadPackageSources()
-                .Where(source => source.IsEnabled)
-                .Select(source => source.Name)
-                .ToList();
-        }
-        catch (Exception ex)
-        {
-            ServiceLog.Warn($"Could not read NuGet sources: {ex.Message}", key: "nuget-sources");
-            return [];
-        }
-    }
-
-    public static async Task<IReadOnlyList<PackageSummary>> SearchAsync(
-        string query, bool includePrerelease, int skip, int take, CancellationToken ct)
+    public static async Task<FeedResults<PackageSummary>> SearchAsync(
+        string query, bool includePrerelease, int skip, int take, string? source, CancellationToken ct)
     {
         var installed = await InstalledVersionsAsync(ct);
-        var results = new List<PackageSummary>();
+        using var cache = NuGetFeedContext.RentCache();
 
-        foreach (var repository in Repositories())
-        {
-            try
+        var found = await NuGetFeedContext.FanOutAsync<(PackageSummary Summary, NuGetVersion Version)>(
+            packageId: null,
+            async (repository, token) =>
             {
-                var search = await repository.GetResourceAsync<PackageSearchResource>(ct);
-                if (search is null)
-                    continue;
-
-                var found = await search.SearchAsync(
-                    query, new SearchFilter(includePrerelease), skip, take, NullLogger.Instance, ct);
-
-                foreach (var package in found)
+                if (source is { Length: > 0 } &&
+                    !repository.PackageSource.Name.Equals(source, StringComparison.OrdinalIgnoreCase))
                 {
-                    results.Add(new PackageSummary(
-                        package.Identity.Id,
-                        package.Identity.Version.ToNormalizedString(),
-                        package.Authors,
-                        package.Description,
-                        package.DownloadCount is { } downloads ? (long)downloads : null,
-                        package.IconUrl?.ToString(),
-                        Deprecated: false,
-                        Vulnerable: false,
-                        installed.GetValueOrDefault(package.Identity.Id)));
+                    return [];
                 }
-            }
-            catch (Exception ex)
-            {
-                ServiceLog.Warn(
-                    $"Search failed on '{repository.PackageSource.Name}': {ex.Message}",
-                    key: $"nuget-search:{repository.PackageSource.Name}");
-            }
-        }
 
-        return results
-            .GroupBy(p => p.Id, StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.First())
+                var search = await repository.GetResourceAsync<PackageSearchResource>(token);
+                if (search is null)
+                    return [];
+
+                var results = await search.SearchAsync(
+                    query, new SearchFilter(includePrerelease), skip, take, NullLogger.Instance, token);
+
+                return results.Select(package =>
+                {
+                    var versions = installed.GetValueOrDefault(package.Identity.Id);
+                    return (
+                        new PackageSummary(
+                            package.Identity.Id,
+                            package.Identity.Version.ToNormalizedString(),
+                            package.Authors,
+                            package.Description,
+                            package.DownloadCount is { } downloads ? (long)downloads : null,
+                            package.IconUrl?.ToString(),
+                            Deprecated: false,
+                            Vulnerable: false,
+                            InstalledVersion: versions?.FirstOrDefault(),
+                            InstalledVersions: versions,
+                            SourceName: repository.PackageSource.Name),
+                        package.Identity.Version);
+                });
+            },
+            ct);
+
+        // Several feeds can carry the same id; the highest version wins rather than whichever
+        // feed happened to answer first.
+        var packages = found.Results
+            .GroupBy(entry => entry.Summary.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderByDescending(entry => entry.Version).First().Summary)
             .ToList();
+
+        return new FeedResults<PackageSummary>(packages, found.Feeds);
     }
 
-    public static async Task<IReadOnlyList<string>> VersionsAsync(
-        string id, bool includePrerelease, CancellationToken ct)
+    public static async Task<FeedResults<string>> VersionsAsync(
+        string id, bool includePrerelease, bool refresh, CancellationToken ct)
     {
-        var versions = new List<NuGetVersion>();
+        var all = await AllVersionsAsync(id, includePrerelease, refresh, ct);
 
-        foreach (var repository in Repositories())
-        {
-            try
+        return new FeedResults<string>(
+            all.Results.Select(v => v.ToNormalizedString()).ToList(),
+            all.Feeds);
+    }
+
+    /// <summary>Every version of a package the configured feeds know about, newest first.</summary>
+    internal static async Task<FeedResults<NuGetVersion>> AllVersionsAsync(
+        string id, bool includePrerelease, bool refresh, CancellationToken ct)
+    {
+        using var cache = NuGetFeedContext.RentCache(refresh);
+
+        var found = await NuGetFeedContext.FanOutAsync<NuGetVersion>(
+            id,
+            async (repository, token) =>
             {
-                var finder = await repository.GetResourceAsync<FindPackageByIdResource>(ct);
-                if (finder is null)
-                    continue;
+                var finder = await repository.GetResourceAsync<FindPackageByIdResource>(token);
+                return finder is null
+                    ? []
+                    : await finder.GetAllVersionsAsync(id, cache, NullLogger.Instance, token);
+            },
+            ct);
 
-                versions.AddRange(await finder.GetAllVersionsAsync(id, s_cache, NullLogger.Instance, ct));
-            }
-            catch (Exception ex)
-            {
-                ServiceLog.Warn($"Version lookup failed for '{id}': {ex.Message}", key: $"nuget-versions:{id}");
-            }
-        }
-
-        return versions
+        var versions = found.Results
             .Where(v => includePrerelease || !v.IsPrerelease)
             .Distinct()
             .OrderByDescending(v => v)
-            .Select(v => v.ToNormalizedString())
             .ToList();
-    }
 
-    /// <summary>The download cache, shared so packages.config installs reuse it.</summary>
-    internal static SourceCacheContext Cache => s_cache;
+        return new FeedResults<NuGetVersion>(versions, found.Feeds);
+    }
 
     /// <summary>
     /// The first feed that can hand over a .nupkg, for the packages.config installer — which
     /// unpacks the package itself rather than letting the CLI do it.
     /// </summary>
-    internal static async Task<FindPackageByIdResource?> FindPackageResourceAsync(CancellationToken ct)
+    internal static async Task<FindPackageByIdResource?> FindPackageResourceAsync(
+        string? packageId, CancellationToken ct)
     {
-        foreach (var repository in Repositories())
+        foreach (var repository in NuGetFeedContext.Repositories(packageId))
         {
             try
             {
@@ -163,16 +166,20 @@ public static class NuGetService
     }
 
     /// <summary>Direct package references per project, with their resolved versions.</summary>
+    /// <remarks>
+    /// The project list comes from <see cref="SolutionProjectIndex"/> rather than from Roslyn.
+    /// A daemon that has just started has loaded nothing — the Solution Explorer is populated from
+    /// the .sln on disk — so asking Roslyn returns an empty solution and the panel reports that
+    /// there are no projects while the tree plainly shows six. Reading packages needs MSBuild
+    /// evaluation, not a compilation, so there is nothing to wait for.
+    /// </remarks>
     public static async Task<IReadOnlyList<ProjectPackages>> InstalledAsync(CancellationToken ct)
     {
-        var solution = WorkspaceService.TryGetMostRecentSolution();
-        if (solution is null)
-            return [];
-
         var result = new List<ProjectPackages>();
-        foreach (var project in solution.Projects)
+
+        foreach (string path in SolutionProjectIndex.ProjectPaths())
         {
-            if (project.FilePath is not { Length: > 0 } path)
+            if (!File.Exists(path))
                 continue;
 
             // A packages.config project has no PackageReference items at all, so reading only the
@@ -195,44 +202,20 @@ public static class NuGetService
                     .Where(p => !p.IsImplicit)
                     .Select(p => new PackageSummary(
                         p.Id, p.Version ?? "", Authors: null, Description: null, Downloads: null,
-                        IconUrl: null, Deprecated: false, Vulnerable: false, InstalledVersion: p.Version))
+                        IconUrl: null, Deprecated: false, Vulnerable: false, InstalledVersion: p.Version,
+                        InstalledVersions: p.Version is { Length: > 0 } ? [p.Version] : null,
+                        IsCentrallyManaged: p.IsCentrallyManaged,
+                        IsGlobalPackageReference: p.IsGlobalPackageReference,
+                        VersionSource: p.VersionSource))
                     .ToList();
             }
 
-            result.Add(new ProjectPackages(path, project.Name, packages));
+            result.Add(new ProjectPackages(path, Path.GetFileNameWithoutExtension(path), packages));
         }
 
         return result
             .DistinctBy(p => p.ProjectPath, StringComparer.OrdinalIgnoreCase)
             .ToList();
-    }
-
-    /// <summary>Installed packages that have a newer version on a configured feed.</summary>
-    public static async Task<IReadOnlyList<PackageSummary>> UpdatesAsync(
-        bool includePrerelease, CancellationToken ct)
-    {
-        var installed = await InstalledVersionsAsync(ct);
-        var updates = new List<PackageSummary>();
-
-        foreach (var (id, current) in installed)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            var versions = await VersionsAsync(id, includePrerelease, ct);
-            if (versions.Count == 0)
-                continue;
-
-            if (NuGetVersion.TryParse(versions[0], out var latest) &&
-                NuGetVersion.TryParse(current, out var installedVersion) &&
-                latest > installedVersion)
-            {
-                updates.Add(new PackageSummary(
-                    id, latest.ToNormalizedString(), null, null, null, null,
-                    Deprecated: false, Vulnerable: false, InstalledVersion: current));
-            }
-        }
-
-        return updates;
     }
 
     /// <summary>
@@ -257,10 +240,11 @@ public static class NuGetService
     }
 
     public static Task<PackageOperationResult> InstallAsync(
-        string id, string? version, IReadOnlyList<string> projectPaths, CancellationToken ct) =>
+        string id, string? version, IReadOnlyList<string> projectPaths, CancellationToken ct,
+        PackageMutationScope? scope = null) =>
         PerProjectAsync(
             projectPaths,
-            legacy: project => PackagesConfigService.InstallAsync(project, id, version, ct),
+            legacy: (project, batch) => PackagesConfigService.InstallAsync(project, id, version, ct, batch),
             modern: project =>
             {
                 var args = new List<string> { "add", project, "package", id };
@@ -271,15 +255,16 @@ public static class NuGetService
                 }
                 return args;
             },
-            $"Installed {id}", ct);
+            $"Installed {id}", ct, scope);
 
     public static Task<PackageOperationResult> UninstallAsync(
-        string id, IReadOnlyList<string> projectPaths, CancellationToken ct) =>
+        string id, IReadOnlyList<string> projectPaths, CancellationToken ct,
+        PackageMutationScope? scope = null) =>
         PerProjectAsync(
             projectPaths,
-            legacy: project => PackagesConfigService.UninstallAsync(project, id, ct),
+            legacy: (project, batch) => PackagesConfigService.UninstallAsync(project, id, ct, batch),
             modern: project => ["remove", project, "package", id],
-            $"Removed {id}", ct);
+            $"Removed {id}", ct, scope);
 
     /// <summary>
     /// Splits a package operation by project format: packages.config projects are handled here,
@@ -289,17 +274,27 @@ public static class NuGetService
     /// The CLI rejects a packages.config project outright, so routing by format is the difference
     /// between the panel working on a legacy solution and reporting an opaque failure.
     /// </remarks>
+    /// <remarks>
+    /// The legacy callback takes the scope rather than closing over one, because the scope this
+    /// method actually uses may be created here: a lambda built by the caller would capture the
+    /// caller's <c>null</c>, and the packages.config path would then evict the workspace per
+    /// project and never fire the editor refresh at all.
+    /// </remarks>
     private static async Task<PackageOperationResult> PerProjectAsync(
         IReadOnlyList<string> projectPaths,
-        Func<string, Task<PackageOperationResult>> legacy,
+        Func<string, PackageMutationScope, Task<PackageOperationResult>> legacy,
         Func<string, IReadOnlyList<string>> modern,
         string successMessage,
-        CancellationToken ct)
+        CancellationToken ct,
+        PackageMutationScope? scope)
     {
         // Splitting an empty list leaves both halves empty, which would otherwise read as
         // "everything succeeded" rather than "nothing was selected".
         if (projectPaths.Count == 0)
             return new PackageOperationResult(false, "No project selected.");
+
+        await using var owned = scope is null ? new PackageMutationScope(ct) : null;
+        var effective = scope ?? owned!;
 
         var legacyProjects = projectPaths.Where(PackagesConfigService.Uses).ToList();
         var modernProjects = projectPaths.Except(legacyProjects, StringComparer.OrdinalIgnoreCase).ToList();
@@ -308,14 +303,16 @@ public static class NuGetService
 
         foreach (string project in legacyProjects)
         {
-            var result = await legacy(project);
-            if (!result.Success)
+            var result = await legacy(project, effective);
+            if (result.Success)
+                effective.Touch(project);
+            else
                 failures.Add($"{Path.GetFileName(project)}: {result.Message}");
         }
 
         if (modernProjects.Count > 0)
         {
-            var result = await RunPerProjectAsync(modernProjects, modern, successMessage, ct);
+            var result = await RunPerProjectAsync(modernProjects, modern, successMessage, ct, effective);
             if (!result.Success)
                 failures.Add(result.Message);
         }
@@ -349,7 +346,8 @@ public static class NuGetService
         IReadOnlyList<string> projectPaths,
         Func<string, IReadOnlyList<string>> argumentsFor,
         string successMessage,
-        CancellationToken ct)
+        CancellationToken ct,
+        PackageMutationScope scope)
     {
         if (projectPaths.Count == 0)
             return new PackageOperationResult(false, "No project selected.");
@@ -365,18 +363,15 @@ public static class NuGetService
             if (exitCode != 0)
                 failures.Add($"{Path.GetFileName(project)}: {FirstLine(output)}");
 
-            ProjectEvaluationService.Evict(project);
+            scope.Touch(project);
         }
-
-        // The package set changed, so every cached snapshot and analyzer result is stale.
-        await WorkspaceService.EvictAllAsync(ct);
 
         return failures.Count == 0
             ? new PackageOperationResult(true, $"{successMessage} in {projectPaths.Count} project(s).")
             : new PackageOperationResult(false, string.Join("; ", failures));
     }
 
-    private static async Task<(int ExitCode, string Output)> RunDotnetAsync(
+    internal static async Task<(int ExitCode, string Output)> RunDotnetAsync(
         IReadOnlyList<string> arguments, CancellationToken ct)
     {
         var startInfo = new ProcessStartInfo("dotnet")
@@ -393,130 +388,72 @@ public static class NuGetService
         if (process is null)
             return (-1, "Failed to start dotnet.");
 
-        string stdout = await process.StandardOutput.ReadToEndAsync(ct);
-        string stderr = await process.StandardError.ReadToEndAsync(ct);
+        // Both pipes are drained at once. Reading one to EOF first deadlocks as soon as the child
+        // fills the other pipe's buffer — which a failing solution-wide restore easily does.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+        await Task.WhenAll(stdoutTask, stderrTask);
         await process.WaitForExitAsync(ct);
+
+        string stdout = await stdoutTask;
+        string stderr = await stderrTask;
 
         return (process.ExitCode, stderr.Length > 0 ? stderr : stdout);
     }
 
-    private static string FirstLine(string text) =>
+    internal static string FirstLine(string text) =>
         text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .FirstOrDefault(line => line.Contains("error", StringComparison.OrdinalIgnoreCase))
         ?? text.Split('\n').FirstOrDefault()?.Trim()
         ?? "failed";
 
-    /// <summary>Package id → the version installed somewhere in the solution.</summary>
-    private static async Task<Dictionary<string, string>> InstalledVersionsAsync(CancellationToken ct)
+    /// <summary>
+    /// Package id to every version installed in the solution, highest first.
+    /// </summary>
+    /// <remarks>
+    /// Plural on purpose: a solution mid-migration references the same package at two versions,
+    /// and reporting one of them — whichever project enumeration reached first — made the Browse
+    /// tab's "installed" badge nondeterministic.
+    /// </remarks>
+    internal static async Task<Dictionary<string, IReadOnlyList<string>>> InstalledVersionsAsync(
+        CancellationToken ct)
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var byId = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var project in await InstalledAsync(ct))
         {
             foreach (var package in project.Packages)
-                map.TryAdd(package.Id, package.Version);
-        }
-        return map;
-    }
-
-    private static IEnumerable<SourceRepository> Repositories()
-    {
-        PackageSource[] sources;
-        try
-        {
-            sources = new PackageSourceProvider(LoadSettings())
-                .LoadPackageSources()
-                .Where(source => source.IsEnabled)
-                .ToArray();
-        }
-        catch (Exception ex)
-        {
-            ServiceLog.Warn($"Could not load NuGet sources: {ex.Message}", key: "nuget-load");
-            yield break;
-        }
-
-        foreach (var source in sources)
-        {
-            yield return s_repositories.GetOrAdd(
-                source.Source, _ => Repository.Factory.GetCoreV3(source));
-        }
-    }
-
-    private static ISettings LoadSettings()
-    {
-        string? root = Path.GetDirectoryName(WorkspaceService.TryGetMostRecentSolution()?.FilePath)
-            ?? Directory.GetCurrentDirectory();
-        return Settings.LoadDefaultSettings(root);
-    }
-
-    /// <summary>
-    /// Reads a package icon and returns it as a data URI. The webview's CSP forbids remote
-    /// images outright, so proxying here is what makes icons possible at all; oversized ones
-    /// are dropped rather than inlined.
-    /// </summary>
-    public static async Task<string?> IconDataUriAsync(string url, CancellationToken ct)
-    {
-        const int maxBytes = 256 * 1024;
-
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
-            uri.Scheme is not ("http" or "https"))
-            return null;
-
-        try
-        {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
-            using var response = await client.GetAsync(uri, ct);
-            if (!response.IsSuccessStatusCode)
-                return null;
-
-            if (response.Content.Headers.ContentLength is > maxBytes)
-                return null;
-
-            byte[] bytes = await response.Content.ReadAsByteArrayAsync(ct);
-            if (bytes.Length > maxBytes)
-                return null;
-
-            string mediaType = response.Content.Headers.ContentType?.MediaType ?? "image/png";
-            return $"data:{mediaType};base64,{Convert.ToBase64String(bytes)}";
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    /// <summary>Transitive dependencies from project.assets.json — resolved without a restore,
-    /// and recording which direct reference pulled each one in.</summary>
-    public static IReadOnlyList<(string Id, string Version, string BroughtInBy)> Transitive(string projectPath)
-    {
-        string assets = Path.Combine(Path.GetDirectoryName(projectPath) ?? "", "obj", "project.assets.json");
-        if (!File.Exists(assets))
-            return [];
-
-        try
-        {
-            using var document = JsonDocument.Parse(File.ReadAllText(assets));
-            if (!document.RootElement.TryGetProperty("targets", out var targets))
-                return [];
-
-            var result = new List<(string, string, string)>();
-            foreach (var target in targets.EnumerateObject())
             {
-                foreach (var package in target.Value.EnumerateObject())
-                {
-                    var parts = package.Name.Split('/');
-                    if (parts.Length != 2 || !package.Value.TryGetProperty("dependencies", out var dependencies))
-                        continue;
+                if (package.Version is not { Length: > 0 })
+                    continue;
 
-                    foreach (var dependency in dependencies.EnumerateObject())
-                        result.Add((dependency.Name, dependency.Value.GetString() ?? "", parts[0]));
-                }
-                break; // one target framework is enough for a dependency listing
+                if (!byId.TryGetValue(package.Id, out var versions))
+                    byId[package.Id] = versions = new SortedSet<string>(VersionOrder.DescendingInstance);
+                versions.Add(package.Version);
             }
-            return result;
         }
-        catch
+
+        return byId.ToDictionary(
+            entry => entry.Key,
+            entry => (IReadOnlyList<string>)entry.Value.ToList(),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Highest first, with unparseable versions sorted last rather than dropped.</summary>
+    private sealed class VersionOrder : IComparer<string>
+    {
+        public static readonly VersionOrder DescendingInstance = new();
+
+        public int Compare(string? x, string? y)
         {
-            return [];
+            bool xOk = NuGetVersion.TryParse(x, out var left);
+            bool yOk = NuGetVersion.TryParse(y, out var right);
+
+            if (xOk && yOk)
+                return right.CompareTo(left);
+            if (xOk != yOk)
+                return xOk ? -1 : 1;
+            return string.CompareOrdinal(x, y);
         }
     }
 }

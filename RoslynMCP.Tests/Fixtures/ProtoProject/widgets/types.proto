@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+option csharp_namespace = "ProtoFixture.Widgets";
+
+package widgets;
+
+import "common/types.proto";
+import "google/protobuf/timestamp.proto";
+
+message Widget {
+  int64 id = 1;
+  common.UUID uuid = 2;
+  string label = 3;
+  common.Channel channel = 4;
+  google.protobuf.Timestamp created_at = 5;
+
+  oneof image {
+    string image_url = 6;
+    string image_hash = 7;
+  }
+
+  map<string, string> attributes = 8;
+
+  message Placement {
+    int32 row = 1;
+    int32 column = 2;
+  }
+
+  enum Visibility {
+    VISIBILITY_UNSPECIFIED = 0;
+    VISIBILITY_PRIVATE = 1;
+    VISIBILITY_PUBLIC = 2;
+  }
+
+  Placement placement = 9;
+  Visibility visibility = 10;
+}
+
+message GroupMember {
+  int64 widget_id = 1;
+  string role = 2;
+}
+
+message GroupMemberList {
+  repeated GroupMember members = 1;
+}
+
+message Note {
+  string note = 1;
+  google.protobuf.Timestamp written_at = 2;
+  common.Channel channel = 3;
+}

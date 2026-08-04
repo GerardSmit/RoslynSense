@@ -1,5 +1,7 @@
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
+using RoslynMCP.Languages;
+using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
@@ -88,6 +90,63 @@ public class WorkspaceDiagnosticsTests : IDisposable
 
         // Re-reporting an unchanged world on every sweep is what makes this feature unusable.
         Assert.Contains(second.Items, item => item is WorkspaceUnchangedDocumentDiagnosticReport);
+    }
+
+    [Fact]
+    public async Task MarkupIsSweptWithoutAnyDocumentBeingOpen()
+    {
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "solution";
+        await UseWebFormsAsync();
+
+        var report = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(), default);
+
+        // The point of the sweep: a markup file is not a Roslyn document, so an OnClick= naming a
+        // handler that does not exist reached Problems only while the page was open.
+        Assert.False(OpenDocumentStore.IsOpen(FixturePaths.EventWiringAspxFile));
+
+        var markup = Assert.Single(
+            report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>(),
+            r => r.Uri.EndsWith("EventWiring.aspx", StringComparison.OrdinalIgnoreCase));
+
+        var diagnostic = Assert.Single(markup.Items, d => d.Code == "WFC0008");
+        Assert.Contains("MissingHandler", diagnostic.Message);
+    }
+
+    [Fact]
+    public async Task UnchangedMarkupAnswersUnchangedOnASecondSweep()
+    {
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "solution";
+        await UseWebFormsAsync();
+
+        var first = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(), default);
+
+        var previous = first.Items
+            .OfType<WorkspaceFullDocumentDiagnosticReport>()
+            .Where(r => r.ResultId is not null && r.Uri.EndsWith(".aspx", StringComparison.OrdinalIgnoreCase))
+            .Select(r => new PreviousResultId(r.Uri, r.ResultId!))
+            .ToArray();
+        Assert.NotEmpty(previous);
+
+        var second = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(previous), default);
+
+        // Re-parsing every page in a site on every sweep is what makes the feature unusable, so
+        // the result id has to survive a round trip through the client.
+        Assert.Contains(
+            second.Items.OfType<WorkspaceUnchangedDocumentDiagnosticReport>(),
+            r => r.Uri.EndsWith("EventWiring.aspx", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// The sweep asks the registered packs. Calling the handler directly means no host has built a
+    /// registry, so this stands in for one.
+    /// </summary>
+    private static async Task UseWebFormsAsync()
+    {
+        new LanguageRegistry([new WebFormsLanguage(new MarkdownFormatter())]).Publish();
+        await RoslynTestHelpers.OpenProjectAsync(FixturePaths.AspxProjectFile);
     }
 
     [Fact]

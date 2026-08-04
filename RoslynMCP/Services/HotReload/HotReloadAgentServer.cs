@@ -23,7 +23,13 @@ namespace RoslynMCP.Services.HotReload;
 internal sealed class HotReloadAgentServer : IDisposable
 {
     private const int OpApplyUpdate = 1;
-    private const int ExpectedProtocol = 1;
+    private const int ExpectedProtocol = 2;
+
+    /// <summary>How long an agent gets to answer an apply. Without a bound, an app suspended by
+    /// a debugger mid-apply parks the whole apply-on-save loop forever.</summary>
+    private static readonly TimeSpan ApplyTimeout = TimeSpan.FromSeconds(30);
+
+    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>The environment variable the agent reads to find this pipe. Must match
     /// <c>RoslynMCP.HotReloadAgent</c>, which cannot reference this assembly.</summary>
@@ -47,7 +53,6 @@ internal sealed class HotReloadAgentServer : IDisposable
         string[] Capabilities,
         NamedPipeServerStream Pipe,
         BinaryReader Reader,
-        BinaryWriter Writer,
         SemaphoreSlim Gate);
 
     private HotReloadAgentServer(string pipeName)
@@ -111,6 +116,12 @@ internal sealed class HotReloadAgentServer : IDisposable
         {
             return false;
         }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            // Access denied querying it — a process we cannot ask about is more likely alive
+            // than gone, and dropping a live agent loses the connection for good.
+            return true;
+        }
     }
 
     /// <summary>
@@ -124,6 +135,10 @@ internal sealed class HotReloadAgentServer : IDisposable
     /// </remarks>
     public IReadOnlyList<string> Capabilities()
     {
+        // Reap first, like Targets and ApplyAsync: an agent whose process exited must not keep
+        // voting its old runtime's ceiling into every future edit session.
+        Reap();
+
         var agents = _agents.Values.ToList();
         if (agents.Count == 0)
             return [];
@@ -162,6 +177,13 @@ internal sealed class HotReloadAgentServer : IDisposable
                     errors.Add($"{agent.Name} (pid {agent.ProcessId}): {error}");
                 }
             }
+            catch (OperationCanceledException)
+            {
+                // The request may already be on the wire, so the connection is mid-frame and
+                // cannot be reused: keeping it would have the next apply read this one's answer.
+                Drop(agent);
+                throw;
+            }
             catch (Exception ex) when (ex is IOException or EndOfStreamException or ObjectDisposedException)
             {
                 ok = false;
@@ -170,7 +192,7 @@ internal sealed class HotReloadAgentServer : IDisposable
             }
             finally
             {
-                agent.Gate.Release();
+                try { agent.Gate.Release(); } catch (ObjectDisposedException) { }
             }
 
             if (ok)
@@ -183,21 +205,50 @@ internal sealed class HotReloadAgentServer : IDisposable
     private static async Task<(bool Ok, string Error)> SendAsync(
         Agent agent, HotReloadDelta delta, CancellationToken cancellationToken)
     {
-        agent.Writer.Write(OpApplyUpdate);
-        agent.Writer.Write(delta.ModuleId.ToByteArray());
-        WriteBlock(agent.Writer, delta.MetadataDelta);
-        WriteBlock(agent.Writer, delta.IlDelta);
-        WriteBlock(agent.Writer, delta.PdbDelta);
-        agent.Writer.Flush();
+        // The frame is built in memory and written in one cancellable call, so a cancelled
+        // apply never leaves half a request on the wire.
+        using var frame = new MemoryStream();
+        using (var writer = new BinaryWriter(frame, Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write(OpApplyUpdate);
+            writer.Write(delta.ModuleId.ToByteArray());
+            WriteBlock(writer, delta.MetadataDelta);
+            WriteBlock(writer, delta.IlDelta);
+            WriteBlock(writer, delta.PdbDelta);
+            writer.Write(delta.UpdatedTypes.Length);
+            foreach (int token in delta.UpdatedTypes)
+                writer.Write(token);
+        }
 
-        // The agent answers on the same connection, so the read is the acknowledgement.
-        await Task.Yield();
-        cancellationToken.ThrowIfCancellationRequested();
+        await agent.Pipe.WriteAsync(frame.GetBuffer().AsMemory(0, (int)frame.Length), cancellationToken);
+        await agent.Pipe.FlushAsync(cancellationToken);
 
-        bool ok = agent.Reader.ReadBoolean();
-        string error = agent.Reader.ReadString();
-        return (ok, ok ? "" : error);
+        // The agent answers on the same connection, so the read is the acknowledgement. The
+        // read itself is synchronous; the bound is what makes it safe — on timeout or
+        // cancellation the caller drops the agent, which also unblocks this read.
+        var read = Task.Run(() =>
+        {
+            bool ok = agent.Reader.ReadBoolean();
+            string error = agent.Reader.ReadString();
+            return (Ok: ok, Error: error);
+        }, CancellationToken.None);
+
+        var completed = await Task.WhenAny(read, Task.Delay(ApplyTimeout, cancellationToken));
+        if (completed != read)
+        {
+            Observe(read);
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new IOException($"{agent.Name} (pid {agent.ProcessId}) did not answer the apply in time.");
+        }
+
+        var (okResult, errorResult) = await read;
+        return (okResult, okResult ? "" : errorResult);
     }
+
+    /// <summary>Keeps an abandoned read's eventual failure from surfacing as an unobserved
+    /// task exception when the pipe under it is torn down.</summary>
+    private static void Observe(Task task) =>
+        _ = task.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
 
     private static void WriteBlock(BinaryWriter writer, byte[] block)
     {
@@ -220,14 +271,19 @@ internal sealed class HotReloadAgentServer : IDisposable
             }
             catch (IOException)
             {
-                return;
+                // Transient (the name can be briefly busy while an old instance closes). Giving
+                // up would orphan every future launch: the pipe name is still handed to each of
+                // them, so a dead accept loop reads as "nothing is running" forever.
+                try { await Task.Delay(1000, cancellationToken); }
+                catch (OperationCanceledException) { return; }
+                continue;
             }
 
             try
             {
                 await pipe.WaitForConnectionAsync(cancellationToken);
             }
-            catch (Exception ex) when (ex is OperationCanceledException or IOException)
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException)
             {
                 await pipe.DisposeAsync();
                 if (cancellationToken.IsCancellationRequested)
@@ -235,43 +291,62 @@ internal sealed class HotReloadAgentServer : IDisposable
                 continue;
             }
 
-            Register(pipe);
+            // On its own task, under a timeout: a client that connects and never completes the
+            // handshake must not block every later registration.
+            _ = RegisterAsync(pipe, cancellationToken);
         }
     }
 
-    private void Register(NamedPipeServerStream pipe)
+    private async Task RegisterAsync(NamedPipeServerStream pipe, CancellationToken cancellationToken)
     {
+        var handshake = Task.Run(() => ReadHandshake(pipe), CancellationToken.None);
+
+        var completed = await Task.WhenAny(handshake, Task.Delay(HandshakeTimeout, cancellationToken));
+        if (completed != handshake)
+        {
+            Observe(handshake);
+            try { pipe.Dispose(); } catch { }
+            return;
+        }
+
         try
         {
-            var reader = new BinaryReader(pipe, Encoding.UTF8, leaveOpen: true);
-            var writer = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
-
-            int version = reader.ReadInt32();
-            if (version != ExpectedProtocol)
+            if (await handshake is not { } agent)
             {
                 pipe.Dispose();
                 return;
             }
 
-            int processId = reader.ReadInt32();
-            string name = reader.ReadString();
-            string[] capabilities = reader.ReadString()
-                .Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
             int connection = Interlocked.Increment(ref _nextConnection);
-            _agents[connection] = new Agent(
-                connection, processId, name, capabilities, pipe, reader, writer, new SemaphoreSlim(1, 1));
+            _agents[connection] = agent with { Connection = connection };
         }
-        catch (Exception ex) when (ex is IOException or EndOfStreamException)
+        catch
         {
-            pipe.Dispose();
+            try { pipe.Dispose(); } catch { }
         }
+    }
+
+    private static Agent? ReadHandshake(NamedPipeServerStream pipe)
+    {
+        var reader = new BinaryReader(pipe, Encoding.UTF8, leaveOpen: true);
+
+        int version = reader.ReadInt32();
+        if (version != ExpectedProtocol)
+            return null;
+
+        int processId = reader.ReadInt32();
+        string name = reader.ReadString();
+        string[] capabilities = reader.ReadString()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        return new Agent(Connection: 0, processId, name, capabilities, pipe, reader, new SemaphoreSlim(1, 1));
     }
 
     private void Drop(Agent agent)
     {
         _agents.TryRemove(agent.Connection, out _);
         try { agent.Pipe.Dispose(); } catch { }
+        try { agent.Gate.Dispose(); } catch { }
     }
 
     public void Dispose()

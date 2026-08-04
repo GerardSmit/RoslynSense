@@ -16,7 +16,7 @@ namespace RoslynMCP.Services;
 /// engine reports stops asynchronously, so this waits for the next stop after each resuming
 /// command rather than returning while the target is still running.
 /// </remarks>
-internal sealed class IcorDebugBackend : IDebugBackend
+internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 {
     /// <summary>How long to wait for the target to stop again after a resume.</summary>
     private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(60);
@@ -41,6 +41,14 @@ internal sealed class IcorDebugBackend : IDebugBackend
     {
         get { lock (_gate) return _currentFrame; }
     }
+
+    /// <inheritdoc />
+    public event Action<DebugNotice>? Notice;
+
+    /// <inheritdoc />
+    public long StopSequence => Interlocked.Read(ref _stopSequence);
+
+    private long _stopSequence;
 
     /// <summary>
     /// The engine for the current session, created when the target is known.
@@ -641,6 +649,12 @@ internal sealed class IcorDebugBackend : IDebugBackend
         _breakpoints.Clear();
         lock (_gate) _currentFrame = null;
         _state = DebuggerService.DebugState.NotStarted;
+
+        // Everything a second session on this instance would inherit. The pump is bound to the
+        // engine that just went away, so leaving it set means the next session never starts one
+        // and never sees a stop; leaving _exited set makes every resume answer "already exited".
+        _pump = null;
+        _exited = false;
         return "Debug session stopped.";
     }
 
@@ -670,6 +684,11 @@ internal sealed class IcorDebugBackend : IDebugBackend
     /// </summary>
     private void StartPump()
     {
+        // A pump left over from a session that failed or ended has completed, and `??=` would
+        // keep it — silently leaving the new session with no event stream at all.
+        if (_pump is { IsCompleted: true })
+            _pump = null;
+
         _pump ??= Task.Run(async () =>
         {
             await foreach (var e in Engine.Events.ReadAllAsync())
@@ -698,6 +717,10 @@ internal sealed class IcorDebugBackend : IDebugBackend
                         }
                         _selectedFrame = 0;
                         _state = DebuggerService.DebugState.Stopped;
+                        Interlocked.Increment(ref _stopSequence);
+                        // Raised before the release so a listener sees the stop even when nothing
+                        // was waiting for one — which is every breakpoint hit in a running app.
+                        Raise(DebugNoticeKind.Stopped, e, StopReason(e.Kind));
                         _stopped.Release();
                         break;
 
@@ -705,18 +728,75 @@ internal sealed class IcorDebugBackend : IDebugBackend
                         _exited = true;
                         _state = DebuggerService.DebugState.Exited;
                         lock (_gate) _currentFrame = null;
+                        Raise(DebugNoticeKind.Exited, e);
                         _stopped.Release();
                         break;
 
                     case DebugEventKind.Output:
-                        _output.Enqueue(e.Message);
-                        while (_output.Count > 200)
-                            _output.TryDequeue(out _);
+                        Remember(e.Message);
+                        Raise(DebugNoticeKind.Output, e);
+                        break;
+
+                    case DebugEventKind.Diagnostic:
+                        Remember(e.Message);
+                        Raise(DebugNoticeKind.Diagnostic, e);
+                        break;
+
+                    case DebugEventKind.Module:
+                        Raise(DebugNoticeKind.Module, e);
+                        break;
+
+                    case DebugEventKind.BreakpointBound:
+                        Raise(DebugNoticeKind.BreakpointBound, e);
+                        break;
+
+                    case DebugEventKind.BreakpointUnbound:
+                        Raise(DebugNoticeKind.BreakpointUnbound, e);
                         break;
                 }
             }
         });
     }
+
+    private void Remember(string line)
+    {
+        _output.Enqueue(line);
+        while (_output.Count > 200)
+            _output.TryDequeue(out _);
+    }
+
+    /// <summary>
+    /// Republishes an engine event as a notice. A handler that throws must not kill the pump —
+    /// the stops that follow it are what the whole session depends on.
+    /// </summary>
+    private void Raise(DebugNoticeKind kind, DebugEvent e, string? message = null)
+    {
+        if (Notice is not { } handler)
+            return;
+
+        try
+        {
+            handler(new DebugNotice(
+                kind,
+                message ?? e.Message,
+                e.FilePath,
+                (int)e.Line,
+                int.TryParse(e.BreakpointId, out var id) ? id : 0));
+        }
+        catch
+        {
+            // A client that cannot take a diagnostic still gets its breakpoints.
+        }
+    }
+
+    /// <summary>The engine's stop kind as DAP names it.</summary>
+    private static string StopReason(DebugEventKind kind) => kind switch
+    {
+        DebugEventKind.Step => "step",
+        DebugEventKind.Paused => "pause",
+        DebugEventKind.Exception => "exception",
+        _ => "breakpoint",
+    };
 
     private static string FormatPosition(DebuggerService.StoppedFrame frame)
     {

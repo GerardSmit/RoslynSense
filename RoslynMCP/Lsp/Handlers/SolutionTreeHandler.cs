@@ -1,5 +1,6 @@
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Packages;
 using RoslynMCP.Services.ProjectModel;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -31,6 +32,13 @@ internal static class SolutionTreeHandler
         {
             nodes = p.NodeId switch
             {
+                // A filter replaces the root with what matches, anywhere in the solution.
+                // Narrowing the root level by label stopped working the moment the tree grew a
+                // solution node: the only thing at that level is the solution's own name, so
+                // filtering by anything else emptied the tree instead of narrowing it.
+                null or "" when p.Filter is { Length: > 0 } query =>
+                    await SolutionTreeSearchHandler.SearchAsync(
+                        new SolutionTreeSearchParams(query, Limit: 200), ct),
                 null or "" => Roots(solutionPath),
                 var id when id.StartsWith("folder:", StringComparison.Ordinal) =>
                     await FolderChildrenAsync(id["folder:".Length..], p, ct),
@@ -38,12 +46,16 @@ internal static class SolutionTreeHandler
                     await DependencyGroupsAsync(id[..^DependenciesSuffix.Length], ct),
                 var id when id.StartsWith("group:", StringComparison.Ordinal) =>
                     await GroupChildrenAsync(id["group:".Length..], ct),
+                var id when id.StartsWith("package:", StringComparison.Ordinal) =>
+                    PackageChildren(id["package:".Length..]),
                 var id when id.StartsWith("project:", StringComparison.Ordinal) =>
                     await ProjectChildrenAsync(id["project:".Length..], p, ct),
                 var id when id.StartsWith("slnfolder:", StringComparison.Ordinal) =>
-                    SolutionFolderChildren(solutionPath, id["slnfolder:".Length..]),
+                    SolutionFolderChildren(solutionPath, id["slnfolder:".Length..], p),
                 var id when id.StartsWith("solution:", StringComparison.Ordinal) =>
-                    SolutionChildren(id["solution:".Length..]),
+                    SolutionChildren(id["solution:".Length..], p),
+                var id when id.StartsWith("file:", StringComparison.Ordinal) =>
+                    await NestedChildrenAsync(id["file:".Length..], p, ct),
                 _ => [],
             };
         }
@@ -59,7 +71,10 @@ internal static class SolutionTreeHandler
             return [];
         }
 
-        return Filter(nodes, p.Filter);
+        // The root already answered with matches from across the solution; filtering those by
+        // label again would drop the ones that ranked rather than matched literally. Every
+        // other level narrows in place, which is what filtering inside a project means.
+        return string.IsNullOrEmpty(p.NodeId) ? nodes : Filter(nodes, p.Filter);
     }
 
     /// <summary>
@@ -92,7 +107,46 @@ internal static class SolutionTreeHandler
         ];
     }
 
-    private static SolutionTreeNode[] SolutionChildren(string solutionPath)
+    /// <summary>
+    /// Every project in the solution, flat — what a "reference another project" picker needs.
+    /// </summary>
+    public static SolutionProjectInfo[] Projects()
+    {
+        return [.. SolutionProjectIndex.Projects()
+            .Select(p => new SolutionProjectInfo(p.Path, p.Name))];
+    }
+
+    /// <summary>
+    /// The framework assemblies a project could reference. Empty for anything but a .NET
+    /// Framework target, which is what the client uses to decide whether to offer the command.
+    /// </summary>
+    public static string[] AssemblyReferences(SolutionTreeSearchParams p) =>
+        [.. ProjectMutationService.AvailableAssemblyReferences(p.Query)];
+
+    /// <summary>What a new project can be created from, and for which frameworks.</summary>
+    public static async Task<ProjectTemplateChoices> TemplatesAsync(CancellationToken ct)
+    {
+        var templates = await ProjectTemplateService.ListAsync(ct);
+        var frameworks = await ProjectTemplateService.TargetFrameworksAsync(ct);
+
+        return new ProjectTemplateChoices(
+            templates.Select(t => new ProjectTemplateChoice(t.Name, t.ShortName, t.Tags)).ToArray(),
+            frameworks);
+    }
+
+    /// <summary>
+    /// Solution folders first, then projects, each run alphabetically.
+    /// </summary>
+    /// <remarks>
+    /// Without this the tree shows whatever order the <c>.sln</c> lists its <c>Project(...)</c>
+    /// blocks in, which is the order things happened to be added and reads as no order at all.
+    /// </remarks>
+    private static IEnumerable<SolutionNode> Ordered(IEnumerable<SolutionNode> nodes) =>
+        nodes
+            .OrderBy(n => n.IsFolder ? 0 : 1)
+            .ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase);
+
+    private static SolutionTreeNode[] SolutionChildren(string solutionPath, SolutionTreeParams p)
     {
         var all = SolutionFileService.Read(solutionPath);
         var roots = all.Where(n => n.ParentId is null).ToList();
@@ -101,10 +155,11 @@ internal static class SolutionTreeHandler
         if (roots.Count == 0)
             roots = all.ToList();
 
-        return roots.Select(node => ToNode(node, all)).ToArray();
+        return Ordered(roots).Select(node => ToNode(node, all, p)).ToArray();
     }
 
-    private static SolutionTreeNode[] SolutionFolderChildren(string? solutionPath, string folderId)
+    private static SolutionTreeNode[] SolutionFolderChildren(
+        string? solutionPath, string folderId, SolutionTreeParams p)
     {
         if (solutionPath is null)
             return [];
@@ -112,20 +167,28 @@ internal static class SolutionTreeHandler
         var all = SolutionFileService.Read(solutionPath);
         var folder = all.FirstOrDefault(n => n.Id == folderId);
 
-        var children = all.Where(n => n.ParentId == folderId).Select(n => ToNode(n, all));
-        var files = (folder?.Files ?? []).Select(file => new SolutionTreeNode(
-            Id: $"file:{file}",
-            Kind: SolutionNodeKind.SolutionItem,
-            Label: Path.GetFileName(file),
-            Description: null,
-            ResourceUri: LspConverters.PathToUri(file),
-            HasChildren: false,
-            ContextValue: SolutionNodeKind.SolutionItem));
+        var children = Ordered(all.Where(n => n.ParentId == folderId)).Select(n => ToNode(n, all, p));
+        var files = (folder?.Files ?? [])
+            .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+            .Select(file => new SolutionTreeNode(
+                // Not "file:", which is what the same file is called inside the project that
+                // compiles it. A file can be both, and the client keys tree items by id: two
+                // nodes sharing one id makes the second branch fail to render. The folder is
+                // part of the id because it is also the only way back to which folder listed
+                // it, which detaching the item needs.
+                Id: $"slnitem:{folderId}|{file}",
+                Kind: SolutionNodeKind.SolutionItem,
+                Label: Path.GetFileName(file),
+                Description: null,
+                ResourceUri: LspConverters.PathToUri(file),
+                HasChildren: false,
+                ContextValue: SolutionNodeKind.SolutionItem));
 
         return children.Concat(files).ToArray();
     }
 
-    private static SolutionTreeNode ToNode(SolutionNode node, IReadOnlyList<SolutionNode> all)
+    private static SolutionTreeNode ToNode(
+        SolutionNode node, IReadOnlyList<SolutionNode> all, SolutionTreeParams p)
     {
         if (node.IsFolder)
         {
@@ -140,20 +203,32 @@ internal static class SolutionTreeHandler
                 ContextValue: SolutionNodeKind.SolutionFolder);
         }
 
+        // An unloaded project is drawn but not evaluated: the point of unloading it is to stop
+        // paying for it, and expanding it is the expensive part.
+        bool unloaded = node.Path is { Length: > 0 } && IsUnloaded(node.Path, p);
+
         return new SolutionTreeNode(
             Id: $"project:{node.Path}",
             Kind: SolutionNodeKind.Project,
             Label: node.Name,
-            Description: null,
+            Description: unloaded ? "unloaded" : null,
             ResourceUri: node.Path is null ? null : LspConverters.PathToUri(node.Path),
-            HasChildren: true,
+            HasChildren: !unloaded,
             // The context value carries runnability so the row's Run and Debug actions are
             // shown only where they would do something. Classification is a file scan with an
             // mtime cache, which keeps the root listing free of MSBuild evaluation.
-            ContextValue: node.Path is { Length: > 0 } path && ProjectClassifier.Classify(path).IsRunnable
-                ? SolutionNodeKind.RunnableProject
-                : SolutionNodeKind.Project);
+            ContextValue: unloaded
+                ? SolutionNodeKind.UnloadedProject
+                : node.Path is { Length: > 0 } path && ProjectClassifier.Classify(path).IsRunnable
+                    ? SolutionNodeKind.RunnableProject
+                    : SolutionNodeKind.Project,
+            Dimmed: unloaded);
     }
+
+    private static bool IsUnloaded(string projectPath, SolutionTreeParams p) =>
+        p.UnloadedProjects is { Length: > 0 } unloaded
+        && unloaded.Any(path => string.Equals(
+            Path.GetFullPath(path), Path.GetFullPath(projectPath), StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Projects anywhere beneath a solution folder — the count Rider shows next to it.</summary>
     private static int CountProjects(string folderId, IReadOnlyList<SolutionNode> all)
@@ -167,10 +242,14 @@ internal static class SolutionTreeHandler
     private static async Task<SolutionTreeNode[]> ProjectChildrenAsync(
         string projectPath, SolutionTreeParams p, CancellationToken ct)
     {
+        bool isNetFramework =
+            ProjectClassifier.Classify(projectPath).DebugRuntime == DebugRuntime.NetFramework;
+
         var nodes = new List<SolutionTreeNode>
         {
             new($"{projectPath}{DependenciesSuffix}", SolutionNodeKind.Dependencies,
-                "Dependencies", null, null, HasChildren: true, SolutionNodeKind.Dependencies),
+                "Dependencies", null, null, HasChildren: true,
+                isNetFramework ? SolutionNodeKind.DependenciesNetFx : SolutionNodeKind.Dependencies),
         };
 
         nodes.AddRange(await FolderContentsAsync(
@@ -218,12 +297,59 @@ internal static class SolutionTreeHandler
         }
 
         Add(SolutionNodeKind.Packages, "Packages", evaluation.PackageReferences.Count);
+
+        // Everything restore resolved that the project never asked for by name. This is where a
+        // vulnerable dependency two levels down is actually visible; nothing in the project file
+        // mentions it.
+        Add(SolutionNodeKind.Transitive, "Transitive",
+            ProjectAssetsService.TransitiveOnly(projectPath, targetFramework: null).Count);
+
         Add(SolutionNodeKind.Projects, "Projects", evaluation.ProjectReferences.Count);
         Add(SolutionNodeKind.Assemblies, "Assemblies", evaluation.AssemblyReferences.Count);
         Add(SolutionNodeKind.Analyzers, "Analyzers", evaluation.Analyzers.Count);
 
         return groups.ToArray();
     }
+
+    /// <summary>
+    /// What one package brought in with it, from the resolved graph.
+    /// </summary>
+    /// <remarks>
+    /// One level only, and the children do not expand further. <c>project.assets.json</c> stores a
+    /// flat resolved set rather than a tree, so a deeper hierarchy would be a shape we invented —
+    /// and one that can loop, because two packages may legitimately depend on each other's
+    /// resolved versions.
+    /// </remarks>
+    private static SolutionTreeNode[] PackageChildren(string packageId)
+    {
+        var parts = packageId.Split('|');
+        if (parts.Length < 2)
+            return [];
+
+        return [.. ProjectAssetsService
+            .DependenciesOf(parts[0], parts[1], targetFramework: null)
+            .Select(package => TransitiveNode(parts[0], parts[1], package))
+            .OrderBy(node => node.Label, StringComparer.OrdinalIgnoreCase)];
+    }
+
+    /// <summary>
+    /// A transitive package node. The id carries the parent and the framework because the same
+    /// package legitimately appears under several parents and once per target framework, and the
+    /// tree requires ids to be unique across the whole view — a repeat makes the node fail to
+    /// render rather than merely look odd.
+    /// </summary>
+    private static SolutionTreeNode TransitiveNode(
+        string projectPath, string parent, TransitivePackage package) =>
+        new($"transitive:{projectPath}|{parent}|{package.TargetFramework}|{package.Id}",
+            SolutionNodeKind.TransitivePackage,
+            package.Id,
+            package.TargetFramework.Length > 0
+                ? $"{package.Version} · {package.TargetFramework}"
+                : package.Version,
+            ResourceUri: null,
+            HasChildren: false,
+            ContextValue: SolutionNodeKind.TransitivePackage,
+            Dimmed: true);
 
     private static async Task<SolutionTreeNode[]> GroupChildrenAsync(
         string groupId, CancellationToken ct)
@@ -235,9 +361,14 @@ internal static class SolutionTreeHandler
         string kind = parts[0];
         string projectPath = parts[1];
 
+        // A dependency list comes back in MSBuild evaluation order, which is neither the order
+        // they were written in nor one anybody can predict; by name is the only useful one.
+        static SolutionTreeNode[] Sorted(IEnumerable<SolutionTreeNode> nodes) =>
+            [.. nodes.OrderBy(n => n.Label, StringComparer.OrdinalIgnoreCase)];
+
         if (kind == SolutionNodeKind.Generator)
         {
-            return (await VirtualDocumentHandler.ListGeneratedAsync(projectPath, ct))
+            return Sorted((await VirtualDocumentHandler.ListGeneratedAsync(projectPath, ct))
                 .Select(file => new SolutionTreeNode(
                     Id: $"generated:{file.Uri}",
                     Kind: SolutionNodeKind.GeneratedFile,
@@ -245,15 +376,14 @@ internal static class SolutionTreeHandler
                     Description: file.Generator,
                     ResourceUri: file.Uri,
                     HasChildren: false,
-                    ContextValue: SolutionNodeKind.GeneratedFile))
-                .ToArray();
+                    ContextValue: SolutionNodeKind.GeneratedFile)));
         }
 
         var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
         if (evaluation is null)
             return [];
 
-        return kind switch
+        return Sorted(kind switch
         {
             SolutionNodeKind.Imports => evaluation.Imports
                 .Select(path => Leaf(SolutionNodeKind.Import, Path.GetFileName(path), path,
@@ -263,8 +393,19 @@ internal static class SolutionTreeHandler
             SolutionNodeKind.Packages => evaluation.PackageReferences
                 .Select(package => new SolutionTreeNode(
                     $"package:{projectPath}|{package.Id}", SolutionNodeKind.Package,
-                    package.Id, package.Version, ResourceUri: null, HasChildren: false,
+                    package.Id,
+                    // Under Central Package Management the version lives elsewhere, which is
+                    // worth saying here rather than showing a bare number with no context.
+                    package.IsCentrallyManaged ? $"{package.Version} (central)" : package.Version,
+                    ResourceUri: null,
+                    HasChildren: ProjectAssetsService
+                        .DependenciesOf(projectPath, package.Id, targetFramework: null).Count > 0,
                     ContextValue: SolutionNodeKind.Package, Dimmed: package.IsImplicit))
+                .ToArray(),
+
+            SolutionNodeKind.Transitive => ProjectAssetsService
+                .TransitiveOnly(projectPath, targetFramework: null)
+                .Select(package => TransitiveNode(projectPath, "", package))
                 .ToArray(),
 
             SolutionNodeKind.Projects => evaluation.ProjectReferences
@@ -283,8 +424,8 @@ internal static class SolutionTreeHandler
                 .Select(path => Leaf(SolutionNodeKind.Analyzer, Path.GetFileName(path), path, null))
                 .ToArray(),
 
-            _ => [],
-        };
+            _ => Array.Empty<SolutionTreeNode>(),
+        });
     }
 
     private static SolutionTreeNode Leaf(string kind, string label, string? path, string? description) =>
@@ -345,6 +486,89 @@ internal static class SolutionTreeHandler
         return map;
     }
 
+    /// <summary>
+    /// Whether a directory is worth showing in "Project items" mode.
+    /// </summary>
+    /// <remarks>
+    /// Anything the project compiles, obviously — but also a directory with no files under it
+    /// at all. A folder created from the tree starts empty, so requiring project content hid it
+    /// the moment it was made: the folder appeared to not be created. An empty directory is
+    /// something the user just asked for, and hiding it is never what they meant. A directory
+    /// that holds only excluded files is a different case and stays hidden.
+    /// </remarks>
+    private static bool HasProjectContent(
+        string directory, Dictionary<string, ProjectItemInfo> projectFiles)
+    {
+        string prefix = directory + Path.DirectorySeparatorChar;
+        if (projectFiles.Keys.Any(f => f.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        try
+        {
+            return !Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories).Any();
+        }
+        catch (Exception)
+        {
+            // Unreadable — treat it as having nothing to show rather than failing the listing.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The files nested under one file — <c>Default.aspx.cs</c> and
+    /// <c>Default.aspx.designer.cs</c> under <c>Default.aspx</c>.
+    /// </summary>
+    /// <remarks>
+    /// Nesting is worked out for a whole directory at once, so this recomputes it for the
+    /// file's own directory and takes that file's share. Without it a nested parent drew an
+    /// expand arrow that opened onto nothing: the children were counted when the folder was
+    /// listed and then never served, because the tree had no case for a file node at all.
+    /// </remarks>
+    private static async Task<SolutionTreeNode[]> NestedChildrenAsync(
+        string filePath, SolutionTreeParams p, CancellationToken ct)
+    {
+        string? directory = Path.GetDirectoryName(filePath);
+        if (directory is null || FindOwningProject(directory) is not { } projectPath)
+            return [];
+
+        var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
+        var projectFiles = ByPath(evaluation?.Items);
+
+        var files = Directory.EnumerateFiles(directory)
+            .Where(f => p.ShowAllFiles || projectFiles.ContainsKey(f))
+            .Where(f => p.ShowIgnored || !IsHidden(Path.GetFileName(f)))
+            .ToList();
+
+        var dependentUpon = projectFiles
+            .Where(pair => pair.Value.DependentUpon is not null)
+            .ToDictionary(pair => pair.Key, pair => pair.Value.DependentUpon!, StringComparer.OrdinalIgnoreCase);
+
+        var parent = FileNestingService.Nest(files, dependentUpon, p.FileNesting)
+            .FirstOrDefault(n => string.Equals(
+                Path.GetFullPath(n.FullPath), Path.GetFullPath(filePath), StringComparison.OrdinalIgnoreCase));
+
+        return parent is null
+            ? []
+            : [.. parent.Children.Select(child =>
+                FileNode(projectPath, child, projectFiles.ContainsKey(child.FullPath)))];
+    }
+
+    /// <summary>The nearest project above a directory.</summary>
+    private static string? FindOwningProject(string directory)
+    {
+        var current = new DirectoryInfo(directory);
+        while (current is not null)
+        {
+            string? project = Directory
+                .EnumerateFiles(current.FullName, "*.*proj", SearchOption.TopDirectoryOnly)
+                .FirstOrDefault(f => !f.EndsWith(".vcxproj", StringComparison.OrdinalIgnoreCase));
+            if (project is not null)
+                return project;
+            current = current.Parent;
+        }
+        return null;
+    }
+
     /// <summary>Directories and nested files directly under one directory of a project.</summary>
     private static async Task<SolutionTreeNode[]> FolderContentsAsync(
         string projectPath, string directory, SolutionTreeParams p, CancellationToken ct)
@@ -362,8 +586,7 @@ internal static class SolutionTreeHandler
             string name = Path.GetFileName(subdirectory);
             if (IsHidden(name) && !p.ShowIgnored)
                 continue;
-            if (!p.ShowAllFiles && !projectFiles.Keys.Any(f =>
-                    f.StartsWith(subdirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)))
+            if (!p.ShowAllFiles && !HasProjectContent(subdirectory, projectFiles))
                 continue;
 
             nodes.Add(new SolutionTreeNode(

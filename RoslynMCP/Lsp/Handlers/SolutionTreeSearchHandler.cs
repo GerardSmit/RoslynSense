@@ -23,7 +23,11 @@ internal static class SolutionTreeSearchHandler
         if (string.IsNullOrWhiteSpace(p.Query))
             return Task.FromResult<SolutionTreeNode[]>([]);
 
-        string? solutionPath = WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        // The same resolution the tree itself uses. Asking only for the most recently
+        // *loaded* solution meant search found nothing until Roslyn had opened one, so a
+        // freshly opened folder showed its projects in the tree and matched none of them.
+        string? solutionPath =
+            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
         if (solutionPath is null)
             return Task.FromResult<SolutionTreeNode[]>([]);
 
@@ -99,7 +103,8 @@ internal static class SolutionTreeSearchHandler
         SolutionTreeRevealParams p, CancellationToken ct)
     {
         string? path = LspConverters.UriToPath(p.Uri);
-        string? solutionPath = WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        string? solutionPath =
+            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
         if (path is null || solutionPath is null)
             return Task.FromResult(new SolutionTreeRevealResult([]));
 

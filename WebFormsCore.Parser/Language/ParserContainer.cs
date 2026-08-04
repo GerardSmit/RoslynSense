@@ -109,6 +109,13 @@ internal class ParserContainer
         Add(node);
     }
 
+    /// <summary>Adds a builder without turning the parent into a render method: the value is
+    /// resolved while parsing, so nothing of it reaches generated code.</summary>
+    public void AddExpressionBuilder(ExpressionBuilderNode node)
+    {
+        Add(node);
+    }
+
     private void SetParentAsRenderMethod()
     {
         if (Parent.RenderName != null) return;

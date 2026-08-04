@@ -7,6 +7,11 @@ namespace RoslynMCP.Lsp.Handlers;
 /// <summary>textDocument/prepareTypeHierarchy + typeHierarchy/supertypes/subtypes.
 /// Direct relationships only (each level expands on demand); metadata-only types are
 /// skipped because hierarchy items need a source location to navigate to.</summary>
+/// <remarks>
+/// Split the same way as <see cref="CallHierarchyHandler"/>: the parameter overloads resolve
+/// against the workspace, and the symbol overloads serve a language pack that resolved the
+/// position itself and needs its projection mapped out of the answer.
+/// </remarks>
 internal static class TypeHierarchyHandler
 {
     public static async Task<HierarchyItem[]> PrepareAsync(
@@ -17,10 +22,17 @@ internal static class TypeHierarchyHandler
             return Array.Empty<HierarchyItem>();
 
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
+        return Prepare(symbol, mapper: null);
+    }
+
+    /// <summary>The root item for an already-resolved symbol, empty for anything that is not a
+    /// type.</summary>
+    public static HierarchyItem[] Prepare(ISymbol? symbol, IHierarchySourceMapper? mapper)
+    {
         if (GetNamedType(symbol) is not { } type)
             return Array.Empty<HierarchyItem>();
 
-        var item = HierarchyItemFactory.ToItem(type);
+        var item = HierarchyItemFactory.ToItem(type, mapper);
         return item is null ? Array.Empty<HierarchyItem>() : [item];
     }
 
@@ -28,6 +40,11 @@ internal static class TypeHierarchyHandler
         TypeHierarchyItemParams p, CancellationToken ct)
     {
         var (symbol, _) = await HierarchyItemFactory.ResolveSymbolAsync(p.Item, ct);
+        return Supertypes(symbol, mapper: null);
+    }
+
+    public static HierarchyItem[] Supertypes(ISymbol? symbol, IHierarchySourceMapper? mapper)
+    {
         if (GetNamedType(symbol) is not { } type)
             return Array.Empty<HierarchyItem>();
 
@@ -37,7 +54,7 @@ internal static class TypeHierarchyHandler
         supertypes.AddRange(type.Interfaces);
 
         return supertypes
-            .Select(HierarchyItemFactory.ToItem)
+            .Select(t => HierarchyItemFactory.ToItem(t, mapper))
             .Where(i => i is not null)
             .Select(i => i!)
             .ToArray();
@@ -47,10 +64,18 @@ internal static class TypeHierarchyHandler
         TypeHierarchyItemParams p, CancellationToken ct)
     {
         var (symbol, document) = await HierarchyItemFactory.ResolveSymbolAsync(p.Item, ct);
-        if (GetNamedType(symbol) is not { } type || document is null)
+        if (document is null)
             return Array.Empty<HierarchyItem>();
 
-        var solution = document.Project.Solution;
+        return await SubtypesAsync(symbol, document.Project.Solution, mapper: null, ct);
+    }
+
+    public static async Task<HierarchyItem[]> SubtypesAsync(
+        ISymbol? symbol, Solution solution, IHierarchySourceMapper? mapper, CancellationToken ct)
+    {
+        if (GetNamedType(symbol) is not { } type)
+            return Array.Empty<HierarchyItem>();
+
         var subtypes = new List<INamedTypeSymbol>();
         if (type.TypeKind == TypeKind.Interface)
         {
@@ -66,7 +91,7 @@ internal static class TypeHierarchyHandler
         }
 
         return subtypes
-            .Select(HierarchyItemFactory.ToItem)
+            .Select(t => HierarchyItemFactory.ToItem(t, mapper))
             .Where(i => i is not null)
             .Select(i => i!)
             .Take(200)

@@ -35,7 +35,7 @@ public static partial class FileNestingService
 
     /// <summary>Dotted-segment rules: <c>appsettings.Development.json</c> under
     /// <c>appsettings.json</c>.</summary>
-    private static readonly string[] s_dottedVariantExtensions = [".json", ".resx", ".config", ".xml"];
+    private static readonly string[] s_dottedVariantExtensions = [".json", ".config", ".xml"];
 
     /// <summary>Exact pairs that share no naming pattern.</summary>
     private static readonly Dictionary<string, string> s_exactPairs = new(StringComparer.OrdinalIgnoreCase)
@@ -172,8 +172,21 @@ public static partial class FileNestingService
                 return match.Groups["stem"].Value + parentExtension;
         }
 
-        // appsettings.Development.json → appsettings.json
         string extension = Path.GetExtension(fileName);
+
+        // A translation carries culture and customization segments rather than one dotted suffix,
+        // so the first dot is the wrong split: it claims Global.resx for Global.ascx.de-DE.resx,
+        // a name that need not exist, and claims My.resx for My.Company.Strings.resx, which is a
+        // neutral file in its own right.
+        if (extension.Equals(".resx", StringComparison.OrdinalIgnoreCase))
+        {
+            return Languages.Resources.Core.ResourceFamilyParser.TryStripVariant(
+                Path.GetFileNameWithoutExtension(fileName), out string neutral)
+                ? neutral + extension
+                : null;
+        }
+
+        // appsettings.Development.json → appsettings.json
         if (s_dottedVariantExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
         {
             string stem = Path.GetFileNameWithoutExtension(fileName);

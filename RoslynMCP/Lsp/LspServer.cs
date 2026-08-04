@@ -1,6 +1,8 @@
+using System.Collections.Immutable;
 using System.Reflection;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using StreamJsonRpc;
@@ -18,6 +20,14 @@ internal sealed class LspServer : IDisposable
 
     private readonly IServiceProvider _services;
     private readonly LspResolveCache _resolveCache = new();
+
+    /// <summary>
+    /// The language packs this connection has switched on. An instance field, never a static:
+    /// the daemon serves several editors from one container, and one window's language settings
+    /// must not deactivate a pack under another. Replaced in <see cref="Initialize"/>; until then
+    /// — and for a server constructed without services, as tests do — every request is C#.
+    /// </summary>
+    private LanguageSession _languages = LanguageSession.Empty;
     private JsonRpc? _rpc;
     private DiagnosticsPublisher? _diagnostics;
     private bool _clientPullsDiagnostics;
@@ -73,9 +83,17 @@ internal sealed class LspServer : IDisposable
         }
     }
 
-    /// <summary>Every file operation the server registers for is a C# file.</summary>
-    private static readonly FileOperationRegistration CSharpFileOperations =
-        new([new FileOperationFilter("file", new FileOperationPattern("**/*.cs", "file"))]);
+    /// <summary>
+    /// C#'s own completion triggers. No " " or "(": space fires on every keystroke boundary — junk
+    /// requests that burn Roslyn's provider time budgets — and "(" belongs to signature help.
+    /// </summary>
+    private static readonly string[] CSharpCompletionTriggers = [".", "["];
+
+    /// <summary>C#'s own signature-help triggers; "&lt;" opens a type argument list.</summary>
+    private static readonly string[] CSharpSignatureHelpTriggers = ["(", ",", "<"];
+
+    /// <summary>The only files C# itself owns.</summary>
+    private const string CSharpFileGlob = "**/*.cs";
 
     public LspServer(IServiceProvider services) => _services = services;
 
@@ -86,6 +104,8 @@ internal sealed class LspServer : IDisposable
         LspSessionRegistry.Register(SessionId, rpc, this);
         LspProgress.Install();
         LspLog.Install();
+        LspNuGetCredentials.Install();
+        Handlers.NuGetHandler.InstallMutationHook();
     }
 
     // ---- Lifecycle -------------------------------------------------------------------
@@ -104,6 +124,30 @@ internal sealed class LspServer : IDisposable
         // Before the capabilities are built: workspaceDiagnostics decides one of them.
         Handlers.ConfigurationHandler.Apply(p.InitializationOptions);
 
+        // After it, because the client's initialization options say which packs this connection
+        // wants; before the capabilities, because the enabled set decides what they advertise.
+        // Resolved through the registry rather than as a bare collection: constructing it is also
+        // what publishes it to the handlers that run outside DI. A server built without services
+        // — every test that constructs one directly — gets pure C#.
+        var activation = Handlers.ConfigurationHandler.ReadLanguages(p.InitializationOptions);
+        _languages = new LanguageSession(
+            (_services.GetService(typeof(LanguageRegistry)) as LanguageRegistry ?? LanguageRegistry.Empty).Packs,
+            pack => activation.IsEnabled(pack.Id));
+
+        // The publisher was built at Attach, before the client had said which languages it wants.
+        // Without this, push diagnostics — the path clients without pull support use — would be the
+        // one surface the per-window toggle never reached.
+        if (_diagnostics is { } diagnostics)
+            diagnostics.Languages = _languages;
+
+        // Designer regeneration was armed only by the MCP open_solution tool, so a control added
+        // to markup in the editor never got its code-behind field.
+        DesignerWatchBridge.Start(_services, p);
+
+        // One registration serves willRename, didCreate and didDelete: the set of files the server
+        // wants to hear about is the same for all three.
+        var fileOperations = FileOperations();
+
         var capabilities = new ServerCapabilities
         {
             TextDocumentSync = new TextDocumentSyncOptions(
@@ -119,13 +163,13 @@ internal sealed class LspServer : IDisposable
             WorkspaceSymbolProvider = true,
             DocumentHighlightProvider = true,
             RenameProvider = new RenameOptions(PrepareProvider: true),
-            // No " " or "(" triggers: space fires on every keystroke boundary (junk requests
-            // that burn Roslyn's provider time budgets), "(" belongs to signature help.
             CompletionProvider = new CompletionOptions(
-                TriggerCharacters: [".", "["],
+                TriggerCharacters: TriggerCharacters(
+                    CSharpCompletionTriggers, static c => c.CompletionTriggerCharacters),
                 ResolveProvider: true),
             SignatureHelpProvider = new SignatureHelpOptions(
-                TriggerCharacters: ["(", ",", "<"],
+                TriggerCharacters: TriggerCharacters(
+                    CSharpSignatureHelpTriggers, static c => c.SignatureHelpTriggerCharacters),
                 RetriggerCharacters: [")", "]", ">"]),
             CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
@@ -140,34 +184,90 @@ internal sealed class LspServer : IDisposable
             TypeHierarchyProvider = true,
             // Delta and range both matter on a large file: an edit otherwise re-sends every
             // token in it, and opening one classifies the whole file before anything paints.
+            // The legend is the session's, not C#'s: a pack appends its own token types after
+            // Roslyn's, and which packs this connection enabled decides the numbering.
             SemanticTokensProvider = new SemanticTokensOptions(
-                new SemanticTokensLegend(
-                    Handlers.SemanticTokensHandler.TokenTypes,
-                    Handlers.SemanticTokensHandler.TokenModifiers),
+                _languages.Legend,
                 Full: new SemanticTokensFullOptions(Delta: true),
                 Range: true),
             DiagnosticProvider = new DiagnosticOptions(
                 InterFileDependencies: true,
                 WorkspaceDiagnostics: LspFeatureOptions.WorkspaceDiagnosticsScope != "off"),
             CodeLensProvider = new CodeLensOptions(ResolveProvider: true),
-            ExecuteCommandProvider = new ExecuteCommandOptions(Handlers.ExecuteCommandHandler.Commands),
+            // A command the client can see is a command it can put on a menu, so a pack's commands
+            // are advertised only while that pack is enabled.
+            ExecuteCommandProvider = new ExecuteCommandOptions(
+                [
+                    .. Handlers.ExecuteCommandHandler.Commands,
+                    .. _languages.Packs.SelectMany(pack => pack.Capabilities.Commands),
+                ]),
             InlayHintProvider = new InlayHintOptions(ResolveProvider: false),
             SelectionRangeProvider = true,
             LinkedEditingRangeProvider = true,
             InlineValueProvider = true,
-            // Renaming a .cs file should rename the type inside it. Returning the edit from
-            // willRename puts it in the same undo step as the rename itself. Create and delete
-            // are after-the-fact: a new file needs its namespace, a deleted one needs to leave
-            // its project's item list.
+            // Nothing in C# is a link; the targets a document names — a master page, a user
+            // control's Src, a stylesheet — are a markup idea, so the capability follows the packs.
+            // Every link a pack returns carries its target, so there is nothing left to resolve.
+            DocumentLinkProvider = _languages.Contributors<ILanguageDocumentLinkProvider>().Count > 0
+                ? new DocumentLinkOptions(ResolveProvider: false)
+                : null,
             Workspace = new WorkspaceServerCapabilities(
                 new FileOperationsServerCapabilities(
-                    WillRename: CSharpFileOperations,
-                    DidCreate: CSharpFileOperations,
-                    DidDelete: CSharpFileOperations)),
+                    WillRename: fileOperations,
+                    DidCreate: fileOperations,
+                    DidDelete: fileOperations)),
         };
 
         string? version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3);
         return new InitializeResult(capabilities, new ServerInfo("RoslynSense", version));
+    }
+
+    /// <summary>
+    /// C#'s trigger characters widened by every enabled pack's, deduplicated and with C#'s first.
+    /// </summary>
+    /// <remarks>
+    /// A union rather than a per-language registration because the protocol gives the whole server
+    /// one list. The asymmetry is what makes the union the safe direction: an extra character costs
+    /// a request the handler declines — Roslyn runs its own <c>ShouldTriggerCompletion</c> before
+    /// doing any work — while a missing one means the editor never asks at all.
+    /// </remarks>
+    private string[] TriggerCharacters(
+        string[] csharp, Func<LanguageCapabilities, ImmutableArray<string>> select)
+    {
+        var union = new List<string>(csharp);
+
+        foreach (var pack in _languages.Packs)
+        {
+            foreach (string character in select(pack.Capabilities))
+            {
+                if (!union.Contains(character))
+                    union.Add(character);
+            }
+        }
+
+        return [.. union];
+    }
+
+    /// <summary>
+    /// The files the server wants file-operation notifications about: C#'s, plus each enabled
+    /// pack's.
+    /// </summary>
+    /// <remarks>
+    /// Renaming a <c>.cs</c> file should rename the type inside it, and returning that edit from
+    /// <c>willRename</c> puts it in the same undo step as the rename itself. Create and delete are
+    /// after the fact: a new file needs its namespace, a deleted one needs to leave its project's
+    /// item list. A pack's files want the same three, which is why the glob list is the only part
+    /// that varies.
+    /// </remarks>
+    private FileOperationRegistration FileOperations()
+    {
+        var globs = new List<string> { CSharpFileGlob };
+
+        foreach (var pack in _languages.Packs)
+            globs.AddRange(pack.Capabilities.FileOperationGlobs);
+
+        return new FileOperationRegistration(
+            [.. globs.Select(glob => new FileOperationFilter("file", new FileOperationPattern(glob, "file")))]);
     }
 
     [JsonRpcMethod("initialized")]
@@ -233,6 +333,10 @@ internal sealed class LspServer : IDisposable
     public Task<LaunchTarget[]> LaunchTargets(LaunchTargetsParams p, CancellationToken ct) =>
         Handlers.LaunchHandler.LaunchTargetsAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/targetForFile", UseSingleObjectParameterDeserialization = true)]
+    public LaunchTarget? TargetForFile(TargetForFileParams p) =>
+        Handlers.LaunchHandler.TargetForFile(p);
+
     [JsonRpcMethod("roslynSense/attachTargets")]
     public AttachTarget[] AttachTargets() => Handlers.LaunchHandler.AttachTargets();
 
@@ -261,6 +365,17 @@ internal sealed class LspServer : IDisposable
     public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
         Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/solutionProjects")]
+    public SolutionProjectInfo[] SolutionProjects() => Handlers.SolutionTreeHandler.Projects();
+
+    [JsonRpcMethod("roslynSense/assemblyReferences", UseSingleObjectParameterDeserialization = true)]
+    public string[] AssemblyReferences(SolutionTreeSearchParams p) =>
+        Handlers.SolutionTreeHandler.AssemblyReferences(p);
+
+    [JsonRpcMethod("roslynSense/projectTemplates")]
+    public Task<ProjectTemplateChoices> ProjectTemplates(CancellationToken ct) =>
+        Handlers.SolutionTreeHandler.TemplatesAsync(ct);
+
     [JsonRpcMethod("roslynSense/solutionTreeSearch", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeNode[]> SolutionTreeSearch(SolutionTreeSearchParams p, CancellationToken ct) =>
         Handlers.SolutionTreeSearchHandler.SearchAsync(p, ct);
@@ -284,11 +399,11 @@ internal sealed class LspServer : IDisposable
     // ---- Packages -----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/nuget/search", UseSingleObjectParameterDeserialization = true)]
-    public Task<Handlers.PackageSummaryDto[]> NuGetSearch(Handlers.NuGetSearchParams p, CancellationToken ct) =>
+    public Task<Handlers.NuGetSearchResultDto> NuGetSearch(Handlers.NuGetSearchParams p, CancellationToken ct) =>
         Handlers.NuGetHandler.SearchAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/nuget/versions", UseSingleObjectParameterDeserialization = true)]
-    public Task<IReadOnlyList<string>> NuGetVersions(Handlers.NuGetVersionsParams p, CancellationToken ct) =>
+    public Task<Handlers.NuGetVersionsResultDto> NuGetVersions(Handlers.NuGetVersionsParams p, CancellationToken ct) =>
         Handlers.NuGetHandler.VersionsAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/nuget/installed")]
@@ -296,7 +411,7 @@ internal sealed class LspServer : IDisposable
         Handlers.NuGetHandler.InstalledAsync(ct);
 
     [JsonRpcMethod("roslynSense/nuget/updates", UseSingleObjectParameterDeserialization = true)]
-    public Task<Handlers.PackageSummaryDto[]> NuGetUpdates(Handlers.NuGetUpdatesParams p, CancellationToken ct) =>
+    public Task<Handlers.NuGetUpdatesResultDto> NuGetUpdates(Handlers.NuGetUpdatesParams p, CancellationToken ct) =>
         Handlers.NuGetHandler.UpdatesAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/nuget/consolidations")]
@@ -304,7 +419,32 @@ internal sealed class LspServer : IDisposable
         Handlers.NuGetHandler.ConsolidationsAsync(ct);
 
     [JsonRpcMethod("roslynSense/nuget/sources")]
-    public string[] NuGetSources() => Handlers.NuGetHandler.Sources();
+    public Handlers.PackageSourceDto[] NuGetSources() => Handlers.NuGetHandler.Sources();
+
+    [JsonRpcMethod("roslynSense/nuget/sources/edit", UseSingleObjectParameterDeserialization = true)]
+    public Handlers.NuGetSourceEditResultDto NuGetEditSources(Handlers.NuGetSourceEditParams p) =>
+        Handlers.NuGetHandler.EditSources(p);
+
+    [JsonRpcMethod("roslynSense/nuget/icon", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.NuGetIconDto> NuGetIcon(Handlers.NuGetIconParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.IconAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/metadata", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.PackageMetadataDto?> NuGetMetadata(Handlers.NuGetMetadataParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.MetadataAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/checkFramework", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.NuGetFrameworkCheckDto> NuGetCheckFramework(
+        Handlers.NuGetFrameworkCheckParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.CheckFrameworkAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/transitive", UseSingleObjectParameterDeserialization = true)]
+    public Handlers.NuGetTransitiveDto NuGetTransitive(Handlers.NuGetTransitiveParams p) =>
+        Handlers.NuGetHandler.Transitive(p);
+
+    [JsonRpcMethod("roslynSense/nuget/audit", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.NuGetAuditDto> NuGetAudit(Handlers.NuGetAuditParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.AuditAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/nuget/install", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetInstall(Handlers.NuGetOperationParams p, CancellationToken ct) =>
@@ -313,6 +453,16 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/nuget/update", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetUpdate(Handlers.NuGetOperationParams p, CancellationToken ct) =>
         Handlers.NuGetHandler.InstallAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/updatePlan", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.NuGetUpdatePlanResultDto> NuGetUpdatePlan(
+        Handlers.NuGetUpdatePlanParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.UpdatePlanAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/nuget/updateAll", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.NuGetUpdateAllResultDto> NuGetUpdateAll(
+        Handlers.NuGetUpdateAllParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.UpdateAllAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/nuget/uninstall", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetUninstall(Handlers.NuGetOperationParams p, CancellationToken ct) =>
@@ -333,7 +483,7 @@ internal sealed class LspServer : IDisposable
         Handlers.TestHandler.DiscoverAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/testRun", UseSingleObjectParameterDeserialization = true)]
-    public Task<TestResultInfo[]> TestRun(TestRunParams p, CancellationToken ct) =>
+    public Task<TestRunResponse> TestRun(TestRunParams p, CancellationToken ct) =>
         Handlers.TestHandler.RunAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/testDebug", UseSingleObjectParameterDeserialization = true)]
@@ -350,7 +500,11 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("workspace/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceDiagnosticReport> WorkspaceDiagnostic(
         WorkspaceDiagnosticParams p, CancellationToken ct) =>
-        Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct);
+        Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct, _languages);
+
+    [JsonRpcMethod("roslynSense/searchEverywhere", UseSingleObjectParameterDeserialization = true)]
+    public Task<SearchEverywhereResult> SearchEverywhere(SearchEverywhereParams p, CancellationToken ct) =>
+        Handlers.SearchEverywhereHandler.SearchAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/editorContext", UseSingleObjectParameterDeserialization = true)]
     public void EditorContext(Handlers.EditorContextParams p) =>
@@ -358,7 +512,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("workspace/willRenameFiles", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceEdit?> WillRenameFiles(Handlers.RenameFilesParams p, CancellationToken ct) =>
-        Handlers.FileOperationsHandler.WillRenameAsync(p, ct);
+        Handlers.FileOperationsHandler.WillRenameAsync(p, ct, _languages);
 
     [JsonRpcMethod("workspace/didChangeConfiguration", UseSingleObjectParameterDeserialization = true)]
     public Task DidChangeConfiguration(DidChangeConfigurationParams p, CancellationToken ct) =>
@@ -370,11 +524,11 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("workspace/didCreateFiles", UseSingleObjectParameterDeserialization = true)]
     public Task DidCreateFiles(CreateFilesParams p, CancellationToken ct) =>
-        Handlers.FileOperationsHandler.DidCreateAsync(p, ct);
+        Handlers.FileOperationsHandler.DidCreateAsync(p, ct, _languages);
 
     [JsonRpcMethod("workspace/didDeleteFiles", UseSingleObjectParameterDeserialization = true)]
     public Task DidDeleteFiles(DeleteFilesParams p, CancellationToken ct) =>
-        Handlers.FileOperationsHandler.DidDeleteAsync(p, ct);
+        Handlers.FileOperationsHandler.DidDeleteAsync(p, ct, _languages);
 
     [JsonRpcMethod("textDocument/didClose", UseSingleObjectParameterDeserialization = true)]
     public void DidClose(DidCloseTextDocumentParams p)
@@ -386,61 +540,115 @@ internal sealed class LspServer : IDisposable
 
     // ---- Language features -----------------------------------------------------------
 
+    /// <summary>
+    /// Sends a request to the pack that owns the document, or to the C# handler when no enabled
+    /// pack owns it — or owns it but cannot answer this particular request.
+    /// </summary>
+    /// <remarks>
+    /// Every one of these is a genuine either/or. A markup file has no Roslyn document, so the C#
+    /// handlers resolve nothing in it; the pack covers the tags and attributes and hands anything
+    /// inside a code block back to Roslyn through its own projection. The one case where both
+    /// must run — find-references on a C# symbol also listing the markup that names it — is a
+    /// contributor inside the C# handler, not a route.
+    /// </remarks>
+    private Task<T> Route<TProvider, T>(
+        TextDocumentIdentifier textDocument, Func<TProvider, Task<T>> language, Func<Task<T>> csharp)
+        where TProvider : class =>
+        Route(textDocument.Uri, language, csharp);
+
+    /// <summary>The same, for the requests that carry a bare URI: a hierarchy item names its own
+    /// document rather than arriving with a <see cref="TextDocumentIdentifier"/>.</summary>
+    private Task<T> Route<TProvider, T>(
+        string uri, Func<TProvider, Task<T>> language, Func<Task<T>> csharp)
+        where TProvider : class =>
+        _languages.Resolve<TProvider>(uri) is { } provider ? language(provider) : csharp();
+
     [JsonRpcMethod("textDocument/definition", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> Definition(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: false, ct);
+        Route<ILanguageDefinitionProvider, Location[]>(p.TextDocument,
+            l => l.DefinitionAsync(p, typeDefinition: false, ct),
+            () => Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: false, ct, _languages));
 
     [JsonRpcMethod("textDocument/typeDefinition", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> TypeDefinition(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: true, ct);
+        Route<ILanguageDefinitionProvider, Location[]>(p.TextDocument,
+            l => l.DefinitionAsync(p, typeDefinition: true, ct),
+            () => Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: true, ct, _languages));
 
     [JsonRpcMethod("textDocument/references", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> References(ReferenceParams p, CancellationToken ct) =>
-        Handlers.NavigationHandlers.ReferencesAsync(p, ct);
+        Route<ILanguageReferencesProvider, Location[]>(p.TextDocument,
+            l => l.ReferencesAsync(p, ct),
+            () => Handlers.NavigationHandlers.ReferencesAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/implementation", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> Implementation(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.NavigationHandlers.ImplementationAsync(p, ct);
+        Route<ILanguageImplementationProvider, Location[]>(p.TextDocument,
+            l => l.ImplementationAsync(p, ct),
+            () => Handlers.NavigationHandlers.ImplementationAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/hover", UseSingleObjectParameterDeserialization = true)]
     public Task<Hover?> Hover(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.HoverHandler.HoverAsync(p, ct);
+        Route<ILanguageHoverProvider, Hover?>(p.TextDocument,
+            l => l.HoverAsync(p, ct),
+            () => Handlers.HoverHandler.HoverAsync(p, ct));
 
     [JsonRpcMethod("textDocument/documentHighlight", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentHighlight[]> DocumentHighlight(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.NavigationHandlers.DocumentHighlightAsync(p, ct);
+        Route<ILanguageDocumentHighlightProvider, DocumentHighlight[]>(p.TextDocument,
+            l => l.DocumentHighlightAsync(p, ct),
+            () => Handlers.NavigationHandlers.DocumentHighlightAsync(p, ct));
 
     [JsonRpcMethod("textDocument/documentSymbol", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentSymbol[]> DocumentSymbol(DocumentSymbolParams p, CancellationToken ct) =>
-        Handlers.SymbolHandlers.DocumentSymbolsAsync(p, ct);
+        Route<ILanguageDocumentSymbolProvider, DocumentSymbol[]>(p.TextDocument,
+            l => l.DocumentSymbolAsync(p, ct),
+            () => Handlers.SymbolHandlers.DocumentSymbolsAsync(p, ct));
 
     [JsonRpcMethod("workspace/symbol", UseSingleObjectParameterDeserialization = true)]
     public Task<SymbolInformation[]> WorkspaceSymbol(WorkspaceSymbolParams p, CancellationToken ct) =>
-        Handlers.SymbolHandlers.WorkspaceSymbolsAsync(p, ct);
+        Handlers.SymbolHandlers.WorkspaceSymbolsAsync(p, ct, _languages);
 
     [JsonRpcMethod("textDocument/prepareRename", UseSingleObjectParameterDeserialization = true)]
     public Task<PrepareRenameResult?> PrepareRename(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.RenameHandler.PrepareRenameAsync(p, ct);
+        Route<ILanguageRenameProvider, PrepareRenameResult?>(p.TextDocument,
+            l => l.PrepareRenameAsync(p, ct),
+            () => Handlers.RenameHandler.PrepareRenameAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/rename", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceEdit?> Rename(RenameParams p, CancellationToken ct) =>
-        Handlers.RenameHandler.RenameAsync(p, ct);
+        Route<ILanguageRenameProvider, WorkspaceEdit?>(p.TextDocument,
+            l => l.RenameAsync(p, ct),
+            () => Handlers.RenameHandler.RenameAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/signatureHelp", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.SignatureHelp?> SignatureHelp(SignatureHelpParams p, CancellationToken ct) =>
-        Handlers.SignatureHelpHandler.SignatureHelpAsync(p, ct);
+        Route<ILanguageSignatureHelpProvider, Protocol.SignatureHelp?>(p.TextDocument,
+            l => l.SignatureHelpAsync(p, ct),
+            () => Handlers.SignatureHelpHandler.SignatureHelpAsync(p, ct));
 
     [JsonRpcMethod("textDocument/completion", UseSingleObjectParameterDeserialization = true)]
     public Task<CompletionList> Completion(CompletionParams p, CancellationToken ct) =>
-        Handlers.CompletionHandler.CompletionAsync(p, _resolveCache, ct);
+        Route<ILanguageCompletionProvider, CompletionList>(p.TextDocument,
+            l => l.CompletionAsync(p, _resolveCache, ct),
+            () => Handlers.CompletionHandler.CompletionAsync(p, _resolveCache, ct));
 
+    /// <summary>
+    /// Resolve carries no document, so it cannot be routed by URI. Items from a pack are
+    /// self-contained today; the contract for one that is not is to stamp the pack's id into
+    /// <c>data</c> and route on that.
+    /// </summary>
     [JsonRpcMethod("completionItem/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<CompletionItem> CompletionResolve(CompletionItem item, CancellationToken ct) =>
-        Handlers.CompletionHandler.ResolveAsync(item, _resolveCache, ct);
+        Handlers.CompletionHandler.ResolveAsync(item, _resolveCache, ct, _languages);
 
     [JsonRpcMethod("textDocument/codeAction", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeAction[]> CodeAction(CodeActionParams p, CancellationToken ct) =>
-        Handlers.CodeActionHandler.CodeActionsAsync(p, _resolveCache, ct);
+        Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri))
+            ? Handlers.BindingRedirectHandler.CodeActionsAsync(p, ct)
+            : Route<ILanguageCodeActionProvider, Protocol.CodeAction[]>(p.TextDocument,
+                l => l.CodeActionsAsync(p, ct),
+                () => Handlers.CodeActionHandler.CodeActionsAsync(p, _resolveCache, ct));
 
     [JsonRpcMethod("codeAction/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeAction> CodeActionResolve(Protocol.CodeAction action, CancellationToken ct) =>
@@ -448,11 +656,15 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/formatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> Formatting(DocumentFormattingParams p, CancellationToken ct) =>
-        Handlers.FormattingHandler.FormatAsync(p, ct);
+        Route<ILanguageFormattingProvider, TextEdit[]>(p.TextDocument,
+            l => l.FormatAsync(p, ct),
+            () => Handlers.FormattingHandler.FormatAsync(p, ct));
 
     [JsonRpcMethod("textDocument/rangeFormatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> RangeFormatting(DocumentRangeFormattingParams p, CancellationToken ct) =>
-        Handlers.FormattingHandler.FormatRangeAsync(p, ct);
+        Route<ILanguageFormattingProvider, TextEdit[]>(p.TextDocument,
+            l => l.FormatRangeAsync(p, ct),
+            () => Handlers.FormattingHandler.FormatRangeAsync(p, ct));
 
     [JsonRpcMethod("textDocument/onTypeFormatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> OnTypeFormatting(DocumentOnTypeFormattingParams p, CancellationToken ct) =>
@@ -460,51 +672,86 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/foldingRange", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.FoldingRange[]> FoldingRange(FoldingRangeParams p, CancellationToken ct) =>
-        Handlers.FoldingRangeHandler.FoldingRangesAsync(p, ct);
+        Route<ILanguageFoldingRangeProvider, Protocol.FoldingRange[]>(p.TextDocument,
+            l => l.FoldingRangeAsync(p, ct),
+            () => Handlers.FoldingRangeHandler.FoldingRangesAsync(p, ct));
 
     [JsonRpcMethod("textDocument/prepareCallHierarchy", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> PrepareCallHierarchy(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.CallHierarchyHandler.PrepareAsync(p, ct);
+        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.TextDocument,
+            l => l.PrepareCallHierarchyAsync(p, ct),
+            () => Handlers.CallHierarchyHandler.PrepareAsync(p, ct));
 
     [JsonRpcMethod("callHierarchy/incomingCalls", UseSingleObjectParameterDeserialization = true)]
     public Task<CallHierarchyIncomingCall[]> IncomingCalls(CallHierarchyCallsParams p, CancellationToken ct) =>
-        Handlers.CallHierarchyHandler.IncomingCallsAsync(p, ct);
+        Route<ILanguageHierarchyProvider, CallHierarchyIncomingCall[]>(p.Item.Uri,
+            l => l.IncomingCallsAsync(p, ct),
+            () => Handlers.CallHierarchyHandler.IncomingCallsAsync(p, ct, _languages));
 
     [JsonRpcMethod("callHierarchy/outgoingCalls", UseSingleObjectParameterDeserialization = true)]
     public Task<CallHierarchyOutgoingCall[]> OutgoingCalls(CallHierarchyCallsParams p, CancellationToken ct) =>
-        Handlers.CallHierarchyHandler.OutgoingCallsAsync(p, ct);
+        Route<ILanguageHierarchyProvider, CallHierarchyOutgoingCall[]>(p.Item.Uri,
+            l => l.OutgoingCallsAsync(p, ct),
+            () => Handlers.CallHierarchyHandler.OutgoingCallsAsync(p, ct));
 
     [JsonRpcMethod("textDocument/prepareTypeHierarchy", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> PrepareTypeHierarchy(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.TypeHierarchyHandler.PrepareAsync(p, ct);
+        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.TextDocument,
+            l => l.PrepareTypeHierarchyAsync(p, ct),
+            () => Handlers.TypeHierarchyHandler.PrepareAsync(p, ct));
 
     [JsonRpcMethod("typeHierarchy/supertypes", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> Supertypes(TypeHierarchyItemParams p, CancellationToken ct) =>
-        Handlers.TypeHierarchyHandler.SupertypesAsync(p, ct);
+        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.Item.Uri,
+            l => l.SupertypesAsync(p, ct),
+            () => Handlers.TypeHierarchyHandler.SupertypesAsync(p, ct));
 
     [JsonRpcMethod("typeHierarchy/subtypes", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> Subtypes(TypeHierarchyItemParams p, CancellationToken ct) =>
-        Handlers.TypeHierarchyHandler.SubtypesAsync(p, ct);
+        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.Item.Uri,
+            l => l.SubtypesAsync(p, ct),
+            () => Handlers.TypeHierarchyHandler.SubtypesAsync(p, ct));
 
     [JsonRpcMethod("textDocument/semanticTokens/full", UseSingleObjectParameterDeserialization = true)]
     public Task<SemanticTokens> SemanticTokensFull(SemanticTokensParams p, CancellationToken ct) =>
-        Handlers.SemanticTokensHandler.SemanticTokensFullAsync(SessionId, p, ct);
+        Route<ILanguageSemanticTokensProvider, SemanticTokens>(p.TextDocument,
+            l => l.SemanticTokensFullAsync(p, _languages, ct),
+            () => Handlers.SemanticTokensHandler.SemanticTokensFullAsync(SessionId, p, ct));
 
+    /// <summary>A pack that declines delta answers full instead, which the protocol allows and
+    /// clients handle — the same fallback the C# handler takes when it has no baseline.</summary>
     [JsonRpcMethod("textDocument/semanticTokens/full/delta", UseSingleObjectParameterDeserialization = true)]
     public Task<object> SemanticTokensDelta(SemanticTokensDeltaParams p, CancellationToken ct) =>
-        Handlers.SemanticTokensHandler.SemanticTokensDeltaAsync(SessionId, p, ct);
+        Route<ILanguageSemanticTokensProvider, object>(p.TextDocument,
+            async l => await l.SemanticTokensFullAsync(new SemanticTokensParams(p.TextDocument), _languages, ct),
+            () => Handlers.SemanticTokensHandler.SemanticTokensDeltaAsync(SessionId, p, ct));
 
     [JsonRpcMethod("textDocument/semanticTokens/range", UseSingleObjectParameterDeserialization = true)]
     public Task<SemanticTokens> SemanticTokensRange(SemanticTokensRangeParams p, CancellationToken ct) =>
-        Handlers.SemanticTokensHandler.SemanticTokensRangeAsync(p, ct);
+        Route<ILanguageSemanticTokensProvider, SemanticTokens>(p.TextDocument,
+            l => l.SemanticTokensRangeAsync(p, _languages, ct),
+            () => Handlers.SemanticTokensHandler.SemanticTokensRangeAsync(p, ct));
 
     [JsonRpcMethod("textDocument/selectionRange", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.SelectionRange[]> SelectionRange(SelectionRangeParams p, CancellationToken ct) =>
-        Handlers.SelectionRangeHandler.SelectionRangesAsync(p, ct);
+        Route<ILanguageSelectionRangeProvider, Protocol.SelectionRange[]>(p.TextDocument,
+            l => l.SelectionRangesAsync(p, ct),
+            () => Handlers.SelectionRangeHandler.SelectionRangesAsync(p, ct));
 
     [JsonRpcMethod("textDocument/linkedEditingRange", UseSingleObjectParameterDeserialization = true)]
     public Task<LinkedEditingRanges?> LinkedEditingRange(TextDocumentPositionParams p, CancellationToken ct) =>
-        Handlers.LinkedEditingHandler.RangesAsync(p, ct);
+        Route<ILanguageLinkedEditingProvider, LinkedEditingRanges?>(p.TextDocument,
+            l => l.LinkedEditingRangesAsync(p, ct),
+            () => Handlers.LinkedEditingHandler.RangesAsync(p, ct));
+
+    /// <summary>Advertised only while a pack contributes links, but still routed unconditionally:
+    /// a client that cached the capability from an earlier session must get an empty answer rather
+    /// than a method-not-found fault.</summary>
+    [JsonRpcMethod("textDocument/documentLink", UseSingleObjectParameterDeserialization = true)]
+    public Task<DocumentLink[]> DocumentLink(DocumentLinkParams p, CancellationToken ct) =>
+        Route<ILanguageDocumentLinkProvider, DocumentLink[]>(p.TextDocument,
+            l => l.DocumentLinksAsync(p, ct),
+            () => Task.FromResult<DocumentLink[]>([]));
 
     [JsonRpcMethod("textDocument/inlineValue", UseSingleObjectParameterDeserialization = true)]
     public Task<object[]> InlineValue(InlineValueParams p, CancellationToken ct) =>
@@ -512,19 +759,25 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<object> Diagnostic(DocumentDiagnosticParams p, CancellationToken ct) =>
-        Handlers.DiagnosticsHandler.PullAsync(p, ct);
+        Handlers.DiagnosticsHandler.PullAsync(p, ct, _languages);
 
     [JsonRpcMethod("textDocument/codeLens", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeLens[]> CodeLens(CodeLensParams p, CancellationToken ct) =>
-        Handlers.CodeLensHandler.CodeLensAsync(p, ct);
+        Route<ILanguageCodeLensProvider, Protocol.CodeLens[]>(p.TextDocument,
+            l => l.CodeLensAsync(p, ct),
+            () => Handlers.CodeLensHandler.CodeLensAsync(p, ct, _languages));
 
+    /// <summary>Routable where the other resolve endpoints are not: an unresolved lens already
+    /// carries the URI it came from.</summary>
     [JsonRpcMethod("codeLens/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeLens> CodeLensResolve(Protocol.CodeLens lens, CancellationToken ct) =>
-        Handlers.CodeLensHandler.ResolveAsync(lens, ct);
+        Route<ILanguageCodeLensProvider, Protocol.CodeLens>(lens.Data?.Uri ?? "",
+            l => l.ResolveCodeLensAsync(lens, ct),
+            () => Handlers.CodeLensHandler.ResolveAsync(lens, ct, _languages));
 
     [JsonRpcMethod("workspace/executeCommand", UseSingleObjectParameterDeserialization = true)]
     public Task<object> ExecuteCommand(ExecuteCommandParams p, CancellationToken ct) =>
-        Handlers.ExecuteCommandHandler.ExecuteAsync(p, ct);
+        Handlers.ExecuteCommandHandler.ExecuteAsync(p, ct, _languages);
 
     [JsonRpcMethod("textDocument/inlayHint", UseSingleObjectParameterDeserialization = true)]
     public Task<InlayHint[]> InlayHint(InlayHintParams p, CancellationToken ct) =>
@@ -532,7 +785,9 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/onAutoInsert", UseSingleObjectParameterDeserialization = true)]
     public Task<OnAutoInsertResult?> OnAutoInsert(OnAutoInsertParams p, CancellationToken ct) =>
-        Handlers.OnAutoInsertHandler.OnAutoInsertAsync(p, ct);
+        Route<ILanguageAutoInsertProvider, OnAutoInsertResult?>(p.TextDocument,
+            l => l.OnAutoInsertAsync(p, ct),
+            () => Handlers.OnAutoInsertHandler.OnAutoInsertAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/inheritanceMarkers", UseSingleObjectParameterDeserialization = true)]
     public Task<InheritanceMarker[]> InheritanceMarkers(InheritanceMarkersParams p, CancellationToken ct) =>

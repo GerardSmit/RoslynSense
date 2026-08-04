@@ -3,6 +3,8 @@ using System.Text;
 using Microsoft.CodeAnalysis;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Languages;
+using RoslynMCP.Lsp.Handlers;
 
 namespace RoslynMCP.Tools;
 
@@ -58,6 +60,36 @@ public static class GoToDefinitionSnippetTool
 
             if (!ctx.IsResolved)
                 return ToolHelper.FormatResolutionError(ctx.Resolution);
+
+            // The seam the editor's F12 goes through, called with the document and offset this
+            // tool's own markup resolution produced. One helper for both front-ends is what stops
+            // an AI session and the editor resolving the same dispatch differently.
+            var redirected = await NavigationHandlers.RedirectedSymbolsAsync(
+                ctx.Document, ctx.Resolution.Position ?? 0, ctx.Symbol!,
+                NavigationKind.Definition, languages: null, cancellationToken);
+
+            if (redirected.Count == 1)
+            {
+                return await FormatDefinitionAsync(
+                    redirected[0], ctx.Project, contextLines, fmt, cancellationToken);
+            }
+
+            if (redirected.Count > 1)
+            {
+                // A notification has as many handlers as subscribe to it, and choosing one to show
+                // would be a guess. Every one, each rendered the way a single definition is.
+                var all = new StringBuilder();
+                all.AppendLine($"# {redirected.Count} handlers");
+                all.AppendLine();
+
+                foreach (var target in redirected)
+                {
+                    all.AppendLine(await FormatDefinitionAsync(
+                        target, ctx.Project, contextLines, fmt, cancellationToken));
+                }
+
+                return all.ToString();
+            }
 
             return await FormatDefinitionAsync(ctx.Symbol!, ctx.Project, contextLines, fmt, cancellationToken);
         }

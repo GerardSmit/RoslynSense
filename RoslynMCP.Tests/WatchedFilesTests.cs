@@ -2,6 +2,9 @@ using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Languages;
+using RoslynMCP.Languages.WebForms;
+using RoslynMCP.Languages.WebForms.Core;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -75,6 +78,74 @@ public class WatchedFilesTests
         // computed under the previous rules.
         Assert.True(outcome.ReloadedWorkspace);
         Assert.False(AnalyzerDiagnosticCache.IsComputed(document, version));
+    }
+
+    [Fact]
+    public async Task MarkupChangedOnDiskAsksTheEditorToRefresh()
+    {
+        // Watched files are offered to the registered packs, and calling the handler directly
+        // rather than through a server means no host has built a registry, so this stands in
+        // for one.
+        new LanguageRegistry([new WebFormsLanguage(new MarkdownFormatter())]).Publish();
+
+        // A markup file is not a Roslyn document, so it evicts no project and reloads nothing.
+        // What it must still do is report that something happened — otherwise the diagnostics
+        // already on screen were computed from the old markup and nothing asks for them again.
+        var outcome = await WatchedFilesHandler.ProcessAsync(
+            [new FileEvent(
+                LspConverters.PathToUri(FixturePaths.EventWiringAspxFile), FileChangeType.Changed)],
+            default);
+
+        Assert.False(outcome.ReloadedWorkspace);
+        Assert.Empty(outcome.EvictedProjects);
+        Assert.True(outcome.DidAnything);
+        Assert.Contains(
+            FixturePaths.EventWiringAspxFile,
+            outcome.InvalidatedMarkup ?? [],
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task WebConfigChangeDropsEveryParseThatDependedOnIt()
+    {
+        new LanguageRegistry([new WebFormsLanguage(new MarkdownFormatter())]).Publish();
+
+        // web.config registers tag prefixes, so it changes how every page binds without changing
+        // any page. The parse cache keys on a file's own text and its compilation, neither of
+        // which moves — so nothing short of clearing it is correct. Prime several markup files of
+        // different kinds: a per-file Invalidate keyed on the web.config's own path would satisfy
+        // a one-page assertion while leaving every other page bound against the old prefixes.
+        string[] markup =
+        [
+            FixturePaths.DefaultAspxFile,
+            FixturePaths.DesignerAspxFile,
+            FixturePaths.SiteMasterFile,
+            FixturePaths.HeaderControlFile,
+        ];
+
+        var before = new Dictionary<string, AspxDocument>(StringComparer.OrdinalIgnoreCase);
+        foreach (string path in markup)
+        {
+            var document = await AspxDocumentService.GetAsync(path, default);
+            Assert.NotNull(document);
+            before[path] = document;
+        }
+
+        var outcome = await WatchedFilesHandler.ProcessAsync(
+            [new FileEvent(
+                LspConverters.PathToUri(FixturePaths.AspxWebConfigFile), FileChangeType.Changed)],
+            default);
+
+        Assert.True(outcome.DidAnything);
+
+        // Nothing was reparsed yet, so an unchanged instance here means the entry survived the
+        // event — the page would keep reporting a newly registered control as unknown.
+        foreach (string path in markup)
+        {
+            var after = await AspxDocumentService.GetAsync(path, default);
+            Assert.NotNull(after);
+            Assert.NotSame(before[path], after);
+        }
     }
 
     [Fact]

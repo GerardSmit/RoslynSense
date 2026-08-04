@@ -78,6 +78,23 @@
         <MSBuild Projects="Fixtures\SourceGenFixture\Consumer\Consumer.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\MultiSolution\ProjectB\ProjectB.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\DebugTestProject\DebugTestProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\ProtoProject\ProtoProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\ProtoNeverBuiltProject\ProtoNeverBuiltProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <!--
+          MediatorGenerator comes in through MediatorProject's analyzer reference, so one line
+          builds both. It has to build here rather than on demand: the generated SenderExtensions
+          is what the fixture's own call sites bind against.
+        -->
+        <MSBuild Projects="Fixtures\MediatorProject\MediatorProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <!--
+          Server and Client each pull Contracts in through their ProjectReference, so the three
+          together cover the whole ProtoSolution graph; Unrelated references nothing and needs its
+          own line. Restored here rather than left to the on-demand restore inside a workspace load,
+          which would otherwise happen with the load's timeout already running.
+        -->
+        <MSBuild Projects="Fixtures\ProtoSolution\Server\Server.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\ProtoSolution\Client\Client.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\ProtoSolution\Unrelated\Unrelated.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
     </Target>
 
 </Project>

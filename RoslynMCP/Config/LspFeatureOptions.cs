@@ -5,6 +5,14 @@ namespace RoslynMCP.Config;
 /// analyzer services are static too (matching <see cref="Services.WorkspaceService"/>);
 /// values come from environment variables at startup and are settable for tests.
 /// </summary>
+/// <remarks>
+/// Everything here describes the solution, so one shared value across the daemon's editor
+/// windows and MCP clients is right. Anything that describes a <em>window</em> does not belong
+/// here — which is why the language-pack switches (<c>roslynSense.languages.*</c>) live on the
+/// per-connection <c>LanguageSession</c> instead: as a static, one window turning a pack off
+/// would turn it off under every other window and remove the matching MCP tools from the AI
+/// sessions attached to the same daemon.
+/// </remarks>
 public static class LspFeatureOptions
 {
     /// <summary>Run project analyzers (StyleCop, Roslynator, in-house) for editor diagnostics.</summary>

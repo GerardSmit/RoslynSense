@@ -25,8 +25,22 @@ interface SolutionTreeNode {
 
 const VIEW_ID = 'roslynSense.solutionExplorer';
 
-/** Private drag payload: newline-separated resource URIs. */
+/** Private drag payload: the dragged nodes, as JSON. */
 const DROP_MIME = 'application/vnd.code.tree.roslynsense.solutionexplorer';
+
+/** What a drag from outside the tree carries — the OS file explorer, or VS Code's own. */
+const URI_LIST_MIME = 'text/uri-list';
+
+/**
+ * A dragged node, reduced to what a drop needs.
+ *
+ * The id matters as much as the URI: a project and a file dropped on the same target mean
+ * completely different edits, and a payload of bare URIs cannot tell them apart.
+ */
+interface DragItem {
+    id: string;
+    resourceUri: string | null;
+}
 
 interface TreeEditResult {
     ok: boolean;
@@ -45,7 +59,7 @@ interface ViewState {
 
 /** What `Ctrl+C` / `Ctrl+X` put down, until a paste picks it up. */
 interface Clipboard {
-    uris: string[];
+    items: DragItem[];
     cut: boolean;
 }
 
@@ -66,8 +80,17 @@ export function registerSolutionExplorer(
     let filter: string | undefined;
     let clipboard: Clipboard | undefined;
 
+    /// Unloading is a per-window view choice rather than a property of the solution, so it lives
+    /// here and never reaches the solution file.
+    let unloaded: string[] = context.workspaceState.get('roslynSense.unloadedProjects', []);
+    let startupProject: string | undefined =
+        context.workspaceState.get('roslynSense.startupProject', undefined);
+
     const changeEmitter = new vscode.EventEmitter<SolutionTreeNode | undefined>();
     const nodesById = new Map<string, SolutionTreeNode>();
+
+    /// Who listed each node, which is the only record of the parent for ids that do not encode it.
+    const parentById = new Map<string, string>();
 
     /** The solution the tree is showing, learned from its root node. */
     const solutionUriOf = (): string | undefined => {
@@ -93,9 +116,15 @@ export function registerSolutionExplorer(
                     showIgnored: state.showIgnored,
                     filter: filter ?? null,
                     fileNesting: state.fileNesting,
+                    unloadedProjects: unloaded,
                 }
             );
-            children.forEach((child) => nodesById.set(child.id, child));
+            children.forEach((child) => {
+                nodesById.set(child.id, child);
+                if (nodeId) {
+                    parentById.set(child.id, nodeId);
+                }
+            });
             return children;
         } catch {
             return [];
@@ -121,12 +150,10 @@ export function registerSolutionExplorer(
             if (node.resourceUri) {
                 item.resourceUri = vscode.Uri.parse(node.resourceUri);
             }
-            // Files use the resource for their icon so the user's file icon theme applies;
-            // logical nodes get a ThemeIcon since they have no file behind them.
-            const themeIcon = iconFor(node.kind);
-            if (themeIcon) {
-                item.iconPath = themeIcon;
-            }
+            // Every row gets an icon, always. A row without one draws its label where the icon
+            // would have been, so a single icon-less kind shifts its whole branch out of line
+            // with the rest of the tree.
+            item.iconPath = iconFor(node, context.extensionUri);
             if (node.kind === 'file' || node.kind === 'solutionItem' || node.kind === 'import') {
                 item.command = {
                     command: 'vscode.open',
@@ -145,6 +172,12 @@ export function registerSolutionExplorer(
             if (node.dimmed) {
                 item.description = node.description ?? 'not in project';
             }
+            // Visual Studio and Rider both mark the project F5 will start; without it the setting
+            // is invisible and the only way to learn it is to press F5 and see what happens.
+            if (startupProject && projectPathOf(node) && samePath(projectPathOf(node)!, startupProject)
+                && node.id.startsWith('project:')) {
+                item.description = item.description ? `${item.description} · startup` : 'startup';
+            }
             return item;
         },
 
@@ -162,37 +195,72 @@ export function registerSolutionExplorer(
         canSelectMany: true,
         showCollapseAll: true,
         dragAndDropController: {
-            dropMimeTypes: [DROP_MIME],
+            dropMimeTypes: [DROP_MIME, URI_LIST_MIME],
             dragMimeTypes: [DROP_MIME],
 
             handleDrag(source, data) {
-                // Only things with a file behind them can be moved; a Dependencies node has
-                // nowhere to go.
-                const movable = source.filter((node) => node.resourceUri).map((node) => node.resourceUri);
+                // Only things with somewhere to go: a file or folder has a path, a project has a
+                // place in the solution. A Dependencies node has neither.
+                const movable = draggableOf(source);
                 if (movable.length > 0) {
-                    data.set(DROP_MIME, new vscode.DataTransferItem(movable.join('\n')));
+                    data.set(DROP_MIME, new vscode.DataTransferItem(JSON.stringify(movable)));
                 }
             },
 
             async handleDrop(target, data) {
-                const payload = data.get(DROP_MIME);
-                if (!payload || !target?.resourceUri) {
+                if (!target) {
                     return;
                 }
-                for (const uri of String(await payload.asString()).split('\n').filter(Boolean)) {
-                    await edit({
-                        action: 'move',
-                        targetUri: uri,
-                        destinationUri: target.resourceUri,
-                    });
+
+                const own = data.get(DROP_MIME);
+                if (own) {
+                    await dropNodes(target, JSON.parse(String(await own.asString())) as DragItem[]);
+                    return;
                 }
-                refresh();
+
+                const external = data.get(URI_LIST_MIME);
+                if (external) {
+                    await dropFiles(target, parseUriList(String(await external.asString())));
+                }
             },
         },
     });
     context.subscriptions.push(view, changeEmitter);
 
-    const refresh = () => changeEmitter.fire(undefined);
+    /// Refreshing one node re-fetches only its branch, and collapses whatever was open inside it —
+    /// which is also the only way to collapse a subtree, since VS Code exposes no collapse API.
+    const refresh = (node?: SolutionTreeNode) => changeEmitter.fire(node);
+
+    /**
+     * The nodes a command should act on.
+     *
+     * A context menu invokes a command with the clicked node, and with the whole selection when
+     * there is more than one. A *keybinding* invokes it with no arguments at all — VS Code has no
+     * way to pass the tree's selection through a keystroke — so every shortcut in this view used
+     * to throw on `node.id` and do nothing. Reading the selection off the view is what makes the
+     * keyboard and the mouse reach the same code.
+     */
+    const targetsOf = (
+        node?: SolutionTreeNode,
+        selected?: SolutionTreeNode[]
+    ): SolutionTreeNode[] =>
+        selected?.length ? selected : node ? [node] : [...view.selection];
+
+    const targetOf = (node?: SolutionTreeNode): SolutionTreeNode | undefined =>
+        node ?? view.selection[0];
+
+    /** Registers a command that acts on whatever the tree points at. */
+    const onNode = (
+        command: string,
+        run: (node: SolutionTreeNode, selected: SolutionTreeNode[]) => unknown
+    ): vscode.Disposable =>
+        vscode.commands.registerCommand(
+            command,
+            (node?: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
+                const targets = targetsOf(node, selected);
+                return targets.length > 0 ? run(targets[0], targets) : undefined;
+            }
+        );
 
     /// Runs one tree edit and applies whatever namespace fixups it implies. The edits come back
     /// rather than being written server-side so an open, unsaved file is changed in its buffer.
@@ -215,6 +283,150 @@ export function registerSolutionExplorer(
                 await client.protocol2CodeConverter.asWorkspaceEdit(result.edit));
         }
         return result;
+    }
+
+    /**
+     * What a drop from inside the tree means, decided by what was picked up and what it landed on.
+     *
+     * A project dropped on a solution folder is an edit to the solution file and nothing moves on
+     * disk; a file dropped on a project folder is the exact opposite. Routing both through one
+     * `move` action is what used to make dragging a project try to relocate its `.csproj`.
+     */
+    async function dropNodes(
+        target: SolutionTreeNode,
+        items: DragItem[],
+        intent?: 'move' | 'copy'
+    ): Promise<void> {
+        const folderId = solutionFolderIdOf(target);
+        const solutionUri = solutionUriOf();
+
+        for (const item of items) {
+            if (item.id.startsWith('project:')) {
+                // A project only ever moves between solution folders, and there is no such thing
+                // as copying one into a second folder — the solution lists it once.
+                if (folderId === undefined || !solutionUri || intent === 'copy') {
+                    continue;
+                }
+                await edit({
+                    action: 'moveProject',
+                    targetUri: vscode.Uri.file(item.id.slice('project:'.length)).toString(),
+                    destinationUri: solutionUri,
+                    projectPath: folderId,
+                    name: target.label,
+                });
+                continue;
+            }
+
+            if (!item.resourceUri) {
+                continue;
+            }
+
+            // A solution folder holds references to files, not the files themselves — and not
+            // directories, which the solution format has no way to carry.
+            if (folderId !== undefined) {
+                if (folderId && solutionUri && !item.id.startsWith('folder:')) {
+                    await edit({
+                        action: 'addSolutionItem',
+                        targetUri: item.resourceUri,
+                        destinationUri: solutionUri,
+                        projectPath: folderId,
+                    });
+
+                    // Dragging an item from one solution folder to another moves it, the way
+                    // dragging anything else does. Without this it would be listed twice.
+                    const from = solutionItemFolderOf(item.id);
+                    if (from !== undefined && from !== folderId && intent !== 'copy') {
+                        await edit({
+                            action: 'removeSolutionItem',
+                            targetUri: item.resourceUri,
+                            destinationUri: solutionUri,
+                            projectPath: from,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            const destination = containerUriOf(target);
+            if (!destination) {
+                continue;
+            }
+
+            const action = intent ?? (await moveOrCopy(item.resourceUri, target));
+            if (action) {
+                await edit({ action, targetUri: item.resourceUri, destinationUri: destination });
+            }
+        }
+
+        refresh();
+    }
+
+    /**
+     * Whether a cross-project drop should move or copy.
+     *
+     * Visual Studio and Rider decide this from whether Ctrl is held, and VS Code's tree drag API
+     * reports no modifier state at all — so the question gets asked instead, and only when the
+     * answer is not obvious. Within one project a drag is a move, the way it is everywhere else.
+     */
+    async function moveOrCopy(
+        sourceUri: string,
+        target: SolutionTreeNode
+    ): Promise<'move' | 'copy' | undefined> {
+        const project = projectPathOf(target);
+        const source = vscode.Uri.parse(sourceUri).fsPath;
+        if (!project || isUnder(source, Path.dirname(project))) {
+            return 'move';
+        }
+
+        const picked = await vscode.window.showQuickPick(
+            [
+                { label: 'Move', detail: 'Take it out of its current project', action: 'move' as const },
+                { label: 'Copy', detail: 'Leave the original where it is', action: 'copy' as const },
+            ],
+            { title: `${Path.basename(source)} → ${Path.basename(project, Path.extname(project))}` }
+        );
+        return picked?.action;
+    }
+
+    /**
+     * Files dragged in from outside the tree.
+     *
+     * Onto a solution folder they are referenced where they lie, which is what a solution item is.
+     * Onto a project they are copied in, because a project compiles what is inside it — unless the
+     * file is already inside it, which is the "Add Existing Item" case for a file that is on disk
+     * but excluded. Copying that one would only produce "X copy.cs" beside the original.
+     */
+    async function dropFiles(target: SolutionTreeNode, uris: vscode.Uri[]): Promise<void> {
+        const folderId = solutionFolderIdOf(target);
+        const solutionUri = solutionUriOf();
+        const destination = containerUriOf(target);
+
+        for (const uri of uris) {
+            if (folderId !== undefined) {
+                if (folderId && solutionUri) {
+                    await edit({
+                        action: 'addSolutionItem',
+                        targetUri: uri.toString(),
+                        destinationUri: solutionUri,
+                        projectPath: folderId,
+                    });
+                }
+                continue;
+            }
+            if (!destination) {
+                continue;
+            }
+
+            const owner = projectPathOf(target) ?? projectPathOf(parentOf(target));
+            const inside = owner && isUnder(uri.fsPath, Path.dirname(owner));
+            await edit(
+                inside
+                    ? { action: 'includeExistingFile', targetUri: uri.toString() }
+                    : { action: 'copy', targetUri: uri.toString(), destinationUri: destination }
+            );
+        }
+
+        refresh();
     }
 
     /// Expands each ancestor the server names, then selects the file. Without this, revealing
@@ -269,7 +481,12 @@ export function registerSolutionExplorer(
             return;
         }
 
+        // Running a project makes it the startup project, so the badge has to follow — otherwise
+        // it keeps pointing at whatever was started before, which is worse than not showing it.
+        startupProject = projectPath;
         await context.workspaceState.update('roslynSense.startupProject', projectPath);
+        refresh();
+
         await vscode.debug.startDebugging(
             undefined,
             {
@@ -280,6 +497,58 @@ export function registerSolutionExplorer(
             },
             { noDebug: !options.debug }
         );
+    }
+
+    const setUnloaded = async (paths: string[]) => {
+        // Deduplicated on the way in: unloading an already-unloaded project is a no-op, and a
+        // list with it twice would need removing twice.
+        unloaded = paths.filter(
+            (path, index) => paths.findIndex((other) => samePath(other, path)) === index);
+        await context.workspaceState.update('roslynSense.unloadedProjects', unloaded);
+        refresh();
+    };
+
+    async function buildSolution(
+        node: SolutionTreeNode,
+        target: 'build' | 'rebuild' | 'clean'
+    ): Promise<void> {
+        const client = getClient();
+        const solutionUri = solutionUriOf();
+        if (!client || !solutionUri) {
+            return;
+        }
+
+        const titles = { build: 'Building', rebuild: 'Rebuilding', clean: 'Cleaning' };
+        await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Window, title: `${titles[target]} ${node.label}…` },
+            () =>
+                client.sendRequest('workspace/executeCommand', {
+                    command: 'roslynSense.build',
+                    arguments: [vscode.Uri.parse(solutionUri).fsPath, 'Debug', target],
+                })
+        );
+    }
+
+    /**
+     * The node one level up.
+     *
+     * Some ids carry their parent and some do not — a project reference is `project:<path>` no
+     * matter which project references it — so this is remembered from the listing that produced
+     * the node rather than parsed out of its id.
+     */
+    function parentOf(node: SolutionTreeNode): SolutionTreeNode | undefined {
+        const parentId = parentById.get(node.id) ?? parentIdOf(node.id);
+        return parentId ? nodesById.get(parentId) : undefined;
+    }
+
+    /** Which solution folder a solution item hangs off. */
+    function solutionFolderOf(node: SolutionTreeNode): string | undefined {
+        const own = solutionItemFolderOf(node.id);
+        if (own !== undefined) {
+            return own;
+        }
+        const parent = parentById.get(node.id);
+        return parent?.startsWith('slnfolder:') ? parent.slice('slnfolder:'.length) : undefined;
     }
 
     const setToggle = async (key: keyof ViewState, value: boolean) => {
@@ -323,41 +592,85 @@ export function registerSolutionExplorer(
             searchSolution(getClient, view)
         ),
 
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.revealInExplorer',
-            (node: SolutionTreeNode) => {
-                if (node.resourceUri) {
-                    void vscode.commands.executeCommand(
-                        'revealFileInOS', vscode.Uri.parse(node.resourceUri));
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.filter', () => {
+            // A QuickPick used as a live filter box: every keystroke narrows the tree behind
+            // it. VS Code has no way to put an input inside a TreeView, and its own find widget
+            // does not reach contributed views, so this is as close to a Rider speed search as
+            // the API allows — incremental, and over the whole solution rather than the rows
+            // that happen to be expanded.
+            const box = vscode.window.createQuickPick();
+            box.title = 'Filter the solution';
+            box.placeholder = 'Type to narrow the tree — Enter keeps it, Escape clears it';
+            box.value = filter ?? '';
+
+            let pending: NodeJS.Timeout | undefined;
+            let committed = false;
+
+            const apply = (value: string) => {
+                clearTimeout(pending);
+                pending = setTimeout(() => {
+                    filter = value.trim() ? value.trim() : undefined;
+                    view.message = filter ? `Filtering by “${filter}”` : undefined;
+                    refresh();
+                }, 120);
+            };
+
+            box.onDidChangeValue(apply);
+            box.onDidAccept(() => {
+                committed = true;
+                box.hide();
+            });
+            box.onDidHide(() => {
+                clearTimeout(pending);
+                if (!committed) {
+                    filter = undefined;
+                    view.message = undefined;
+                    refresh();
                 }
+                box.dispose();
+            });
+
+            box.show();
+        }),
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.clearFilter', () => {
+            filter = undefined;
+            view.message = undefined;
+            refresh();
+        }),
+
+        onNode('roslynSense.solutionExplorer.revealInExplorer', (node) => {
+            if (node.resourceUri) {
+                void vscode.commands.executeCommand(
+                    'revealFileInOS', vscode.Uri.parse(node.resourceUri));
             }
-        ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.findInFolder',
-            (node: SolutionTreeNode) => {
-                if (node.resourceUri) {
-                    void vscode.commands.executeCommand('workbench.action.findInFiles', {
-                        filesToInclude: vscode.Uri.parse(node.resourceUri).fsPath,
-                    });
-                }
+        }),
+        onNode('roslynSense.solutionExplorer.findInFolder', (node) => {
+            if (node.resourceUri) {
+                void vscode.commands.executeCommand('workbench.action.findInFiles', {
+                    filesToInclude: vscode.Uri.parse(node.resourceUri).fsPath,
+                });
             }
-        ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.openProjectFile',
-            (node: SolutionTreeNode) => {
-                const target = node.id.startsWith('project:')
-                    ? vscode.Uri.file(node.id.slice('project:'.length))
-                    : node.resourceUri
-                      ? vscode.Uri.parse(node.resourceUri)
-                      : undefined;
-                if (target) {
-                    void vscode.window.showTextDocument(target);
-                }
+        }),
+        onNode('roslynSense.solutionExplorer.openProjectFile', (node) => {
+            const target = node.id.startsWith('project:')
+                ? vscode.Uri.file(node.id.slice('project:'.length))
+                : node.resourceUri
+                  ? vscode.Uri.parse(node.resourceUri)
+                  : undefined;
+            if (target) {
+                void vscode.window.showTextDocument(target);
             }
-        ),
+        }),
         vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.newFile',
-            async (node: SolutionTreeNode, preselectedKind?: string) => {
+            async (clicked: SolutionTreeNode | undefined, second?: unknown) => {
+                const node = targetOf(clicked);
+                if (!node) {
+                    return;
+                }
+                // The second argument is a kind when the New Item menu supplies one, and the rest
+                // of the selection when the context menu invokes this with several rows selected.
+                const preselectedKind = typeof second === 'string' ? second : undefined;
                 const name = await vscode.window.showInputBox({
                     title: 'New file',
                     prompt: 'File name, with or without an extension',
@@ -384,15 +697,171 @@ export function registerSolutionExplorer(
                     name,
                     kind,
                 });
+                // Only the folder it landed in changed; rebuilding the whole tree would collapse
+                // every branch the user had open to get here.
+                refresh(node);
+                if (result?.ok && result.uri) {
+                    await vscode.window.showTextDocument(vscode.Uri.parse(result.uri));
+                }
+            }
+        ),
+        onNode(
+            'roslynSense.solutionExplorer.addProjectReference',
+            async (node) => {
+                const client = getClient();
+                const projectPath = projectPathOf(node);
+                if (!client || !projectPath) {
+                    return;
+                }
+
+                const projects = await client.sendRequest<{ path: string; name: string }[]>(
+                    'roslynSense/solutionProjects'
+                );
+                const others = projects.filter((p) => !samePath(p.path, projectPath));
+                if (others.length === 0) {
+                    void vscode.window.showInformationMessage(
+                        'There are no other projects in this solution to reference.');
+                    return;
+                }
+
+                const picked = await vscode.window.showQuickPick(
+                    others.map((p) => ({ label: p.name, description: p.path, project: p })),
+                    { title: 'Add project reference', canPickMany: true }
+                );
+                if (!picked?.length) {
+                    return;
+                }
+
+                for (const choice of picked) {
+                    await edit({
+                        action: 'addProjectReference',
+                        projectPath,
+                        destinationUri: vscode.Uri.file(choice.project.path).toString(),
+                    });
+                }
+                refresh();
+            }
+        ),
+        onNode(
+            'roslynSense.solutionExplorer.addAssemblyReference',
+            async (node) => {
+                const client = getClient();
+                const projectPath = projectPathOf(node);
+                if (!client || !projectPath) {
+                    return;
+                }
+
+                const assemblies = await client.sendRequest<string[]>(
+                    'roslynSense/assemblyReferences',
+                    { query: projectPath, limit: 0 }
+                );
+
+                if (assemblies.length === 0) {
+                    // The menu only offers this on a .NET Framework project, so reaching here
+                    // means the reference assemblies for its target framework are not installed.
+                    void vscode.window.showErrorMessage(
+                        'No reference assemblies were found for this project’s target framework. ' +
+                        'Install the matching .NET Framework targeting pack.');
+                    return;
+                }
+
+                const picked = await vscode.window.showQuickPick(assemblies, {
+                    title: 'Add reference',
+                    placeHolder: 'System.ServiceModel',
+                    canPickMany: true,
+                });
+                if (!picked?.length) {
+                    return;
+                }
+
+                for (const assembly of picked) {
+                    await edit({ action: 'addAssemblyReference', projectPath, name: assembly });
+                }
+                refresh();
+            }
+        ),
+        onNode(
+            'roslynSense.solutionExplorer.newProject',
+            async (node) => {
+                const client = getClient();
+                const solutionUri = node.id.startsWith('solution:')
+                    ? vscode.Uri.file(node.id.slice('solution:'.length)).toString()
+                    : solutionUriOf();
+                if (!client || !solutionUri) {
+                    return;
+                }
+
+                const choices = await vscode.window.withProgress(
+                    { location: vscode.ProgressLocation.Window, title: 'Reading templates…' },
+                    () => client.sendRequest<{
+                        templates: { name: string; shortName: string; tags: string }[];
+                        targetFrameworks: string[];
+                    }>('roslynSense/projectTemplates')
+                );
+
+                if (!choices.templates.length) {
+                    void vscode.window.showErrorMessage(
+                        'No project templates were found. Is the .NET SDK on PATH?');
+                    return;
+                }
+
+                const template = await vscode.window.showQuickPick(
+                    choices.templates.map((t) => ({
+                        label: t.name,
+                        description: t.shortName,
+                        detail: t.tags || undefined,
+                        shortName: t.shortName,
+                    })),
+                    { title: 'New project', matchOnDescription: true, matchOnDetail: true }
+                );
+                if (!template) {
+                    return;
+                }
+
+                const name = await vscode.window.showInputBox({
+                    title: 'Project name',
+                    placeHolder: 'Contoso.Widgets',
+                });
+                if (!name) {
+                    return;
+                }
+
+                const framework = await vscode.window.showQuickPick(
+                    [
+                        { label: 'Template default', framework: undefined as string | undefined },
+                        ...choices.targetFrameworks.map((f) => ({ label: f, framework: f })),
+                    ],
+                    { title: 'Target framework' }
+                );
+                if (!framework) {
+                    return;
+                }
+
+                const result = await vscode.window.withProgress(
+                    { location: vscode.ProgressLocation.Window, title: `Creating ${name}…` },
+                    () =>
+                        edit({
+                            action: 'addProject',
+                            targetUri: solutionUri,
+                            // The solution folder to nest under, when invoked on one.
+                            projectPath: node.id.startsWith('slnfolder:')
+                                ? node.id.slice('slnfolder:'.length)
+                                : undefined,
+                            name,
+                            kind: template.shortName,
+                            targetFramework: framework.framework,
+                        })
+                );
+
                 refresh();
                 if (result?.ok && result.uri) {
                     await vscode.window.showTextDocument(vscode.Uri.parse(result.uri));
                 }
             }
         ),
-        vscode.commands.registerCommand(
+        onNode(
             'roslynSense.solutionExplorer.newSolutionFolder',
-            async (node: SolutionTreeNode) => {
+            async (node) => {
                 const name = await vscode.window.showInputBox({
                     title: 'New solution folder',
                     prompt: 'A grouping inside the solution file — not a directory on disk',
@@ -422,22 +891,41 @@ export function registerSolutionExplorer(
                 refresh();
             }
         ),
-        vscode.commands.registerCommand(
+        onNode(
             'roslynSense.solutionExplorer.newFolder',
-            async (node: SolutionTreeNode) => {
+            async (node) => {
                 const name = await vscode.window.showInputBox({
                     title: 'New folder',
                     prompt: 'Folder name',
                 });
                 if (name) {
                     await edit({ action: 'addFolder', targetUri: containerUriOf(node), name });
-                    refresh();
+                    refresh(node);
                 }
             }
         ),
-        vscode.commands.registerCommand(
+        // One Rename, doing whatever renaming means for the row it was pressed on — a solution
+        // folder has no file to rename, and F2 landing on nothing is worse than no F2 at all.
+        onNode(
             'roslynSense.solutionExplorer.rename',
-            async (node: SolutionTreeNode) => {
+            async (node) => {
+                if (node.id.startsWith('slnfolder:')) {
+                    const name = await vscode.window.showInputBox({
+                        title: 'Rename solution folder',
+                        value: node.label,
+                    });
+                    if (name && name !== node.label) {
+                        await edit({
+                            action: 'renameSolutionFolder',
+                            targetUri: solutionUriOf(),
+                            projectPath: node.id.slice('slnfolder:'.length),
+                            name,
+                        });
+                        refresh();
+                    }
+                    return;
+                }
+
                 if (!node.resourceUri) {
                     return;
                 }
@@ -451,91 +939,211 @@ export function registerSolutionExplorer(
                     return;
                 }
                 await edit({ action: 'rename', targetUri: node.resourceUri, name });
-                refresh();
+                refresh(parentOf(node));
             }
         ),
-        vscode.commands.registerCommand(
+        // Likewise Delete: a solution item is detached, a solution folder is dissolved, a project
+        // leaves the solution, and only a real file is actually deleted.
+        onNode(
             'roslynSense.solutionExplorer.delete',
-            async (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
-                const targets = (selected?.length ? selected : [node]).filter((n) => n.resourceUri);
+            async (_node, selected) => {
+                const targets = selected.filter(
+                    (n) => n.resourceUri || n.id.startsWith('slnfolder:'));
                 if (targets.length === 0) {
                     return;
                 }
 
-                // Deleting from a tree is easy to do by accident and impossible to undo.
+                // Deleting from a tree is easy to do by accident and impossible to undo, so the
+                // prompt says exactly which of the four things is about to happen.
                 const confirmed = await vscode.window.showWarningMessage(
-                    targets.length === 1
-                        ? `Delete ${targets[0].label}?`
-                        : `Delete ${targets.length} items?`,
+                    describeDeleteAll(targets),
                     { modal: true },
                     'Delete'
                 );
                 if (confirmed !== 'Delete') {
                     return;
                 }
+
+                const solutionUri = solutionUriOf();
                 for (const target of targets) {
-                    await edit({ action: 'delete', targetUri: target.resourceUri });
+                    if (target.id.startsWith('slnfolder:')) {
+                        await edit({
+                            action: 'removeSolutionFolder',
+                            targetUri: solutionUri,
+                            projectPath: target.id.slice('slnfolder:'.length),
+                        });
+                    } else if (target.kind === 'solutionItem') {
+                        await edit({
+                            action: 'removeSolutionItem',
+                            targetUri: target.resourceUri,
+                            destinationUri: solutionUri,
+                            projectPath: solutionFolderOf(target),
+                        });
+                    } else if (target.id.startsWith('project:')) {
+                        await edit({
+                            action: 'removeProject',
+                            targetUri: target.resourceUri,
+                            destinationUri: solutionUri,
+                        });
+                    } else {
+                        await edit({ action: 'delete', targetUri: target.resourceUri });
+                    }
                 }
                 refresh();
             }
         ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.copy',
-            (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
-                const uris = urisOf(node, selected);
-                if (uris.length > 0) {
-                    clipboard = { uris, cut: false };
-                    view.message = `${describeCount(uris.length)} copied.`;
-                }
-            }
-        ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.cut',
-            (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
-                const uris = urisOf(node, selected);
-                if (uris.length > 0) {
-                    clipboard = { uris, cut: true };
-                    view.message = `${describeCount(uris.length)} cut.`;
-                }
-            }
-        ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.paste',
-            async (node: SolutionTreeNode) => {
-                const destination = containerUriOf(node);
-                if (!clipboard || !destination) {
+        onNode(
+            'roslynSense.solutionExplorer.addExistingItem',
+            async (node) => {
+                const folderId = solutionFolderIdOf(node);
+                const picked = await vscode.window.showOpenDialog({
+                    title: folderId
+                        ? `Add existing item to ${node.label}`
+                        : 'Add existing item',
+                    canSelectMany: true,
+                    openLabel: 'Add',
+                    defaultUri: defaultDialogUri(node),
+                });
+                if (!picked?.length) {
                     return;
                 }
-                // A cut is a move, which carries the namespace fixups with it; a copy is not,
-                // because the copy is a second type with the original's name and renaming it is
-                // the user's next step rather than ours to guess.
-                for (const uri of clipboard.uris) {
+                await dropFiles(node, picked);
+            }
+        ),
+        onNode(
+            'roslynSense.solutionExplorer.addExistingProject',
+            async (node) => {
+                const solutionUri = solutionUriOf();
+                if (!solutionUri) {
+                    return;
+                }
+                const picked = await vscode.window.showOpenDialog({
+                    title: 'Add existing project',
+                    canSelectMany: true,
+                    openLabel: 'Add',
+                    filters: { 'Project files': ['csproj', 'vbproj', 'fsproj'] },
+                    defaultUri: vscode.Uri.file(Path.dirname(vscode.Uri.parse(solutionUri).fsPath)),
+                });
+                if (!picked?.length) {
+                    return;
+                }
+
+                for (const project of picked) {
                     await edit({
-                        action: clipboard.cut ? 'move' : 'copy',
-                        targetUri: uri,
-                        destinationUri: destination,
+                        action: 'addExistingProject',
+                        targetUri: solutionUri,
+                        destinationUri: project.toString(),
+                        projectPath: node.id.startsWith('slnfolder:')
+                            ? node.id.slice('slnfolder:'.length)
+                            : undefined,
                     });
                 }
+                refresh();
+            }
+        ),
+        onNode(
+            'roslynSense.solutionExplorer.excludeFile',
+            async (_node, selected) => {
+                for (const uri of urisOf(selected)) {
+                    await edit({ action: 'excludeFile', targetUri: uri });
+                }
+                refresh(parentOf(selected[0]));
+            }
+        ),
+        onNode(
+            'roslynSense.solutionExplorer.removeReference',
+            async (node) => {
+                // A reference node is "project:<path>" under a "group:projects|<owner>" parent,
+                // so the owner comes from the parent rather than from the node itself.
+                const owner = projectPathOf(parentOf(node));
+                if (!owner || !node.resourceUri) {
+                    return;
+                }
+                await edit({
+                    action: 'removeProjectReference',
+                    projectPath: owner,
+                    destinationUri: node.resourceUri,
+                });
+                refresh();
+            }
+        ),
+        onNode('roslynSense.solutionExplorer.unloadProject', async (_node, selected) => {
+            const paths = selected.map(projectPathOf).filter((p): p is string => Boolean(p));
+            await setUnloaded([...unloaded, ...paths]);
+        }),
+        onNode('roslynSense.solutionExplorer.reloadProject', async (_node, selected) => {
+            const paths = selected.map(projectPathOf).filter((p): p is string => Boolean(p));
+            await setUnloaded(unloaded.filter((u) => !paths.some((p) => samePath(p, u))));
+        }),
+        onNode('roslynSense.solutionExplorer.setStartupProject', async (node) => {
+            const projectPath = projectPathOf(node);
+            if (projectPath) {
+                startupProject = projectPath;
+                await context.workspaceState.update('roslynSense.startupProject', projectPath);
+                refresh();
+            }
+        }),
+        onNode('roslynSense.solutionExplorer.collapseDescendants', (node) => refresh(node)),
+        onNode('roslynSense.solutionExplorer.compareSelected', async (_node, selected) => {
+            const uris = urisOf(selected);
+            if (uris.length !== 2) {
+                void vscode.window.showInformationMessage('Select exactly two files to compare.');
+                return;
+            }
+            await vscode.commands.executeCommand(
+                'vscode.diff', vscode.Uri.parse(uris[0]), vscode.Uri.parse(uris[1]));
+        }),
+        onNode('roslynSense.solutionExplorer.buildSolution', (node) => buildSolution(node, 'build')),
+        onNode('roslynSense.solutionExplorer.rebuildSolution', (node) =>
+            buildSolution(node, 'rebuild')
+        ),
+        onNode('roslynSense.solutionExplorer.cleanSolution', (node) => buildSolution(node, 'clean')),
+        onNode('roslynSense.solutionExplorer.copy', (_node, selected) => {
+            const items = draggableOf(selected);
+            if (items.length > 0) {
+                clipboard = { items, cut: false };
+                view.message = `${describeCount(items.length)} copied.`;
+            }
+        }),
+        onNode('roslynSense.solutionExplorer.cut', (_node, selected) => {
+            const items = draggableOf(selected);
+            if (items.length > 0) {
+                clipboard = { items, cut: true };
+                view.message = `${describeCount(items.length)} cut.`;
+            }
+        }),
+        onNode(
+            'roslynSense.solutionExplorer.paste',
+            async (node) => {
+                if (!clipboard) {
+                    return;
+                }
+                // The same dispatch a drop goes through, so pasting a project into a solution
+                // folder means what dragging it there means. A cut is a move, which carries the
+                // namespace fixups with it; a copy is not, because the copy is a second type with
+                // the original's name and renaming it is the user's next step rather than ours to
+                // guess.
+                await dropNodes(node, clipboard.items, clipboard.cut ? 'move' : 'copy');
+
                 if (clipboard.cut) {
                     clipboard = undefined;
                 }
                 view.message = undefined;
-                refresh();
             }
         ),
-        vscode.commands.registerCommand(
+        onNode(
             'roslynSense.solutionExplorer.duplicate',
-            async (node: SolutionTreeNode, selected?: SolutionTreeNode[]) => {
-                for (const uri of urisOf(node, selected)) {
+            async (_node, selected) => {
+                for (const uri of urisOf(selected)) {
                     // Duplicate is a paste back into the folder the file is already in.
                     await edit({ action: 'copy', targetUri: uri, destinationUri: uri });
                 }
                 refresh();
             }
         ),
-        vscode.commands.registerCommand(
+        onNode(
             'roslynSense.solutionExplorer.newItem',
-            async (node: SolutionTreeNode) => {
+            async (node) => {
                 const kind = await vscode.window.showQuickPick(
                     ['class', 'interface', 'record', 'enum', 'empty file', 'folder'],
                     { title: 'New' }
@@ -552,21 +1160,18 @@ export function registerSolutionExplorer(
                 );
             }
         ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.startupAndDebug',
-            (node: SolutionTreeNode) => launch(node, { debug: true })
+        onNode('roslynSense.solutionExplorer.startupAndDebug', (node) =>
+            launch(node, { debug: true })
         ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.debugProject',
-            (node: SolutionTreeNode) => launch(node, { debug: true })
+        onNode('roslynSense.solutionExplorer.debugProject', (node) =>
+            launch(node, { debug: true })
         ),
-        vscode.commands.registerCommand(
-            'roslynSense.solutionExplorer.runProject',
-            (node: SolutionTreeNode) => launch(node, { debug: false })
+        onNode('roslynSense.solutionExplorer.runProject', (node) =>
+            launch(node, { debug: false })
         ),
-        vscode.commands.registerCommand(
+        onNode(
             'roslynSense.solutionExplorer.packageDetails',
-            (node: SolutionTreeNode) => {
+            (node) => {
                 // Package nodes are "package:<projectPath>|<id>"; the panel takes the project
                 // and opens with that package selected.
                 const [projectPath, packageId] = node.id.startsWith('package:')
@@ -579,9 +1184,9 @@ export function registerSolutionExplorer(
                 );
             }
         ),
-        vscode.commands.registerCommand(
+        onNode(
             'roslynSense.solutionExplorer.buildProject',
-            async (node: SolutionTreeNode) => {
+            async (node) => {
                 const client = getClient();
                 if (!client || !node.id.startsWith('project:')) {
                     return;
@@ -692,15 +1297,129 @@ async function searchSolution(
     picker.show();
 }
 
-/** The files behind a click, honouring a multi-selection when there is one. */
-function urisOf(node: SolutionTreeNode, selected?: SolutionTreeNode[]): string[] {
-    return (selected?.length ? selected : [node])
-        .map((n) => n.resourceUri)
-        .filter((uri): uri is string => Boolean(uri));
+/** The files behind a set of nodes, skipping the ones that have none. */
+function urisOf(nodes: SolutionTreeNode[]): string[] {
+    return nodes.map((n) => n.resourceUri).filter((uri): uri is string => Boolean(uri));
+}
+
+/** The nodes that can be dragged or put on the clipboard, reduced to what a drop needs. */
+function draggableOf(nodes: readonly SolutionTreeNode[]): DragItem[] {
+    return nodes
+        .filter((node) => node.resourceUri || node.id.startsWith('project:'))
+        .map((node) => ({ id: node.id, resourceUri: node.resourceUri }));
+}
+
+/** Compares two file-system paths the way Windows does. */
+function samePath(a: string, b: string): boolean {
+    return normalisePath(a) === normalisePath(b);
+}
+
+function normalisePath(value: string): string {
+    return value.split('\\').join('/').toLowerCase();
+}
+
+function isUnder(path: string, directory: string): boolean {
+    const parent = normalisePath(directory).replace(/\/$/, '');
+    return normalisePath(path).startsWith(parent + '/');
+}
+
+/**
+ * The solution-folder a node names: its id for a solution folder, the empty string for the
+ * solution itself, and undefined for anything that is not part of the solution's own structure.
+ */
+function solutionFolderIdOf(node: SolutionTreeNode): string | undefined {
+    if (node.id.startsWith('slnfolder:')) {
+        return node.id.slice('slnfolder:'.length);
+    }
+    return node.id.startsWith('solution:') ? '' : undefined;
+}
+
+/**
+ * `text/uri-list` is newline-separated. Entries that will not parse are skipped rather than
+ * thrown on — the payload arrives malformed on some VS Code builds when several files are
+ * dragged at once (microsoft/vscode#195048), and one bad line should not lose the rest.
+ */
+function parseUriList(value: string): vscode.Uri[] {
+    const uris: vscode.Uri[] = [];
+    for (const line of value.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) {
+            continue;
+        }
+        try {
+            uris.push(vscode.Uri.parse(trimmed, true));
+        } catch {
+            // Not a URI this can act on.
+        }
+    }
+    return uris;
 }
 
 function describeCount(count: number): string {
     return count === 1 ? '1 item' : `${count} items`;
+}
+
+/**
+ * What Delete is about to do, said plainly.
+ *
+ * Three of the four cases do not touch the disk at all, and a dialog that says "Delete X?"
+ * regardless is asking the user to guess which one they are in.
+ */
+/**
+ * The same promise for a whole selection.
+ *
+ * "Delete 3 items?" is the wrong prompt for a batch where two of the three are only leaving the
+ * solution and one is really going off the disk — the user has no way to tell which is which, and
+ * the single-item wording taught them to expect that distinction to be made.
+ */
+function describeDeleteAll(nodes: SolutionTreeNode[]): string {
+    if (nodes.length === 1) {
+        return describeDelete(nodes[0]);
+    }
+
+    const onDisk = nodes.filter(
+        (n) => !n.id.startsWith('slnfolder:')
+            && !n.id.startsWith('project:')
+            && n.kind !== 'solutionItem');
+    const listedOnly = nodes.length - onDisk.length;
+
+    if (listedOnly === 0) {
+        return `Delete ${describeCount(onDisk.length)} from disk?`;
+    }
+    if (onDisk.length === 0) {
+        return `Remove ${describeCount(listedOnly)} from the solution? Nothing is deleted from disk.`;
+    }
+    return `Delete ${describeCount(onDisk.length)} from disk and remove ` +
+        `${describeCount(listedOnly)} from the solution?`;
+}
+
+function describeDelete(node: SolutionTreeNode): string {
+    if (node.id.startsWith('slnfolder:')) {
+        const path = node.id.slice('slnfolder:'.length);
+        // Only a top-level folder can lose anything: its solution items have no folder above
+        // them to move to, and the solution cannot list a file outside one.
+        return path.replace(/^\/|\/$/g, '').includes('/')
+            ? `Remove the solution folder ${node.label}? What is inside it moves up a level.`
+            : `Remove the solution folder ${node.label}? Projects and folders inside it move up ` +
+              'a level; any solution items it holds stop being listed. Nothing is deleted from disk.';
+    }
+    if (node.kind === 'solutionItem') {
+        return `Remove ${node.label} from the solution folder? The file stays on disk.`;
+    }
+    if (node.id.startsWith('project:')) {
+        return `Remove ${node.label} from the solution? Its files stay on disk.`;
+    }
+    return `Delete ${node.label}?`;
+}
+
+/** Where an "add existing" dialog should open: next to whatever it was invoked on. */
+function defaultDialogUri(node: SolutionTreeNode): vscode.Uri | undefined {
+    const container = containerUriOf(node);
+    if (!container) {
+        return undefined;
+    }
+    const path = vscode.Uri.parse(container).fsPath;
+    return vscode.Uri.file(Path.extname(path) ? Path.dirname(path) : path);
 }
 
 /** Where a "new file here" lands: the node's own folder, or the folder its file sits in. */
@@ -721,6 +1440,13 @@ function projectPathOf(node: SolutionTreeNode | undefined): string | undefined {
     if (node?.id.startsWith('project:')) {
         return node.id.slice('project:'.length);
     }
+    // Dependencies and its groups are named "<projectPath>!deps" and "group:<projectPath>|...".
+    if (node?.id.endsWith('!deps')) {
+        return node.id.slice(0, -'!deps'.length);
+    }
+    if (node?.id.startsWith('group:')) {
+        return node.id.slice('group:'.length).split('|')[0];
+    }
     // folder ids are "folder:<projectPath>|<directory>".
     if (node?.id.startsWith('folder:')) {
         return node.id.slice('folder:'.length).split('|')[0];
@@ -729,43 +1455,137 @@ function projectPathOf(node: SolutionTreeNode | undefined): string | undefined {
 }
 
 function parentIdOf(id: string): string | undefined {
+    const folder = solutionItemFolderOf(id);
+    if (folder !== undefined) {
+        return `slnfolder:${folder}`;
+    }
     const separator = id.lastIndexOf('|');
     return separator > 0 ? id.slice(0, separator) : undefined;
 }
 
-function iconFor(kind: string): vscode.ThemeIcon | undefined {
-    switch (kind) {
+/**
+ * The solution folder a solution item is listed under, read out of its id
+ * (`slnitem:<folder>|<file>`), or undefined for anything that is not a solution item.
+ */
+function solutionItemFolderOf(id: string): string | undefined {
+    if (!id.startsWith('slnitem:')) {
+        return undefined;
+    }
+    const rest = id.slice('slnitem:'.length);
+    const separator = rest.lastIndexOf('|');
+    return separator < 0 ? undefined : rest.slice(0, separator);
+}
+
+/** What a row can be drawn with: a codicon, or one of the shipped language badges. */
+type NodeIcon = vscode.ThemeIcon | vscode.Uri;
+
+/**
+ * The badge for a project, by the language it is written in.
+ *
+ * Codicons have one project glyph and no notion of language, so a C# and a Visual Basic project
+ * used to be the same grey box — the one distinction Visual Studio, Rider and ReSharper all draw
+ * first. These are shipped as SVGs for that reason, and are coloured rather than themed, since a
+ * language badge means the same thing under a light theme as under a dark one.
+ */
+function languageIcon(resourceUri: string | null, extensionUri: vscode.Uri): NodeIcon {
+    const extension = resourceUri
+        ? Path.extname(vscode.Uri.parse(resourceUri).fsPath).toLowerCase()
+        : '';
+    const badges: Record<string, string> = {
+        '.csproj': 'project-csharp',
+        '.vbproj': 'project-vb',
+        '.fsproj': 'project-fsharp',
+    };
+    const file = badges[extension];
+    return file
+        ? vscode.Uri.joinPath(extensionUri, 'media', `${file}.svg`)
+        : tinted('project', 'charts.blue');
+}
+
+/**
+ * A codicon with a tint, the way Rider and Visual Studio colour their tree.
+ *
+ * Blue, green and purple only. `charts.orange` and `charts.yellow` resolve to #d18616 and
+ * #cca700, which at 16px on a dark background read as brown rather than as a colour anyone chose.
+ */
+function tinted(id: string, color: string): vscode.ThemeIcon {
+    return new vscode.ThemeIcon(id, new vscode.ThemeColor(color));
+}
+
+/**
+ * What a row is drawn with.
+ *
+ * Files get `ThemeIcon.File`, which is VS Code's way of saying "let the user's file icon theme
+ * decide", so a `.cs` file looks the same here as it does in the Explorer. Everything else gets
+ * an icon of its own, because a tree drawn entirely in the foreground colour reads as one
+ * undifferentiated list.
+ *
+ * Every expandable row must end up with an icon, and that is why folders are a codicon rather
+ * than `ThemeIcon.Folder`. Most file icon themes — Seti, the default — ship file icons and no
+ * folder icons, so `ThemeIcon.Folder` resolves to nothing under them. VS Code reacts to an
+ * expandable row without an icon by collapsing the twistie column on its *leaf* siblings, to line
+ * their icons up with the arrows; a row that does have one keeps the column. Mixing the two,
+ * which is what happened while folders came from the icon theme, indents the icon-bearing rows a
+ * whole extra level and lines up nothing with anything.
+ */
+function iconFor(node: SolutionTreeNode, extensionUri: vscode.Uri): NodeIcon {
+    // A project's kind stays "project" whether it is runnable or unloaded; only its context
+    // value says which, and an unloaded one is drawn greyed the way its label already is.
+    switch (node.kind === 'project' ? node.contextValue : node.kind) {
         case 'solution':
-            return new vscode.ThemeIcon('versions');
+            return tinted('versions', 'charts.purple');
+        // A solution folder is not a directory — it exists only in the .sln — so it is drawn
+        // apart from the real folders it sits beside.
         case 'solutionFolder':
+            return tinted('folder-library', 'charts.blue');
         case 'folder':
             return new vscode.ThemeIcon('folder');
         case 'project':
+        case 'projectRunnable':
         case 'projectRef':
-            return new vscode.ThemeIcon('project');
+            return languageIcon(node.resourceUri, extensionUri);
+        case 'projectUnloaded':
+            // Nothing about an unloaded project is live, and a full-colour icon says otherwise.
+            return tinted('project', 'descriptionForeground');
         case 'dependencies':
-            return new vscode.ThemeIcon('references');
+        case 'dependenciesNetFx':
+            return tinted('references', 'charts.blue');
         case 'imports':
         case 'import':
             return new vscode.ThemeIcon('file-symlink-file');
         case 'framework':
-            return new vscode.ThemeIcon('layers');
+            return tinted('layers', 'charts.green');
         case 'packages':
         case 'package':
-            return new vscode.ThemeIcon('package');
+            return tinted('package', 'charts.blue');
+        case 'transitive':
+        case 'transitivePackage':
+            // Distinct from a direct reference on purpose: nothing in the project file names
+            // these, so they are not something to right-click and uninstall.
+            return tinted('git-merge', 'descriptionForeground');
         case 'projects':
-            return new vscode.ThemeIcon('type-hierarchy');
+            return tinted('type-hierarchy', 'charts.blue');
         case 'assemblies':
         case 'assembly':
-            return new vscode.ThemeIcon('library');
+            return tinted('library', 'charts.green');
         case 'analyzers':
         case 'analyzer':
-            return new vscode.ThemeIcon('circuit-board');
+            return tinted('circuit-board', 'charts.purple');
         case 'generator':
-            return new vscode.ThemeIcon('wand');
+            return tinted('wand', 'charts.purple');
+        // Generated output is a file the user never wrote, and telling it apart from one they
+        // did is the whole point of showing it separately.
         case 'generatedFile':
-            return new vscode.ThemeIcon('file-code');
+            return tinted('file-code', 'charts.purple');
+        case 'file':
+        case 'solutionItem':
+            return vscode.ThemeIcon.File;
         default:
-            return undefined;
+            // An unknown kind is still a row, and a row still needs its slot filled.
+            return node.hasChildren
+                ? new vscode.ThemeIcon('folder')
+                : node.resourceUri
+                  ? vscode.ThemeIcon.File
+                  : tinted('circle-outline', 'descriptionForeground');
     }
 }

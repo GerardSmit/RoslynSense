@@ -122,7 +122,7 @@ public static class CodeScope
         }
 
         // The file name is a namespace hint in its own right — a project can compile into an
-        // assembly named differently (ForWorkWear.Website.csproj → iEntityV2.Modules.dll) while
+        // assembly named differently (Storefront.Website.csproj → Legacy.Modules.dll) while
         // code still lives in namespaces matching either name.
         names.Add(Path.GetFileNameWithoutExtension(csprojPath));
 

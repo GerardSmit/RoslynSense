@@ -59,17 +59,17 @@ public class CodeScopeTests : IDisposable
     [Fact]
     public void WhenAssemblyNameDiffersFromFileNameThenBothNamespacesMatch()
     {
-        // Mirrors ForWorkWear: project file ForWorkWear.Website, assembly iEntityV2.Modules,
-        // code namespaces iEntityV2.*.
+        // A real shape this has to handle: project file Storefront.Website, assembly
+        // Legacy.Modules, code namespaces Legacy.*.
         var project = WriteProject(
-            @"src\ForWorkWear.Website\ForWorkWear.Website.csproj",
-            assemblyName: "iEntityV2.Modules");
-        WriteSolution("EntityV2.sln", project);
+            @"src\Storefront.Website\Storefront.Website.csproj",
+            assemblyName: "Legacy.Modules");
+        WriteSolution("Legacy.sln", project);
 
         var prefixes = CodeScope.OwnPrefixesForProject(project);
 
-        Assert.True(CodeScope.IsOwn("iEntityV2.CustomerData.ExcludePage", prefixes));
-        Assert.True(CodeScope.IsOwn("ForWorkWear.Website.Handlers.Sitemap", prefixes));
+        Assert.True(CodeScope.IsOwn("Legacy.CustomerData.ExcludePage", prefixes));
+        Assert.True(CodeScope.IsOwn("Storefront.Website.Handlers.Sitemap", prefixes));
         Assert.False(CodeScope.IsOwn("System.String.Concat", prefixes));
         Assert.False(CodeScope.IsOwn("DotNetNuke.Common.Globals.GetPortalSettings", prefixes));
     }

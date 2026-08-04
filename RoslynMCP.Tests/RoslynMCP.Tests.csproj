@@ -37,6 +37,16 @@
         <Compile Remove="Fixtures\**\bin\**\*.cs" />
     </ItemGroup>
 
+    <!--
+      LargeSolutionFixture.cs lives under Fixtures\ because it is a fixture, but unlike everything
+      else there it is generator code this assembly compiles and calls, not a sample project's
+      source the workspace loads at test time — so it needs to be added back after the broad
+      Remove above excludes it.
+    -->
+    <ItemGroup>
+        <Compile Include="Fixtures\LargeSolutionFixture.cs" />
+    </ItemGroup>
+
     <ItemGroup>
         <ProjectReference Include="..\RoslynMCP\RoslynMCP.csproj" />
     </ItemGroup>

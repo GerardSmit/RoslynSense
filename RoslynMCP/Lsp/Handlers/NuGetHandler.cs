@@ -63,7 +63,8 @@ internal static class NuGetHandler
             Lock: ParseLock(p.VersionLock),
             Prerelease: ParsePrerelease(p.Prerelease),
             ProjectPaths: p.ProjectPaths,
-            Refresh: p.Refresh);
+            Refresh: p.Refresh,
+            AlignPlatform: p.AlignPlatform);
 
         var found = await PackageUpdateService.OutdatedAsync(query, ct);
 
@@ -72,7 +73,7 @@ internal static class NuGetHandler
                 .Select(u => new PackageUpdateDto(
                     u.Id, u.CurrentVersion, u.LatestVersion, u.Severity.ToString().ToLowerInvariant(),
                     u.ProjectPath, u.ProjectName, u.IsCentrallyManaged, u.IsGlobalPackageReference,
-                    u.VersionSource))
+                    u.VersionSource, u.LatestUncapped))
                 .ToArray(),
             found.Feeds.Select(ToDto).ToArray());
     }
@@ -177,7 +178,10 @@ internal static class NuGetHandler
         var induced = await PackageDependencyPlanner.PlanAsync(
             requests,
             ParseMode(p.Mode),
-            new UpdateQuery(IncludePrerelease: p.IncludePrerelease, Lock: ParseLock(p.VersionLock)),
+            new UpdateQuery(
+                IncludePrerelease: p.IncludePrerelease,
+                Lock: ParseLock(p.VersionLock),
+                AlignPlatform: p.AlignPlatform),
             ct);
 
         return new NuGetUpdatePlanResultDto(

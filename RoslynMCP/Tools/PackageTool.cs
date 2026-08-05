@@ -172,10 +172,14 @@ public static class PackageTool
         [Description("Include prerelease versions (default: false).")] bool includePrerelease = false,
         [Description("How far a version may move: none, major (stay on the current major), minor.")]
         string versionLock = "none",
+        [Description("Keep platform-tracking packages (Microsoft.Extensions.*, System.*, ...) on " +
+            "the .NET major the project targets (default: true).")]
+        bool alignPlatform = true,
         CancellationToken cancellationToken = default)
     {
         var found = await PackageUpdateService.OutdatedAsync(
-            BuildQuery(projectPath, includePrerelease, versionLock, refresh: false), cancellationToken);
+            BuildQuery(projectPath, includePrerelease, versionLock, refresh: false, alignPlatform),
+            cancellationToken);
 
         if (found.Results.Count == 0)
             return $"Every package is up to date.{FeedProblems(found.Feeds)}";
@@ -194,6 +198,16 @@ public static class PackageTool
             fmt.EndRow(sb);
         }
         fmt.EndTable(sb);
+
+        var capped = found.Results.Where(u => u.LatestUncapped is not null).ToList();
+        if (capped.Count > 0)
+        {
+            sb.AppendLine(
+                "Band-aligned to the project's .NET major: " +
+                string.Join(", ", capped.Select(u => $"{u.Id} ({u.LatestUncapped} exists)").Distinct()) +
+                ". Pass alignPlatform: false to offer the newer band.");
+        }
+
         sb.Append(FeedProblems(found.Feeds));
         return sb.ToString();
     }
@@ -210,10 +224,14 @@ public static class PackageTool
         [Description("How far a version may move: none, major (stay on the current major), minor.")]
         string versionLock = "none",
         [Description("Include prerelease versions (default: false).")] bool includePrerelease = false,
+        [Description("Keep platform-tracking packages (Microsoft.Extensions.*, System.*, ...) on " +
+            "the .NET major the project targets (default: true).")]
+        bool alignPlatform = true,
         CancellationToken cancellationToken = default)
     {
         var found = await PackageUpdateService.OutdatedAsync(
-            BuildQuery(projectPath, includePrerelease, versionLock, refresh: true), cancellationToken);
+            BuildQuery(projectPath, includePrerelease, versionLock, refresh: true, alignPlatform),
+            cancellationToken);
 
         var wanted = packageIds is { Length: > 0 }
             ? packageIds.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -362,7 +380,8 @@ public static class PackageTool
     }
 
     private static UpdateQuery BuildQuery(
-        string? projectPath, bool includePrerelease, string versionLock, bool refresh) =>
+        string? projectPath, bool includePrerelease, string versionLock, bool refresh,
+        bool alignPlatform = true) =>
         new(IncludePrerelease: includePrerelease,
             Lock: versionLock.ToLowerInvariant() switch
             {
@@ -372,7 +391,8 @@ public static class PackageTool
             },
             Prerelease: includePrerelease ? PrereleaseReporting.Always : PrereleaseReporting.Auto,
             ProjectPaths: projectPath is { Length: > 0 } ? SplitProjects(projectPath) : null,
-            Refresh: refresh);
+            Refresh: refresh,
+            AlignPlatform: alignPlatform);
 
     /// <summary>
     /// A target-framework mismatch, stated before it becomes an NU1202 at restore time. Advisory

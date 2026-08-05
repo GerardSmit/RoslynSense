@@ -38,11 +38,13 @@ public class PackageUpdateServiceTests
     }
 
     /// <summary>
-    /// The framework lock bounds the candidate by the .NET major the project targets rather than
-    /// by the major the reference happens to be on.
+    /// The platform band bounds the candidate by the .NET major the project targets rather than
+    /// by the major the reference happens to be on — and it does so under the default lock, not
+    /// behind a mode of its own. "Latest" on a net8.0 project must not mean 9.x of the platform
+    /// families.
     /// </summary>
     [Fact]
-    public void TheFrameworkLockCapsAtThePlatformMajor()
+    public void ThePlatformBandCapsTheCandidateUnderAnyLock()
     {
         IReadOnlyList<NuGetVersion> band =
         [
@@ -52,11 +54,16 @@ public class PackageUpdateServiceTests
             NuGetVersion.Parse("9.0.0"),
         ];
 
-        var resolved = PackageUpdateService.Resolve(
+        var unlocked = PackageUpdateService.Resolve(
+            NuGetVersion.Parse("8.0.1"), "8.0.1", band,
+            new UpdateQuery(), platformMajor: 8);
+        Assert.Equal("8.0.11", unlocked?.ToNormalizedString());
+
+        // The legacy wire value still parses; it adds nothing on top of the cap.
+        var legacy = PackageUpdateService.Resolve(
             NuGetVersion.Parse("8.0.1"), "8.0.1", band,
             new UpdateQuery(Lock: VersionLock.Framework), platformMajor: 8);
-
-        Assert.Equal("8.0.11", resolved?.ToNormalizedString());
+        Assert.Equal("8.0.11", legacy?.ToNormalizedString());
     }
 
     /// <summary>
@@ -64,7 +71,7 @@ public class PackageUpdateServiceTests
     /// the band the project targets, not the band the reference is on.
     /// </summary>
     [Fact]
-    public void TheFrameworkLockLiftsAReferenceThatIsBehindTheBand()
+    public void ThePlatformBandLiftsAReferenceThatIsBehindIt()
     {
         IReadOnlyList<NuGetVersion> band =
         [
@@ -75,7 +82,7 @@ public class PackageUpdateServiceTests
 
         var resolved = PackageUpdateService.Resolve(
             NuGetVersion.Parse("6.0.0"), "6.0.0", band,
-            new UpdateQuery(Lock: VersionLock.Framework), platformMajor: 8);
+            new UpdateQuery(), platformMajor: 8);
 
         Assert.Equal("8.0.11", resolved?.ToNormalizedString());
     }
@@ -90,17 +97,17 @@ public class PackageUpdateServiceTests
     {
         var resolved = PackageUpdateService.Resolve(
             NuGetVersion.Parse("1.0.0"), "1.0.0", Available,
-            new UpdateQuery(Lock: VersionLock.Framework), platformMajor: 8);
+            new UpdateQuery(), platformMajor: 8);
 
         Assert.Equal("2.0.0", resolved?.ToNormalizedString());
     }
 
     [Fact]
-    public void TheFrameworkLockIsUnboundedWithoutAProjectTarget()
+    public void ThePlatformBandIsUnboundedWithoutAProjectTarget()
     {
         var resolved = PackageUpdateService.Resolve(
             NuGetVersion.Parse("1.0.0"), "1.0.0", Available,
-            new UpdateQuery(Lock: VersionLock.Framework), platformMajor: null);
+            new UpdateQuery(), platformMajor: null);
 
         Assert.Equal("2.0.0", resolved?.ToNormalizedString());
     }

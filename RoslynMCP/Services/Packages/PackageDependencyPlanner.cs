@@ -173,13 +173,21 @@ public static class PackageDependencyPlanner
         if (lookup.Results.Count == 0)
             return required;
 
-        int? cap = query.Lock == VersionLock.Framework &&
+        int? cap = query.AlignPlatform &&
             FrameworkVersionPolicy.TracksPlatformVersion(reference.Id)
                 ? FrameworkVersionPolicy.PlatformMajor(projectFrameworks)
                 : null;
 
         var resolved = PackageUpdateService.Resolve(
             current, reference.Version, lookup.Results, query, cap);
+
+        // The same probe the update list applies: an induced bump to a version the project's
+        // frameworks cannot use trades NU1605 for NU1202.
+        if (resolved is { } candidate && candidate > required)
+        {
+            resolved = await PackageUpdateService.CompatibleAsync(
+                reference.Id, current, candidate, lookup.Results, projectFrameworks, ct);
+        }
 
         return resolved is { } best && best > required ? best : required;
     }

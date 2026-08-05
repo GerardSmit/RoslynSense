@@ -21,7 +21,8 @@ public sealed record NuGetUpdatesParams(
     [property: JsonPropertyName("versionLock")] string? VersionLock = null,
     [property: JsonPropertyName("prerelease")] string? Prerelease = null,
     [property: JsonPropertyName("projectPaths")] string[]? ProjectPaths = null,
-    [property: JsonPropertyName("refresh")] bool Refresh = false);
+    [property: JsonPropertyName("refresh")] bool Refresh = false,
+    [property: JsonPropertyName("alignPlatform")] bool AlignPlatform = true);
 
 public sealed record NuGetOperationParams(
     [property: JsonPropertyName("id")] string Id,
@@ -59,7 +60,8 @@ public sealed record NuGetUpdatePlanParams(
     [property: JsonPropertyName("packages")] NuGetUpdateItem[] Packages,
     [property: JsonPropertyName("mode")] string? Mode = null,
     [property: JsonPropertyName("versionLock")] string? VersionLock = null,
-    [property: JsonPropertyName("includePrerelease")] bool IncludePrerelease = false);
+    [property: JsonPropertyName("includePrerelease")] bool IncludePrerelease = false,
+    [property: JsonPropertyName("alignPlatform")] bool AlignPlatform = true);
 
 public sealed record NuGetTransitiveParams(
     [property: JsonPropertyName("projectPath")] string ProjectPath,
@@ -206,6 +208,8 @@ public sealed record FrameworkMismatchDto(
     [property: JsonPropertyName("projectName")] string ProjectName,
     [property: JsonPropertyName("targetFrameworks")] string[] TargetFrameworks);
 
+/// <param name="LatestUncapped">The newest usable version beyond the platform band, when band
+/// alignment held <paramref name="LatestVersion"/> back. Disclosure only.</param>
 public sealed record PackageUpdateDto(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("currentVersion")] string CurrentVersion,
@@ -215,7 +219,8 @@ public sealed record PackageUpdateDto(
     [property: JsonPropertyName("projectName")] string ProjectName,
     [property: JsonPropertyName("isCentrallyManaged")] bool IsCentrallyManaged,
     [property: JsonPropertyName("isGlobalPackageReference")] bool IsGlobalPackageReference,
-    [property: JsonPropertyName("versionSource")] string? VersionSource);
+    [property: JsonPropertyName("versionSource")] string? VersionSource,
+    [property: JsonPropertyName("latestUncapped")] string? LatestUncapped = null);
 
 public sealed record NuGetUpdatesResultDto(
     [property: JsonPropertyName("updates")] PackageUpdateDto[] Updates,

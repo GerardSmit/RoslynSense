@@ -16,8 +16,9 @@ public enum VersionLock
     Minor,
 
     /// <summary>
-    /// Stay on the .NET major the project targets, for the families that version with the
-    /// platform. Unbounded for every other package.
+    /// Retained for wire compatibility. The platform band cap this used to switch on is now
+    /// <see cref="UpdateQuery.AlignPlatform"/> and applies under every lock, so this behaves
+    /// as <see cref="None"/>.
     /// </summary>
     Framework,
 }
@@ -44,14 +45,25 @@ public enum UpdateSeverity
     Unknown,
 }
 
+/// <param name="AlignPlatform">
+/// Keep the families that version with the platform (<see cref="FrameworkVersionPolicy"/>) on the
+/// .NET major the project targets. On by default: a net8.0 project asking for "latest" almost
+/// never means "move Microsoft.Extensions.* a band ahead of the runtime".
+/// </param>
 public sealed record UpdateQuery(
     bool IncludePrerelease = false,
     VersionLock Lock = VersionLock.None,
     PrereleaseReporting Prerelease = PrereleaseReporting.Auto,
     string? PrereleaseLabel = null,
     IReadOnlyList<string>? ProjectPaths = null,
-    bool Refresh = false);
+    bool Refresh = false,
+    bool AlignPlatform = true);
 
+/// <param name="LatestUncapped">
+/// The newest usable version beyond the platform band, when the band cap held
+/// <paramref name="LatestVersion"/> back. Disclosure, not a candidate: the panel shows it so the
+/// cap never reads as "up to date" while a newer band exists.
+/// </param>
 public sealed record PackageUpdate(
     string Id,
     string CurrentVersion,
@@ -61,7 +73,8 @@ public sealed record PackageUpdate(
     string ProjectName,
     bool IsCentrallyManaged,
     bool IsGlobalPackageReference,
-    string? VersionSource);
+    string? VersionSource,
+    string? LatestUncapped = null);
 
 public sealed record PackageUpdateRequest(string Id, string Version, IReadOnlyList<string> ProjectPaths);
 
@@ -115,13 +128,10 @@ public static class PackageUpdateService
         // Resolved once per project rather than once per reference: evaluation is cached, but a
         // two-hundred-reference solution would still go through the cache two hundred times.
         var frameworks = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
-        if (query.Lock == VersionLock.Framework)
+        foreach (var project in projects)
         {
-            foreach (var project in projects)
-            {
-                frameworks[project.ProjectPath] =
-                    await PackageFrameworkService.FrameworksOfAsync(project.ProjectPath, ct);
-            }
+            frameworks[project.ProjectPath] =
+                await PackageFrameworkService.FrameworksOfAsync(project.ProjectPath, ct);
         }
 
         await using var progress = await ProgressReporter.BeginAsync("Checking for package updates", ct);
@@ -166,7 +176,7 @@ public static class PackageUpdateService
 
                 var projectFrameworks = frameworks.GetValueOrDefault(project.ProjectPath, []);
 
-                int? cap = FrameworkVersionPolicy.TracksPlatformVersion(package.Id)
+                int? cap = query.AlignPlatform && FrameworkVersionPolicy.TracksPlatformVersion(package.Id)
                     ? FrameworkVersionPolicy.PlatformMajor(projectFrameworks)
                     : null;
 
@@ -174,16 +184,33 @@ public static class PackageUpdateService
                 if (latest is null || latest <= current)
                     return;
 
-                if (query.Lock == VersionLock.Framework)
-                {
-                    latest = await CompatibleAsync(
-                        package.Id, current, latest, lookup.Results, projectFrameworks, token);
+                // Unconditional: a version whose assets no target framework can use is not an
+                // update under any lock — offering it is just NU1202 with extra steps.
+                latest = await CompatibleAsync(
+                    package.Id, current, latest, lookup.Results, projectFrameworks, token);
 
-                    if (latest is null || latest <= current)
-                        return;
+                if (latest is null || latest <= current)
+                    return;
+
+                // When the band cap held the answer back, disclose the newest usable version
+                // beyond it. Silently hiding it reads as "your tool is out of date" to anyone
+                // who knows the newer band exists.
+                NuGetVersion? uncapped = null;
+                if (cap is not null &&
+                    Resolve(current, package.Version, lookup.Results, query, platformMajor: null)
+                        is { } beyond &&
+                    beyond > latest)
+                {
+                    uncapped = await CompatibleAsync(
+                        package.Id, current, beyond, lookup.Results, projectFrameworks, token);
+
+                    if (uncapped is not null && uncapped <= latest)
+                        uncapped = null;
                 }
 
-                updates.Add(Row(project, package, latest.ToNormalizedString(), SeverityOf(current, latest)));
+                updates.Add(Row(
+                    project, package, latest.ToNormalizedString(), SeverityOf(current, latest),
+                    uncapped?.ToNormalizedString()));
             });
 
         return new FeedResults<PackageUpdate>(
@@ -391,8 +418,9 @@ public static class PackageUpdateService
         // The cap only means anything if the package publishes that major. Applying it to a family
         // that does not version with the platform would bound the search to a band that was never
         // released, which reads as "up to date" — the one answer worse than offering too much.
-        if (query.Lock == VersionLock.Framework &&
-            platformMajor is { } cap &&
+        // The caller decides whether a cap applies (UpdateQuery.AlignPlatform); here it is
+        // orthogonal to the lock, so "latest" and "same major" both stay inside the band.
+        if (platformMajor is { } cap &&
             available.Any(version => version.Major == cap))
         {
             available = available.Where(version => version.Major <= cap).ToList();
@@ -464,7 +492,7 @@ public static class PackageUpdateService
     /// NU1202 out of restore — after the reference has been written.
     /// </remarks>
     /// <returns><c>null</c> when nothing in range is usable, so the package reports no update.</returns>
-    private static async Task<NuGetVersion?> CompatibleAsync(
+    internal static async Task<NuGetVersion?> CompatibleAsync(
         string id,
         NuGetVersion current,
         NuGetVersion candidate,
@@ -559,7 +587,11 @@ public static class PackageUpdateService
     }
 
     private static PackageUpdate Row(
-        ProjectPackages project, PackageSummary package, string latest, UpdateSeverity severity) =>
+        ProjectPackages project,
+        PackageSummary package,
+        string latest,
+        UpdateSeverity severity,
+        string? latestUncapped = null) =>
         new(package.Id,
             package.Version,
             latest,
@@ -568,5 +600,6 @@ public static class PackageUpdateService
             project.ProjectName,
             package.IsCentrallyManaged,
             package.IsGlobalPackageReference,
-            package.VersionSource);
+            package.VersionSource,
+            latestUncapped);
 }

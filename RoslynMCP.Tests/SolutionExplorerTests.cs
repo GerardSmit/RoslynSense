@@ -96,6 +96,43 @@ public class SolutionExplorerTests
         Assert.All(nested, n => Assert.Empty(n.Children));
     }
 
+    /// <summary>
+    /// Revealing a nested file has to go through the file it is nested under.
+    /// </summary>
+    /// <remarks>
+    /// With nesting on the folder lists Form1.cs and not Form1.Designer.cs, so a reveal chain
+    /// that jumps from the folder to the designer file names a row the tree never draws — which
+    /// is how "select the file I am editing" did nothing for every designer, resource and
+    /// <c>appsettings.*.json</c> file while working fine for a plain one.
+    /// </remarks>
+    [Fact]
+    public void RevealGoesThroughTheFileANestedFileHangsUnder()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), $"reveal-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            foreach (string name in new[] { "Form1.cs", "Form1.Designer.cs", "Program.cs" })
+                File.WriteAllText(Path.Combine(dir, name), "");
+
+            string project = Path.Combine(dir, "Unevaluated.csproj");
+            string designer = Path.Combine(dir, "Form1.Designer.cs");
+
+            Assert.Equal(
+                [Path.Combine(dir, "Form1.cs")],
+                SolutionTreeHandler.NestingAncestorsOf(project, designer, nesting: true));
+
+            // Nesting off puts every file straight in its folder, so there is nothing in between.
+            Assert.Empty(SolutionTreeHandler.NestingAncestorsOf(project, designer, nesting: false));
+            Assert.Empty(SolutionTreeHandler.NestingAncestorsOf(
+                project, Path.Combine(dir, "Program.cs"), nesting: true));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
     [Fact]
     public void ExplicitDependentUponBeatsTheRules()
     {

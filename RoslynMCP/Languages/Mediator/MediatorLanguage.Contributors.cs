@@ -50,7 +50,7 @@ internal sealed partial class MediatorLanguage :
     public async Task<IReadOnlyList<LspLocation>> ReferencesAsync(
         ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false)
     {
-        var sites = await SitesForAsync(symbol, project, ct);
+        var sites = await SitesForAsync(symbol, project, ct, waitForCompleteScope);
         return sites.Count == 0
             ? []
             : await HandlerHelpers.ToLocationsAsync(sites.Select(s => s.Location), project, ct);
@@ -171,9 +171,11 @@ internal sealed partial class MediatorLanguage :
     /// not — every registered pack is asked about every C# symbol in the solution.
     /// </summary>
     private async Task<IReadOnlyList<MediatorDispatchSite>> SitesForAsync(
-        ISymbol symbol, Project project, CancellationToken ct) =>
+        ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false) =>
         InterestingSymbolKinds.Contains(symbol.Kind)
-            ? await MediatorReferenceService.FindAsync(symbol, project, ct)
+            ? await MediatorReferenceService.FindAsync(
+                symbol, project, ct,
+                waitForCompleteScope ? Services.SearchScopeService.ExplicitSearchBudget : null)
             : [];
 
     private static LspCodeLens Lens(string uri, SourceText text, TextSpan identifier)

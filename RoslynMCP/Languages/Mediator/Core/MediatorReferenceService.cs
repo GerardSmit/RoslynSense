@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.Mediator.Core;
 
@@ -62,7 +63,7 @@ internal static class MediatorReferenceService
     /// </para>
     /// </remarks>
     public static async Task<IReadOnlyList<MediatorDispatchSite>> FindAsync(
-        ISymbol symbol, Project project, CancellationToken ct)
+        ISymbol symbol, Project project, CancellationToken ct, TimeSpan? scopeBudget = null)
     {
         if (symbol.Kind is not (SymbolKind.NamedType or SymbolKind.Method))
             return [];
@@ -73,6 +74,19 @@ internal static class MediatorReferenceService
 
         if (!TryGetSubject(symbol, types, out var messages, out bool handlerSide))
             return [];
+
+        // The dispatch sites live in projects that reference the message's project, which lazy
+        // loading never followed. Only the caller that may wait passes a budget — Shift+F12 —
+        // while a code lens resolving on scroll searches what is open, exactly like the C# side.
+        if (scopeBudget is { } budget)
+        {
+            foreach (var message in messages.Distinct())
+            {
+                var solution = await SearchScopeService.WidenForSymbolAsync(
+                    message.Type, project, budget, ct);
+                project = solution.GetProject(project.Id) ?? project;
+            }
+        }
 
         var sites = new List<MediatorDispatchSite>();
         var seen = new HashSet<(DocumentId, TextSpan)>();

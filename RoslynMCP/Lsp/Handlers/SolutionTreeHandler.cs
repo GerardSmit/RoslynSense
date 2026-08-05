@@ -556,6 +556,59 @@ internal static class SolutionTreeHandler
                 FileNode(projectPath, child, projectFiles.ContainsKey(child.FullPath)))];
     }
 
+    /// <summary>
+    /// The files a nested file is listed under, outermost first, or nothing when it sits
+    /// directly in its folder.
+    /// </summary>
+    /// <remarks>
+    /// With nesting on the folder never lists <c>Form1.Designer.cs</c> at all — it lists
+    /// <c>Form1.cs</c>, and the designer file is one of its children. A reveal chain that goes
+    /// straight from the folder to the file therefore names a row the tree does not draw, and
+    /// reveal stops there. Which is why revealing worked for a plain file and quietly did
+    /// nothing for every designer, resource and <c>appsettings.*.json</c> file.
+    /// </remarks>
+    internal static IReadOnlyList<string> NestingAncestorsOf(
+        string projectPath, string filePath, bool nesting)
+    {
+        string full = Path.GetFullPath(filePath);
+        string? directory = Path.GetDirectoryName(full);
+        if (!nesting || directory is null)
+            return [];
+
+        var projectFiles = ByPath(ProjectEvaluationService.TryGetCached(projectPath)?.Items);
+
+        // Nesting is computed over whatever the folder listed, so the same set has to be used
+        // here: a file that is in the project was nested among project files, and one that is
+        // not was only ever listed with "show all files" on.
+        bool showAll = projectFiles.Count == 0 || !projectFiles.ContainsKey(full);
+        var files = Directory.EnumerateFiles(directory)
+            .Where(f => showAll || projectFiles.ContainsKey(f))
+            .Where(f => !IsHidden(Path.GetFileName(f)))
+            .ToList();
+
+        var dependentUpon = projectFiles
+            .Where(pair => pair.Value.DependentUpon is not null)
+            .ToDictionary(
+                pair => pair.Key, pair => pair.Value.DependentUpon!, StringComparer.OrdinalIgnoreCase);
+
+        var ancestors = new List<string>();
+        var siblings = FileNestingService.Nest(files, dependentUpon, nesting);
+        while (true)
+        {
+            var parent = siblings.FirstOrDefault(
+                n => Descendants(n).Any(d => string.Equals(d, full, StringComparison.OrdinalIgnoreCase)));
+            if (parent is null || string.Equals(parent.FullPath, full, StringComparison.OrdinalIgnoreCase))
+                return ancestors;
+
+            ancestors.Add(parent.FullPath);
+            siblings = parent.Children;
+        }
+    }
+
+    /// <summary>A nested file and everything under it, however deep the nesting goes.</summary>
+    private static IEnumerable<string> Descendants(NestedFile file) =>
+        [Path.GetFullPath(file.FullPath), .. file.Children.SelectMany(Descendants)];
+
     /// <summary>The nearest project above a directory.</summary>
     private static string? FindOwningProject(string directory)
     {

@@ -147,6 +147,15 @@ internal static class SolutionTreeSearchHandler
             current = Path.GetDirectoryName(current);
         }
         chain.AddRange(directories);
+
+        // And then whichever files this one is nested under, since those are the rows the folder
+        // actually listed.
+        foreach (string ancestor in
+                 SolutionTreeHandler.NestingAncestorsOf(owner.Path, path, p.FileNesting))
+        {
+            chain.Add($"file:{Path.GetFullPath(ancestor)}");
+        }
+
         chain.Add($"file:{Path.GetFullPath(path)}");
 
         return Task.FromResult(new SolutionTreeRevealResult(chain.ToArray()));

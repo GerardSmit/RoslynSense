@@ -11,14 +11,14 @@ internal sealed partial class ResourcesLanguage : ILanguageDiagnosticProvider
     /// <summary>RSX0001 — "The key '{0}' is declared more than once in this file".</summary>
     private const string DuplicateKey = "RSX0001";
 
-    /// <summary>RSX0002 — "'{0}' declares {1} this translation does not: {2}".</summary>
+    /// <summary>RSX0002 — "'{0}' has no translation in {1}".</summary>
     private const string MissingTranslation = "RSX0002";
 
     /// <summary>What the server calls itself in every diagnostic it publishes.</summary>
     private const string DiagnosticSource = "roslyn-sense";
 
-    /// <summary>How many missing keys a single message names before it stops being readable.</summary>
-    private const int MaxNamedKeys = 5;
+    /// <summary>How many names a single message lists before it stops being readable.</summary>
+    private const int MaxNames = 5;
 
     /// <summary>
     /// What is wrong with one <c>.resx</c>: a key it declares twice, and — when it is a
@@ -50,73 +50,78 @@ internal sealed partial class ResourcesLanguage : ILanguageDiagnosticProvider
                 $"The key '{key}' is declared more than once in this file."));
         }
 
-        if (Untranslated(filePath, contents, text) is { } missing)
-            diagnostics.Add(missing);
+        diagnostics.AddRange(Untranslated(filePath, contents, text));
 
         return Task.FromResult(diagnostics.ToArray());
     }
 
     /// <summary>
-    /// The keys this file's neutral original declares and it does not, as one report.
+    /// For each key this neutral file declares, the translations that do not — reported at the
+    /// key's own declaration, because the missing entries have no position anywhere else.
     /// </summary>
     /// <remarks>
-    /// Information rather than a warning, and one diagnostic rather than one per key: an
-    /// untranslated string still renders — <c>TryGetFromResourceFile</c> reads each file directly
-    /// and falls back through the cascade — so this is the translator's worklist, not a defect. A
-    /// row per key would put a hundred identical locations in the Problems panel and get the whole
-    /// rule switched off.
+    /// Information rather than a warning: an untranslated string still renders —
+    /// <c>TryGetFromResourceFile</c> reads each file directly and falls back through the cascade —
+    /// so this is the translator's worklist, not a defect. One diagnostic per key, with the
+    /// cultures folded into it, rather than one per (key, culture): the count is bounded by the
+    /// file's own entries no matter how many languages the site ships.
     /// <para>
-    /// Only a plain translation is compared. A customization is <em>meant</em> to carry the handful
-    /// of keys it overrides and nothing else, so measuring <c>View.ascx.Portal-3.resx</c> against
-    /// the base file would report every key in the family on every override in the solution.
+    /// Only plain translations are measured. A customization is <em>meant</em> to carry the handful
+    /// of keys it overrides and nothing else, so counting <c>View.ascx.Portal-3.resx</c> would
+    /// flag every key in the family on every override in the solution.
     /// </para>
     /// </remarks>
-    private Diagnostic? Untranslated(string filePath, ResxContents contents, SourceText text)
+    private IEnumerable<Diagnostic> Untranslated(string filePath, ResxContents contents, SourceText text)
     {
         if (ResourceDocuments.FamilyOf(filePath, Settings.Discovery.Overrides) is not { } family)
-            return null;
+            yield break;
 
-        if (ResourceDocuments.Member(family, filePath) is not { Culture: not null, OverrideRank: 0 })
-            return null;
+        if (ResourceDocuments.Member(family, filePath) is not { Culture: null, OverrideRank: 0 })
+            yield break;
 
-        if (family.Neutral is not { } neutral)
-            return null;
+        var translations = new List<ResourceFileIndex>();
 
-        var original = ResourceCatalogService.Read(neutral);
-        var missing = new List<string>();
-
-        foreach (string key in original.Entries.Keys.Order(StringComparer.Ordinal))
+        foreach (var file in family.Files)
         {
-            if (!contents.Entries.ContainsKey(key))
-                missing.Add(key);
+            if (file is { Culture: not null, OverrideRank: 0 })
+                translations.Add(ResourceCatalogService.Read(file));
         }
 
-        if (missing.Count == 0)
-            return null;
+        if (translations.Count == 0)
+            yield break;
 
-        string count = missing.Count == 1 ? "1 key" : $"{missing.Count} keys";
+        foreach (var entry in contents.Entries.Values.OrderBy(e => e.KeySpan.Start))
+        {
+            if (entry.KeySpan == default)
+                continue;
 
-        return new Diagnostic(
-            FirstLine(text),
-            LspConverters.ToLspSeverity(DiagnosticSeverity.Info),
-            MissingTranslation,
-            DiagnosticSource,
-            $"'{Path.GetFileName(neutral.FilePath)}' declares {count} this translation does not: "
-            + $"{Names(missing)}.");
+            var missing = new List<string>();
+
+            foreach (var translation in translations)
+            {
+                if (!translation.Entries.ContainsKey(entry.Key))
+                    missing.Add(translation.Culture!.Name);
+            }
+
+            if (missing.Count == 0)
+                continue;
+
+            missing.Sort(StringComparer.OrdinalIgnoreCase);
+
+            yield return new Diagnostic(
+                LspConverters.ToRange(text.Lines, entry.KeySpan),
+                LspConverters.ToLspSeverity(DiagnosticSeverity.Info),
+                MissingTranslation,
+                DiagnosticSource,
+                $"'{entry.Key}' has no translation in {Names(missing)}.");
+        }
     }
 
-    private static string Names(List<string> keys)
+    private static string Names(List<string> names)
     {
-        if (keys.Count <= MaxNamedKeys)
-            return string.Join(", ", keys);
+        if (names.Count <= MaxNames)
+            return string.Join(", ", names);
 
-        return $"{string.Join(", ", keys.Take(MaxNamedKeys))} and {keys.Count - MaxNamedKeys} more";
+        return $"{string.Join(", ", names.Take(MaxNames))} and {names.Count - MaxNames} more";
     }
-
-    /// <summary>
-    /// Where a report about the file as a whole goes. The protocol has no range meaning "this
-    /// document", and a zero-width one at the origin is a squiggle the user cannot see.
-    /// </summary>
-    private static Lsp.Protocol.Range FirstLine(SourceText text) =>
-        LspConverters.ToRange(text.Lines, text.Lines[0].Span);
 }

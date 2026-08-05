@@ -82,6 +82,13 @@ export function registerSolutionExplorer(
     let filter: string | undefined;
     let clipboard: Clipboard | undefined;
 
+    /// Whether files are drawn by the user's file icon theme instead of by this extension.
+    const readFileIconSource = () =>
+        vscode.workspace
+            .getConfiguration('roslynSense')
+            .get<string>('solutionExplorer.fileIcons', 'roslynSense') === 'theme';
+    let fileIconsFromTheme = readFileIconSource();
+
     /// Unloading is a per-window view choice rather than a property of the solution, so it lives
     /// here and never reaches the solution file.
     let unloaded: string[] = context.workspaceState.get('roslynSense.unloadedProjects', []);
@@ -205,7 +212,7 @@ export function registerSolutionExplorer(
             // Every row gets an icon, always. A row without one draws its label where the icon
             // would have been, so a single icon-less kind shifts its whole branch out of line
             // with the rest of the tree.
-            item.iconPath = iconFor(node, context.extensionUri);
+            item.iconPath = iconFor(node, context.extensionUri, fileIconsFromTheme);
             if (node.kind === 'file' || node.kind === 'solutionItem' || node.kind === 'import') {
                 item.command = {
                     command: 'vscode.open',
@@ -236,8 +243,12 @@ export function registerSolutionExplorer(
         getChildren: (node) => fetchChildren(node?.id ?? null),
 
         getParent(node) {
-            // Reveal needs a parent chain; ids encode enough to find it for files.
-            const parentId = parentIdOf(node.id);
+            // Reveal walks this chain to the root and gives up at the first row that cannot name
+            // its parent — and a file id is nothing but its path, so parsing the id alone
+            // answered undefined for every file in the tree. That is why revealing a file did
+            // nothing at all: not a failed lookup, a parent chain one step long. The listing that
+            // produced the node is the record for every id that does not encode its own parent.
+            const parentId = parentById.get(node.id) ?? parentIdOf(node.id);
             return parentId ? nodesById.get(parentId) : undefined;
         },
     };
@@ -282,6 +293,15 @@ export function registerSolutionExplorer(
     /// Refreshing one node re-fetches only its branch, and collapses whatever was open inside it —
     /// which is also the only way to collapse a subtree, since VS Code exposes no collapse API.
     const refresh = (node?: SolutionTreeNode) => changeEmitter.fire(node);
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('roslynSense.solutionExplorer.fileIcons')) {
+                fileIconsFromTheme = readFileIconSource();
+                refresh();
+            }
+        })
+    );
 
     // The view is built at activation and asked for its roots straight away, which is before the
     // client exists — so the first fetch answered empty, and a TreeDataProvider is never asked
@@ -513,7 +533,8 @@ export function registerSolutionExplorer(
         let chain: string[];
         try {
             const result = await client.sendRequest<{ path: string[] }>(
-                'roslynSense/solutionTreeReveal', { uri: uri.toString() });
+                'roslynSense/solutionTreeReveal',
+                { uri: uri.toString(), fileNesting: state.fileNesting });
             chain = result?.path ?? [];
         } catch {
             return false;
@@ -522,23 +543,34 @@ export function registerSolutionExplorer(
             return false;
         }
 
-        let node: SolutionTreeNode | undefined;
+        // Walk the chain listing each level, so `parentById` knows who listed every node on the
+        // way down. A cached node whose parent is unrecorded — or recorded as somebody else, which
+        // happens for a project reference listed under two projects — is re-fetched rather than
+        // trusted, because `getParent` is about to be asked the same question.
+        let parent: SolutionTreeNode | undefined;
         for (const id of chain) {
-            node = nodesById.get(id) ?? (await fetchChildren(node?.id ?? null))
-                .find((child) => child.id === id);
+            const cached = nodesById.get(id);
+            const node =
+                cached && (!parent || parentById.get(id) === parent.id)
+                    ? cached
+                    : (await fetchChildren(parent?.id ?? null)).find((child) => child.id === id);
             if (!node) {
                 return false;
             }
-            if (node.id !== chain[chain.length - 1]) {
-                await view.reveal(node, { select: false, focus: false, expand: true });
-            }
+            parent = node;
         }
 
-        if (node) {
-            await view.reveal(node, { select: true, focus: false });
-            return true;
+        await view.reveal(parent!, { select: true, focus: false, expand: true });
+        return true;
+    }
+
+    /** Puts the tree on the file being edited, if the solution has anywhere to put it. */
+    async function revealActiveEditor(): Promise<boolean> {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || editor.document.uri.scheme !== 'file') {
+            return false;
         }
-        return false;
+        return revealUri(editor.document.uri);
     }
 
     /**
@@ -654,8 +686,42 @@ export function registerSolutionExplorer(
         vscode.commands.registerCommand('roslynSense.solutionExplorer.hideIgnored', () =>
             setToggle('showIgnored', false)
         ),
+        // Focus is the one-shot: put the tree on the file I am editing, now. Following is the
+        // same thing standing — and turning it on has to move the tree straight away, because a
+        // toggle whose only effect is on the *next* editor change reads as a button that does
+        // nothing at all.
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.focusCurrentFile',
+            async () => {
+                if (await revealActiveEditor()) {
+                    return;
+                }
+                // Saying nothing here is what made this look broken rather than inapplicable.
+                const editor = vscode.window.activeTextEditor;
+                void vscode.window.showInformationMessage(
+                    editor
+                        ? `${Path.basename(editor.document.uri.fsPath)} is not part of the open ` +
+                          'solution, so there is nowhere in the tree to select.'
+                        : 'No file is open.'
+                );
+            }
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.followCurrentFile',
+            async () => {
+                await setToggle('revealActiveFile', true);
+                await revealActiveEditor();
+            }
+        ),
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.unfollowCurrentFile', () =>
+            setToggle('revealActiveFile', false)
+        ),
         vscode.commands.registerCommand('roslynSense.solutionExplorer.revealActiveFile', () =>
-            setToggle('revealActiveFile', !state.revealActiveFile)
+            vscode.commands.executeCommand(
+                state.revealActiveFile
+                    ? 'roslynSense.solutionExplorer.unfollowCurrentFile'
+                    : 'roslynSense.solutionExplorer.followCurrentFile'
+            )
         ),
         vscode.commands.registerCommand('roslynSense.solutionExplorer.toggleFileNesting', () =>
             setToggle('fileNesting', !state.fileNesting)
@@ -1276,17 +1342,19 @@ export function registerSolutionExplorer(
         )
     );
 
-    // "Always select opened file", off by default because it fights with manual navigation.
+    // "Follow current file", off by default because it fights with manual navigation.
     context.subscriptions.push(
-        vscode.window.onDidChangeActiveTextEditor(async (editor) => {
-            if (!state.revealActiveFile || !editor || !view.visible) {
-                return;
+        vscode.window.onDidChangeActiveTextEditor(() => {
+            if (state.revealActiveFile && view.visible) {
+                void revealActiveEditor();
             }
-            const node = nodesById.get(`file:${editor.document.uri.fsPath}`);
-            if (node) {
-                await view.reveal(node, { select: true, focus: false });
-            } else {
-                await revealUri(editor.document.uri);
+        }),
+        // Editors change while the view is hidden, and revealing into a hidden tree is wasted
+        // work — so the catch-up happens when it comes back, otherwise the view stays pointing at
+        // whatever was open the last time anyone looked at it.
+        view.onDidChangeVisibility((event) => {
+            if (state.revealActiveFile && event.visible) {
+                void revealActiveEditor();
             }
         })
     );
@@ -1553,26 +1621,125 @@ function solutionItemFolderOf(id: string): string | undefined {
 type NodeIcon = vscode.ThemeIcon | vscode.Uri;
 
 /**
- * The badge for a project, by the language it is written in.
+ * The badge a project is drawn with, by the extension of its project file.
  *
  * Codicons have one project glyph and no notion of language, so a C# and a Visual Basic project
  * used to be the same grey box — the one distinction Visual Studio, Rider and ReSharper all draw
  * first. These are shipped as SVGs for that reason, and are coloured rather than themed, since a
- * language badge means the same thing under a light theme as under a dark one.
+ * language badge means the same under a light theme as under a dark one.
+ *
+ * Projects only. A solid badge on every `.cs` as well makes a project row indistinguishable from
+ * the files inside it, and drowns out the one row in the branch that the badge is there to mark.
  */
-function languageIcon(resourceUri: string | null, extensionUri: vscode.Uri): NodeIcon {
-    const extension = resourceUri
+const PROJECT_BADGES: Record<string, string> = {
+    '.csproj': 'csharp',
+    '.vbproj': 'vb',
+    '.fsproj': 'fsharp',
+};
+
+/**
+ * Everything else, as a tinted codicon.
+ *
+ * The point is coverage rather than fidelity: an extension that falls through here still gets a
+ * glyph, so no row is ever drawn without one. See {@link iconFor} for why that matters.
+ */
+const FILE_CODICONS: Record<string, [string, string]> = {
+    // The source languages, marked by colour rather than by a badge — the badge is the project's.
+    '.cs': ['file-code', 'charts.purple'],
+    '.csx': ['file-code', 'charts.purple'],
+    '.vb': ['file-code', 'charts.blue'],
+    '.fs': ['file-code', 'charts.green'],
+    '.fsi': ['file-code', 'charts.green'],
+    '.fsx': ['file-code', 'charts.green'],
+    '.razor': ['code', 'charts.purple'],
+    '.cshtml': ['code', 'charts.purple'],
+    '.aspx': ['code', 'charts.purple'],
+    '.ascx': ['code', 'charts.purple'],
+    '.ashx': ['code', 'charts.purple'],
+    '.master': ['code', 'charts.purple'],
+    '.json': ['json', 'charts.blue'],
+    '.xml': ['code', 'charts.green'],
+    '.xaml': ['code', 'charts.green'],
+    '.config': ['settings-gear', 'charts.blue'],
+    '.props': ['settings-gear', 'charts.blue'],
+    '.targets': ['settings-gear', 'charts.blue'],
+    '.editorconfig': ['settings-gear', 'charts.blue'],
+    '.yml': ['settings-gear', 'charts.blue'],
+    '.yaml': ['settings-gear', 'charts.blue'],
+    '.toml': ['settings-gear', 'charts.blue'],
+    '.ini': ['settings-gear', 'charts.blue'],
+    '.resx': ['symbol-string', 'charts.green'],
+    '.md': ['markdown', 'charts.blue'],
+    '.txt': ['note', 'descriptionForeground'],
+    '.sql': ['database', 'charts.blue'],
+    '.ts': ['file-code', 'charts.blue'],
+    '.tsx': ['file-code', 'charts.blue'],
+    '.js': ['file-code', 'charts.blue'],
+    '.mjs': ['file-code', 'charts.blue'],
+    '.css': ['symbol-color', 'charts.blue'],
+    '.scss': ['symbol-color', 'charts.blue'],
+    '.html': ['browser', 'charts.green'],
+    '.htm': ['browser', 'charts.green'],
+    '.sh': ['terminal', 'charts.green'],
+    '.ps1': ['terminal', 'charts.blue'],
+    '.cmd': ['terminal', 'descriptionForeground'],
+    '.bat': ['terminal', 'descriptionForeground'],
+    '.png': ['file-media', 'charts.purple'],
+    '.jpg': ['file-media', 'charts.purple'],
+    '.jpeg': ['file-media', 'charts.purple'],
+    '.gif': ['file-media', 'charts.purple'],
+    '.svg': ['file-media', 'charts.purple'],
+    '.ico': ['file-media', 'charts.purple'],
+    '.dll': ['library', 'charts.green'],
+    '.exe': ['library', 'charts.green'],
+    '.pdb': ['library', 'descriptionForeground'],
+    '.snk': ['lock', 'charts.green'],
+    '.pfx': ['lock', 'charts.green'],
+    '.sln': ['versions', 'charts.purple'],
+    '.slnx': ['versions', 'charts.purple'],
+};
+
+function extensionOf(resourceUri: string | null): string {
+    return resourceUri
         ? Path.extname(vscode.Uri.parse(resourceUri).fsPath).toLowerCase()
         : '';
-    const badges: Record<string, string> = {
-        '.csproj': 'project-csharp',
-        '.vbproj': 'project-vb',
-        '.fsproj': 'project-fsharp',
-    };
-    const file = badges[extension];
-    return file
-        ? vscode.Uri.joinPath(extensionUri, 'media', `${file}.svg`)
-        : tinted('project', 'charts.blue');
+}
+
+function badgeUri(name: string, extensionUri: vscode.Uri): vscode.Uri {
+    return vscode.Uri.joinPath(extensionUri, 'media', `lang-${name}.svg`);
+}
+
+/** The badge for a project, by the language it is written in. */
+function languageIcon(resourceUri: string | null, extensionUri: vscode.Uri): NodeIcon {
+    const badge = PROJECT_BADGES[extensionOf(resourceUri)];
+    return badge ? badgeUri(badge, extensionUri) : tinted('project', 'charts.blue');
+}
+
+/**
+ * The icon for a file.
+ *
+ * `ThemeIcon.File` hands the decision to the user's file icon theme, which is the friendlier
+ * answer right up until the theme has nothing for the extension — or the user has no file icon
+ * theme at all. Then the row is drawn without an icon, and one icon-less row is enough to shift a
+ * whole branch out of line (see {@link iconFor}). Drawing files ourselves is what makes every row
+ * the same width; `solutionExplorer.fileIcons` gives the icon theme back to anyone who prefers it.
+ */
+function fileIcon(
+    resourceUri: string | null,
+    extensionUri: vscode.Uri,
+    fromIconTheme: boolean
+): NodeIcon {
+    if (fromIconTheme) {
+        return vscode.ThemeIcon.File;
+    }
+    const extension = extensionOf(resourceUri);
+    // The one file that keeps a shipped badge: no codicon says "protobuf", and `.proto` has no
+    // project of its own for a badge to sit on instead.
+    if (extension === '.proto') {
+        return badgeUri('proto', extensionUri);
+    }
+    const [id, color] = FILE_CODICONS[extension] ?? ['file', 'descriptionForeground'];
+    return tinted(id, color);
 }
 
 /**
@@ -1588,10 +1755,9 @@ function tinted(id: string, color: string): vscode.ThemeIcon {
 /**
  * What a row is drawn with.
  *
- * Files get `ThemeIcon.File`, which is VS Code's way of saying "let the user's file icon theme
- * decide", so a `.cs` file looks the same here as it does in the Explorer. Everything else gets
- * an icon of its own, because a tree drawn entirely in the foreground colour reads as one
- * undifferentiated list.
+ * Every kind gets an icon of its own, because a tree drawn entirely in the foreground colour
+ * reads as one undifferentiated list. A project carries the language badge; the files inside it
+ * carry a glyph tinted in the same family, so the project is still the row that stands out.
  *
  * Every expandable row must end up with an icon, and that is why folders are a codicon rather
  * than `ThemeIcon.Folder`. Most file icon themes — Seti, the default — ship file icons and no
@@ -1601,7 +1767,11 @@ function tinted(id: string, color: string): vscode.ThemeIcon {
  * which is what happened while folders came from the icon theme, indents the icon-bearing rows a
  * whole extra level and lines up nothing with anything.
  */
-function iconFor(node: SolutionTreeNode, extensionUri: vscode.Uri): NodeIcon {
+function iconFor(
+    node: SolutionTreeNode,
+    extensionUri: vscode.Uri,
+    fileIconsFromTheme: boolean
+): NodeIcon {
     // A project's kind stays "project" whether it is runnable or unloaded; only its context
     // value says which, and an unloaded one is drawn greyed the way its label already is.
     switch (node.kind === 'project' ? node.contextValue : node.kind) {
@@ -1652,13 +1822,13 @@ function iconFor(node: SolutionTreeNode, extensionUri: vscode.Uri): NodeIcon {
             return tinted('file-code', 'charts.purple');
         case 'file':
         case 'solutionItem':
-            return vscode.ThemeIcon.File;
+            return fileIcon(node.resourceUri, extensionUri, fileIconsFromTheme);
         default:
             // An unknown kind is still a row, and a row still needs its slot filled.
             return node.hasChildren
                 ? new vscode.ThemeIcon('folder')
                 : node.resourceUri
-                  ? vscode.ThemeIcon.File
+                  ? fileIcon(node.resourceUri, extensionUri, fileIconsFromTheme)
                   : tinted('circle-outline', 'descriptionForeground');
     }
 }

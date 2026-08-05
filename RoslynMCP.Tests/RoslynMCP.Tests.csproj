@@ -107,6 +107,15 @@
         <MSBuild Projects="Fixtures\ProtoSolution\Server\Server.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\ProtoSolution\Client\Client.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\ProtoSolution\Unrelated\Unrelated.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <!--
+          The cross-project navigation fixtures. Api covers Contracts and Messaging through its
+          ProjectReference; Inventory and Billing sit in sibling subtrees nothing references, so
+          each needs its own line. Same for Storefront over Warehouse.
+        -->
+        <MSBuild Projects="Fixtures\MediatorModules\Api\Api.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\MediatorModules\Inventory\Inventory.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\MediatorModules\Billing\Billing.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\LayeredApp\Storefront\Storefront.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
     </Target>
 
 </Project>

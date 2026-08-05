@@ -231,9 +231,17 @@ internal static class NavigationHandlers
         ISymbol symbol, Project project, bool includeDeclaration, CancellationToken ct,
         LanguageSession? languages = null, bool waitForCompleteScope = false)
     {
+        // The references to a symbol live in the projects that consume its project — the direction
+        // lazy loading does not follow — so the caller that may wait, waits for that scope to
+        // exist before searching it. The incidental callers search what is open, unchanged.
+        var solution = waitForCompleteScope
+            ? await Services.SearchScopeService.WidenForSymbolAsync(
+                symbol, project, Services.SearchScopeService.ExplicitSearchBudget, ct)
+            : project.Solution;
+
         var locations = new List<Microsoft.CodeAnalysis.Location>();
 
-        foreach (var referenced in await SymbolFinder.FindReferencesAsync(symbol, project.Solution, ct))
+        foreach (var referenced in await SymbolFinder.FindReferencesAsync(symbol, solution, ct))
         {
             if (includeDeclaration)
                 locations.AddRange(referenced.Definition.Locations.Where(l => l.IsInSource));
@@ -297,7 +305,11 @@ internal static class NavigationHandlers
             return redirectedLocations.Distinct().ToArray();
         }
 
-        var solution = document.Project.Solution;
+        // Implementations of a symbol live in projects that reference its declaring project, which
+        // is the one direction lazy loading never took. Ctrl+F12 is always a deliberate gesture,
+        // so it may wait for that scope the same way Shift+F12 does.
+        var solution = await Services.SearchScopeService.WidenForSymbolAsync(
+            symbol, document.Project, Services.SearchScopeService.ExplicitSearchBudget, ct);
         var results = new List<ISymbol>();
 
         switch (symbol)

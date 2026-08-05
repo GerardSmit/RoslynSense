@@ -204,6 +204,30 @@ internal static class FixturePaths
     public static string ProtoUnrelatedLookupFile => Path.Combine(ProtoUnrelatedProjectDir, "WidgetLookup.cs");
 
     /// <summary>
+    /// The multi-project mediator fixture, laid out the way a modular solution is: the message in
+    /// Contracts, one handler each in the sibling modules Inventory and Billing, and the dispatch
+    /// in Api — which references only Contracts, so neither handler is in the dispatch project's
+    /// dependency closure. MediatorProject cannot stand in for this: it holds every role in one
+    /// assembly, so a search that never left the caret's own project still finds every answer there.
+    /// </summary>
+    public static string MediatorModulesDir => Path.Combine(s_fixturesRoot, "MediatorModules");
+    public static string MediatorModulesSolutionFile => Path.Combine(MediatorModulesDir, "MediatorModules.sln");
+    public static string MediatorModulesEndpointFile => Path.Combine(MediatorModulesDir, "Api", "CustomerEndpoint.cs");
+    public static string MediatorModulesInventoryHandlerFile => Path.Combine(MediatorModulesDir, "Inventory", "InventorySyncHandler.cs");
+    public static string MediatorModulesBillingHandlerFile => Path.Combine(MediatorModulesDir, "Billing", "BillingSyncHandler.cs");
+
+    /// <summary>
+    /// Two plain C# projects with nothing mediator- or proto-shaped about them: an extension
+    /// method declared in Warehouse and called only from Storefront, the project that references
+    /// it. The one direction lazy loading does not follow — a search started from the declaration
+    /// must widen the solution with the projects that consume it, or answer "0 references".
+    /// </summary>
+    public static string LayeredAppDir => Path.Combine(s_fixturesRoot, "LayeredApp");
+    public static string LayeredAppSolutionFile => Path.Combine(LayeredAppDir, "LayeredApp.sln");
+    public static string LayeredAppWarehouseModuleFile => Path.Combine(LayeredAppDir, "Warehouse", "WarehouseModule.cs");
+    public static string LayeredAppStartupFile => Path.Combine(LayeredAppDir, "Storefront", "Startup.cs");
+
+    /// <summary>
     /// Walks up from the test assembly location to find the Fixtures directory.
     /// Prefer the source-tree fixtures so Roslyn can open the nested sample project
     /// with its real restore/build artifacts; fall back to copied output fixtures.

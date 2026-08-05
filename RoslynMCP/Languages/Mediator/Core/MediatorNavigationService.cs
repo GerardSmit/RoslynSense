@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Operations;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.Mediator.Core;
 
@@ -226,6 +227,14 @@ internal static class MediatorNavigationService
     private static async Task<IReadOnlyList<ISymbol>> FindHandlersAsync(
         MediatorMessage message, Project project, MediatorTypes types, bool wantType, CancellationToken ct)
     {
+        // The handlers live in projects that reference the message's project — sibling modules the
+        // dispatch project has never heard of — and lazy loading never walks that direction. This
+        // is only reached from F12/Ctrl+F12 on a dispatch, a deliberate gesture, so it may wait
+        // for that scope to exist; otherwise the answer is whichever handler happened to be loaded.
+        var solution = await SearchScopeService.WidenForSymbolAsync(
+            message.Type, project, SearchScopeService.ExplicitSearchBudget, ct);
+        project = solution.GetProject(project.Id) ?? project;
+
         var handlerTypes = new List<INamedTypeSymbol>();
         var delegateHandlers = new List<IMethodSymbol>();
         var models = new Dictionary<DocumentId, SemanticModel?>();

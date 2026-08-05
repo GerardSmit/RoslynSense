@@ -102,7 +102,10 @@ public sealed record SolutionTreeSearchParams(
     [property: JsonPropertyName("limit")] int Limit = 50);
 
 public sealed record SolutionTreeRevealParams(
-    [property: JsonPropertyName("uri")] string Uri);
+    [property: JsonPropertyName("uri")] string Uri,
+    // The chain runs through a file's nesting parent when nesting is on, so it has to be known
+    // here as well as when the folder was listed.
+    [property: JsonPropertyName("fileNesting")] bool FileNesting = true);
 
 /// <summary>The chain of node ids from the root down to the target, so the client can expand
 /// each ancestor before revealing.</summary>

@@ -185,10 +185,25 @@
         "category": "RoslynSense"
       },
       {
-        "command": "roslynSense.solutionExplorer.revealActiveFile",
-        "title": "Toggle: Always Select Opened File",
+        "command": "roslynSense.solutionExplorer.focusCurrentFile",
+        "title": "Focus Current File",
         "category": "RoslynSense",
         "icon": "$(target)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.followCurrentFile",
+        "title": "Follow Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.unfollowCurrentFile",
+        "title": "Stop Following Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.revealActiveFile",
+        "title": "Toggle: Follow Current File",
+        "category": "RoslynSense"
       },
       {
         "command": "roslynSense.solutionExplorer.goToNode",
@@ -606,44 +621,54 @@
       ],
       "view/title": [
         {
+          "command": "roslynSense.solutionExplorer.goToNode",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.focusCurrentFile",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.followCurrentFile",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.revealActiveFile",
+          "group": "1_view@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.unfollowCurrentFile",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.revealActiveFile",
+          "group": "1_view@1"
+        },
+        {
           "command": "roslynSense.solutionExplorer.showAllFiles",
           "when": "view == roslynSense.solutionExplorer && !roslynSense.showAllFiles",
-          "group": "navigation@2"
+          "group": "1_view@2"
         },
         {
           "command": "roslynSense.solutionExplorer.hideNonProjectFiles",
           "when": "view == roslynSense.solutionExplorer && roslynSense.showAllFiles",
-          "group": "navigation@2"
-        },
-        {
-          "command": "roslynSense.solutionExplorer.revealActiveFile",
-          "when": "view == roslynSense.solutionExplorer",
-          "group": "navigation@3"
-        },
-        {
-          "command": "roslynSense.solutionExplorer.refresh",
-          "when": "view == roslynSense.solutionExplorer",
-          "group": "navigation@4"
+          "group": "1_view@2"
         },
         {
           "command": "roslynSense.solutionExplorer.showIgnored",
           "when": "view == roslynSense.solutionExplorer && !roslynSense.showIgnored",
-          "group": "1_toggles"
+          "group": "1_view@3"
         },
         {
           "command": "roslynSense.solutionExplorer.hideIgnored",
           "when": "view == roslynSense.solutionExplorer && roslynSense.showIgnored",
-          "group": "1_toggles"
+          "group": "1_view@3"
         },
         {
           "command": "roslynSense.solutionExplorer.toggleFileNesting",
           "when": "view == roslynSense.solutionExplorer",
-          "group": "navigation@4"
+          "group": "1_view@4"
         },
         {
-          "command": "roslynSense.solutionExplorer.goToNode",
+          "command": "roslynSense.solutionExplorer.refresh",
           "when": "view == roslynSense.solutionExplorer",
-          "group": "navigation@1"
+          "group": "9_refresh"
         }
       ],
       "view/item/context": [
@@ -922,6 +947,19 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Resolve `Send`, `Publish` and the generated mediator extension methods to the handler that runs, and count those calls as usages of the handler. Supports MediatR and Zapto.Mediator. Off leaves them resolving to the mediator interface in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.solutionExplorer.fileIcons": {
+          "type": "string",
+          "enum": [
+            "roslynSense",
+            "theme"
+          ],
+          "enumDescriptions": [
+            "Icons shipped with RoslynSense: a language badge for C#, F#, Visual Basic and .proto, and a glyph for everything else, so every row is the same width.",
+            "The file icon theme, the way the built-in Explorer draws files. An extension the theme has nothing for is drawn without an icon, which shifts its siblings out of line."
+          ],
+          "default": "roslynSense",
+          "description": "Where the Solution Explorer gets its file icons."
         },
         "roslynSense.solutionExplorer.fileNesting": {
           "type": "boolean",

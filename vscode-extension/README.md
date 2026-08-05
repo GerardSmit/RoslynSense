@@ -64,6 +64,17 @@ to them as solution items, including by dragging from the OS file explorer. Both
 Add Existing Item on a project reads the surrounding folder: a file already inside the project's
 directory is included where it lies, and only a file from elsewhere is copied in.
 
+The toolbar carries three buttons — Search the solution, Focus Current File, and Collapse All. The
+rest of the view's toggles (Follow Current File, Show All Files, Show Ignored Folders, file nesting,
+Refresh) live in the `…` menu beside them.
+
+Every row is drawn with an icon of its own, so a folder and the files inside it line up. A project
+carries a language badge — C#, F#, Visual Basic — and the files inside it carry a glyph tinted in
+the same family, which keeps the project the row that stands out. `.proto` keeps a badge of its own,
+having no project to put one on. Set
+`roslynSense.solutionExplorer.fileIcons` to `theme` to have files drawn by your file icon theme
+instead — at the cost of that alignment wherever the theme has nothing for an extension.
+
 ### Keyboard
 
 | Key | Action |
@@ -248,9 +259,9 @@ instead.
   `App_LocalResources` file reads as a list of controls rather than `btnSave.Text`,
   `btnSave.ToolTip`, `btnSave.AlternateText` interleaved three ways over. **Go to symbol in
   workspace (Ctrl+T)** searches keys with the same matcher C# symbols use.
-- **Diagnostics** in the `.resx` buffer flag a key declared twice (RSX0001, warning) and report keys
-  the neutral file has that a translation does not (RSX0002, information — one aggregate message per
-  file, because an untranslated key still renders and this is a worklist, not a defect).
+- **Diagnostics** in the `.resx` buffer flag a key declared twice (RSX0001, warning) and, in the
+  neutral file, mark each key at its declaration with the translations that lack it (RSX0002,
+  information — an untranslated key still renders, so this is a worklist, not a defect).
 - **Renaming a `.resx`** in the explorer drags its translations, its customizations and its
   `.Designer.cs` with it. Renaming `Strings.nl-NL.resx` alone does not — that is a statement about
   one file.

@@ -32,17 +32,41 @@ internal sealed record AspxProjectedText(string Text, ImmutableArray<AspxProject
 
     /// <summary>The markup span a projected span came from, or <c>null</c> when it landed in
     /// scaffolding rather than in copied code.</summary>
+    /// <remarks>
+    /// Binary search over <see cref="Segments"/>, which the builder emits in projected order.
+    /// A find-references over a whole project maps every result through here, so this is the
+    /// direction that sees N calls per gesture where <see cref="ToProjected"/> sees one.
+    /// </remarks>
     public TextSpan? ToAspx(TextSpan projected)
     {
-        foreach (var segment in Segments)
+        int lo = 0, hi = Segments.Length - 1;
+        while (lo <= hi)
         {
-            if (projected.Start < segment.ProjectedStart
-                || projected.Start > segment.ProjectedStart + segment.Length)
-                continue;
+            int mid = lo + ((hi - lo) >> 1);
+            var segment = Segments[mid];
 
-            int start = segment.AspxStart + (projected.Start - segment.ProjectedStart);
-            int length = Math.Min(projected.Length, segment.Length - (projected.Start - segment.ProjectedStart));
-            return new TextSpan(start, Math.Max(0, length));
+            if (projected.Start < segment.ProjectedStart)
+            {
+                hi = mid - 1;
+            }
+            else if (projected.Start > segment.ProjectedStart + segment.Length)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                // Two script blocks copied back to back share a boundary offset; the linear scan
+                // this replaces answered with the first of the two.
+                while (mid > 0 && projected.Start <= Segments[mid - 1].ProjectedStart + Segments[mid - 1].Length)
+                {
+                    mid--;
+                    segment = Segments[mid];
+                }
+
+                int start = segment.AspxStart + (projected.Start - segment.ProjectedStart);
+                int length = Math.Min(projected.Length, segment.Length - (projected.Start - segment.ProjectedStart));
+                return new TextSpan(start, Math.Max(0, length));
+            }
         }
         return null;
     }

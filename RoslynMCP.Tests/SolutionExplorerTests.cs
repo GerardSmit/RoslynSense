@@ -211,6 +211,15 @@ public class SolutionExplorerTests
 
         try
         {
+            // Evaluated first, and the test is meaningless without it. The tree reads the item
+            // list cached-only and never blocks on MSBuild — an unevaluated project falls back to
+            // showing every file, which is the right answer for responsiveness and the wrong one
+            // to assert exclusion against. A real editor reaches this state by having expanded
+            // Dependencies, or simply by the project having been opened; a freshly written temp
+            // project has nothing cached, so without this the assertion below is checking the
+            // fallback rather than the exclusion.
+            Assert.NotNull(await ProjectEvaluationService.EvaluateAsync(project, default));
+
             var nodes = await SolutionTreeHandler.ChildrenAsync(
                 new SolutionTreeParams(NodeId: $"project:{project}"), default);
             Assert.DoesNotContain(nodes, n => n.Label == "Excluded");

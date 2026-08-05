@@ -93,8 +93,11 @@ public class ProjectCreationTests
                 new SolutionTreeEditParams(
                     Action: "addProject",
                     TargetUri: LspConverters.PathToUri(solutionPath),
-                    // Created inside the solution folder it was invoked on.
-                    ProjectPath: "{11111111-1111-1111-1111-111111111111}",
+                    // Created inside the solution folder it was invoked on. A solution folder is
+                    // addressed by its path and not by the GUID the .sln writes down: that is the
+                    // id SolutionFileService.Read hands out and the id the tree puts behind a
+                    // `slnfolder:` node, so it is the one an edit arrives carrying.
+                    ProjectPath: "/Libraries/",
                     Name: "Contoso.Widgets",
                     Kind: "classlib",
                     TargetFramework: "net10.0"),
@@ -106,9 +109,14 @@ public class ProjectCreationTests
             Assert.True(File.Exists(created), "the project file was not created");
             Assert.Contains("net10.0", await File.ReadAllTextAsync(created));
 
+            // Nesting failing is reported in the message rather than in Ok — the project was still
+            // created and added, so the edit did not fail — which means asserting Ok alone would
+            // pass over exactly the thing this test is for.
+            Assert.DoesNotContain("could not be moved", result.Message, StringComparison.OrdinalIgnoreCase);
+
             var nodes = SolutionFileService.Read(solutionPath);
             var project = nodes.Single(n => n.Name == "Contoso.Widgets");
-            Assert.Equal("{11111111-1111-1111-1111-111111111111}", project.ParentId);
+            Assert.Equal("/Libraries/", project.ParentId);
         }
         finally
         {

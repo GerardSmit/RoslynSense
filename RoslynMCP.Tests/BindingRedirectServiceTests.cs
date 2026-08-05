@@ -43,8 +43,10 @@ public class BindingRedirectServiceTests
         Assert.Equal(new Version(12, 0, 0, 0), redirect.OldHigh);
         Assert.Equal(new Version(12, 0, 0, 0), redirect.NewVersion);
 
-        // 0-based, and the element is on the sixth line of the document.
-        Assert.Equal(5, redirect.Line);
+        // The line recorded is the <dependentAssembly> — the element a rewrite replaces — and not
+        // the <assemblyIdentity> inside it that the assertions above read. 0-based, so the fifth
+        // line of the document is 4.
+        Assert.Equal(4, redirect.Line);
     }
 
     [Fact]
@@ -202,7 +204,12 @@ public class BindingRedirectServiceTests
 
         Assert.NotNull(info);
         Assert.NotEmpty(info!.References);
-        Assert.All(info.References, reference => Assert.NotEqual(0, reference.Version.Major));
+
+        // That a version was read at all, rather than that it is 1.0 or later. A project reference
+        // is a reference like any other and this assembly has one — RoslynMCP itself, at 0.1.0.0 —
+        // so asserting a non-zero major says the product is broken whenever a solution has not
+        // reached 1.0, which is most of them.
+        Assert.All(info.References, reference => Assert.NotEqual(new Version(0, 0, 0, 0), reference.Version));
     }
 
     private static BindingRedirectFinding Stale(

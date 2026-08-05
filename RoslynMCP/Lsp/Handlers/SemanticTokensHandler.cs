@@ -169,7 +169,7 @@ internal static class SemanticTokensHandler
         return [new SemanticTokensEdit(prefix, deleteCount, after[prefix..(prefix + insertCount)])];
     }
 
-    private static string CacheKey(string sessionId, string uri) => sessionId + " " + uri;
+    private static string CacheKey(string sessionId, string uri) => sessionId + "\0" + uri;
 
     private static string Remember(string sessionId, string uri, int[] data)
     {
@@ -195,7 +195,7 @@ internal static class SemanticTokensHandler
     /// <summary>Drops the baselines of a session that has gone away.</summary>
     public static void Forget(string sessionId)
     {
-        string prefix = sessionId + " ";
+        string prefix = sessionId + "\0";
         foreach (var key in s_previous.Keys)
         {
             if (key.StartsWith(prefix, StringComparison.Ordinal))

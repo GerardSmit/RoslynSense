@@ -106,6 +106,14 @@ label.check { display: inline-flex; align-items: center; gap: 4px; white-space: 
 .chip:hover { border-color: var(--vscode-focusBorder); }
 .chip.warn { color: var(--vscode-inputValidation-warningBorder); font-weight: 600; }
 
+/* Installed-tab filters. The pressed one reads as selected, not merely hovered. */
+.chip.filter { max-width: none; cursor: pointer; }
+.chip.filter[aria-pressed="true"] {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border-color: var(--vscode-button-background);
+}
+
 .truncate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 nav {
@@ -342,8 +350,18 @@ li.row.row-induced {
 
 /* The word carries the meaning; colour is a second channel, never the only one — chart colours
    make no contrast guarantee and colour-only severity is unreadable for a lot of people. */
+/* An update is available: the badge carries the move ("8.0.1 → 9.0.4"). */
+.badge.upd { font-weight: 600; }
+
 /* A newer band exists but tracks a later .NET than the project; informational, never the offer. */
 .badge.upd-capped { opacity: 0.75; font-style: italic; }
+
+/* Per-row actions on the Installed tab: quiet until the row is hovered or selected, so a long
+   list is not a wall of buttons. */
+.row-actions { flex: 0 0 auto; align-self: center; visibility: hidden; }
+li.row:hover .row-actions,
+li.row[aria-selected="true"] .row-actions,
+.row-actions:focus-within { visibility: visible; }
 
 .sev { border-left: 3px solid transparent; font-weight: 600; }
 .sev-major, .sev-vuln { border-left-color: var(--vscode-charts-red); }

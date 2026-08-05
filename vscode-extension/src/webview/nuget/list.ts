@@ -71,6 +71,11 @@ namespace NG {
             if (state.tab === 'browse' && state.hasMore) {
                 addSentinel(list);
             }
+            if (state.tab === 'installed') {
+                // Late chunks arrive after the filter last ran; they must not surface rows the
+                // active chip hides.
+                applyInstalledFilter();
+            }
             applyPendingSelection();
         };
 
@@ -181,12 +186,20 @@ namespace NG {
         }
         li.appendChild(text);
 
+        // Only the Installed tab has per-row actions; elsewhere the details pane is the actor.
+        let actions: HTMLElement | undefined;
+        if (state.tab === 'installed') {
+            actions = make('span', 'row-actions');
+            li.appendChild(actions);
+        }
+
         const row: Row = {
             pkg,
             li,
             iconImg: img,
             iconFallback: fallback,
             badges,
+            actions,
             check,
             projectPaths: projectsWith(pkg.id),
         };
@@ -200,16 +213,30 @@ namespace NG {
         return row;
     }
 
-    /** Installed / vulnerable / deprecated / centrally-managed markers, rebuilt on demand. */
+    /** Installed / update / vulnerable / deprecated / centrally-managed markers, rebuilt on demand. */
     export function decorateRow(row: Row): void {
         row.badges.replaceChildren();
+        row.actions?.replaceChildren();
+
+        const pending = state.tab === 'installed' ? updatesFor(row.pkg.id) : [];
 
         if (row.pkg.installedVersion) {
-            const label =
-                row.pkg.installedVersions.length > 1
-                    ? `installed ${row.pkg.installedVersions.join(', ')}`
-                    : `installed ${row.pkg.installedVersion}`;
-            row.badges.appendChild(make('span', 'badge', label));
+            const installed = row.pkg.installedVersions.join(', ');
+            const latest = [...new Set(pending.map((u) => u.latestVersion))].join(', ');
+            const label = latest ? `${installed} → ${latest}` : `installed ${installed}`;
+            row.badges.appendChild(make('span', latest ? 'badge upd' : 'badge', label));
+        }
+
+        if (state.tab === 'installed' && row.pkg.installedVersions.length > 1) {
+            const mixed = make('span', 'sev sev-minor', 'mixed versions');
+            mixed.title =
+                'Projects reference this package at different versions. ' +
+                'Use Consolidate in the details pane to align them.';
+            row.badges.appendChild(mixed);
+        }
+
+        if (pending.length > 0 && row.actions) {
+            row.actions.appendChild(buildRowUpdate(row, pending));
         }
 
         if (row.pkg.isGlobalPackageReference) {
@@ -224,12 +251,13 @@ namespace NG {
             row.badges.appendChild(make('span', `sev sev-${row.severity}`, row.severity));
         }
 
-        if (row.update?.latestUncapped) {
+        const uncapped = row.update?.latestUncapped ?? pending.find((u) => u.latestUncapped)?.latestUncapped;
+        if (uncapped) {
             // Band alignment held the offer back; disclose what exists so the cap never reads as
             // "up to date" to someone who knows the newer band shipped.
-            const capped = make('span', 'badge upd-capped', `${row.update.latestUncapped} available`);
+            const capped = make('span', 'badge upd-capped', `${uncapped} available`);
             capped.title =
-                `${row.update.latestUncapped} tracks a newer .NET than this project targets. ` +
+                `${uncapped} tracks a newer .NET than this project targets. ` +
                 'Turn off roslynSense.nuget.alignPlatformPackages to update across bands.';
             row.badges.appendChild(capped);
         }
@@ -243,6 +271,54 @@ namespace NG {
         if (advisories.deprecated) {
             row.badges.appendChild(make('span', 'sev sev-deprecated', 'deprecated'));
         }
+    }
+
+    export function updatesFor(id: string): NuGetMsg.PackageUpdate[] {
+        return state.updates.filter((u) => u.id.toLowerCase() === id.toLowerCase());
+    }
+
+    /**
+     * The Installed tab's one-click Update. It goes through updateAll rather than install:
+     * install shells `dotnet add package`, which would also add the reference to selected
+     * projects that do not have it — updateAll edits versions only, writes
+     * Directory.Packages.props under CPM, and the host's silent plan drags induced references
+     * along so the restore cannot NU1605.
+     */
+    function buildRowUpdate(row: Row, pending: NuGetMsg.PackageUpdate[]): HTMLButtonElement {
+        // Grouped by target version: with different TFMs the same package can resolve to
+        // different latests in different projects, and each project must get its own.
+        const byVersion = new Map<string, string[]>();
+        for (const update of pending) {
+            const paths = byVersion.get(update.latestVersion);
+            if (paths) {
+                paths.push(update.projectPath);
+            } else {
+                byVersion.set(update.latestVersion, [update.projectPath]);
+            }
+        }
+
+        const button = make('button', 'linklike row-update', 'Update') as HTMLButtonElement;
+        button.title = `Update to ${[...byVersion.keys()].join(', ')} in ${
+            new Set(pending.map((u) => u.projectName)).size
+        } project(s)`;
+        button.setAttribute('aria-label', `Update ${row.pkg.id}`);
+        button.addEventListener('click', (event) => {
+            // The row click handler focuses the row and loads details; the button is an action,
+            // not a selection.
+            event.stopPropagation();
+            row.li.classList.add('row-working');
+            post({
+                type: 'updateAll',
+                packages: [...byVersion].map(([version, projectPaths]) => ({
+                    id: row.pkg.id,
+                    version,
+                    projectPaths,
+                })),
+                versionLock: el<HTMLSelectElement>('version-lock').value as NuGetMsg.Lock,
+                includePrerelease: el<HTMLInputElement>('prerelease').checked,
+            });
+        });
+        return button;
     }
 
     export function auditFor(id: string): { worst: number; deprecated: boolean } {
@@ -262,6 +338,48 @@ namespace NG {
             worst,
             deprecated: audit.deprecations.some((d) => d.id.toLowerCase() === id.toLowerCase()),
         };
+    }
+
+    export type InstalledFilter = 'all' | 'updates' | 'mixed';
+    let installedFilter: InstalledFilter = 'all';
+
+    export function setInstalledFilter(filter: InstalledFilter): void {
+        installedFilter = filter;
+        applyInstalledFilter();
+    }
+
+    /**
+     * Narrows the Installed list to the rows that need attention. Hidden rows stay built —
+     * keyboard navigation already skips them (nextVisible), and toggling `hidden` is cheaper
+     * than rebuilding a thousand rows per chip click.
+     */
+    export function applyInstalledFilter(): void {
+        if (state.tab !== 'installed') {
+            return;
+        }
+
+        let updates = 0;
+        let mixed = 0;
+        for (const row of rows) {
+            const hasUpdate = updatesFor(row.pkg.id).length > 0;
+            const isMixed = row.pkg.installedVersions.length > 1;
+            updates += hasUpdate ? 1 : 0;
+            mixed += isMixed ? 1 : 0;
+            row.li.hidden =
+                installedFilter === 'updates' ? !hasUpdate :
+                installedFilter === 'mixed' ? !isMixed : false;
+        }
+
+        const counts: Record<InstalledFilter, string> = {
+            all: `All (${rows.length})`,
+            updates: `Updates (${updates})`,
+            mixed: `Mixed versions (${mixed})`,
+        };
+        for (const chip of document.querySelectorAll<HTMLButtonElement>('#installed-toolbar .filter')) {
+            const filter = chip.dataset.filter as InstalledFilter;
+            chip.textContent = counts[filter];
+            chip.setAttribute('aria-pressed', String(filter === installedFilter));
+        }
     }
 
     export function projectsWith(id: string): string[] {
@@ -288,10 +406,6 @@ namespace NG {
                 : ['Search the configured feeds', 'Start typing a package name.'],
             installed: ['No packages referenced', 'Nothing in this solution references a NuGet package.'],
             updates: ['Everything is up to date', 'No installed package has a newer version available.'],
-            consolidate: [
-                'No version conflicts',
-                'Every package is referenced at the same version across the solution.',
-            ],
             sources: ['', ''],
         };
 

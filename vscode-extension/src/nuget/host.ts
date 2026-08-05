@@ -185,17 +185,6 @@ export function wire(
                         break;
                     }
 
-                    case 'consolidations': {
-                        start();
-                        const results = await client.sendRequest<NuGetMsg.Consolidation[]>(
-                            'roslynSense/nuget/consolidations',
-                            {}
-                        );
-                        post({ type: 'consolidations', gen: message.gen, results });
-                        settle(started);
-                        break;
-                    }
-
                     case 'audit': {
                         const audit = await client.sendRequest<NuGetMsg.Audit>(
                             'roslynSense/nuget/audit',

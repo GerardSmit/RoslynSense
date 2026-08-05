@@ -3,9 +3,10 @@ import type { LanguageClient } from 'vscode-languageclient/node';
 import { openSourcesConfig, wire } from './host';
 
 /**
- * NuGet package management, Rider-style: Browse / Installed / Updates / Consolidate, a versions
+ * NuGet package management, Rider-style: Browse / Installed / Updates / Sources, a versions
  * dropdown, and a details pane with the README, license, dependency groups and any known
- * advisories.
+ * advisories. Mixed-version fix-ups (what Visual Studio calls Consolidate) live inside the
+ * Installed tab as a filter chip and a details-pane action.
  *
  * All network access happens in the daemon, never here: private feeds need NuGet.config
  * credentials and credential providers, which a webview cannot supply. The webview therefore runs

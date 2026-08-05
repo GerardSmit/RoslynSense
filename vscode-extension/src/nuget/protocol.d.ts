@@ -32,11 +32,6 @@ declare namespace NuGetMsg {
         packages: PackageSummary[];
     }
 
-    interface Consolidation {
-        id: string;
-        versions: { projectPath: string; projectName: string; version: string }[];
-    }
-
     interface FeedOutcome {
         name: string;
         source: string;
@@ -182,7 +177,7 @@ declare namespace NuGetMsg {
 
     // ---- Panel state -----------------------------------------------------------------
 
-    type Tab = 'browse' | 'installed' | 'updates' | 'consolidate' | 'sources';
+    type Tab = 'browse' | 'installed' | 'updates' | 'sources';
 
     type SourceAction = 'add' | 'update' | 'remove' | 'enable' | 'disable' | 'reorder';
 
@@ -224,7 +219,6 @@ declare namespace NuGetMsg {
         | { type: 'search'; gen: number; query: string; includePrerelease: boolean; source: string; skip: number }
         | { type: 'installed'; gen: number }
         | { type: 'updates'; gen: number; includePrerelease: boolean; versionLock: Lock; projectPaths: string[] }
-        | { type: 'consolidations'; gen: number }
         | { type: 'audit'; gen: number; refresh: boolean }
         | { type: 'versions'; id: string; includePrerelease: boolean }
         | { type: 'metadata'; gen: number; id: string; version: string | null }
@@ -262,7 +256,6 @@ declare namespace NuGetMsg {
         | { type: 'projects'; gen: number; projects: ProjectPackages[] }
         | { type: 'updates'; gen: number; updates: PackageUpdate[]; feeds: FeedOutcome[] }
         | { type: 'updatePlan'; gen: number; induced: InducedUpdate[] }
-        | { type: 'consolidations'; gen: number; results: Consolidation[] }
         | { type: 'audit'; gen: number; audit: Audit }
         | { type: 'versions'; id: string; versions: string[] }
         | { type: 'metadata'; gen: number; id: string; version: string; metadata: PackageMetadata | null }

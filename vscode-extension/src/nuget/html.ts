@@ -62,9 +62,6 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
     <button role="tab" data-tab="updates" aria-selected="false" id="tab-updates">
       Updates<span class="count" data-count="updates"></span>
     </button>
-    <button role="tab" data-tab="consolidate" aria-selected="false" id="tab-consolidate">
-      Consolidate<span class="count" data-count="consolidate"></span>
-    </button>
     <button role="tab" data-tab="sources" aria-selected="false" id="tab-sources">Sources</button>
   </nav>
   <div class="progress" id="progress" role="presentation"></div>
@@ -72,6 +69,13 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 
 <div class="strip" id="feeds" hidden></div>
 <div class="strip" id="summary" hidden></div>
+
+<div class="toolbar" id="installed-toolbar" hidden>
+  <button class="chip filter" data-filter="all" aria-pressed="true">All</button>
+  <button class="chip filter" data-filter="updates" aria-pressed="false">Updates</button>
+  <button class="chip filter" data-filter="mixed" aria-pressed="false"
+          title="Projects referencing this package at different versions (Consolidate)">Mixed versions</button>
+</div>
 
 <div class="toolbar" id="updates-toolbar" hidden>
   <label class="check"><input type="checkbox" id="select-all"> Select all</label>

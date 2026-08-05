@@ -229,6 +229,25 @@ namespace NG {
             actions.appendChild(remove);
         }
 
+        if (row.pkg.installedVersions.length > 1) {
+            // What the Consolidate tab used to do, next to the package that needs it: every
+            // project that references this package moves to the chosen version, solution-wide.
+            const consolidate = make('button', 'action secondary') as HTMLButtonElement;
+            consolidate.textContent = `Consolidate to ${versions.value}`;
+            consolidate.title =
+                'Projects reference this package at different versions ' +
+                `(${row.pkg.installedVersions.join(', ')}). ` +
+                'Set every one of them to the selected version.';
+            consolidate.disabled = row.pkg.isGlobalPackageReference;
+            consolidate.addEventListener('click', () =>
+                post({ type: 'consolidate', id: row.pkg.id, version: versions.value })
+            );
+            versions.addEventListener('change', () => {
+                consolidate.textContent = `Consolidate to ${versions.value}`;
+            });
+            actions.appendChild(consolidate);
+        }
+
         details.appendChild(actions);
 
         if (row.pkg.isGlobalPackageReference) {

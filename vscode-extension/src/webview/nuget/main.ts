@@ -48,6 +48,12 @@ namespace NG {
             button.addEventListener('click', () => switchTab(button.dataset.tab as NuGetMsg.Tab));
         }
 
+        for (const chip of document.querySelectorAll<HTMLButtonElement>('#installed-toolbar .filter')) {
+            chip.addEventListener('click', () =>
+                setInstalledFilter(chip.dataset.filter as InstalledFilter)
+            );
+        }
+
         document.addEventListener('keydown', (event) => {
             if (event.key === '/' && document.activeElement !== query) {
                 event.preventDefault();
@@ -61,6 +67,11 @@ namespace NG {
     }
 
     export function switchTab(tab: NuGetMsg.Tab): void {
+        // A restored state can carry a tab this version no longer has (the Consolidate tab
+        // folded into Installed); an unknown value must not strand the panel on a blank pane.
+        if (!['browse', 'installed', 'updates', 'sources'].includes(tab)) {
+            tab = 'browse';
+        }
         state.tab = tab;
 
         for (const button of document.querySelectorAll<HTMLButtonElement>('nav button')) {
@@ -68,6 +79,7 @@ namespace NG {
         }
 
         el<HTMLElement>('updates-toolbar').hidden = tab !== 'updates';
+        el<HTMLElement>('installed-toolbar').hidden = tab !== 'installed';
         el<HTMLElement>('summary').hidden = true;
 
         // Feeds are a different shape from packages, so they get their own pane rather than
@@ -100,15 +112,15 @@ namespace NG {
                 });
                 break;
             case 'installed':
+                // The same generation for all three: the updates reply decorates the rows the
+                // projects reply builds, and a mismatched gen would orphan one of them.
                 post({ type: 'installed', gen });
                 post({ type: 'audit', gen, refresh: false });
+                requestUpdates(gen);
                 break;
             case 'updates':
                 requestUpdates();
                 post({ type: 'audit', gen: listGen, refresh: false });
-                break;
-            case 'consolidate':
-                post({ type: 'consolidations', gen });
                 break;
             case 'sources':
                 post({ type: 'sources' });
@@ -171,8 +183,20 @@ namespace NG {
                         if (message.gen !== listGen) {
                             return;
                         }
-                        showFeeds(message.feeds);
-                        showUpdates(message.updates);
+                        state.updates = message.updates;
+                        if (state.tab === 'updates') {
+                            showFeeds(message.feeds);
+                            showUpdates(message.updates);
+                        } else if (state.tab === 'installed') {
+                            // The Installed tab asked, to decorate its rows with "8.0.1 → 9.0.4"
+                            // hints. Rows built after this reply pick the data up in buildRow;
+                            // rows already built are re-decorated here — same shape as audit.
+                            setCount('updates', groupedUpdateCount(message.updates));
+                            for (const row of rows) {
+                                decorateRow(row);
+                            }
+                            applyInstalledFilter();
+                        }
                         break;
 
                     case 'updatePlan':
@@ -180,13 +204,6 @@ namespace NG {
                             return;
                         }
                         showPlan(message.induced);
-                        break;
-
-                    case 'consolidations':
-                        if (message.gen !== listGen) {
-                            return;
-                        }
-                        showConsolidations(message.results);
                         break;
 
                     case 'audit':
@@ -313,27 +330,9 @@ namespace NG {
         return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
     }
 
-    function showConsolidations(consolidations: NuGetMsg.Consolidation[]): void {
-        setRows(
-            consolidations.map((consolidation) => ({
-                id: consolidation.id,
-                version: consolidation.versions[0]?.version ?? '',
-                authors: null,
-                description: consolidation.versions
-                    .map((v) => `${v.projectName}: ${v.version}`)
-                    .join(' · '),
-                downloads: null,
-                iconUrl: null,
-                deprecated: false,
-                vulnerable: false,
-                installedVersion: consolidation.versions[0]?.version ?? null,
-                installedVersions: [...new Set(consolidation.versions.map((v) => v.version))],
-                isCentrallyManaged: false,
-                isGlobalPackageReference: false,
-                versionSource: null,
-                sourceName: null,
-            }))
-        );
+    /** The Updates tab badge counts one entry per (package, latest), the way its rows group. */
+    function groupedUpdateCount(updates: NuGetMsg.PackageUpdate[]): number {
+        return new Set(updates.map((u) => `${u.id}|${u.latestVersion}`.toLowerCase())).size;
     }
 
     function showFeeds(feeds: NuGetMsg.FeedOutcome[]): void {

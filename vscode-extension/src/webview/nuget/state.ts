@@ -7,6 +7,8 @@ namespace NG {
         iconImg: HTMLImageElement;
         iconFallback: HTMLElement;
         badges: HTMLElement;
+        /** Per-row actions (the Installed tab's Update button); rebuilt by decorateRow. */
+        actions?: HTMLElement;
         check?: HTMLInputElement;
         severity?: NuGetMsg.Severity;
         update?: NuGetMsg.PackageUpdate;
@@ -23,6 +25,8 @@ namespace NG {
         versions: {} as Record<string, string[]>,
         metadata: {} as Record<string, NuGetMsg.PackageMetadata | null>,
         audit: null as NuGetMsg.Audit | null,
+        /** Available updates, kept for the Installed tab's inline hints and Update buttons. */
+        updates: [] as NuGetMsg.PackageUpdate[],
         pendingSelect: null as string | null,
         hasMore: false,
         query: '',

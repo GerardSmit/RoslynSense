@@ -18,6 +18,38 @@ namespace RoslynMCP.Services;
 /// </summary>
 internal static class WorkspaceService
 {
+    /// <summary>
+    /// Raised whenever the set of loaded projects changes — a workspace loaded, projects added to
+    /// one, a workspace thrown away.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The editor caches what it was told. When the project set moves underneath it, everything
+    /// derived from the old set is wrong and the client has no way to find out: it did not ask for
+    /// the change and nothing in LSP tells it. The one gesture that widens the workspace is
+    /// find-references, which is why "go to reference works but the code lens beside it still says
+    /// nothing" — the search pulled in the projects, and the lens was never asked again.
+    /// </para>
+    /// <para>
+    /// A delegate rather than a call into <c>LspSessionRegistry</c>, matching
+    /// <see cref="ProgressReporter.Factory"/> and <see cref="ServiceLog.Sink"/>: this service is
+    /// used by hosts that have no LSP layer at all, and it must not depend on one.
+    /// </para>
+    /// <para>
+    /// Raised from here rather than from the handlers that trigger loads. That was the original
+    /// design and it is what produced the gaps — six handlers refresh, two sibling branches doing
+    /// the same kind of work do not, and background loads never did. This is the only place that
+    /// knows the set actually moved.
+    /// </para>
+    /// </remarks>
+    public static Action? ProjectSetChanged;
+
+    private static void NotifyProjectSetChanged()
+    {
+        try { ProjectSetChanged?.Invoke(); }
+        catch { /* an editor that cannot be told is not a reason to fail the load */ }
+    }
+
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan EvictionInterval = TimeSpan.FromMinutes(1);
 
@@ -528,6 +560,7 @@ internal static class WorkspaceService
         Workspace workspace;
         Project openedProject;
         ShadowCopyAnalyzerAssemblyLoader? shadowLoader = null;
+        bool notifyLoaded = false;
         HashSet<string>? shadowDirs = null;
         string? decompileTempDir = null;
         // The s_cache key == loadKey: the .sln path in solution-mode (so siblings share and
@@ -692,6 +725,7 @@ internal static class WorkspaceService
                 var newEntry = new CachedWorkspaceEntry(
                     cacheKey, workspace, openedProject.Id, shadowLoader, shadowDirs, tempDirs);
                 s_cache[cacheKey] = newEntry;
+                notifyLoaded = true;
                 RegisterProjectMappingsLocked(cacheKey, normalizedPath, workspace);
                 RegisterShadowDirsLocked(cacheKey, shadowDirs);
                 Console.Error.WriteLine(
@@ -712,6 +746,12 @@ internal static class WorkspaceService
         }
 
         ourTcs!.TrySetResult(result);
+
+        // After the waiters are released and the lock is gone: the client re-pulls in response,
+        // and re-pulling must not queue behind the load it is reacting to.
+        if (notifyLoaded)
+            NotifyProjectSetChanged();
+
         return result;
     }
 
@@ -1015,6 +1055,17 @@ internal static class WorkspaceService
 
         var watch = Stopwatch.StartNew();
 
+        // The seed load has always announced itself; this one never did, and this is the one that
+        // runs while the user is already working — opening a file in a project that is not loaded
+        // yet, or a search widening the solution. Several seconds of it looked exactly like the
+        // editor having stopped responding, with nothing on screen to say otherwise. That is the
+        // "nothing shows me that something is being loaded" in the report.
+        await using var progress = await ProgressReporter.BeginAsync(
+            missing.Count == 1
+                ? $"Loading {Path.GetFileNameWithoutExtension(missing[0])}"
+                : $"Loading {missing.Count} projects",
+            cancellationToken);
+
         ImmutableArray<ProjectInfo> loaded;
         try
         {
@@ -1096,6 +1147,9 @@ internal static class WorkspaceService
             {
                 s_cacheLock.Release();
             }
+
+            // The gutter beside the caret was computed against the smaller solution.
+            NotifyProjectSetChanged();
         }
         finally
         {
@@ -1319,9 +1373,13 @@ internal static class WorkspaceService
     /// </summary>
     public static async Task EvictAllAsync(CancellationToken cancellationToken = default)
     {
+        bool evictedAnything;
+
         await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
+            evictedAnything = s_cache.Count > 0;
+
             foreach (var entry in s_cache.Values)
             {
                 foreach (var projectPath in entry.ProjectIds.Keys)
@@ -1337,6 +1395,13 @@ internal static class WorkspaceService
         {
             s_cacheLock.Release();
         }
+
+        // The second eviction funnel: this one disposes inline rather than going through
+        // EvictEntryLocked, so it needs its own signal. It is reached by a solution rebind, an
+        // analyzer rebuild and a watched .csproj changing — every one of which leaves the editor
+        // holding answers computed against workspaces that are now gone.
+        if (evictedAnything)
+            NotifyProjectSetChanged();
 
         // Deliberately not tearing down the build hosts here. This method means "drop the cached
         // workspaces" — it is called on a solution rebind, on analyzer rebuilds, and by tests
@@ -1480,6 +1545,14 @@ internal static class WorkspaceService
         // this workspace served (a solution entry served many).
         foreach (var projectPath in entry.ProjectIds.Keys)
             AnalyzerService.EvictAnalyzersForProject(projectPath);
+
+        // The funnel every eviction goes through — the idle sweep, the LRU cap, EvictAllAsync, a
+        // .csproj change, an analyzer rebuild. Everything the editor holds was derived from a
+        // workspace that no longer exists, and it has no way to find that out.
+        //
+        // Raised under s_cacheLock, which is safe because the subscriber only arms a debounce and
+        // returns; it does not call back into this service.
+        NotifyProjectSetChanged();
     }
 
     /// <summary>
@@ -1711,14 +1784,30 @@ internal static class WorkspaceService
             if (!acquired)
                 return; // another operation holds the lock — skip this cycle
 
-            var now = DateTime.UtcNow;
-            var expired = s_cache
-                .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout)
-                .Select(kvp => kvp.Key)
-                .ToList();
+            // Idle eviction is for the MCP case, where a workspace is loaded to answer a question
+            // and then nobody comes back. An editor is the opposite: quiet means the user is
+            // reading, or was in a meeting, and the files are still open in front of them.
+            //
+            // Evicting under a connected editor is what "I didn't use it for a while and now it
+            // doesn't work" was. Ten minutes of not typing threw the solution away, silently —
+            // the sweep says so on Console.Error, which in the shared-daemon setup is a process
+            // the user is not looking at — and the next request had to load it all again from
+            // cold, with nothing on screen to say why the editor had gone dead.
+            //
+            // The LRU cap below still runs, so memory stays bounded either way. That one is
+            // deliberate: it evicts because there are too many solutions open at once, which is a
+            // real reason, rather than because time passed.
+            if (!Lsp.LspSessionRegistry.HasSessions)
+            {
+                var now = DateTime.UtcNow;
+                var expired = s_cache
+                    .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout)
+                    .Select(kvp => kvp.Key)
+                    .ToList();
 
-            foreach (var key in expired)
-                TryEvictLoggedLocked(key, "idle workspace");
+                foreach (var key in expired)
+                    TryEvictLoggedLocked(key, "idle workspace");
+            }
 
             // LRU cap: after the idle sweep, if still over the cap, evict the
             // least-recently-used entries down to MaxCachedWorkspaces.
@@ -1756,12 +1845,21 @@ internal static class WorkspaceService
         try
         {
             EvictEntryLocked(key, entry);
-            Console.Error.WriteLine($"[WorkspaceService] Evicted {label} for '{key}'.");
+
+            // Through ServiceLog, not Console.Error. Under the shared daemon the console is a temp
+            // file in a process the user is not looking at, so unloading a solution — the single
+            // most surprising thing this service does on its own — was invisible. It is the answer
+            // to "did the solution unload?", and the user could not have found it.
+            ServiceLog.Warn(
+                $"Unloaded {label} for '{Path.GetFileNameWithoutExtension(key)}'. "
+                + "The next request will load it again.",
+                key: $"evict:{key}");
+
         }
         catch (Exception ex)
         {
-            try { Console.Error.WriteLine($"[WorkspaceService] Eviction of '{key}' failed: {ex.Message}"); }
-            catch { /* console gone during teardown */ }
+            try { ServiceLog.Warn($"Could not unload '{key}': {ex.Message}", key: $"evict-failed:{key}"); }
+            catch { /* logging gone during teardown */ }
         }
     }
 

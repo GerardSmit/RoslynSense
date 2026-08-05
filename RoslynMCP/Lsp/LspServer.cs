@@ -104,6 +104,7 @@ internal sealed class LspServer : IDisposable
         _diagnostics = new DiagnosticsPublisher(rpc);
         LspSessionRegistry.Register(SessionId, rpc, this);
         LspProgress.Install();
+        LspWorkspaceRefresh.Install();
         LspLog.Install();
         LspNuGetCredentials.Install();
         Handlers.NuGetHandler.InstallMutationHook();

@@ -321,9 +321,32 @@ internal static class AspxReferenceService
         return separator < 0 ? newName : existing[..(separator + 1)] + newName;
     }
 
-    private static bool Same(ISymbol? candidate, ISymbol symbol) =>
-        candidate is not null
-        && SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, symbol);
+    /// <summary>
+    /// Whether the tree's symbol and the caller's name the same declaration, tolerating that
+    /// they may come from different compilation snapshots: the tree keeps the snapshot it was
+    /// parsed against while a caller arriving from the C# side holds the current one, and
+    /// Roslyn's equality never matches source symbols across snapshots.
+    /// </summary>
+    private static bool Same(ISymbol? candidate, ISymbol symbol)
+    {
+        if (candidate is null)
+            return false;
+
+        candidate = candidate.OriginalDefinition;
+        if (SymbolEqualityComparer.Default.Equals(candidate, symbol))
+            return true;
+
+        if (candidate.Kind != symbol.Kind
+            || !string.Equals(candidate.MetadataName, symbol.MetadataName, StringComparison.Ordinal))
+            return false;
+
+        if (candidate is IMethodSymbol cm && symbol is IMethodSymbol sm
+            && cm.Parameters.Length != sm.Parameters.Length)
+            return false;
+
+        return candidate.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
+            .Equals(symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// Every ASPX-family file under the project directory. The listing is re-taken periodically

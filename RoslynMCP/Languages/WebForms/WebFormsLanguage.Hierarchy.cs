@@ -100,8 +100,12 @@ internal sealed partial class WebFormsLanguage :
         if (await ResolveAsync(p.Item.Uri, p.Item.SelectionRange.Start, ct) is not var (document, symbol))
             return [];
 
+        // Derived types are searched in the current solution: the search resolves the type's
+        // originating project by compilation identity, which a cached snapshot's symbol fails.
+        var (project, target) = await AspxDocumentService.AnchorAsync(document, symbol, ct);
+
         return await TypeHierarchyHandler.SubtypesAsync(
-            TypeAt(document, symbol), document.Project.Solution, MapperFor(document), ct);
+            TypeAt(document, target), project.Solution, MapperFor(document), ct);
     }
 
     // ---- Called from C# ------------------------------------------------------------------
@@ -182,9 +186,15 @@ internal sealed partial class WebFormsLanguage :
     /// is not optional: this is a different <see cref="Compilation"/>, so the symbol the position
     /// produced is not the same object as the one this compilation knows.
     /// </remarks>
-    private static Task<(AspxProjectProjection Projection, ISymbol Symbol, MarkupMapper Mapper)?>
-        ProjectWideAsync(AspxDocument document, ISymbol symbol, CancellationToken ct) =>
-        ProjectWideAsync(document.Project, symbol, ct);
+    private static async Task<(AspxProjectProjection Projection, ISymbol Symbol, MarkupMapper Mapper)?>
+        ProjectWideAsync(AspxDocument document, ISymbol symbol, CancellationToken ct)
+    {
+        // The current project, not the cached document's snapshot: the project-wide projection
+        // is keyed on the current compilation, and handing it an older one would rebuild the
+        // whole fork for every gesture — against text the user has since moved.
+        var (project, target) = await AspxDocumentService.AnchorAsync(document, symbol, ct);
+        return await ProjectWideAsync(project, target, ct);
+    }
 
     /// <inheritdoc cref="ProjectWideAsync(AspxDocument, ISymbol, CancellationToken)"/>
     private static async Task<(AspxProjectProjection Projection, ISymbol Symbol, MarkupMapper Mapper)?>

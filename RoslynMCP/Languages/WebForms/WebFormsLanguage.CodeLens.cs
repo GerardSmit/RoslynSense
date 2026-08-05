@@ -125,8 +125,9 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
         // The ID attribute is the declaration, and the markup pass returns it the way Roslyn
         // returns a declaration — a lens that counted itself would read "1 reference" on a
         // control nothing uses.
+        var (project, target) = await AspxDocumentService.AnchorAsync(document, field, ct);
         var locations = (await NavigationHandlers.AllReferencesAsync(
-                field, document.Project, includeDeclaration: false, ct))
+                target, project, includeDeclaration: false, ct))
             .Where(location => !IsSelf(location, data))
             .ToArray();
 

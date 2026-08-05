@@ -158,7 +158,7 @@ internal static class AspxProjectionService
 
     // ---- Single document -------------------------------------------------------------------
 
-    private sealed record CacheEntry(string Text, Compilation Compilation, AspxProjection? Projection);
+    private sealed record CacheEntry(AspxDocument Document, AspxProjection? Projection);
 
     private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -167,17 +167,21 @@ internal static class AspxProjectionService
     /// Builds (or returns the memoized) projection for a document, or <c>null</c> when there is
     /// nothing to project.
     /// </summary>
+    /// <remarks>
+    /// Keyed on the document instance: <see cref="AspxDocumentService"/> serves the same
+    /// <see cref="AspxDocument"/> for as long as its parse is valid, so the projection built from
+    /// it — same text, same snapshots — is valid exactly as long.
+    /// </remarks>
     public static AspxProjection? Get(AspxDocument document)
     {
         if (s_cache.TryGetValue(document.FilePath, out var cached)
-            && ReferenceEquals(cached.Compilation, document.Compilation)
-            && string.Equals(cached.Text, document.Text, StringComparison.Ordinal))
+            && ReferenceEquals(cached.Document, document))
         {
             return cached.Projection;
         }
 
         var projection = Build(document);
-        s_cache[document.FilePath] = new CacheEntry(document.Text, document.Compilation, projection);
+        s_cache[document.FilePath] = new CacheEntry(document, projection);
         return projection;
     }
 

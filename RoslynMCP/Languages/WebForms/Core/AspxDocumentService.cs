@@ -31,14 +31,35 @@ internal sealed record AspxDocument(
 /// <see cref="LspDocumentResolver"/> resolves a <c>.cs</c> path to a Roslyn document.
 /// </summary>
 /// <remarks>
-/// Parsing is memoized per file against the buffer text and the compilation it was parsed
-/// against. Both have to match: an edit to the markup changes the tree, and an edit to the
-/// code-behind changes which symbols the same markup binds to. Compilations are snapshots, so
-/// reference equality is the correct staleness test.
+/// <para>
+/// Parsing is memoized per file the way an incremental generator stage is: against the buffer
+/// text and the project's dependent semantic version, which moves when a declaration anywhere
+/// in the dependency closure changes and stays put for a method-body edit. Markup binds only
+/// to declarations — control types, members, event handlers — so a body edit cannot change
+/// what the same markup means, and the memo survives the keystrokes that used to invalidate
+/// every markup parse in the project.
+/// </para>
+/// <para>
+/// The code-behind's own files are checked by text version on top of that. A body edit there
+/// still shifts the lines that markup navigation answers with, and the file is being edited
+/// alongside its markup anyway.
+/// </para>
+/// <para>
+/// A served hit keeps the project and compilation snapshots it was parsed against, so the
+/// tree, its symbols and those snapshots stay consistent with each other. Symbols read from
+/// the tree may therefore be from an older snapshot than the caller's: anything that feeds
+/// them into <c>SymbolFinder</c> against a newer solution has to re-anchor them first (see
+/// <c>AspxReferenceService</c>), because Roslyn resolves a symbol's originating project by
+/// compilation identity and silently returns nothing for a foreign snapshot's symbol.
+/// </para>
 /// </remarks>
 internal static class AspxDocumentService
 {
-    private sealed record CacheEntry(string Text, Compilation Compilation, AspxDocument Document);
+    private sealed record CacheEntry(
+        string Text,
+        VersionStamp SemanticVersion,
+        ImmutableArray<(DocumentId Id, VersionStamp Version)> CodeBehindVersions,
+        AspxDocument Document);
 
     private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -72,16 +93,21 @@ internal static class AspxDocumentService
         var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
             projectPath, targetFilePath: path, cancellationToken: ct);
 
-        var compilation = await project.GetCompilationAsync(ct);
-        if (compilation is null)
-            return null;
+        // The staleness test runs before the compilation is asked for: on a hit, a hover in
+        // markup after a C# body edit no longer waits for that edit to compile.
+        var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
 
         if (s_cache.TryGetValue(path, out var cached)
-            && ReferenceEquals(cached.Compilation, compilation)
-            && string.Equals(cached.Text, text, StringComparison.Ordinal))
+            && cached.SemanticVersion.Equals(semanticVersion)
+            && string.Equals(cached.Text, text, StringComparison.Ordinal)
+            && await UnchangedAsync(project, cached.CodeBehindVersions, ct))
         {
             return cached.Document;
         }
+
+        var compilation = await project.GetCompilationAsync(ct);
+        if (compilation is null)
+            return null;
 
         string? projectDir = Path.GetDirectoryName(projectPath);
         var namespaces = projectDir is null ? default : WebConfigNamespaces(projectDir);
@@ -94,8 +120,48 @@ internal static class AspxDocumentService
         var document = new AspxDocument(
             path, text, SourceText.From(text), project, compilation, parse);
 
-        s_cache[path] = new CacheEntry(text, compilation, document);
+        s_cache[path] = new CacheEntry(
+            text, semanticVersion, await CodeBehindVersionsAsync(project, document, ct), document);
         return document;
+    }
+
+    /// <summary>The text versions of the files declaring the code-behind class, so an edit in
+    /// them — even a body edit the semantic version ignores — reparses and navigation into the
+    /// class answers with the lines the user is looking at.</summary>
+    private static async Task<ImmutableArray<(DocumentId Id, VersionStamp Version)>> CodeBehindVersionsAsync(
+        Project project, AspxDocument document, CancellationToken ct)
+    {
+        if (document.CodeBehind is not { } codeBehind)
+            return [];
+
+        var versions = ImmutableArray.CreateBuilder<(DocumentId, VersionStamp)>();
+        foreach (var reference in codeBehind.DeclaringSyntaxReferences)
+        {
+            foreach (var id in project.Solution.GetDocumentIdsWithFilePath(reference.SyntaxTree.FilePath))
+            {
+                if (project.Solution.GetDocument(id) is { } declaring)
+                    versions.Add((id, await declaring.GetTextVersionAsync(ct)));
+            }
+        }
+
+        return versions.ToImmutable();
+    }
+
+    private static async Task<bool> UnchangedAsync(
+        Project project,
+        ImmutableArray<(DocumentId Id, VersionStamp Version)> versions,
+        CancellationToken ct)
+    {
+        foreach (var (id, version) in versions)
+        {
+            if (project.Solution.GetDocument(id) is not { } document
+                || !(await document.GetTextVersionAsync(ct)).Equals(version))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>Open buffer first — an unsaved edit is what the user is looking at.</summary>
@@ -143,6 +209,45 @@ internal static class AspxDocumentService
         return namespaces;
     }
 
+    /// <summary>
+    /// The current project for a cached document, with <paramref name="symbol"/> re-resolved
+    /// into it — for the gestures that search or edit. <c>SymbolFinder</c> and <c>Renamer</c>
+    /// resolve a symbol's originating project by compilation identity, so a cached snapshot's
+    /// symbol fed to the current solution silently finds nothing; and an edit computed against
+    /// a stale solution lands on lines the user no longer has. Falls back to the document's own
+    /// snapshot — consistent, merely older — when the symbol no longer resolves.
+    /// </summary>
+    public static async Task<(Project Project, ISymbol Symbol)> AnchorAsync(
+        AspxDocument document, ISymbol symbol, CancellationToken ct)
+    {
+        var project = await CurrentProjectAsync(document, ct);
+
+        if (ReferenceEquals(project.Solution, document.Project.Solution))
+            return (project, symbol);
+
+        if (await project.GetCompilationAsync(ct) is { } compilation
+            && Microsoft.CodeAnalysis.FindSymbols.SymbolFinder
+                .FindSimilarSymbols(symbol.OriginalDefinition, compilation, ct)
+                .FirstOrDefault() is { } fresh)
+        {
+            return (project, fresh);
+        }
+
+        return (document.Project, symbol);
+    }
+
+    /// <summary>The current project for a cached document — for gestures whose answers are
+    /// positions in text the user has now rather than in the snapshot the parse kept.</summary>
+    public static async Task<Project> CurrentProjectAsync(AspxDocument document, CancellationToken ct)
+    {
+        if (document.Project.FilePath is not { Length: > 0 } projectPath)
+            return document.Project;
+
+        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+            projectPath, targetFilePath: document.FilePath, cancellationToken: ct);
+        return project;
+    }
+
     /// <summary>Drops a file's memoized parse — used when the file changes on disk under us.</summary>
     public static void Invalidate(string filePath) =>
         s_cache.TryRemove(PathHelper.NormalizePath(filePath), out _);
@@ -150,7 +255,8 @@ internal static class AspxDocumentService
     /// <summary>
     /// Drops every memoized parse. For a <c>web.config</c> change, which is the one edit that
     /// changes how markup binds without changing any markup: the entries are keyed on the file's
-    /// own text and its compilation, neither of which moves when a tag prefix is registered, so
+    /// own text and the project's semantic version, neither of which moves when a tag prefix is
+    /// registered, so
     /// every already-parsed page would keep reporting the control it now knows about as unknown.
     /// </summary>
     public static void InvalidateAll()

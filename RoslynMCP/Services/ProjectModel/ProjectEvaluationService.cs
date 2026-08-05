@@ -141,6 +141,34 @@ public static class ProjectEvaluationService
         return true;
     }
 
+    /// <summary>
+    /// Whether the project reaches for something only Visual Studio ships — the web targets, the
+    /// office/SharePoint ones — via <c>$(VSToolsPath)</c>.
+    /// </summary>
+    /// <remarks>
+    /// Read from the project's own text rather than inferred from it being legacy. Most legacy
+    /// projects import nothing from Visual Studio and evaluate fine without any of this, and an
+    /// SDK-style project is perfectly entitled to import the web targets — so the question worth
+    /// asking is whether this project names <c>VSToolsPath</c>, not what shape it is.
+    /// </remarks>
+    private static bool NeedsVisualStudioTargets(string projectPath)
+    {
+        if (MsBuildLocator.VsEvaluationProperties.Count == 0)
+            return false;
+
+        try
+        {
+            return File.ReadAllText(projectPath)
+                .Contains("VSToolsPath", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // Unreadable here is reported by the evaluation itself a moment later, with the
+            // message the caller needs.
+            return false;
+        }
+    }
+
     // NoInlining matters: the JIT resolves a method's types on entry, so inlining this into a
     // caller would load Microsoft.Build before EnsureRegistered() had run.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
@@ -151,7 +179,17 @@ public static class ProjectEvaluationService
         // A private collection keeps this evaluation out of any global state and lets it be
         // unloaded immediately; MSBuild's global collection would otherwise hold every project
         // it ever evaluated for the life of the process.
-        using var collection = new ProjectCollection();
+        //
+        // The properties are what let a legacy web project evaluate at all. Its
+        // `$(VSToolsPath)\WebApplications\Microsoft.WebApplication.targets` import otherwise
+        // resolves into the .NET SDK — because MSBuildLocator pointed MSBuildExtensionsPath32
+        // there — and names a Visual Studio file under an SDK path that has never existed. They
+        // are only supplied for a project that asks for them: VisualStudioVersion is not inert for
+        // an SDK project, and nothing here should change how the ordinary case evaluates.
+        using var collection = NeedsVisualStudioTargets(projectPath)
+            ? new ProjectCollection(MsBuildLocator.VsEvaluationProperties.ToDictionary(
+                pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase))
+            : new ProjectCollection();
         try
         {
             var project = collection.LoadProject(projectPath);

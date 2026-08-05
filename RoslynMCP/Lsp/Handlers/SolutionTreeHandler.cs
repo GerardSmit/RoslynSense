@@ -635,9 +635,19 @@ internal static class SolutionTreeHandler
             .Where(pair => pair.Value.DependentUpon is not null)
             .ToDictionary(pair => pair.Key, pair => pair.Value.DependentUpon!, StringComparer.OrdinalIgnoreCase);
 
+        // "In the project" is only answerable once there is an item list to answer it from. Without
+        // one every file came back dimmed and labelled "not in project" — which is not a cautious
+        // answer, it is a wrong one, and it was wrong about every file in the project at once. It
+        // shows while the evaluation is still running, and it shows permanently for a project that
+        // cannot be evaluated at all, so the first thing a user saw of a project this tool could not
+        // read was the claim that none of its files belonged to it.
+        bool itemsKnown = evaluation is not null;
+
         foreach (var nested in FileNestingService.Nest(files, dependentUpon, p.FileNesting))
         {
-            nodes.Add(FileNode(projectPath, nested, projectFiles.ContainsKey(nested.FullPath)));
+            nodes.Add(FileNode(
+                projectPath, nested,
+                inProject: !itemsKnown || projectFiles.ContainsKey(nested.FullPath)));
         }
 
         return nodes.ToArray();

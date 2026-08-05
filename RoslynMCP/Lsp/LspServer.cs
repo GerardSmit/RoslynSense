@@ -1,5 +1,6 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
 using RoslynMCP.Languages;
@@ -567,16 +568,69 @@ internal sealed class LspServer : IDisposable
     /// contributor inside the C# handler, not a route.
     /// </remarks>
     private Task<T> Route<TProvider, T>(
-        TextDocumentIdentifier textDocument, Func<TProvider, Task<T>> language, Func<Task<T>> csharp)
+        TextDocumentIdentifier textDocument, Func<TProvider, Task<T>> language, Func<Task<T>> csharp,
+        Func<T>? whenBroken = null, [CallerMemberName] string method = "")
         where TProvider : class =>
-        Route(textDocument.Uri, language, csharp);
+        Route(textDocument.Uri, language, csharp, whenBroken, method);
 
     /// <summary>The same, for the requests that carry a bare URI: a hierarchy item names its own
     /// document rather than arriving with a <see cref="TextDocumentIdentifier"/>.</summary>
-    private Task<T> Route<TProvider, T>(
-        string uri, Func<TProvider, Task<T>> language, Func<Task<T>> csharp)
-        where TProvider : class =>
-        _languages.Resolve<TProvider>(uri) is { } provider ? language(provider) : csharp();
+    /// <param name="whenBroken">
+    /// What to answer when the request throws. Defaults to an empty array or <see langword="null"/>,
+    /// which is the shape of "nothing to report" for nearly every endpoint; pass one where that is
+    /// not true — <c>codeLens/resolve</c> has to hand the lens back rather than nothing.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// One project the tool cannot read must not become an editor that cannot do anything. Without
+    /// this boundary any failure — a legacy web project whose <c>$(VSToolsPath)</c> import does not
+    /// resolve, a file outside every project, a bug in one pack — travelled out through
+    /// StreamJsonRpc as an RPC error, and the client rendered it as "Request codeLens/resolve
+    /// failed". On requests the editor re-fires on every scroll that is not one message, it is a
+    /// permanent broken state for the whole window, over a problem confined to one project.
+    /// </para>
+    /// <para>
+    /// Degrading to nothing is the honest answer for a question that could not be computed, and it
+    /// is what <see cref="Handlers.SolutionTreeHandler"/> already does for the same reason. The
+    /// warning is what keeps it from being a silent one — keyed so a broken project says so once
+    /// rather than on every scroll.
+    /// </para>
+    /// <para>
+    /// Cancellation is re-thrown rather than swallowed: a cancelled request is the client changing
+    /// its mind, and reporting an empty result for one would have the client cache "no lenses here"
+    /// for a file that has plenty.
+    /// </para>
+    /// </remarks>
+    private async Task<T> Route<TProvider, T>(
+        string uri, Func<TProvider, Task<T>> language, Func<Task<T>> csharp,
+        Func<T>? whenBroken = null, [CallerMemberName] string method = "")
+        where TProvider : class
+    {
+        try
+        {
+            return _languages.Resolve<TProvider>(uri) is { } provider
+                ? await language(provider)
+                : await csharp();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"{method} failed for '{Path.GetFileName(LspConverters.UriToPath(uri))}': {ex.Message}",
+                key: $"lsp:{method}:{uri}");
+
+            return whenBroken is not null ? whenBroken() : Nothing<T>();
+        }
+    }
+
+    /// <summary>The empty answer for an endpoint's result type.</summary>
+    private static T Nothing<T>() =>
+        typeof(T).IsArray
+            ? (T)(object)Array.CreateInstance(typeof(T).GetElementType()!, 0)
+            : default!;
 
     [JsonRpcMethod("textDocument/definition", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> Definition(TextDocumentPositionParams p, CancellationToken ct) =>
@@ -788,7 +842,10 @@ internal sealed class LspServer : IDisposable
     public Task<Protocol.CodeLens> CodeLensResolve(Protocol.CodeLens lens, CancellationToken ct) =>
         Route<ILanguageCodeLensProvider, Protocol.CodeLens>(lens.Data?.Uri ?? "",
             l => CodeLensResolveMemo.ResolveAsync(l, lens, ct),
-            () => Handlers.CodeLensHandler.ResolveAsync(lens, ct, _languages));
+            () => Handlers.CodeLensHandler.ResolveAsync(lens, ct, _languages),
+            // A lens that cannot be counted goes back uncommanded rather than as null, which the
+            // client would treat as a protocol violation on top of whatever actually went wrong.
+            whenBroken: () => lens);
 
     [JsonRpcMethod("workspace/executeCommand", UseSingleObjectParameterDeserialization = true)]
     public Task<object> ExecuteCommand(ExecuteCommandParams p, CancellationToken ct) =>

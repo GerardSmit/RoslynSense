@@ -1,3 +1,4 @@
+﻿using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Net.Http;
 
@@ -211,6 +212,75 @@ internal static class MsBuildLocator
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Global properties that let an <b>in-process</b> MSBuild evaluation resolve
+    /// <c>$(VSToolsPath)</c>, or empty when no Visual Studio install can be found.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The environment-variable route below works for a child process; an evaluation running in
+    /// this process needs the properties handed to the <c>ProjectCollection</c> instead. Without
+    /// them <c>VSToolsPath</c> falls back to
+    /// <c>$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)</c>, and
+    /// because MSBuildLocator registered the .NET SDK for <c>MSBuildWorkspace</c>,
+    /// <c>MSBuildExtensionsPath32</c> is the SDK directory. A legacy web project then fails with
+    /// an import of
+    /// <c>C:\Program Files\dotnet\sdk\<em>version</em>\Microsoft\VisualStudio\v18.0\WebApplications\Microsoft.WebApplication.targets</c>
+    /// — a path under the SDK that could never have existed, naming a file that only ships with
+    /// Visual Studio.
+    /// </para>
+    /// <para>
+    /// The version directory is discovered rather than assumed. It tracks the VS release
+    /// (<c>v17.0</c> for 2022, <c>v18.0</c> for 2026) and the one worth having is whichever
+    /// actually carries the web targets, so the highest that does is the one chosen.
+    /// </para>
+    /// </remarks>
+    public static IReadOnlyDictionary<string, string> VsEvaluationProperties => s_vsProperties.Value;
+
+    private static readonly Lazy<IReadOnlyDictionary<string, string>> s_vsProperties =
+        new(FindVsEvaluationProperties, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private static IReadOnlyDictionary<string, string> FindVsEvaluationProperties()
+    {
+        try
+        {
+            if (FindMsBuild() is not { } msbuild || GetVsInstallDir(msbuild) is not { } vsInstallDir)
+                return ImmutableDictionary<string, string>.Empty;
+
+            string root = Path.Combine(vsInstallDir, "MSBuild", "Microsoft", "VisualStudio");
+            if (!Directory.Exists(root))
+                return ImmutableDictionary<string, string>.Empty;
+
+            var best = Directory.EnumerateDirectories(root, "v*")
+                .Select(directory => (Directory: directory, Name: Path.GetFileName(directory)))
+                .Where(candidate => File.Exists(Path.Combine(
+                    candidate.Directory, "WebApplications", "Microsoft.WebApplication.targets")))
+                .OrderByDescending(candidate =>
+                    Version.TryParse(candidate.Name.TrimStart('v', 'V'), out var parsed)
+                        ? parsed
+                        : new Version(0, 0))
+                .FirstOrDefault();
+
+            if (best.Directory is null)
+                return ImmutableDictionary<string, string>.Empty;
+
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["VSToolsPath"] = best.Directory,
+                ["VisualStudioVersion"] = best.Name.TrimStart('v', 'V'),
+            };
+        }
+        catch (Exception ex)
+        {
+            // Locating Visual Studio is best-effort: a machine without it simply cannot evaluate
+            // legacy web projects, and that is a clearer thing to report than a crash here.
+            ServiceLog.Warn(
+                $"Could not locate Visual Studio's web targets: {ex.Message}",
+                key: "vs-evaluation-properties");
+            return ImmutableDictionary<string, string>.Empty;
+        }
     }
 
     /// <summary>

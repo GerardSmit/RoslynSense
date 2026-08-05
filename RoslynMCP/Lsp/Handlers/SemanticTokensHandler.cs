@@ -96,10 +96,11 @@ internal static class SemanticTokensHandler
     /// against. Keyed by session as well as document: two editors on one daemon ask
     /// independently and would otherwise each invalidate the other's baseline.
     /// </summary>
-    private static readonly ConcurrentDictionary<string, (string ResultId, int[] Data)> s_previous =
+    private static readonly ConcurrentDictionary<string, (string ResultId, int[] Data, long Stamp)> s_previous =
         new(StringComparer.Ordinal);
 
     private static int s_resultCounter;
+    private static long s_stampCounter;
 
     /// <summary>Keeps the baseline cache from growing with every file ever opened.</summary>
     private const int MaxCachedResults = 256;
@@ -174,10 +175,20 @@ internal static class SemanticTokensHandler
     {
         string resultId = Interlocked.Increment(ref s_resultCounter).ToString();
 
+        // Oldest first rather than everything at once: a dropped baseline costs one full re-send
+        // for that file, and wiping the table cost one for every open file in every session.
         if (s_previous.Count > MaxCachedResults)
-            s_previous.Clear();
+        {
+            foreach (var stale in s_previous.ToArray()
+                         .OrderBy(pair => pair.Value.Stamp)
+                         .Take(s_previous.Count - MaxCachedResults + MaxCachedResults / 8))
+            {
+                s_previous.TryRemove(stale.Key, out _);
+            }
+        }
 
-        s_previous[CacheKey(sessionId, uri)] = (resultId, data);
+        s_previous[CacheKey(sessionId, uri)] =
+            (resultId, data, Interlocked.Increment(ref s_stampCounter));
         return resultId;
     }
 

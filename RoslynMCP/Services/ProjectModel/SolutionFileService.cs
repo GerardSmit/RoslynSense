@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.VisualStudio.SolutionPersistence.Model;
 using Microsoft.VisualStudio.SolutionPersistence.Serializer;
 
@@ -28,14 +29,32 @@ public sealed record SolutionNode(
 /// </remarks>
 public static class SolutionFileService
 {
+    /// <summary>The parse, keyed on the file's stamp. A full-tree refresh replays this once per
+    /// expanded node and the search picker once per keystroke, so re-reading the file each time
+    /// made the parse the constant cost of the whole explorer.</summary>
+    private sealed record CachedNodes(DateTime LastWriteUtc, long Length, IReadOnlyList<SolutionNode> Nodes);
+
+    private static readonly ConcurrentDictionary<string, CachedNodes> s_read =
+        new(StringComparer.OrdinalIgnoreCase);
+
     public static IReadOnlyList<SolutionNode> Read(string solutionPath)
     {
-        if (!File.Exists(solutionPath))
+        var info = new FileInfo(solutionPath);
+        if (!info.Exists)
             return [];
+
+        if (s_read.TryGetValue(info.FullName, out var cached)
+            && cached.LastWriteUtc == info.LastWriteTimeUtc
+            && cached.Length == info.Length)
+        {
+            return cached.Nodes;
+        }
 
         try
         {
-            return ToNodes(Open(solutionPath), solutionPath);
+            var nodes = ToNodes(Open(solutionPath), solutionPath);
+            s_read[info.FullName] = new CachedNodes(info.LastWriteTimeUtc, info.Length, nodes);
+            return nodes;
         }
         catch (Exception ex)
         {
@@ -58,8 +77,14 @@ public static class SolutionFileService
     internal static SolutionModel Open(string solutionPath) =>
         SerializerFor(solutionPath).OpenAsync(solutionPath, default).GetAwaiter().GetResult();
 
-    internal static void Save(string solutionPath, SolutionModel model) =>
+    internal static void Save(string solutionPath, SolutionModel model)
+    {
         SerializerFor(solutionPath).SaveAsync(solutionPath, model, default).GetAwaiter().GetResult();
+
+        // The stamp check would catch this too, but not within the same timestamp granularity —
+        // and the caller is about to re-read what it just wrote.
+        s_read.TryRemove(Path.GetFullPath(solutionPath), out _);
+    }
 
     private static Microsoft.VisualStudio.SolutionPersistence.ISolutionSerializer SerializerFor(
         string solutionPath) =>

@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
@@ -323,7 +324,23 @@ internal static class ProtoReferenceService
     /// its <c>.proto</c> line.
     /// </para>
     /// </remarks>
+    /// <summary>The computed scopes per solution snapshot: one rpc is five or six symbols searched
+    /// together, and each was paying the full document enumeration for the same answer.</summary>
+    private static readonly ConditionalWeakTable<
+        Solution,
+        System.Collections.Concurrent.ConcurrentDictionary<
+            (ProjectId, ProtoGeneratedIndex), StrongBox<IImmutableSet<Document>?>>> s_searchScopes = new();
+
     private static IImmutableSet<Document>? DocumentsWorthSearching(
+        Solution solution, Project project, ProtoGeneratedIndex index)
+    {
+        var byKey = s_searchScopes.GetValue(solution, _ => new());
+        return byKey.GetOrAdd(
+            (project.Id, index),
+            _ => new StrongBox<IImmutableSet<Document>?>(ComputeScope(solution, project, index))).Value;
+    }
+
+    private static IImmutableSet<Document>? ComputeScope(
         Solution solution, Project project, ProtoGeneratedIndex index)
     {
         var kept = ImmutableHashSet.CreateBuilder<Document>();

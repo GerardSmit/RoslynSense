@@ -174,7 +174,9 @@ internal static class AspxProjectionService
     // ---- Whole project ---------------------------------------------------------------------
 
     private sealed record ProjectCacheEntry(
-        Compilation BaseCompilation, string Fingerprint, AspxProjectProjection? Projection);
+        Compilation BaseCompilation,
+        ImmutableDictionary<string, string> Stamps,
+        AspxProjectProjection? Projection);
 
     private static readonly ConcurrentDictionary<string, ProjectCacheEntry> s_projectCache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -184,9 +186,12 @@ internal static class AspxProjectionService
     /// when none of them has any code to project.
     /// </summary>
     /// <remarks>
-    /// Rebuilt when the project's compilation changes or any markup file's text does — which is
-    /// what makes it safe to bind against. Built lazily: only find-references and rename need
-    /// the whole project, and both are deliberate gestures rather than per-keystroke work.
+    /// Rebuilt outright when the project's compilation changes or a file enters or leaves the
+    /// projection — which is what makes it safe to bind against. When only some files' contents
+    /// changed, the cached fork is patched instead: replacing one document's text lets Roslyn
+    /// reuse every other tree of the forked compilation, where rebuilding re-forks and re-binds
+    /// all of them for a one-character markup edit. Built lazily: only find-references and rename
+    /// need the whole project, and both are deliberate gestures rather than per-keystroke work.
     /// </remarks>
     public static async Task<AspxProjectProjection?> GetProjectAsync(
         Project project, CancellationToken ct)
@@ -207,27 +212,112 @@ internal static class AspxProjectionService
                 documents.Add(document);
         }
 
-        string fingerprint = Fingerprint(documents);
+        var stamps = Stamps(documents);
 
         if (s_projectCache.TryGetValue(projectPath, out var cached)
-            && ReferenceEquals(cached.BaseCompilation, compilation)
-            && string.Equals(cached.Fingerprint, fingerprint, StringComparison.Ordinal))
+            && ReferenceEquals(cached.BaseCompilation, compilation))
         {
-            return cached.Projection;
+            if (StampsEqual(cached.Stamps, stamps))
+                return cached.Projection;
+
+            if (await TryPatchAsync(project, cached, documents, stamps, ct) is { } patched)
+            {
+                s_projectCache[projectPath] = patched;
+                return patched.Projection;
+            }
         }
 
         var built = await BuildProjectAsync(project, documents, ct);
-        s_projectCache[projectPath] = new ProjectCacheEntry(compilation, fingerprint, built);
+        s_projectCache[projectPath] = new ProjectCacheEntry(compilation, stamps, built);
         return built;
     }
 
-    private static string Fingerprint(IReadOnlyList<AspxDocument> documents)
+    /// <summary>Checksums rather than <c>string.GetHashCode</c>: a 32-bit string hash colliding
+    /// across two versions of a page would silently serve the old projection for the new text.</summary>
+    private static ImmutableDictionary<string, string> Stamps(IReadOnlyList<AspxDocument> documents)
     {
-        var sb = new StringBuilder();
-        foreach (var document in documents.OrderBy(d => d.FilePath, StringComparer.OrdinalIgnoreCase))
-            sb.Append(document.FilePath).Append('#').Append(document.Text.Length)
-              .Append('#').Append(document.Text.GetHashCode()).Append(';');
-        return sb.ToString();
+        var stamps = ImmutableDictionary.CreateBuilder<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var document in documents)
+            stamps[document.FilePath] = Convert.ToHexString(document.SourceText.GetChecksum().AsSpan());
+        return stamps.ToImmutable();
+    }
+
+    private static bool StampsEqual(
+        ImmutableDictionary<string, string> old, ImmutableDictionary<string, string> current)
+    {
+        if (old.Count != current.Count)
+            return false;
+
+        foreach (var (path, stamp) in current)
+        {
+            if (!old.TryGetValue(path, out var previous) || previous != stamp)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The cached fork with only the changed files' text replaced, or <c>null</c> when the change
+    /// is one a patch cannot express: a file joined or left the projection, so the fork's document
+    /// set is wrong and only a rebuild fixes it.
+    /// </summary>
+    private static async Task<ProjectCacheEntry?> TryPatchAsync(
+        Project project, ProjectCacheEntry cached, IReadOnlyList<AspxDocument> documents,
+        ImmutableDictionary<string, string> stamps, CancellationToken ct)
+    {
+        if (cached.Projection is not { } projection)
+            return null;
+
+        // A different file set is a membership change however the stamps read.
+        if (cached.Stamps.Count != stamps.Count
+            || documents.Any(d => !cached.Stamps.ContainsKey(d.FilePath)))
+            return null;
+
+        var byPath = projection.Files.ToDictionary(
+            pair => pair.Value.MarkupPath, pair => pair.Key, StringComparer.OrdinalIgnoreCase);
+
+        var solution = projection.Solution;
+        var files = projection.Files;
+
+        foreach (var document in documents)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (cached.Stamps[document.FilePath] == stamps[document.FilePath])
+                continue;
+
+            bool wasProjected = byPath.TryGetValue(document.FilePath, out var id);
+            var projected = ProjectText(document);
+
+            if (projected is null)
+            {
+                if (!wasProjected)
+                    continue;
+                return null;
+            }
+
+            if (!wasProjected)
+                return null;
+
+            solution = solution.WithDocumentText(id!, SourceText.From(projected.Text));
+            files = files.SetItem(
+                id!, new AspxProjectedFile(document.FilePath, document.SourceText, projected));
+        }
+
+        var compilation = await solution.GetProject(project.Id)!.GetCompilationAsync(ct);
+        if (compilation is null)
+            return null;
+
+        var projectionDocuments = projection.Documents
+            .Select(d => solution.GetDocument(d.Id)!)
+            .ToImmutableArray();
+
+        return cached with
+        {
+            Stamps = stamps,
+            Projection = new AspxProjectProjection(compilation, projectionDocuments, files),
+        };
     }
 
     private static async Task<AspxProjectProjection?> BuildProjectAsync(

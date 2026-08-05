@@ -63,7 +63,11 @@ internal sealed record ProtoDocument(ProtoFile Parse, Project? Project)
 /// </remarks>
 internal static class ProtoDocumentService
 {
-    private sealed record CacheEntry(ImmutableArray<byte> Checksum, ProtoFile File);
+    /// <summary>The stamp of the disk file an entry was parsed from, when it came from disk —
+    /// what lets a closed file answer without being re-read, let alone re-parsed.</summary>
+    private readonly record struct DiskStamp(DateTime LastWriteUtc, long Length);
+
+    private sealed record CacheEntry(ImmutableArray<byte> Checksum, ProtoFile File, DiskStamp? Disk = null);
 
     private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -147,7 +151,37 @@ internal static class ProtoDocumentService
 
         string path = Normalize(filePath);
 
-        return ReadText(path) is { } text ? GetParse(path, text) : null;
+        if (OpenDocumentStore.TryGet(path, out var open))
+            return GetParse(path, open);
+
+        // A closed file is what workspace-symbol reads once per .proto per keystroke, so the disk
+        // stamp answers before the read: same stamp, same parse. The checksum path below remains
+        // the authority whenever the stamp has moved or was never taken.
+        FileInfo info;
+        try
+        {
+            info = new FileInfo(path);
+            if (!info.Exists)
+                return null;
+        }
+        catch (ArgumentException) { return null; }
+        catch (IOException) { return null; }
+
+        if (s_cache.TryGetValue(path, out var stamped)
+            && stamped.Disk is { } disk
+            && disk.LastWriteUtc == info.LastWriteTimeUtc
+            && disk.Length == info.Length)
+        {
+            return stamped.File;
+        }
+
+        if (ReadText(path) is not { } text)
+            return null;
+
+        var parsed = GetParse(path, text);
+        s_cache[path] = new CacheEntry(
+            text.GetChecksum(), parsed, new DiskStamp(info.LastWriteTimeUtc, info.Length));
+        return parsed;
     }
 
     /// <summary>The parse of text the caller already holds, for a caller that has the buffer and

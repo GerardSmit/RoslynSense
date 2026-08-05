@@ -58,9 +58,13 @@ internal static class SolutionTreeSearchHandler
             if (directory is null || !Directory.Exists(directory))
                 continue;
 
-            foreach (string file in EnumerateProjectFiles(directory))
+            // The cached walk rather than a fresh enumeration: this runs per keystroke, and the
+            // 30-second staleness the index accepts is invisible next to typing a filter.
+            foreach (string file in Search.SolutionFileIndex.FilesUnder(directory, ct))
             {
                 ct.ThrowIfCancellationRequested();
+                if (IsIgnored(file))
+                    continue;
                 if (++scanned > MaxScannedFiles)
                     break;
 
@@ -189,23 +193,6 @@ internal static class SolutionTreeSearchHandler
         Path.GetFullPath(path).StartsWith(
             Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
             StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>Source-ish files under a project, skipping the directories no one searches.</summary>
-    private static IEnumerable<string> EnumerateProjectFiles(string directory)
-    {
-        var options = new EnumerationOptions
-        {
-            RecurseSubdirectories = true,
-            IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.System,
-        };
-
-        foreach (string file in Directory.EnumerateFiles(directory, "*", options))
-        {
-            if (!IsIgnored(file))
-                yield return file;
-        }
-    }
 
     private static bool IsIgnored(string path)
     {

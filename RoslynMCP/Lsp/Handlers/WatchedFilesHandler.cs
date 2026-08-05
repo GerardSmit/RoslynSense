@@ -132,8 +132,10 @@ internal static class WatchedFilesHandler
             evicted.Add(projectPath);
         }
 
-        if (evicted.Count > 0)
-            AnalyzerDiagnosticCache.Clear();
+        // No analyzer-cache clear here, and deliberately so: eviction reloads the solution under
+        // fresh ids, so every cached result for it is keyed by a DocumentId nothing will ever ask
+        // for again and ages out of the cap on its own. Clearing would also drop every other
+        // solution's still-valid results.
 
         return new Outcome(false, evicted, invalidatedMarkup);
     }

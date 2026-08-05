@@ -49,10 +49,16 @@ internal static class CodeLensResolveMemo
     /// <summary>A resolvable lens, identified the way the client asks for it.</summary>
     private readonly record struct Slot(int Line, int Character, string Kind, string? PackId);
 
-    private sealed record Entry(object Generation, ConcurrentDictionary<Slot, Lazy<Task<Command?>>> Answers);
+    private sealed record Entry(object Generation, ConcurrentDictionary<Slot, Lazy<Task<Command?>>> Answers)
+    {
+        /// <summary>When this file was last asked about, for evicting the least recent first.</summary>
+        public long Touched;
+    }
 
     private static readonly ConcurrentDictionary<string, Entry> s_byUri =
         new(StringComparer.OrdinalIgnoreCase);
+
+    private static long s_clock;
 
     /// <summary>
     /// Resolves <paramref name="lens"/> through <paramref name="provider"/>, reusing an answer
@@ -88,10 +94,20 @@ internal static class CodeLensResolveMemo
                 ? existing
                 : new Entry(generation, new()));
 
+        Volatile.Write(ref entry.Touched, Interlocked.Increment(ref s_clock));
+
         // Bounded rather than evicted precisely: an entry is per file, and dropping one costs a
-        // recomputation and not a wrong answer.
+        // recomputation and not a wrong answer. Least recent first, though — wiping the table
+        // made the ninth file cost every other file its answers.
         if (s_byUri.Count > MaxFiles)
-            s_byUri.Clear();
+        {
+            foreach (var stale in s_byUri.ToArray()
+                         .OrderBy(pair => Volatile.Read(ref pair.Value.Touched))
+                         .Take(s_byUri.Count - MaxFiles))
+            {
+                s_byUri.TryRemove(stale.Key, out _);
+            }
+        }
 
         // Lazy rather than a bare task factory: ConcurrentDictionary does not hold its lock across
         // GetOrAdd's factory, so two resolves racing on one lens would otherwise both start the

@@ -43,6 +43,14 @@ public static class SolutionFileIndex
     public static void Clear() => s_cache.Clear();
 
     /// <summary>
+    /// The cached walk for one directory, for a caller that has a root rather than a
+    /// <see cref="Solution"/> — the solution-tree search fields a request per keystroke, and it
+    /// worked from the <c>.sln</c> on disk precisely so it never has to wait for Roslyn.
+    /// </summary>
+    public static IReadOnlyList<string> FilesUnder(string root, CancellationToken ct) =>
+        Files(Path.GetFullPath(root), ct);
+
+    /// <summary>
     /// One directory per project, minus any that sit inside another — walking a parent twice is
     /// the difference between one pass over a repo and one pass per project in it.
     /// </summary>

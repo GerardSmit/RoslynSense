@@ -177,6 +177,35 @@ internal interface ILanguageCodeLensProvider
     Task<CodeLens> ResolveCodeLensAsync(CodeLens lens, CancellationToken ct);
 }
 
+/// <summary>
+/// Opts a code-lens pack into having its resolved lenses kept — see
+/// <see cref="Lsp.CodeLensResolveMemo"/>. Implement it when resolving a lens is expensive enough
+/// that answering the same question twice is worth avoiding.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The one thing a pack has to supply is what its answers depend on, because only the pack knows.
+/// Return a value whose <b>equality</b> is the staleness test: two calls returning equal values
+/// promise that every lens in that file would resolve identically. A record over the immutable
+/// snapshots the answers came from is the usual shape — the buffer, whatever generated artefact was
+/// consulted, the solution — since those compare by reference and a new one appears exactly when
+/// something moved.
+/// </para>
+/// <para>
+/// Err towards a generation that changes too often. A spurious change costs a recomputation, which
+/// is what would have happened anyway; a missed one puts a stale number in the gutter, and a wrong
+/// count is worse than a slow one.
+/// </para>
+/// <para>
+/// Return <see langword="null"/> when the state cannot be described yet — no view for that file,
+/// nothing built — and the resolve runs uncached rather than being refused.
+/// </para>
+/// </remarks>
+internal interface ILanguageCodeLensGeneration
+{
+    ValueTask<object?> LensGenerationAsync(string uri, CancellationToken ct);
+}
+
 /// <summary>textDocument/documentLink: the file paths a markup document names — a master page,
 /// a user control's <c>Src</c>, a script or stylesheet — made openable.</summary>
 internal interface ILanguageDocumentLinkProvider

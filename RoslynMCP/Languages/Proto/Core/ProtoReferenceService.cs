@@ -738,6 +738,10 @@ internal static class ProtoReferenceService
     /// How long the caller may wait for the consumers to load, or <see langword="null"/> — the same
     /// as <see cref="TimeSpan.Zero"/> — to search only what is already open and start nothing.
     /// </param>
+    /// <summary>The search scope, for a probe that measures the phases of a lens resolve.</summary>
+    internal static Task<Solution> SearchScopeForTestsAsync(Project project, CancellationToken ct) =>
+        SearchScopeAsync(project, ct);
+
     private static async Task<Solution> SearchScopeAsync(
         Project project, CancellationToken ct, TimeSpan? budget = null)
     {

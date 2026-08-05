@@ -1,3 +1,4 @@
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.Proto.Core;
 using RoslynMCP.Languages.Proto.Lsp;
@@ -8,8 +9,33 @@ using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
 namespace RoslynMCP.Languages.Proto;
 
-internal sealed partial class ProtoLanguage : ILanguageCodeLensProvider
+internal sealed partial class ProtoLanguage : ILanguageCodeLensProvider, ILanguageCodeLensGeneration
 {
+    /// <summary>
+    /// What a lens count on a <c>.proto</c> depends on, so <see cref="CodeLensResolveMemo"/> can
+    /// tell when one is still good.
+    /// </summary>
+    /// <remarks>
+    /// Three snapshots, and each covers a way the answer moves. <c>Text</c> is a new instance on
+    /// every keystroke, so an edited schema is never answered from the old one. <c>Index</c> is
+    /// replaced whenever the compilation or protoc's output moves, so regenerated code is never
+    /// answered from the old generation. <c>Solution</c> is replaced when projects are grafted in,
+    /// so a count taken while only the contracts project was loaded does not outlive the arrival of
+    /// the consumers that widen it — which is the case that would otherwise leave "0 references"
+    /// over an rpc the whole solution calls.
+    /// </remarks>
+    private sealed record LensGeneration(SourceText Text, ProtoGeneratedIndex Index, Solution Solution);
+
+    public async ValueTask<object?> LensGenerationAsync(string uri, CancellationToken ct)
+    {
+        if (await ProtoWorkspace.GetAsync(LspConverters.UriToPath(uri), ct) is not { } view)
+            return null;
+
+        return view.Project is { } project
+            ? new LensGeneration(view.Text, view.Index, project.Solution)
+            : null;
+    }
+
     /// <summary>As many as the peek window can usefully show, matching the C# handler.</summary>
     private const int MaxLensLocations = 100;
 

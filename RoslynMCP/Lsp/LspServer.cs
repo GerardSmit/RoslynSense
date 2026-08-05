@@ -787,7 +787,7 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("codeLens/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeLens> CodeLensResolve(Protocol.CodeLens lens, CancellationToken ct) =>
         Route<ILanguageCodeLensProvider, Protocol.CodeLens>(lens.Data?.Uri ?? "",
-            l => l.ResolveCodeLensAsync(lens, ct),
+            l => CodeLensResolveMemo.ResolveAsync(l, lens, ct),
             () => Handlers.CodeLensHandler.ResolveAsync(lens, ct, _languages));
 
     [JsonRpcMethod("workspace/executeCommand", UseSingleObjectParameterDeserialization = true)]

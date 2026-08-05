@@ -242,15 +242,19 @@ The one genuinely reducible item left is the 388 ms scan in `ProtoGeneratedIndex
 walks two large generated files. It is worth attention for its own sake — it sits between opening a
 `.proto` and seeing its first code lens — but it is 5% of the scenario and cannot close a 2.3 s gap.
 
+> **Superseded in part.** The paragraph below was written before the BuildHost was pooled, and its
+> conclusion — that the per-call cost cannot amortise — was true only of Roslyn's default of one
+> host per top-level call. Pooling makes it amortise; see §0.4b for the mechanism and §0.5b for
+> what that changed and what it did not. The measurement itself still stands as a description of
+> the unpooled behaviour.
+
 The per-call BuildHost cost does not amortise: measured across nine consecutive opens in one
 process it is flat (1570/1587/1554/1576/1623/1541/1545/1569/1731 ms), because each is a fresh
 `dotnet` process and a fresh MSBuild `ProjectCollection`. And the three demand points are seconds
 apart, so no amount of batching merges them — a call that has not been asked for yet cannot join a
 batch that has already run.
 
-**A whole-scenario number under 5 s therefore is not reachable by tuning this design.** Roughly
-5.3 s of the 8 s is BuildHost fixed cost and MEF composition, both incurred before any of this
-code's own logic runs. Getting under it means not asking MSBuild:
+Getting further under it means not asking MSBuild:
 
 1. **A persisted project-model cache**, keyed on the `.csproj` plus every file it imports plus
    `project.assets.json`. Everything a design-time build produces is already recoverable without
@@ -272,6 +276,45 @@ which is the signal that the batching machinery should be deleted rather than ke
 5 projects rather than the stress test's 9 because the per-project strategy is the slow one by
 construction, and the ratio is already decisive there (8,224 ms vs 2,523 ms, 3.3×).
 
+### 0.5b Warming a host, and the limits of measuring on this machine
+
+Three things came out of the round that pooled the BuildHost, and the third is the one that should
+be read before trusting any number above.
+
+**Connecting a host is not what makes it warm.** `BuildHostWarmupProbe` measures one host asked for
+four distinct trivial projects in turn: the manager constructor is free, connecting to the
+subprocess costs 427 ms, and then the four loads cost **956, 234, 239, 264 ms**. Nearly a second of
+the first load is MSBuild discovering toolsets and SDK resolvers and parsing the SDK's several
+hundred `.props` and `.targets` — work about the SDK rather than about the project, which every
+later load through that host reuses. So a warm-up that only spawns the process warms nothing;
+`SharedBuildHost.WarmInBackground` now makes each host evaluate a synthetic project that names the
+same SDK and framework. Synthetic, because warming with a real one would record it as evaluated and
+the first genuine request for it would recycle the host that was just warmed.
+
+**Warming has to yield, or it costs more than it saves.** Warming four hosts concurrently at bind
+measured *slower end to end* than not warming at all — 6,415 ms against 5,924 ms — and warming them
+one at a time was worse still at 6,749 ms. There is no bug in that: initialisation is about a
+second per host, the benchmark's first request arrives about 1.3 s in, and every millisecond
+warming spends is taken from the request being waited on. That is a fact about the benchmark, which
+asks for a code lens immediately, and not about an editor, where somebody opens a folder and reads
+for a few seconds first. Warming therefore waits for no shard load to be in flight before it warms
+the next host, which keeps the win in the case that has idle time without paying for it in the case
+that does not.
+
+**The measurement noise on this machine is larger than most of the remaining opportunities.** Three
+consecutive runs of *unchanged* code produced `[4]` values of 4,425 / 5,296 / 7,439 ms. Any single
+run claiming a 200–400 ms improvement is indistinguishable from that spread, and two changes were
+adopted on such single runs during this work before repeated runs showed one of them to be a
+regression. Anything measured here from now on wants at least three runs and a median, and a change
+whose only evidence is a single run should be treated as unmeasured.
+
+That last point is why the code-lens batching idea was reverted rather than kept. Computing all
+seventeen lens answers on the first resolve and serving the rest from a memo is sound in principle
+— they are seventeen independent queries over one immutable snapshot — but one rpc is five or six
+symbols, so seventeen at once is roughly eighty concurrent solution-wide searches contending for
+the same document indexes they are all trying to build. Measured three times, it was consistently
+worse than leaving them serial, both throttled and not.
+
 ### 0.5a .NET and MSBuild settings: what helps and what does not
 
 Measured, because most of these are folklore either way:
@@ -286,6 +329,17 @@ Measured, because most of these are folklore either way:
 Roslyn's BuildHost is spawned as a child of the server process and inherits its environment, so a
 `DOTNET_*` or `MSBUILD*` variable set on the server reaches the design-time build too. That is what
 makes these testable at all — and what makes a bad one costly.
+
+**And a negative result worth writing down so the question is not reopened: no global property can
+remove a target from the per-project design-time build without costing references.** Per project,
+Roslyn requests exactly `Compile` + `CoreCompile`, plus `DesignTimeMarkupCompilation` when the
+project defines it, once per `TargetFramework` for a multi-targeted project — `ProjectBuildManager`
+in Roslyn's own source, not inferred. Only `CoreCompile` produces what a `ProjectInfo` is made of.
+The properties that look like they trim work each drop something load depends on: without resolved
+references a project's compilation cannot resolve corlib, and the result is not a load failure but
+a project full of false "type not found" diagnostics — the silent-wrong-answer failure mode rather
+than the loud one. Effort belongs on the host being warm and on what is asked of Roslyn after the
+load, not on asking MSBuild for less.
 
 **The static-graph caveat, stated plainly, because the retry does not cover it.** The failure mode
 that matters is not a failed restore — it is a *successful* one that is quietly incomplete. Static

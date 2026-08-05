@@ -298,6 +298,61 @@ internal static class ProtoReferenceService
         return [];
     }
 
+    /// <summary>
+    /// Every document in <paramref name="solution"/> except the ones protoc generated for
+    /// <paramref name="project"/>, or <see langword="null"/> when that is all of them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The sweep below used to search the whole solution and then throw the generated hits away a
+    /// few lines later, which is the rule this class is built on — a reference inside a generated
+    /// document is not a reference. Throwing them away is not free: Roslyn has to locate each
+    /// occurrence, bind it with a semantic model and return it across the engine boundary before
+    /// anything here can decide it does not count.
+    /// </para>
+    /// <para>
+    /// That is most of the work on the code-lens path. When only the contracts project is loaded,
+    /// its protoc output <em>is</em> the solution — one generated file of about 1,100 lines and
+    /// another of 220 — and a type like <c>Widget</c> appears in it 68 times, a field like
+    /// <c>Label</c> 36. One rpc is five or six symbols, so a single lens binds those hundreds of
+    /// occurrences several times over, and there are seventeen lenses.
+    /// </para>
+    /// <para>
+    /// Only the index already in hand is consulted. Asking every project in the solution whether a
+    /// document is generated would build an index per project — the expensive thing this is trying
+    /// to avoid — so other projects stay in scope and the filter after the sweep remains their
+    /// backstop. Definitions are unaffected either way: they are read off the symbol rather than
+    /// off the documents searched, so a declaration in an excluded file is still reported against
+    /// its <c>.proto</c> line.
+    /// </para>
+    /// </remarks>
+    private static IImmutableSet<Document>? DocumentsWorthSearching(
+        Solution solution, Project project, ProtoGeneratedIndex index)
+    {
+        var kept = ImmutableHashSet.CreateBuilder<Document>();
+        bool excludedAny = false;
+
+        foreach (var candidate in solution.Projects)
+        {
+            bool isTarget = candidate.Id == project.Id;
+
+            foreach (var document in candidate.Documents)
+            {
+                if (isTarget && index.IsGenerated(document))
+                {
+                    excludedAny = true;
+                    continue;
+                }
+
+                kept.Add(document);
+            }
+        }
+
+        // Nothing to exclude means the unscoped overload, which lets Roslyn pick its own document
+        // set rather than being handed one it would have derived anyway.
+        return excludedAny ? kept.ToImmutable() : null;
+    }
+
     private static async Task<ImmutableArray<ProtoUsage>> FindUsagesAsync(
         ProtoDeclaration? target, ISymbol? fallback, ProtoGeneratedIndex index, Project project,
         CancellationToken ct, TimeSpan? budget = null)
@@ -324,8 +379,11 @@ internal static class ProtoReferenceService
         // order the sequential loop produced them: `seen` and `declared` still decide the same
         // winner for a span two symbols both reach, and the output stays byte-identical rather than
         // reordering itself run to run.
-        var perSymbol = await Task.WhenAll(
-            symbols.Select(symbol => SymbolFinder.FindReferencesAsync(symbol, solution, ct)));
+        var scope = DocumentsWorthSearching(solution, project, index);
+
+        var perSymbol = await Task.WhenAll(symbols.Select(symbol => scope is null
+            ? SymbolFinder.FindReferencesAsync(symbol, solution, ct)
+            : SymbolFinder.FindReferencesAsync(symbol, solution, scope, ct)));
 
         foreach (var referencedGroup in perSymbol)
         {

@@ -51,6 +51,24 @@ internal readonly record struct ProtoDeclarationRef(
 /// descriptor pool by protobuf's own rule, which means a caller can ask about a declaration it
 /// parsed itself without the index having to hand out — or recognise — declaration instances.
 /// </para>
+/// <para>
+/// A built index is memoized against the project's dependent semantic version rather than against
+/// its compilation, the way an incremental generator stage cuts off on unchanged inputs. Every
+/// binding here is made from declarations — descriptor expressions, <c>…FieldNumber</c> constants,
+/// <c>__ServiceName</c>, the types and members protoc emitted — and a method-body edit changes none
+/// of them, so an index built before one is still the right answer after it. protoc's output is
+/// checked in as ordinary <c>Compile</c> items, so a regenerated file <em>does</em> move the
+/// semantic version and does rebuild this. That keying is what lets a hover in a <c>.proto</c>
+/// answer without waiting for the C# the user is typing to compile.
+/// </para>
+/// <para>
+/// The cost is that <see cref="Compilation"/> — the snapshot every <see cref="ISymbol"/> in here
+/// came from — can be one the solution has since retired, because a body edit forks the compilation
+/// without moving the semantic version. Reading a symbol's name, its locations or its members is
+/// unaffected. Handing one to <c>SymbolFinder</c> is not: Roslyn resolves a symbol's originating
+/// project by compilation identity and silently returns nothing for a foreign snapshot's symbol, so
+/// every search boundary re-anchors first — see <c>ProtoReferenceService</c>.
+/// </para>
 /// </remarks>
 internal sealed class ProtoGeneratedIndex
 {
@@ -105,6 +123,18 @@ internal sealed class ProtoGeneratedIndex
     private ProtoGeneratedIndex()
     {
     }
+
+    /// <summary>
+    /// The compilation every symbol in this index was read out of, or <c>null</c> for
+    /// <see cref="Empty"/>, which holds none.
+    /// </summary>
+    /// <remarks>
+    /// Exposed so a caller about to search can tell whether the index has drifted away from the
+    /// snapshot it is searching — the index survives a method-body edit and the compilation does
+    /// not, so the two part company routinely and a compilation is the only thing that answers it.
+    /// Compilations are snapshots, so reference equality is the test.
+    /// </remarks>
+    internal Compilation? Compilation { get; private set; }
 
     /// <summary>Whether the project produced no generated output at all — the never-built case,
     /// in which every lookup below returns <c>null</c>.</summary>
@@ -312,29 +342,39 @@ internal sealed class ProtoGeneratedIndex
 
     // ---- Entry point -----------------------------------------------------------------------
 
-    private sealed record ScanCacheEntry(Compilation Compilation, Dictionary<string, GeneratedProto> Scan);
+    private sealed record ScanCacheEntry(
+        VersionStamp SemanticVersion, Compilation Compilation, Dictionary<string, GeneratedProto> Scan);
 
     private static readonly ConcurrentDictionary<ProjectId, ScanCacheEntry> s_scans = new();
 
     private sealed record IndexCacheEntry(
-        Compilation Compilation, string Fingerprint, ProtoGeneratedIndex Index);
+        VersionStamp SemanticVersion, string Fingerprint, ProtoGeneratedIndex Index);
 
     private static readonly ConcurrentDictionary<ProjectId, IndexCacheEntry> s_indexes = new();
 
     /// <summary>
-    /// The index for one project, built once per compilation and reused after.
+    /// The index for one project, built once per set of declarations and reused after.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Two caches, not one. The generated half is keyed on the compilation alone — it can only
-    /// change when a build rewrites the generated files, which is exactly what produces a new
-    /// compilation — while the index around it also watches the <c>.proto</c> text, because a
-    /// proto edit changes the names the caller will ask about without changing the compilation
-    /// at all. Splitting them keeps a keystroke in a <c>.proto</c> to a parse of a few small
-    /// files instead of a re-walk of every generated syntax tree.
+    /// Two caches, not one. The generated half — the walk of every generated syntax tree — can
+    /// only change when a build rewrites the generated files, while the index around it also
+    /// watches the <c>.proto</c> text, because a proto edit changes the names the caller will ask
+    /// about without touching the generated code at all. Splitting them keeps a keystroke in a
+    /// <c>.proto</c> to a parse of a few small files instead of a re-walk of the generated ones.
     /// </para>
     /// <para>
-    /// Compilations are snapshots, so reference equality is the correct staleness test.
+    /// Both are keyed on the project's dependent semantic version, which moves when a declaration
+    /// anywhere in the dependency closure changes and stays put for a method-body edit. It is the
+    /// right key for both halves: the walk reads declarations and the bindings are made from them,
+    /// and protoc's output is checked in as ordinary documents, so regenerating it moves the
+    /// version like any other declaration change.
+    /// </para>
+    /// <para>
+    /// The version is asked for before the compilation is — it is a cheap traversal that forces no
+    /// binding — so a hit answers without one. That is the point: a hover or a code lens in a
+    /// <c>.proto</c> no longer waits for the C# the user is typing to compile, and the compilation
+    /// is only paid for by the callers that go on to search, which need it anyway.
     /// </para>
     /// </remarks>
     public static async Task<ProtoGeneratedIndex> GetAsync(Project project, CancellationToken ct)
@@ -349,41 +389,51 @@ internal sealed class ProtoGeneratedIndex
             return Empty;
 
         var buildWatch = System.Diagnostics.Stopwatch.StartNew();
-        var compilation = await project.GetCompilationAsync(ct);
-        if (compilation is null)
-            return Empty;
-
-        long compilationMs = buildWatch.ElapsedMilliseconds;
         string fingerprint = Fingerprint(protoPaths);
+        var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
 
         if (s_indexes.TryGetValue(project.Id, out var cachedIndex)
-            && ReferenceEquals(cachedIndex.Compilation, compilation)
+            && cachedIndex.SemanticVersion.Equals(semanticVersion)
             && string.Equals(cachedIndex.Fingerprint, fingerprint, StringComparison.Ordinal))
         {
             return cachedIndex.Index;
         }
 
+        Compilation compilation;
         Dictionary<string, GeneratedProto> scan;
+        long compilationMs = 0;
+        long scanMs = 0;
+
+        // The scan's own compilation on a hit, and not the project's current one. The symbols in
+        // the scan came from it, and the index stamps itself with the snapshot its symbols are
+        // from so a later search can tell whether it has to re-anchor them.
         if (s_scans.TryGetValue(project.Id, out var cachedScan)
-            && ReferenceEquals(cachedScan.Compilation, compilation))
+            && cachedScan.SemanticVersion.Equals(semanticVersion))
         {
-            scan = cachedScan.Scan;
+            (compilation, scan) = (cachedScan.Compilation, cachedScan.Scan);
         }
         else
         {
+            long before = buildWatch.ElapsedMilliseconds;
+
+            if (await project.GetCompilationAsync(ct) is not { } built)
+                return Empty;
+
+            compilation = built;
+            compilationMs = buildWatch.ElapsedMilliseconds - before;
             scan = await ScanAsync(project, compilation, ct);
-            s_scans[project.Id] = new ScanCacheEntry(compilation, scan);
+            scanMs = buildWatch.ElapsedMilliseconds - before - compilationMs;
+            s_scans[project.Id] = new ScanCacheEntry(semanticVersion, compilation, scan);
         }
 
-        long scanMs = buildWatch.ElapsedMilliseconds - compilationMs;
-
-        var index = Build(protoPaths, scan, ct);
-        s_indexes[project.Id] = new IndexCacheEntry(compilation, fingerprint, index);
+        var index = Build(protoPaths, scan, compilation, ct);
+        s_indexes[project.Id] = new IndexCacheEntry(semanticVersion, fingerprint, index);
 
         // Only a genuinely expensive build is worth a line. This is the cost that sits between a
         // .proto being opened and its first code lens appearing, and it splits into two halves with
         // completely different owners: the compilation is Roslyn binding protoc's generated output,
-        // the scan is this file walking it.
+        // the scan is this file walking it. Both read zero when the .proto alone was edited, which
+        // is what says the rebuild was the cheap kind.
         if (buildWatch.ElapsedMilliseconds >= 200)
         {
             Console.Error.WriteLine(
@@ -1085,9 +1135,14 @@ internal sealed class ProtoGeneratedIndex
     private static ProtoGeneratedIndex Build(
         IReadOnlyList<string> protoPaths,
         Dictionary<string, GeneratedProto> scan,
+        Compilation compilation,
         CancellationToken ct)
     {
-        var index = new ProtoGeneratedIndex { _protoFiles = [.. protoPaths] };
+        var index = new ProtoGeneratedIndex
+        {
+            _protoFiles = [.. protoPaths],
+            Compilation = compilation,
+        };
 
         if (scan.Count == 0)
             return index;

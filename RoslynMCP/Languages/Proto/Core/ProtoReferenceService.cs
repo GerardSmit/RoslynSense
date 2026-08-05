@@ -96,14 +96,18 @@ internal static class ProtoReferenceService
         var symbols = ImmutableArray.CreateBuilder<ISymbol>();
         var solution = await SearchScopeAsync(project, ct, budget);
 
+        // Every symbol below is read off the index and every one of them ends up in a SymbolFinder
+        // sweep, so the whole set is anchored here rather than at the individual calls.
+        var anchor = await AnchorAsync(index, solution, project, ct);
+
         switch (target)
         {
             case ProtoService service:
             {
-                Add(symbols, index.ServiceTypeFor(service));
-                Add(symbols, index.ServiceClientFor(service));
+                Add(symbols, anchor.Rebind(index.ServiceTypeFor(service), ct));
+                Add(symbols, anchor.Rebind(index.ServiceClientFor(service), ct));
 
-                if (index.ServiceBaseFor(service) is { } @base)
+                if (anchor.Rebind(index.ServiceBaseFor(service), ct) is { } @base)
                 {
                     Add(symbols, @base);
                     foreach (var derived in await SymbolFinder.FindDerivedClassesAsync(
@@ -119,9 +123,9 @@ internal static class ProtoReferenceService
             case ProtoRpc rpc:
             {
                 foreach (var method in index.MethodsFor(rpc))
-                    Add(symbols, method);
+                    Add(symbols, anchor.Rebind(method, ct));
 
-                if (index.BaseMethodFor(rpc) is { } baseMethod)
+                if (anchor.Rebind(index.BaseMethodFor(rpc), ct) is { } baseMethod)
                 {
                     foreach (var @override in await SymbolFinder.FindOverridesAsync(
                         baseMethod, solution, cancellationToken: ct))
@@ -135,7 +139,9 @@ internal static class ProtoReferenceService
 
             case ProtoField field:
             {
-                if (index.PropertyFor(field) is { } property)
+                // Anchored before its neighbours are read off it, so the property and the presence
+                // members beside it all come from one compilation.
+                if (anchor.Rebind(index.PropertyFor(field), ct) is { } property)
                 {
                     Add(symbols, property);
 
@@ -158,7 +164,7 @@ internal static class ProtoReferenceService
 
             case ProtoOneof oneof when oneof.Parent is ProtoMessage owner:
             {
-                if (index.TypeFor(owner) is { } type)
+                if (anchor.Rebind(index.TypeFor(owner), ct) is { } type)
                 {
                     // The one place a name is predicted rather than read back off a symbol: a oneof
                     // generates no anchor of its own — no descriptor index, no `…FieldNumber`, no
@@ -179,23 +185,107 @@ internal static class ProtoReferenceService
             }
 
             case ProtoMessage message:
-                Add(symbols, index.TypeFor(message));
+                Add(symbols, anchor.Rebind(index.TypeFor(message), ct));
                 break;
 
             case ProtoEnum @enum:
-                Add(symbols, index.TypeFor(@enum));
+                Add(symbols, anchor.Rebind(index.TypeFor(@enum), ct));
                 break;
 
             case ProtoEnumValue value:
-                Add(symbols, index.MemberFor(value));
+                Add(symbols, anchor.Rebind(index.MemberFor(value), ct));
                 break;
 
             default:
-                Add(symbols, fallback);
+                // The caret's own symbol, which a caret in a .proto also read off the index.
+                Add(symbols, anchor.Rebind(fallback, ct));
                 break;
         }
 
         return symbols.ToImmutable();
+    }
+
+    /// <summary>
+    /// How a symbol read off a <see cref="ProtoGeneratedIndex"/> is carried into the compilation a
+    /// search is about to run against.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The index outlives the compilation it was built from on purpose: it is keyed on the
+    /// project's dependent semantic version, so a method-body edit anywhere in the dependency
+    /// closure leaves it valid while forking the compilation underneath it. Reading a symbol's
+    /// name, members or locations across that fork is fine. Searching with one is not — Roslyn
+    /// resolves a symbol's originating project by compilation identity and returns an empty result
+    /// for a symbol it cannot place, without saying that is why.
+    /// </para>
+    /// <para>
+    /// Re-resolution goes through <c>SymbolKey</c>, which names a symbol by its declaration rather
+    /// than by its instance and so reads the same from either snapshot. <see cref="Target"/> is
+    /// <see langword="null"/> in the common case — nothing drifted — and rebinding is then the
+    /// identity, so the sweep pays nothing for this when there is nothing to pay for.
+    /// </para>
+    /// </remarks>
+    private readonly record struct IndexAnchor(Compilation? Target)
+    {
+        public TSymbol? Rebind<TSymbol>(TSymbol? symbol, CancellationToken ct)
+            where TSymbol : class, ISymbol
+        {
+            if (Target is null || symbol is null)
+                return symbol;
+
+            // The original when the re-resolve finds nothing, which is no worse than not having
+            // tried: a declaration that has genuinely gone is one no search would have found
+            // either way, and handing back null would turn a stale answer into no answer.
+            return symbol.OriginalDefinition is TSymbol definition
+                && SymbolFinder.FindSimilarSymbols(definition, Target, ct).FirstOrDefault() is { } fresh
+                ? fresh
+                : symbol;
+        }
+    }
+
+    /// <summary>
+    /// The re-anchoring one search needs, computed once for the whole symbol set.
+    /// </summary>
+    /// <remarks>
+    /// The compilation is fetched rather than the semantic version compared, because a body edit
+    /// forks the compilation without moving the version — which is exactly the case the index
+    /// survives and a search does not. It costs nothing here: every caller is on its way into a
+    /// <c>SymbolFinder</c> sweep, which has to have the compilation regardless.
+    /// </remarks>
+    private static async Task<IndexAnchor> AnchorAsync(
+        ProtoGeneratedIndex index, Solution solution, Project project, CancellationToken ct)
+    {
+        if (index.Compilation is null)
+            return default;
+
+        // The project as the solution being searched holds it, and not as the caller holds it: a
+        // symbol has to come from a compilation that solution owns or nothing can place it, and
+        // the two snapshots differ whenever widening the scope loaded a project.
+        var searched = solution.GetProject(project.Id) ?? project;
+        var compilation = await searched.GetCompilationAsync(ct);
+
+        return compilation is null || ReferenceEquals(compilation, index.Compilation)
+            ? default
+            : new IndexAnchor(compilation);
+    }
+
+    /// <summary>
+    /// One symbol read off an index, together with the solution it is now searchable in.
+    /// </summary>
+    /// <remarks>
+    /// For the callers that hand an index symbol to Roslyn directly rather than through this class
+    /// — the type hierarchy, whose subtypes are a <c>SymbolFinder</c> search of its own. The two
+    /// halves travel together because they have to: a symbol anchored in one snapshot and searched
+    /// in another is the silent empty result <see cref="IndexAnchor"/> exists to prevent.
+    /// </remarks>
+    public static async Task<(TSymbol? Symbol, Solution Solution)> AnchoredForSearchAsync<TSymbol>(
+        TSymbol? symbol, ProtoGeneratedIndex index, Project project, CancellationToken ct,
+        TimeSpan? budget = null)
+        where TSymbol : class, ISymbol
+    {
+        var solution = await SearchScopeAsync(project, ct, budget);
+        var anchor = await AnchorAsync(index, solution, project, ct);
+        return (anchor.Rebind(symbol, ct), solution);
     }
 
     /// <summary>
@@ -507,7 +597,7 @@ internal static class ProtoReferenceService
         ProtoHit hit, ProtoGeneratedIndex index, Project project, CancellationToken ct,
         TimeSpan? budget = null) =>
         await ImplementationsForAsync(
-            hit.Target, index, await SearchScopeAsync(project, ct, budget), ct);
+            hit.Target, index, project, await SearchScopeAsync(project, ct, budget), ct);
 
     /// <summary>
     /// The same answer for a caret that started in C#: the hand-written code implementing whatever
@@ -533,20 +623,26 @@ internal static class ProtoReferenceService
                 continue;
 
             return await ImplementationsForAsync(
-                reference.Declaration, index, await SearchScopeAsync(candidate, ct, budget), ct);
+                reference.Declaration, index, candidate,
+                await SearchScopeAsync(candidate, ct, budget), ct);
         }
 
         return [];
     }
 
     private static async Task<ImmutableArray<ISymbol>> ImplementationsForAsync(
-        ProtoDeclaration? target, ProtoGeneratedIndex index, Solution solution, CancellationToken ct)
+        ProtoDeclaration? target, ProtoGeneratedIndex index, Project project, Solution solution,
+        CancellationToken ct)
     {
         var results = ImmutableArray.CreateBuilder<ISymbol>();
 
+        // The seeds here never pass through SymbolSetForAsync, so they are anchored on their own.
+        var anchor = await AnchorAsync(index, solution, project, ct);
+
         switch (target)
         {
-            case ProtoService service when index.ServiceBaseFor(service) is { } @base:
+            case ProtoService service
+                when anchor.Rebind(index.ServiceBaseFor(service), ct) is { } @base:
                 foreach (var derived in await SymbolFinder.FindDerivedClassesAsync(
                     @base, solution, cancellationToken: ct))
                 {
@@ -555,7 +651,7 @@ internal static class ProtoReferenceService
 
                 break;
 
-            case ProtoRpc rpc when index.BaseMethodFor(rpc) is { } method:
+            case ProtoRpc rpc when anchor.Rebind(index.BaseMethodFor(rpc), ct) is { } method:
                 foreach (var @override in await SymbolFinder.FindOverridesAsync(
                     method, solution, cancellationToken: ct))
                 {
@@ -718,6 +814,16 @@ internal static class ProtoReferenceService
     /// follows references, which from a contracts project points away from every answer — is
     /// documented there.
     /// </summary>
+    /// <remarks>
+    /// Public for the callers that reach Roslyn directly rather than through this class. Such a
+    /// caller has to search the snapshot <see cref="SymbolSetForAsync"/> anchored its symbols
+    /// into, which is this one: a different snapshot of the same solution places none of them and
+    /// answers nothing.
+    /// </remarks>
+    public static Task<Solution> SearchSolutionAsync(
+        Project project, CancellationToken ct, TimeSpan? budget = null) =>
+        SearchScopeAsync(project, ct, budget);
+
     /// <summary>The search scope, for a probe that measures the phases of a lens resolve.</summary>
     internal static Task<Solution> SearchScopeForTestsAsync(Project project, CancellationToken ct) =>
         SearchScopeAsync(project, ct);

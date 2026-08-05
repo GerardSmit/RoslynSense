@@ -63,12 +63,17 @@ internal sealed partial class ProtoLanguage :
         var callers = new Dictionary<(string Uri, int Line, int Character), HierarchyItem>();
         var sites = new Dictionary<(string Uri, int Line, int Character), List<LspRange>>();
 
+        // The search scope rather than the caret's own solution: it is the snapshot the symbol set
+        // was anchored into, and Roslyn places a symbol only in the solution that owns its
+        // compilation.
+        var solution = await ProtoReferenceService.SearchSolutionAsync(project, ct);
+
         foreach (var symbol in await ProtoReferenceService.SymbolSetForAsync(hit, view.Index, project, ct))
         {
             ct.ThrowIfCancellationRequested();
 
             foreach (var call in await CallHierarchyHandler.IncomingCallsAsync(
-                symbol, project.Solution, mapper: null, ct))
+                symbol, solution, mapper: null, ct))
             {
                 var key = (call.From.Uri,
                     call.From.SelectionRange.Start.Line,
@@ -137,8 +142,13 @@ internal sealed partial class ProtoLanguage :
         if (view.Project is not { } project)
             return [];
 
-        return await TypeHierarchyHandler.SubtypesAsync(
-            ServiceBaseFor(view, hit), project.Solution, mapper: null, ct);
+        // The base comes off the index, which may have been built before the last C# keystroke, and
+        // the subtype search is a SymbolFinder sweep — so it is re-anchored into the solution that
+        // sweep runs against before it is handed over.
+        var (@base, solution) = await ProtoReferenceService.AnchoredForSearchAsync(
+            ServiceBaseFor(view, hit), view.Index, project, ct);
+
+        return await TypeHierarchyHandler.SubtypesAsync(@base, solution, mapper: null, ct);
     }
 
     // ---- Called from C# ----------------------------------------------------------------------

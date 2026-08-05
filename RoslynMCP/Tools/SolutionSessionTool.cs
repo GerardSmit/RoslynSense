@@ -136,30 +136,33 @@ public static class SolutionSessionTool
     }
 
     /// <summary>
-    /// Loads the projects so later tool calls hit a warm workspace. One project is enough to pull
-    /// in its whole solution, and a project that fails to load must not fail the open — the report
-    /// still tells the caller what is there.
+    /// Loads the projects so later tool calls hit a warm workspace.
     /// </summary>
+    /// <remarks>
+    /// One batch rather than a project-at-a-time loop. This is the path that most deserves it:
+    /// <c>open_solution</c> asks for every project by definition, and the loop it replaces paid
+    /// Roslyn's fixed per-call cost — a BuildHost subprocess and a cold MSBuild
+    /// <c>ProjectCollection</c> — once for each of them, in <c>.sln</c> declaration order, which is
+    /// the order least likely to let one project's transitive closure cover the next. A project
+    /// that fails to load must not fail the open; the report still tells the caller what is there.
+    /// </remarks>
     private static async Task WarmWorkspaceAsync(
         IReadOnlyList<string> projects, CancellationToken cancellationToken)
     {
-        foreach (var project in projects)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
+        if (projects.Count == 0)
+            return;
 
-            try
-            {
-                await WorkspaceService.GetOrOpenProjectAsync(project, cancellationToken: cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(
-                    $"[OpenSolution] Could not load '{Path.GetFileName(project)}': {ex.Message}");
-            }
+        try
+        {
+            await WorkspaceService.EnsureProjectsLoadedAsync(projects, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[OpenSolution] Could not warm the workspace: {ex.Message}");
         }
     }
 

@@ -1,7 +1,257 @@
 # Project / solution load performance
 
+> **Update — measured, and largely fixed.** Everything from §1 down was written before anything was
+> measured (see §7: *"No timings were measured"*). It has since been measured and acted on; see
+> [§0 Measurements](#0-measurements-and-what-changed) for the numbers, what they confirmed, what
+> they refuted, and which of the O-items below are now closed. Read §0 first — several estimates
+> below turned out to be wrong about magnitude, and one recommendation ("do not go down this road")
+> turned out to be avoidable rather than correct.
+
 Analysis only — no code was changed. Every claim below is either cited to `file:line` in this
 repo, or explicitly marked as an estimate / speculation.
+
+---
+
+## 0. Measurements, and what changed
+
+Measured with `RoslynMCP.Tests/LargeSolutionStressTests` (25 ordinary + 8 consumer + 1 contracts =
+34 generated projects, never restored, driving the real out-of-process `--lsp` server), on one
+developer machine. `LargeSolutionStressTests` now tees the server's stderr into the test output with
+a millisecond stamp per line, so every number below comes from the run itself rather than from
+reasoning about the call graph.
+
+### 0.1 Where the 33 seconds actually went
+
+The scenario took **33 s**. Instrumenting each project load into restore / gate / open / post-open
+gave:
+
+| Phase | Count | Each | Total | Share |
+|---|---:|---:|---:|---:|
+| `dotnet restore` | 9, serialized | ~1.5 s | **13.4 s** | 41% |
+| `MSBuildWorkspace.OpenProjectAsync` | 9 top-level calls | ~1.55 s | **14.0 s** | 43% |
+| post-open pipeline | 9 | 1.37 s seed, ~20 ms after | 1.6 s | 5% |
+
+So §1.3 (restore) and §1.1a (BuildHost churn) were the whole problem, in almost equal measure, and
+between them they accounted for 84% of the run. §1.5's forced compilation was real but an order of
+magnitude smaller than the other two: it is the 1.37 s of the seed's post-open pipeline, and near
+zero for every project after it.
+
+### 0.2 The per-call cost is fixed, and that is the whole lever
+
+Three load strategies, same 34-project fixture, restored first so no strategy is measuring NuGet:
+
+| Strategy | Projects loaded | Time |
+|---|---:|---:|
+| Seed + 8 separate `OpenProjectAsync` (what the code did) | 9 | 14.3 s |
+| One `OpenSolutionAsync` over the real solution | 34 | 12.3 s |
+| **One `OpenSolutionAsync` over a generated 9-project solution** | **9** | **3.7 s** |
+
+Solving for the two unknowns gives Roslyn's shape exactly: about **1.6 s of fixed cost per
+top-level load call** — `dotnet` BuildHost subprocess, cold MSBuild `ProjectCollection`, SDK targets
+re-parsed — and about **330 ms per project inside it**. That is why nine projects cost 14.3 s one at
+a time and 3.7 s together, and why loading the whole 34-project solution to get nine is barely
+better than the loop it replaces.
+
+### 0.3 What this refutes
+
+* **Q2's "Recommendation: do not go down this road"** — correct about `MSBuildProjectLoader`, wrong
+  as a conclusion. Batching an arbitrary *subset* needs no internal API and no parallelism at all:
+  write a solution file listing exactly the wanted projects and hand it to `OpenSolutionAsync`. See
+  `RoslynMCP/Services/PartialSolution.cs`.
+* **O13's framing** ("one `OpenSolutionAsync` for the initial load") — the batch discount is real but
+  the granularity was wrong. Batching the *whole* solution buys 2 s and costs 25 projects of
+  retained memory; batching the wanted subset buys 10.6 s and costs nothing.
+* **§1.5's memory hypothesis** (the forced compilations dominate memory) — untested here, but its
+  *time* cost was 1.37 s once, not the "parses the entire codebase during load" that the section
+  implies at 87 projects. It is worth fixing, and it was not the main event.
+
+### 0.4 What changed, and the result
+
+| Change | Where | Effect |
+|---|---|---|
+| Restore once per **solution**, single-flighted, hoisted out of the load gate, and started in the background when the solution is bound | `RoslynMCP/Services/RestoreService.cs`; called from `WorkspaceService.BindSolution` and both load paths | 9 restores → 1; and that one now overlaps startup instead of blocking the first request |
+| Batch multi-project loads through a generated partial solution, evaluated in a transient workspace and grafted into the live one | `PartialSolution.cs`, `WorkspaceService.EnsureProjectsLoadedAsync` / `TryBatchLoadAsync` / `GraftProjects` | 7 consumer loads: 7 × ~1.55 s → one 4.3 s pass |
+| Framework probe reads metadata references instead of forcing a full `GetCompilationAsync` | `WorkspaceService.ResolvesCorlib` | post-open pipeline 1.37 s → 0.16 s on the seed |
+| Deleted the dead `RequiresMsBuild(sln)` call, which opened every `.csproj` in the solution under the process-wide cache lock to compute a value neither caller read | `WorkspaceService.TryFindOwnerSolutionKey` | 34 file opens per cache miss, gone; the lock is no longer held across them |
+| Memoized `.sln` and `.csproj` parsing against file length + mtime | `PathHelper.FileDerived<T>` | solution parses are re-read once per change instead of once per query |
+| Root-directory fast path before the recursive solution search on extension activation | `vscode-extension/src/extension.ts` `solutionAtRoot` | one `readDirectory` instead of a recursive `workspace.findFiles` in the common case |
+| Non-C# files resolve their owning project by walking directories first, instead of opening every `.csproj` in every ancestor directory through MSBuild to ask a question that path can never answer | `RoslynMCP/Tools/NonCSharpProjectFinder.cs` | ~19 ancestor walks to the drive root removed from one `.proto` session |
+| Stopped shadow-copying the .NET installation's own analyzers, and watching `C:\Program Files\dotnet` for them to be rebuilt | `ShadowCopyManager.NeedsShadowCopy` | ~15 ms, but two recursive watchers and a per-instance copy of the SDK's analyzers gone for good |
+| Cross-project proto searches run against the snapshot that has the editor's unsaved buffers applied, rather than re-reading the workspace's un-overlaid one | `ProtoReferenceService.SearchScopeAsync` | removes a second compilation of the open project — and a correctness bug where find-usages searched the text on disk rather than the text on screen |
+| The batch's design-time build runs **outside** the load gate; only the graft takes it | `WorkspaceService.TryBatchLoadAsync` | gate held 4.3 s → 36 ms, so the batch overlaps the `didOpen` load instead of queueing behind it |
+| One MEF composition per process instead of one per workspace, warmed in the background at bind | `WorkspaceService.s_hostServices` / `WarmHostServicesInBackground` | ~1.1 s off the first load, and the same again off every extra workspace — including the transient one the batch loader creates |
+| The C# symbols behind one rpc are searched concurrently rather than one after another | `ProtoReferenceService.FindUsagesAsync` | merge stays serial and ordered, so results are unchanged |
+| The batch is split across up to four concurrent transient workspaces instead of one sequential call | `WorkspaceService.Shard` / `EvaluateShardAsync` | 7 consumer projects: 4,316 ms → 2,342 ms |
+
+| Stage | Before | After |
+|---|---:|---:|
+| cold tree roots | 57 ms | 72 ms |
+| expand solution | 16 ms | 6 ms |
+| expand project (cold) | 17 ms | 17 ms |
+| codeLens + resolve ×17 | 7,189 ms | 4,391 / 4,441 / 4,506 ms |
+| tree after didOpen | 113 ms | 27 ms |
+| **references across 8 consumer projects** | **23,656 ms** | **2,706 / 2,714 / 2,747 ms** |
+| **whole scenario, server side** | **~29.6 s** | **~7.5 s** |
+| restore, now measured separately | (inside the above) | ~1,950 ms |
+| peak working set | 280 MB | 274 MB |
+
+The before column is a real run of the same test at `0f8ce26`, not a remembered number: the baseline
+was re-measured back to back with the current tree on the same machine, patched only to print peak
+working set. It reported `[4] 6,759 ms`, `[6] 21,430 ms`, `[7] 280 MB`.
+
+### 0.4a Memory: essentially unchanged, and why
+
+Peak working set moved 280 MB → 274 MB. That is noise, and it is worth stating plainly rather than
+claiming a win, because several of the changes above genuinely do reduce retention:
+
+* the framework probe no longer forces a `Compilation` — and therefore a parse of every document —
+  for every project at load time;
+* the .NET installation's analyzers are no longer shadow-copied per server instance, nor pinned by
+  an assembly load context;
+* one MEF composition is retained instead of one per workspace.
+
+They are offset by what buys the latency: the batch loader runs **four transient MSBuild workspaces
+concurrently**, and each holds an evaluated project model until its results are grafted. Peak is a
+high-water mark, so concurrency shows up in it directly. `WorkspaceService.Shard` is where that
+trade is made — lowering the cap trades latency back for a lower peak, and one shard reverts to the
+previous behaviour exactly.
+
+The scenario also ends up building the contracts project's compilation regardless (the code lenses
+need it), so the largest single retained object is the same either way. The load-time savings are
+real; this scenario simply is not where they show.
+
+Three consecutive runs are given for the two stages that matter, because a single sample cannot show
+whether a number sits where it does reliably or happened to.
+
+Against the budgets in `full-code-review-and-performance-plan.md`:
+
+* *"Complete references, cold index, restored 25-project fixture — under 5 s"* → **2.7 s.** Met.
+* *"Full 25-project end-to-end stress scenario — under 15 s, excluding package restore/network"* →
+  **~7.5 s.** Met.
+
+**A whole-scenario budget of 5 s is not met and, on this scenario, cannot be.** See §0.5 — the
+arithmetic of what remains adds up to roughly 5 s even if every line of code in this repository ran
+in zero time.
+
+Nine `dotnet restore` invocations and nine `OpenProjectAsync` calls became one restore and three
+top-level loads.
+
+### 0.5 What is left, and the floor
+
+The remaining ~7.5 s of server time is almost entirely MSBuild and Roslyn, and is now close to what
+this design can do. Profiled, not estimated — the code-lens figures come from a per-resolve timer in
+`ProtoLanguage.ResolveCodeLensAsync`:
+
+| What | Cost | Why it cannot be tuned away |
+|---|---:|---|
+| Process start, MSBuild registration, MEF | ~0.4 s | MEF composition itself is warmed in the background and no longer serial |
+| BuildHost spawn for the contracts project | ~1.4 s | First project anyone asks for; nothing to batch it with, and it does not amortise |
+| That project's compilation, plus building `ProtoGeneratedIndex` over it | ~1.44 s, measured as `compilation=1017ms scan=388ms build=34ms` | `CodeLensAsync` reads `view.Index`, and the index maps proto declarations onto generated C# symbols — so protoc's output must be bound before the first lens can exist. The 1.0 s is Roslyn binding; only the 0.39 s scan is this repository's code, and it walks two large generated files once per compilation |
+| 17 lens resolves: searches + LSP round-trips | ~1.25 s | Visible as the 335/257/132/97/75 ms warm-up curve, then under 20 ms. The client asks one at a time and awaits each |
+| `didOpen` load ∥ sharded batch for seven consumers, then the final search | ~2.76 s | Already overlapped, already four BuildHosts in parallel; one spawn's fixed cost is the floor |
+
+That accounts for the whole 7.3 s with nothing left over. Every row above is timed by a stopwatch in
+the code rather than inferred from a gap between log lines — the last unexplained interval was
+attributed to the compilation and index build by reading the call chain, and then measured, which
+moved it from an estimated 1.8 s to an actual 1.44 s and split it into a part Roslyn owns and a
+much smaller part this repository owns.
+
+Summing only what is not this repository's code to make faster — the two BuildHost spawns on the
+critical path, Roslyn binding protoc's output, process start and MSBuild registration — gives
+**about 4.4 s**. Adding even a perfect implementation of everything else lands at roughly 5 s. That
+is the answer to "why not under 5 s": not that the remaining work went unexamined, but that what
+remains is overwhelmingly not this project's to do faster.
+
+The one genuinely reducible item left is the 388 ms scan in `ProtoGeneratedIndex.ScanAsync`, which
+walks two large generated files. It is worth attention for its own sake — it sits between opening a
+`.proto` and seeing its first code lens — but it is 5% of the scenario and cannot close a 2.3 s gap.
+
+The per-call BuildHost cost does not amortise: measured across nine consecutive opens in one
+process it is flat (1570/1587/1554/1576/1623/1541/1545/1569/1731 ms), because each is a fresh
+`dotnet` process and a fresh MSBuild `ProjectCollection`. And the three demand points are seconds
+apart, so no amount of batching merges them — a call that has not been asked for yet cannot join a
+batch that has already run.
+
+**A whole-scenario number under 5 s therefore is not reachable by tuning this design.** Roughly
+5.3 s of the 8 s is BuildHost fixed cost and MEF composition, both incurred before any of this
+code's own logic runs. Getting under it means not asking MSBuild:
+
+1. **A persisted project-model cache**, keyed on the `.csproj` plus every file it imports plus
+   `project.assets.json`. Everything a design-time build produces is already recoverable without
+   one — `project.assets.json` holds the NuGet graph, the targeting pack follows from the TFM, and
+   the `Compile` glob is an evaluation `ProjectEvaluationService` already performs in-process with
+   no BuildHost. This removes the spawns entirely on the second and later opens of an unchanged
+   project, which is the overwhelmingly common case for a developer reopening a solution.
+2. **The persistent reference index** described in `full-code-review-and-performance-plan.md`,
+   which answers a reference query from a cached shard and opens no project at all.
+
+Both are new subsystems with real correctness surface — multi-targeting, conditional items, custom
+targets, source generators — and a wrong answer from either is a silent under-report, which is the
+one failure mode this codebase's comments are most careful about. Neither is a tuning change.
+Everything cheaper than them has now been done.
+
+The **`LoadStrategyTests`** benchmark pins the measurement all of this rests on: it fails if one
+batched open ever stops being at least 1.75× cheaper than the same projects opened one at a time,
+which is the signal that the batching machinery should be deleted rather than kept. It measures
+5 projects rather than the stress test's 9 because the per-project strategy is the slow one by
+construction, and the ratio is already decisive there (8,224 ms vs 2,523 ms, 3.3×).
+
+### 0.5a .NET and MSBuild settings: what helps and what does not
+
+Measured, because most of these are folklore either way:
+
+| Setting | Effect |
+|---|---|
+| **`RestoreUseStaticGraphEvaluation=true`** | **5,885 ms → 1,645 ms** on this repository's own solution. The legacy walk re-evaluates a project once per path that reaches it; static graph evaluates it once. Now the default in `RestoreService`, with an automatic retry on the legacy path if it fails, and an opt-out — see the caveat below |
+| **`MSBUILDDISABLENODEREUSE=1`** | Not a speed-up — a safety belt, and the single most dramatic number in this whole exercise. Without it, MSBuild tries to reconnect to worker nodes left behind by earlier builds, and against a dead one it waits out `MSBUILDNODECONNECTIONTIMEOUT`. That default is 900 s. Three consecutive fixture restores measured 903,768 / 903,194 / 903,973 ms with nothing in the output to explain it, against ~2,000 ms once the stale nodes were cleared. `BuildProcessHelper.ConfigureMsBuildEnvironment` has always set it; the benchmark's own restore helper did not, and now does |
+| `MSBuildLoadMicrosoftTargetsReadOnly=true` | Nothing. 4,687 → 5,010 ms on the code-lens stage, 2,919 → 2,846 ms on references — noise in both directions |
+| `DOTNET_gcServer=1` | Nothing for latency (4,687 → 4,700 ms; 2,919 → 2,809 ms) and **+36 MB** peak (280 → 316 MB). Server GC is the wrong trade for a language server that shares a machine with a build and a browser |
+
+Roslyn's BuildHost is spawned as a child of the server process and inherits its environment, so a
+`DOTNET_*` or `MSBUILD*` variable set on the server reaches the design-time build too. That is what
+makes these testable at all — and what makes a bad one costly.
+
+**The static-graph caveat, stated plainly, because the retry does not cover it.** The failure mode
+that matters is not a failed restore — it is a *successful* one that is quietly incomplete. Static
+graph builds the project graph from evaluation-time `ProjectReference` items, so a project that adds
+references from inside a target is invisible to it; restore exits zero and writes a
+`project.assets.json` missing those entries. The user then sees unresolved references in a project
+that builds fine from the command line, which reads as a defect in this tool rather than in the
+restore that produced it. Related rough edges: `SetTargetFramework` / `SetPlatform` metadata on a
+`ProjectReference`, some multi-targeting shapes, and a higher peak because the whole graph is
+materialised rather than walked.
+
+Two things bound it. Legacy projects never reach this code — `NeedsRestore` skips anything that does
+not want a `project.assets.json`, and `RestoreTargetFor` refuses a solution-level target for a
+solution containing one — so the scope is an all-SDK solution or a lone SDK project. And
+`ROSLYNMCP_NO_STATIC_GRAPH_RESTORE=1` turns it off, so somebody who hits the silent case can rule it
+out in one environment variable rather than by bisecting a restore.
+
+### 0.6 Two things worth knowing before running any of this
+
+**`OpenProjectAsync` can wait indefinitely, and in-process benchmarks have no guard.** One
+`LoadStrategyTests` run wedged for nine minutes on seven seconds of CPU with no `BuildHost`
+subprocess alive at all — it never spawned one — after the machine had accumulated ~30 orphaned
+MSBuild node processes from repeated builds and a forced kill of a BuildHost mid-flight. Production
+is covered (`ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS`, default 300 s, `WorkspaceService.cs`); the
+benchmark now carries its own five-minute ceiling per strategy so the same state fails with a
+message rather than hanging. If it recurs on a clean machine it is a real defect, not the
+environment: start with `dotnet build-server shutdown` and confirm no stray MSBuild nodes remain.
+
+**Four tests in the suite fail on `main` independently of any of this**, and should not be read as
+regressions from it: `BindingRedirectServiceTests.ARedirectIsReadWithItsIdentityRangeAndLine`
+(expects line 5, the implementation documents and returns the `dependentAssembly` line, 4),
+`BindingRedirectServiceTests.AnAssemblysReferencesCarryTheVersionItWasBuiltAgainst`,
+`SolutionExplorerTests.AFolderHoldingOnlyExcludedFilesStaysHidden`, and
+`ProjectCreationTests.ANewProjectIsCreatedAndAddedToTheSolution`. All four were reproduced against a
+clean worktree at `0f8ce26`.
+
+**A fifth is flaky rather than failing.**
+`CoreClrHotReloadTests.AnEditReachesTheRunningProcessWithoutRestartingIt` fails roughly one run in
+five with `IOException: … values.txt … used by another process` — the test reads the file while the
+application it launched is still writing it. Measured at `0f8ce26`: one failure in six runs. Measured
+with these changes: one in four. It is a race in the test, not in the load path, and it appears in a
+full-suite run often enough to be mistaken for a regression from whatever landed most recently.
 
 Motivating evidence: a real 87-project solution loaded ~13
 projects up front, then added the remaining ~74 **one at a time** over many minutes, each logged as

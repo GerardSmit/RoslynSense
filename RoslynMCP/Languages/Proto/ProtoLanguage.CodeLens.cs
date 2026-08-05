@@ -121,7 +121,20 @@ internal sealed partial class ProtoLanguage : ILanguageCodeLensProvider
             return lens;
         }
 
+        var lensWatch = System.Diagnostics.Stopwatch.StartNew();
         var locations = await LensLocationsAsync(data, ct);
+        lensWatch.Stop();
+
+        // A code lens resolves on every scroll, so its cost is paid continuously rather than once.
+        // The threshold is set above the warm-up curve a cold contracts project produces — measured
+        // 335/257/132/97/75 ms and then under 20 ms as the compilation and the search caches fill —
+        // so this reports a lens that is genuinely slow rather than narrating a normal first scroll.
+        if (lensWatch.ElapsedMilliseconds >= 500)
+        {
+            Console.Error.WriteLine(
+                $"[Proto] codeLens/resolve {data.Kind} at {data.Line}:{data.Character} took " +
+                $"{lensWatch.ElapsedMilliseconds} ms ({locations.Length} location(s)).");
+        }
 
         // A zero-count lens still carries the command with an empty location list: LSP requires a
         // non-empty command id, and an empty peek is a sane result for a click.

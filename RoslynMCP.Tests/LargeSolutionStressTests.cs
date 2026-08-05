@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services;
 using StreamJsonRpc;
 using Xunit;
 using Xunit.Abstractions;
@@ -69,6 +70,23 @@ public class LargeSolutionStressTests
         var solution = LargeSolutionFixture.Create(new LargeSolutionOptions(
             ProjectCount: FixtureProjectCount, ConsumerProjectCount: FixtureConsumerProjectCount));
 
+        // Restored before the server is started, and reported on its own line.
+        //
+        // This test used to hand the server a solution that had never been restored, so the first
+        // request that needed a project also paid for NuGet — and every stage timing below carried
+        // a share of it. That is not a measurement of RoslynSense: a cold package cache, a slow
+        // feed or an offline machine would all show up as "the editor is slow", and an improvement
+        // to the server would be invisible underneath the variance. It also made this test
+        // disagree with LargeSolutionBenchmarks, which has always restored first.
+        //
+        // The restore is still worth timing — it is real latency a user on a fresh clone pays —
+        // which is why it is measured and printed rather than hidden. It is simply not attributed
+        // to the server.
+        double restoreMs = await RestoreAsync(solution.SolutionPath);
+        _output.WriteLine(
+            $"[0] dotnet restore (environment cost, excluded from the stage budgets below): " +
+            $"{restoreMs:F0} ms");
+
         string exePath = typeof(LspProxy).Assembly.Location;
 
         var psi = new ProcessStartInfo
@@ -90,7 +108,7 @@ public class LargeSolutionStressTests
         try
         {
             process = Process.Start(psi)!;
-            _ = process.StandardError.ReadToEndAsync(); // drain
+            _ = DrainServerLog(process, _output);
 
             using var rpc = new JsonRpc(new HeaderDelimitedMessageHandler(
                 process.StandardInput.BaseStream, process.StandardOutput.BaseStream,
@@ -233,6 +251,16 @@ public class LargeSolutionStressTests
                 $"[6] textDocument/references (waits for full consumer load): " +
                 $"{referencesWatch.ElapsedMilliseconds} ms, {referenceLocations.Length} location(s)");
 
+            // Read last, so every request above has had its chance to push it higher. Peak rather
+            // than current: what matters for an editor sharing a machine with a build and a browser
+            // is the high-water mark a solution load reaches, not what is left after the GC has had
+            // a quiet moment.
+            process.Refresh();
+            _output.WriteLine(
+                $"[7] peak working set: {process.PeakWorkingSet64 / 1024.0 / 1024.0:F0} MB " +
+                $"for {FixtureProjectCount + FixtureConsumerProjectCount + 1} projects " +
+                "(9 of them loaded into the workspace)");
+
             await rpc.InvokeAsync<object?>("shutdown");
             await rpc.NotifyAsync("exit");
         }
@@ -247,6 +275,76 @@ public class LargeSolutionStressTests
 
             solution.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Restores the generated solution, so that nothing the server is timed on is waiting on NuGet.
+    /// One call for the whole solution, which is what writes <c>project.assets.json</c> for every
+    /// project it lists.
+    /// </summary>
+    private static async Task<double> RestoreAsync(string solutionPath)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("restore");
+        psi.ArgumentList.Add(solutionPath);
+
+        // The same environment the server gives its own restores, and for the same reason.
+        // MSBuild's node reuse keeps worker processes alive between invocations and reconnects to
+        // them by named pipe; when one of those is dead or wedged — which a test run that was
+        // cancelled, or a machine that has been building all day, reliably produces — the connect
+        // waits out MSBUILDNODECONNECTIONTIMEOUT before falling back. That default is 900 s, and it
+        // turned a two-second restore in this fixture into a fifteen-minute one, three runs in a
+        // row, with nothing in the output to say why.
+        BuildProcessHelper.ConfigureMsBuildEnvironment(psi);
+
+        var watch = Stopwatch.StartNew();
+        using var process = Process.Start(psi)!;
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        await Task.WhenAll(stdout, stderr);
+        watch.Stop();
+
+        // Both streams and the exit code, because a silent restore failure would surface much later
+        // as a wall of unresolved-reference errors from the server and look like a server defect.
+        Assert.True(process.ExitCode == 0,
+            $"dotnet restore failed (exit {process.ExitCode}) for {solutionPath}.\n" +
+            $"STDOUT:\n{await stdout}\nSTDERR:\n{await stderr}");
+
+        return watch.Elapsed.TotalMilliseconds;
+    }
+
+    /// <summary>
+    /// Reads the server's stderr line by line, stamping each with the milliseconds since the
+    /// process started, and echoes it into the test output.
+    /// </summary>
+    /// <remarks>
+    /// The previous <c>ReadToEndAsync</c> drain kept the pipe from filling and threw everything
+    /// away, which is why a 33-second run could only ever be reported as six stage totals with no
+    /// account of where the seconds went. Stamped lines turn the server's own load log — restore,
+    /// project open, post-open pipeline — into the breakdown, at the cost of nothing this test
+    /// measures: it is a background read on a pipe the server writes to regardless.
+    /// </remarks>
+    private static Task DrainServerLog(Process process, ITestOutputHelper output)
+    {
+        var watch = Stopwatch.StartNew();
+        return Task.Run(async () =>
+        {
+            string? line;
+            while ((line = await process.StandardError.ReadLineAsync()) is not null)
+            {
+                // The test may already have finished when a late line arrives; xUnit throws on
+                // writing to output after that, and a drain thread is not worth failing a run for.
+                try { output.WriteLine($"    server +{watch.ElapsedMilliseconds,6} ms | {line}"); }
+                catch { return; }
+            }
+        });
     }
 
     private static async Task<(TimeSpan Elapsed, SolutionTreeNode[] Nodes)> TimedTreeAsync(

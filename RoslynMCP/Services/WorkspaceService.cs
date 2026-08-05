@@ -90,9 +90,44 @@ internal static class WorkspaceService
 
     /// <summary>
     /// Indicates whether legacy .NET Framework projects (non-SDK-style .csproj) are supported.
-    /// True when MSBuild is registered and .NET Framework targeting packs are available.
+    /// True when a Visual Studio install with the MSBuild component and the .NET Framework
+    /// targeting packs are both present.
     /// </summary>
-    public static bool IsLegacyProjectSupported { get; private set; }
+    /// <remarks>
+    /// Answered on first ask, not at startup. Computing it means shelling out to <c>vswhere</c> —
+    /// about 210 ms of subprocess — and it used to happen inside the static constructor, so every
+    /// server start paid it, before MSBuild was even registered, to answer a question that only
+    /// matters when somebody opens a non-SDK-style project. Worse, everything the constructor gates
+    /// queued behind it: the background NuGet restore and the MEF warm-up both start after
+    /// <c>BindSolution</c> touches this class, so a probe for Visual Studio delayed the first real
+    /// project load on solutions that have no legacy project anywhere in them.
+    /// </remarks>
+    public static bool IsLegacyProjectSupported => s_legacyMsBuildDir.Value is not null;
+
+    /// <summary>
+    /// The MSBuild bin directory a legacy project's BuildHost needs, or <c>null</c> when this
+    /// machine cannot build one. Probed via <c>vswhere</c> because MSBuildLocator's VS Setup COM
+    /// discovery often fails in the .NET 10 host even when VS is installed.
+    /// </summary>
+    private static readonly Lazy<string?> s_legacyMsBuildDir = new(() =>
+    {
+        // Targeting packs first: without them the VS probe cannot change the answer, and this is a
+        // directory existence check against a subprocess launch.
+        string refAssembliesPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            "Reference Assemblies", "Microsoft", "Framework", ".NETFramework");
+
+        string? directory = Directory.Exists(refAssembliesPath)
+            ? FindLegacyCompatibleMsBuildDirViaVsWhere()
+            : null;
+
+        Console.Error.WriteLine(directory is not null
+            ? $"[WorkspaceService] Legacy .NET Framework projects supported via BuildHost (MSBuild at '{directory}')."
+            : "[WorkspaceService] Legacy .NET Framework projects NOT supported (no VS install with " +
+              "the MSBuild component, or no .NET Framework targeting packs).");
+
+        return directory;
+    }, LazyThreadSafetyMode.ExecutionAndPublication);
 
     /// <summary>
     /// Triggers the static initializer (MSBuildLocator registration). Call this from test
@@ -100,6 +135,59 @@ internal static class WorkspaceService
     /// <see cref="GetOrOpenProjectAsync"/>, so MSBuild is registered before workspace creation.
     /// </summary>
     public static void EnsureRegistered() { }
+
+    /// <summary>
+    /// The MEF composition every workspace runs on, built once for the process.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This used to be built inside <see cref="CreateWorkspace"/>, so every workspace composed the
+    /// whole of Roslyn's feature catalogue from scratch — several hundred milliseconds of assembly
+    /// loading and export discovery, paid again for the second solution a window opened, and again
+    /// for each short-lived workspace the batch loader creates.
+    /// </para>
+    /// <para>
+    /// Sharing one is the intended use: a <c>MefHostServices</c> is a stateless container of
+    /// exports, Roslyn's own <c>MefHostServices.DefaultHost</c> is a process-wide singleton for
+    /// exactly this reason, and the per-workspace state that does exist lives on the
+    /// <see cref="Workspace"/> rather than on the host.
+    /// </para>
+    /// <para>
+    /// The own-assembly addition is what makes this a custom host rather than the default one: it
+    /// exports no-op implementations of the VS-only Pythia contracts that the C# feature providers
+    /// import, and without them composition fails at the first completion request
+    /// (see <c>PythiaStubExports</c>).
+    /// </para>
+    /// </remarks>
+    private static readonly Lazy<Microsoft.CodeAnalysis.Host.Mef.MefHostServices> s_hostServices =
+        new(() => Microsoft.CodeAnalysis.Host.Mef.MefHostServices.Create(
+                Microsoft.CodeAnalysis.Host.Mef.MefHostServices.DefaultAssemblies
+                    .Add(typeof(NullPythiaSignatureHelpImplementation).Assembly)),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
+    /// <summary>
+    /// Builds the MEF composition ahead of the first request that needs it, on a background thread.
+    /// </summary>
+    /// <remarks>
+    /// Pure warm-up: it loads no project, reads no solution and allocates nothing that is not going
+    /// to be allocated anyway the moment the editor asks for anything semantic. It exists because
+    /// the composition is unavoidable, fixed, and otherwise lands squarely inside the first request
+    /// the user waits on.
+    /// </remarks>
+    public static void WarmHostServicesInBackground() =>
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                _ = s_hostServices.Value;
+            }
+            catch (Exception ex)
+            {
+                // Nothing awaits this. Left to the real caller to fail properly, with its own
+                // error handling and its own message.
+                Console.Error.WriteLine($"[WorkspaceService] MEF warm-up failed: {ex.Message}");
+            }
+        });
 
     private static Dictionary<string, string> CreateDefaultProperties() => new()
     {
@@ -209,27 +297,12 @@ internal static class WorkspaceService
                 .OrderByDescending(i => i.Version)
                 .FirstOrDefault();
 
-            // Legacy .NET Framework support is determined entirely by what's available to the
-            // BuildHost subprocess: a VS install with the MSBuild component AND .NET Framework
-            // targeting packs. We probe via vswhere because MSBuildLocator's VS Setup COM
-            // discovery often fails in the .NET 10 host even when VS is installed.
-            var refAssembliesPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                "Reference Assemblies", "Microsoft", "Framework", ".NETFramework");
-
-            var legacyMsBuildDir = Directory.Exists(refAssembliesPath)
-                ? FindLegacyCompatibleMsBuildDirViaVsWhere()
-                : null;
-            IsLegacyProjectSupported = legacyMsBuildDir is not null;
-
             if (dotnetSdkInstance is not null)
             {
                 MSBuildLocator.RegisterInstance(dotnetSdkInstance);
                 Console.Error.WriteLine(
-                    $"[WorkspaceService] Registered MSBuild from '{dotnetSdkInstance.Name}' v{dotnetSdkInstance.Version} at '{dotnetSdkInstance.MSBuildPath}'."
-                    + (IsLegacyProjectSupported
-                        ? $" Legacy .NET Framework projects supported via BuildHost (MSBuild at '{legacyMsBuildDir}')."
-                        : " Legacy .NET Framework projects NOT supported (no VS install with MSBuild component, or no targeting packs)."));
+                    $"[WorkspaceService] Registered MSBuild from '{dotnetSdkInstance.Name}' " +
+                    $"v{dotnetSdkInstance.Version} at '{dotnetSdkInstance.MSBuildPath}'.");
                 return;
             }
 
@@ -301,15 +374,16 @@ internal static class WorkspaceService
     /// The caller is responsible for disposing the returned workspace.
     /// Prefer <see cref="GetOrOpenProjectAsync"/> for cached access.
     /// </summary>
-    public static MSBuildWorkspace CreateWorkspace(TextWriter? diagnosticWriter = null, bool isLegacy = false)
+    public static MSBuildWorkspace CreateWorkspace(
+        TextWriter? diagnosticWriter = null, bool isLegacy = false,
+        IReadOnlyDictionary<string, string>? extraProperties = null)
     {
         var properties = isLegacy ? CreateLegacyProperties() : CreateDefaultProperties();
-        // Own assembly joins the MEF catalog: it exports no-op implementations for the
-        // VS-only Pythia contracts that CSharp.Features providers import (see PythiaStubExports).
-        var host = Microsoft.CodeAnalysis.Host.Mef.MefHostServices.Create(
-            Microsoft.CodeAnalysis.Host.Mef.MefHostServices.DefaultAssemblies
-                .Add(typeof(NullPythiaSignatureHelpImplementation).Assembly));
-        var workspace = MSBuildWorkspace.Create(properties, host);
+        if (extraProperties is not null)
+            foreach (var (key, value) in extraProperties)
+                properties[key] = value;
+
+        var workspace = MSBuildWorkspace.Create(properties, s_hostServices.Value);
 
         workspace.RegisterWorkspaceFailedHandler(args =>
         {
@@ -361,7 +435,7 @@ internal static class WorkspaceService
                 if (!ownerResolved)
                 {
                     if (!isDecompile)
-                        solutionPath = TryFindOwnerSolutionKey(normalizedPath).slnKey;
+                        solutionPath = TryFindOwnerSolutionKey(normalizedPath);
                     loadKey = solutionPath ?? normalizedPath;
                     ownerResolved = true;
                 }
@@ -476,10 +550,13 @@ internal static class WorkspaceService
                         "Install 'Visual Studio Build Tools' and relaunch the MCP server.");
                 var msbuildWorkspace = CreateWorkspace(diagnosticWriter, isLegacy);
 
+                var phases = new LoadPhaseTimings();
                 try
                 {
                     progress.Report("Restoring packages");
-                    await EnsureRestoredAsync(normalizedPath, cancellationToken);
+                    phases.Start();
+                    await RestoreService.EnsureRestoredAsync(normalizedPath, cancellationToken);
+                    phases.Mark(ref phases.RestoreMs);
                     progress.Report($"Opening {Path.GetFileName(normalizedPath)}");
 
                     // Hard ceiling on OpenProjectAsync so a wedged BuildHost-net472 subprocess
@@ -513,10 +590,17 @@ internal static class WorkspaceService
                             tex);
                     }
 
+                    phases.Mark(ref phases.OpenMs);
+
                     var openedId = openedProject.Id;
-                    (shadowLoader, shadowDirs) = await ApplyPostOpenPipelineAsync(
-                        msbuildWorkspace, newProjects: null, existingLoader: null, cancellationToken);
+                    (shadowLoader, shadowDirs) = ApplyPostOpenPipeline(
+                        msbuildWorkspace, newProjects: null, existingLoader: null);
+                    phases.Mark(ref phases.PipelineMs);
                     openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedId)!;
+
+                    Console.Error.WriteLine(
+                        $"[WorkspaceService] Seed-loaded '{Path.GetFileName(normalizedPath)}' " +
+                        $"({msbuildWorkspace.CurrentSolution.ProjectIds.Count} project(s) in closure). {phases}");
 
                     workspace = msbuildWorkspace;
                 }
@@ -672,6 +756,18 @@ internal static class WorkspaceService
         // between "the solution is big" and a feature quietly walking every project in it.
         string origin = LoadOrigin();
 
+        var phases = new LoadPhaseTimings();
+        phases.Start();
+
+        // Before the gate, deliberately. Restore is a subprocess and, on a cold package cache, the
+        // network; the gate exists only because MSBuildWorkspace cannot take two concurrent opens,
+        // and holding it across a restore made every other project in the solution — and every
+        // interactive request queued behind them — wait out somebody else's NuGet download.
+        // RestoreService single-flights per solution, so N projects arriving here at once still
+        // produce one restore rather than N.
+        await RestoreService.EnsureRestoredAsync(normalizedProjectPath, cancellationToken);
+        phases.Mark(ref phases.RestoreMs);
+
         await entry.LoadGate.WaitAsync(cancellationToken);
         try
         {
@@ -682,15 +778,18 @@ internal static class WorkspaceService
 
             using var openCts = new CancellationTokenSource(OpenProjectTimeout);
             using var openLinked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, openCts.Token);
-            await EnsureRestoredAsync(normalizedProjectPath, cancellationToken);
+
+            phases.Mark(ref phases.GateMs);
             await ws.OpenProjectAsync(normalizedProjectPath, cancellationToken: openLinked.Token)
                 .WaitAsync(OpenProjectTimeout, cancellationToken);
+            phases.Mark(ref phases.OpenMs);
 
             var newIds = ws.CurrentSolution.ProjectIds.Where(id => !beforeIds.Contains(id)).ToHashSet();
             if (newIds.Count == 0)
                 return; // already present transitively; mappings unchanged
 
-            var (loader, dirs) = await ApplyPostOpenPipelineAsync(ws, newIds, entry.ShadowLoader, cancellationToken);
+            var (loader, dirs) = ApplyPostOpenPipeline(ws, newIds, entry.ShadowLoader);
+            phases.Mark(ref phases.PipelineMs);
 
             await s_cacheLock.WaitAsync(cancellationToken);
             try
@@ -704,7 +803,7 @@ internal static class WorkspaceService
                 Console.Error.WriteLine(
                     $"[WorkspaceService] Incrementally loaded '{Path.GetFileName(normalizedProjectPath)}' into " +
                     $"'{Path.GetFileName(entry.CacheKey)}' (+{newIds.Count} project(s); {entry.ProjectIds.Count} loaded) " +
-                    $"for {origin}.");
+                    $"for {origin}. {phases}");
             }
             finally
             {
@@ -716,6 +815,446 @@ internal static class WorkspaceService
             entry.LoadGate.Release();
         }
     }
+
+    /// <summary>
+    /// Loads several projects of one solution in a single Roslyn batch instead of one call each.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// For a caller that already knows it wants N projects — every consumer of a shared contract,
+    /// every project in an explicitly opened solution — this is the difference between paying
+    /// Roslyn's fixed per-call cost once and paying it N times. Measured on a generated 34-project
+    /// solution: nine projects one at a time is 14.3 s, the same nine in one batch is 3.7 s.
+    /// See <see cref="PartialSolution"/> for why the batch has to be expressed as a solution file.
+    /// </para>
+    /// <para>
+    /// Falls back to the per-project path — silently, and with the same end state — whenever the
+    /// batch cannot apply: fewer than two projects actually missing, no solution-keyed entry to
+    /// batch into, a non-MSBuild workspace, or the batch itself failing. A caller gets the projects
+    /// loaded either way; only the cost differs.
+    /// </para>
+    /// <para>
+    /// Projects already loaded are re-listed in the generated solution rather than left out. They
+    /// have to be: the batch produces a whole new workspace, and one that omitted them would drop
+    /// projects this entry has already promised to serve.
+    /// </para>
+    /// </remarks>
+    public static async Task EnsureProjectsLoadedAsync(
+        IReadOnlyCollection<string> projectPaths, CancellationToken cancellationToken = default)
+    {
+        var normalized = projectPaths
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (normalized.Count == 0)
+            return;
+
+        // Restore first, once, for everything: it is per solution and outside every gate, so doing
+        // it here rather than inside the loop below means one subprocess for the whole batch.
+        await RestoreService.EnsureRestoredAsync(normalized[0], cancellationToken);
+
+        // The first project both establishes the solution workspace (via the ordinary cached path,
+        // including all its fallback behaviour) and tells us which entry the rest belong in.
+        await GetOrOpenProjectAsync(normalized[0], cancellationToken: cancellationToken);
+
+        CachedWorkspaceEntry? entry = null;
+        await s_cacheLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (s_projectToCacheKey.TryGetValue(normalized[0], out var key)
+                && s_cache.TryGetValue(key, out var found)
+                && found.Workspace is MSBuildWorkspace
+                && PathHelper.IsSolutionFile(found.CacheKey))
+            {
+                entry = found;
+            }
+        }
+        finally
+        {
+            s_cacheLock.Release();
+        }
+
+        if (entry is null)
+        {
+            // Loose projects, decompiled entries, or a solution whose workspace failed to become
+            // the owner: nothing to batch into.
+            foreach (string path in normalized.Skip(1))
+                await LoadOneIgnoringFailureAsync(path, cancellationToken);
+            return;
+        }
+
+        if (!await TryBatchLoadAsync(entry, normalized, cancellationToken))
+        {
+            foreach (string path in normalized)
+                await LoadOneIgnoringFailureAsync(path, cancellationToken);
+        }
+    }
+
+    private static async Task LoadOneIgnoringFailureAsync(string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await GetOrOpenProjectAsync(path, cancellationToken: cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // One project that will not load must not end the batch: the answer is then as narrow
+            // as it would have been without this call, which is a worse result and not a failure.
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Batch member '{Path.GetFileName(path)}' failed to load: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Evaluates <paramref name="wanted"/> in one throwaway workspace, then grafts the resulting
+    /// projects into <paramref name="entry"/>'s live workspace. Returns <see langword="false"/>
+    /// when the batch does not apply or did not succeed, leaving the entry exactly as it was.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The expensive half of a project load — the BuildHost subprocess and the MSBuild design-time
+    /// evaluation — has nothing to do with which workspace the result lands in, so it is done in a
+    /// transient workspace that exists only for the duration of this call and is disposed before it
+    /// returns. What survives is the evaluated project model, grafted onto the live solution.
+    /// </para>
+    /// <para>
+    /// Grafting rather than swapping the live workspace for the batch one, which is the obvious
+    /// shortcut and is wrong. Callers hold <see cref="ISymbol"/>s, <see cref="Project"/>s and
+    /// <see cref="Solution"/>s taken from this workspace across a load — cross-project find-usages
+    /// resolves the symbol first and then asks for the projects to search it in — and a symbol from
+    /// a replaced workspace belongs to no compilation in the new one, so
+    /// <c>SymbolFinder.FindReferencesAsync</c> silently returns nothing. The invariant that a
+    /// cached workspace only ever <em>gains</em> projects is relied on well outside this file, and
+    /// grafting is what keeps it true.
+    /// </para>
+    /// </remarks>
+    private static async Task<bool> TryBatchLoadAsync(
+        CachedWorkspaceEntry entry, IReadOnlyList<string> wanted, CancellationToken cancellationToken)
+    {
+        if (entry.Workspace is not MSBuildWorkspace live)
+            return false;
+
+        // Read without the gate. This is a hint, not a decision: another loader may add one of
+        // these while the evaluation below runs, and GraftProjects re-checks by file path and skips
+        // whatever arrived meanwhile. The only thing being decided here is whether a batch is worth
+        // starting at all.
+        var missing = wanted
+            .Where(p => !entry.ProjectIds.ContainsKey(p) && File.Exists(p))
+            .ToList();
+
+        // One project is not a batch: a single OpenProjectAsync costs the same one BuildHost and
+        // skips the graft entirely, so the common incremental case stays on the path that has
+        // always served it.
+        if (missing.Count < 2)
+            return false;
+
+        var watch = Stopwatch.StartNew();
+        var shards = Shard(missing);
+
+        // One loader for all shards, created here rather than let each shard make its own.
+        //
+        // The rebind creates a loader on demand, so N concurrent shards that each need one would
+        // each build a separate collectible load context — and MergeShadow adopts only the first,
+        // leaving the rest owned by nobody, disposed by nobody, and still referenced by the
+        // AnalyzerFileReferences that were rebound onto them. Constructing one up front costs a
+        // dictionary and a lock; if no shard turns out to need shadowing it is adopted unused and
+        // released with the entry.
+        var shadowLoader = entry.ShadowLoader ?? new ShadowCopyAnalyzerAssemblyLoader();
+
+        // Each shard evaluates in its own workspace, and they run together.
+        //
+        // Roslyn's loader is strictly sequential inside one call — a plain foreach over the project
+        // paths — so one batch of N projects is N evaluations back to back behind a single
+        // BuildHost. Splitting into shards buys real concurrency for the same reason the gate can be
+        // dropped around them: these workspaces are private to this method and share nothing, so
+        // MSBuildWorkspace's inability to take two concurrent opens simply does not apply across
+        // them. What it costs is one extra BuildHost per shard, which is why Shard bounds the count
+        // rather than sharding per project.
+        var evaluated = await Task.WhenAll(shards.Select(shard =>
+            EvaluateShardAsync(entry, shard, shadowLoader, cancellationToken)));
+        long evaluateMs = watch.ElapsedMilliseconds;
+
+        var usable = evaluated.Where(e => e is not null).ToList();
+        if (usable.Count == 0)
+        {
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Every shard of the {missing.Count}-project batch for " +
+                $"'{Path.GetFileName(entry.CacheKey)}' failed; falling back to one at a time.");
+            return false;
+        }
+
+        try
+        {
+            await entry.LoadGate.WaitAsync(cancellationToken);
+            long gateMs;
+            int added = 0;
+            try
+            {
+                gateMs = watch.ElapsedMilliseconds - evaluateMs;
+
+                // Serially, under the gate, and order matters only in that a project two shards both
+                // pulled in transitively is added by whichever gets there first; GraftProjects skips
+                // it for the other.
+                foreach (var shard in usable)
+                    added += GraftProjects(live, shard!.Value.Solution);
+
+                if (added == 0)
+                {
+                    // Everything this evaluated arrived by another route while it ran. The work is
+                    // wasted but the outcome is the one the caller wanted, so it is a success:
+                    // falling back would re-open projects that are already loaded.
+                    Console.Error.WriteLine(
+                        $"[WorkspaceService] Batch of {missing.Count} project(s) for " +
+                        $"'{Path.GetFileName(entry.CacheKey)}' was overtaken by another load; " +
+                        "nothing left to add.");
+                    return true;
+                }
+
+                await s_cacheLock.WaitAsync(cancellationToken);
+                try
+                {
+                    entry.MergeShadow(shadowLoader, null);
+                    foreach (var shard in usable)
+                    {
+                        if (shard!.Value.Dirs is { Count: > 0 } dirs)
+                        {
+                            entry.MergeShadow(shadowLoader, dirs);
+                            RegisterShadowDirsLocked(entry.CacheKey, dirs);
+                        }
+                    }
+
+                    entry.RefreshProjectIds();
+                    RegisterProjectMappingsLocked(entry.CacheKey, wanted[0], live);
+                    Interlocked.Increment(ref IncrementalLoadCount);
+                }
+                finally
+                {
+                    s_cacheLock.Release();
+                }
+            }
+            finally
+            {
+                entry.LoadGate.Release();
+            }
+
+            // A shard that failed left its projects unloaded. Reporting success would strand them,
+            // so the caller is told to fall back — the ones this batch did land are already in the
+            // workspace and cost it nothing but a cache hit.
+            var stillMissing = missing.Where(p => !entry.ProjectIds.ContainsKey(p)).ToList();
+
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Batch-loaded {added} project(s) into " +
+                $"'{Path.GetFileName(entry.CacheKey)}' across {shards.Count} concurrent shard(s) " +
+                $"({entry.ProjectIds.Count} loaded) [evaluate={evaluateMs}ms gate={gateMs}ms " +
+                $"graft={watch.ElapsedMilliseconds - evaluateMs - gateMs}ms]" +
+                (stillMissing.Count > 0 ? $" — {stillMissing.Count} still missing." : "."));
+
+            return stillMissing.Count == 0;
+        }
+        finally
+        {
+            foreach (var shard in usable)
+                shard!.Value.Workspace.Dispose();
+        }
+    }
+
+    /// <summary>One shard's evaluated result, still held in the transient workspace that produced it.</summary>
+    private readonly record struct EvaluatedShard(
+        MSBuildWorkspace Workspace,
+        Solution Solution,
+        ShadowCopyAnalyzerAssemblyLoader? Loader,
+        HashSet<string>? Dirs);
+
+    /// <summary>
+    /// Splits the wanted projects across a bounded number of shards.
+    /// </summary>
+    /// <remarks>
+    /// Bounded, not one shard per project, because each shard costs its own BuildHost — about 1.5 s
+    /// of fixed cost against roughly 330 ms per additional project inside it — so past a handful the
+    /// spawns cost more than the sequencing they remove. Half the processors, capped at four,
+    /// matching <c>ProjectEvaluationService</c> and <c>WorkspaceDiagnosticsHandler</c>; these are
+    /// subprocesses doing MSBuild evaluation, and oversubscribing turns a latency win into disk and
+    /// scheduler contention with the editor the user is typing into.
+    /// </remarks>
+    private static List<List<string>> Shard(List<string> projects)
+    {
+        int shardCount = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+        shardCount = Math.Min(shardCount, projects.Count);
+
+        var shards = new List<List<string>>(shardCount);
+        for (int i = 0; i < shardCount; i++)
+            shards.Add([]);
+
+        // Round-robin rather than contiguous blocks: adjacent entries in the wanted list are
+        // typically siblings that reference the same things, so dealing them out spreads the
+        // transitive closures across shards instead of concentrating them in one.
+        for (int i = 0; i < projects.Count; i++)
+            shards[i % shardCount].Add(projects[i]);
+
+        return shards;
+    }
+
+    /// <summary>
+    /// Runs the design-time build for one shard in a workspace of its own, returning
+    /// <see langword="null"/> when it failed — the surviving shards are still worth grafting.
+    /// </summary>
+    private static async Task<EvaluatedShard?> EvaluateShardAsync(
+        CachedWorkspaceEntry entry, List<string> shard,
+        ShadowCopyAnalyzerAssemblyLoader shadowLoader, CancellationToken cancellationToken)
+    {
+        using var partial = PartialSolution.Create(entry.CacheKey, shard);
+
+        var workspace = CreateWorkspace(
+            diagnosticWriter: TextWriter.Null,
+            isLegacy: PathHelper.IsLegacySolution(entry.CacheKey),
+            extraProperties: partial.GlobalProperties);
+
+        try
+        {
+            using var openCts = new CancellationTokenSource(OpenProjectTimeout);
+            using var openLinked = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, openCts.Token);
+
+            await workspace.OpenSolutionAsync(partial.Path, cancellationToken: openLinked.Token)
+                .WaitAsync(OpenProjectTimeout, cancellationToken);
+
+            // Over the transient workspace, before the graft: the analyzer rebind has to happen
+            // while these projects are still untouched, and doing it here means the references that
+            // reach the live solution already point at shadow copies. Safe to run concurrently with
+            // the other shards — they share one loader, and both it and the shadow-copy manager
+            // underneath it serialize their own state.
+            var (_, dirs) = ApplyPostOpenPipeline(
+                workspace, newProjects: null, existingLoader: shadowLoader);
+
+            return new EvaluatedShard(workspace, workspace.CurrentSolution, shadowLoader, dirs);
+        }
+        catch (OperationCanceledException)
+        {
+            workspace.Dispose();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[WorkspaceService] A shard of the batch for '{Path.GetFileName(entry.CacheKey)}' " +
+                $"failed ({ex.Message}); its projects will be loaded one at a time instead.");
+            workspace.Dispose();
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Copies every project of <paramref name="source"/> that <paramref name="live"/> does not
+    /// already have into it, remapping identifiers and cross-project references as it goes.
+    /// Returns how many were added.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Identity is the project's file path, which is what every caller of this service already uses
+    /// to name a project and what the entry's own map is keyed on. A project already present in
+    /// <paramref name="live"/> is skipped rather than replaced: it may be the one holding the
+    /// symbol the caller is mid-way through searching for.
+    /// </para>
+    /// <para>
+    /// Documents are carried as <see cref="FileTextLoader"/>s rather than as text, so this stays a
+    /// metadata-only operation — nothing here reads a source file, and the batch does not force the
+    /// parse that the per-project path also defers.
+    /// </para>
+    /// <para>
+    /// Applied through <see cref="SwapCurrentSolutionInPlace"/> and not
+    /// <see cref="Workspace.TryApplyChanges"/>: to <c>TryApplyChanges</c> an added project is an
+    /// instruction to write a new <c>.csproj</c> to disk, which is emphatically not what loading
+    /// one means.
+    /// </para>
+    /// </remarks>
+    private static int GraftProjects(MSBuildWorkspace live, Solution source)
+    {
+        var solution = live.CurrentSolution;
+
+        var idByPath = new Dictionary<string, ProjectId>(StringComparer.OrdinalIgnoreCase);
+        foreach (var project in solution.Projects)
+        {
+            if (project.FilePath is { Length: > 0 } path)
+                idByPath[Path.GetFullPath(path)] = project.Id;
+        }
+
+        var incoming = source.Projects
+            .Where(p => p.FilePath is { Length: > 0 })
+            .Where(p => !idByPath.ContainsKey(Path.GetFullPath(p.FilePath!)))
+            .ToList();
+
+        if (incoming.Count == 0)
+            return 0;
+
+        // Allocated before any ProjectInfo is built, so a reference between two incoming projects
+        // resolves to the identifier the other one is about to be added under.
+        foreach (var project in incoming)
+            idByPath[Path.GetFullPath(project.FilePath!)] = ProjectId.CreateNewId(project.Name);
+
+        foreach (var project in incoming)
+            solution = solution.AddProject(ToProjectInfo(project, source, idByPath));
+
+        SwapCurrentSolutionInPlace(live, solution);
+        return incoming.Count;
+    }
+
+    private static ProjectInfo ToProjectInfo(
+        Project project, Solution source, Dictionary<string, ProjectId> idByPath)
+    {
+        var id = idByPath[Path.GetFullPath(project.FilePath!)];
+
+        var projectReferences = project.ProjectReferences
+            .Select(reference =>
+            {
+                // A reference whose target has no ProjectInfo is how Roslyn represents a
+                // <ProjectReference> that does not resolve to a file on disk. It has no path to map
+                // and nothing to point at, so it is dropped rather than carried as a dangling id.
+                string? path = source.GetProject(reference.ProjectId)?.FilePath;
+                return path is { Length: > 0 } && idByPath.TryGetValue(Path.GetFullPath(path), out var mapped)
+                    ? new ProjectReference(mapped, reference.Aliases, reference.EmbedInteropTypes)
+                    : null;
+            })
+            .OfType<ProjectReference>()
+            .ToList();
+
+        return ProjectInfo
+            .Create(
+                id,
+                project.Version,
+                project.Name,
+                project.AssemblyName,
+                project.Language,
+                filePath: project.FilePath,
+                outputFilePath: project.OutputFilePath,
+                compilationOptions: project.CompilationOptions,
+                parseOptions: project.ParseOptions,
+                documents: project.Documents.Select(d => ToDocumentInfo(id, d)),
+                projectReferences: projectReferences,
+                metadataReferences: project.MetadataReferences,
+                analyzerReferences: project.AnalyzerReferences,
+                additionalDocuments: project.AdditionalDocuments.Select(d => ToDocumentInfo(id, d)))
+            .WithDefaultNamespace(project.DefaultNamespace)
+            .WithOutputRefFilePath(project.OutputRefFilePath)
+            .WithAnalyzerConfigDocuments(
+                project.AnalyzerConfigDocuments.Select(d => ToDocumentInfo(id, d)));
+    }
+
+    private static DocumentInfo ToDocumentInfo(ProjectId newProjectId, TextDocument document) =>
+        DocumentInfo.Create(
+            DocumentId.CreateNewId(newProjectId, document.Name),
+            document.Name,
+            folders: document.Folders,
+            sourceCodeKind: (document as Document)?.SourceCodeKind ?? SourceCodeKind.Regular,
+            // No file path means nothing on disk backs it, so there is no loader to give it and the
+            // document is added empty rather than dropped — losing the file from the project would
+            // be a worse lie than an empty one.
+            loader: document.FilePath is { Length: > 0 } path ? new FileTextLoader(path, defaultEncoding: null) : null,
+            filePath: document.FilePath);
 
     /// <summary>
     /// Walks up the directory tree from <paramref name="filePath"/> to find
@@ -864,7 +1403,17 @@ internal static class WorkspaceService
     public static void BindSolution(string? solutionPath)
     {
         if (solutionPath is { Length: > 0 } path && PathHelper.IsSolutionFile(path) && File.Exists(path))
+        {
             BoundSolutionPath = Path.GetFullPath(path);
+
+            // Nothing is loaded here — these only start the two fixed costs the first real request
+            // would otherwise discover inside itself: the NuGet restore the solution needs if and
+            // only if it has never been restored, and the MEF composition every workspace runs on.
+            // Both overlap the seconds the editor spends on structural work, which needs neither.
+            // See StartSolutionRestoreInBackground for why this is not a preload.
+            RestoreService.StartSolutionRestoreInBackground(BoundSolutionPath);
+            WarmHostServicesInBackground();
+        }
     }
 
     /// <summary>
@@ -1104,37 +1653,43 @@ internal static class WorkspaceService
     /// Used by preload to warm each solution once.
     /// </summary>
     internal static string? GetOwnerSolutionKey(string projectPath) =>
-        TryFindOwnerSolutionKey(Path.GetFullPath(projectPath)).slnKey;
+        TryFindOwnerSolutionKey(Path.GetFullPath(projectPath));
 
     /// <summary>
     /// Walks up from the project to its nearest solution file and, if that solution lists
     /// the project and contains more than one project, returns the normalized solution path
-    /// to use as the shared cache key. Returns <c>(null, false)</c> for loose / single-project
+    /// to use as the shared cache key. Returns <c>null</c> for loose / single-project
     /// solutions, which fall back to per-project loading.
     /// </summary>
-    private static (string? slnKey, bool isLegacy) TryFindOwnerSolutionKey(string normalizedProjectPath)
+    /// <remarks>
+    /// This used to also return whether the solution was legacy, computed by
+    /// <c>PathHelper.RequiresMsBuild(sln)</c> — which opens and regex-scans <em>every</em>
+    /// <c>.csproj</c> the solution lists. Neither caller ever read the flag. On a 34-project
+    /// solution that was 34 file opens per cache miss, spent to produce a value that was
+    /// immediately discarded, and spent while holding the process-wide cache lock that every
+    /// interactive hover and completion also has to take.
+    /// </remarks>
+    private static string? TryFindOwnerSolutionKey(string normalizedProjectPath)
     {
         try
         {
             string? sln = PathHelper.FindNearestSolution(normalizedProjectPath);
             if (string.IsNullOrEmpty(sln))
-                return (null, false);
+                return null;
 
             var projects = PathHelper.GetProjectsFromSolution(sln);
             if (projects.Count <= 1)
-                return (null, false);  // single-project solution gains nothing from sharing
+                return null;  // single-project solution gains nothing from sharing
 
             bool contains = projects.Any(p =>
                 string.Equals(Path.GetFullPath(p), normalizedProjectPath, StringComparison.OrdinalIgnoreCase));
-            if (!contains)
-                return (null, false);
 
-            return (Path.GetFullPath(sln), PathHelper.RequiresMsBuild(sln));
+            return contains ? Path.GetFullPath(sln) : null;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WorkspaceService] Solution discovery failed for '{normalizedProjectPath}': {ex.Message}");
-            return (null, false);
+            return null;
         }
     }
 
@@ -1379,25 +1934,27 @@ internal static class WorkspaceService
     /// projects. Returns the shadow loader now in use and the NEW source directories it pinned on
     /// this call (for the rebuild-eviction watcher).
     /// </summary>
-    private static async Task<(ShadowCopyAnalyzerAssemblyLoader? Loader, HashSet<string>? Dirs)>
-        ApplyPostOpenPipelineAsync(
+    private static (ShadowCopyAnalyzerAssemblyLoader? Loader, HashSet<string>? Dirs)
+        ApplyPostOpenPipeline(
             MSBuildWorkspace workspace, HashSet<ProjectId>? newProjects,
-            ShadowCopyAnalyzerAssemblyLoader? existingLoader, CancellationToken cancellationToken)
+            ShadowCopyAnalyzerAssemblyLoader? existingLoader)
     {
         var stripped = StripUnresolvedAnalyzerReferences(workspace.CurrentSolution, newProjects);
         if (stripped != workspace.CurrentSolution)
             workspace.TryApplyChanges(stripped);
 
-        // Rebind BEFORE any GetCompilationAsync (the framework probe below triggers one): Roslyn's
-        // default loader opens the original analyzer DLL via PEReader on first compilation access,
-        // locking it on disk — a rebind after that is too late.
+        // Rebind BEFORE anything can ask these projects for a compilation: Roslyn's default loader
+        // opens the original analyzer DLL via PEReader on first compilation access, locking it on
+        // disk — a rebind after that is too late. Nothing here forces a compilation any more (the
+        // framework probe below reads metadata references only), so what keeps this ordering
+        // load-bearing is that the projects are not reachable by any caller until this pipeline
+        // returns and the cache mappings are published.
         var (rebound, loader, dirs) =
             RebindAnalyzerReferencesToShadowLoader(workspace.CurrentSolution, newProjects, existingLoader);
         if (rebound != workspace.CurrentSolution)
             SwapCurrentSolutionInPlace(workspace, rebound);
 
-        var injected = await InjectMissingFrameworkReferencesAsync(
-            workspace.CurrentSolution, newProjects, cancellationToken);
+        var injected = InjectMissingFrameworkReferences(workspace.CurrentSolution, newProjects);
         if (injected != workspace.CurrentSolution)
             workspace.TryApplyChanges(injected);
 
@@ -1477,87 +2034,16 @@ internal static class WorkspaceService
     }
 
     /// <summary>
-    /// Runs <c>dotnet restore</c> if the project's <c>project.assets.json</c> is missing,
-    /// so that MSBuildWorkspace can properly resolve NuGet packages and framework references.
-    /// Legacy .NET Framework projects (non-SDK-style) don't use project.assets.json, so this is skipped for them.
-    /// </summary>
-    private static async Task EnsureRestoredAsync(string projectPath, CancellationToken cancellationToken)
-    {
-        string? projectDir = Path.GetDirectoryName(projectPath);
-        if (projectDir is null) return;
-
-        // Legacy projects use packages.config, not project.assets.json — skip dotnet restore
-        if (PathHelper.RequiresMsBuild(projectPath)) return;
-
-        string assetsFile = Path.Combine(projectDir, "obj", "project.assets.json");
-        if (File.Exists(assetsFile)) return;
-
-        Console.Error.WriteLine($"[WorkspaceService] project.assets.json missing for '{Path.GetFileName(projectPath)}', running dotnet restore...");
-
-        using var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = "dotnet",
-                Arguments = $"restore \"{projectPath}\" --verbosity quiet",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = projectDir
-            }
-        };
-
-        BuildProcessHelper.ConfigureMsBuildEnvironment(process.StartInfo);
-
-        try
-        {
-            BuildProcessHelper.StartWithClosedInput(process);
-
-            // Drain stdout/stderr in parallel to prevent pipe deadlock
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
-            await process.WaitForExitAsync(cancellationToken);
-
-            // Await both tasks to ensure pipes are fully consumed before disposal
-            await Task.WhenAll(stdoutTask, stderrTask);
-
-            if (process.ExitCode == 0)
-                Console.Error.WriteLine("[WorkspaceService] Restore completed successfully.");
-            else
-            {
-                var stderr = await stderrTask;
-                Console.Error.WriteLine($"[WorkspaceService] Restore failed (exit {process.ExitCode}): {stderr.Trim()}");
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            await BuildProcessHelper.KillAndDrainAsync(process);
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[WorkspaceService] Restore failed: {ex.Message}");
-        }
-    }
-
-    /// <summary>
     /// Detects projects missing core framework references (System.Object, System.Int32, etc.)
     /// and injects the appropriate references based on target framework.
     /// </summary>
-    private static async Task<Solution> InjectMissingFrameworkReferencesAsync(
-        Solution solution, HashSet<ProjectId>? only, CancellationToken cancellationToken)
+    private static Solution InjectMissingFrameworkReferences(
+        Solution solution, HashSet<ProjectId>? only)
     {
         foreach (var project in solution.Projects)
         {
             if (only is not null && !only.Contains(project.Id)) continue;
-            var compilation = await project.GetCompilationAsync(cancellationToken);
-            if (compilation is null) continue;
-
-            // Check if System.Object is resolvable — if not, framework references are broken
-            var objectType = compilation.GetSpecialType(SpecialType.System_Object);
-            if (objectType.TypeKind != TypeKind.Error) continue;
+            if (ResolvesCorlib(project)) continue;
 
             var refsToAdd = GetFrameworkReferences(project);
             if (refsToAdd.Count == 0) continue;
@@ -1581,6 +2067,55 @@ internal static class WorkspaceService
         }
 
         return solution;
+    }
+
+    /// <summary>
+    /// Whether <see cref="SpecialType.System_Object"/> resolves from this project's metadata
+    /// references alone — the test for "did MSBuild give us a framework at all".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This used to be <c>await project.GetCompilationAsync(ct)</c> followed by the same
+    /// <c>GetSpecialType</c> call. That answers the question, and it answers it by parsing every
+    /// document in the project and binding every reference — so loading a solution parsed the whole
+    /// codebase, at load time, on the critical path, to ask something that depends only on
+    /// <see cref="Project.MetadataReferences"/>. It cost 1.3 seconds on a single generated contracts
+    /// project and grows with the source, not with the question.
+    /// </para>
+    /// <para>
+    /// A bare <c>CSharpCompilation</c> over the same references gives the identical verdict:
+    /// <c>GetSpecialType</c> reads the corlib's metadata and nothing else, and no syntax tree is
+    /// involved either way. The reference metadata it touches is the same memory-mapped, globally
+    /// cached metadata a real compilation of this project would touch, so the work is not repeated
+    /// later — it is only no longer accompanied by a full parse.
+    /// </para>
+    /// <para>
+    /// Not language-conditional: the probe is about metadata, and a VB or F# project's references
+    /// resolve or fail to resolve exactly the same way when read through a C# compilation.
+    /// </para>
+    /// </remarks>
+    private static bool ResolvesCorlib(Project project)
+    {
+        // No references at all means MSBuild evaluation produced nothing — ProjectFileInfo.CreateEmpty,
+        // the shape Roslyn leaves behind for a project whose evaluation failed. Short-circuited
+        // because building a compilation over an empty reference list to be told so is pure overhead.
+        if (project.MetadataReferences.Count == 0)
+            return false;
+
+        try
+        {
+            var probe = CSharpCompilation.Create("corlib-probe", references: project.MetadataReferences);
+            return probe.GetSpecialType(SpecialType.System_Object).TypeKind != TypeKind.Error;
+        }
+        catch (Exception ex)
+        {
+            // A reference that cannot be read as metadata (a deleted file, a native DLL wired in by
+            // mistake) throws here. That is precisely the broken-references case this probe exists
+            // to detect, so it is a "no", not a failure.
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Framework probe for '{project.Name}' could not read its references: {ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>
@@ -1678,6 +2213,45 @@ internal static class WorkspaceService
     }
 
 
+    /// <summary>
+    /// Splits one project load into the three phases that can each dominate it — restore,
+    /// <c>OpenProjectAsync</c>, post-open pipeline — so the load log says which one cost the time.
+    /// </summary>
+    /// <remarks>
+    /// A single "loaded X in 900 ms" line cannot distinguish a slow NuGet restore from a slow
+    /// MSBuild evaluation from a compilation forced by the post-open pipeline, and those three have
+    /// nothing in common with each other: different fix, different owner, different risk. The cost
+    /// of keeping them apart is one <see cref="Stopwatch"/> per load, against a load that is
+    /// hundreds of milliseconds at its very best.
+    /// </remarks>
+    private sealed class LoadPhaseTimings
+    {
+        private readonly Stopwatch _watch = new();
+        private long _lastMs;
+
+        public long RestoreMs;
+
+        /// <summary>Time spent queued behind another project's load on the same solution. Nonzero
+        /// here is the signal that the gate, not the work, is the bottleneck.</summary>
+        public long GateMs;
+
+        public long OpenMs;
+        public long PipelineMs;
+
+        public void Start() => _watch.Restart();
+
+        /// <summary>Charges everything since the previous mark to <paramref name="slot"/>.</summary>
+        public void Mark(ref long slot)
+        {
+            long now = _watch.ElapsedMilliseconds;
+            slot = now - _lastMs;
+            _lastMs = now;
+        }
+
+        public override string ToString() =>
+            $"[restore={RestoreMs}ms gate={GateMs}ms open={OpenMs}ms pipeline={PipelineMs}ms]";
+    }
+
     private sealed class CachedWorkspaceEntry : IDisposable
     {
         public string CacheKey { get; }
@@ -1756,6 +2330,7 @@ internal static class WorkspaceService
             if (newDirs is { Count: > 0 })
                 (ShadowDirs ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).UnionWith(newDirs);
         }
+
 
         /// <summary>
         /// Resolves the <see cref="Project"/> for the requested path, falling back to the

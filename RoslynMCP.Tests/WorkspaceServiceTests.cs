@@ -154,6 +154,22 @@ public class WorkspaceServiceTests
         }
     }
 
+    /// <remarks>
+    /// The pair to <see cref="WhenSourceFileModifiedAfterCacheThenDocumentTextIsRefreshed"/>: that
+    /// one proves the requested file <em>is</em> refreshed, this one proves the refresh is scoped
+    /// to it rather than re-stat-ing and reloading every document in the project on every query.
+    /// <para>
+    /// The materialising read below is load-bearing and used not to be. Loading a project used to
+    /// force a full <c>GetCompilationAsync</c> for every project, which parsed every document and
+    /// therefore snapshotted every document's text as a side effect — so this test could modify a
+    /// file and observe the old text without ever having asked for it. That compilation was removed
+    /// (it existed to answer a question about metadata references and cost the parse of an entire
+    /// codebase at load time), and without it Roslyn's <c>FileTextLoader</c> stays lazy: a document
+    /// nothing has read yet reads whatever is on disk when it is first asked, which is neither a
+    /// refresh nor a cache hit. Reading the text first makes the precondition explicit instead of
+    /// inherited from an unrelated implementation detail.
+    /// </para>
+    /// </remarks>
     [Fact]
     public async Task WhenUnrelatedFileModifiedThenCachedContentIsUsed()
     {
@@ -167,9 +183,16 @@ public class WorkspaceServiceTests
         try
         {
             // Populate cache via CalculatorFile (not the file we'll modify)
-            await WorkspaceService.GetOrOpenProjectAsync(
+            var (_, populated) = await WorkspaceService.GetOrOpenProjectAsync(
                 FixturePaths.SampleProjectFile,
                 targetFilePath: FixturePaths.CalculatorFile);
+
+            // Materialise the unrelated file's text into the cached workspace, so that what follows
+            // measures whether the re-query refreshes it — see the remarks above.
+            var cachedDoc = WorkspaceService.FindDocumentInProject(
+                populated, FixturePaths.WorkspaceRefreshTargetFile);
+            Assert.NotNull(cachedDoc);
+            Assert.DoesNotContain("sentinel-change", (await cachedDoc!.GetTextAsync()).ToString());
 
             // Modify WorkspaceRefreshTargetFile and advance its timestamp
             await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, modifiedContent);

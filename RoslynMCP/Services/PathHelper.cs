@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 
@@ -6,8 +8,83 @@ namespace RoslynMCP.Services;
 /// <summary>
 /// Centralizes file-path normalization used by every MCP tool.
 /// </summary>
-internal static class PathHelper
+internal static partial class PathHelper
 {
+    [GeneratedRegex("""Sdk\s*=\s*["']([^"']+)["']""", RegexOptions.IgnoreCase)]
+    private static partial Regex SdkAttributeRegex();
+
+    [GeneratedRegex("""Name\s*=\s*["']([^"']+)["']""", RegexOptions.IgnoreCase)]
+    private static partial Regex SdkNameAttributeRegex();
+
+    [GeneratedRegex(
+        @"Project\(""[^""]*""\)\s*=\s*""[^""]*""\s*,\s*""([^""]+\.(?:csproj|vbproj|fsproj))""",
+        RegexOptions.IgnoreCase)]
+    private static partial Regex SolutionProjectLineRegex();
+
+    /// <summary>
+    /// Identity of a file as of a particular read: its length and last-write time. Two reads that
+    /// agree on both are treated as reads of the same content.
+    /// </summary>
+    /// <remarks>
+    /// Length as well as timestamp, because a file rewritten inside the filesystem's timestamp
+    /// granularity — which a code generator or a fast <c>git checkout</c> genuinely does — changes
+    /// length far more often than it does not. Missing files get a distinct sentinel so "not there"
+    /// caches too and a repeated miss is not a repeated <c>File.Exists</c> plus a failed open.
+    /// </remarks>
+    private readonly record struct FileStamp(long Length, long TicksUtc)
+    {
+        public static readonly FileStamp Missing = new(-1, -1);
+
+        public static FileStamp Of(string path)
+        {
+            try
+            {
+                var info = new FileInfo(path);
+                return info.Exists ? new FileStamp(info.Length, info.LastWriteTimeUtc.Ticks) : Missing;
+            }
+            catch
+            {
+                return Missing;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A value derived purely from one file's content, remembered until that file changes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The parses on this path are small individually and enormous in aggregate. A single cold
+    /// project load used to re-read a 34-project <c>.sln</c> several times over and open every
+    /// <c>.csproj</c> it lists — once to decide the owning solution, once to pick a restore target,
+    /// once per proto consumer scan — and every one of those reads produced the same answer as the
+    /// last, because none of the files had changed in between.
+    /// </para>
+    /// <para>
+    /// Keyed on the file's own length and timestamp rather than on a generation counter or an
+    /// explicit invalidation call: a <c>.sln</c> or <c>.csproj</c> can be edited by the user, by
+    /// <c>git</c>, or by <c>dotnet sln add</c> without anything in this process being told, and a
+    /// cache that needed to be told would serve a stale project list until restart.
+    /// </para>
+    /// </remarks>
+    private static class FileDerived<T>
+    {
+        private static readonly ConcurrentDictionary<string, (FileStamp Stamp, T Value)> s_cache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public static T Get(string path, Func<string, T> compute)
+        {
+            var stamp = FileStamp.Of(path);
+
+            if (s_cache.TryGetValue(path, out var cached) && cached.Stamp == stamp)
+                return cached.Value;
+
+            T value = compute(path);
+            s_cache[path] = (stamp, value);
+            return value;
+        }
+    }
+
     /// <summary>
     /// Reads the SDK attribute from a .csproj file (e.g., "Microsoft.NET.Sdk.Web").
     /// Returns null if the file is legacy (non-SDK-style) or cannot be read.
@@ -17,6 +94,11 @@ internal static class PathHelper
         if (!projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
             return null;
 
+        return FileDerived<string?>.Get(projectPath, ReadProjectSdkUncached);
+    }
+
+    private static string? ReadProjectSdkUncached(string projectPath)
+    {
         try
         {
             using var reader = new StreamReader(projectPath);
@@ -26,9 +108,7 @@ internal static class PathHelper
                 line = line.TrimStart();
                 if (line.StartsWith("<Project", StringComparison.OrdinalIgnoreCase))
                 {
-                    var match = System.Text.RegularExpressions.Regex.Match(
-                        line, """Sdk\s*=\s*["']([^"']+)["']""",
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    var match = SdkAttributeRegex().Match(line);
                     if (match.Success)
                         return match.Groups[1].Value;
                     break;
@@ -37,9 +117,7 @@ internal static class PathHelper
                 // Also check for <Sdk Name="..."/> import style
                 if (line.StartsWith("<Sdk", StringComparison.OrdinalIgnoreCase))
                 {
-                    var match = System.Text.RegularExpressions.Regex.Match(
-                        line, """Name\s*=\s*["']([^"']+)["']""",
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    var match = SdkNameAttributeRegex().Match(line);
                     if (match.Success)
                         return match.Groups[1].Value;
                 }
@@ -62,11 +140,25 @@ internal static class PathHelper
     /// <summary>
     /// Returns true if a .sln contains at least one legacy .csproj.
     /// </summary>
+    /// <remarks>
+    /// Cached against the <c>.sln</c>'s own stamp only, not against the projects it lists. The
+    /// answer does depend on those projects, so in principle a project converted from legacy to
+    /// SDK-style without touching the <c>.sln</c> goes unnoticed until the solution file changes.
+    /// That is the right trade: this opens every project in the solution to compute one boolean,
+    /// stamping all of them would cost most of what the cache saves, and the two callers — pick a
+    /// restore target, pick MSBuild vs the dotnet CLI — both degrade to "slower but correct" rather
+    /// than to a wrong answer.
+    /// </remarks>
     public static bool IsLegacySolution(string slnPath)
     {
         if (!IsSolutionFile(slnPath) || !File.Exists(slnPath))
             return false;
 
+        return FileDerived<bool>.Get(slnPath, IsLegacySolutionUncached);
+    }
+
+    private static bool IsLegacySolutionUncached(string slnPath)
+    {
         var slnDir = Path.GetDirectoryName(slnPath)!;
 
         try
@@ -75,13 +167,9 @@ internal static class PathHelper
                 return IsLegacySolutionXml(slnPath, slnDir);
 
             // Parse Project("{type}") = "Name", "relative\path.csproj", "{GUID}" lines
-            var projectLineRegex = new System.Text.RegularExpressions.Regex(
-                @"Project\(""[^""]*""\)\s*=\s*""[^""]*""\s*,\s*""([^""]+\.(?:csproj|vbproj|fsproj))""",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
             foreach (var line in File.ReadLines(slnPath))
             {
-                var match = projectLineRegex.Match(line);
+                var match = SolutionProjectLineRegex().Match(line);
                 if (!match.Success) continue;
 
                 var relativePath = match.Groups[1].Value.Replace('/', Path.DirectorySeparatorChar);
@@ -184,7 +272,17 @@ internal static class PathHelper
     /// Parses a .sln or .slnx file and returns the absolute paths of all .csproj projects it references.
     /// Returns an empty list if the file cannot be read or contains no C# projects.
     /// </summary>
-    public static List<string> GetProjectsFromSolution(string solutionPath)
+    /// <remarks>
+    /// Memoized against the solution file's own stamp. This is read on every workspace cache miss,
+    /// on every restore-target decision and on every cross-project reference sweep, and it is a
+    /// pure function of the file — so the second and every later read of an unchanged <c>.sln</c>
+    /// was a full <c>File.ReadAllLines</c> and re-parse for a list the process already had.
+    /// The returned list is shared, so callers must not mutate it.
+    /// </remarks>
+    public static List<string> GetProjectsFromSolution(string solutionPath) =>
+        FileDerived<List<string>>.Get(solutionPath, GetProjectsFromSolutionUncached);
+
+    private static List<string> GetProjectsFromSolutionUncached(string solutionPath)
     {
         var slnDir = Path.GetDirectoryName(solutionPath)!;
         var result = new List<string>();

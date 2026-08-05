@@ -33,6 +33,11 @@ internal sealed class ShadowCopyManager : IDisposable
     private readonly Dictionary<string, Timer> _debounceTimers = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly string _nugetPackagesDir;
+
+    /// <summary>Directory trees a build never writes to, so analyzers in them can be loaded in
+    /// place. See <see cref="NeedsShadowCopy"/>.</summary>
+    private readonly string[] _immutableRoots;
+
     private int _generationCounter;
     private bool _disposed;
 
@@ -45,6 +50,7 @@ internal sealed class ShadowCopyManager : IDisposable
     public ShadowCopyManager()
     {
         _nugetPackagesDir = GetNuGetPackagesDirectory();
+        _immutableRoots = BuildImmutableRoots(_nugetPackagesDir);
         CleanupStaleInstances();
 
         _instanceDir = Path.Combine(BaseDir, Guid.NewGuid().ToString("N"));
@@ -59,16 +65,99 @@ internal sealed class ShadowCopyManager : IDisposable
 
     /// <summary>
     /// Returns <c>true</c> when the analyzer at <paramref name="path"/> should be
-    /// shadow-copied. Skipped for the NuGet global packages folder (immutable) and for
-    /// paths already inside our own shadow root (avoids double-shadowing on re-loads).
+    /// shadow-copied. Skipped for anything that a build cannot overwrite: the NuGet global
+    /// packages folder, the .NET installation, and our own shadow root.
     /// </summary>
-    public bool NeedsShadowCopy(string path)
+    /// <remarks>
+    /// <para>
+    /// Shadow copying exists for exactly one reason — an analyzer or source generator that this
+    /// process has loaded is locked on disk, and MSBuild then cannot overwrite it, so
+    /// <c>dotnet build</c> fails on a project that generates its own analyzers. That reason applies
+    /// to build output and to nothing else, and every directory a build never writes to is a
+    /// directory whose analyzers can be loaded in place.
+    /// </para>
+    /// <para>
+    /// The .NET installation is the omission that mattered. Every SDK-style project references the
+    /// SDK's own analyzers under <c>&lt;dotnet&gt;/sdk/&lt;version&gt;/Sdks/Microsoft.NET.Sdk/analyzers</c>
+    /// and the targeting pack's under <c>&lt;dotnet&gt;/packs/…/analyzers</c>, so every server
+    /// instance copied those directories out of an installed, read-only tree and then armed a
+    /// <see cref="FileSystemWatcher"/> over <c>C:\Program Files\dotnet</c> waiting for a rebuild
+    /// that cannot happen.
+    /// </para>
+    /// <para>
+    /// Measured, the copy itself is only about 15 ms — the directories are small and the OS cache is
+    /// warm — so this is not a latency fix and should not be sold as one. What it removes is the
+    /// standing cost: two recursive watchers per server instance pointed at the .NET installation,
+    /// the temp-directory copies they keep alive, and the assembly-load-context pin that made the
+    /// SDK's own analyzers unshareable between instances.
+    /// </para>
+    /// </remarks>
+    public bool NeedsShadowCopy(string path) => !IsUnderImmutableRoot(path);
+
+    private bool IsUnderImmutableRoot(string path)
     {
-        if (path.StartsWith(_nugetPackagesDir, StringComparison.OrdinalIgnoreCase))
+        foreach (string root in _immutableRoots)
+        {
+            if (IsUnder(path, root))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is inside <paramref name="root"/>, comparing whole path
+    /// segments so that a sibling directory whose name merely starts the same way — a
+    /// <c>packages.backup</c> beside <c>packages</c> — is not swallowed by it.
+    /// </summary>
+    private static bool IsUnder(string path, string root)
+    {
+        if (root.Length == 0)
             return false;
-        if (path.StartsWith(BaseDir, StringComparison.OrdinalIgnoreCase))
-            return false;
-        return true;
+
+        string normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        return path.Length > normalizedRoot.Length
+            && path.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase)
+            && (path[normalizedRoot.Length] == Path.DirectorySeparatorChar
+                || path[normalizedRoot.Length] == Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// The root of the .NET installation this process is running on, or <c>null</c> when it cannot
+    /// be identified with confidence.
+    /// </summary>
+    /// <remarks>
+    /// Derived from the runtime directory — <c>&lt;dotnet&gt;/shared/Microsoft.NETCore.App/&lt;version&gt;</c>,
+    /// so three levels up — and then confirmed by looking for the <c>sdk</c> or <c>packs</c>
+    /// directory that the analyzers in question actually live under. A guess that cannot be
+    /// confirmed returns <c>null</c> and everything keeps being shadow-copied, because copying a
+    /// directory that did not need it wastes a second and failing to copy one that did breaks the
+    /// user's build.
+    /// </remarks>
+    private static string? TryFindDotnetRoot()
+    {
+        try
+        {
+            var directory = new DirectoryInfo(
+                System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory());
+
+            for (int up = 0; up < 3 && directory is not null; up++)
+                directory = directory.Parent;
+
+            if (directory is null)
+                return null;
+
+            bool looksLikeDotnetRoot =
+                Directory.Exists(Path.Combine(directory.FullName, "sdk"))
+                || Directory.Exists(Path.Combine(directory.FullName, "packs"));
+
+            return looksLikeDotnetRoot ? directory.FullName : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -225,6 +314,20 @@ internal sealed class ShadowCopyManager : IDisposable
     }
 
     // ───────────────────────── NuGet cache detection ─────────────────────────
+
+    private static string[] BuildImmutableRoots(string nugetPackagesDir)
+    {
+        var roots = new List<string> { nugetPackagesDir, BaseDir };
+
+        if (TryFindDotnetRoot() is { } dotnetRoot)
+        {
+            roots.Add(dotnetRoot);
+            Console.Error.WriteLine(
+                $"[ShadowCopy] Loading analyzers in place from the .NET installation at '{dotnetRoot}'.");
+        }
+
+        return [.. roots];
+    }
 
     private static string GetNuGetPackagesDirectory()
     {

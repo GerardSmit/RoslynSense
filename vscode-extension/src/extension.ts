@@ -165,6 +165,8 @@ async function solutionForFolder(
         .get<string>('solutionPath', '');
 
     let resolved: string | undefined = configured || undefined;
+    resolved ??= await solutionAtRoot(folder);
+
     if (!resolved) {
         const found = await vscode.workspace.findFiles(
             new vscode.RelativePattern(folder, '**/*.{sln,slnx}'),
@@ -181,6 +183,35 @@ async function solutionForFolder(
 
     solutionByFolder.set(key, resolved);
     return resolved;
+}
+
+/**
+ * The single solution file sitting directly in the root, or nothing.
+ *
+ * One directory read, ahead of the recursive `findFiles` below it, because that is where a solution
+ * almost always is and because `findFiles` is not cheap on the repositories where startup latency
+ * is actually felt: it walks the tree — or waits on VS Code's file index to finish being built —
+ * and activation was awaiting it before the language client had been started at all. A
+ * `readDirectory` is a single syscall against a directory the editor has open anyway.
+ *
+ * Silent on anything other than exactly one match. Zero means look harder; more than one is
+ * genuinely ambiguous and the recursive search reaches the same conclusion by the same rule, so
+ * answering here would only duplicate the decision in two places.
+ */
+async function solutionAtRoot(folder: vscode.WorkspaceFolder): Promise<string | undefined> {
+    try {
+        const entries = await vscode.workspace.fs.readDirectory(folder.uri);
+        const solutions = entries
+            .filter(([name, type]) => type === vscode.FileType.File && /\.slnx?$/i.test(name))
+            .map(([name]) => name);
+
+        return solutions.length === 1
+            ? vscode.Uri.joinPath(folder.uri, solutions[0]).fsPath
+            : undefined;
+    } catch {
+        // Unreadable root (a virtual or disconnected workspace) — let the search below decide.
+        return undefined;
+    }
 }
 
 async function pickSolution(): Promise<string | undefined> {

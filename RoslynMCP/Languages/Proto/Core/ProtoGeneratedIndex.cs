@@ -348,10 +348,12 @@ internal sealed class ProtoGeneratedIndex
         if (protoPaths.Count == 0)
             return Empty;
 
+        var buildWatch = System.Diagnostics.Stopwatch.StartNew();
         var compilation = await project.GetCompilationAsync(ct);
         if (compilation is null)
             return Empty;
 
+        long compilationMs = buildWatch.ElapsedMilliseconds;
         string fingerprint = Fingerprint(protoPaths);
 
         if (s_indexes.TryGetValue(project.Id, out var cachedIndex)
@@ -373,8 +375,23 @@ internal sealed class ProtoGeneratedIndex
             s_scans[project.Id] = new ScanCacheEntry(compilation, scan);
         }
 
+        long scanMs = buildWatch.ElapsedMilliseconds - compilationMs;
+
         var index = Build(protoPaths, scan, ct);
         s_indexes[project.Id] = new IndexCacheEntry(compilation, fingerprint, index);
+
+        // Only a genuinely expensive build is worth a line. This is the cost that sits between a
+        // .proto being opened and its first code lens appearing, and it splits into two halves with
+        // completely different owners: the compilation is Roslyn binding protoc's generated output,
+        // the scan is this file walking it.
+        if (buildWatch.ElapsedMilliseconds >= 200)
+        {
+            Console.Error.WriteLine(
+                $"[Proto] Built the generated-code index for '{Path.GetFileName(project.FilePath)}' " +
+                $"in {buildWatch.ElapsedMilliseconds} ms [compilation={compilationMs}ms scan={scanMs}ms " +
+                $"build={buildWatch.ElapsedMilliseconds - compilationMs - scanMs}ms].");
+        }
+
         return index;
     }
 

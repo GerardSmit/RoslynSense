@@ -385,7 +385,7 @@ internal static class MediatorNavigationService
             if (compilation is null || MediatorTypes.For(compilation) is null)
                 continue;
 
-            foreach (var type in DeclaredTypes(compilation.Assembly.GlobalNamespace, ct))
+            foreach (var type in MediatorHandlerIndex.HandlerTypes(compilation, ct))
             {
                 if (MediatorSymbols.HandlerInterfacesOf(type)
                     .Any(h => MediatorSymbols.MessagesMatch(h.Message.Type, message.Type)))
@@ -396,27 +396,5 @@ internal static class MediatorNavigationService
         }
 
         return found;
-    }
-
-    private static IEnumerable<INamedTypeSymbol> DeclaredTypes(INamespaceSymbol root, CancellationToken ct)
-    {
-        foreach (var member in root.GetMembers())
-        {
-            ct.ThrowIfCancellationRequested();
-
-            switch (member)
-            {
-                case INamespaceSymbol nested:
-                    foreach (var type in DeclaredTypes(nested, ct))
-                        yield return type;
-                    break;
-
-                case INamedTypeSymbol type:
-                    yield return type;
-                    foreach (var nested in type.GetTypeMembers())
-                        yield return nested;
-                    break;
-            }
-        }
     }
 }

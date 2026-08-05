@@ -148,6 +148,85 @@ public class WebFormsLspTests
                 .EndsWith("Designer.aspx", StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// A tag naming a user control opens the control's markup, not its class.
+    /// </summary>
+    /// <remarks>
+    /// A user control <em>is</em> its <c>.ascx</c>: the tags, the layout and the IDs a caller came
+    /// to read are there, while the class holds the handlers. F12 used to offer both halves of that
+    /// class's partial — the code-behind and the generated designer — so the gesture was a picker
+    /// between two files, one of which the next regeneration overwrites.
+    /// </remarks>
+    [Fact]
+    public async Task GoToDefinitionOnAUserControlTagOpensItsMarkup()
+    {
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.UsesUserControlFile),
+                PositionOf(FixturePaths.UsesUserControlFile, "uc:OrderItems runat", 4)),
+            typeDefinition: false,
+            default);
+
+        var location = Assert.Single(locations);
+        Assert.EndsWith("OrderItems.ascx", Uri.UnescapeDataString(location.Uri));
+
+        // Not the code-behind beside it: staying in markup is the point.
+        Assert.DoesNotContain(
+            locations,
+            candidate => Uri.UnescapeDataString(candidate.Uri)
+                .EndsWith("OrderItems.ascx.cs", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// A control that is only a class still resolves to the class.
+    /// </summary>
+    /// <remarks>
+    /// <c>LocalizedLabel</c> is a plain <c>WebControl</c> subclass with no markup of its own, which
+    /// is also the shape of every control from a referenced assembly. The markup preference has to
+    /// decline for those rather than leave F12 with nothing.
+    /// </remarks>
+    [Fact]
+    public async Task GoToDefinitionOnACodeOnlyControlTagStillReachesItsClass()
+    {
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.LocalizedAspxFile),
+                PositionOf(FixturePaths.LocalizedAspxFile, "uc:LocalizedLabel", 4)),
+            typeDefinition: false,
+            default);
+
+        Assert.NotEmpty(locations);
+        Assert.All(
+            locations,
+            location => Assert.EndsWith(
+                "LocalizedLabel.cs", Uri.UnescapeDataString(location.Uri)));
+    }
+
+    /// <summary>
+    /// No markup-side answer ever includes a generated designer.
+    /// </summary>
+    /// <remarks>
+    /// The withdrawal used to live only on the C# side, where it runs through
+    /// <c>ILanguageSupersedingContributor</c>; the markup handler calls
+    /// <c>DefinitionLocationsAsync</c> directly and never consulted a contributor, so the same
+    /// designer that F12 from C# had stopped offering was still offered from the page.
+    /// </remarks>
+    [Fact]
+    public async Task NoMarkupDefinitionOffersAGeneratedDesigner()
+    {
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.DesignerAspxFile),
+                PositionOf(FixturePaths.DesignerAspxFile, "asp:Repeater", 5)),
+            typeDefinition: false,
+            default);
+
+        Assert.DoesNotContain(
+            locations,
+            candidate => Uri.UnescapeDataString(candidate.Uri)
+                .EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase));
+    }
+
     /// <summary>The type is still a definition, so Ctrl+F12 on the same caret is unaffected.</summary>
     [Fact]
     public async Task TypeDefinitionOnAControlIdStillReachesTheControlClass()

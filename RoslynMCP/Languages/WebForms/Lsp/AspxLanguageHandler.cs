@@ -63,8 +63,19 @@ internal static class AspxLanguageHandler
         if (hit is { Kind: AspxHitKind.ControlId, Symbol: { } declared } && !typeDefinition)
             return await ControlIdUsagesAsync(document, hit, declared, ct);
 
+        // A tag naming a user control: its markup is the control, not the class behind it.
+        if (hit is { Kind: AspxHitKind.ControlType, Symbol: INamedTypeSymbol control }
+            && await UserControlMarkupAsync(control, ct) is { } markup)
+        {
+            return markup;
+        }
+
         if (hit is { Symbol: { } symbol })
-            return await NavigationHandlers.DefinitionLocationsAsync(symbol, document.Project, typeDefinition, ct);
+        {
+            return WithoutDesigners(
+                await NavigationHandlers.DefinitionLocationsAsync(
+                    symbol, document.Project, typeDefinition, ct));
+        }
 
         if (await ProjectedSymbolAsync(document, offset, ct) is { } projected)
         {
@@ -78,6 +89,86 @@ internal static class AspxLanguageHandler
         }
 
         return [];
+    }
+
+    /// <summary>
+    /// The <c>.ascx</c> behind a tag, or null when the tag names a control that is only a class.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A user control is its markup. The class in <c>CustomControl.ascx.cs</c> holds the handlers,
+    /// but the tags, the layout and the <c>ID</c>s a caller came to read are in the
+    /// <c>.ascx</c> — and F12 from a page into a <c>partial class</c> declaration is a jump out of
+    /// the language the reader is working in, for a file that is half of the answer at best. The
+    /// class is still one hop away, by F12 on anything inside the control it opens.
+    /// </para>
+    /// <para>
+    /// The markup is derived from the type's own declaring files rather than from the
+    /// <c>&lt;%@ Register Src="…" %&gt;</c> that brought the tag into scope. A prefix registered in
+    /// <c>web.config</c> carries no <c>Src</c> at all, and a page that inherits its registrations
+    /// from a master never wrote one — deriving from the class covers every way the tag could have
+    /// resolved, and it is the same mapping the designer withdrawal uses in reverse.
+    /// </para>
+    /// <para>
+    /// A control with no markup — a plain <c>WebControl</c> subclass, or anything from a referenced
+    /// assembly — returns null so the caller falls through to the C# declaration it would have
+    /// given before.
+    /// </para>
+    /// </remarks>
+    private static async Task<LspLocation[]?> UserControlMarkupAsync(
+        INamedTypeSymbol control, CancellationToken ct)
+    {
+        var results = new List<LspLocation>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var reference in control.OriginalDefinition.DeclaringSyntaxReferences)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (reference.SyntaxTree.FilePath is not { Length: > 0 } declaring
+                || AspxSourceMappingService.MarkupPathFor(declaring) is not { } markupPath
+                || !seen.Add(markupPath))
+            {
+                continue;
+            }
+
+            // Loaded, not merely derived: a class named after a page it does not belong to would
+            // otherwise send F12 to a file that has nothing to do with the tag.
+            var index = await WebFormsIndex.GetAsync(markupPath, ct);
+            if (index is null)
+                continue;
+
+            // The Inherits value, which is where the markup names this class — the closest thing a
+            // page has to a declaration of it, and it puts the caret at the top of the file either
+            // way.
+            results.Add(new LspLocation(
+                LspConverters.PathToUri(markupPath),
+                index.Inherits is { Length: > 0 }
+                    ? LspConverters.ToRange(index.InheritsSpan)
+                    : new LspRange(new Position(0, 0), new Position(0, 0))));
+        }
+
+        return results.Count > 0 ? [.. results] : null;
+    }
+
+    /// <summary>
+    /// The same results without the generated designer halves.
+    /// </summary>
+    /// <remarks>
+    /// A designer is a transcription of markup the caret is already in, so from a markup file it is
+    /// never the useful half of a <c>partial class</c> — F12 on a tag offered both and made the
+    /// editor ask which. Dropped only while something else survives, for the reason
+    /// <c>NavigationHandlers</c> applies to its own withdrawal: landing somewhere imperfect beats a
+    /// gesture that reports nothing.
+    /// </remarks>
+    private static LspLocation[] WithoutDesigners(LspLocation[] locations)
+    {
+        var kept = locations
+            .Where(location =>
+                !AspxSourceMappingService.IsDesignerPath(LspConverters.UriToPath(location.Uri)))
+            .ToArray();
+
+        return kept.Length > 0 ? kept : locations;
     }
 
     /// <summary>

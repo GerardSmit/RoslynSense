@@ -27,6 +27,37 @@ internal static class AspxSourceMappingService
         return s_aspxExtensions.Any(e => string.Equals(ext, e, StringComparison.OrdinalIgnoreCase));
     }
 
+    private const string DesignerSuffix = ".designer.cs";
+
+    /// <summary>
+    /// The markup file a code-behind or designer file belongs to, or null when the path is
+    /// neither.
+    /// </summary>
+    /// <remarks>
+    /// The path <em>is</em> the relationship — ASP.NET names both halves after the page — and the
+    /// generator on the other end of this repository does the same derivation forwards (see
+    /// <c>AspxDesignerGenerator.GetDesignerPath</c>). Existence is deliberately not checked: every
+    /// caller goes on to load the markup, and a check here would be a second stat of a file that
+    /// is about to be read anyway.
+    /// </remarks>
+    public static string? MarkupPathFor(string declaringPath)
+    {
+        if (!declaringPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        string candidate = declaringPath.EndsWith(DesignerSuffix, StringComparison.OrdinalIgnoreCase)
+            ? declaringPath[..^DesignerSuffix.Length]
+            : declaringPath[..^".cs".Length];
+
+        return IsAspxFile(candidate) ? candidate : null;
+    }
+
+    /// <summary>Whether a path is the generated designer of a markup file. String work only — the
+    /// navigation handlers run this per result.</summary>
+    public static bool IsDesignerPath(string path) =>
+        path.EndsWith(DesignerSuffix, StringComparison.OrdinalIgnoreCase)
+        && IsAspxFile(path[..^DesignerSuffix.Length]);
+
     /// <summary>
     /// Parses an ASPX file and returns a structured result with all extracted elements.
     /// </summary>

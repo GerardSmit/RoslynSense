@@ -48,6 +48,9 @@ internal static class FixturePaths
     public static string DesignerAspxFile => Path.Combine(AspxProjectDir, "Designer.aspx");
     public static string DesignerAspxDesignerFile => Path.Combine(AspxProjectDir, "Designer.aspx.designer.cs");
     public static string DesignerAspxCodeBehindFile => Path.Combine(AspxProjectDir, "Designer.aspx.cs");
+    public static string UsesUserControlFile => Path.Combine(AspxProjectDir, "UsesUserControl.aspx");
+    public static string OrderItemsCodeBehindFile =>
+        Path.Combine(AspxProjectDir, "Controls", "OrderItems.ascx.cs");
     public static string EventWiringAspxFile => Path.Combine(AspxProjectDir, "EventWiring.aspx");
     public static string EventWiringCodeBehindFile => Path.Combine(AspxProjectDir, "EventWiring.aspx.cs");
     public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");

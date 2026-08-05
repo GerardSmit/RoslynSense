@@ -47,7 +47,7 @@ internal sealed partial class WebFormsLanguage :
             ct.ThrowIfCancellationRequested();
 
             if (reference.SyntaxTree.FilePath is not { Length: > 0 } declaringPath
-                || MarkupPathFor(declaringPath) is not { } markupPath
+                || AspxSourceMappingService.MarkupPathFor(declaringPath) is not { } markupPath
                 || !seen.Add(markupPath))
             {
                 continue;
@@ -94,29 +94,7 @@ internal sealed partial class WebFormsLanguage :
     /// matching <c>ID</c> keeps whatever Roslyn found.
     /// </remarks>
     public bool Supersedes(LspLocation location) =>
-        IsDesignerFor(LspConverters.UriToPath(location.Uri));
-
-    /// <summary>
-    /// The markup file a code-behind or designer file belongs to, or null when the path is
-    /// neither.
-    /// </summary>
-    private static string? MarkupPathFor(string declaringPath)
-    {
-        if (!declaringPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        string candidate = declaringPath.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase)
-            ? declaringPath[..^".designer.cs".Length]
-            : declaringPath[..^".cs".Length];
-
-        return AspxDocumentService.IsAspxFile(candidate) ? candidate : null;
-    }
-
-    /// <summary>Whether a path is the generated designer of a markup file. String work only —
-    /// <see cref="Supersedes"/> runs per result on every navigation in the solution.</summary>
-    private static bool IsDesignerFor(string path) =>
-        path.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase)
-        && AspxDocumentService.IsAspxFile(path[..^".designer.cs".Length]);
+        AspxSourceMappingService.IsDesignerPath(LspConverters.UriToPath(location.Uri));
 
     public async Task<IReadOnlyList<LspLocation>> ReferencesAsync(
         ISymbol symbol, Project project, CancellationToken ct, bool waitForCompleteScope = false)

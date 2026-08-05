@@ -106,11 +106,13 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
       <button class="action" id="source-add">Add feed…</button>
       <button class="linklike" id="source-open-config">Open NuGet.config</button>
       <span class="spacer"></span>
-      <span class="muted">Order decides which feed answers first.</span>
+      <span class="muted">Drag to reorder · Alt+↑/↓</span>
     </div>
     <ul id="sources-list" aria-label="Configured feeds"></ul>
     <p class="muted footnote">
       Credentials are kept in the OS keychain, never written to NuGet.config.
+      Restore queries all enabled feeds in parallel; use Package Source Mapping in NuGet.config
+      to control which feed serves a package.
     </p>
   </div>
 </section>

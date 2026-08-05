@@ -56,7 +56,7 @@ internal sealed record AspxDocument(
 internal static class AspxDocumentService
 {
     private sealed record CacheEntry(
-        string Text,
+        ImmutableArray<byte> Checksum,
         VersionStamp SemanticVersion,
         ImmutableArray<(DocumentId Id, VersionStamp Version)> CodeBehindVersions,
         AspxDocument Document);
@@ -82,8 +82,8 @@ internal static class AspxDocumentService
 
         string path = PathHelper.NormalizePath(filePath);
 
-        string? text = ReadText(path);
-        if (text is null)
+        var sourceText = ReadSourceText(path);
+        if (sourceText is null)
             return null;
 
         string? projectPath = await NonCSharpProjectFinder.FindProjectAsync(path, ct);
@@ -94,12 +94,15 @@ internal static class AspxDocumentService
             projectPath, targetFilePath: path, cancellationToken: ct);
 
         // The staleness test runs before the compilation is asked for: on a hit, a hover in
-        // markup after a C# body edit no longer waits for that edit to compile.
+        // markup after a C# body edit no longer waits for that edit to compile. The text is
+        // compared by the buffer's own checksum — materializing an open buffer into a string
+        // costs a full copy, and this runs on every request.
         var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
+        var checksum = sourceText.GetChecksum();
 
         if (s_cache.TryGetValue(path, out var cached)
             && cached.SemanticVersion.Equals(semanticVersion)
-            && string.Equals(cached.Text, text, StringComparison.Ordinal)
+            && cached.Checksum.SequenceEqual(checksum)
             && await UnchangedAsync(project, cached.CodeBehindVersions, ct))
         {
             return cached.Document;
@@ -112,16 +115,17 @@ internal static class AspxDocumentService
         string? projectDir = Path.GetDirectoryName(projectPath);
         var namespaces = projectDir is null ? default : WebConfigNamespaces(projectDir);
 
+        string text = sourceText.ToString();
         var parse = AspxSourceMappingService.Parse(
             path, text, compilation,
             namespaces: namespaces.IsDefaultOrEmpty ? null : namespaces,
             rootDirectory: projectDir);
 
         var document = new AspxDocument(
-            path, text, SourceText.From(text), project, compilation, parse);
+            path, text, sourceText, project, compilation, parse);
 
         s_cache[path] = new CacheEntry(
-            text, semanticVersion, await CodeBehindVersionsAsync(project, document, ct), document);
+            checksum, semanticVersion, await CodeBehindVersionsAsync(project, document, ct), document);
         return document;
     }
 
@@ -165,14 +169,14 @@ internal static class AspxDocumentService
     }
 
     /// <summary>Open buffer first — an unsaved edit is what the user is looking at.</summary>
-    private static string? ReadText(string path)
+    private static SourceText? ReadSourceText(string path)
     {
         if (OpenDocumentStore.TryGet(path, out var open))
-            return open.ToString();
+            return open;
 
         try
         {
-            return File.Exists(path) ? File.ReadAllText(path) : null;
+            return File.Exists(path) ? SourceText.From(File.ReadAllText(path)) : null;
         }
         catch (IOException)
         {

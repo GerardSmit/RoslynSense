@@ -735,7 +735,15 @@ public ref struct Lexer
 
     private TokenString CreateString(TokenPosition start, TokenPosition end)
     {
-        return new TokenString(_input.Slice(start.Offset, end.Offset - start.Offset).ToString(), new TokenRange(File, start, end));
+        // Clamped rather than trusted. Every token in the file is cut here, so this is the one
+        // place where a position that ran off the end turns into an exception out of the parse —
+        // and an exception out of the parse costs the file every markup feature at once, plus its
+        // code-behind's C# lenses. A token that reports a slightly short span is a far better
+        // outcome than a page with no hover, no folding and no diagnostics.
+        int from = Math.Clamp(start.Offset, 0, _input.Length);
+        int to = Math.Clamp(end.Offset, from, _input.Length);
+
+        return new TokenString(_input.Slice(from, to - from).ToString(), new TokenRange(File, start, end));
     }
 
     public void SkipWhiteSpace()
@@ -938,7 +946,19 @@ public ref struct Lexer
 
             if (current == '\\')
             {
+                // Skip what the backslash escapes — but only if there is one. `continue` runs the
+                // loop's own Forward() as well, so this branch advances twice against a single
+                // bounds check, and a file whose last character is a backslash ends with the
+                // offset one past the end. The token built from that position then slices past the
+                // buffer and throws out of the middle of parsing, which costs the file every
+                // markup feature it has.
                 Forward();
+
+                if (_offset >= _input.Length)
+                {
+                    break;
+                }
+
                 continue;
             }
 

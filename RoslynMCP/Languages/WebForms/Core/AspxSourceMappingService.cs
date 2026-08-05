@@ -41,12 +41,56 @@ internal static class AspxSourceMappingService
     /// <param name="rootDirectory">
     /// Optional project root directory used to resolve <c>@Register src="~/..."</c> paths.
     /// </param>
+    /// <remarks>
+    /// <para>
+    /// Nothing the parser can do to itself is allowed past this method. Every markup feature —
+    /// hover, folding, document symbols, semantic tokens, document links, code actions, code lens,
+    /// diagnostics — asks for the parse first, and the code-behind's C# code lens asks this pack
+    /// for markup references, so an exception in here does not break one feature. It breaks two
+    /// files entirely, and it does it on every keystroke.
+    /// </para>
+    /// <para>
+    /// That is too much to rest on a parser being free of bugs. It was not: three separate ones
+    /// surfaced this way in a single afternoon — a diagnostic whose location had no file, a token
+    /// range with no file behind it, and a tag that wrote <c>runat</c> twice — each found only
+    /// when somebody opened the one file that triggered it. Each is fixed at its source, and this
+    /// is what makes the next one cost a file's markup features rather than the file.
+    /// </para>
+    /// <para>
+    /// Deliberately not a substitute for fixing them. A parse that fails still says so, as a
+    /// diagnostic on the file, so the failure is visible rather than quietly empty.
+    /// </para>
+    /// </remarks>
     public static AspxParseResult Parse(
         string filePath,
         string text,
         Compilation compilation,
         IEnumerable<KeyValuePair<string, string>>? namespaces = null,
         string? rootDirectory = null)
+    {
+        try
+        {
+            return ParseCore(filePath, text, compilation, namespaces, rootDirectory);
+        }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not parse '{Path.GetFileName(filePath)}': {ex.GetType().Name}: {ex.Message}",
+                key: $"aspx-parse:{filePath}");
+
+            return new AspxParseResult(
+                filePath, [], [], [], [], [],
+                [ReportedDiagnostic.Create(Descriptors.SourceGeneratorException, Location.None, ex.Message)],
+                null);
+        }
+    }
+
+    private static AspxParseResult ParseCore(
+        string filePath,
+        string text,
+        Compilation compilation,
+        IEnumerable<KeyValuePair<string, string>>? namespaces,
+        string? rootDirectory)
     {
         // Auto-inject default ASP.NET namespace mappings when the compilation
         // references System.Web. In traditional ASP.NET, the 'asp' prefix is

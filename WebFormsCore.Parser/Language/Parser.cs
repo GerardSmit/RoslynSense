@@ -299,7 +299,9 @@ public class Parser
                 }
                 else
                 {
-                    element.Attributes.Add(next.Text, new AttributeValue(false, value));
+                    // TryAdd for the same reason as a tag's attributes: a directive that repeats
+                    // one is a mistake in the markup, not a reason to abandon the whole file.
+                    element.Attributes.TryAdd(next.Text, new AttributeValue(false, value));
                 }
             }
             else if (next.Type == TokenType.EndDirective)
@@ -464,7 +466,7 @@ public class Parser
             }
 
             Diagnostics.Add(ReportedDiagnostic.Create(Descriptors.ControlNotFound, src.Range, src.Value));
-            _controlTypes.Add(key, ("WebFormsCore.UI.Control", path));
+            _controlTypes.TryAdd(key, (FallbackControlTypeName, path));
             return;
         }
 
@@ -478,7 +480,7 @@ public class Parser
             return;
         }
 
-        _controlTypes.Add(key, (typeName, path));
+        _controlTypes.TryAdd(key, (typeName, path));
     }
 
     private bool TryResolveAssemblyControl(string path, ControlKey key)
@@ -513,7 +515,7 @@ public class Parser
 
                     if (displayName is not null)
                     {
-                        _controlTypes.Add(key, (displayName, path));
+                        _controlTypes.TryAdd(key, (displayName, path));
                         return true;
                     }
                 }
@@ -858,15 +860,26 @@ public class Parser
         if (key.Value.Contains(':') ||
             key.Value.Equals("resourcekey", StringComparison.OrdinalIgnoreCase))
         {
-            controlNode.Attributes.Add(key, value);
+            controlNode.Attributes.TryAdd(key, value);
             return;
         }
 
-        var implementsAttributeAccessor = controlType.AllInterfaces.Any(x => x.Name == "IAttributeAccessor" && x.ContainingNamespace.ToString() == "WebFormsCore.UI");
+        // A control that implements IAttributeAccessor takes arbitrary attributes and renders them
+        // through, so an attribute it does not declare a property for is correct rather than a
+        // mistake — `class`, `style`, `data-*`, `aria-*` on any server control.
+        //
+        // Both namespaces, and that is the fix. The check named only WebFormsCore.UI, so on a
+        // classic ASP.NET project — where the interface is System.Web.UI.IAttributeAccessor, and
+        // where WebControl and HtmlControl implement it — nothing ever matched, and every such
+        // attribute reported "Could not find property 'class' on type ...". That is a warning on
+        // ordinary, correct markup, which teaches people to ignore the warnings.
+        var implementsAttributeAccessor = controlType.AllInterfaces.Any(x =>
+            x.Name == "IAttributeAccessor"
+            && x.ContainingNamespace.ToString() is "WebFormsCore.UI" or "System.Web.UI");
 
         if (implementsAttributeAccessor)
         {
-            controlNode.Attributes.Add(key, value);
+            controlNode.Attributes.TryAdd(key, value);
             return;
         }
 
@@ -954,7 +967,22 @@ public class Parser
                     _itemType = value.Value;
                 }
 
-                attributes.Add(key, value);
+                // A tag is allowed to write the same attribute twice. It is a mistake, but it is a
+                // mistake that exists in real markup — `runat="server"` duplicated by a merge, a
+                // copied tag with a leftover attribute — and ASP.NET itself renders such a page.
+                // Add threw on it, out of the middle of parsing, which took down every feature for
+                // the file: hover, folding, document symbols, semantic tokens, document links,
+                // code actions, code lens and diagnostics all ask for the parse first, and so does
+                // the code-behind's C# code lens.
+                //
+                // The first wins, matching how the tag reads left to right, and the duplicate is
+                // reported where it belongs — as a diagnostic on the offending attribute rather
+                // than as an exception that hides the rest of the file.
+                if (!attributes.TryAdd(key, value))
+                {
+                    Diagnostics.Add(ReportedDiagnostic.Create(
+                        Descriptors.DuplicateAttribute, key.Range, key.Value));
+                }
             }
             else if (keyNode.Type == TokenType.TagSlashClose)
             {
@@ -1091,6 +1119,21 @@ public class Parser
 
         return type;
     }
+
+    /// <summary>
+    /// The <c>Control</c> base type to stand in with when a registered control cannot be resolved,
+    /// named for whichever framework this compilation actually references.
+    /// </summary>
+    /// <remarks>
+    /// It used to be <c>WebFormsCore.UI.Control</c> unconditionally. On a classic ASP.NET project
+    /// that type does not exist, so the stand-in resolved to nothing and every attribute on the
+    /// unresolved control was then reported as a property that could not be found — a page's worth
+    /// of warnings, caused by one control the parser could not locate.
+    /// </remarks>
+    private string FallbackControlTypeName =>
+        (_compilation.GetType("System.Web.UI", "Control")
+         ?? _compilation.GetType("WebFormsCore.UI", "Control"))?.ToDisplayString()
+        ?? "System.Web.UI.Control";
 
     private INamedTypeSymbol? ResolveHtmlControl(string typeName)
     {

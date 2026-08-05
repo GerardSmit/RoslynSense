@@ -77,6 +77,27 @@ internal static partial class SharedBuildHost
         for (int i = 0; i < PoolSize; i++)
             shards[i] = [];
 
+        // One project is the interactive case — the seed load, an incremental add — and it gets to
+        // choose its host rather than hash to one. Two things follow from choosing.
+        //
+        // It prefers low-numbered shards, because that is the order background warming works
+        // through the pool, so the load the editor is waiting on meets the host that is warm (or is
+        // being warmed, and is worth queueing behind) rather than a cold one three slots along.
+        //
+        // And it skips hosts that have already evaluated this project, which is a reroute in place
+        // of a recycle. A warm host holding a stale evaluation used to be retired so the next load
+        // read from disk; now the load simply goes to a host that never saw the project, which is
+        // just as correct and costs nothing. Recycling is left for when every host has it.
+        if (projectPaths.Count == 1)
+        {
+            shards[ChooseShardFor(projectPaths[0], properties)].Add(projectPaths[0]);
+
+            var single = await Task.WhenAll(shards.Select((shard, index) =>
+                LoadShardAsync(workspace, properties, shard, index, projectMapFactory, cancellationToken)));
+
+            return Reconcile(single);
+        }
+
         // Round-robin for balance, but starting from a shard derived from the first path rather than
         // always from zero. Both halves matter. Round-robin keeps a batch spread evenly, because
         // adjacent entries in the wanted list are typically siblings pulling in the same
@@ -110,6 +131,33 @@ internal static partial class SharedBuildHost
     /// would still be stable enough here, but a hash written down is one that can be reasoned about
     /// when a shard turns out to be hot.
     /// </remarks>
+    /// <summary>
+    /// Picks the host for a single-project load: the lowest-numbered one that has not already
+    /// evaluated it, falling back to <see cref="ShardFor"/> when every host has.
+    /// </summary>
+    private static int ChooseShardFor(string projectPath, ImmutableDictionary<string, string> properties)
+    {
+        string full = Path.GetFullPath(projectPath);
+        string suffix = KeyFor(properties);
+
+        for (int index = 0; index < PoolSize; index++)
+        {
+            if (!s_evaluated.TryGetValue($"{index} {suffix}", out var seen))
+                return index;   // Never used at all, so it cannot be holding a stale evaluation.
+
+            lock (seen)
+            {
+                if (!seen.Contains(full))
+                    return index;
+            }
+        }
+
+        // Every host has this project cached. Whichever one is picked will be recycled, so pick the
+        // stable one: a project that has to be reloaded repeatedly then keeps retiring the same
+        // host instead of working its way around the pool retiring all of them.
+        return ShardFor(projectPath);
+    }
+
     private static int ShardFor(string projectPath)
     {
         uint hash = 2166136261;     // FNV-1a
@@ -138,7 +186,12 @@ internal static partial class SharedBuildHost
         string key = $"{shardIndex} {KeyFor(properties)}";
         var gate = s_gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
+        // Counted around the wait as well as the work, and released in a finally that covers both:
+        // a load cancelled while queued would otherwise leave the count raised forever, and
+        // background warming — which waits on it — would never run again.
         Interlocked.Increment(ref s_inFlightLoads);
+        try
+        {
         await gate.WaitAsync(cancellationToken);
         try
         {
@@ -178,8 +231,12 @@ internal static partial class SharedBuildHost
         }
         finally
         {
-            Interlocked.Decrement(ref s_inFlightLoads);
             gate.Release();
+        }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref s_inFlightLoads);
         }
     }
 
@@ -246,12 +303,71 @@ internal static partial class SharedBuildHost
             seen.Clear();
     }
 
-    private static BuildHostProcessManager ManagerFor(string key, ImmutableDictionary<string, string> properties) =>
-        s_managers.GetOrAdd(key, _ => new Lazy<BuildHostProcessManager>(
+    private static BuildHostProcessManager ManagerFor(string key, ImmutableDictionary<string, string> properties)
+    {
+        s_lastUsed[key] = Interlocked.Increment(ref s_useClock);
+
+        var manager = s_managers.GetOrAdd(key, _ => new Lazy<BuildHostProcessManager>(
             () => new BuildHostProcessManager(
                 knownCommandLineParserLanguages: [LanguageNames.CSharp, LanguageNames.VisualBasic],
                 globalMSBuildProperties: properties),
             LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+
+        TrimToCap();
+        return manager;
+    }
+
+    /// <summary>Monotonic tick, so hosts can be ordered by when they were last asked for.</summary>
+    private static long s_useClock;
+
+    private static readonly ConcurrentDictionary<string, long> s_lastUsed = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The most hosts to keep alive across every property set.
+    /// </summary>
+    /// <remarks>
+    /// The pool is keyed by global properties, and <c>SolutionDir</c> is one of them, so every
+    /// solution the process touches wants a pool of its own. That is fine for an editor with one
+    /// solution open and not fine for anything that walks through many: each host is a
+    /// <c>dotnet</c> process, and since warming makes it parse the whole SDK, each is now expensive
+    /// to keep rather than nearly free. Unbounded, a test run that opens dozens of fixture
+    /// solutions ends up with dozens of pools and exhausts the machine.
+    /// </remarks>
+    private static readonly int MaxLiveHosts = PoolSize * 2;
+
+    /// <summary>Retires the least recently used hosts until the pool is back within its cap.</summary>
+    private static void TrimToCap()
+    {
+        while (s_managers.Count > MaxLiveHosts)
+        {
+            // Oldest by last use, and only among hosts that still exist.
+            var victim = s_lastUsed
+                .Where(entry => s_managers.ContainsKey(entry.Key))
+                .OrderBy(entry => entry.Value)
+                .Select(entry => (string?)entry.Key)
+                .FirstOrDefault();
+
+            if (victim is null || !s_managers.TryRemove(victim, out var stale))
+                return;
+
+            s_lastUsed.TryRemove(victim, out _);
+            s_evaluated.TryRemove(victim, out _);
+
+            if (!stale.IsValueCreated)
+                continue;
+
+            // Fire and forget: the caller is on the load path waiting for a different host, and a
+            // subprocess that is slow to die must not hold it up.
+            _ = Task.Run(async () =>
+            {
+                try { await stale.Value.DisposeAsync(); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[BuildHost] Could not retire an idle host: {ex.Message}");
+                }
+            });
+        }
+    }
 
     /// <summary>
     /// Merges the shards into one set with one model per project file, rewriting references that

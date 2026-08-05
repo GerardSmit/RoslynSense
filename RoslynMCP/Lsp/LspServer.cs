@@ -507,7 +507,9 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("workspace/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceDiagnosticReport> WorkspaceDiagnostic(
         WorkspaceDiagnosticParams p, CancellationToken ct) =>
-        Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct, _languages);
+        Guarded(uri: "",
+            () => Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct, _languages),
+            whenBroken: () => new WorkspaceDiagnosticReport([]));
 
     /// <summary>
     /// A test seam, not a feature a real editor calls: exposes
@@ -618,12 +620,129 @@ internal sealed class LspServer : IDisposable
         }
         catch (Exception ex)
         {
-            ServiceLog.Warn(
-                $"{method} failed for '{Path.GetFileName(LspConverters.UriToPath(uri))}': {ex.Message}",
-                key: $"lsp:{method}:{uri}");
-
+            ReportBroken(method, uri, ex);
             return whenBroken is not null ? whenBroken() : Nothing<T>();
         }
+    }
+
+    /// <summary>
+    /// Runs an endpoint that does not route through a language pack under the same boundary.
+    /// </summary>
+    /// <remarks>
+    /// Diagnostics are the reason this exists separately. They are answered by one handler for
+    /// every language rather than by a pack chosen per file, so they never went through
+    /// <see cref="Route{TProvider,T}"/> — and a failure there reached the client as
+    /// "Request textDocument/diagnostic failed", repeated for as long as the file stayed open,
+    /// while the code lens beside it had already been made to degrade quietly.
+    /// </remarks>
+    private static async Task<T> Guarded<T>(
+        string uri, Func<Task<T>> body, Func<T>? whenBroken = null, [CallerMemberName] string method = "")
+    {
+        try
+        {
+            return await body();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ReportBroken(method, uri, ex);
+            return whenBroken is not null ? whenBroken() : Nothing<T>();
+        }
+    }
+
+    /// <summary>Last time each distinct failure was reported, so a repeat is not a flood.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> s_reported = new();
+
+    private static readonly TimeSpan ReportInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Says a request failed, once per minute per (endpoint, file, cause).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The rate limit is not tidiness. A code lens is re-resolved on every scroll, so a single
+    /// unreadable file produced the same line dozens of times in twenty seconds and buried
+    /// everything else in the log — including the one other message that would have explained it.
+    /// <c>ServiceLog</c>'s key throttles the pop-up but not the log, which is the right default for
+    /// a log and the wrong one for something that repeats at scroll frequency.
+    /// </para>
+    /// <para>
+    /// The message carries where it threw, not only what it said. "Value cannot be null. (Parameter
+    /// 'filePath')" names no file, no pack and no call — it is a sentence that could have come from
+    /// anywhere in the server, and without a frame to go with it the only way to find out is to
+    /// guess. The frames are filtered to this assembly because the top of the stack is usually
+    /// inside the BCL or Roslyn, and the interesting line is the last one that was ours.
+    /// </para>
+    /// </remarks>
+    private static void ReportBroken(string method, string uri, Exception ex)
+    {
+        string where = OurFrames(ex);
+        string key = $"lsp:{method}:{uri}:{ex.GetType().Name}:{ex.Message}";
+
+        var now = DateTime.UtcNow;
+        var last = s_reported.GetOrAdd(key, DateTime.MinValue);
+        if (now - last < ReportInterval)
+            return;
+
+        s_reported[key] = now;
+
+        ServiceLog.Warn(
+            $"{method} failed{Describe(uri)}: {ex.GetType().Name}: {ex.Message}{where}",
+            key: key);
+    }
+
+    /// <summary>
+    /// " for 'Default.aspx'", or nothing when the request did not name one file.
+    /// </summary>
+    /// <remarks>
+    /// Defensive on purpose, and not theoretically. A workspace-wide request carries no URI at all,
+    /// and <c>UriToPath</c> builds a <c>Uri</c> — so reporting a failure would itself throw, inside
+    /// the catch block whose whole job is to stop exceptions escaping. The result would be the
+    /// original error replaced by a confusing one from the error handler, which is the worst
+    /// possible outcome for the thing meant to explain what went wrong.
+    /// </remarks>
+    private static string Describe(string uri)
+    {
+        if (string.IsNullOrEmpty(uri))
+            return "";
+
+        try
+        {
+            return $" for '{Path.GetFileName(LspConverters.UriToPath(uri))}'";
+        }
+        catch
+        {
+            return $" for '{uri}'";
+        }
+    }
+
+    /// <summary>The first few frames of <paramref name="ex"/> that belong to this assembly.</summary>
+    private static string OurFrames(Exception ex)
+    {
+        string? stack = (ex is AggregateException aggregate
+            ? aggregate.InnerException ?? aggregate
+            : ex).StackTrace;
+
+        if (stack is null)
+            return "";
+
+        // Everything that is not the framework, rather than this assembly only. Filtering to
+        // "RoslynMCP." hid the frames that mattered the first time this was used in anger: the
+        // throw was inside the markup parser, which lives in a sibling assembly, so the report
+        // named the last RoslynMCP frame before it and pointed at a call that was innocent.
+        var ours = stack
+            .Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => line.StartsWith("at ", StringComparison.Ordinal))
+            .Where(line => !line.StartsWith("at System.", StringComparison.Ordinal)
+                        && !line.StartsWith("at Microsoft.", StringComparison.Ordinal))
+            .Take(4)
+            .ToList();
+
+        return ours.Count == 0 ? "" : $" — {string.Join(" | ", ours)}";
     }
 
     /// <summary>The empty answer for an endpoint's result type.</summary>
@@ -828,7 +947,11 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<object> Diagnostic(DocumentDiagnosticParams p, CancellationToken ct) =>
-        Handlers.DiagnosticsHandler.PullAsync(p, ct, _languages);
+        Guarded<object>(p.TextDocument.Uri,
+            () => Handlers.DiagnosticsHandler.PullAsync(p, ct, _languages),
+            // A report with no items, rather than null: the client treats the response as a
+            // complete answer for this document, and null is not one of the shapes it accepts.
+            whenBroken: () => new FullDocumentDiagnosticReport("full", []));
 
     [JsonRpcMethod("textDocument/codeLens", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeLens[]> CodeLens(CodeLensParams p, CancellationToken ct) =>

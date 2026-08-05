@@ -37,6 +37,14 @@ public ref struct Lexer
     private bool _ignoreNewLine;
     private bool _isStart;
 
+    // Memo for the tag scan: _scanClose is the first '>' at or after _scanStart (input length
+    // when there is none) and _scanRunAt is the first "runat" before it (-1 when there is none).
+    // Inline script is full of '<' with no tag around it, and without this every one of them
+    // re-scanned ahead to the same faraway '>'.
+    private int _scanStart;
+    private int _scanClose;
+    private int _scanRunAt;
+
     public Lexer(string file, ReadOnlySpan<char> input)
     {
         _nodes = new List<Token>();
@@ -60,6 +68,9 @@ public ref struct Lexer
         _textEnd = default;
         _tags = new Stack<string>();
         _isStart = true;
+        _scanStart = -1;
+        _scanClose = -1;
+        _scanRunAt = -1;
     }
 
     public string File { get; }
@@ -225,9 +236,40 @@ public ref struct Lexer
             return false;
         }
 
-        var slice = _input.Slice(_offset);
-        var last = slice.IndexOf('>');
-        return last != -1 && slice.Slice(0, last).Contains(_runAt, StringComparison.OrdinalIgnoreCase);
+        var close = NextTagClose(_offset);
+        return close < _input.Length && _scanRunAt >= _offset;
+    }
+
+    /// <summary>
+    /// The offset of the first '>' at or after <paramref name="offset"/>, or the input length
+    /// when there is none, leaving <see cref="_scanRunAt"/> at the first "runat" in
+    /// [<paramref name="offset"/>, close) or -1.
+    /// </summary>
+    private int NextTagClose(int offset)
+    {
+        if (offset >= _scanStart && offset < _scanClose)
+        {
+            if (_scanRunAt >= offset || _scanRunAt == -1)
+            {
+                return _scanClose;
+            }
+
+            // The memoized hit starts before this window; the window can still hold a later one.
+            var sub = _input.Slice(offset, _scanClose - offset);
+            var next = sub.IndexOf(_runAt, StringComparison.OrdinalIgnoreCase);
+            _scanStart = offset;
+            _scanRunAt = next == -1 ? -1 : offset + next;
+            return _scanClose;
+        }
+
+        var slice = _input.Slice(offset);
+        var index = slice.IndexOf('>');
+        var close = index == -1 ? _input.Length : offset + index;
+        var runAt = slice.Slice(0, close - offset).IndexOf(_runAt, StringComparison.OrdinalIgnoreCase);
+        _scanStart = offset;
+        _scanClose = close;
+        _scanRunAt = runAt == -1 ? -1 : offset + runAt;
+        return close;
     }
 
     private bool ConsumeWebFormsTag()
@@ -242,7 +284,7 @@ public ref struct Lexer
 
     private bool ConsumeElement(bool requireRunAt = false)
     {
-        var isServerTag = IsWebFormsElement(); // TODO: Performance
+        var isServerTag = IsWebFormsElement();
 
         if (requireRunAt && !isServerTag)
         {
@@ -408,16 +450,15 @@ public ref struct Lexer
 
         // It's possible there is a expression in the attribute list.
         // If this it the case, we should not parse the tag since we need to render the expression.
-        var slice = _input.Slice(_offset);
-        var last = slice.IndexOf('>');
+        var last = NextTagClose(_offset);
 
-        if (last == -1)
+        if (last >= _input.Length)
         {
             return true;
         }
 
         // Check for '<%'
-        if (slice.Slice(0, last).Contains(_startStatement, StringComparison.OrdinalIgnoreCase))
+        if (_input.Slice(_offset, last - _offset).Contains(_startStatement, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }

@@ -68,6 +68,19 @@ internal static class CodeLensResolveMemo
             return await provider.ResolveCodeLensAsync(lens, ct);
         }
 
+        // Detached from this request's token the same way the general path is — see below.
+        return await ResolveAsync(data, generation, lens,
+            async l => (await provider.ResolveCodeLensAsync(l, CancellationToken.None)).Command, ct);
+    }
+
+    /// <summary>
+    /// The same memo for a resolver that is not a pack — C#'s own reference and inheritance
+    /// counts — with the generation supplied by the caller instead of asked of the provider.
+    /// </summary>
+    public static async Task<CodeLens> ResolveAsync(
+        CodeLensData data, object generation, CodeLens lens,
+        Func<CodeLens, Task<Command?>> resolve, CancellationToken ct)
+    {
         var entry = s_byUri.AddOrUpdate(
             data.Uri,
             _ => new Entry(generation, new()),
@@ -86,7 +99,7 @@ internal static class CodeLensResolveMemo
         var answer = entry.Answers.GetOrAdd(
             new Slot(data.Line, data.Character, data.Kind, data.PackId),
             _ => new Lazy<Task<Command?>>(
-                async () => (await provider.ResolveCodeLensAsync(lens, CancellationToken.None)).Command,
+                () => resolve(lens),
                 LazyThreadSafetyMode.ExecutionAndPublication));
 
         // Not cancelled by this request: another resolve may be waiting on the same entry, and one

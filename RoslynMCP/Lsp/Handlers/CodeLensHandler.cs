@@ -147,12 +147,48 @@ internal static class CodeLensHandler
             return lens;
         }
 
-        if (lens.Data is { Kind: "derived" or "implemented" or "overridden" } downData)
-            return await ResolveInheritanceDownAsync(lens, downData, ct);
-
-        if (lens.Data is not { Kind: "references" } data)
+        if (lens.Data is not { Kind: "references" or "derived" or "implemented" or "overridden" } data)
             return lens;
 
+        // Both kinds run a workspace-wide search, and the client re-resolves every visible lens on
+        // every edit and every scroll. The answer is a function of this file's text and the
+        // semantics it can see, so it is memoized against exactly that — the same key
+        // AnalyzerDiagnosticCache versions by. An edit in a project that depends on this one can
+        // leave a count stale until this key next moves, which is the trade every IDE's lens makes.
+        if (await LensGenerationAsync(data.Uri, ct) is { } generation)
+        {
+            return await CodeLensResolveMemo.ResolveAsync(data, generation, lens,
+                async l => (await ResolveCountedAsync(l, data, CancellationToken.None, languages)).Command,
+                ct);
+        }
+
+        return await ResolveCountedAsync(lens, data, ct, languages);
+    }
+
+    /// <summary>What a counted lens's answer depends on: this file's text, and the semantics of
+    /// its project and everything that project references.</summary>
+    private static async Task<object?> LensGenerationAsync(string uri, CancellationToken ct)
+    {
+        var document = await LspDocumentResolver.ResolveAsync(LspConverters.UriToPath(uri), ct);
+        if (document is null)
+            return null;
+
+        var text = await document.GetTextVersionAsync(ct);
+        var semantics = await document.Project.GetDependentSemanticVersionAsync(ct);
+        return new CSharpLensGeneration(text, semantics);
+    }
+
+    private sealed record CSharpLensGeneration(VersionStamp Text, VersionStamp Semantics);
+
+    private static Task<LspCodeLens> ResolveCountedAsync(
+        LspCodeLens lens, CodeLensData data, CancellationToken ct, LanguageSession? languages) =>
+        data.Kind == "references"
+            ? ResolveReferencesAsync(lens, data, ct, languages)
+            : ResolveInheritanceDownAsync(lens, data, ct);
+
+    private static async Task<LspCodeLens> ResolveReferencesAsync(
+        LspCodeLens lens, CodeLensData data, CancellationToken ct, LanguageSession? languages)
+    {
         // Zero-reference lenses still carry the showReferences command (with an empty
         // location list) — LSP requires a non-empty command id, and an empty peek is a
         // sane click result.

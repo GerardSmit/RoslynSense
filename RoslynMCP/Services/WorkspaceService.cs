@@ -167,6 +167,12 @@ internal static class WorkspaceService
             LazyThreadSafetyMode.ExecutionAndPublication);
 
     /// <summary>
+    /// The shared MEF composition, for the few places that need a workspace of their own rather
+    /// than one from the cache.
+    /// </summary>
+    internal static Microsoft.CodeAnalysis.Host.HostServices HostServices => s_hostServices.Value;
+
+    /// <summary>
     /// Builds the MEF composition ahead of the first request that needs it, on a background thread.
     /// </summary>
     /// <remarks>
@@ -593,9 +599,14 @@ internal static class WorkspaceService
                         // the second is not worth a second. The batch path below does use the pool:
                         // it adds to a workspace this call already created, which is a different and
                         // demonstrably safe situation.
-                        openedProject = await msbuildWorkspace.OpenProjectAsync(
-                            normalizedPath, cancellationToken: openLinked.Token)
-                            .WaitAsync(OpenProjectTimeout, cancellationToken);
+                        var solutionForMap = msbuildWorkspace.CurrentSolution;
+                        var seedInfos = await SharedBuildHost.LoadAsync(
+                            msbuildWorkspace, msbuildWorkspace.Properties, [normalizedPath],
+                            () => ProjectMap.Create(solutionForMap), openLinked.Token);
+                        AddProjectsAndRewireReferences(msbuildWorkspace, seedInfos);
+                        openedProject = msbuildWorkspace.CurrentSolution.Projects.First(p =>
+                            p.FilePath is { Length: > 0 } fp
+                            && string.Equals(Path.GetFullPath(fp), normalizedPath, StringComparison.OrdinalIgnoreCase));
                     }
                     catch (TimeoutException tex)
                     {

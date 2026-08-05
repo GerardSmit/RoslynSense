@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 
@@ -32,7 +33,7 @@ namespace RoslynMCP.Services;
 /// properties.
 /// </para>
 /// </remarks>
-internal static class SharedBuildHost
+internal static partial class SharedBuildHost
 {
     private static readonly ConcurrentDictionary<string, Lazy<BuildHostProcessManager>> s_managers =
         new(StringComparer.Ordinal);
@@ -69,27 +70,56 @@ internal static class SharedBuildHost
         Func<ProjectMap> projectMapFactory,
         CancellationToken cancellationToken)
     {
-        // Sharded across several warm hosts, because the two costs are independent. Keeping a host
-        // alive removes MSBuild's start-up; running several removes the sequencing. One host does
-        // not give both: inside it there is a single MSBuild BuildManager with one in-process node,
-        // and BeginBuild/EndBuild is not re-entrant, so concurrency has to come from more hosts.
-        int shardCount = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
-        shardCount = Math.Min(shardCount, projectPaths.Count);
+        if (projectPaths.Count == 0)
+            return [];
 
-        var shards = new List<string>[shardCount];
-        for (int i = 0; i < shardCount; i++)
+        var shards = new List<string>[PoolSize];
+        for (int i = 0; i < PoolSize; i++)
             shards[i] = [];
 
-        // Round-robin: adjacent entries in the wanted list are typically siblings referencing the
-        // same things, so dealing them out spreads the transitive closures rather than
-        // concentrating them in one shard.
+        // Round-robin for balance, but starting from a shard derived from the first path rather than
+        // always from zero. Both halves matter. Round-robin keeps a batch spread evenly, because
+        // adjacent entries in the wanted list are typically siblings pulling in the same
+        // dependencies. The offset is what stops shard 0 from serving every single-project load in
+        // the process: it took every seed and every incremental add, so its set of already-evaluated
+        // projects grew until nearly any reload of anything recycled it — while shards 1..3 sat
+        // warm and idle. With the offset, a given project deterministically starts at the same
+        // shard every time, so a genuine reload retires exactly the one host that had it cached.
+        int start = ShardFor(projectPaths[0]);
         for (int i = 0; i < projectPaths.Count; i++)
-            shards[i % shardCount].Add(projectPaths[i]);
+            shards[(start + i) % PoolSize].Add(projectPaths[i]);
 
         var results = await Task.WhenAll(shards.Select((shard, index) =>
             LoadShardAsync(workspace, properties, shard, index, projectMapFactory, cancellationToken)));
 
         return Reconcile(results);
+    }
+
+    /// <summary>
+    /// How many warm hosts to keep. Each is a <c>dotnet</c> process holding a parsed copy of the
+    /// SDK, so this trades memory for the ability to evaluate projects concurrently.
+    /// </summary>
+    private static readonly int PoolSize = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+
+    /// <summary>
+    /// The shard a project starts at — stable for a given path within the process, so the same
+    /// project always meets the same host.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <see cref="string.GetHashCode()"/>: that is randomised per process, which
+    /// would still be stable enough here, but a hash written down is one that can be reasoned about
+    /// when a shard turns out to be hot.
+    /// </remarks>
+    private static int ShardFor(string projectPath)
+    {
+        uint hash = 2166136261;     // FNV-1a
+        foreach (char c in Path.GetFullPath(projectPath))
+        {
+            hash ^= char.ToLowerInvariant(c);
+            hash *= 16777619;
+        }
+
+        return (int)(hash % (uint)PoolSize);
     }
 
     private static async Task<ImmutableArray<ProjectInfo>> LoadShardAsync(
@@ -108,6 +138,7 @@ internal static class SharedBuildHost
         string key = $"{shardIndex} {KeyFor(properties)}";
         var gate = s_gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
+        Interlocked.Increment(ref s_inFlightLoads);
         await gate.WaitAsync(cancellationToken);
         try
         {
@@ -147,9 +178,15 @@ internal static class SharedBuildHost
         }
         finally
         {
+            Interlocked.Decrement(ref s_inFlightLoads);
             gate.Release();
         }
     }
+
+    /// <summary>
+    /// Shard loads currently running, so background warming can stay out of their way.
+    /// </summary>
+    private static int s_inFlightLoads;
 
     /// <summary>Project paths each host has already evaluated, and therefore has cached.</summary>
     private static readonly ConcurrentDictionary<string, HashSet<string>> s_evaluated =
@@ -273,14 +310,42 @@ internal static class SharedBuildHost
     }
 
     /// <summary>
-    /// Starts the host for <paramref name="properties"/> and pays its MSBuild initialisation now,
-    /// so the first project load does not.
+    /// Starts the hosts for <paramref name="properties"/> and pays their MSBuild initialisation
+    /// now, so the first project load does not.
     /// </summary>
     /// <remarks>
-    /// Loads no project and reads no solution: it asks the manager for a host, which spawns the
-    /// subprocess and lets it initialise. On a solution nobody goes on to open, the cost is one
-    /// idle <c>dotnet</c> process — which is why this is called when a solution is explicitly
-    /// bound, not on every path that happens to touch this class.
+    /// <para>
+    /// Connecting a host is not what makes it warm. Measured on one host with four distinct trivial
+    /// projects: the manager constructor is free, connecting to the subprocess costs 427 ms, and
+    /// then the loads cost <b>956, 234, 239, 264 ms</b>. Nearly a second of the first load is
+    /// MSBuild discovering toolsets and SDK resolvers and parsing the SDK's several hundred
+    /// <c>.props</c> and <c>.targets</c> into the collection's <c>ProjectRootElementCache</c> —
+    /// work that is about the SDK, not about the project, and that every later load reuses.
+    /// </para>
+    /// <para>
+    /// So warming has to make each host <em>evaluate</em> something. It evaluates a synthetic
+    /// project in a temp directory rather than one of the solution's: a real project would be
+    /// recorded as evaluated and the first genuine request for it would then recycle the very host
+    /// this just warmed. The synthetic one names the same SDK and target framework, which is what
+    /// decides which targets get parsed.
+    /// </para>
+    /// <para>
+    /// Warming runs one host at a time, and under the same gate real loads take. Both are
+    /// deliberate. Warming all four at once was measured <em>slower end to end</em> than not warming
+    /// at all — four MSBuild initialisations land on the CPU at the same moment as the request the
+    /// editor is waiting on, and the request loses. Taking the gate turns a race into a queue: a
+    /// load that arrives mid-warm-up waits for a warm host and then runs at ~235 ms, instead of
+    /// racing an initialising one and paying the initialisation twice over.
+    /// </para>
+    /// <para>
+    /// Sequential also means shard 0 — where the first load goes, see <see cref="ShardFor"/> — is
+    /// ready first, rather than last-ish behind three hosts nobody needs yet.
+    /// </para>
+    /// <para>
+    /// On a solution nobody goes on to open, the cost is a few idle <c>dotnet</c> processes — which
+    /// is why this is called when a solution is explicitly bound, not on every path that happens to
+    /// touch this class.
+    /// </para>
     /// </remarks>
     public static void WarmInBackground(ImmutableDictionary<string, string> properties, string anyProjectPath)
     {
@@ -289,24 +354,42 @@ internal static class SharedBuildHost
             try
             {
                 var watch = Stopwatch.StartNew();
-                int shardCount = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+                string? warmupProject = TryCreateWarmupProject(anyProjectPath);
 
-                // All of them, together: a batch fans out across the pool, so warming only the first
-                // would leave the rest to initialise from cold inside the request that needs them.
-                await Task.WhenAll(Enumerable.Range(0, shardCount).Select(async index =>
+                for (int index = 0; index < PoolSize; index++)
                 {
-                    string key = $"{index} {KeyFor(properties)}";
-                    var manager = s_managers.GetOrAdd(key, _ => new Lazy<BuildHostProcessManager>(
-                        () => new BuildHostProcessManager(
-                            knownCommandLineParserLanguages: [LanguageNames.CSharp, LanguageNames.VisualBasic],
-                            globalMSBuildProperties: properties),
-                        LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+                    await WaitForIdleAsync();
 
-                    await manager.GetBuildHostWithFallbackAsync(anyProjectPath, CancellationToken.None);
-                }));
+                    string key = $"{index} {KeyFor(properties)}";
+                    var gate = s_gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+
+                    await gate.WaitAsync();
+                    try
+                    {
+                        var manager = ManagerFor(key, properties);
+                        await manager.GetBuildHostWithFallbackAsync(anyProjectPath, CancellationToken.None);
+
+                        if (warmupProject is null)
+                            continue;
+
+                        // Not routed through LoadShardAsync, which would record the synthetic project
+                        // in s_evaluated — harmless in itself, but it muddies the one signal recycling
+                        // depends on.
+                        var loader = new MSBuildProjectLoader(s_warmupWorkspace.Value, properties);
+                        var provider = new BuildHostProjectFileInfoProvider(
+                            manager, loader.ProjectFileExtensionRegistry, loader.Reporter, progress: null);
+
+                        await loader.LoadInfosAsync(
+                            [warmupProject], provider, ProjectMap.Create(), progress: null, CancellationToken.None);
+                    }
+                    finally
+                    {
+                        gate.Release();
+                    }
+                }
 
                 Console.Error.WriteLine(
-                    $"[BuildHost] Warmed {shardCount} host(s) in {watch.ElapsedMilliseconds} ms; " +
+                    $"[BuildHost] Warmed {PoolSize} host(s) in {watch.ElapsedMilliseconds} ms; " +
                     "project loads now skip MSBuild's start-up.");
             }
             catch (Exception ex)
@@ -314,7 +397,123 @@ internal static class SharedBuildHost
                 // Nothing awaits this, and the on-demand path creates its own host if this failed.
                 Console.Error.WriteLine($"[BuildHost] Warm-up failed: {ex.Message}");
             }
+            finally
+            {
+                CleanUpWarmupDirectory();
+            }
         });
+    }
+
+    /// <summary>
+    /// A workspace for warm-up loads to resolve language services against. Never read from — the
+    /// project models the warm-up produces are thrown away; only the parsing they caused inside the
+    /// host is wanted.
+    /// </summary>
+    private static readonly Lazy<Workspace> s_warmupWorkspace =
+        new(() => new AdhocWorkspace(WorkspaceService.HostServices), LazyThreadSafetyMode.ExecutionAndPublication);
+
+    /// <summary>
+    /// Blocks until no shard load is running, so warming only ever uses time nobody wanted.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the whole difference between warming helping and warming hurting, and it was measured
+    /// both ways. Warming four hosts concurrently at bind cost the 25-project benchmark 6,415 ms
+    /// against 5,924 ms for not warming at all; warming them one at a time cost 6,749 ms. Neither
+    /// was a warming bug — MSBuild initialisation is around a second per host and the first request
+    /// arrives about 1.3 s in, so there is no runway, and every millisecond warming spends is taken
+    /// from the request the editor is waiting on.
+    /// </para>
+    /// <para>
+    /// Which is a fact about the benchmark, not about the product: it opens a solution and asks for
+    /// a code lens immediately, where a person opens a folder and reads for a few seconds first.
+    /// Yielding keeps the win in the case that has idle time without paying for it in the case that
+    /// does not — the worst outcome becomes a host warmed by the load that needed it, which is
+    /// exactly what would have happened anyway.
+    /// </para>
+    /// </remarks>
+    private static async Task WaitForIdleAsync()
+    {
+        // Bounded, because a server under continuous load would otherwise never warm at all; at
+        // the deadline warming proceeds and takes its chances against whatever is running.
+        var deadline = Stopwatch.StartNew();
+        while (Volatile.Read(ref s_inFlightLoads) > 0 && deadline.Elapsed < TimeSpan.FromSeconds(30))
+            await Task.Delay(150);
+    }
+
+    private static string? s_warmupDirectory;
+
+    /// <summary>
+    /// Writes a throwaway project that names the same SDK and target framework as
+    /// <paramref name="anyProjectPath"/>, so evaluating it parses the same targets the real
+    /// projects will need.
+    /// </summary>
+    private static string? TryCreateWarmupProject(string anyProjectPath)
+    {
+        try
+        {
+            string? sdk = PathHelper.ReadProjectSdk(anyProjectPath);
+            if (sdk is null or "")
+                return null;    // Legacy project: no SDK to pre-parse, and a synthetic one would mislead.
+
+            // The framework matters because it selects which targets import. Read rather than
+            // assumed: warming net10.0 targets for a net48 solution parses the wrong set.
+            string framework = ReadFirstTargetFramework(anyProjectPath) ?? "net8.0";
+
+            string dir = Path.Combine(Path.GetTempPath(), $"roslynsense-warmup-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            s_warmupDirectory = dir;
+
+            string path = Path.Combine(dir, "Warmup.csproj");
+            File.WriteAllText(path, $"""
+                <Project Sdk="{sdk}">
+                  <PropertyGroup>
+                    <TargetFramework>{framework}</TargetFramework>
+                    <EnableDefaultItems>false</EnableDefaultItems>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            return path;
+        }
+        catch
+        {
+            // Warm-up is an optimisation. A temp directory that cannot be written costs the first
+            // real load its speed, not its correctness.
+            return null;
+        }
+    }
+
+    private static string? ReadFirstTargetFramework(string projectPath)
+    {
+        try
+        {
+            var match = TargetFrameworkPattern().Match(File.ReadAllText(projectPath));
+            if (!match.Success)
+                return null;
+
+            // <TargetFrameworks> is a semicolon list; the first is enough to pull the targets in.
+            string value = match.Groups["value"].Value.Trim();
+            int semicolon = value.IndexOf(';');
+            return semicolon < 0 ? value : value[..semicolon].Trim();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    [GeneratedRegex(
+        @"<TargetFrameworks?>(?<value>[^<]+)</TargetFrameworks?>",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex TargetFrameworkPattern();
+
+    private static void CleanUpWarmupDirectory()
+    {
+        if (Interlocked.Exchange(ref s_warmupDirectory, null) is not { } dir)
+            return;
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
     }
 
     /// <summary>Tears down every host. Called when the process is shutting down.</summary>

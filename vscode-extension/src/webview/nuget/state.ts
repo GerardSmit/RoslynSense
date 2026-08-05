@@ -37,6 +37,7 @@ namespace NG {
      */
     export let listGen = 0;
     export let detailsGen = 0;
+    export let planGen = 0;
 
     export function nextListGen(): number {
         return ++listGen;
@@ -44,6 +45,10 @@ namespace NG {
 
     export function nextDetailsGen(): number {
         return ++detailsGen;
+    }
+
+    export function nextPlanGen(): number {
+        return ++planGen;
     }
 
     const api = acquireVsCodeApi();

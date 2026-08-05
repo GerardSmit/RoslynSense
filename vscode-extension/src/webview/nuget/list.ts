@@ -224,6 +224,16 @@ namespace NG {
             row.badges.appendChild(make('span', `sev sev-${row.severity}`, row.severity));
         }
 
+        if (row.update?.latestUncapped) {
+            // Band alignment held the offer back; disclose what exists so the cap never reads as
+            // "up to date" to someone who knows the newer band shipped.
+            const capped = make('span', 'badge upd-capped', `${row.update.latestUncapped} available`);
+            capped.title =
+                `${row.update.latestUncapped} tracks a newer .NET than this project targets. ` +
+                'Turn off roslynSense.nuget.alignPlatformPackages to update across bands.';
+            row.badges.appendChild(capped);
+        }
+
         const advisories = auditFor(row.pkg.id);
         if (advisories.worst >= 0) {
             row.badges.appendChild(

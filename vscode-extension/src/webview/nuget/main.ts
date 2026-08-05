@@ -175,6 +175,13 @@ namespace NG {
                         showUpdates(message.updates);
                         break;
 
+                    case 'updatePlan':
+                        if (message.gen !== planGen || state.tab !== 'updates') {
+                            return;
+                        }
+                        showPlan(message.induced);
+                        break;
+
                     case 'consolidations':
                         if (message.gen !== listGen) {
                             return;

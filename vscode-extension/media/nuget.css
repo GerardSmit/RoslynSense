@@ -273,6 +273,17 @@ li.row[aria-selected="true"] .muted { color: inherit; opacity: 0.8; }
 li.row.row-working { opacity: 0.5; }
 li.row.row-failed { border-left-color: var(--vscode-charts-red); }
 
+/* A reference the selection drags along: indented under the row that asked for it, with a guide
+   line instead of a checkbox — it is included by construction, not by choice. */
+li.row.row-induced {
+  padding-left: 34px;
+  opacity: 0.92;
+  cursor: default;
+  border-left: 2px solid var(--vscode-tree-indentGuidesStroke, var(--vscode-widget-border));
+}
+
+#plan-note { flex: 0 1 auto; }
+
 .cell { display: flex; align-items: center; flex: 0 0 auto; }
 
 /* Both children sit in a fixed box, so swapping the image in is a paint and can never move
@@ -331,6 +342,9 @@ li.row.row-failed { border-left-color: var(--vscode-charts-red); }
 
 /* The word carries the meaning; colour is a second channel, never the only one — chart colours
    make no contrast guarantee and colour-only severity is unreadable for a lot of people. */
+/* A newer band exists but tracks a later .NET than the project; informational, never the offer. */
+.badge.upd-capped { opacity: 0.75; font-style: italic; }
+
 .sev { border-left: 3px solid transparent; font-weight: 600; }
 .sev-major, .sev-vuln { border-left-color: var(--vscode-charts-red); }
 .sev-minor, .sev-deprecated { border-left-color: var(--vscode-charts-yellow); }

@@ -58,6 +58,11 @@ internal static class AspxLanguageHandler
         if (hit is not null && AspxResourceHandler.Handles(hit.Kind))
             return await AspxResourceHandler.DefinitionAsync(document, hit, ct);
 
+        // The caret is already on the declaration, so there is no definition to go to — the
+        // question a user asks here is the other one. See ControlIdUsagesAsync.
+        if (hit is { Kind: AspxHitKind.ControlId, Symbol: { } declared } && !typeDefinition)
+            return await ControlIdUsagesAsync(document, hit, declared, ct);
+
         if (hit is { Symbol: { } symbol })
             return await NavigationHandlers.DefinitionLocationsAsync(symbol, document.Project, typeDefinition, ct);
 
@@ -74,6 +79,49 @@ internal static class AspxLanguageHandler
 
         return [];
     }
+
+    /// <summary>
+    /// Where a control is used, for a caret on the <c>ID</c> that declares it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The <c>ID</c> attribute <em>is</em> the declaration — it is what makes the code-behind field
+    /// exist, and this pack already says so everywhere else: the reference search reports it the way
+    /// Roslyn reports a declaration, and the code lens counts from it. Go-to-definition on a
+    /// declaration therefore has nowhere to go, and answering it with the designer field sends the
+    /// reader to a transcription of the line their caret is already on — the same dead end
+    /// <see cref="WebFormsLanguage.Supersedes"/> removes when the gesture starts from C#. Doing one
+    /// there and the other here would be the two halves of one relationship disagreeing.
+    /// </para>
+    /// <para>
+    /// Usages instead, which is what Visual Studio does for the identical caret in C#. Several
+    /// locations make the editor open its peek list rather than jump, and that is the right shape
+    /// for a question with more than one answer.
+    /// </para>
+    /// <para>
+    /// The <c>ID</c> itself is filtered out for the reason the lens filters it: it is in the results
+    /// because it is the declaration, and offering the caret its own position is an invitation to
+    /// go nowhere.
+    /// </para>
+    /// </remarks>
+    private static async Task<LspLocation[]> ControlIdUsagesAsync(
+        AspxDocument document, AspxHit hit, ISymbol declared, CancellationToken ct)
+    {
+        var range = ToRange(document, hit.Span);
+
+        return
+        [
+            .. (await AllReferencesAsync(declared, document.Project, includeDeclaration: false, ct))
+                .Where(location => !IsSelf(location, document.FilePath, range)),
+        ];
+    }
+
+    /// <summary>Whether a result is the <c>ID</c> the request started on.</summary>
+    private static bool IsSelf(LspLocation location, string filePath, LspRange range) =>
+        location.Range.Start.Line == range.Start.Line
+        && location.Range.Start.Character == range.Start.Character
+        && string.Equals(
+            LspConverters.UriToPath(location.Uri), filePath, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// A symbol's declarations, for the ones declared in the projected C# rather than in a real

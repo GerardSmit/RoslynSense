@@ -114,8 +114,17 @@ public class WebFormsLspTests
         Assert.EndsWith("Designer.aspx.cs", Uri.UnescapeDataString(location.Uri));
     }
 
+    /// <summary>
+    /// The caret is on the declaration, so the answer is the usages rather than a definition.
+    /// </summary>
+    /// <remarks>
+    /// This used to land on the designer field, which is the same dead end the C# side of the
+    /// gesture stopped offering: the <c>ID</c> is what makes that field exist, so the designer is a
+    /// transcription of the line the caret is already on. Go-to-definition on a declaration has
+    /// nowhere to go, and Visual Studio answers the identical caret in C# with the usages.
+    /// </remarks>
     [Fact]
-    public async Task GoToDefinitionOnAControlIdLandsOnItsField()
+    public async Task GoToDefinitionOnAControlIdListsItsUsagesRatherThanTheDesigner()
     {
         var locations = await AspxLanguageHandler.DefinitionAsync(
             new TextDocumentPositionParams(
@@ -124,9 +133,33 @@ public class WebFormsLspTests
             typeDefinition: false,
             default);
 
-        // Declared by the generated designer half, which is where the field lives.
+        // `lblHeading.Text = "Heading";` in the code-behind, and nothing else.
         var location = Assert.Single(locations);
-        Assert.EndsWith("Designer.aspx.designer.cs", Uri.UnescapeDataString(location.Uri));
+        Assert.EndsWith("Designer.aspx.cs", Uri.UnescapeDataString(location.Uri));
+
+        // Not the transcription, and not the caret's own position either.
+        Assert.DoesNotContain(
+            locations,
+            candidate => Uri.UnescapeDataString(candidate.Uri)
+                .EndsWith("Designer.aspx.designer.cs", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(
+            locations,
+            candidate => Uri.UnescapeDataString(candidate.Uri)
+                .EndsWith("Designer.aspx", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>The type is still a definition, so Ctrl+F12 on the same caret is unaffected.</summary>
+    [Fact]
+    public async Task TypeDefinitionOnAControlIdStillReachesTheControlClass()
+    {
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.DesignerAspxFile),
+                PositionOf(FixturePaths.DesignerAspxFile, "\"lblHeading\"", 3)),
+            typeDefinition: true,
+            default);
+
+        Assert.NotEmpty(locations);
     }
 
     [Fact]

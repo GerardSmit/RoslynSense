@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Text;
+using WebFormsCore.Models;
 using WebFormsCore.SourceGenerator.Models;
 using Xunit;
 
@@ -43,6 +44,42 @@ public class ReportedDiagnosticTests
         Assert.Equal("TEST001", converted.Id);
         Assert.Equal(Location.None, converted.Location);
         Assert.Contains("argument", converted.GetMessage());
+    }
+
+    /// <summary>
+    /// A range belonging to no file converts to no location rather than throwing.
+    /// </summary>
+    /// <remarks>
+    /// <c>TokenString</c> converts implicitly from <c>string</c> and gives the result
+    /// <c>default</c> for its range, so every name the parser synthesizes rather than reads out of
+    /// the markup carries a range whose <c>File</c> is null. Reporting a diagnostic against one —
+    /// <c>PropertyNotFound</c> on an attribute, say — is perfectly reasonable, and used to throw
+    /// out of the middle of parsing.
+    /// </remarks>
+    [Fact]
+    public void ARangeWithNoFileConvertsToNoLocation()
+    {
+        TokenString synthesized = "SomeAttributeName";
+
+        Assert.True(string.IsNullOrEmpty(synthesized.Range.File));
+
+        Location location = synthesized.Range;
+
+        Assert.Equal(Location.None, location);
+    }
+
+    [Fact]
+    public void ARangeWithAFileKeepsIt()
+    {
+        var range = new TokenRange(
+            @"C:\site\Controls\Widget.ascx",
+            new TokenPosition(Offset: 20, Line: 2, Column: 4),
+            new TokenPosition(Offset: 25, Line: 2, Column: 9));
+
+        Location location = range;
+
+        Assert.Equal(@"C:\site\Controls\Widget.ascx", location.GetLineSpan().Path);
+        Assert.Equal(new TextSpan(20, 5), location.SourceSpan);
     }
 
     [Fact]

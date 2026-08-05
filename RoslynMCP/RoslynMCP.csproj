@@ -66,6 +66,13 @@
       <Publicize Include="Microsoft.CodeAnalysis.Features" />
       <Publicize Include="Microsoft.CodeAnalysis.CSharp.Features" />
       <Publicize Include="Microsoft.CodeAnalysis.Workspaces" />
+      <!-- BuildHost reuse. MSBuildProjectLoader builds a fresh BuildHostProcessManager for every
+           top-level OpenProject/OpenSolution call and disposes it on return, so each one pays a
+           cold MSBuild initialisation (~945ms) on top of the evaluation it actually needs (~354ms).
+           The internal LoadInfosAsync overload takes an IProjectFileInfoProvider, which is the seam
+           for handing it a long-lived one. -->
+      <Publicize Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" />
+      <Publicize Include="Microsoft.CodeAnalysis.Workspaces.MSBuild.Contracts" />
     </ItemGroup>
 
     <ItemGroup>

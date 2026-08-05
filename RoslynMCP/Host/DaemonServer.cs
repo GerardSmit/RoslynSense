@@ -72,7 +72,7 @@ internal sealed class DaemonServer
         catch (OperationCanceledException) { /* idle shutdown */ }
 
         Console.Error.WriteLine("[Daemon] Idle/shutdown; disposing workspaces.");
-        await WorkspaceService.EvictAllAsync();
+        await WorkspaceService.ShutdownAsync();
         AnalyzerService.DisposeHost();
         ProjectIndexCacheService.DisposeAll();
         ShadowCopyService.DisposeIfCreated();

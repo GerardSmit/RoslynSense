@@ -98,7 +98,7 @@ internal static class LspProxy
         await using var services = Daemon.ToolHostServices.Build(settings, formatter, workingDir);
 
         await LspSessionHost.RunAsync(stdin, stdout, services, cts.Token);
-        await WorkspaceService.EvictAllAsync();
+        await WorkspaceService.ShutdownAsync();
         return 0;
     }
 

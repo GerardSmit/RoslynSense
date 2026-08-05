@@ -88,11 +88,12 @@ better than the loop it replaces.
 | cold tree roots | 57 ms | 72 ms |
 | expand solution | 16 ms | 6 ms |
 | expand project (cold) | 17 ms | 17 ms |
-| codeLens + resolve ×17 | 7,189 ms | 4,391 / 4,441 / 4,506 ms |
-| tree after didOpen | 113 ms | 27 ms |
-| **references across 8 consumer projects** | **23,656 ms** | **2,706 / 2,714 / 2,747 ms** |
-| **whole scenario, server side** | **~29.6 s** | **~7.5 s** |
-| restore, now measured separately | (inside the above) | ~1,950 ms |
+| codeLens + resolve ×17 | 7,189 ms | 4,445 / 4,480 / 4,572 ms |
+| tree after didOpen | 113 ms | 22 ms |
+| **references across 8 consumer projects** | **23,656 ms** | **2,075 / 2,078 / 2,093 ms** |
+| **whole scenario, server side** | **~29.6 s** | **~6.7 s** |
+| peak working set | 280 MB | 235 MB |
+| restore, now measured separately | (inside the above) | ~3,150 ms |
 | peak working set | 280 MB | 274 MB |
 
 The before column is a real run of the same test at `0f8ce26`, not a remembered number: the baseline
@@ -125,9 +126,9 @@ whether a number sits where it does reliably or happened to.
 
 Against the budgets in `full-code-review-and-performance-plan.md`:
 
-* *"Complete references, cold index, restored 25-project fixture — under 5 s"* → **2.7 s.** Met.
+* *"Complete references, cold index, restored 25-project fixture — under 5 s"* → **2.1 s.** Met.
 * *"Full 25-project end-to-end stress scenario — under 15 s, excluding package restore/network"* →
-  **~7.5 s.** Met.
+  **~6.7 s.** Met.
 
 **A whole-scenario budget of 5 s is not met and, on this scenario, cannot be.** See §0.5 — the
 arithmetic of what remains adds up to roughly 5 s even if every line of code in this repository ran
@@ -135,6 +136,81 @@ in zero time.
 
 Nine `dotnet restore` invocations and nine `OpenProjectAsync` calls became one restore and three
 top-level loads.
+
+### 0.4b The per-call cost was never the subprocess — it was MSBuild starting up inside it
+
+The first version of §0.5 called Roslyn's ~1.5 s per-call cost "a subprocess spawn" and treated it as
+a floor. That attribution was wrong, and measuring it properly is what produced the largest single
+change here.
+
+| Measured | |
+|---|---:|
+| BuildHost process start, no work (`dotnet exec …BuildHost.dll` with a bad argument) | **75 ms** |
+| MSBuild's own view of a design-time build of a trivial net10.0 project (`-clp:PerformanceSummary`) | **354 ms**, of which `Compile;CoreCompile` is 226 ms and every individual target rounds to 0 |
+| A whole cold `dotnet msbuild` process running that same design-time build | **~860 ms** |
+| Roslyn's `OpenProjectAsync` for the same shape of project | **~1,374 ms** |
+
+So the subprocess is 5% of it. The rest is MSBuild loading and JIT-ing its assemblies, discovering
+toolsets and SDK resolvers, and parsing the SDK's several hundred imports — from cold, in a process
+Roslyn creates per top-level load call (`MSBuildProjectLoader.LoadInfosAsync` does
+`new BuildHostProcessManager(...)` followed by `await using`) and throws away on return.
+
+Keeping one alive removes all of it. Measured over six generated projects:
+
+| | per project, steady state | six projects |
+|---|---:|---:|
+| Fresh BuildHost per call | 1,704 ms | 9,990 ms |
+| One reused BuildHost | **230 ms** | **2,375 ms** |
+
+`RoslynMCP/Services/SharedBuildHost.cs` is that pool: a small set of long-lived hosts, warmed in the
+background when a solution is bound, driven through the `IProjectFileInfoProvider` overload of
+`MSBuildProjectLoader.LoadInfosAsync` that exists for exactly this. Reaching it needs
+`Microsoft.CodeAnalysis.Workspaces.MSBuild` and its `Contracts` assembly publicized, which is the
+same mechanism this repository already uses for three other Roslyn assemblies — and it fails at
+build rather than at runtime if a Roslyn upgrade moves the seam.
+
+**Two things it is deliberately *not* used for**, both learned by breaking them:
+
+* **The seed load still goes through `MSBuildWorkspace.OpenProjectAsync`, and this is the open
+  item.** Measured on that exact path, a fresh host costs 1,429 ms and a warm one 276 ms, so it is
+  worth about a second — the largest single piece of what stands between 6.7 s and 5 s. Routing it
+  through the pool passes in isolation and fails under a parallel test run: seven tests covering
+  rename, file operations, document formatting and completion break together, and only while other
+  tests are loading projects concurrently. `UpdateReferencesAfterAdd` is the obvious suspect — it is
+  what `OpenProjectAsync` does that a bare `OnProjectAdded` does not, and it is what turns a
+  metadata reference to a project's output back into a `ProjectReference` — but adding it changed
+  nothing. Something about a *first*, workspace-creating load is not reproduced by adding project
+  models to an empty workspace. Until that is understood the second is not worth having, and the
+  batch path is unaffected: it adds to a workspace the seed already created, which is a different
+  and demonstrably safe situation.
+* **The hosts are not disposed by `EvictAllAsync`.** That method means "drop the cached workspaces";
+  the hosts are warm MSBuild processes that have nothing to do with any one workspace, and tearing
+  them down there killed hosts that other in-flight loads were mid-conversation with. They are
+  released in `ShutdownAsync`, at the one point where nothing can still be using them.
+
+**The hazard that comes with a warm host, and the price of fixing it.** `BuildHost` builds its
+`ProjectBuildManager` once and leaves a batch build open for the life of the process
+(`BuildHost.cs:149-150`), so `ProjectBuildManager.LoadProjectAsync` goes through
+`projectCollection.GetLoadedProjects(path)` and returns the **first** evaluation of a project for as
+long as that host lives. Roslyn never trips over it because it disposes the whole host per top-level
+call; a pool has to handle it itself. Untreated it is silent: a file added on disk is invisible, an
+edited `.csproj` has no effect, completion returns nothing, and no error appears anywhere — it was
+found as seven unrelated-looking tests failing together on rename, formatting, completion and
+file-watching, every one of which loads a fixture project more than once.
+
+`SharedBuildHost` therefore tracks which project paths each host has evaluated and retires a host
+before reusing it for one it has seen. That costs the host its warmth and nothing else: the case the
+pool exists for — many distinct projects of one solution — never repeats a path, and the case that
+does repeat is a reload, which has to re-read from disk to be correct anyway.
+`SharedBuildHostStalenessTests` pins it, and was checked against the unfixed code to confirm it
+actually catches the staleness rather than passing for its own reasons.
+
+And one more bug worth recording because it is equally silent: **`ProjectMap` is a plain
+unsynchronised dictionary**, so sharing one instance across concurrent shards corrupts it — the load
+then returns fewer projects than asked for, or none, with no error anywhere. It presents as an
+intermittently slow benchmark (one run measured 11 s where its neighbours measured 2.1 s) because
+the caller can only read the empty result as "the batch did not work" and fall back to loading one
+at a time. Each shard builds its own.
 
 ### 0.5 What is left, and the floor
 

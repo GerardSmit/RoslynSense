@@ -1,3 +1,4 @@
+﻿using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -570,12 +571,28 @@ internal static class WorkspaceService
 
                     try
                     {
-                        // Open ONLY the requested project (Roslyn additionally pulls in its
-                        // transitive ProjectReferences). When the project belongs to a multi-
-                        // project solution, cacheKey is the .sln path, so sibling and referencing
-                        // projects requested later are added to THIS same workspace incrementally
-                        // (EnsureProjectLoadedAsync) — sharing already-loaded references — instead
-                        // of loading the entire solution up front.
+                        // Only the requested project (Roslyn additionally pulls in its transitive
+                        // ProjectReferences). When the project belongs to a multi-project solution,
+                        // cacheKey is the .sln path, so sibling and referencing projects requested
+                        // later are added to THIS same workspace incrementally — sharing
+                        // already-loaded references — instead of loading the whole solution up front.
+                        //
+                        // Deliberately still OpenProjectAsync, even though the shared BuildHost
+                        // evaluates the same project about a second faster — measured, on this very
+                        // path: 1,429 ms through a fresh host against 276 ms through a warm one.
+                        //
+                        // Routing the seed through the pool passes in isolation and fails under a
+                        // parallel test run: seven tests covering rename, file operations, document
+                        // formatting and completion break together, and only when other tests are
+                        // loading projects at the same time. UpdateReferencesAfterAdd — the obvious
+                        // candidate, and the thing OpenProjectAsync does that a bare OnProjectAdded
+                        // does not — is not the difference; adding it changed nothing.
+                        //
+                        // Something about a first, workspace-creating load is not reproduced by
+                        // adding project models to an empty workspace, and until that is understood
+                        // the second is not worth a second. The batch path below does use the pool:
+                        // it adds to a workspace this call already created, which is a different and
+                        // demonstrably safe situation.
                         openedProject = await msbuildWorkspace.OpenProjectAsync(
                             normalizedPath, cancellationToken: openLinked.Token)
                             .WaitAsync(OpenProjectTimeout, cancellationToken);
@@ -817,6 +834,38 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// Adds <paramref name="infos"/> to <paramref name="workspace"/> and then lets it convert the
+    /// references between them from file paths into real project references.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>OnProjectAdded</c>, not a <c>SetCurrentSolution</c> swap: it is the mutation API a
+    /// <see cref="Workspace"/> exposes for this, and it raises the change notifications the rest of
+    /// Roslyn — and everything in this repository that watches for a project appearing — depends on.
+    /// </para>
+    /// <para>
+    /// <c>UpdateReferencesAfterAdd</c> is the step whose absence broke this the first time it was
+    /// tried, and it is easy to miss because nothing throws. MSBuild reports a
+    /// <c>&lt;ProjectReference&gt;</c> whose target is not in the batch as a metadata reference to
+    /// that project's output assembly; this is what turns those back into
+    /// <see cref="ProjectReference"/>s once the target has been added. Skip it and the workspace
+    /// reads perfectly — every symbol resolves, through the DLL — while a rename stops crossing
+    /// project boundaries and cross-project navigation lands in metadata instead of source.
+    /// </para>
+    /// </remarks>
+    private static void AddProjectsAndRewireReferences(
+        MSBuildWorkspace workspace, ImmutableArray<ProjectInfo> infos)
+    {
+        foreach (var info in infos)
+        {
+            if (!workspace.CurrentSolution.ContainsProject(info.Id))
+                workspace.OnProjectAdded(info);
+        }
+
+        workspace.UpdateReferencesAfterAdd();
+    }
+
+    /// <summary>
     /// Loads several projects of one solution in a single Roslyn batch instead of one call each.
     /// </summary>
     /// <remarks>
@@ -954,307 +1003,107 @@ internal static class WorkspaceService
             return false;
 
         var watch = Stopwatch.StartNew();
-        var shards = Shard(missing);
 
-        // One loader for all shards, created here rather than let each shard make its own.
-        //
-        // The rebind creates a loader on demand, so N concurrent shards that each need one would
-        // each build a separate collectible load context — and MergeShadow adopts only the first,
-        // leaving the rest owned by nobody, disposed by nobody, and still referenced by the
-        // AnalyzerFileReferences that were rebound onto them. Constructing one up front costs a
-        // dictionary and a lock; if no shard turns out to need shadowing it is adopted unused and
-        // released with the entry.
-        var shadowLoader = entry.ShadowLoader ?? new ShadowCopyAnalyzerAssemblyLoader();
-
-        // Each shard evaluates in its own workspace, and they run together.
-        //
-        // Roslyn's loader is strictly sequential inside one call — a plain foreach over the project
-        // paths — so one batch of N projects is N evaluations back to back behind a single
-        // BuildHost. Splitting into shards buys real concurrency for the same reason the gate can be
-        // dropped around them: these workspaces are private to this method and share nothing, so
-        // MSBuildWorkspace's inability to take two concurrent opens simply does not apply across
-        // them. What it costs is one extra BuildHost per shard, which is why Shard bounds the count
-        // rather than sharding per project.
-        var evaluated = await Task.WhenAll(shards.Select(shard =>
-            EvaluateShardAsync(entry, shard, shadowLoader, cancellationToken)));
-        long evaluateMs = watch.ElapsedMilliseconds;
-
-        var usable = evaluated.Where(e => e is not null).ToList();
-        if (usable.Count == 0)
-        {
-            Console.Error.WriteLine(
-                $"[WorkspaceService] Every shard of the {missing.Count}-project batch for " +
-                $"'{Path.GetFileName(entry.CacheKey)}' failed; falling back to one at a time.");
-            return false;
-        }
-
+        ImmutableArray<ProjectInfo> loaded;
         try
         {
-            await entry.LoadGate.WaitAsync(cancellationToken);
-            long gateMs;
-            int added = 0;
-            try
-            {
-                gateMs = watch.ElapsedMilliseconds - evaluateMs;
-
-                // Serially, under the gate, and order matters only in that a project two shards both
-                // pulled in transitively is added by whichever gets there first; GraftProjects skips
-                // it for the other.
-                foreach (var shard in usable)
-                    added += GraftProjects(live, shard!.Value.Solution);
-
-                if (added == 0)
-                {
-                    // Everything this evaluated arrived by another route while it ran. The work is
-                    // wasted but the outcome is the one the caller wanted, so it is a success:
-                    // falling back would re-open projects that are already loaded.
-                    Console.Error.WriteLine(
-                        $"[WorkspaceService] Batch of {missing.Count} project(s) for " +
-                        $"'{Path.GetFileName(entry.CacheKey)}' was overtaken by another load; " +
-                        "nothing left to add.");
-                    return true;
-                }
-
-                await s_cacheLock.WaitAsync(cancellationToken);
-                try
-                {
-                    entry.MergeShadow(shadowLoader, null);
-                    foreach (var shard in usable)
-                    {
-                        if (shard!.Value.Dirs is { Count: > 0 } dirs)
-                        {
-                            entry.MergeShadow(shadowLoader, dirs);
-                            RegisterShadowDirsLocked(entry.CacheKey, dirs);
-                        }
-                    }
-
-                    entry.RefreshProjectIds();
-                    RegisterProjectMappingsLocked(entry.CacheKey, wanted[0], live);
-                    Interlocked.Increment(ref IncrementalLoadCount);
-                }
-                finally
-                {
-                    s_cacheLock.Release();
-                }
-            }
-            finally
-            {
-                entry.LoadGate.Release();
-            }
-
-            // A shard that failed left its projects unloaded. Reporting success would strand them,
-            // so the caller is told to fall back — the ones this batch did land are already in the
-            // workspace and cost it nothing but a cache hit.
-            var stillMissing = missing.Where(p => !entry.ProjectIds.ContainsKey(p)).ToList();
-
-            Console.Error.WriteLine(
-                $"[WorkspaceService] Batch-loaded {added} project(s) into " +
-                $"'{Path.GetFileName(entry.CacheKey)}' across {shards.Count} concurrent shard(s) " +
-                $"({entry.ProjectIds.Count} loaded) [evaluate={evaluateMs}ms gate={gateMs}ms " +
-                $"graft={watch.ElapsedMilliseconds - evaluateMs - gateMs}ms]" +
-                (stillMissing.Count > 0 ? $" — {stillMissing.Count} still missing." : "."));
-
-            return stillMissing.Count == 0;
-        }
-        finally
-        {
-            foreach (var shard in usable)
-                shard!.Value.Workspace.Dispose();
-        }
-    }
-
-    /// <summary>One shard's evaluated result, still held in the transient workspace that produced it.</summary>
-    private readonly record struct EvaluatedShard(
-        MSBuildWorkspace Workspace,
-        Solution Solution,
-        ShadowCopyAnalyzerAssemblyLoader? Loader,
-        HashSet<string>? Dirs);
-
-    /// <summary>
-    /// Splits the wanted projects across a bounded number of shards.
-    /// </summary>
-    /// <remarks>
-    /// Bounded, not one shard per project, because each shard costs its own BuildHost — about 1.5 s
-    /// of fixed cost against roughly 330 ms per additional project inside it — so past a handful the
-    /// spawns cost more than the sequencing they remove. Half the processors, capped at four,
-    /// matching <c>ProjectEvaluationService</c> and <c>WorkspaceDiagnosticsHandler</c>; these are
-    /// subprocesses doing MSBuild evaluation, and oversubscribing turns a latency win into disk and
-    /// scheduler contention with the editor the user is typing into.
-    /// </remarks>
-    private static List<List<string>> Shard(List<string> projects)
-    {
-        int shardCount = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
-        shardCount = Math.Min(shardCount, projects.Count);
-
-        var shards = new List<List<string>>(shardCount);
-        for (int i = 0; i < shardCount; i++)
-            shards.Add([]);
-
-        // Round-robin rather than contiguous blocks: adjacent entries in the wanted list are
-        // typically siblings that reference the same things, so dealing them out spreads the
-        // transitive closures across shards instead of concentrating them in one.
-        for (int i = 0; i < projects.Count; i++)
-            shards[i % shardCount].Add(projects[i]);
-
-        return shards;
-    }
-
-    /// <summary>
-    /// Runs the design-time build for one shard in a workspace of its own, returning
-    /// <see langword="null"/> when it failed — the surviving shards are still worth grafting.
-    /// </summary>
-    private static async Task<EvaluatedShard?> EvaluateShardAsync(
-        CachedWorkspaceEntry entry, List<string> shard,
-        ShadowCopyAnalyzerAssemblyLoader shadowLoader, CancellationToken cancellationToken)
-    {
-        using var partial = PartialSolution.Create(entry.CacheKey, shard);
-
-        var workspace = CreateWorkspace(
-            diagnosticWriter: TextWriter.Null,
-            isLegacy: PathHelper.IsLegacySolution(entry.CacheKey),
-            extraProperties: partial.GlobalProperties);
-
-        try
-        {
-            using var openCts = new CancellationTokenSource(OpenProjectTimeout);
-            using var openLinked = CancellationTokenSource.CreateLinkedTokenSource(
-                cancellationToken, openCts.Token);
-
-            await workspace.OpenSolutionAsync(partial.Path, cancellationToken: openLinked.Token)
-                .WaitAsync(OpenProjectTimeout, cancellationToken);
-
-            // Over the transient workspace, before the graft: the analyzer rebind has to happen
-            // while these projects are still untouched, and doing it here means the references that
-            // reach the live solution already point at shadow copies. Safe to run concurrently with
-            // the other shards — they share one loader, and both it and the shadow-copy manager
-            // underneath it serialize their own state.
-            var (_, dirs) = ApplyPostOpenPipeline(
-                workspace, newProjects: null, existingLoader: shadowLoader);
-
-            return new EvaluatedShard(workspace, workspace.CurrentSolution, shadowLoader, dirs);
+            // Evaluated through the process-wide warm BuildHost, and outside the gate. Nothing here
+            // touches the live workspace — Roslyn is being asked to build project models, and the
+            // ProjectMap is what makes those models point at the projects the workspace already
+            // holds instead of at duplicates of them.
+            var solutionForMaps = live.CurrentSolution;
+            loaded = await SharedBuildHost.LoadAsync(
+                live,
+                live.Properties,
+                missing,
+                () => ProjectMap.Create(solutionForMaps),
+                cancellationToken);
         }
         catch (OperationCanceledException)
         {
-            workspace.Dispose();
             throw;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine(
-                $"[WorkspaceService] A shard of the batch for '{Path.GetFileName(entry.CacheKey)}' " +
-                $"failed ({ex.Message}); its projects will be loaded one at a time instead.");
-            workspace.Dispose();
-            return null;
+                $"[WorkspaceService] Batch load of '{Path.GetFileName(entry.CacheKey)}' failed " +
+                $"({ex.Message}); falling back to loading one project at a time.");
+            return false;
         }
-    }
 
-    /// <summary>
-    /// Copies every project of <paramref name="source"/> that <paramref name="live"/> does not
-    /// already have into it, remapping identifiers and cross-project references as it goes.
-    /// Returns how many were added.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Identity is the project's file path, which is what every caller of this service already uses
-    /// to name a project and what the entry's own map is keyed on. A project already present in
-    /// <paramref name="live"/> is skipped rather than replaced: it may be the one holding the
-    /// symbol the caller is mid-way through searching for.
-    /// </para>
-    /// <para>
-    /// Documents are carried as <see cref="FileTextLoader"/>s rather than as text, so this stays a
-    /// metadata-only operation — nothing here reads a source file, and the batch does not force the
-    /// parse that the per-project path also defers.
-    /// </para>
-    /// <para>
-    /// Applied through <see cref="SwapCurrentSolutionInPlace"/> and not
-    /// <see cref="Workspace.TryApplyChanges"/>: to <c>TryApplyChanges</c> an added project is an
-    /// instruction to write a new <c>.csproj</c> to disk, which is emphatically not what loading
-    /// one means.
-    /// </para>
-    /// </remarks>
-    private static int GraftProjects(MSBuildWorkspace live, Solution source)
-    {
-        var solution = live.CurrentSolution;
-
-        var idByPath = new Dictionary<string, ProjectId>(StringComparer.OrdinalIgnoreCase);
-        foreach (var project in solution.Projects)
+        long evaluateMs = watch.ElapsedMilliseconds;
+        if (loaded.IsDefaultOrEmpty)
         {
-            if (project.FilePath is { Length: > 0 } path)
-                idByPath[Path.GetFullPath(path)] = project.Id;
+            // Said out loud rather than returned quietly: the caller's fallback is to load the same
+            // projects one at a time, which works but costs several seconds, and a batch that
+            // produces nothing without explanation looks exactly like a batch that was never tried.
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Batch load of {missing.Count} project(s) for " +
+                $"'{Path.GetFileName(entry.CacheKey)}' produced no projects after " +
+                $"{evaluateMs} ms; falling back to loading one at a time.");
+            return false;
         }
 
-        var incoming = source.Projects
-            .Where(p => p.FilePath is { Length: > 0 })
-            .Where(p => !idByPath.ContainsKey(Path.GetFullPath(p.FilePath!)))
-            .ToList();
+        await entry.LoadGate.WaitAsync(cancellationToken);
+        long gateMs;
+        int added;
+        try
+        {
+            gateMs = watch.ElapsedMilliseconds - evaluateMs;
 
-        if (incoming.Count == 0)
-            return 0;
+            // A project the ProjectMap matched to one already in the solution comes back with that
+            // project's own id; AddProjectsAndRewireReferences skips those, so this counts what
+            // genuinely arrived.
+            added = loaded.Count(i => !live.CurrentSolution.ContainsProject(i.Id));
+            AddProjectsAndRewireReferences(live, loaded);
 
-        // Allocated before any ProjectInfo is built, so a reference between two incoming projects
-        // resolves to the identifier the other one is about to be added under.
-        foreach (var project in incoming)
-            idByPath[Path.GetFullPath(project.FilePath!)] = ProjectId.CreateNewId(project.Name);
-
-        foreach (var project in incoming)
-            solution = solution.AddProject(ToProjectInfo(project, source, idByPath));
-
-        SwapCurrentSolutionInPlace(live, solution);
-        return incoming.Count;
-    }
-
-    private static ProjectInfo ToProjectInfo(
-        Project project, Solution source, Dictionary<string, ProjectId> idByPath)
-    {
-        var id = idByPath[Path.GetFullPath(project.FilePath!)];
-
-        var projectReferences = project.ProjectReferences
-            .Select(reference =>
+            if (added == 0)
             {
-                // A reference whose target has no ProjectInfo is how Roslyn represents a
-                // <ProjectReference> that does not resolve to a file on disk. It has no path to map
-                // and nothing to point at, so it is dropped rather than carried as a dangling id.
-                string? path = source.GetProject(reference.ProjectId)?.FilePath;
-                return path is { Length: > 0 } && idByPath.TryGetValue(Path.GetFullPath(path), out var mapped)
-                    ? new ProjectReference(mapped, reference.Aliases, reference.EmbedInteropTypes)
-                    : null;
-            })
-            .OfType<ProjectReference>()
-            .ToList();
+                Console.Error.WriteLine(
+                    $"[WorkspaceService] Batch of {missing.Count} project(s) for " +
+                    $"'{Path.GetFileName(entry.CacheKey)}' was overtaken by another load; " +
+                    "nothing left to add.");
+                return true;
+            }
 
-        return ProjectInfo
-            .Create(
-                id,
-                project.Version,
-                project.Name,
-                project.AssemblyName,
-                project.Language,
-                filePath: project.FilePath,
-                outputFilePath: project.OutputFilePath,
-                compilationOptions: project.CompilationOptions,
-                parseOptions: project.ParseOptions,
-                documents: project.Documents.Select(d => ToDocumentInfo(id, d)),
-                projectReferences: projectReferences,
-                metadataReferences: project.MetadataReferences,
-                analyzerReferences: project.AnalyzerReferences,
-                additionalDocuments: project.AdditionalDocuments.Select(d => ToDocumentInfo(id, d)))
-            .WithDefaultNamespace(project.DefaultNamespace)
-            .WithOutputRefFilePath(project.OutputRefFilePath)
-            .WithAnalyzerConfigDocuments(
-                project.AnalyzerConfigDocuments.Select(d => ToDocumentInfo(id, d)));
+            // Over the newly added projects only, and while they are still unreachable by any other
+            // caller: the analyzer rebind has to happen before anything asks them for a compilation.
+            var (loader, dirs) = ApplyPostOpenPipeline(
+                live, [.. loaded.Select(i => i.Id)], entry.ShadowLoader);
+
+            await s_cacheLock.WaitAsync(cancellationToken);
+            try
+            {
+                entry.MergeShadow(loader, dirs);
+                entry.RefreshProjectIds();
+                RegisterProjectMappingsLocked(entry.CacheKey, wanted[0], live);
+                if (dirs is { Count: > 0 })
+                    RegisterShadowDirsLocked(entry.CacheKey, dirs);
+                Interlocked.Increment(ref IncrementalLoadCount);
+            }
+            finally
+            {
+                s_cacheLock.Release();
+            }
+        }
+        finally
+        {
+            entry.LoadGate.Release();
+        }
+
+        // Anything the batch did not produce is still unloaded, so the caller is told to fall back;
+        // whatever it did land is already in the workspace and costs the retry a cache hit.
+        var stillMissing = missing.Where(p => !entry.ProjectIds.ContainsKey(p)).ToList();
+
+        Console.Error.WriteLine(
+            $"[WorkspaceService] Batch-loaded {added} project(s) into " +
+            $"'{Path.GetFileName(entry.CacheKey)}' through the shared BuildHost " +
+            $"({entry.ProjectIds.Count} loaded) [evaluate={evaluateMs}ms gate={gateMs}ms " +
+            $"apply={watch.ElapsedMilliseconds - evaluateMs - gateMs}ms]" +
+            (stillMissing.Count > 0 ? $" — {stillMissing.Count} still missing." : "."));
+
+        return stillMissing.Count == 0;
     }
-
-    private static DocumentInfo ToDocumentInfo(ProjectId newProjectId, TextDocument document) =>
-        DocumentInfo.Create(
-            DocumentId.CreateNewId(newProjectId, document.Name),
-            document.Name,
-            folders: document.Folders,
-            sourceCodeKind: (document as Document)?.SourceCodeKind ?? SourceCodeKind.Regular,
-            // No file path means nothing on disk backs it, so there is no loader to give it and the
-            // document is added empty rather than dropped — losing the file from the project would
-            // be a worse lie than an empty one.
-            loader: document.FilePath is { Length: > 0 } path ? new FileTextLoader(path, defaultEncoding: null) : null,
-            filePath: document.FilePath);
 
     /// <summary>
     /// Walks up the directory tree from <paramref name="filePath"/> to find
@@ -1406,13 +1255,17 @@ internal static class WorkspaceService
         {
             BoundSolutionPath = Path.GetFullPath(path);
 
-            // Nothing is loaded here — these only start the two fixed costs the first real request
-            // would otherwise discover inside itself: the NuGet restore the solution needs if and
-            // only if it has never been restored, and the MEF composition every workspace runs on.
-            // Both overlap the seconds the editor spends on structural work, which needs neither.
-            // See StartSolutionRestoreInBackground for why this is not a preload.
+            // Nothing is loaded here — these only start the fixed costs the first real request would
+            // otherwise discover inside itself: the NuGet restore the solution needs if and only if
+            // it has never been restored, the MEF composition every workspace runs on, and MSBuild's
+            // own start-up inside the BuildHost. All three overlap the seconds the editor spends on
+            // structural work, which needs none of them. See StartSolutionRestoreInBackground for
+            // why this is not a preload: no project is opened and no solution is read.
             RestoreService.StartSolutionRestoreInBackground(BoundSolutionPath);
             WarmHostServicesInBackground();
+
+            if (PathHelper.GetProjectsFromSolution(BoundSolutionPath).FirstOrDefault() is { } anyProject)
+                SharedBuildHost.WarmInBackground(CreateDefaultProperties().ToImmutableDictionary(), anyProject);
         }
     }
 
@@ -1473,6 +1326,25 @@ internal static class WorkspaceService
         {
             s_cacheLock.Release();
         }
+
+        // Deliberately not tearing down the build hosts here. This method means "drop the cached
+        // workspaces" — it is called on a solution rebind, on analyzer rebuilds, and by tests
+        // between cases — and the hosts have nothing to do with any one workspace: they are warm
+        // MSBuild processes that answer questions about project files. Disposing them here killed
+        // hosts that other in-flight loads were mid-conversation with. They are released in
+        // ShutdownAsync instead, at the one point where nothing can still be using them.
+    }
+
+    /// <summary>
+    /// Releases the process-wide resources that outlive any workspace. Call once, on the way out.
+    /// </summary>
+    public static async Task ShutdownAsync()
+    {
+        await EvictAllAsync(CancellationToken.None);
+
+        // Subprocesses, so nothing else reclaims them: left behind they are the orphaned MSBuild
+        // hosts that accumulate on a machine until it is rebooted.
+        await SharedBuildHost.DisposeAllAsync();
     }
 
     // ---- Test hooks (exposed via InternalsVisibleTo) ----

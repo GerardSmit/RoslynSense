@@ -1,3 +1,4 @@
+using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.WebForms.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
@@ -8,10 +9,46 @@ using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
 namespace RoslynMCP.Languages.WebForms;
 
-internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider
+internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILanguageCodeLensGeneration
 {
     /// <summary>As many as the peek window can usefully show, matching the C# handler.</summary>
     private const int MaxReferenceLocations = 100;
+
+    /// <summary>
+    /// What a reference count on a markup file depends on, so <see cref="CodeLensResolveMemo"/> can
+    /// tell when one is still good.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>Text</c> covers an edit to the page itself. <c>Compilation</c> covers an edit to the
+    /// code-behind, which changes what the same <c>ID</c> binds to without touching this file, and
+    /// it is a snapshot so reference equality is the whole test.
+    /// </para>
+    /// <para>
+    /// Deliberately not the solution as well, which would only look like it covered more. The
+    /// document these are read from is memoized on (text, compilation) alone, so a hit hands back
+    /// the solution captured when it was parsed — a project grafted in afterwards would compare
+    /// equal and change nothing. Widening the workspace is announced instead, by the refresh
+    /// <c>LspWorkspaceRefresh</c> sends when the project set moves, which makes the client re-pull
+    /// and this memo re-key on whatever compilation the graft produced.
+    /// </para>
+    /// </remarks>
+    private sealed record LensGeneration(string Text, Compilation Compilation);
+
+    /// <remarks>
+    /// Without this the memo passes the pack straight through, and every <c>codeLens/resolve</c> —
+    /// one per visible control, re-fired on every scroll and every edit — pays a fresh solution-wide
+    /// reference search plus a walk of the project's markup. On a page with a couple of hundred
+    /// <c>ID</c>s that is the difference between a gutter that fills in and one that arrives twenty
+    /// seconds late.
+    /// </remarks>
+    public async ValueTask<object?> LensGenerationAsync(string uri, CancellationToken ct)
+    {
+        var document = await AspxDocumentService.GetAsync(LspConverters.UriToPath(uri), ct);
+        return document is null
+            ? null
+            : new LensGeneration(document.Text, document.Compilation);
+    }
 
     /// <summary>
     /// A reference count over every control <c>ID</c> that has a code-behind field — the markup

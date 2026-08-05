@@ -68,10 +68,14 @@ internal static class AspxReferenceService
             return results;
 
         var definition = symbol.OriginalDefinition;
+        var mentions = AspxMentionFilter.For(symbol);
 
         foreach (string file in EnumerateFiles(project))
         {
             ct.ThrowIfCancellationRequested();
+
+            if (!mentions.MayMention(file))
+                continue;
 
             var document = await AspxDocumentService.GetAsync(file, ct);
             if (document?.Tree is not { } root)

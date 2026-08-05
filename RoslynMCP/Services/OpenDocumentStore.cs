@@ -26,9 +26,41 @@ public static class OpenDocumentStore
         new(StringComparer.OrdinalIgnoreCase);
 
     private static long s_generation;
+    private static long s_overlayGeneration;
 
-    /// <summary>Bumped on every open/change/close; snapshot overlays are memoized against it.</summary>
+    /// <summary>Bumped on every open/change/close of any buffer, whatever its language.</summary>
     public static long Generation => Interlocked.Read(ref s_generation);
+
+    /// <summary>
+    /// Bumped only when a buffer moved that a Roslyn snapshot can actually carry — see
+    /// <see cref="IsOverlayable"/>. This is what
+    /// <see cref="WorkspaceService.ApplyOpenDocumentOverlay"/> memoizes against.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="Generation"/> because the overlay is the expensive consumer and a
+    /// markup buffer can never change its outcome. Opening one <c>.ascx</c> used to fork a fresh
+    /// <c>Solution</c> — and therefore a fresh <c>Compilation</c> for every project holding an open
+    /// <c>.cs</c> — which invalidated every cached markup parse in the project, moved every
+    /// document's dependent semantic version, and so made the next <c>workspace/diagnostic</c> pull
+    /// report a whole website as changed. All of that for a file Roslyn does not model.
+    /// </remarks>
+    public static long OverlayGeneration => Interlocked.Read(ref s_overlayGeneration);
+
+    /// <summary>
+    /// Whether a buffer at this path can change what the overlay produces. The overlay only ever
+    /// calls <c>Solution.WithDocumentText</c>, which reaches regular documents and nothing else, so
+    /// the answer is exactly "is this a file Roslyn compiles".
+    /// </summary>
+    /// <remarks>
+    /// Deliberately an extension test rather than a workspace lookup: this runs inside didOpen and
+    /// didChange, on the message loop, before any project is necessarily loaded — and it has to be
+    /// answerable for a path the workspace has never heard of. Erring towards <see langword="true"/>
+    /// costs a redundant fork, which is what happened unconditionally before.
+    /// </remarks>
+    private static bool IsOverlayable(string path) =>
+        Path.GetExtension(path.AsSpan()) is var ext
+        && (ext.Equals(".cs", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".vb", StringComparison.OrdinalIgnoreCase));
 
     public static bool IsEmpty => s_docs.IsEmpty;
 
@@ -64,7 +96,7 @@ public static class OpenDocumentStore
             doc.Version = version;
             doc.OwnerSessions.Add(sessionId);
         }
-        Interlocked.Increment(ref s_generation);
+        Bump(key);
     }
 
     /// <summary>Applies incremental (or full) changes. Returns the resulting text, or null if
@@ -80,7 +112,7 @@ public static class OpenDocumentStore
             doc.Text = updated;
             doc.Version = version;
         }
-        Interlocked.Increment(ref s_generation);
+        Bump(PathHelper.NormalizePath(filePath));
         return updated;
     }
 
@@ -97,7 +129,7 @@ public static class OpenDocumentStore
         }
         if (removed)
             s_docs.TryRemove(key, out _);
-        Interlocked.Increment(ref s_generation);
+        Bump(key);
     }
 
     /// <summary>Drops every document owned by a session that disconnected.</summary>
@@ -114,7 +146,19 @@ public static class OpenDocumentStore
             if (removed)
                 s_docs.TryRemove(key, out _);
         }
+
+        // A disconnecting session takes buffers of every kind with it, so both counters move
+        // rather than being decided per path.
         Interlocked.Increment(ref s_generation);
+        Interlocked.Increment(ref s_overlayGeneration);
+    }
+
+    /// <summary>Records that a buffer moved, on both counters or only the general one.</summary>
+    private static void Bump(string normalizedPath)
+    {
+        Interlocked.Increment(ref s_generation);
+        if (IsOverlayable(normalizedPath))
+            Interlocked.Increment(ref s_overlayGeneration);
     }
 
     /// <summary>True when the file is open in some editor (its buffer may differ from disk).</summary>

@@ -1728,12 +1728,19 @@ internal static class WorkspaceService
     /// open files, not just the requested one. The forked solution is memoized per store
     /// generation — rebuilding it on every request would re-fork N documents each call.
     /// </summary>
+    /// <remarks>
+    /// <see cref="OpenDocumentStore.OverlayGeneration"/> rather than
+    /// <see cref="OpenDocumentStore.Generation"/>: a rebuild that produces the same texts still
+    /// produces a <em>new</em> <see cref="Solution"/>, and every compilation, semantic version and
+    /// downstream cache keyed on one goes with it. Only a buffer this method could actually apply
+    /// is allowed to cause that.
+    /// </remarks>
     private static Project ApplyOpenDocumentOverlay(CachedWorkspaceEntry entry, Project project)
     {
         if (OpenDocumentStore.IsEmpty)
             return project;
 
-        long generation = OpenDocumentStore.Generation;
+        long generation = OpenDocumentStore.OverlayGeneration;
         var baseSolution = project.Solution;
         Solution? overlay;
         lock (entry.OverlayLock)

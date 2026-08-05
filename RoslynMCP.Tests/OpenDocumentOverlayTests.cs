@@ -76,6 +76,55 @@ public class OpenDocumentOverlayTests
         Assert.False(OpenDocumentStore.IsOpen(path));
     }
 
+    /// <summary>
+    /// Opening a markup file must not fork the solution.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// An <c>.ascx</c> is not a Roslyn document, so the overlay can never apply it — but the store
+    /// bumped one generation for every buffer, and the rebuild that followed produced a new
+    /// <see cref="Microsoft.CodeAnalysis.Solution"/> whether or not any text actually moved. Every
+    /// compilation went with it, and so did everything keyed on one: the memoized markup parses
+    /// (which compare compilations by reference), and every document's dependent semantic version,
+    /// which is half of the <c>workspace/diagnostic</c> result id. Closing and reopening one page
+    /// therefore made the next pull report a whole website as changed and re-analyse it.
+    /// </para>
+    /// <para>
+    /// Asserted on the compilation rather than on the counter, because the counter is the mechanism
+    /// and this is the property that matters — a later mechanism that keeps the snapshot stable
+    /// should keep this test passing.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task OpeningAMarkupBufferLeavesTheCompilationSnapshotAlone()
+    {
+        string session = Guid.NewGuid().ToString("N");
+        string markupPath = FixturePaths.DefaultAspxFile;
+
+        var before = await GetCompilationAsync(FixturePaths.AspxProjectFile);
+
+        OpenDocumentStore.Open(
+            session, markupPath, SourceText.From(await File.ReadAllTextAsync(markupPath)), version: 1);
+        try
+        {
+            Assert.Same(before, await GetCompilationAsync(FixturePaths.AspxProjectFile));
+        }
+        finally
+        {
+            OpenDocumentStore.Close(session, markupPath);
+        }
+
+        // And closing it again is the other half of the reported gesture.
+        Assert.Same(before, await GetCompilationAsync(FixturePaths.AspxProjectFile));
+    }
+
+    private static async Task<Microsoft.CodeAnalysis.Compilation?> GetCompilationAsync(string projectPath)
+    {
+        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+            projectPath, cancellationToken: default);
+        return await project.GetCompilationAsync();
+    }
+
     private static async Task<string> GetSnapshotTextAsync(string filePath)
     {
         var projectPath = await WorkspaceService.FindContainingProjectAsync(filePath, default);

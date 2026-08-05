@@ -29,7 +29,7 @@ internal sealed partial class ResourcesLanguage : ILanguageDiagnosticProvider
         if (ResourceCatalogService.Text(filePath) is not { } text)
             return Task.FromResult(Array.Empty<Diagnostic>());
 
-        var contents = ResxReader.Read(text);
+        var contents = ResourceCatalogService.ReadContents(filePath, text);
         var diagnostics = new List<Diagnostic>();
 
         foreach (string key in contents.DuplicateKeys)

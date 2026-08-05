@@ -5,17 +5,19 @@ namespace RoslynMCP.Languages.Resources;
 internal sealed partial class ResourcesLanguage : ILanguageWatchedFileHandler
 {
     /// <summary>
-    /// A <c>.resx</c> changed outside the editor. The batch this arrives in has already lost which
-    /// of created, changed or deleted it was, so every event is treated as a membership change:
-    /// regrouping a directory reads no file contents, while assuming a content edit would leave a
-    /// deleted file in its family and a created one out of it.
+    /// A <c>.resx</c> changed outside the editor. A content edit re-reads the family and keeps the
+    /// catalog — membership is a function of file names and none of them moved. A create or delete
+    /// moved membership, so every catalog covering the path regroups.
     /// </summary>
-    public bool Invalidate(string path)
+    public bool Invalidate(string path, WatchedFileChange change)
     {
         if (!Path.GetExtension(path).Equals(".resx", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        ResourceCatalogService.InvalidateLayout(path);
+        if (change == WatchedFileChange.Changed)
+            ResourceCatalogService.InvalidateContent(path);
+        else
+            ResourceCatalogService.InvalidateLayout(path);
         return true;
     }
 }

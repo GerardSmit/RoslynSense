@@ -321,5 +321,17 @@ internal interface ILanguageWatchedFileHandler
     /// Invalidates anything cached for <paramref name="path"/>, returning whether the path was
     /// one this pack recognised. False means "not mine", not "nothing to do".
     /// </summary>
-    bool Invalidate(string path);
+    bool Invalidate(string path, WatchedFileChange change);
+}
+
+/// <summary>
+/// How a watched file changed on disk. Mirrors LSP's <c>FileChangeType</c>, redeclared here so a
+/// pack needs no protocol reference — and because the distinction is load-bearing: a content edit
+/// and a membership change (create/delete/rename) invalidate different amounts of cache.
+/// </summary>
+internal enum WatchedFileChange
+{
+    Created,
+    Changed,
+    Deleted,
 }

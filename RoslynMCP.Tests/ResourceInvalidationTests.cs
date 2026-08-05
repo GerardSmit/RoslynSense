@@ -42,12 +42,12 @@ public class ResourceInvalidationTests
         // did above — which is the point of caching it.
         Assert.Empty(ResourceCatalogService.Get(site.Root).Families);
 
-        Assert.True(pack.Invalidate(added));
+        Assert.True(pack.Invalidate(added, WatchedFileChange.Created));
         Assert.Equal(AddedFamily, Assert.Single(ResourceCatalogService.Get(site.Root).Families).BaseName);
 
         // Every path is offered to every pack, so declining the ones that are not its own is part
         // of the contract rather than an optimization.
-        Assert.False(pack.Invalidate(Path.ChangeExtension(added, ".cs")));
+        Assert.False(pack.Invalidate(Path.ChangeExtension(added, ".cs"), WatchedFileChange.Created));
     }
 
     [Fact]

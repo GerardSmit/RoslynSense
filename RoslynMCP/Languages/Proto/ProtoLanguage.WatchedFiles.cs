@@ -20,7 +20,7 @@ internal sealed partial class ProtoLanguage : ILanguageWatchedFileHandler
     /// on fully-qualified proto names is for: a declaration whose generated C# is a build behind
     /// still resolves, as long as its name did not move.
     /// </remarks>
-    public bool Invalidate(string path)
+    public bool Invalidate(string path, WatchedFileChange change)
     {
         if (!ProtoDocumentService.IsProtoFile(path))
             return false;

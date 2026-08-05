@@ -117,18 +117,28 @@ internal static class ResourceCatalogService
         if (ReadText(file.FilePath) is not { } text)
             return file;
 
+        var contents = ReadContents(file.FilePath, text);
+        return file with { Entries = contents.Entries, DuplicateKeys = contents.DuplicateKeys };
+    }
+
+    /// <summary>
+    /// One file's parsed contents through the same checksum cache as <see cref="Read"/>, for
+    /// callers that hold a path and its text rather than a family member — diagnostics and the
+    /// caret run per keystroke on an open <c>.resx</c>, and the parse is the expensive part.
+    /// </summary>
+    public static ResxContents ReadContents(string filePath, SourceText text)
+    {
         var checksum = text.GetChecksum();
 
-        if (s_files.TryGetValue(file.FilePath, out var cached)
+        if (s_files.TryGetValue(filePath, out var cached)
             && cached.Checksum.AsSpan().SequenceEqual(checksum.AsSpan()))
         {
-            return file with { Entries = cached.Entries, DuplicateKeys = cached.DuplicateKeys };
+            return new ResxContents(cached.Entries, cached.DuplicateKeys);
         }
 
         var contents = ResxReader.Read(text);
-        s_files[file.FilePath] = new FileCacheEntry(checksum, contents.Entries, contents.DuplicateKeys);
-
-        return file with { Entries = contents.Entries, DuplicateKeys = contents.DuplicateKeys };
+        s_files[filePath] = new FileCacheEntry(checksum, contents.Entries, contents.DuplicateKeys);
+        return contents;
     }
 
     /// <summary>

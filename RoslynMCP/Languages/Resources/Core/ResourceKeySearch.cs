@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -823,7 +824,7 @@ internal static class ResourceKeySearch
         // An entry the reader could not span carries an entity reference in its name. It has no
         // range to offer prepareRename and none a rename could replace, so the caret finds nothing
         // rather than something approximate.
-        var entry = ResxReader.Read(text).Entries.Values
+        var entry = ResourceCatalogService.ReadContents(filePath, text).Entries.Values
             .FirstOrDefault(e => !e.KeySpan.IsEmpty && Touches(e.KeySpan, offset));
 
         if (entry.Key is not { Length: > 0 } key
@@ -1258,17 +1259,51 @@ internal static class ResourceKeySearch
         return forms.ToImmutable();
     }
 
+    /// <summary>How much of a file is searched at a time in <see cref="Mentions"/>.</summary>
+    private const int MentionsChunk = 16 * 1024;
+
+    /// <summary>Whether any written form appears in the text at all — the filter that decides if a
+    /// file is worth opening. Searched in pooled chunks rather than <c>text.ToString()</c>: this
+    /// runs against every document in scope per find-references, and a full-string copy of each
+    /// file was the dominant allocation. Chunks overlap by a candidate length so a mention
+    /// straddling a boundary is still seen.</summary>
     private static bool Mentions(SourceText text, ImmutableArray<string> candidates)
     {
-        string content = text.ToString();
+        int length = text.Length;
+        if (length == 0 || candidates.IsDefaultOrEmpty)
+            return false;
 
+        int longest = 0;
         foreach (string candidate in candidates)
-        {
-            if (content.Contains(candidate, StringComparison.Ordinal))
-                return true;
-        }
+            longest = Math.Max(longest, candidate.Length);
 
-        return false;
+        if (longest == 0 || longest > length)
+            return false;
+
+        char[] buffer = ArrayPool<char>.Shared.Rent(Math.Min(length, MentionsChunk + longest));
+        try
+        {
+            int chunk = Math.Min(buffer.Length, length);
+            for (int start = 0; ; start += chunk - (longest - 1))
+            {
+                int count = Math.Min(chunk, length - start);
+                text.CopyTo(start, buffer, 0, count);
+                var window = buffer.AsSpan(0, count);
+
+                foreach (string candidate in candidates)
+                {
+                    if (window.IndexOf(candidate.AsSpan(), StringComparison.Ordinal) >= 0)
+                        return true;
+                }
+
+                if (start + count >= length)
+                    return false;
+            }
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(buffer);
+        }
     }
 
     private static bool Intersects(

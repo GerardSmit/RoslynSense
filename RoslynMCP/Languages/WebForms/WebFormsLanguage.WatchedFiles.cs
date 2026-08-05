@@ -11,7 +11,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWatchedFileHandler
     /// clear the cache outright — every parsed document in the project inherited its
     /// <c>&lt;pages&gt;</c> namespaces.
     /// </summary>
-    public bool Invalidate(string path)
+    public bool Invalidate(string path, WatchedFileChange change)
     {
         if (Path.GetFileName(path).Equals("web.config", StringComparison.OrdinalIgnoreCase))
         {

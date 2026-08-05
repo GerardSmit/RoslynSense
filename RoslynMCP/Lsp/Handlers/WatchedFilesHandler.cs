@@ -70,10 +70,11 @@ internal static class WatchedFilesHandler
     internal static async Task<Outcome> ProcessAsync(
         IReadOnlyList<FileEvent> changes, CancellationToken ct)
     {
-        var paths = changes
-            .Select(c => LspConverters.UriToPath(c.Uri))
-            .Where(p => !IsIgnored(p))
+        var events = changes
+            .Select(c => (Path: LspConverters.UriToPath(c.Uri), Change: KindOf(c.Type)))
+            .Where(e => !IsIgnored(e.Path))
             .ToList();
+        var paths = events.Select(e => e.Path).ToList();
 
         if (paths.Count == 0)
             return new Outcome(false, []);
@@ -97,11 +98,11 @@ internal static class WatchedFilesHandler
         // markup that has since changed on disk.
         var watchers = LanguageScope.Process.Contributors<ILanguageWatchedFileHandler>();
         var invalidatedMarkup = new List<string>();
-        foreach (string path in paths)
+        foreach (var (path, change) in events)
         {
             bool invalidated = false;
             foreach (var watcher in watchers)
-                invalidated |= watcher.Invalidate(path);
+                invalidated |= watcher.Invalidate(path, change);
 
             if (invalidated)
                 invalidatedMarkup.Add(path);
@@ -136,6 +137,13 @@ internal static class WatchedFilesHandler
 
         return new Outcome(false, evicted, invalidatedMarkup);
     }
+
+    private static WatchedFileChange KindOf(int type) => type switch
+    {
+        FileChangeType.Created => WatchedFileChange.Created,
+        FileChangeType.Deleted => WatchedFileChange.Deleted,
+        _ => WatchedFileChange.Changed,
+    };
 
     private static bool IsIgnored(string path)
     {

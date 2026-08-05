@@ -284,11 +284,14 @@ internal static class AspxLanguageHandler
 
         // The markup counterpart of the pre-pass in NavigationHandlers: a `<%$ Resources: %>`
         // argument resolves to no symbol, so a search started on one has to reach the pack that
-        // knows what a resource key is before the resolve declines.
+        // knows what a resource key is before the resolve declines. The current project, not the
+        // parse's snapshot: a key search reads document text, and its answers are positions in
+        // the files as they are now.
+        var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
         foreach (var provider in
                  LanguageScope.Process.Contributors<ISymbolFreeReferenceProvider>())
         {
-            if (await provider.ReferencesAsync(document.FilePath, offset, document.Project, ct)
+            if (await provider.ReferencesAsync(document.FilePath, offset, current, ct)
                 is { } found)
             {
                 return [.. found];
@@ -608,12 +611,15 @@ internal static class AspxLanguageHandler
         if (await ResolveAsync(p.TextDocument, p.Position, ct) is not var (document, offset))
             return null;
 
-        // Ahead of the markup resolve, for the same reason prepareRename is.
+        // Ahead of the markup resolve, for the same reason prepareRename is. The current project,
+        // not the parse's snapshot: a key rename's edits are applied to the buffers the user has
+        // now, and a stale snapshot's offsets would land them mid-word.
+        var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
         foreach (var provider in
                  LanguageScope.Process.Contributors<ISymbolFreeRenameProvider>())
         {
             if (await provider.RenameAsync(
-                    document.FilePath, offset, p.NewName, document.Project, ct) is { } edit)
+                    document.FilePath, offset, p.NewName, current, ct) is { } edit)
             {
                 return edit;
             }

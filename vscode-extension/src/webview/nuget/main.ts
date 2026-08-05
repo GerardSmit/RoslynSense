@@ -418,7 +418,6 @@ namespace NG {
         el<HTMLInputElement>('query').value = saved.query;
         el<HTMLInputElement>('prerelease').checked = saved.prerelease;
         el<HTMLSelectElement>('version-lock').value = saved.versionLock;
-        el<HTMLSelectElement>('dependency-mode').value = saved.dependencyMode ?? 'selectedOnly';
         el<HTMLSelectElement>('source').value = saved.source;
         switchTab(saved.tab);
     }

@@ -54,7 +54,7 @@ namespace NG {
 
     export function savedState(): NuGetMsg.SavedState | null {
         const stored = api.getState() as NuGetMsg.SavedState | undefined;
-        return stored && stored.v === 1 ? stored : null;
+        return stored && stored.v === 2 ? stored : null;
     }
 
     let persistTimer: number | undefined;
@@ -63,12 +63,11 @@ namespace NG {
         window.clearTimeout(persistTimer);
         persistTimer = window.setTimeout(() => {
             api.setState({
-                v: 1,
+                v: 2,
                 tab: state.tab,
                 query: state.query,
                 prerelease: el<HTMLInputElement>('prerelease').checked,
                 versionLock: el<HTMLSelectElement>('version-lock').value as NuGetMsg.Lock,
-                dependencyMode: el<HTMLSelectElement>('dependency-mode').value as NuGetMsg.DependencyMode,
                 source: el<HTMLSelectElement>('source').value,
                 selectedId: focusedRow?.pkg.id ?? null,
                 splitPercent: state.splitPercent,

@@ -229,6 +229,22 @@
         "category": "RoslynSense"
       },
       {
+        "command": "roslynSense.nuget.updateAll",
+        "title": "NuGet: Review Package Updates",
+        "category": "RoslynSense",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "roslynSense.nuget.clearCredentials",
+        "title": "NuGet: Clear Saved Feed Credentials",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.nuget.openSourcesConfig",
+        "title": "NuGet: Open NuGet.config",
+        "category": "RoslynSense"
+      },
+      {
         "command": "roslynSense.solutionExplorer.newFile",
         "title": "New File\u2026",
         "category": "RoslynSense",
@@ -919,6 +935,53 @@
             "type": "string"
           },
           "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` \u2014 for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
+        },
+        "roslynSense.nuget.alignPlatformPackages": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Keep platform-tracking packages (`Microsoft.Extensions.*`, `Microsoft.AspNetCore.*`, `System.*`, EF Core, \u2026) on the release band matching the project's target framework: a net8.0 project is offered 8.x, with newer bands disclosed but not applied. Turn off to let \u201clatest\u201d cross into a band built for a newer .NET."
+        },
+        "roslynSense.nuget.pageSize": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 200,
+          "description": "How many packages one Browse page requests from the feeds."
+        },
+        "roslynSense.nuget.readme": {
+          "type": "string",
+          "enum": [
+            "rendered",
+            "plain",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Render the package README as formatted text.",
+            "Show the package README as plain text.",
+            "Do not fetch READMEs at all."
+          ],
+          "default": "rendered",
+          "description": "How the NuGet panel shows a package's README."
+        },
+        "roslynSense.nuget.showTransitive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show transitive dependencies in the NuGet panel's details pane."
+        },
+        "roslynSense.nuget.defaultScope": {
+          "type": "string",
+          "enum": [
+            "lastUsed",
+            "openedProject",
+            "none"
+          ],
+          "enumDescriptions": [
+            "Start with the projects that were selected last time.",
+            "Start empty unless the panel was opened from a project node.",
+            "Start with no project selected."
+          ],
+          "default": "lastUsed",
+          "description": "Which projects the NuGet panel targets when it opens. A single-project solution always selects that project."
         }
       }
     }

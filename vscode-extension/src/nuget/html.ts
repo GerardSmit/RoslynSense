@@ -75,23 +75,16 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 
 <div class="toolbar" id="updates-toolbar" hidden>
   <label class="check"><input type="checkbox" id="select-all"> Select all</label>
-  <label class="check">Allow
+  <label class="check">Update to
     <select id="version-lock" aria-label="How far a version may move">
-      <option value="none">any newer version</option>
-      <option value="major">same major only</option>
-      <option value="minor">same minor only</option>
-      <option value="framework">match target framework</option>
+      <option value="none">latest</option>
+      <option value="major">same major</option>
+      <option value="minor">same minor</option>
     </select>
   </label>
-  <label class="check">Dependencies
-    <select id="dependency-mode" aria-label="Whether references a package needs are updated too">
-      <option value="selectedOnly">selected only</option>
-      <option value="minimal">bump to minimum required</option>
-      <option value="latest">bump to latest allowed</option>
-    </select>
-  </label>
+  <span class="muted" id="plan-note" aria-live="polite"></span>
   <span class="spacer"></span>
-  <button class="action" id="update-selected" disabled>Update selected</button>
+  <button class="action" id="update-selected" disabled>Update</button>
 </div>
 
 <section class="pane" id="pane-packages">

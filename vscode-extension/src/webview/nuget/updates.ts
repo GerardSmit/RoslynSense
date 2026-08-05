@@ -123,19 +123,21 @@ namespace NG {
                 packages,
                 // The lock travels with the request: it decides how far an induced bump may go,
                 // and the host has no view of this control.
-                mode: el<HTMLSelectElement>('dependency-mode').value as NuGetMsg.DependencyMode,
                 versionLock: el<HTMLSelectElement>('version-lock').value as NuGetMsg.Lock,
                 includePrerelease: el<HTMLInputElement>('prerelease').checked,
             });
         });
     }
 
-    export function requestUpdates(): void {
+    export function requestUpdates(gen?: number): void {
         post({
             type: 'updates',
-            gen: nextListGen(),
+            gen: gen ?? nextListGen(),
             includePrerelease: el<HTMLInputElement>('prerelease').checked,
             versionLock: el<HTMLSelectElement>('version-lock').value as NuGetMsg.Lock,
+            // The scope chip narrows this tab like every other: updating a project you filtered
+            // out is the kind of surprise the chip exists to prevent.
+            projectPaths: state.scope,
         });
     }
 

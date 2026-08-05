@@ -67,6 +67,22 @@ declare namespace NuGetMsg {
         isCentrallyManaged: boolean;
         isGlobalPackageReference: boolean;
         versionSource: string | null;
+        /**
+         * The newest usable version beyond the project's platform band, when band alignment held
+         * latestVersion back. Shown as a disclosure, never offered as the update.
+         */
+        latestUncapped: string | null;
+    }
+
+    /** A reference the selected updates drag along with them (NU1605 prevention). */
+    interface InducedUpdate {
+        id: string;
+        currentVersion: string;
+        version: string;
+        projectPath: string;
+        projectName: string;
+        requiredBy: string;
+        requiredByVersion: string;
     }
 
     interface DependencyGroup {
@@ -169,18 +185,20 @@ declare namespace NuGetMsg {
     type Tab = 'browse' | 'installed' | 'updates' | 'consolidate' | 'sources';
 
     type SourceAction = 'add' | 'update' | 'remove' | 'enable' | 'disable' | 'reorder';
-    type Lock = 'none' | 'major' | 'minor' | 'framework';
 
-    /** How far an update may reach beyond the packages that were ticked. */
-    type DependencyMode = 'selectedOnly' | 'minimal' | 'latest';
+    /**
+     * How far a version may move. The platform band for Microsoft.Extensions.*-style families is
+     * not a lock value: it is always applied by the server (see the alignPlatformPackages setting),
+     * so "latest" already means "latest for the .NET major this project targets".
+     */
+    type Lock = 'none' | 'major' | 'minor';
 
     interface SavedState {
-        v: 1;
+        v: 2;
         tab: Tab;
         query: string;
         prerelease: boolean;
         versionLock: Lock;
-        dependencyMode: DependencyMode;
         source: string;
         selectedId: string | null;
         /** Width of the list pane, as a percentage of the split. */
@@ -205,7 +223,7 @@ declare namespace NuGetMsg {
         | { type: 'ready'; state: SavedState | null }
         | { type: 'search'; gen: number; query: string; includePrerelease: boolean; source: string; skip: number }
         | { type: 'installed'; gen: number }
-        | { type: 'updates'; gen: number; includePrerelease: boolean; versionLock: Lock }
+        | { type: 'updates'; gen: number; includePrerelease: boolean; versionLock: Lock; projectPaths: string[] }
         | { type: 'consolidations'; gen: number }
         | { type: 'audit'; gen: number; refresh: boolean }
         | { type: 'versions'; id: string; includePrerelease: boolean }
@@ -221,7 +239,13 @@ declare namespace NuGetMsg {
         | {
               type: 'updateAll';
               packages: { id: string; version: string; projectPaths: string[] }[];
-              mode: DependencyMode;
+              versionLock: Lock;
+              includePrerelease: boolean;
+          }
+        | {
+              type: 'updatePlan';
+              gen: number;
+              packages: { id: string; version: string; projectPaths: string[] }[];
               versionLock: Lock;
               includePrerelease: boolean;
           }
@@ -237,6 +261,7 @@ declare namespace NuGetMsg {
         | { type: 'results'; gen: number; tab: Tab; skip: number; results: PackageSummary[]; hasMore: boolean; feeds: FeedOutcome[] }
         | { type: 'projects'; gen: number; projects: ProjectPackages[] }
         | { type: 'updates'; gen: number; updates: PackageUpdate[]; feeds: FeedOutcome[] }
+        | { type: 'updatePlan'; gen: number; induced: InducedUpdate[] }
         | { type: 'consolidations'; gen: number; results: Consolidation[] }
         | { type: 'audit'; gen: number; audit: Audit }
         | { type: 'versions'; id: string; versions: string[] }

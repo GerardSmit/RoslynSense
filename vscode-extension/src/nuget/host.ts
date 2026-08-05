@@ -172,6 +172,8 @@ export function wire(
                         }>('roslynSense/nuget/updates', {
                             includePrerelease: message.includePrerelease,
                             versionLock: message.versionLock,
+                            projectPaths: message.projectPaths.length > 0 ? message.projectPaths : null,
+                            alignPlatform: alignPlatform(),
                         });
                         post({
                             type: 'updates',
@@ -334,11 +336,31 @@ export function wire(
                         break;
                     }
 
+                    case 'updatePlan': {
+                        // Advice for the panel to render inline; a planning failure costs a hint,
+                        // never an update.
+                        const plan = await client
+                            .sendRequest<{ induced: NuGetMsg.InducedUpdate[] }>(
+                                'roslynSense/nuget/updatePlan',
+                                planParams(message.packages, message.versionLock, message.includePrerelease)
+                            )
+                            .catch(() => ({ induced: [] as NuGetMsg.InducedUpdate[] }));
+                        post({ type: 'updatePlan', gen: message.gen, induced: plan.induced });
+                        break;
+                    }
+
                     case 'updateAll': {
-                        const packages = await withInduced(client, message);
-                        if (!packages) {
-                            break;
-                        }
+                        // The plan is re-computed at execution time rather than trusted from the
+                        // panel: the inline preview may be minutes old. The webview has already
+                        // shown the induced set, so no modal interrupts here — the outcome list
+                        // reports everything that moved.
+                        const plan = await client
+                            .sendRequest<{ induced: NuGetMsg.InducedUpdate[] }>(
+                                'roslynSense/nuget/updatePlan',
+                                planParams(message.packages, message.versionLock, message.includePrerelease)
+                            )
+                            .catch(() => ({ induced: [] as NuGetMsg.InducedUpdate[] }));
+                        const packages = merge(message.packages, plan.induced);
 
                         const result = await vscode.window.withProgress(
                             {
@@ -398,70 +420,25 @@ export function wire(
 
 type UpdateItem = { id: string; version: string; projectPaths: string[] };
 
-interface InducedUpdate {
-    id: string;
-    currentVersion: string;
-    version: string;
-    projectPath: string;
-    projectName: string;
-    requiredBy: string;
-    requiredByVersion: string;
-}
-
 /**
- * Adds the references a selection drags along with it, once the user has seen them.
+ * The parameters for a dependency plan: what else has to move for these updates to restore.
  *
- * A direct reference the updated package outgrew is not a warning — it wins the resolution, so
- * restore fails with NU1605 after every project file has already been written. The confirmation is
- * not optional either: these are packages the user did not tick, and silently rewriting them is a
- * worse surprise than the failed restore.
- *
- * @returns the packages to update, or undefined when the user backed out.
+ * Mode is always "minimal" — the lowest version that satisfies the requirement. A direct reference
+ * the updated package outgrew is not a warning; it wins the resolution, so restore fails with
+ * NU1605 after every project file has already been written.
  */
-async function withInduced(
-    client: LanguageClient,
-    message: Extract<NuGetMsg.ToHost, { type: 'updateAll' }>
-): Promise<UpdateItem[] | undefined> {
-    if (message.mode === 'selectedOnly') {
-        return message.packages;
-    }
-
-    // A planning failure must not cost the user their update: it is advice, and the batch is
-    // exactly as valid without it as it was before this existed.
-    const plan = await client
-        .sendRequest<{ induced: InducedUpdate[] }>('roslynSense/nuget/updatePlan', {
-            packages: message.packages,
-            mode: message.mode,
-            versionLock: message.versionLock,
-            includePrerelease: message.includePrerelease,
-        })
-        .catch(() => null);
-
-    if (!plan || plan.induced.length === 0) {
-        return message.packages;
-    }
-
-    const shown = plan.induced.slice(0, 10);
-    const detail = shown
-        .map(
-            (item) =>
-                `${item.id} ${item.currentVersion} → ${item.version}` +
-                ` — needed by ${item.requiredBy} ${item.requiredByVersion} in ${item.projectName}`
-        )
-        .concat(plan.induced.length > shown.length ? [`…and ${plan.induced.length - shown.length} more`] : [])
-        .join('\n');
-
-    const answer = await vscode.window.showWarningMessage(
-        `${plan.induced.length} other reference(s) have to move for this update to restore.`,
-        { modal: true, detail },
-        'Update all',
-        'Only selected'
-    );
-
-    if (answer === undefined) {
-        return undefined;
-    }
-    return answer === 'Update all' ? merge(message.packages, plan.induced) : message.packages;
+function planParams(
+    packages: UpdateItem[],
+    versionLock: NuGetMsg.Lock,
+    includePrerelease: boolean
+): Record<string, unknown> {
+    return {
+        packages,
+        mode: 'minimal',
+        versionLock,
+        includePrerelease,
+        alignPlatform: alignPlatform(),
+    };
 }
 
 /**
@@ -470,7 +447,7 @@ async function withInduced(
  * The planner resolves per project, so the same package can be induced to different versions in
  * different projects — collapsing on id alone would silently pick one of them for all of them.
  */
-function merge(selected: UpdateItem[], induced: InducedUpdate[]): UpdateItem[] {
+function merge(selected: UpdateItem[], induced: NuGetMsg.InducedUpdate[]): UpdateItem[] {
     const versions = new Map<string, { id: string; version: string; projectPath: string }>();
 
     for (const item of selected) {
@@ -723,4 +700,14 @@ function settings(): NuGetMsg.Settings {
         readme: config.get<'rendered' | 'plain' | 'off'>('nuget.readme', 'rendered'),
         showTransitive: config.get<boolean>('nuget.showTransitive', true),
     };
+}
+
+/**
+ * Whether platform-tracking packages stay on the .NET major the project targets. Host-side only:
+ * the webview never sees it, the server applies it.
+ */
+function alignPlatform(): boolean {
+    return vscode.workspace
+        .getConfiguration('roslynSense')
+        .get<boolean>('nuget.alignPlatformPackages', true);
 }

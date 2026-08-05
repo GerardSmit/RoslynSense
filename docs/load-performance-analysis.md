@@ -315,6 +315,41 @@ symbols, so seventeen at once is roughly eighty concurrent solution-wide searche
 the same document indexes they are all trying to build. Measured three times, it was consistently
 worse than leaving them serial, both throttled and not.
 
+### 0.5c Where a code lens actually goes, and what is left in stage [4]
+
+`ProtoLensCostProbe` splits a resolve into its parts. Warm, over the fixture's sixteen lenses and
+twenty-eight symbols:
+
+| Part | Cost |
+|---|---:|
+| Reaching the view (`ProtoWorkspace.GetAsync`) | 24 ms |
+| Search scope | 1 ms |
+| Building the symbol set — includes the hierarchy walks for a service and an rpc | 214 ms |
+| The reference sweeps | **851 ms** |
+
+So warm, seventeen lenses are about 1.1 s; in the benchmark they are about 3.1 s. The ~2 s
+difference is first-touch — the project's compilation, and Roslyn building a document index per
+generated file — and it lands inside stage [4] because that stage *is* the first thing to ask
+anything semantic.
+
+Two consequences. The sweep is the part worth attacking, which is what the generated-document
+scoping in `ProtoReferenceService` does and what a multi-symbol sweep would do next: within one
+lens the per-symbol results are merged into one list anyway, so replacing N engine passes over the
+same documents with one requires no attribution of results back to symbols and cannot change the
+answer.
+
+And the ~2 s of first touch is not addressable by memoising, which is why `CodeLensResolveMemo`
+does not move this benchmark at all and was not built to. It is built for the case the benchmark
+does not measure: the client re-requests lenses on every edit and re-resolves whatever scrolls into
+view, so those 1.1 s were being spent again every time the gutter came back. That is the cost a
+person actually feels, and it is now paid once per (buffer, generation, solution).
+
+**Stage [4] and [6] together currently measure 6.2–7.2 s across runs, so the under-5 s goal is not
+met.** With the load made free it would still be about 4.7 s, and the two terms that remain — one
+cold MSBuild evaluation and one cold Roslyn compilation, both first-touch with nothing to hide them
+behind in a benchmark that asks for a code lens 1.3 s after start — are the ones §0.5's closing
+section is about.
+
 ### 0.5a .NET and MSBuild settings: what helps and what does not
 
 Measured, because most of these are folklore either way:

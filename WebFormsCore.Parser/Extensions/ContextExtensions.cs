@@ -124,6 +124,47 @@ public static class ContextExtensions
         return !type.IsAssignableTo("Control");
     }
 
+    /// <summary>
+    /// The collection property children land in when no property tag wraps them —
+    /// <c>[ParseChildren(true, "Items")]</c> makes <c>&lt;asp:ListItem&gt;</c> directly inside a
+    /// DropDownList an item of <c>Items</c>. The nearest attribute in the chain decides, exactly
+    /// like <see cref="ParseChildren"/>: a derived class redeclaring the attribute overrides it.
+    /// </summary>
+    public static string? DefaultCollectionProperty(this ITypeSymbol type)
+    {
+        for (var current = type; current != null; current = current.BaseType)
+        {
+            foreach (var attribute in current.GetAttributes())
+            {
+                if (attribute.AttributeClass?.Name != "ParseChildrenAttribute")
+                {
+                    continue;
+                }
+
+                // System.Web ignores the default property unless children are properties.
+                var childrenAsProperties =
+                    attribute.NamedArguments.FirstOrDefault(i => i.Key == "ChildrenAsProperties").Value.Value as bool?
+                    ?? attribute.ConstructorArguments.FirstOrDefault().Value as bool?;
+
+                if (childrenAsProperties != true)
+                {
+                    return null;
+                }
+
+                if (attribute.NamedArguments.FirstOrDefault(i => i.Key == "DefaultProperty").Value.Value is string named)
+                {
+                    return named;
+                }
+
+                return attribute.ConstructorArguments is [_, { Value: string defaultProperty }]
+                    ? defaultProperty
+                    : null;
+            }
+        }
+
+        return null;
+    }
+
     public static MemberResult? GetMemberDeep(this ITypeSymbol type, string name)
     {
         foreach (var symbol in type.GetMembers())

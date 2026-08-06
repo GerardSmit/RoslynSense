@@ -31,6 +31,14 @@ public class TemplateNode : ElementNode
     /// </summary>
     public bool IsSingleInstance { get; set; }
 
+    /// <summary>
+    /// The type <c>[TemplateContainer(typeof(X))]</c> on the template property declares for
+    /// <c>Container</c> in data-binding expressions — <c>RepeaterItem</c> for a Repeater's
+    /// ItemTemplate. Without it <c>Container</c> has no type and nothing in
+    /// <c>&lt;%# Container.DataItem %&gt;</c> binds.
+    /// </summary>
+    public INamedTypeSymbol? ContainerType { get; set; }
+
     public List<ContainerNode> RenderMethods { get; set; } = new();
 
     public List<ControlId> Ids { get; set; } = new();

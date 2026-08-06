@@ -126,6 +126,61 @@ public class DesignerGenerationTests
     }
 
     [Fact]
+    public async Task WhenHtmlElementsRunAtServerThenFieldsUseTheSpecificHtmlControlTypes()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <input runat="server" id="txtName" />
+                    <INPUT runat="server" id="chkAgree" TYPE="CHECKBOX" />
+                    <input runat="server" id="txtWhen" type="date" />
+                    <input runat="server" id="btnGo" type="submit" />
+                    <select runat="server" id="ddlCountry"></select>
+                    <textarea runat="server" id="txtNotes"></textarea>
+                    <a runat="server" id="lnkHome"></a>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var content = await scenario.GenerateAsync();
+
+        // Visual Studio types these fields through System.Web's tag mapper; an `<input>` that
+        // came out as HtmlGenericControl would break every code-behind touching `.Value`.
+        // Tag and type dispatch are case-insensitive; an HTML5 type the mapper does not know
+        // is HtmlInputGenericControl, and submit falls back to HtmlInputButton when the
+        // framework has no HtmlInputSubmit (this stub set does not, like pre-4.5).
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlInputText txtName;", content);
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlInputCheckBox chkAgree;", content);
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlInputGenericControl txtWhen;", content);
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlInputButton btnGo;", content);
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlSelect ddlCountry;", content);
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlTextArea txtNotes;", content);
+        Assert.Contains("protected global::System.Web.UI.HtmlControls.HtmlAnchor lnkHome;", content);
+        Assert.Equal(7, CountFields(content));
+    }
+
+    [Fact]
+    public async Task WhenItemsSitInADefaultCollectionThenTheyNeverBecomeFields()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:DropDownList ID="ddlChoice" runat="server">
+                        <asp:ListItem id="itemFirst" Text="First" Value="1" />
+                        <asp:ListItem Text="Second" Value="2" />
+                    </asp:DropDownList>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var content = await scenario.GenerateAsync();
+
+        // [ParseChildren(true, "Items")]: the ListItems are collection items without an <Items>
+        // wrapper. They are plain objects, so even an id on one adds no field.
+        Assert.Contains("protected global::System.Web.UI.WebControls.DropDownList ddlChoice;", content);
+        Assert.DoesNotContain("itemFirst", content);
+        Assert.Equal(1, CountFields(content));
+    }
+
+    [Fact]
     public async Task WhenTwoMarkupFilesShareAClassThenTheCanonicalDesignerUnionsThem()
     {
         await using var scenario = await MarkupScenario.CreateAsync(

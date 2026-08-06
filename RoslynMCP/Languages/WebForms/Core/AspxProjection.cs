@@ -521,12 +521,23 @@ internal static class AspxProjectionService
     {
         sb.Append("private void ").Append(InlineMethodPrefix).Append(index).AppendLine("() {");
 
-        // The variable ASP.NET puts in scope inside a container that declares an ItemType.
-        if (container is TemplateNode { ItemType: { } itemType })
+        if (container is TemplateNode template)
         {
-            sb.Append("var Item = default(")
-              .Append(itemType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
-              .AppendLine(")!;");
+            // The variable ASP.NET puts in scope inside a container that declares an ItemType.
+            if (template.ItemType is { } itemType)
+            {
+                sb.Append("var Item = default(")
+                  .Append(itemType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+                  .AppendLine(")!;");
+            }
+
+            // `Container`, typed by [TemplateContainer] on the template property.
+            if (template.ContainerType is { } containerType)
+            {
+                sb.Append("var Container = default(")
+                  .Append(containerType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+                  .AppendLine(")!;");
+            }
         }
 
         // A template is itself an element, and its own attributes can carry code.

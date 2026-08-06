@@ -364,6 +364,21 @@ public class WebFormsLspTests
     }
 
     [Fact]
+    public async Task CompletionOnContainerOffersTheTemplateContainerMembers()
+    {
+        // Repeater.ItemTemplate carries [TemplateContainer(typeof(RepeaterItem))], so `Container`
+        // inside the template is a RepeaterItem and `Container.` has to offer its members.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.TypedRepeaterAscxFile),
+                PositionOf(FixturePaths.TypedRepeaterAscxFile, "Container.DataItem", "Container.".Length)),
+            new LspResolveCache(),
+            default);
+
+        Assert.Contains("DataItem", completions.Items.Select(i => i.Label));
+    }
+
+    [Fact]
     public async Task CompletionForATagNameOffersTheRegisteredPrefixes()
     {
         var completions = await AspxCompletionHandler.CompletionAsync(

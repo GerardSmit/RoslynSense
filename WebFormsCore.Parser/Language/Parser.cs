@@ -597,6 +597,7 @@ public class Parser
                     Member = elementMember,
                     ClassName = $"Template_{_type?.Name}_{_container.Current.VariableName}_{name}",
                     IsSingleInstance = IsSingleInstanceTemplate(elementMember.Symbol),
+                    ContainerType = GetTemplateContainerType(elementMember.Symbol),
                     ControlsType = attributes.TryGetValue("ControlsType", out var controlsType)
                         ? controlsType.Value
                         : null,
@@ -654,7 +655,14 @@ public class Parser
 
             return;
         }
-        else if (runAt == RunAt.Server || (ns.HasValue && _container.Current is CollectionNode))
+        // The third arm is a default collection property — [ParseChildren(true, "Items")]:
+        // `<asp:ListItem>` sits directly inside `<asp:DropDownList>` with no `<Items>` wrapper,
+        // and ASP.NET parses it as an item of that collection all the same.
+        else if (runAt == RunAt.Server ||
+                 (ns.HasValue && _container.Current is CollectionNode) ||
+                 (ns.HasValue &&
+                  _container.Current is ControlNode { ParseChildren: true } listParent &&
+                  listParent.ControlType.DefaultCollectionProperty() is not null))
         {
             INamedTypeSymbol? controlType = null;
             string? controlPath = null;
@@ -680,7 +688,7 @@ public class Parser
                     }
                 }
 
-                controlType ??= GetControlType(ns?.Text, name.Text);
+                controlType ??= GetControlType(ns?.Text, name.Text, attributes: attributes);
             }
 
             controlType ??= _compilation.GetType("WebFormsCore.UI.HtmlGenericControl")
@@ -696,7 +704,9 @@ public class Parser
                 ItemType = itemType
             };
 
-            if (attributes.TryGetValue("id", out var id))
+            // Only Controls get designer fields: a collection item (`<asp:ListItem id="x">`)
+            // is a plain object the page class never holds.
+            if (attributes.TryGetValue("id", out var id) && !IsKnownNonControl(controlType))
             {
                 // A control inside only single-instance templates (UpdatePanel.ContentTemplate)
                 // is instantiated once, so it gets a designer field like a top-level control.
@@ -761,6 +771,25 @@ public class Parser
         }
     }
 
+    /// <summary>
+    /// Whether the type provably is not a Control. A base chain broken by an unresolved type —
+    /// a missing reference, code-behind mid-edit — gets the benefit of the doubt: dropping a
+    /// designer field over a transiently broken compilation would cascade into CS0103 on every
+    /// use of it.
+    /// </summary>
+    private static bool IsKnownNonControl(ITypeSymbol type)
+    {
+        for (var current = type; current != null; current = current.BaseType)
+        {
+            if (current.Name == "Control" || current.TypeKind == TypeKind.Error)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /// <summary>Whether a template property carries <c>[TemplateInstance(TemplateInstance.Single)]</c>.</summary>
     private static bool IsSingleInstanceTemplate(ISymbol symbol)
     {
@@ -774,6 +803,22 @@ public class Parser
         }
 
         return false;
+    }
+
+    /// <summary>The type <c>[TemplateContainer(typeof(X))]</c> declares for <c>Container</c>
+    /// inside the template, like <c>RepeaterItem</c> for a Repeater's ItemTemplate.</summary>
+    private static INamedTypeSymbol? GetTemplateContainerType(ISymbol symbol)
+    {
+        foreach (var attribute in symbol.GetAttributes())
+        {
+            if (attribute.AttributeClass is { Name: "TemplateContainerAttribute" }
+                && attribute.ConstructorArguments is [{ Value: INamedTypeSymbol container }, ..])
+            {
+                return container;
+            }
+        }
+
+        return null;
     }
 
     private void AddAttributes(Dictionary<TokenString, AttributeValue> attributes, ITypedNode node)
@@ -1131,24 +1176,61 @@ public class Parser
         };
     }
 
-    private INamedTypeSymbol? GetControlType(TokenString? elementNs, TokenString name, bool returnNull = false)
+    private INamedTypeSymbol? GetControlType(
+        TokenString? elementNs,
+        TokenString name,
+        bool returnNull = false,
+        Dictionary<TokenString, AttributeValue>? attributes = null)
     {
         if (!elementNs.HasValue)
         {
+            // System.Web's HtmlTagNameToTypeMapper table, which is also what Visual Studio uses
+            // to type designer fields for `runat="server"` HTML elements — an `<input>` must be
+            // an HtmlInputText there, or code-behind touching `.Value` stops compiling.
+            // body/script/style/title go beyond that mapper (title is HtmlTitle only inside a
+            // `<head runat=server>` there): they exist for WebFormsCore, and on System.Web
+            // targets the missing ones fall back to HtmlGenericControl anyway.
             // Note: make sure this list is up-to-date with WebObjectActivator.CreateElement
-
-            return name.Value switch
+            var typeName = name.Value.ToLowerInvariant() switch
             {
-                "form" or "FORM" => ResolveHtmlControl("HtmlForm"),
-                "body" or "BODY" => ResolveHtmlControl("HtmlBody") ?? ResolveHtmlControl("HtmlGenericControl"),
-                "title" or "TITLE" => ResolveHtmlControl("HtmlTitle"),
-                "head" or "HEAD" => ResolveHtmlControl("HtmlHead"),
-                "link" or "LINK" => ResolveHtmlControl("HtmlLink"),
-                "script" or "SCRIPT" => ResolveHtmlControl("HtmlScript") ?? ResolveHtmlControl("HtmlGenericControl"),
-                "style" or "STYLE" => ResolveHtmlControl("HtmlStyle") ?? ResolveHtmlControl("HtmlGenericControl"),
-                "img" or "IMG" => ResolveHtmlControl("HtmlImage"),
-                _ => ResolveHtmlControl("HtmlGenericControl")
+                "a" => "HtmlAnchor",
+                "area" => "HtmlArea",
+                "audio" => "HtmlAudio",
+                "body" => "HtmlBody",
+                "button" => "HtmlButton",
+                "embed" => "HtmlEmbed",
+                "form" => "HtmlForm",
+                "head" => "HtmlHead",
+                "iframe" => "HtmlIframe",
+                "img" => "HtmlImage",
+                "input" => InputControlTypeName(attributes),
+                "link" => "HtmlLink",
+                "meta" => "HtmlMeta",
+                "script" => "HtmlScript",
+                "select" => "HtmlSelect",
+                "source" => "HtmlSource",
+                "style" => "HtmlStyle",
+                "table" => "HtmlTable",
+                "td" or "th" => "HtmlTableCell",
+                "textarea" => "HtmlTextArea",
+                "title" => "HtmlTitle",
+                "tr" => "HtmlTableRow",
+                "track" => "HtmlTrack",
+                "video" => "HtmlVideo",
+                _ => "HtmlGenericControl"
             };
+
+            var htmlType = ResolveHtmlControl(typeName);
+
+            // Pre-4.5 frameworks lack some of the specific types. Submit/reset land on the
+            // HtmlInputButton that era used; unknown input types raised a parse error there,
+            // but for tooling a lenient HtmlInputText beats refusing the page.
+            if (htmlType is null && typeName is "HtmlInputSubmit" or "HtmlInputReset")
+                htmlType = ResolveHtmlControl("HtmlInputButton");
+            if (htmlType is null && typeName is "HtmlInputGenericControl")
+                htmlType = ResolveHtmlControl("HtmlInputText");
+
+            return htmlType ?? ResolveHtmlControl("HtmlGenericControl");
         }
 
         INamedTypeSymbol? type;
@@ -1182,6 +1264,33 @@ public class Parser
                 elementNs));
 
         return type;
+    }
+
+    /// <summary>
+    /// The <c>&lt;input&gt;</c> control type for its <c>type</c> attribute, per System.Web's
+    /// HtmlTagNameToTypeMapper: a missing type means text, and HTML5 types the mapper does not
+    /// know go to HtmlInputGenericControl.
+    /// </summary>
+    private static string InputControlTypeName(Dictionary<TokenString, AttributeValue>? attributes)
+    {
+        var type = attributes != null && attributes.TryGetValue("type", out var value)
+            ? value.Value
+            : "text";
+
+        return type.ToLowerInvariant() switch
+        {
+            "text" => "HtmlInputText",
+            "password" => "HtmlInputPassword",
+            "button" => "HtmlInputButton",
+            "submit" => "HtmlInputSubmit",
+            "reset" => "HtmlInputReset",
+            "image" => "HtmlInputImage",
+            "checkbox" => "HtmlInputCheckBox",
+            "radio" => "HtmlInputRadioButton",
+            "hidden" => "HtmlInputHidden",
+            "file" => "HtmlInputFile",
+            _ => "HtmlInputGenericControl"
+        };
     }
 
     /// <summary>

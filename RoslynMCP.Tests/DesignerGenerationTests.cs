@@ -96,6 +96,110 @@ public class DesignerGenerationTests
     }
 
     [Fact]
+    public async Task WhenControlSitsInSingleInstanceTemplateThenItStillGetsAField()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:UpdatePanel ID="upMain" runat="server">
+                        <ContentTemplate>
+                            <asp:Label ID="lblInside" runat="server" />
+                            <asp:Repeater ID="rptInside" runat="server">
+                                <ItemTemplate>
+                                    <asp:Label ID="lblPerItem" runat="server" />
+                                </ItemTemplate>
+                            </asp:Repeater>
+                        </ContentTemplate>
+                    </asp:UpdatePanel>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var content = await scenario.GenerateAsync();
+
+        // ContentTemplate is [TemplateInstance(Single)]: its controls exist exactly once, so
+        // Visual Studio gives them fields. The Repeater's ItemTemplate stays excluded.
+        Assert.Contains("protected global::System.Web.UI.UpdatePanel upMain;", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.Label lblInside;", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.Repeater rptInside;", content);
+        Assert.DoesNotContain("lblPerItem", content);
+        Assert.Equal(3, CountFields(content));
+    }
+
+    [Fact]
+    public async Task WhenTwoMarkupFilesShareAClassThenTheCanonicalDesignerUnionsThem()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Label ID="lblShared" runat="server" />
+                    <asp:Label ID="lblOnlyMain" runat="server" />
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }",
+            ("Variant.aspx", """
+                             <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                             <asp:Label ID="lblShared" runat="server" />
+                             <asp:TextBox ID="txtOnlyVariant" runat="server" />
+                             """));
+
+        var content = await scenario.GenerateAsync();
+
+        // The class is loaded from either markup file, so the designer carries the union; a
+        // control missing from one variant really is null when that variant is the one loaded.
+        Assert.Contains("#nullable enable", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.Label lblShared;", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.Label? lblOnlyMain;", content);
+        Assert.Contains("protected global::System.Web.UI.WebControls.TextBox? txtOnlyVariant;", content);
+        Assert.Equal(3, CountFields(content));
+    }
+
+    [Fact]
+    public async Task WhenMarkupIsNotTheCanonicalFileThenItsDesignerIsAnEmptyPartial()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Label ID="lblMain" runat="server" />
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }",
+            ("Variant.aspx", """
+                             <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                             <asp:Label ID="lblVariant" runat="server" />
+                             """));
+
+        var generator = new AspxDesignerGenerator();
+        var result = await generator.GenerateAsync(
+            scenario.SiblingPaths.Single(), scenario.Project, default);
+
+        // The fields live in the canonical designer (beside the class's own code-behind);
+        // emitting them here too would declare every member twice.
+        Assert.NotNull(result.Content);
+        Assert.Contains("public partial class SamplePage {", result.Content);
+        Assert.Equal(0, CountFields(result.Content!));
+        Assert.Equal(scenario.MarkupPath, Assert.Single(result.RelatedSources), ignoreCase: true);
+    }
+
+    [Fact]
+    public async Task WhenSharedIdHasDifferentTypesThenTheFieldUsesTheirCommonBase()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Button ID="ctlAction" runat="server" />
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }",
+            ("Variant.aspx", """
+                             <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                             <asp:LinkButton ID="ctlAction" runat="server" />
+                             """));
+
+        var content = await scenario.GenerateAsync();
+
+        // Button and LinkButton share WebControl; only a common base can hold both.
+        Assert.Contains("protected global::System.Web.UI.WebControls.WebControl ctlAction;", content);
+        Assert.Equal(1, CountFields(content));
+    }
+
+    [Fact]
     public async Task WhenFieldDeclaredInCodeBehindThenDesignerSkipsItToAvoidDuplicate()
     {
         await using var scenario = await MarkupScenario.CreateAsync(
@@ -340,9 +444,13 @@ public class DesignerGenerationTests
         public required string MarkupPath { get; init; }
         public Project Project { get; private set; } = null!;
 
+        /// <summary>Extra markup files written beside the main one, for shared-class scenarios.</summary>
+        public IReadOnlyList<string> SiblingPaths { get; private init; } = [];
+
         public string DesignerPath => MarkupPath + ".designer.cs";
 
-        public static Task<MarkupScenario> CreateAsync(string markup, string codeBehind)
+        public static Task<MarkupScenario> CreateAsync(
+            string markup, string codeBehind, params (string FileName, string Content)[] siblings)
         {
             var directory = Path.Combine(
                 Path.GetTempPath(), "roslynsense-designer-" + Guid.NewGuid().ToString("N"));
@@ -351,10 +459,19 @@ public class DesignerGenerationTests
             var markupPath = Path.Combine(directory, "SamplePage.aspx");
             File.WriteAllText(markupPath, markup);
 
+            var siblingPaths = new List<string>();
+            foreach (var (fileName, content) in siblings)
+            {
+                var path = Path.Combine(directory, fileName);
+                File.WriteAllText(path, content);
+                siblingPaths.Add(path);
+            }
+
             var scenario = new MarkupScenario
             {
                 Directory = directory,
                 MarkupPath = markupPath,
+                SiblingPaths = siblingPaths,
             };
 
             scenario.Project = scenario.BuildProject(codeBehind);

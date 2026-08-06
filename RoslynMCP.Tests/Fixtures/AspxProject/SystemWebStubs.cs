@@ -18,6 +18,19 @@ namespace System.Web.UI
 {
     public interface ITemplate { }
 
+    public enum TemplateInstance
+    {
+        Multiple = 0,
+        Single = 1,
+    }
+
+    [AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
+    public sealed class TemplateInstanceAttribute : Attribute
+    {
+        public TemplateInstanceAttribute(TemplateInstance instances) => Instances = instances;
+        public TemplateInstance Instances { get; }
+    }
+
     [AttributeUsage(AttributeTargets.Class, AllowMultiple = false)]
     public sealed class ParseChildrenAttribute : Attribute
     {
@@ -41,6 +54,15 @@ namespace System.Web.UI
     }
 
     public class UserControl : Control { }
+
+    /// <summary>Single-instance template host, like the real UpdatePanel: controls inside its
+    /// ContentTemplate still get designer fields.</summary>
+    [ParseChildren(true)]
+    public class UpdatePanel : Control
+    {
+        [TemplateInstance(TemplateInstance.Single)]
+        public ITemplate? ContentTemplate { get; set; }
+    }
 
     namespace HtmlControls
     {

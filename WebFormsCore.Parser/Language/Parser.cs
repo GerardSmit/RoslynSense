@@ -596,6 +596,7 @@ public class Parser
                     Property = name,
                     Member = elementMember,
                     ClassName = $"Template_{_type?.Name}_{_container.Current.VariableName}_{name}",
+                    IsSingleInstance = IsSingleInstanceTemplate(elementMember.Symbol),
                     ControlsType = attributes.TryGetValue("ControlsType", out var controlsType)
                         ? controlsType.Value
                         : null,
@@ -697,7 +698,9 @@ public class Parser
 
             if (attributes.TryGetValue("id", out var id))
             {
-                if (_container.Template == null)
+                // A control inside only single-instance templates (UpdatePanel.ContentTemplate)
+                // is instantiated once, so it gets a designer field like a top-level control.
+                if (_container.Template == null || !_container.InMultiInstanceTemplate)
                 {
                     var member = _type?.GetMemberDeep(id.Value);
 
@@ -756,6 +759,21 @@ public class Parser
         {
             _container.Pop();
         }
+    }
+
+    /// <summary>Whether a template property carries <c>[TemplateInstance(TemplateInstance.Single)]</c>.</summary>
+    private static bool IsSingleInstanceTemplate(ISymbol symbol)
+    {
+        foreach (var attribute in symbol.GetAttributes())
+        {
+            if (attribute.AttributeClass is { Name: "TemplateInstanceAttribute" }
+                && attribute.ConstructorArguments is [{ Value: 1 }])
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void AddAttributes(Dictionary<TokenString, AttributeValue> attributes, ITypedNode node)

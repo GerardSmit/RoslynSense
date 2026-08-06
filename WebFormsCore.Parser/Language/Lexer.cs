@@ -546,10 +546,38 @@ public ref struct Lexer
             name.Value));
     }
 
+    /// <summary>
+    /// The HTML (and common SVG) element names. A lowercase tag with one of these names is
+    /// literal output; anything else is a property tag like <c>&lt;columns&gt;</c> or
+    /// <c>&lt;itemtemplate&gt;</c>, which ASP.NET matches case-insensitively.
+    /// </summary>
+    private static readonly HashSet<string> HtmlElements = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "html", "body", "head", "title", "base", "basefont", "meta", "noscript", "template", "slot",
+        "address", "article", "aside", "footer", "header", "hgroup", "main", "nav", "section",
+        "search", "h1", "h2", "h3", "h4", "h5", "h6",
+        "blockquote", "dd", "div", "dl", "dt", "figcaption", "figure", "hr", "li", "menu", "ol",
+        "p", "pre", "ul",
+        "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "br", "center", "cite", "code", "data",
+        "dfn", "em", "font", "i", "kbd", "mark", "q", "rp", "rt", "ruby", "s", "samp", "small",
+        "span", "strike", "strong", "sub", "sup", "time", "tt", "u", "var", "wbr",
+        "area", "audio", "map", "track", "video", "embed", "iframe", "object", "param", "picture",
+        "source", "canvas", "svg", "math", "script", "style", "link", "img",
+        "circle", "ellipse", "g", "line", "path", "polygon", "polyline", "rect", "text", "use",
+        "defs", "clippath", "lineargradient", "radialgradient", "stop", "filter", "symbol",
+        "marker", "mask", "pattern", "tspan",
+        "table", "caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr",
+        "button", "datalist", "fieldset", "form", "input", "label", "legend", "meter", "optgroup",
+        "option", "output", "progress", "select", "textarea",
+        "details", "dialog", "summary",
+        "dir", "frame", "frameset", "noframes", "marquee", "applet", "nobr",
+    };
+
     private bool ShouldParse(string name, bool isClosingTag)
     {
-        var isSpecialTag = // Properties
+        var isSpecialTag = // Properties: <ItemTemplate>, <Columns> — in any casing
             char.IsUpper(name[0]) ||
+            (!HtmlElements.Contains(name) && !name.Contains('-')) ||
 
             // Special elements
             name.Equals("html", StringComparison.OrdinalIgnoreCase) ||

@@ -23,6 +23,14 @@ public class TemplateNode : ElementNode
 
     public string? ControlsType { get; set; }
 
+    /// <summary>
+    /// Whether the template property is marked <c>[TemplateInstance(TemplateInstance.Single)]</c>,
+    /// like <c>UpdatePanel.ContentTemplate</c>. Controls inside a single-instance template are
+    /// instantiated exactly once, so Visual Studio gives them designer fields as if the template
+    /// wrapper were not there.
+    /// </summary>
+    public bool IsSingleInstance { get; set; }
+
     public List<ContainerNode> RenderMethods { get; set; } = new();
 
     public List<ControlId> Ids { get; set; } = new();

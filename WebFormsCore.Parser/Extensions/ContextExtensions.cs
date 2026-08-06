@@ -93,34 +93,35 @@ public static class ContextExtensions
 
     public static bool ParseChildren(this ITypeSymbol type)
     {
-        foreach (var attribute in type.GetAttributes())
+        for (var current = type; current != null; current = current.BaseType)
         {
-            if (attribute.AttributeClass?.Name != "ParseChildrenAttribute")
+            foreach (var attribute in current.GetAttributes())
             {
-                continue;
-            }
+                if (attribute.AttributeClass?.Name != "ParseChildrenAttribute")
+                {
+                    continue;
+                }
 
-            var childrenAsProperties = attribute.NamedArguments.FirstOrDefault(i => i.Key == "ChildrenAsProperties").Value.Value;
+                var childrenAsProperties = attribute.NamedArguments.FirstOrDefault(i => i.Key == "ChildrenAsProperties").Value.Value;
 
-            if (childrenAsProperties is bool value)
-            {
-                return value;
-            }
+                if (childrenAsProperties is bool value)
+                {
+                    return value;
+                }
 
-            var firstArgument = attribute.ConstructorArguments.FirstOrDefault();
+                var firstArgument = attribute.ConstructorArguments.FirstOrDefault();
 
-            if (firstArgument.Value is bool boolValue)
-            {
-                return boolValue;
+                if (firstArgument.Value is bool boolValue)
+                {
+                    return boolValue;
+                }
             }
         }
 
-        if (type.BaseType != null)
-        {
-            return ParseChildren(type.BaseType);
-        }
-
-        return false;
+        // No attribute anywhere in the chain. A Control's children default to child controls,
+        // but a plain object (a grid column, a list item definition) has nothing else its
+        // children could be than properties — which is how ASP.NET's object parser treats them.
+        return !type.IsAssignableTo("Control");
     }
 
     public static MemberResult? GetMemberDeep(this ITypeSymbol type, string name)

@@ -1,4 +1,9 @@
 import * as vscode from 'vscode';
+import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { PassThrough } from 'stream';
 import {
     CloseAction,
     ErrorAction,
@@ -6,6 +11,7 @@ import {
     LanguageClientOptions,
     ServerOptions,
     State,
+    StreamInfo,
     TransportKind,
 } from 'vscode-languageclient/node';
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
@@ -363,6 +369,58 @@ function resolveServerPath(config: vscode.WorkspaceConfiguration): string {
     return process.env.ROSLYNSENSE_SERVER?.trim() || 'roslyn-sense';
 }
 
+let serverStderrChannel: vscode.OutputChannel | undefined;
+
+/**
+ * Spawns the server ourselves so the bytes the client's reader actually receives can be written
+ * down verbatim.
+ *
+ * The server records its own copy of what it sent. If the two files differ, the stream was
+ * damaged between the two processes; if they are identical, the server is exonerated and the
+ * reader is what mis-framed them. Nothing else distinguishes those two cases, and they lead to
+ * opposite fixes. Only used while `roslynSense.traceProtocolStream` is on.
+ */
+function capturingServerOptions(
+    command: string,
+    args: string[],
+    cwd: string | undefined,
+    env: NodeJS.ProcessEnv
+): ServerOptions {
+    return () =>
+        new Promise<StreamInfo>((resolve, reject) => {
+            const child = cp.spawn(command, args, { cwd, env });
+            child.once('error', reject);
+
+            const dir = path.join(os.tmpdir(), 'roslyn-mcp-lsp-diagnostics');
+            let capture: fs.WriteStream | undefined;
+            try {
+                fs.mkdirSync(dir, { recursive: true });
+                capture = fs.createWriteStream(path.join(dir, `client-in-${child.pid ?? 'unknown'}.bin`));
+                // A writable that emits 'error' with nobody listening throws in the extension
+                // host: without this, filling the temp disk mid-session would crash the very
+                // thing the capture exists to diagnose.
+                capture.on('error', () => { capture = undefined; });
+            } catch {
+                // A capture that cannot be written must not stop the server from starting.
+            }
+
+            // pipe() rather than a write() per chunk, so a client that stops reading still applies
+            // backpressure to the server instead of growing a buffer here. The tee listens
+            // alongside it and does not affect that flow control.
+            const reader = new PassThrough();
+            child.stdout.pipe(reader);
+            child.stdout.on('data', (chunk: Buffer) => capture?.write(chunk));
+            child.stdout.on('end', () => capture?.end());
+
+            // The client only drains stderr when it owns the spawn; left unread, the server
+            // blocks on its next diagnostic write once the pipe buffer fills.
+            serverStderrChannel ??= vscode.window.createOutputChannel('RoslynSense Server');
+            child.stderr.on('data', (chunk: Buffer) => serverStderrChannel!.append(chunk.toString('utf8')));
+
+            resolve({ reader, writer: child.stdin });
+        });
+}
+
 async function startClient(
     context: vscode.ExtensionContext,
     binding?: { solutionPath?: string; folder?: vscode.WorkspaceFolder }
@@ -385,12 +443,20 @@ async function startClient(
     // second root has to start its client in its own folder.
     const cwd = binding?.folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-    const serverOptions: ServerOptions = {
-        command: serverPath,
-        args,
-        transport: TransportKind.stdio,
-        options: { cwd },
-    };
+    // The server reads this from its environment because it has to act before any configuration
+    // has been exchanged: the corruption it looks for can happen on the initialize response.
+    const tracing =
+        config.get<boolean>('traceProtocolStream', false) || process.env.ROSLYNSENSE_LSP_TRACE === '1';
+    const env = tracing ? { ...process.env, ROSLYNSENSE_LSP_TRACE: '1' } : undefined;
+
+    const serverOptions: ServerOptions = env
+        ? capturingServerOptions(serverPath, args, cwd, env)
+        : {
+              command: serverPath,
+              args,
+              transport: TransportKind.stdio,
+              options: { cwd },
+          };
 
     // More generous than the default error handler (which gives up after 5 restarts in a
     // short window with "Cannot call write after a stream was destroyed"): keep restarting

@@ -866,6 +866,11 @@
           "default": "",
           "description": "Default solution for this workspace. When empty: a single found .sln/.slnx is used automatically, multiple prompt a picker (use 'RoslynSense: Pick Solution' to change), none lets the server resolve from the workspace folder."
         },
+        "roslynSense.traceProtocolStream": {
+          "type": "boolean",
+          "default": false,
+          "description": "Capture the raw LSP byte stream to disk and validate every message body. For diagnosing 'Header must provide a Content-Length property' and JSON parse errors from the server; the capture goes to %TEMP%/roslyn-mcp-lsp-diagnostics and can grow large. Restart the server after changing this."
+        },
         "roslynSense.debuggerPath": {
           "type": "string",
           "default": "",

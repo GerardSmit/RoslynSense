@@ -84,8 +84,26 @@ internal static class AspxLanguageHandler
             if (InProjection(document, projected) is { Length: > 0 } inMarkup)
                 return inMarkup;
 
-            return await NavigationHandlers.DefinitionLocationsAsync(
+            // Through the contributors, as the C# handler does: one field must not answer with the
+            // markup ID from a .ascx.cs and with the designer line from the .ascx beside it.
+            var found = await NavigationHandlers.DefinitionLocationsAsync(
                 projected, document.Project, typeDefinition, ct);
+
+            // typeDefinition asks what type the control is, and the designer is not in that way.
+            if (typeDefinition)
+                return found;
+
+            // The symbol belongs to the projection's forked compilation, and the contributor
+            // compares with SymbolEqualityComparer, which never matches across two of them.
+            // AnchorAsync keys on the solution, which has not moved; the compilation has.
+            var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
+            var anchored = await current.GetCompilationAsync(ct) is { } compilation
+                ? SymbolFinder.FindSimilarSymbols(projected.OriginalDefinition, compilation, ct)
+                    .FirstOrDefault() ?? projected
+                : projected;
+
+            return await NavigationHandlers.WithContributionsAsync(
+                [anchored.OriginalDefinition], current, [.. found], languages: null, ct);
         }
 
         return [];
@@ -569,7 +587,7 @@ internal static class AspxLanguageHandler
 
         var resources = await AspxResourceHandler.DiagnosticsAsync(document, ct);
 
-        return resources.Length == 0 ? parse : [.. parse, .. resources];
+return resources.Length == 0 ? parse : [.. parse, .. resources];
     }
 
     // ---- Rename ----------------------------------------------------------------------------

@@ -327,6 +327,18 @@ public class WebFormsIndexTests
         Assert.Empty(lenses);
     }
 
+    [Fact]
+    public async Task AUserControlGetsNoLenses()
+    {
+        // OrderItems.ascx names a class and declares rptOrderItems, so every condition for a lens
+        // is met — a .ascx is close to nothing but control declarations, and a count over each one
+        // spaces the markup out rather than annotating it.
+        var lenses = await Pack().CodeLensAsync(
+            new CodeLensParams(Doc(FixturePaths.OrderItemsAscxFile)), default);
+
+        Assert.Empty(lenses);
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------
 
     /// <summary>

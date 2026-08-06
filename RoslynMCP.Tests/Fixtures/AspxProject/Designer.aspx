@@ -12,6 +12,7 @@
             </ItemTemplate>
         </asp:Repeater>
         <asp:Label ID="lblHandWritten" runat="server" Text="declared in code-behind" />
+        <div><%= txtName.ClientID %></div>
     </form>
 </body>
 </html>

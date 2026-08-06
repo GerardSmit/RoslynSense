@@ -38,7 +38,30 @@ internal static class LspProxy
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
         Stream stdin = Console.OpenStandardInput();
-        Stream stdout = Console.OpenStandardOutput();
+
+        // Not Console.OpenStandardOutput(): the stream it returns reports short and failed pipe
+        // writes as successes, which loses whole buffers out of a JSON-RPC frame and leaves the
+        // editor to report the damage as a parse error it cannot attribute. See StdIo.
+        Stream stdout = StdIo.OpenProtocolOutput();
+
+        // From here on stdout carries a protocol, so nothing else may write to it. Console.Out is
+        // pointed at stderr rather than left alone: a stray Console.WriteLine anywhere in this
+        // process — or in a library it loads during start-up — would otherwise land in the middle
+        // of a JSON-RPC frame, which the editor reports as a parse error somewhere else entirely.
+        Console.SetOut(Console.Error);
+
+        using var monitor = LspStreamMonitor.Create("editor-bound");
+        stdout = new MonitoredStream(stdout, monitor);
+
+        // Only while tracing: the requests are what make a bad response reproducible, and capturing
+        // them costs a copy of every keystroke's worth of traffic.
+        LspStreamMonitor? inbound = null;
+        if (LspStreamMonitor.TraceEnabled)
+        {
+            inbound = LspStreamMonitor.Create("host-bound");
+            stdin = new MonitoredReadStream(stdin, inbound);
+        }
+        using var inboundScope = inbound;
 
         var (config, _, _) = RoslynSenseConfigLoader.Load(startPath);
         var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out _);
@@ -65,8 +88,8 @@ internal static class LspProxy
 
                         Console.Error.WriteLine($"[Lsp] Proxying to shared host for '{solutionKey}'.");
                         proxied = true;
-                        var stdinToPipe = PumpAsync(stdin, pipe, cts.Token);
-                        var pipeToStdout = PumpAsync(pipe, stdout, cts.Token);
+                        var stdinToPipe = PumpAsync("editor-to-host", stdin, pipe, cts.Token);
+                        var pipeToStdout = PumpAsync("host-to-editor", pipe, stdout, cts.Token);
                         await Task.WhenAny(stdinToPipe, pipeToStdout);
                         cts.Cancel();
                     }
@@ -102,15 +125,21 @@ internal static class LspProxy
         return 0;
     }
 
-    private static async Task PumpAsync(Stream from, Stream to, CancellationToken ct)
+    private static async Task PumpAsync(string label, Stream from, Stream to, CancellationToken ct)
     {
         try
         {
             await from.CopyToAsync(to, ct);
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+        catch (OperationCanceledException)
         {
-            // Peer closed — session over.
+            // The other direction finished first and cancelled us — the ordinary way a session ends.
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            // Named rather than swallowed: a session that ends here ends for everything, and
+            // "the editor closed" and "the write failed" look identical from the outside.
+            Console.Error.WriteLine($"[Lsp] The {label} pump stopped: {ex.GetType().Name}: {ex.Message}");
         }
     }
 }

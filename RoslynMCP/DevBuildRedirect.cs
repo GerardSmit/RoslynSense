@@ -81,10 +81,13 @@ internal static class DevBuildRedirect
 
         // Raw stream copies rather than line reads: this carries a protocol, and reformatting it
         // on the way through is how a proxy becomes a bug.
+        // The forward pump carries the protocol, so it writes through StdIo rather than the
+        // console stream, which reports short pipe writes as successful and silently loses whole
+        // buffers out of a frame. Diagnostics on stderr can keep the forgiving stream.
         var pumps = new[]
         {
             Console.OpenStandardInput().CopyToAsync(child.StandardInput.BaseStream),
-            child.StandardOutput.BaseStream.CopyToAsync(Console.OpenStandardOutput()),
+            child.StandardOutput.BaseStream.CopyToAsync(StdIo.OpenProtocolOutput()),
             child.StandardError.BaseStream.CopyToAsync(Console.OpenStandardError()),
         };
 

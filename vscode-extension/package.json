@@ -1,7 +1,7 @@
 {
   "name": "roslyn-sense",
   "displayName": "RoslynSense",
-  "description": "C# language server backed by the RoslynSense shared daemon \u2014 the same loaded solution your MCP-connected AI assistant uses.",
+  "description": "C# language server backed by the RoslynSense shared daemon — the same loaded solution your MCP-connected AI assistant uses.",
   "version": "0.2.0",
   "publisher": "roslyn-sense",
   "license": "MIT",
@@ -115,6 +115,10 @@
       {
         "command": "roslynSense.restartServer",
         "title": "RoslynSense: Restart Server"
+      },
+      {
+        "command": "roslynSense.showEmbeddedProjection",
+        "title": "RoslynSense: Show Embedded HTML Projection"
       },
       {
         "command": "roslynSense.restorePackages",
@@ -240,7 +244,7 @@
       },
       {
         "command": "roslynSense.manageNuGetForProject",
-        "title": "Manage NuGet Packages\u2026",
+        "title": "Manage NuGet Packages…",
         "category": "RoslynSense"
       },
       {
@@ -261,19 +265,19 @@
       },
       {
         "command": "roslynSense.solutionExplorer.newFile",
-        "title": "New File\u2026",
+        "title": "New File…",
         "category": "RoslynSense",
         "icon": "$(new-file)"
       },
       {
         "command": "roslynSense.solutionExplorer.newFolder",
-        "title": "New Folder\u2026",
+        "title": "New Folder…",
         "category": "RoslynSense",
         "icon": "$(new-folder)"
       },
       {
         "command": "roslynSense.solutionExplorer.rename",
-        "title": "Rename\u2026",
+        "title": "Rename…",
         "category": "RoslynSense"
       },
       {
@@ -318,7 +322,7 @@
       },
       {
         "command": "roslynSense.solutionExplorer.newItem",
-        "title": "New\u2026",
+        "title": "New…",
         "category": "RoslynSense"
       },
       {
@@ -357,13 +361,13 @@
       },
       {
         "command": "roslynSense.solutionExplorer.addProjectReference",
-        "title": "Add Project Reference\u2026",
+        "title": "Add Project Reference…",
         "category": "RoslynSense",
         "icon": "$(references)"
       },
       {
         "command": "roslynSense.solutionExplorer.newProject",
-        "title": "New Project\u2026",
+        "title": "New Project…",
         "category": "RoslynSense",
         "icon": "$(new-file)"
       }
@@ -866,6 +870,11 @@
           "default": "",
           "description": "Default solution for this workspace. When empty: a single found .sln/.slnx is used automatically, multiple prompt a picker (use 'RoslynSense: Pick Solution' to change), none lets the server resolve from the workspace folder."
         },
+        "roslynSense.embeddedLanguages": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer JavaScript and CSS IntelliSense inside <script> and <style> blocks in markup files, using the language services VS Code ships for HTML. Server-side code (<% %> and <script runat=\"server\">) is excluded."
+        },
         "roslynSense.traceProtocolStream": {
           "type": "boolean",
           "default": false,
@@ -879,7 +888,7 @@
         "roslynSense.shareEditorContext": {
           "type": "boolean",
           "default": true,
-          "description": "Tell connected AI chats which file and symbol you are looking at, so they can resolve 'this method' or 'this error'. Sends paths, the cursor position, the current selection, and diagnostics already visible in the editor \u2014 never whole file contents."
+          "description": "Tell connected AI chats which file and symbol you are looking at, so they can resolve 'this method' or 'this error'. Sends paths, the cursor position, the current selection, and diagnostics already visible in the editor — never whole file contents."
         },
         "roslynSense.trace.server": {
           "type": "string",
@@ -911,7 +920,7 @@
           "default": 15,
           "minimum": 1,
           "maximum": 300,
-          "description": "How long one document\u2019s analyzer pass may take before reporting what it has. A slow analyzer delays squiggles, never typing."
+          "description": "How long one document’s analyzer pass may take before reporting what it has. A slow analyzer delays squiggles, never typing."
         },
         "roslynSense.workspaceDiagnostics": {
           "type": "string",
@@ -977,12 +986,12 @@
           "additionalProperties": {
             "type": "string"
           },
-          "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` \u2014 for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
+          "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` — for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
         },
         "roslynSense.nuget.alignPlatformPackages": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Keep platform-tracking packages (`Microsoft.Extensions.*`, `Microsoft.AspNetCore.*`, `System.*`, EF Core, \u2026) on the release band matching the project's target framework: a net8.0 project is offered 8.x, with newer bands disclosed but not applied. Turn off to let \u201clatest\u201d cross into a band built for a newer .NET."
+          "markdownDescription": "Keep platform-tracking packages (`Microsoft.Extensions.*`, `Microsoft.AspNetCore.*`, `System.*`, EF Core, …) on the release band matching the project's target framework: a net8.0 project is offered 8.x, with newer bands disclosed but not applied. Turn off to let “latest” cross into a band built for a newer .NET."
         },
         "roslynSense.nuget.pageSize": {
           "type": "integer",
@@ -1033,7 +1042,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "dev": "npm run compile && node scripts/dev.mjs",
-    "package": "vsce package"
+    "package": "vsce package",
+    "check:embedded": "node scripts/checkEmbedded.mjs"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

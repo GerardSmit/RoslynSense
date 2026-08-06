@@ -19,6 +19,7 @@ import { registerTestController, runTestById } from './testController';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerSearchEverywhere } from './searchEverywhere';
 import { registerVirtualDocuments } from './virtualDocuments';
+import { registerEmbeddedLanguages } from './embeddedLanguages';
 import { registerNuGetPanel } from './nuget';
 import { createRedactingTraceChannel, wireNuGetCredentials } from './nuget/credentials';
 import { registerTaskProvider } from './taskProvider';
@@ -2323,6 +2324,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerTestController(context, () => client);
     registerSolutionExplorer(context, () => client);
     registerVirtualDocuments(context, () => client);
+    registerEmbeddedLanguages(context);
     registerSearchEverywhere(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);

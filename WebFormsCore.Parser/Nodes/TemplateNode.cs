@@ -9,6 +9,18 @@ public class TemplateNode : ElementNode
 
     public Token Property { get; set; }
 
+    /// <summary>
+    /// The property the tag names — <c>Repeater.HeaderTemplate</c> for a
+    /// <c>&lt;HeaderTemplate&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// Code generation works from <see cref="ClassName"/> and never needs this; the editor does.
+    /// A template tag is a member reference exactly the way an attribute name is, and without the
+    /// symbol behind it go-to-definition and hover on the tag have nothing to answer with — which
+    /// is a hole in the middle of a control, since a template is where most of the markup lives.
+    /// </remarks>
+    public MemberResult? Member { get; set; }
+
     public string? ControlsType { get; set; }
 
     public List<ContainerNode> RenderMethods { get; set; } = new();

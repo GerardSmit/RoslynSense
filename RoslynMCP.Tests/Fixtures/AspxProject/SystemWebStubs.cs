@@ -66,6 +66,12 @@ namespace System.Web.UI
             public string Text { get; set; } = "";
         }
 
+        /// <summary>A container, so a test can put a control inside another control.</summary>
+        public class Panel : WebControl
+        {
+            public string CssClass { get; set; } = "";
+        }
+
         public class Button : WebControl
         {
             public string Text { get; set; } = "";
@@ -95,6 +101,9 @@ namespace System.Web.UI
             public System.Web.UI.ITemplate? SeparatorTemplate { get; set; }
             public event EventHandler<RepeaterItemEventArgs>? ItemDataBound;
             public event EventHandler<RepeaterItemEventArgs>? ItemCreated;
+
+            /// <summary>Names the type a template's `Item` binds to.</summary>
+            public string ItemType { get; set; } = "";
         }
 
         public class RepeaterItem : Control { }

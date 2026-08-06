@@ -41,6 +41,10 @@ public class Parser
     private readonly Dictionary<string, List<string>> _namespaces = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ControlKey, (string Type, string Path)> _controlTypes = new(ControlKeyCompare.OrdinalIgnoreCase);
     private INamedTypeSymbol? _type;
+
+    /// <summary>Whether <see cref="_type"/> is a base class standing in for an unresolved
+    /// <c>Inherits</c>, so the page's own members are unknown.</summary>
+    private bool _inheritsFallback;
     private readonly bool _addFields;
     private readonly string? _rootDirectory;
 
@@ -77,6 +81,8 @@ public class Parser
         {
             Consume(ref lexer, token);
         }
+
+        Diagnostics.AddRange(lexer.Diagnostics);
     }
 
     private void Consume(ref Lexer lexer, Token token)
@@ -334,7 +340,30 @@ public class Parser
             {
                 _type = _compilation.GetType(inherits.Value);
 
-                if (_type != null)
+                // Read the page as the base it would have derived from: a null type turned every
+                // feature on the page off at once.
+                if (_type is null)
+                {
+                    _type = element.DirectiveType is DirectiveType.Control
+                        ? _compilation.GetType("WebFormsCore.UI.UserControl")
+                          ?? _compilation.GetType("System.Web.UI.UserControl")
+                        : _compilation.GetType("WebFormsCore.UI.Page")
+                          ?? _compilation.GetType("System.Web.UI.Page");
+
+                    _inheritsFallback = _type is not null;
+
+                    // Not Root.Inherits: the designer generator refuses to write against an
+                    // unresolved one, and a stand-in base would have it emit fields on UserControl.
+                    if (_type is not null)
+                    {
+                        Diagnostics.Add(ReportedDiagnostic.Create(
+                            Descriptors.InheritsTypeNotFound,
+                            inherits.Range,
+                            inherits.Value,
+                            _type.ToDisplayString()));
+                    }
+                }
+                else if (_type != null)
                 {
                     Root.Inherits = _type;
                     Root.AddFields = _type.ContainingAssembly.Equals(_compilation.Assembly, SymbolEqualityComparer.Default);
@@ -565,6 +594,7 @@ public class Parser
                 var templateNode = new TemplateNode
                 {
                     Property = name,
+                    Member = elementMember,
                     ClassName = $"Template_{_type?.Name}_{_container.Current.VariableName}_{name}",
                     ControlsType = attributes.TryGetValue("ControlsType", out var controlsType)
                         ? controlsType.Value
@@ -605,9 +635,20 @@ public class Parser
                 Root.ScriptBlocks.Add(text);
             }
 
-            if (lexer.Peek() is { Type: TokenType.TagClose })
+            // This branch pushed nothing, so it must eat its own `</script>`: left for the main
+            // loop it closed whatever container the script sat in, reparenting everything after it.
+            if (lexer.Peek() is { Type: TokenType.TagOpenSlash })
             {
                 lexer.Next();
+
+                if (lexer.Peek() is { Type: TokenType.ElementNamespace })
+                    lexer.Next();
+
+                if (lexer.Peek() is { Type: TokenType.ElementName })
+                    lexer.Next();
+
+                if (lexer.Peek() is { Type: TokenType.TagClose })
+                    lexer.Next();
             }
 
             return;
@@ -743,24 +784,29 @@ public class Parser
                 var eventSymbol = controlType?.GetDeep<IEventSymbol>(key.Substring(2));
                 var method = _type?.GetDeep<IMethodSymbol>(value);
 
-                if (eventSymbol != null && method != null)
+                // The control declares the event, so the attribute is one whatever else is known.
+                if (eventSymbol != null)
                 {
-                    node.Events.Add(new EventNode(eventSymbol, method)
+                    if (method != null)
                     {
-                        Range = attribute.Value.Range
-                    });
-                    continue;
-                }
+                        node.Events.Add(new EventNode(eventSymbol, method)
+                        {
+                            Range = attribute.Value.Range
+                        });
+                        continue;
+                    }
 
-                // A real event whose handler does not exist is a missing method, not a missing
-                // property. Reporting it on the handler name is what lets a quick fix generate it.
-                if (eventSymbol != null && _type != null)
-                {
-                    Diagnostics.Add(ReportedDiagnostic.Create(
-                        Descriptors.EventHandlerNotFound,
-                        value.Range,
-                        value.Value,
-                        _type.ToDisplayString()));
+                    // A missing handler is a missing method, not a missing property — and only the
+                    // class the page actually names can be asked whether it has one.
+                    if (_type != null && !_inheritsFallback)
+                    {
+                        Diagnostics.Add(ReportedDiagnostic.Create(
+                            Descriptors.EventHandlerNotFound,
+                            value.Range,
+                            value.Value,
+                            _type.ToDisplayString()));
+                    }
+
                     continue;
                 }
             }

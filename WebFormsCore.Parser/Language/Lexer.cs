@@ -1,5 +1,6 @@
 ﻿using System.Text;
 using WebFormsCore.Models;
+using WebFormsCore.SourceGenerator.Models;
 
 namespace WebFormsCore.Language;
 
@@ -24,6 +25,22 @@ public ref struct Lexer
     private readonly ReadOnlySpan<char> _runAt;
 
     private readonly Stack<string> _tags;
+
+    // The opening tags that were downgraded to text, so a closing tag that gets the same
+    // treatment can tell "closes a tag the lexer left as text" apart from "closes nothing".
+    // A list rather than a stack: HTML lets <li> and <td> stay open, so a close may match
+    // any entry, not just the top.
+    private readonly List<string> _htmlTags;
+
+    // End of the last downgraded opening tag. Once such a tag is text, the lexer re-enters
+    // at every '<' inside its attribute values as if a new tag started there; anything that
+    // begins before this offset is attribute text, not markup.
+    private int _htmlTagEnd;
+
+    // Whether the file has opened a tag of its own yet, which is what separates a fragment
+    // finishing someone else's wrapper from a close that matches nothing.
+    private bool _sawOpenTag;
+
     private readonly StringBuilder _textBuilder;
     private TokenPosition _textStart;
     private TokenPosition _textEnd;
@@ -67,6 +84,10 @@ public ref struct Lexer
         _textStart = default;
         _textEnd = default;
         _tags = new Stack<string>();
+        _htmlTags = new List<string>();
+        _htmlTagEnd = -1;
+        _sawOpenTag = false;
+        Diagnostics = new List<ReportedDiagnostic>();
         _isStart = true;
         _scanStart = -1;
         _scanClose = -1;
@@ -74,6 +95,8 @@ public ref struct Lexer
     }
 
     public string File { get; }
+
+    public List<ReportedDiagnostic> Diagnostics { get; }
 
     public List<int> Lines { get; } = new() { 0 };
 
@@ -299,17 +322,34 @@ public ref struct Lexer
         }
 
         var isClosingTag = Consume('/');
-        var start = Position;
+        var nameStart = Position;
+        var start = nameStart;
         var name = ReadTagName();
-        var isInvalid = name.Value.Length == 0 ||
-                        (!isServerTag && !isClosingTag && !ShouldParse(name.Value, isClosingTag) && Current != ':');
+        var namespaceName = default(TokenString);
+        var hasNamespace = false;
+
+        // Resolve the prefix before the balance bookkeeping below, so the stack and the
+        // unexpected-closing-tag diagnostic both see "asp:PlaceHolder" instead of "asp".
+        if (name.Value.Length > 0 && Current == ':')
+        {
+            hasNamespace = true;
+            namespaceName = name;
+            start = Position;
+            Forward();
+            name = ReadTagName();
+        }
+
+        var fullName = hasNamespace ? $"{namespaceName.Value}:{name.Value}" : name.Value;
+        var isInvalid = fullName.Length == 0 ||
+                        (!isServerTag && !isClosingTag && !hasNamespace && !ShouldParse(name.Value, isClosingTag));
 
         if (isInvalid || isClosingTag)
         {
-            if (isInvalid || _tags.Count == 0 || name.Value != _tags.Peek())
+            if (isInvalid || _tags.Count == 0 || fullName != _tags.Peek())
             {
-                AddNode(TokenType.Text, tagStart, new TokenString(isClosingTag ? "</" : "<", new TokenRange(File, tagStart, start)));
-                AddNode(TokenType.Text, start, new TokenString(name, new TokenRange(File, start, Position)));
+                TrackHtmlTag(tagStart, new TokenString(fullName, new TokenRange(File, nameStart, Position)), isClosingTag);
+                AddNode(TokenType.Text, tagStart, new TokenString(isClosingTag ? "</" : "<", new TokenRange(File, tagStart, nameStart)));
+                AddNode(TokenType.Text, nameStart, new TokenString(fullName, new TokenRange(File, nameStart, Position)));
                 return true;
             }
 
@@ -317,24 +357,19 @@ public ref struct Lexer
         }
         else
         {
-            _tags.Push(name.Value);
+            _tags.Push(fullName);
         }
 
-        AddNode(isClosingTag ? TokenType.TagOpenSlash : TokenType.TagOpen, new TokenRange(File, tagStart, start));
+        AddNode(isClosingTag ? TokenType.TagOpenSlash : TokenType.TagOpen, new TokenRange(File, tagStart, nameStart));
 
-        if (Current == ':')
+        if (hasNamespace)
         {
-            AddNode(TokenType.ElementNamespace, start, name);
-            start = Position;
-            Forward();
-            name = ReadTagName();
+            AddNode(TokenType.ElementNamespace, namespaceName.Range, namespaceName);
         }
 
         AddNode(TokenType.ElementName, new TokenRange(File, start, Position), name);
 
-        var isVoidTag = name.Value is "area" or "base" or "br" or "col" or "command" or "embed"
-            or "hr" or "img" or "input" or "keygen" or "link" or "meta"
-            or "param" or "source" or "track" or "wbr";
+        var isVoidTag = IsVoidTag(name.Value);
 
         var hasClosing = false;
 
@@ -424,6 +459,91 @@ public ref struct Lexer
         }
 
         return true;
+    }
+
+    private static bool IsVoidTag(string name)
+    {
+        return name is "area" or "base" or "br" or "col" or "command" or "embed"
+            or "hr" or "img" or "input" or "keygen" or "link" or "meta"
+            or "param" or "source" or "track" or "wbr";
+    }
+
+    /// <summary>
+    /// Balance bookkeeping for the tags that stay text. An opening tag is remembered; a closing
+    /// tag takes the nearest opening tag of its name off the list, and one that finds no opening
+    /// tag anywhere — not here and not on <see cref="_tags"/> — closes nothing and is reported.
+    /// </summary>
+    /// <remarks>
+    /// Only closing tags are ever reported. HTML lets <c>&lt;li&gt;</c> or <c>&lt;td&gt;</c> stay
+    /// open, so leftover opening tags mean nothing — which is also why a close matches any entry
+    /// instead of unwinding to it. And when nothing is open at all, a fragment may be closing a
+    /// tag that another file opened — the repeater header/footer idiom at file scale — so an
+    /// empty list stays quiet too.
+    /// </remarks>
+    private void TrackHtmlTag(TokenPosition tagStart, TokenString name, bool isClosingTag)
+    {
+        if (name.Value.Length == 0 || tagStart.Offset < _htmlTagEnd)
+        {
+            return;
+        }
+
+        if (!isClosingTag)
+        {
+            var close = NextTagClose(_offset);
+            _htmlTagEnd = close;
+
+            var isSelfClosing = close > 0 && close < _input.Length && _input[close - 1] == '/';
+
+            _sawOpenTag = true;
+
+            if (!isSelfClosing && !IsVoidTag(name.Value))
+            {
+                _htmlTags.Add(name.Value);
+            }
+
+            return;
+        }
+
+        for (var i = _htmlTags.Count - 1; i >= 0; i--)
+        {
+            if (_htmlTags[i].Equals(name.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                _htmlTags.RemoveAt(i);
+                return;
+            }
+        }
+
+        foreach (var tag in _tags)
+        {
+            if (tag.Equals(name.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        if (_htmlTags.Count == 0 && _tags.Count == 0)
+        {
+            // Only before the file has opened anything of its own, where a stray close is a
+            // fragment finishing a wrapper another file opened.
+            if (!_sawOpenTag)
+            {
+                return;
+            }
+
+            Diagnostics.Add(ReportedDiagnostic.Create(
+                Descriptors.ClosingTagWithNothingOpen,
+                new TokenRange(File, tagStart, Position),
+                name.Value));
+            return;
+        }
+
+        var expected = _htmlTags.Count > 0 ? _htmlTags[^1] : _tags.Peek();
+
+        Diagnostics.Add(ReportedDiagnostic.Create(
+            Descriptors.UnexpectedClosingTag,
+            new TokenRange(File, tagStart, Position),
+            expected,
+            name.Value));
     }
 
     private bool ShouldParse(string name, bool isClosingTag)

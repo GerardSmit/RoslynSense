@@ -93,34 +93,76 @@ public static class ContextExtensions
 
     public static bool ParseChildren(this ITypeSymbol type)
     {
-        foreach (var attribute in type.GetAttributes())
+        for (var current = type; current != null; current = current.BaseType)
         {
-            if (attribute.AttributeClass?.Name != "ParseChildrenAttribute")
+            foreach (var attribute in current.GetAttributes())
             {
-                continue;
-            }
+                if (attribute.AttributeClass?.Name != "ParseChildrenAttribute")
+                {
+                    continue;
+                }
 
-            var childrenAsProperties = attribute.NamedArguments.FirstOrDefault(i => i.Key == "ChildrenAsProperties").Value.Value;
+                var childrenAsProperties = attribute.NamedArguments.FirstOrDefault(i => i.Key == "ChildrenAsProperties").Value.Value;
 
-            if (childrenAsProperties is bool value)
-            {
-                return value;
-            }
+                if (childrenAsProperties is bool value)
+                {
+                    return value;
+                }
 
-            var firstArgument = attribute.ConstructorArguments.FirstOrDefault();
+                var firstArgument = attribute.ConstructorArguments.FirstOrDefault();
 
-            if (firstArgument.Value is bool boolValue)
-            {
-                return boolValue;
+                if (firstArgument.Value is bool boolValue)
+                {
+                    return boolValue;
+                }
             }
         }
 
-        if (type.BaseType != null)
+        // No attribute anywhere in the chain. A Control's children default to child controls,
+        // but a plain object (a grid column, a list item definition) has nothing else its
+        // children could be than properties — which is how ASP.NET's object parser treats them.
+        return !type.IsAssignableTo("Control");
+    }
+
+    /// <summary>
+    /// The collection property children land in when no property tag wraps them —
+    /// <c>[ParseChildren(true, "Items")]</c> makes <c>&lt;asp:ListItem&gt;</c> directly inside a
+    /// DropDownList an item of <c>Items</c>. The nearest attribute in the chain decides, exactly
+    /// like <see cref="ParseChildren"/>: a derived class redeclaring the attribute overrides it.
+    /// </summary>
+    public static string? DefaultCollectionProperty(this ITypeSymbol type)
+    {
+        for (var current = type; current != null; current = current.BaseType)
         {
-            return ParseChildren(type.BaseType);
+            foreach (var attribute in current.GetAttributes())
+            {
+                if (attribute.AttributeClass?.Name != "ParseChildrenAttribute")
+                {
+                    continue;
+                }
+
+                // System.Web ignores the default property unless children are properties.
+                var childrenAsProperties =
+                    attribute.NamedArguments.FirstOrDefault(i => i.Key == "ChildrenAsProperties").Value.Value as bool?
+                    ?? attribute.ConstructorArguments.FirstOrDefault().Value as bool?;
+
+                if (childrenAsProperties != true)
+                {
+                    return null;
+                }
+
+                if (attribute.NamedArguments.FirstOrDefault(i => i.Key == "DefaultProperty").Value.Value is string named)
+                {
+                    return named;
+                }
+
+                return attribute.ConstructorArguments is [_, { Value: string defaultProperty }]
+                    ? defaultProperty
+                    : null;
+            }
         }
 
-        return false;
+        return null;
     }
 
     public static MemberResult? GetMemberDeep(this ITypeSymbol type, string name)

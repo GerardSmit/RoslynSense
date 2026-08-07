@@ -191,9 +191,12 @@ internal sealed partial class WebFormsLanguage : ILanguageFileOperationProvider
         // Two halves of one rename. Roslyn rewrites the declaration and every C# use; the
         // Inherits= that names the class is invisible to it, and is rewritten here rather than
         // through the markup reference pass because that pass replaces the whole attribute value
-        // and would drop the namespace qualifying it.
+        // and would drop the namespace qualifying it. Computed against the current solution:
+        // these edits are applied to the buffers the user has now.
+        var (project, anchored) = await AspxDocumentService.AnchorAsync(document, codeBehind, ct);
+
         foreach (var (target, edits) in await FileOperationsHandler.RenameSymbolEditsAsync(
-                     codeBehind, document.Project.Solution, newTypeName, ct))
+                     anchored, project.Solution, newTypeName, ct))
         {
             foreach (var edit in edits)
                 Add(changes, target, edit);

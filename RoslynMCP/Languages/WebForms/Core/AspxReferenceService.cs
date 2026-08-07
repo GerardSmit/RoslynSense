@@ -321,9 +321,52 @@ internal static class AspxReferenceService
         return separator < 0 ? newName : existing[..(separator + 1)] + newName;
     }
 
-    private static bool Same(ISymbol? candidate, ISymbol symbol) =>
-        candidate is not null
-        && SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, symbol);
+    /// <summary>
+    /// A format that identifies a declaration rather than naming one.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="SymbolDisplayFormat.FullyQualifiedFormat"/> qualifies types but not members:
+    /// its <c>memberOptions</c> is <see cref="SymbolDisplayMemberOptions.None"/>, so every
+    /// <c>rptItems</c> in the solution renders as <c>rptItems</c> and every
+    /// <c>rpt_OnItemDataBound</c> as <c>rpt_OnItemDataBound</c>. Comparing with it turned
+    /// <see cref="Same"/> into name equality for members, which put every page that happens to
+    /// use the same <c>ID</c> — or the same handler name — in one page's results. The containing
+    /// type is what the <c>Inherits</c> directive decides, and it is what makes two same-named
+    /// controls on two pages two different controls.
+    /// </remarks>
+    private static readonly SymbolDisplayFormat s_identity = SymbolDisplayFormat.FullyQualifiedFormat
+        .WithMemberOptions(
+            SymbolDisplayMemberOptions.IncludeContainingType
+            | SymbolDisplayMemberOptions.IncludeParameters
+            | SymbolDisplayMemberOptions.IncludeExplicitInterface)
+        .WithParameterOptions(SymbolDisplayParameterOptions.IncludeType);
+
+    /// <summary>
+    /// Whether the tree's symbol and the caller's name the same declaration, tolerating that
+    /// they may come from different compilation snapshots: the tree keeps the snapshot it was
+    /// parsed against while a caller arriving from the C# side holds the current one, and
+    /// Roslyn's equality never matches source symbols across snapshots.
+    /// </summary>
+    private static bool Same(ISymbol? candidate, ISymbol symbol)
+    {
+        if (candidate is null)
+            return false;
+
+        candidate = candidate.OriginalDefinition;
+        if (SymbolEqualityComparer.Default.Equals(candidate, symbol))
+            return true;
+
+        if (candidate.Kind != symbol.Kind
+            || !string.Equals(candidate.MetadataName, symbol.MetadataName, StringComparison.Ordinal))
+            return false;
+
+        if (candidate is IMethodSymbol cm && symbol is IMethodSymbol sm
+            && cm.Parameters.Length != sm.Parameters.Length)
+            return false;
+
+        return candidate.ToDisplayString(s_identity)
+            .Equals(symbol.ToDisplayString(s_identity), StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// Every ASPX-family file under the project directory. The listing is re-taken periodically

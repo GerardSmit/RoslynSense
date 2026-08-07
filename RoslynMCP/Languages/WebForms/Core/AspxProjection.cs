@@ -32,17 +32,41 @@ internal sealed record AspxProjectedText(string Text, ImmutableArray<AspxProject
 
     /// <summary>The markup span a projected span came from, or <c>null</c> when it landed in
     /// scaffolding rather than in copied code.</summary>
+    /// <remarks>
+    /// Binary search over <see cref="Segments"/>, which the builder emits in projected order.
+    /// A find-references over a whole project maps every result through here, so this is the
+    /// direction that sees N calls per gesture where <see cref="ToProjected"/> sees one.
+    /// </remarks>
     public TextSpan? ToAspx(TextSpan projected)
     {
-        foreach (var segment in Segments)
+        int lo = 0, hi = Segments.Length - 1;
+        while (lo <= hi)
         {
-            if (projected.Start < segment.ProjectedStart
-                || projected.Start > segment.ProjectedStart + segment.Length)
-                continue;
+            int mid = lo + ((hi - lo) >> 1);
+            var segment = Segments[mid];
 
-            int start = segment.AspxStart + (projected.Start - segment.ProjectedStart);
-            int length = Math.Min(projected.Length, segment.Length - (projected.Start - segment.ProjectedStart));
-            return new TextSpan(start, Math.Max(0, length));
+            if (projected.Start < segment.ProjectedStart)
+            {
+                hi = mid - 1;
+            }
+            else if (projected.Start > segment.ProjectedStart + segment.Length)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                // Two script blocks copied back to back share a boundary offset; the linear scan
+                // this replaces answered with the first of the two.
+                while (mid > 0 && projected.Start <= Segments[mid - 1].ProjectedStart + Segments[mid - 1].Length)
+                {
+                    mid--;
+                    segment = Segments[mid];
+                }
+
+                int start = segment.AspxStart + (projected.Start - segment.ProjectedStart);
+                int length = Math.Min(projected.Length, segment.Length - (projected.Start - segment.ProjectedStart));
+                return new TextSpan(start, Math.Max(0, length));
+            }
         }
         return null;
     }
@@ -134,7 +158,7 @@ internal static class AspxProjectionService
 
     // ---- Single document -------------------------------------------------------------------
 
-    private sealed record CacheEntry(string Text, Compilation Compilation, AspxProjection? Projection);
+    private sealed record CacheEntry(AspxDocument Document, AspxProjection? Projection);
 
     private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -143,17 +167,21 @@ internal static class AspxProjectionService
     /// Builds (or returns the memoized) projection for a document, or <c>null</c> when there is
     /// nothing to project.
     /// </summary>
+    /// <remarks>
+    /// Keyed on the document instance: <see cref="AspxDocumentService"/> serves the same
+    /// <see cref="AspxDocument"/> for as long as its parse is valid, so the projection built from
+    /// it — same text, same snapshots — is valid exactly as long.
+    /// </remarks>
     public static AspxProjection? Get(AspxDocument document)
     {
         if (s_cache.TryGetValue(document.FilePath, out var cached)
-            && ReferenceEquals(cached.Compilation, document.Compilation)
-            && string.Equals(cached.Text, document.Text, StringComparison.Ordinal))
+            && ReferenceEquals(cached.Document, document))
         {
             return cached.Projection;
         }
 
         var projection = Build(document);
-        s_cache[document.FilePath] = new CacheEntry(document.Text, document.Compilation, projection);
+        s_cache[document.FilePath] = new CacheEntry(document, projection);
         return projection;
     }
 
@@ -492,6 +520,25 @@ internal static class AspxProjectionService
         StringBuilder sb, Action<TokenRange> copy, ContainerNode container, int index)
     {
         sb.Append("private void ").Append(InlineMethodPrefix).Append(index).AppendLine("() {");
+
+        if (container is TemplateNode template)
+        {
+            // The variable ASP.NET puts in scope inside a container that declares an ItemType.
+            if (template.ItemType is { } itemType)
+            {
+                sb.Append("var Item = default(")
+                  .Append(itemType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+                  .AppendLine(")!;");
+            }
+
+            // `Container`, typed by [TemplateContainer] on the template property.
+            if (template.ContainerType is { } containerType)
+            {
+                sb.Append("var Container = default(")
+                  .Append(containerType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+                  .AppendLine(")!;");
+            }
+        }
 
         // A template is itself an element, and its own attributes can carry code.
         if (container is ElementNode owner)

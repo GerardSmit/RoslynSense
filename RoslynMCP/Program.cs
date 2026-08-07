@@ -150,9 +150,13 @@ class Program
         if (sharedHostSolution is null)
             WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
 
+        // WithStdioServerTransport() would take stdout from Console.OpenStandardOutput(), whose
+        // stream reports short and failed pipe writes as successes — silent data loss on a channel
+        // that carries JSON-RPC, and tool results run well past the buffer size where it bites.
+        // Same streams, opened the way a protocol needs. See StdIo.
         var mcpBuilder = builder.Services
             .AddMcpServer()
-            .WithStdioServerTransport();
+            .WithStreamServerTransport(Console.OpenStandardInput(), RoslynMCP.StdIo.OpenProtocolOutput());
 
         if (sharedHostSolution is not null)
         {

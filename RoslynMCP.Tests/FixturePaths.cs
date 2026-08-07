@@ -53,6 +53,7 @@ internal static class FixturePaths
         Path.Combine(AspxProjectDir, "Controls", "OrderItems.ascx.cs");
     public static string EventWiringAspxFile => Path.Combine(AspxProjectDir, "EventWiring.aspx");
     public static string EventWiringCodeBehindFile => Path.Combine(AspxProjectDir, "EventWiring.aspx.cs");
+    public static string TypedRepeaterAscxFile => Path.Combine(AspxProjectDir, "TypedRepeater.ascx");
     public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");
     public static string RepeaterCodeBehindFile => Path.Combine(AspxProjectDir, "Repeater.aspx.cs");
 

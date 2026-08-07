@@ -300,6 +300,85 @@ public class WebFormsLspTests
     }
 
     [Fact]
+    public async Task CompletionInsideAnExpressionBlockOffersTheCurrentScope()
+    {
+        // `<%= Total() %>` is C# in the page's own class, so the members of that class are what a
+        // caret inside it should offer. Answering nothing leaves the editor's word matcher to
+        // suggest whatever words happen to be in the file.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.EventWiringAspxFile),
+                PositionOf(FixturePaths.EventWiringAspxFile, "<%= Total()", "<%= Tot".Length)),
+            new LspResolveCache(),
+            default);
+
+        Assert.Contains("Total", completions.Items.Select(i => i.Label));
+    }
+
+    [Fact]
+    public async Task CompletionInsideADataBindingBlockOffersMembersOfTheBoundType()
+    {
+        // `<%# PageHelper.FormatDate(…) %>` inside an ItemTemplate. The block binds through the
+        // projection the same way the ones outside a template do.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.RepeaterAspxFile),
+                PositionOf(FixturePaths.RepeaterAspxFile, "PageHelper.FormatDate", "PageHelper.".Length)),
+            new LspResolveCache(),
+            default);
+
+        Assert.Contains("FormatDate", completions.Items.Select(i => i.Label));
+    }
+
+    [Fact]
+    public async Task CompletionInsideAStronglyTypedTemplateOffersMembersOfItem()
+    {
+        // The Repeater declares ItemType="System.String", so `Item` inside its ItemTemplate is a
+        // string and `Item.` has to offer string members. This is what a declared ItemType is for.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.TypedRepeaterAscxFile),
+                PositionOf(FixturePaths.TypedRepeaterAscxFile, "Item.Length", "Item.".Length)),
+            new LspResolveCache(),
+            default);
+
+        var labels = completions.Items.Select(i => i.Label).ToList();
+
+        Assert.Contains("Length", labels);
+        Assert.Contains("Substring", labels);
+    }
+
+    [Fact]
+    public async Task ItemIsInScopeInAStronglyTypedTemplate()
+    {
+        // The name itself, not just its members: a caret at the start of the block has to know
+        // `Item` exists before anyone can type a dot after it.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.TypedRepeaterAscxFile),
+                PositionOf(FixturePaths.TypedRepeaterAscxFile, "Item.Length", 0)),
+            new LspResolveCache(),
+            default);
+
+        Assert.Contains("Item", completions.Items.Select(i => i.Label));
+    }
+
+    [Fact]
+    public async Task CompletionOnContainerOffersTheTemplateContainerMembers()
+    {
+        // Repeater.ItemTemplate carries [TemplateContainer(typeof(RepeaterItem))], so `Container`
+        // inside the template is a RepeaterItem and `Container.` has to offer its members.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.TypedRepeaterAscxFile),
+                PositionOf(FixturePaths.TypedRepeaterAscxFile, "Container.DataItem", "Container.".Length)),
+            new LspResolveCache(),
+            default);
+
+        Assert.Contains("DataItem", completions.Items.Select(i => i.Label));
+    }
+
+    [Fact]
     public async Task CompletionForATagNameOffersTheRegisteredPrefixes()
     {
         var completions = await AspxCompletionHandler.CompletionAsync(
@@ -440,6 +519,120 @@ public class WebFormsLspTests
         Assert.Contains(locations, l =>
             Uri.UnescapeDataString(l.Uri).EndsWith("Designer.aspx", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public async Task GoToDefinitionOnAnIdStaysInsideThePageThatDeclaresIt()
+    {
+        // Designer.aspx declares an <asp:Repeater ID="rptItems"> of its own, and its field is
+        // AspxProject.DesignerPage.rptItems — a different class, reached through a different
+        // Inherits. What makes two same-named controls two controls is the class behind the page,
+        // so a markup match on the name alone answered this with every page in the project that
+        // happens to use the ID.
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.RepeaterAspxFile),
+                PositionOf(FixturePaths.RepeaterAspxFile, "rptItems", 2)),
+            typeDefinition: false,
+            default);
+
+        // The ID is the declaration, so the gesture answers with usages — the code that reads the
+        // field is what the reader came for.
+        Assert.Contains(locations, l => FileName(l.Uri) == "Repeater.aspx.cs");
+        Assert.DoesNotContain(locations, l => FileName(l.Uri) == "Designer.aspx");
+        Assert.DoesNotContain(locations, l => FileName(l.Uri) == "Designer.aspx.designer.cs");
+    }
+
+    [Fact]
+    public async Task FindReferencesOnAHandlerStaysInsideTheControlThatDeclaresIt()
+    {
+        // OrderItems.ascx wires OnItemDataBound to a method of the same name and the same
+        // signature on AspxProject.OrderItemsControl. Nothing but the containing type tells the
+        // two apart, and a rename that rewrote both would break a control nobody touched.
+        var locations = await AspxLanguageHandler.ReferencesAsync(
+            new ReferenceParams(
+                Doc(FixturePaths.RepeaterAspxFile),
+                PositionOf(FixturePaths.RepeaterAspxFile, "rpt_OnItemDataBound", 2),
+                new ReferenceContext(IncludeDeclaration: true)),
+            default);
+
+        Assert.Contains(locations, l => FileName(l.Uri) == "Repeater.aspx");
+        Assert.Contains(locations, l => FileName(l.Uri) == "Repeater.aspx.cs");
+        Assert.DoesNotContain(locations, l => FileName(l.Uri) == "OrderItems.ascx");
+    }
+
+    [Fact]
+    public async Task GoToDefinitionOnAControlInACodeBlockReachesTheMarkupThatDeclaresIt()
+    {
+        // `<%= txtName.ClientID %>` binds to the same field that `txtName` in the code-behind binds
+        // to, so it has to answer the same way: the ID attribute that declares the control, not the
+        // designer line generated from it. Answering one way from a .ascx.cs and another from the
+        // .ascx beside it is the two halves of one relationship disagreeing.
+        new LanguageRegistry([new WebFormsLanguage(new MarkdownFormatter())]).Publish();
+
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.DesignerAspxFile),
+                PositionOf(FixturePaths.DesignerAspxFile, "txtName.ClientID", 3)),
+            typeDefinition: false,
+            default);
+
+        Assert.Contains(locations, l => FileName(l.Uri) == "Designer.aspx");
+        Assert.DoesNotContain(locations, l => FileName(l.Uri) == "Designer.aspx.designer.cs");
+
+        // The ID attribute, not the top of the file.
+        var markup = locations.Single(l => FileName(l.Uri) == "Designer.aspx");
+        string line = (await File.ReadAllLinesAsync(FixturePaths.DesignerAspxFile))[markup.Range.Start.Line];
+        Assert.Contains("txtName", line, StringComparison.Ordinal);
+        Assert.Contains("asp:TextBox", line, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ATemplateTagResolvesToThePropertyItFills()
+    {
+        // <ItemTemplate> is Repeater.ItemTemplate. The tag is a member reference the same way an
+        // attribute name is, and it used to resolve to nothing — so F12 and hover did nothing on
+        // the tags most of a control's markup sits inside.
+        var document = await AspxDocumentService.GetAsync(FixturePaths.RepeaterAspxFile, default);
+        int offset = document!.Text.IndexOf("<ItemTemplate>", StringComparison.Ordinal) + 3;
+
+        var hit = AspxSymbolResolver.ResolveAt(document, offset);
+
+        Assert.NotNull(hit);
+        Assert.Equal(AspxHitKind.PropertyName, hit!.Kind);
+        Assert.Equal("ItemTemplate", hit.Symbol!.Name);
+        Assert.Equal("Repeater", hit.Symbol.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task HoverOnATemplateTagDescribesTheProperty()
+    {
+        var hover = await AspxLanguageHandler.HoverAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.RepeaterAspxFile),
+                PositionOf(FixturePaths.RepeaterAspxFile, "<ItemTemplate>", 3)),
+            default);
+
+        Assert.NotNull(hover);
+        Assert.Contains("ItemTemplate", hover!.Contents.Value, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GoToDefinitionOnATemplateTagReachesThePropertyDeclaration()
+    {
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.RepeaterAspxFile),
+                PositionOf(FixturePaths.RepeaterAspxFile, "<ItemTemplate>", 3)),
+            typeDefinition: false,
+            default);
+
+        // The stubs declare Repeater.ItemTemplate, so it is a source location rather than metadata.
+        Assert.NotEmpty(locations);
+        Assert.Contains(locations, l => FileName(l.Uri) == "SystemWebStubs.cs");
+    }
+
+    private static string FileName(string uri) =>
+        Path.GetFileName(LspConverters.UriToPath(uri));
 
     [Fact]
     public async Task ReferencesInCodeBlocksAreBoundRatherThanTextMatched()

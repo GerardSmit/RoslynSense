@@ -142,6 +142,14 @@ internal static class AspxSymbolResolver
         if (Contains(element.StartTag.ElementRange, offset)
             || (element.EndTag is not null && Contains(element.EndTag.ElementRange, offset)))
         {
+            // `<HeaderTemplate>` is `Repeater.HeaderTemplate`: a member reference like an attribute
+            // name, not a control.
+            if (element is TemplateNode { Member: { } member })
+            {
+                return new AspxHit(AspxHitKind.PropertyName, Span(element.StartTag.Name.Range),
+                    Symbol: member.Symbol, Element: element, Name: element.Name.Value);
+            }
+
             return type is null
                 ? null
                 : new AspxHit(AspxHitKind.ControlType, Span(element.StartTag.ElementRange),

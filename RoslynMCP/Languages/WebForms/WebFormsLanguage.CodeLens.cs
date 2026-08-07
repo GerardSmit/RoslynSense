@@ -65,6 +65,12 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
     {
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
 
+        // A user control is nothing but control declarations, so the count lands on almost every
+        // line and pushes the markup apart — the gutter stops being an annotation and becomes the
+        // file's layout. The number is still one gesture away on any ID, by find-references.
+        if (IsUserControl(path))
+            return [];
+
         var index = await WebFormsIndex.GetAsync(path, ct);
         var document = await AspxDocumentService.GetAsync(path, ct);
         if (index is null || document?.CodeBehind is not { } codeBehind)
@@ -125,8 +131,9 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
         // The ID attribute is the declaration, and the markup pass returns it the way Roslyn
         // returns a declaration — a lens that counted itself would read "1 reference" on a
         // control nothing uses.
+        var (project, target) = await AspxDocumentService.AnchorAsync(document, field, ct);
         var locations = (await NavigationHandlers.AllReferencesAsync(
-                field, document.Project, includeDeclaration: false, ct))
+                target, project, includeDeclaration: false, ct))
             .Where(location => !IsSelf(location, data))
             .ToArray();
 
@@ -137,6 +144,10 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
                 [data.Uri, data.Line, data.Character, locations.Take(MaxReferenceLocations).ToArray()]),
         };
     }
+
+    /// <summary>Whether the path is a user control rather than a page.</summary>
+    private static bool IsUserControl(string path) =>
+        Path.GetExtension(path).Equals(".ascx", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsSelf(LspLocation location, CodeLensData data) =>
         location.Range.Start.Line == data.Line

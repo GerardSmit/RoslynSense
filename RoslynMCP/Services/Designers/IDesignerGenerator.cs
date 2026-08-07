@@ -17,6 +17,13 @@ public sealed record DesignerResult(
 {
     public static DesignerResult Failed(string designerPath, params string[] errors) =>
         new(designerPath, null, errors);
+
+    /// <summary>
+    /// Other source files whose designers this result made stale, and which should therefore be
+    /// regenerated as well — the other markup files of a shared code-behind class. Empty for the
+    /// common single-file case.
+    /// </summary>
+    public IReadOnlyList<string> RelatedSources { get; init; } = [];
 }
 
 /// <summary>

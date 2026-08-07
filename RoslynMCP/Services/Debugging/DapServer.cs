@@ -100,8 +100,16 @@ internal sealed class DapServer
         // computed in the daemon, where the workspace lives, but only this process can apply it.
         using var commands = new DebugCommandPipeServer(() => backend);
 
-        var server = new DapServer(
-            backend, Console.OpenStandardInput(), Console.OpenStandardOutput());
+        // Not Console.OpenStandardOutput(): it reports short pipe writes as successful, which
+        // drops bytes out of a DAP frame and desynchronizes the editor's adapter. See StdIo.
+        var input = Console.OpenStandardInput();
+        var output = StdIo.OpenProtocolOutput();
+
+        // stdout belongs to the protocol from here on, so nothing may reach it by another route:
+        // one stray Console.WriteLine anywhere under the debugger would land inside a frame.
+        Console.SetOut(Console.Error);
+
+        var server = new DapServer(backend, input, output);
 
         await server.ListenAsync(ct);
         return 0;

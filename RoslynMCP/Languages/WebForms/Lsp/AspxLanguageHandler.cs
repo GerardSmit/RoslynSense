@@ -84,8 +84,26 @@ internal static class AspxLanguageHandler
             if (InProjection(document, projected) is { Length: > 0 } inMarkup)
                 return inMarkup;
 
-            return await NavigationHandlers.DefinitionLocationsAsync(
+            // Through the contributors, as the C# handler does: one field must not answer with the
+            // markup ID from a .ascx.cs and with the designer line from the .ascx beside it.
+            var found = await NavigationHandlers.DefinitionLocationsAsync(
                 projected, document.Project, typeDefinition, ct);
+
+            // typeDefinition asks what type the control is, and the designer is not in that way.
+            if (typeDefinition)
+                return found;
+
+            // The symbol belongs to the projection's forked compilation, and the contributor
+            // compares with SymbolEqualityComparer, which never matches across two of them.
+            // AnchorAsync keys on the solution, which has not moved; the compilation has.
+            var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
+            var anchored = await current.GetCompilationAsync(ct) is { } compilation
+                ? SymbolFinder.FindSimilarSymbols(projected.OriginalDefinition, compilation, ct)
+                    .FirstOrDefault() ?? projected
+                : projected;
+
+            return await NavigationHandlers.WithContributionsAsync(
+                [anchored.OriginalDefinition], current, [.. found], languages: null, ct);
         }
 
         return [];
@@ -199,10 +217,11 @@ internal static class AspxLanguageHandler
         AspxDocument document, AspxHit hit, ISymbol declared, CancellationToken ct)
     {
         var range = ToRange(document, hit.Span);
+        var (project, target) = await AspxDocumentService.AnchorAsync(document, declared, ct);
 
         return
         [
-            .. (await AllReferencesAsync(declared, document.Project, includeDeclaration: false, ct))
+            .. (await AllReferencesAsync(target, project, includeDeclaration: false, ct))
                 .Where(location => !IsSelf(location, document.FilePath, range)),
         ];
     }
@@ -246,12 +265,13 @@ internal static class AspxLanguageHandler
         if (await ResolveAsync(p.TextDocument, p.Position, ct) is not var (document, offset))
             return [];
 
-        var symbol = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
+        var resolved = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
             ?? await ProjectedSymbolAsync(document, offset, ct);
-        if (symbol is null)
+        if (resolved is null)
             return [];
 
-        var solution = document.Project.Solution;
+        var (project, symbol) = await AspxDocumentService.AnchorAsync(document, resolved, ct);
+        var solution = project.Solution;
         var results = new List<ISymbol>();
 
         switch (symbol)
@@ -272,7 +292,7 @@ internal static class AspxLanguageHandler
             results.Add(symbol);
 
         return await HandlerHelpers.ToLocationsAsync(
-            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), document.Project, ct);
+            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), project, ct);
     }
 
     public static async Task<LspLocation[]> ReferencesAsync(ReferenceParams p, CancellationToken ct)
@@ -282,11 +302,14 @@ internal static class AspxLanguageHandler
 
         // The markup counterpart of the pre-pass in NavigationHandlers: a `<%$ Resources: %>`
         // argument resolves to no symbol, so a search started on one has to reach the pack that
-        // knows what a resource key is before the resolve declines.
+        // knows what a resource key is before the resolve declines. The current project, not the
+        // parse's snapshot: a key search reads document text, and its answers are positions in
+        // the files as they are now.
+        var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
         foreach (var provider in
                  LanguageScope.Process.Contributors<ISymbolFreeReferenceProvider>())
         {
-            if (await provider.ReferencesAsync(document.FilePath, offset, document.Project, ct)
+            if (await provider.ReferencesAsync(document.FilePath, offset, current, ct)
                 is { } found)
             {
                 return [.. found];
@@ -298,7 +321,8 @@ internal static class AspxLanguageHandler
         if (symbol is null)
             return [];
 
-        return await AllReferencesAsync(symbol, document.Project, p.Context.IncludeDeclaration, ct);
+        var (project, target) = await AspxDocumentService.AnchorAsync(document, symbol, ct);
+        return await AllReferencesAsync(target, project, p.Context.IncludeDeclaration, ct);
     }
 
     /// <summary>
@@ -563,7 +587,7 @@ internal static class AspxLanguageHandler
 
         var resources = await AspxResourceHandler.DiagnosticsAsync(document, ct);
 
-        return resources.Length == 0 ? parse : [.. parse, .. resources];
+return resources.Length == 0 ? parse : [.. parse, .. resources];
     }
 
     // ---- Rename ----------------------------------------------------------------------------
@@ -605,21 +629,29 @@ internal static class AspxLanguageHandler
         if (await ResolveAsync(p.TextDocument, p.Position, ct) is not var (document, offset))
             return null;
 
-        // Ahead of the markup resolve, for the same reason prepareRename is.
+        // Ahead of the markup resolve, for the same reason prepareRename is. The current project,
+        // not the parse's snapshot: a key rename's edits are applied to the buffers the user has
+        // now, and a stale snapshot's offsets would land them mid-word.
+        var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
         foreach (var provider in
                  LanguageScope.Process.Contributors<ISymbolFreeRenameProvider>())
         {
             if (await provider.RenameAsync(
-                    document.FilePath, offset, p.NewName, document.Project, ct) is { } edit)
+                    document.FilePath, offset, p.NewName, current, ct) is { } edit)
             {
                 return edit;
             }
         }
 
-        var symbol = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
+        var resolved = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
             ?? await ProjectedSymbolAsync(document, offset, ct);
-        if (symbol is null)
+        if (resolved is null)
             return null;
+
+        // A rename's edits are applied to the buffers the user has now, so they have to be
+        // computed against the current solution — the cached document's snapshot may predate
+        // body edits that moved every span below them.
+        var (project, symbol) = await AspxDocumentService.AnchorAsync(document, resolved, ct);
 
         var changes = new Dictionary<string, List<TextEdit>>(StringComparer.OrdinalIgnoreCase);
 
@@ -632,14 +664,14 @@ internal static class AspxLanguageHandler
         }
 
         var solution = await Renamer.RenameSymbolAsync(
-            document.Project.Solution, symbol, new SymbolRenameOptions(), p.NewName, ct);
+            project.Solution, symbol, new SymbolRenameOptions(), p.NewName, ct);
 
-        foreach (var change in solution.GetChanges(document.Project.Solution).GetProjectChanges())
+        foreach (var change in solution.GetChanges(project.Solution).GetProjectChanges())
         {
             foreach (var id in change.GetChangedDocuments())
             {
                 var updated = solution.GetDocument(id)!;
-                var original = document.Project.Solution.GetDocument(id)!;
+                var original = project.Solution.GetDocument(id)!;
                 if (original.FilePath is not { Length: > 0 } path)
                     continue;
 
@@ -652,7 +684,7 @@ internal static class AspxLanguageHandler
             }
         }
 
-        foreach (var (uri, edit) in await RenameEditsAsync(symbol, document.Project, p.NewName, ct))
+        foreach (var (uri, edit) in await RenameEditsAsync(symbol, project, p.NewName, ct))
             Add(uri, edit);
 
         return changes.Count == 0

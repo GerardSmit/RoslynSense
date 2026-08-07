@@ -69,6 +69,24 @@ internal static class NavigationHandlers
             ? redirected
             : (IReadOnlyList<ISymbol>)[typeDefinition ? TypeOf(symbol) : symbol];
 
+        return await WithContributionsAsync(subjects, document.Project, locations, languages, ct);
+    }
+
+    /// <summary>
+    /// Adds what the packs say a symbol is declared by, and removes the Roslyn locations they
+    /// supersede.
+    /// </summary>
+    /// <remarks>
+    /// Separate from the caller so that a request starting in markup gets the same answer as one
+    /// starting in C#. A caret in a <c>&lt;% %&gt;</c> block binds through the projection to the
+    /// same code-behind field the C# side binds to, and without this pass it lands on the generated
+    /// designer line — the very file the pack exists to redirect away from. Two halves of one
+    /// relationship disagreeing about where a control is declared is worse than either answer.
+    /// </remarks>
+    public static async Task<LspLocation[]> WithContributionsAsync(
+        IReadOnlyList<ISymbol> subjects, Project project, List<LspLocation> locations,
+        LanguageSession? languages, CancellationToken ct)
+    {
         var contributed = new List<LspLocation>();
         var answered = new List<ILanguageDefinitionContributor>();
 
@@ -78,7 +96,7 @@ internal static class NavigationHandlers
             int before = contributed.Count;
 
             foreach (var subject in subjects)
-                contributed.AddRange(await contributor.DefinitionsAsync(subject, document.Project, ct));
+                contributed.AddRange(await contributor.DefinitionsAsync(subject, project, ct));
 
             // Only a pack that put something in this answer may take something out of it, which is
             // what keeps a decline from being able to empty the result.

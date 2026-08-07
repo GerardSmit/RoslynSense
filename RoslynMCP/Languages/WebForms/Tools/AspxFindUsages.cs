@@ -47,7 +47,9 @@ internal class AspxFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
         if (document is null)
             return "Error: Unable to get compilation for the project.";
 
-        var project = document.Project;
+        // The current project, not the parse's snapshot: the FindControl text search and the
+        // reference search both answer with positions in the files as they are now.
+        var project = await AspxDocumentService.CurrentProjectAsync(document, cancellationToken);
         var hit = AspxSourceMappingService.FindMarkedSpan(document.Text, markup!, hintLine) is { } marked
             ? AspxSymbolResolver.ResolveAt(document, marked.Start)
             : null;
@@ -85,11 +87,13 @@ internal class AspxFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
                 controlId!, findControlRefs, systemPath, project.FilePath!, fmt);
         }
 
-        // Resolved symbol: run full Roslyn FindReferences
+        // Resolved symbol: run full Roslyn FindReferences. The tree's symbol is re-anchored
+        // into the current solution first — a foreign snapshot's symbol finds nothing.
+        var (searchProject, target) = await AspxDocumentService.AnchorAsync(document, symbol, cancellationToken);
         var references = await SymbolFinder.FindReferencesAsync(
-            symbol, project.Solution, cancellationToken);
+            target, searchProject.Solution, cancellationToken);
 
-        var markupReferences = await AspxReferenceService.FindAsync(symbol, project, cancellationToken);
+        var markupReferences = await AspxReferenceService.FindAsync(target, searchProject, cancellationToken);
         var razorSourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(project, cancellationToken);
         string searchSummary = controlId is not null
             ? $"Markup target: `{markup!.MarkedText}` (ASPX control ID)"

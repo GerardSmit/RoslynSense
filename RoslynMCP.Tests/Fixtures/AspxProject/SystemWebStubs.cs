@@ -18,11 +18,33 @@ namespace System.Web.UI
 {
     public interface ITemplate { }
 
+    public enum TemplateInstance
+    {
+        Multiple = 0,
+        Single = 1,
+    }
+
+    [AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
+    public sealed class TemplateInstanceAttribute : Attribute
+    {
+        public TemplateInstanceAttribute(TemplateInstance instances) => Instances = instances;
+        public TemplateInstance Instances { get; }
+    }
+
     [AttributeUsage(AttributeTargets.Class, AllowMultiple = false)]
     public sealed class ParseChildrenAttribute : Attribute
     {
         public ParseChildrenAttribute(bool childrenAsProperties) { }
+        public ParseChildrenAttribute(bool childrenAsProperties, string defaultProperty) { }
         public bool ChildrenAsProperties { get; set; }
+        public string DefaultProperty { get; set; } = "";
+    }
+
+    [AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
+    public sealed class TemplateContainerAttribute : Attribute
+    {
+        public TemplateContainerAttribute(Type containerType) => ContainerType = containerType;
+        public Type ContainerType { get; }
     }
 
     public class Control
@@ -42,6 +64,15 @@ namespace System.Web.UI
 
     public class UserControl : Control { }
 
+    /// <summary>Single-instance template host, like the real UpdatePanel: controls inside its
+    /// ContentTemplate still get designer fields.</summary>
+    [ParseChildren(true)]
+    public class UpdatePanel : Control
+    {
+        [TemplateInstance(TemplateInstance.Single)]
+        public ITemplate? ContentTemplate { get; set; }
+    }
+
     namespace HtmlControls
     {
         public class HtmlGenericControl : Control { }
@@ -50,6 +81,15 @@ namespace System.Web.UI
         public class HtmlTitle : Control { }
         public class HtmlLink : Control { }
         public class HtmlImage : Control { }
+        public class HtmlAnchor : Control { }
+        public class HtmlButton : Control { }
+        public class HtmlSelect : Control { }
+        public class HtmlTextArea : Control { }
+        public class HtmlInputText : Control { public string Value { get; set; } = ""; }
+        public class HtmlInputCheckBox : Control { public bool Checked { get; set; } }
+        public class HtmlInputHidden : Control { public string Value { get; set; } = ""; }
+        public class HtmlInputButton : Control { public string Value { get; set; } = ""; }
+        public class HtmlInputGenericControl : Control { public string Value { get; set; } = ""; }
     }
 
     namespace WebControls
@@ -64,6 +104,12 @@ namespace System.Web.UI
         public class Label : WebControl
         {
             public string Text { get; set; } = "";
+        }
+
+        /// <summary>A container, so a test can put a control inside another control.</summary>
+        public class Panel : WebControl
+        {
+            public string CssClass { get; set; } = "";
         }
 
         public class Button : WebControl
@@ -85,9 +131,27 @@ namespace System.Web.UI
             public string PostBackUrl { get; set; } = "";
         }
 
+        /// <summary>Default collection property, like the real ListControl family:
+        /// items sit directly inside the tag with no <c>&lt;Items&gt;</c> wrapper.</summary>
+        [System.Web.UI.ParseChildren(true, "Items")]
+        public class DropDownList : WebControl
+        {
+            public ListItemCollection Items { get; } = new();
+        }
+
+        /// <summary>A collection item, not a Control — never a designer field.</summary>
+        public class ListItem
+        {
+            public string Text { get; set; } = "";
+            public string Value { get; set; } = "";
+        }
+
+        public class ListItemCollection { }
+
         [System.Web.UI.ParseChildren(true)]
         public class Repeater : WebControl
         {
+            [System.Web.UI.TemplateContainer(typeof(RepeaterItem))]
             public System.Web.UI.ITemplate? ItemTemplate { get; set; }
             public System.Web.UI.ITemplate? AlternatingItemTemplate { get; set; }
             public System.Web.UI.ITemplate? HeaderTemplate { get; set; }
@@ -95,9 +159,15 @@ namespace System.Web.UI
             public System.Web.UI.ITemplate? SeparatorTemplate { get; set; }
             public event EventHandler<RepeaterItemEventArgs>? ItemDataBound;
             public event EventHandler<RepeaterItemEventArgs>? ItemCreated;
+
+            /// <summary>Names the type a template's `Item` binds to.</summary>
+            public string ItemType { get; set; } = "";
         }
 
-        public class RepeaterItem : Control { }
+        public class RepeaterItem : Control
+        {
+            public object? DataItem { get; }
+        }
 
         public class RepeaterItemEventArgs : EventArgs
         {

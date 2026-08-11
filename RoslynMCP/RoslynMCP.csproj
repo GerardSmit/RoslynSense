@@ -134,14 +134,21 @@
       net6.0 so one build loads on every runtime a user's app might be on.
     -->
     <Target Name="CopyHotReloadAgent" AfterTargets="Build">
-      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)">
+      <!-- RemoveProperties: the agent is net6.0. During the tool's publish/pack the outer build
+           carries TargetFramework=net10.0 (and NoBuild when packing without a build) as global
+           properties, which otherwise leak into this nested build and fail it
+           (NETSDK1005 / NETSDK1085). -->
+      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)" RemoveProperties="TargetFramework;NoBuild;RuntimeIdentifier;SelfContained">
         <Output TaskParameter="TargetOutputs" ItemName="_HotReloadAgentOutput" />
       </MSBuild>
       <Copy SourceFiles="@(_HotReloadAgentOutput)" DestinationFolder="$(OutputPath)hotreload" SkipUnchangedFiles="true" />
     </Target>
 
     <Target Name="AddHotReloadAgentToPublish" AfterTargets="ComputeFilesToPublish">
-      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)">
+      <!-- See CopyHotReloadAgent: strip the outer TFM/publish globals so the net6.0 agent builds
+           as itself rather than being forced to net10.0 (or refused when packing without a
+           build). -->
+      <MSBuild Projects="..\RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj" Targets="Build" Properties="Configuration=$(Configuration)" RemoveProperties="TargetFramework;NoBuild;RuntimeIdentifier;SelfContained">
         <Output TaskParameter="TargetOutputs" ItemName="_HotReloadAgentPublish" />
       </MSBuild>
       <ItemGroup>

@@ -1040,8 +1040,11 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "compile:webview": "tsc -p ./tsconfig.webview.json",
+    "build": "npm run compile && npm run compile:webview",
+    "vscode:prepublish": "npm run build",
     "watch": "tsc -watch -p ./",
-    "dev": "npm run compile && node scripts/dev.mjs",
+    "dev": "npm run build && node scripts/dev.mjs",
     "package": "vsce package",
     "check:embedded": "node scripts/checkEmbedded.mjs"
   },
@@ -1051,6 +1054,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.0",
     "typescript": "^5.4.0"
   }
 }

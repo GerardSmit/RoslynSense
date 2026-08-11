@@ -89,6 +89,109 @@ public class LspProgressAndRefreshTests
         }
     }
 
+    /// <summary>
+    /// Work that finishes quickly must never have announced itself.
+    /// </summary>
+    /// <remarks>
+    /// The <c>workspace/diagnostic</c> sweep is re-requested after anything that could reach
+    /// another file and normally answers "unchanged" in milliseconds. Announcing each one put a
+    /// "Analyzing solution" notification on screen every time a file was opened, which is what the
+    /// user reads as the whole solution reloading.
+    /// </remarks>
+    [Fact]
+    public async Task DeferredProgressStaysSilentForWorkThatFinishesFirst()
+    {
+        var (recorded, restore) = InstallRecordingFactory();
+        try
+        {
+            await using (var scope = ProgressReporter.BeginDeferred("Analyzing solution", TimeSpan.FromSeconds(30)))
+                scope.Report("ProjectA", 50);
+
+            Assert.Empty(recorded);
+        }
+        finally
+        {
+            restore();
+        }
+    }
+
+    [Fact]
+    public async Task DeferredProgressAppearsOnceTheWorkOutlastsTheDelay()
+    {
+        var (recorded, restore) = InstallRecordingFactory();
+        try
+        {
+            await using (var scope = ProgressReporter.BeginDeferred(
+                "Analyzing solution", TimeSpan.FromMilliseconds(50)))
+            {
+                scope.Report("ProjectA", 50);
+                await Task.Delay(TimeSpan.FromMilliseconds(750));
+            }
+
+            // The title, and the last thing the work said before the scope became visible — a
+            // notification that appeared blank would be worse than none.
+            Assert.Contains("Analyzing solution", recorded);
+            Assert.Contains("ProjectA", recorded);
+        }
+        finally
+        {
+            restore();
+        }
+    }
+
+    /// <summary>
+    /// A burst of refresh requests reaches the client as one refresh.
+    /// </summary>
+    /// <remarks>
+    /// A refresh is not a per-document message — it tells the editor to re-pull everything,
+    /// including a full <c>workspace/diagnostic</c> sweep. The background analyzer pass fires one
+    /// per document, so opening a folder of ten files used to buy ten whole-workspace re-pulls.
+    /// </remarks>
+    [Fact]
+    public async Task ABurstOfRefreshRequestsReachesTheClientOnce()
+    {
+        await using var session = await EditorSession.StartAsync(new
+        {
+            processId = 1234,
+            rootUri = (string?)null,
+            capabilities = new { textDocument = new { diagnostic = new { } } },
+        });
+
+        const int requests = 10;
+        for (int i = 0; i < requests; i++)
+            LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics);
+
+        await session.Client.WaitForAsync("workspace/diagnostic/refresh");
+
+        // Past the coalescing window, so a straggler would have landed by now.
+        await Task.Delay(TimeSpan.FromSeconds(2));
+
+        int seen = session.Client.Seen.Count(m => m == "workspace/diagnostic/refresh");
+
+        // Bounded rather than exact: the registry is process-wide and a background analyzer pass
+        // left over from another case schedules its own refresh into this session. What is being
+        // asserted is that a burst does not cost one refresh per request.
+        Assert.InRange(seen, 1, requests - 1);
+    }
+
+    private static (ConcurrentBag<string> Recorded, Action Restore) InstallRecordingFactory()
+    {
+        var previous = ProgressReporter.Factory;
+        var recorded = new ConcurrentBag<string>();
+        ProgressReporter.Factory = (title, _) =>
+        {
+            recorded.Add(title);
+            return Task.FromResult<IProgressScope>(new RecordingScope(recorded));
+        };
+        return (recorded, () => ProgressReporter.Factory = previous);
+    }
+
+    private sealed class RecordingScope(ConcurrentBag<string> recorded) : IProgressScope
+    {
+        public void Report(string message, int? percentage = null) => recorded.Add(message);
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     /// <summary>An LSP session over an in-memory duplex pair, with the client side recording
     /// every server-initiated request and notification.</summary>
     private sealed class EditorSession : IAsyncDisposable

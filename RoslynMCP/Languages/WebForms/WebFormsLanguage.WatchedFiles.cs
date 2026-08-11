@@ -15,7 +15,11 @@ internal sealed partial class WebFormsLanguage : ILanguageWatchedFileHandler
     {
         if (Path.GetFileName(path).Equals("web.config", StringComparison.OrdinalIgnoreCase))
         {
-            AspxDocumentService.InvalidateAll();
+            // The tree the config governs, not every parse in the process. A web.config applies to
+            // the site it sits in, and dropping everything re-parsed every page of every other site
+            // loaded — including solutions open in other windows, which this handler is offered
+            // events for regardless of whether they enabled the pack.
+            AspxDocumentService.InvalidateUnder(Path.GetDirectoryName(path) ?? "");
             return true;
         }
 

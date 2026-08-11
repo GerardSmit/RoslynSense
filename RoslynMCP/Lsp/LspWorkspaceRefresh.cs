@@ -1,4 +1,4 @@
-using RoslynMCP.Services;
+﻿using RoslynMCP.Services;
 
 namespace RoslynMCP.Lsp;
 
@@ -28,13 +28,6 @@ namespace RoslynMCP.Lsp;
 /// </remarks>
 internal static class LspWorkspaceRefresh
 {
-    /// <summary>Long enough to coalesce a load's worth of batches, short enough that the gutter
-    /// updates while the user is still looking at the line that prompted it.</summary>
-    private static readonly TimeSpan Quiet = TimeSpan.FromMilliseconds(750);
-
-    private static readonly object s_gate = new();
-    private static CancellationTokenSource? s_pending;
-
     /// <summary>
     /// Subscribes to <see cref="WorkspaceService.ProjectSetChanged"/>. Idempotent: every session
     /// calls it on attach, and the refresh goes to all of them regardless of which one asked.
@@ -44,31 +37,11 @@ internal static class LspWorkspaceRefresh
 
     private static void Schedule()
     {
-        CancellationToken token;
-
-        lock (s_gate)
-        {
-            s_pending?.Cancel();
-            s_pending?.Dispose();
-            s_pending = new CancellationTokenSource();
-            token = s_pending.Token;
-        }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(Quiet, token);
-                await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, token);
-            }
-            catch (OperationCanceledException)
-            {
-                // Superseded by a later change — that one will send the refresh.
-            }
-            catch (Exception)
-            {
-                // A client that cannot be told is not a reason to fault a background load.
-            }
-        });
+        // The debounce and its ceiling both live in ScheduleRefresh, which is the one place that
+        // knows how to coalesce these safely — it owns each token's lifetime rather than disposing
+        // a superseded one mid-send, and it has a maximum wait so a steady stream of project-set
+        // changes cannot hold the refresh off forever. This used to be a second, subtly different
+        // implementation of the same thing, with both of those bugs.
+        LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
     }
 }

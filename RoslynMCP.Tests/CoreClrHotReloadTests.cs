@@ -249,8 +249,25 @@ public class CoreClrHotReloadTests : IDisposable
         {
             if (!File.Exists(log))
                 return false;
-            var lines = File.ReadLines(log).ToList();
-            return lines.Count > 0 && lines[^1].Trim() == value;
+
+            // Shared for writing and deletion, because the target is appending to this file the
+            // whole time. File.ReadLines opens with FileShare.Read, which locks the writer out —
+            // its File.AppendAllText then throws an unhandled IOException and the process dies,
+            // which this test reports as "the process restarted on the second apply". The catch
+            // below only ever covered the reader's side of that collision, and the reader is not
+            // the side that was failing.
+            using var stream = new FileStream(
+                log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+
+            string? last = null;
+            while (reader.ReadLine() is { } line)
+            {
+                if (line.Trim().Length > 0)
+                    last = line;
+            }
+
+            return last?.Trim() == value;
         }
         catch (IOException)
         {

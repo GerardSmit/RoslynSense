@@ -135,6 +135,8 @@ public static class OpenDocumentStore
     /// <summary>Drops every document owned by a session that disconnected.</summary>
     public static void CloseSession(string sessionId)
     {
+        var closed = new List<string>();
+
         foreach (var (key, doc) in s_docs)
         {
             bool removed;
@@ -143,22 +145,56 @@ public static class OpenDocumentStore
                 doc.OwnerSessions.Remove(sessionId);
                 removed = doc.OwnerSessions.Count == 0;
             }
-            if (removed)
-                s_docs.TryRemove(key, out _);
+            if (removed && s_docs.TryRemove(key, out _))
+                closed.Add(key);
         }
 
         // A disconnecting session takes buffers of every kind with it, so both counters move
         // rather than being decided per path.
         Interlocked.Increment(ref s_generation);
         Interlocked.Increment(ref s_overlayGeneration);
+
+        // Each abandoned buffer announced, the same as if it had been closed one at a time. The
+        // workspaces hold this session's unsaved text, and nothing else would ever put those
+        // documents back to what is on disk — so a window closing (or an extension reload, or a
+        // crash) left every other window answering hover, completion and diagnostics from text
+        // that no longer exists anywhere.
+        foreach (string path in closed)
+        {
+            if (!IsOverlayable(path))
+                continue;
+
+            try { OverlayableBufferChanged?.Invoke(path); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[OpenDocumentStore] Buffer subscriber failed: {ex.Message}");
+            }
+        }
     }
+
+    /// <summary>
+    /// Raised when a buffer Roslyn can actually carry has opened, changed or closed, so the loaded
+    /// workspaces can bring their own copy in line. See
+    /// <see cref="WorkspaceService.ReconcileOpenBufferAsync"/> for why the workspace holds the text
+    /// rather than every request forking a solution to overlay it.
+    /// </summary>
+    public static Action<string>? OverlayableBufferChanged;
 
     /// <summary>Records that a buffer moved, on both counters or only the general one.</summary>
     private static void Bump(string normalizedPath)
     {
         Interlocked.Increment(ref s_generation);
-        if (IsOverlayable(normalizedPath))
-            Interlocked.Increment(ref s_overlayGeneration);
+        if (!IsOverlayable(normalizedPath))
+            return;
+
+        Interlocked.Increment(ref s_overlayGeneration);
+
+        try { OverlayableBufferChanged?.Invoke(normalizedPath); }
+        catch (Exception ex)
+        {
+            // A subscriber that throws must not break the edit that triggered it.
+            Console.Error.WriteLine($"[OpenDocumentStore] Buffer subscriber failed: {ex.Message}");
+        }
     }
 
     /// <summary>True when the file is open in some editor (its buffer may differ from disk).</summary>

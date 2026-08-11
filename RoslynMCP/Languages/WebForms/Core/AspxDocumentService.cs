@@ -292,4 +292,37 @@ internal static class AspxDocumentService
         s_cache.Clear();
         s_webConfig.Clear();
     }
+
+    /// <summary>
+    /// Drops the memoized parses for one directory tree — the site whose <c>web.config</c> changed.
+    /// </summary>
+    /// <remarks>
+    /// Both caches are keyed by normalized path, so the tree is a precise boundary. Clearing them
+    /// outright meant one site's <c>web.config</c> re-parsed every page of every other site loaded
+    /// in the process, including ones in solutions open in other windows.
+    /// </remarks>
+    public static void InvalidateUnder(string directory)
+    {
+        if (string.IsNullOrEmpty(directory))
+        {
+            InvalidateAll();
+            return;
+        }
+
+        string prefix = PathHelper.NormalizePath(directory)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+
+        foreach (var key in s_cache.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                s_cache.TryRemove(key, out _);
+        }
+
+        foreach (var key in s_webConfig.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                s_webConfig.TryRemove(key, out _);
+        }
+    }
 }

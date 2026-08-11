@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.WebForms.Core;
@@ -78,7 +78,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
     /// </remarks>
     private static string? ResultId(string path, VersionStamp semanticVersion, AspxIncludeGraph graph)
     {
-        byte[]? content = ReadAllBytes(path);
+        byte[]? content = ContentHash(path);
         if (content is null)
             return null;
 
@@ -95,7 +95,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
                 continue;
 
             hash.AppendData(Encoding.UTF8.GetBytes(member.ToUpperInvariant()));
-            hash.AppendData(ReadAllBytes(member) ?? "missing"u8.ToArray());
+            hash.AppendData(ContentHash(member) ?? "missing"u8.ToArray());
         }
 
         return $"{Convert.ToHexString(hash.GetHashAndReset())}:{semanticVersion}";
@@ -117,5 +117,54 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
         {
             return null;
         }
+    }
+
+    /// <summary>Path → the file stamp its hash was computed from, and that hash.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string, (long Ticks, long Length, byte[] Hash)> s_contentHashes = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The SHA-256 of a closed file's bytes, remembered against its size and modification time.
+    /// </summary>
+    /// <remarks>
+    /// The sweep runs after every change that could reach another file, and it needs a content hash
+    /// for every markup file in the project to decide that almost all of them are unchanged. Doing
+    /// that honestly means reading and hashing the whole site on each pull — thousands of files on
+    /// a real WebForms site, to conclude nothing happened. A stat is enough to know the bytes on
+    /// disk cannot have changed.
+    ///
+    /// An open buffer is hashed every time instead: its text moves without the file's stamp
+    /// moving, so a stat says nothing about it. <see cref="ReadAllBytes"/> prefers the buffer over
+    /// the file, so an unsaved edit does move this id.
+    /// </remarks>
+    private static byte[]? ContentHash(string path)
+    {
+        if (OpenDocumentStore.IsOpen(path))
+            return ReadAllBytes(path) is { } buffer ? SHA256.HashData(buffer) : null;
+
+        long ticks, length;
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists)
+                return null;
+            ticks = info.LastWriteTimeUtc.Ticks;
+            length = info.Length;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+
+        if (s_contentHashes.TryGetValue(path, out var cached)
+            && cached.Ticks == ticks && cached.Length == length)
+        {
+            return cached.Hash;
+        }
+
+        if (ReadAllBytes(path) is not { } content)
+            return null;
+
+        var hash = SHA256.HashData(content);
+        s_contentHashes[path] = (ticks, length, hash);
+        return hash;
     }
 }

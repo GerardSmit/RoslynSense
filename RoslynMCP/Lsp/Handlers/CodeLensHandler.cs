@@ -151,17 +151,38 @@ internal static class CodeLensHandler
         // A contributed lens carries the id of the pack that emitted it, because the document is
         // C# and so the URI cannot say whose it is. Checked first: the Kind below it is C#'s own
         // vocabulary and a pack's means something else.
-        if (lens.Data is { PackId: { Length: > 0 } packId })
+        if (lens.Data is { PackId: { Length: > 0 } packId } packData)
         {
+            // Memoized on the same key C#'s own counted lenses use. A contributed lens sits in a
+            // C# document, and a pack's resolve can be just as expensive — the mediator's runs a
+            // solution-wide SymbolFinder sweep per dispatch site, and a file with six handlers
+            // emits about a dozen lenses, every one of them re-resolved on each scroll and each
+            // edit. This branch returned before the memo was ever consulted.
+            var packGeneration = await LensGenerationAsync(packData.Uri, ct);
+
             foreach (var contributor in
                      LanguageScope.Of(languages).Contributors<ILanguageCodeLensContributor>())
             {
-                if (contributor is ILanguagePack pack &&
-                    pack.Id.Equals(packId, StringComparison.OrdinalIgnoreCase) &&
-                    await contributor.ResolveCodeLensAsync(lens, ct) is { } resolvedByPack)
+                if (contributor is not ILanguagePack pack ||
+                    !pack.Id.Equals(packId, StringComparison.OrdinalIgnoreCase))
                 {
-                    return resolvedByPack;
+                    continue;
                 }
+
+                if (packGeneration is null)
+                {
+                    if (await contributor.ResolveCodeLensAsync(lens, ct) is { } uncached)
+                        return uncached;
+                    continue;
+                }
+
+                var resolved = await CodeLensResolveMemo.ResolveAsync(
+                    packData, packGeneration, lens,
+                    async l => (await contributor.ResolveCodeLensAsync(l, CancellationToken.None))?.Command,
+                    ct);
+
+                if (resolved.Command is not null)
+                    return resolved;
             }
 
             // The pack that emitted it is switched off for this window, or declined. An

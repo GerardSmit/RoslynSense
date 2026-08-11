@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using System.Xml.Linq;
 
@@ -142,6 +142,7 @@ public static class ProjectMutationService
 
             group.Add(reference);
             document.Save(projectPath);
+            SelfWriteTracker.Note(projectPath);
             return null;
         }
         catch (Exception ex)
@@ -173,6 +174,7 @@ public static class ProjectMutationService
             foreach (var reference in stale)
                 reference.Remove();
             document.Save(projectPath);
+            SelfWriteTracker.Note(projectPath);
         }
         catch (Exception ex)
         {
@@ -281,8 +283,29 @@ public static class ProjectMutationService
             return null;
         }
 
-        EnsureCompileItem(project, projectDirectory, full);
-        await InvalidateAsync(ct, project);
+        // Only when the project file was really rewritten. EnsureCompileItem returns null for an
+        // SDK-style project, whose glob already covers the new file — so creating a file used to
+        // reload the workspace for a change that was never made.
+        if (EnsureCompileItem(project, projectDirectory, full) is not null)
+        {
+            await InvalidateAsync(ct, project);
+        }
+        else
+        {
+            // Added here rather than left to the file watcher: there is no watcher when this runs
+            // over MCP with no editor attached, and the new file would stay invisible to every
+            // query until the workspace happened to be evicted for some other reason.
+            // Deliberately not authoritative. EnsureCompileItem returns null after checking only
+            // EnableDefaultCompileItems — it never looks at DefaultItemExcludes or Compile Remove,
+            // which is exactly what the workspace's own glob check does look at. Claiming authority
+            // on the strength of it would add documents for files MSBuild excludes, producing
+            // duplicate-definition errors in the editor that do not exist in the build.
+            if (await WorkspaceService.TryApplyFileChangeAsync(
+                    project, full, FileChange.Created, ct) == FileSyncResult.CannotApply)
+            {
+                await InvalidateAsync(ct, project);
+            }
+        }
 
         return Scaffold(project, projectDirectory, full, FileKind.Class);
     }
@@ -377,6 +400,7 @@ public static class ProjectMutationService
 
             group.Add(new XElement(ns + "Reference", new XAttribute("Include", assemblyName)));
             document.Save(projectPath);
+            SelfWriteTracker.Note(projectPath);
         }
         catch (Exception ex)
         {
@@ -531,7 +555,10 @@ public static class ProjectMutationService
             }
 
             if (changed)
+            {
                 document.Save(projectPath);
+                SelfWriteTracker.Note(projectPath);
+            }
         }
         catch (Exception ex)
         {
@@ -713,6 +740,7 @@ public static class ProjectMutationService
                         missing.Select(item =>
                             new XElement(ns + item, new XAttribute("Remove", include)))));
                     document.Save(projectPath);
+                    SelfWriteTracker.Note(projectPath);
                 }
             }
         }
@@ -864,6 +892,7 @@ public static class ProjectMutationService
 
             group.Add(new XElement(ns + "Compile", new XAttribute("Include", include)));
             document.Save(projectPath);
+            SelfWriteTracker.Note(projectPath);
             return "added it to the project file";
         }
         catch (Exception ex)
@@ -899,6 +928,7 @@ public static class ProjectMutationService
             foreach (var element in stale)
                 element.Remove();
             document.Save(projectPath);
+            SelfWriteTracker.Note(projectPath);
         }
         catch (Exception ex)
         {
@@ -948,13 +978,36 @@ public static class ProjectMutationService
         return false;
     }
 
+    /// <summary>
+    /// Drops what a project-file edit invalidated.
+    /// </summary>
+    /// <remarks>
+    /// Scoped to the workspaces serving the named projects rather than every workspace in the
+    /// process. One cache entry already covers a whole solution, so this is not a small blast
+    /// radius to begin with — but a second solution open in another window has nothing to do with
+    /// a package added to this one, and was being reloaded anyway.
+    /// </remarks>
     private static async Task InvalidateAsync(CancellationToken ct, params string[] projects)
     {
+        // No named project means the caller could not say what it changed — creating a project,
+        // adding or removing one from the solution, deleting a file whose owner is unknown. There
+        // is nothing to scope to, and answering "then nothing needs dropping" would leave the
+        // workspace on the old project set until the idle sweep: over MCP with no editor attached
+        // there is no file watcher to notice either.
+        if (projects.Length == 0)
+        {
+            await WorkspaceService.EvictAllAsync(ct);
+            return;
+        }
+
         foreach (string project in projects)
+        {
             ProjectEvaluationService.Evict(project);
 
-        // The compilation itself changed, so every cached snapshot and analyzer result is stale.
-        await WorkspaceService.EvictAllAsync(ct);
+            // References, analyzers and compile items all come from MSBuild evaluation, so the
+            // workspace holding this project genuinely has to be rebuilt.
+            await WorkspaceService.EvictProjectAsync(project, ct);
+        }
     }
 
     private static async Task<(int ExitCode, string Output)> RunDotnetAsync(

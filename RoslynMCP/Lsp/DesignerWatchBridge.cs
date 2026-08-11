@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Designers;
@@ -130,9 +130,17 @@ internal static class DesignerWatchBridge
 
     /// <summary>
     /// A regenerated designer is a compiled document whose text moved underneath the loaded
-    /// snapshot. Until its project is evicted, the code-behind still binds against the old field
+    /// snapshot. Until the workspace is told, the code-behind still binds against the old field
     /// set, so the editor keeps reporting the control that was just added as undefined.
     /// </summary>
+    /// <remarks>
+    /// One generated <c>.cs</c> changed, and this used to answer by evicting the workspace serving
+    /// it — which is the whole solution, since one cache entry serves all of it — then dropping
+    /// every analyzer result in the process, across every other solution too, and then asking every
+    /// editor to re-pull everything, once per regenerated file. Saving a single <c>.aspx</c>
+    /// therefore reloaded the solution from MSBuild. Replacing the one document's text is what
+    /// actually changed, and it keeps every compilation that did not.
+    /// </remarks>
     private static async Task InvalidateAsync(WatchedRegeneration entry)
     {
         try
@@ -141,10 +149,25 @@ internal static class DesignerWatchBridge
             string changed = entry.DesignerPath is { Length: > 0 } designer ? designer : entry.SourcePath;
 
             foreach (var project in Handlers.WatchedFilesHandler.FindNearestProjectFiles(changed))
-                await WorkspaceService.EvictProjectAsync(project);
+            {
+                // Authoritative because the designer generator owns this file: on the first
+                // regeneration there is no document yet, and a legacy WebForms project would
+                // otherwise answer "not compiled" and leave the generated partial out — which is
+                // the "the control I just added is still undefined" this bridge exists to fix.
+                var result = await WorkspaceService.TryApplyFileChangeAsync(
+                    project, changed, FileChange.Changed, authoritative: true);
 
-            AnalyzerDiagnosticCache.Clear();
-            await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All);
+                // A legacy WebForms project cannot have its compile items guessed at, so those
+                // still take the reload — but only the workspace serving them, and without
+                // clearing analyzer results for solutions that have nothing to do with it.
+                if (result == FileSyncResult.CannotApply)
+                    await WorkspaceService.EvictProjectAsync(project);
+            }
+
+            // Deliberately no AnalyzerDiagnosticCache.Clear(): the entries are keyed by DocumentId,
+            // so the regenerated document's own results are the only stale ones and they age out on
+            // their version key. Clearing threw away every other file's analysis in every solution.
+            LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
         }
         catch (Exception ex)
         {

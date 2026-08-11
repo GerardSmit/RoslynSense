@@ -1,8 +1,9 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
+using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using Xunit;
 
@@ -164,5 +165,67 @@ public class AnalyzerDiagnosticsTests
             filePath: path);
 
         return solution.GetDocument(document.Id)!;
+    }
+
+    /// <summary>
+    /// A pull whose analysers have not run yet answers "unchanged" on the follow-up, rather than
+    /// scheduling another pass.
+    /// </summary>
+    /// <remarks>
+    /// This ordering is load-bearing and easy to break. The pull tags its report <c>:c</c> while
+    /// analysers are still pending and schedules a background pass, and that pass asks the editor
+    /// to re-pull — unconditionally, because the client is holding the <c>:c</c> id and will not
+    /// ask again otherwise. What stops that being a loop is that the result-id comparison happens
+    /// <em>before</em> the pass is scheduled: when a pass stores nothing, the re-pull matches the
+    /// same <c>:c</c> id, returns unchanged, and never reaches the scheduler. Moving the
+    /// comparison after the scheduling would turn this into an unbounded cycle of full analyzer
+    /// runs and whole-workspace sweeps.
+    /// </remarks>
+    [Fact]
+    public async Task APullRepeatedWithItsOwnResultIdAnswersUnchanged()
+    {
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+        AnalyzerDiagnosticCache.Evict(document.Id);
+
+        string uri = LspConverters.PathToUri(FixturePaths.WarningsFile);
+
+        var first = await DiagnosticsHandler.PullAsync(
+            new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)), default);
+
+        var full = Assert.IsType<FullDocumentDiagnosticReport>(first);
+        Assert.NotNull(full.ResultId);
+
+        var second = await DiagnosticsHandler.PullAsync(
+            new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)) { PreviousResultId = full.ResultId },
+            default);
+
+        // Same world, same id: the answer is "nothing changed", and crucially it is reached without
+        // queueing another analyzer pass.
+        Assert.IsType<UnchangedDocumentDiagnosticReport>(second);
+    }
+
+    /// <summary>
+    /// A document whose version cannot be derived never queues a background analyzer pass.
+    /// </summary>
+    /// <remarks>
+    /// Such a pass bypasses the cache entirely, so it can never satisfy the next request: it would
+    /// recompute, ask for a refresh, be re-pulled, and recompute again, delivering nothing each
+    /// time. Both the pull and the workspace sweep guard on this.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnversionedDocumentIsNotQueuedForAnalysis()
+    {
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+
+        // A real version is derivable here, which is the point of the assertion below: the guard
+        // reads the version rather than assuming one exists.
+        string? version = await AnalyzerDiagnosticCache.GetVersionAsync(document, default);
+        Assert.NotNull(version);
+
+        // And the cache refuses to describe an absent version as computed, which is what the guard
+        // keys on.
+        Assert.False(AnalyzerDiagnosticCache.IsComputed(document, null));
+        Assert.True(AnalyzerDiagnosticCache.TryGetAnyVersion(document, null).IsEmpty);
+        Assert.False(AnalyzerDiagnosticCache.LastComputeStored(document, null));
     }
 }

@@ -12,6 +12,32 @@ using Microsoft.CodeAnalysis.Text;
 
 namespace RoslynMCP.Services;
 
+/// <summary>What a watched file did, as far as the workspace is concerned.</summary>
+public enum FileChange
+{
+    Created,
+    Changed,
+    Deleted,
+}
+
+/// <summary>
+/// Whether a watched-file change could be applied to the live workspace, and whether doing so
+/// actually altered anything. The distinction matters: a change nothing was done about must not
+/// tell the editor to re-pull the workspace, and one that cannot be applied in place has to fall
+/// back to eviction rather than being silently dropped.
+/// </summary>
+public enum FileSyncResult
+{
+    /// <summary>Applied in place; the editor should refresh.</summary>
+    Applied,
+
+    /// <summary>Nothing needed doing — no reload, and nothing for the editor to re-pull.</summary>
+    NothingToDo,
+
+    /// <summary>Only MSBuild can answer; the caller should evict.</summary>
+    CannotApply,
+}
+
 /// <summary>
 /// Manages MSBuildWorkspace creation, project discovery, document lookup, and
 /// workspace/project caching with configurable idle eviction.
@@ -64,7 +90,15 @@ internal static class WorkspaceService
         int.TryParse(Environment.GetEnvironmentVariable("ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS"), out var s) && s > 0
             ? s : 300);
 
-    private static readonly Dictionary<string, CachedWorkspaceEntry> s_cache = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// The cached workspaces. Concurrent so a reader that only wants to look at an entry does not
+    /// have to take <see cref="s_cacheLock"/>, which a load holds while it caches its result — that
+    /// made <see cref="TryGetMostRecentSolution"/> block whichever request thread called it for as
+    /// long as the load took. The lock still guards mutations, because those maintain invariants
+    /// across this dictionary and the two reverse indexes together.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedWorkspaceEntry> s_cache =
+        new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, Task<(Workspace, Project)>> s_inflight = new(StringComparer.OrdinalIgnoreCase);
     private static readonly SemaphoreSlim s_cacheLock = new(1, 1);
     private static readonly Timer s_evictionTimer;
@@ -79,12 +113,18 @@ internal static class WorkspaceService
 
     /// <summary>
     /// Reverse index: normalized project (.csproj) path — or a decompiled manifest path —
-    /// → the <see cref="s_cache"/> key of the workspace that can serve it. One solution
+    /// → the <see cref="s_cache"/> keys of the workspaces that can serve it. One solution
     /// workspace serves all its member projects, so this maps every project in a loaded
-    /// solution's transitive closure to that single cache entry. This is what gives both
-    /// solution-wide dedup and reuse-by-membership for loose projects.
+    /// solution's transitive closure to that entry. This is what gives both solution-wide dedup
+    /// and reuse-by-membership for loose projects.
+    ///
+    /// A set, not one key: the same project genuinely belongs to more than one entry. Two
+    /// solutions can both include it, and Roslyn pulls a referenced project into whichever
+    /// workspace asked for its consumer. While this was one-to-one, the last registration won and
+    /// every other entry holding that project became unreachable — so invalidating it evicted one
+    /// workspace and left the others compiling against the state it had before.
     /// </summary>
-    private static readonly Dictionary<string, string> s_projectToCacheKey =
+    private static readonly Dictionary<string, HashSet<string>> s_projectToCacheKey =
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
@@ -750,7 +790,10 @@ internal static class WorkspaceService
         // After the waiters are released and the lock is gone: the client re-pulls in response,
         // and re-pulling must not queue behind the load it is reacting to.
         if (notifyLoaded)
+        {
+            ReconcileOpenBuffersAfterLoad();
             NotifyProjectSetChanged();
+        }
 
         return result;
     }
@@ -880,8 +923,19 @@ internal static class WorkspaceService
         }
         finally
         {
-            entry.LoadGate.Release();
+            // Guarded like the newer sites: an eviction can dispose this gate while the load it
+            // guards is still running, and an ObjectDisposedException here escapes into whichever
+            // request triggered the load.
+            try { entry.LoadGate.Release(); }
+            catch (ObjectDisposedException) { }
         }
+
+        // The single-project add is reached whenever exactly one project is missing — which is
+        // precisely "F12 into a project that is not loaded yet", the case the buffer bridge exists
+        // for. Without these the newly added project held disk text for every open file, and the
+        // editor was never told the project set had moved.
+        ReconcileOpenBuffersAfterLoad();
+        NotifyProjectSetChanged();
     }
 
     /// <summary>
@@ -962,7 +1016,8 @@ internal static class WorkspaceService
         await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
-            if (s_projectToCacheKey.TryGetValue(normalized[0], out var key)
+            if (s_projectToCacheKey.TryGetValue(normalized[0], out var keys)
+                && keys.FirstOrDefault(k => s_cache.ContainsKey(k)) is { } key
                 && s_cache.TryGetValue(key, out var found)
                 && found.Workspace is MSBuildWorkspace
                 && PathHelper.IsSolutionFile(found.CacheKey))
@@ -1149,11 +1204,13 @@ internal static class WorkspaceService
             }
 
             // The gutter beside the caret was computed against the smaller solution.
+            ReconcileOpenBuffersAfterLoad();
             NotifyProjectSetChanged();
         }
         finally
         {
-            entry.LoadGate.Release();
+            try { entry.LoadGate.Release(); }
+            catch (ObjectDisposedException) { }
         }
 
         // Anything the batch did not produce is still unloaded, so the caller is told to fall back;
@@ -1342,30 +1399,43 @@ internal static class WorkspaceService
     public static Solution? TryGetMostRecentSolution()
     {
         CachedWorkspaceEntry? entry = null;
-        s_cacheLock.Wait();
-        try
-        {
-            // Synthetic entries are skipped. Opening a decompiled file caches an ad-hoc workspace
-            // keyed by its manifest, and it is by definition the most recently used one — so the
-            // Solution Explorer, which asks this for the solution to list, emptied itself every
-            // time someone looked at decompiled source.
-            foreach (var (key, e) in s_cache)
-            {
-                if (DecompiledSourceService.IsDecompiledPath(key))
-                    continue;
-                if (entry is null || e.LastAccessedUtc > entry.LastAccessedUtc)
-                    entry = e;
-            }
-        }
-        finally { s_cacheLock.Release(); }
 
-        if (entry is null)
+        // Deliberately lock-free. This is called from workspace/symbol, search-everywhere, the
+        // solution tree and the diagnostics sweep — all on request threads — and s_cacheLock is
+        // held across the bookkeeping at the end of a project load, so taking it here stalled
+        // those requests behind whatever was loading. The dictionary is concurrent.
+        //
+        // Synthetic entries are skipped. Opening a decompiled file caches an ad-hoc workspace
+        // keyed by its manifest, and it is by definition the most recently used one — so the
+        // Solution Explorer, which asks this for the solution to list, emptied itself every
+        // time someone looked at decompiled source.
+        Solution? snapshot = null;
+        foreach (var (key, e) in s_cache)
+        {
+            if (DecompiledSourceService.IsDecompiledPath(key))
+                continue;
+            if (entry is not null && e.LastAccessedUtc <= entry.LastAccessedUtc)
+                continue;
+
+            // Captured inside the loop, and kept only if it holds something. Disposing a Workspace
+            // clears its CurrentSolution, so reading it after choosing a winner could hand back an
+            // *empty* solution for an entry evicted in between — the Problems panel and the
+            // Solution Explorer would go blank, which is the symptom this whole change exists to
+            // remove. A Solution is immutable and outlives the entry that produced it, so a
+            // captured non-empty one stays valid however the cache moves afterwards.
+            var candidate = e.Workspace.CurrentSolution;
+            if (candidate.ProjectIds.Count == 0)
+                continue;
+
+            entry = e;
+            snapshot = candidate;
+        }
+
+        if (entry is null || snapshot is null)
             return null;
 
-        var project = entry.Workspace.CurrentSolution.GetProject(entry.PrimaryProjectId);
-        return project is null
-            ? entry.Workspace.CurrentSolution
-            : ApplyOpenDocumentOverlay(entry, project).Solution;
+        var project = snapshot.GetProject(entry.PrimaryProjectId);
+        return project is null ? snapshot : ApplyOpenDocumentOverlay(entry, project).Solution;
     }
 
     /// <summary>
@@ -1389,6 +1459,11 @@ internal static class WorkspaceService
             s_cache.Clear();
             s_dirToProjects.Clear();
             s_projectToCacheKey.Clear();
+
+            // Its answer depends on Directory.Build.props/.targets, whose edits do not move any
+            // .csproj timestamp — and that timestamp is the whole cache key. A .props change comes
+            // through here, so this is where the stale verdict has to go.
+            s_plainGlob.Clear();
             Console.Error.WriteLine("[WorkspaceService] All cached workspaces evicted.");
         }
         finally
@@ -1435,7 +1510,10 @@ internal static class WorkspaceService
     {
         string key = Path.GetFullPath(projectPath);
         s_cacheLock.Wait();
-        try { return s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.ContainsKey(ck); }
+        try
+        {
+            return s_projectToCacheKey.TryGetValue(key, out var cks) && cks.Any(s_cache.ContainsKey);
+        }
         finally { s_cacheLock.Release(); }
     }
 
@@ -1448,7 +1526,8 @@ internal static class WorkspaceService
         s_cacheLock.Wait();
         try
         {
-            return s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.TryGetValue(ck, out var entry)
+            return s_projectToCacheKey.TryGetValue(key, out var cks)
+                && cks.Select(ck => s_cache.TryGetValue(ck, out var e) ? e : null).OfType<CachedWorkspaceEntry>().FirstOrDefault() is { } entry
                 ? entry.ProjectIds.Count
                 : 0;
         }
@@ -1471,17 +1550,764 @@ internal static class WorkspaceService
         await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
-            if (s_projectToCacheKey.TryGetValue(key, out var ck) && s_cache.TryGetValue(ck, out var entry))
-                EvictEntryLocked(ck, entry);
+            // Every workspace holding this project. Evicting one and leaving the rest is how a
+            // project shared by two solutions ended up served from a snapshot nothing would ever
+            // correct — its own .csproj write is recognised as ours, so no staleness check and no
+            // watcher event would come back for it either.
+            if (s_projectToCacheKey.TryGetValue(key, out var cks))
+            {
+                foreach (string ck in cks.ToList())
+                {
+                    if (s_cache.TryGetValue(ck, out var entry))
+                        EvictEntryLocked(ck, entry);
+                }
+            }
         }
         finally { s_cacheLock.Release(); }
     }
 
     /// <summary>
-    /// Returns an immutable project snapshot with refreshed text for
-    /// <paramref name="filePath"/> when the file was modified after
-    /// <paramref name="cacheTime"/>. The workspace's internal solution is unchanged.
+    /// Re-applies every open buffer once a load has finished with the gate.
     /// </summary>
+    /// <remarks>
+    /// A reconcile that arrives while a project is loading waits a bounded time for that project's
+    /// gate and then gives up — an unbounded wait deadlocks, and the per-request overlay still
+    /// covers correctness. But nothing else ever came back for it, so the newly loaded projects
+    /// held disk text for files the editor has open, and the fork this bridge exists to eliminate
+    /// quietly took over again. Every load path has to close that window, not just the first one:
+    /// the incremental adds are the F12-into-an-unloaded-project case the bridge is really for.
+    ///
+    /// Not awaited: the request that triggered the load is waiting on it, and re-applying N buffers
+    /// across M workspaces has nothing to tell that request.
+    /// </remarks>
+    private static void ReconcileOpenBuffersAfterLoad() =>
+        _ = Task.Run(async () =>
+        {
+            foreach (string open in OpenDocumentStore.OpenPaths())
+            {
+                try { await ReconcileOpenBufferAsync(open); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        $"[WorkspaceService] Re-reconciling '{open}' after a load failed: {ex.Message}");
+                }
+            }
+        });
+
+    /// <summary>Serializes buffer reconciliation, so two keystrokes cannot land out of order.</summary>
+    private static readonly SemaphoreSlim s_bufferGate = new(1, 1);
+
+    /// <summary>How long a buffer sync waits for a workspace busy loading before giving up on it.
+    /// Bounded so a load — or an eviction racing one — cannot wedge the bridge; see the wait
+    /// itself for why an unbounded one is unrecoverable.</summary>
+    private static readonly TimeSpan LoadGateWait = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Subscribes the live workspaces to open-buffer changes. Idempotent; called on session attach.
+    /// </summary>
+    public static void InstallOpenBufferBridge() =>
+        OpenDocumentStore.OverlayableBufferChanged = path =>
+            // Task.Run, because the store raises this from inside didOpen/didChange — synchronous
+            // JSON-RPC handlers — and the awaits below all complete synchronously when the gates
+            // are free. Every keystroke was therefore mutating each cached workspace, and running
+            // its WorkspaceChanged fan-out, before the notification handler returned.
+            _ = Task.Run(() => ReconcileOpenBufferAsync(path));
+
+    /// <summary>
+    /// Brings every loaded workspace's copy of <paramref name="filePath"/> in line with the editor:
+    /// the buffer text while it is open, the text on disk once it is closed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The open-buffer overlay (<see cref="ApplyOpenDocumentOverlay"/>) forks a solution per
+    /// request, and a fork cannot be carried across a change to the solution it was forked from.
+    /// So navigating into a project that was not loaded yet — F12 — added that project to the
+    /// workspace, invalidated the fork, and forced every open buffer to be re-applied onto the new
+    /// base, which gave each one a new version and told the editor that everything it held was
+    /// stale. Putting the text in the workspace instead means a project add builds on top of it and
+    /// the versions survive.
+    /// </para>
+    /// <para>
+    /// Reconcile rather than apply: it reads the store inside the gate and writes whatever is
+    /// current, so it converges on the newest buffer no matter what order the calls run in, and a
+    /// reconcile that loses a race with a close restores the file from disk instead of resurrecting
+    /// a buffer that is gone.
+    /// </para>
+    /// </remarks>
+    internal static async Task ReconcileOpenBufferAsync(string filePath)
+    {
+        try
+        {
+            await s_bufferGate.WaitAsync();
+            try
+            {
+                bool open = OpenDocumentStore.TryGet(filePath, out var text);
+
+                foreach (var entry in s_cache.Values)
+                {
+                    if (entry.Workspace is not MSBuildWorkspace live)
+                        continue;
+
+                    var ids = live.CurrentSolution.GetDocumentIdsWithFilePath(filePath);
+                    if (ids.IsEmpty)
+                        continue;
+
+                    // Per entry, so one workspace being evicted underneath this loop — which
+                    // disposes its gate without waiting for holders — does not abandon the
+                    // remaining workspaces. With two solutions open, an eviction in one used to
+                    // silently skip the reconcile for the other, leaving it on stale text.
+                    //
+                    // Bounded, because an unbounded wait here is a permanent hang: a project load
+                    // holds this gate for as long as MSBuild takes, and if the entry is evicted
+                    // while we are parked on it, disposing a SemaphoreSlim does not complete its
+                    // pending waiters. That task would never finish, the finally below would never
+                    // run, and s_bufferGate — which this whole loop holds — would never be
+                    // released, silently killing the buffer bridge for the rest of the session.
+                    bool acquired;
+                    try
+                    {
+                        acquired = await entry.LoadGate.WaitAsync(LoadGateWait);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        continue;
+                    }
+
+                    // Whatever is holding it is mid-load, and a load ends by rebuilding this
+                    // anyway. The overlay fork still covers correctness until then.
+                    if (!acquired)
+                        continue;
+
+                    try
+                    {
+                        foreach (var id in live.CurrentSolution.GetDocumentIdsWithFilePath(filePath))
+                        {
+                            var document = live.CurrentSolution.GetDocument(id);
+                            if (document is null)
+                                continue;
+
+                            if (open)
+                            {
+                                // Content, not reference. The buffer arrives as a fresh SourceText
+                                // — didOpen builds one from the notification's text — so it is
+                                // never the instance the workspace holds, and a reference test
+                                // meant every open re-stamped the document, moved its project's
+                                // dependent semantic version, and missed the analyzer cache for
+                                // every file in it. That is the reported symptom exactly: open a
+                                // file, watch every warning in the window vanish.
+                                // GetTextAsync, not TryGetText: the latter answers false whenever
+                                // the text has not been realized yet, and the guard would then be
+                                // skipped and the change applied — so a cold solution re-stamped
+                                // every document it touched, which is the cost this exists to
+                                // avoid. Materializing is cheap for a file already loaded and
+                                // needed anyway for one that is not.
+                                if ((await document.GetTextAsync()).ContentEquals(text))
+                                    continue;
+
+                                Lsp.AnalyzerDiagnosticCache.Evict(id);
+                                live.OnDocumentTextChanged(id, text, PreservationMode.PreserveIdentity);
+                            }
+                            else
+                            {
+                                // Closing is only a change if the buffer differed from disk. Almost
+                                // always it did not — the file was saved, or never edited — and
+                                // reverting unconditionally made closing a tab invalidate the whole
+                                // project's analysis.
+                                if (!File.Exists(filePath))
+                                    continue;
+
+                                var disk = TryReadDisk(filePath);
+                                if (disk is not null && (await document.GetTextAsync()).ContentEquals(disk))
+                                    continue;
+
+                                Lsp.AnalyzerDiagnosticCache.Evict(id);
+                                live.OnDocumentTextLoaderChanged(
+                                    id, new FileTextLoader(filePath, defaultEncoding: null));
+                            }
+                        }
+                    }
+                    catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException or ArgumentException)
+                    {
+                        // This workspace was torn down underneath us. The others still need the
+                        // buffer, and a single outer catch would have skipped every one of them.
+                        Console.Error.WriteLine(
+                            $"[WorkspaceService] Reconciling '{filePath}' into a workspace failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        try { entry.LoadGate.Release(); }
+                        catch (ObjectDisposedException) { /* evicted while we held it */ }
+                    }
+                }
+            }
+            finally
+            {
+                s_bufferGate.Release();
+            }
+        }
+        catch (Exception ex)
+        {
+            // The overlay still covers correctness; this is the optimization that keeps versions
+            // stable, and failing it must not break editing.
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Reconciling buffer '{filePath}' failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Adds or removes one source file in the live workspace, instead of throwing the workspace
+    /// away so MSBuild can rediscover it. Returns false when that cannot be done safely, and the
+    /// caller should fall back to eviction.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A cache entry serves a whole solution, so "evict just this project" discards every project
+    /// in it — every compilation, every cached analyzer result — because one file appeared. A git
+    /// checkout or a scaffold therefore cost a full reload. An SDK-style project globs its compile
+    /// items, so a <c>.cs</c> under its directory is a compile item by construction and adding the
+    /// document is exactly what re-evaluating MSBuild would have concluded.
+    /// </para>
+    /// <para>
+    /// Legacy projects are refused: they list their compile items explicitly, so a file on disk is
+    /// not necessarily part of the project and only MSBuild can say. Those keep the old behaviour.
+    /// </para>
+    /// </remarks>
+    /// <param name="authoritative">
+    /// True when the caller has itself just made this true of the project — written the
+    /// <c>Compile</c> item, or the <c>Compile Remove</c> — rather than merely observing a file
+    /// appear or vanish on disk. It settles the two questions this method otherwise has to guess
+    /// at: whether a legacy project compiles a file that just appeared, and whether a file still
+    /// present on disk is still part of the project.
+    /// </param>
+    public static async Task<FileSyncResult> TryApplyFileChangeAsync(
+        string projectPath,
+        string filePath,
+        FileChange change,
+        CancellationToken cancellationToken = default,
+        bool authoritative = false)
+    {
+        // Nothing is refused up front on the strength of the project being legacy. Whether a
+        // change can be applied in place is decided per project further down, where the document
+        // set is visible: an edit or a delete concerns a document that is already there, and only
+        // a file that just appeared raises the question of whether the project compiles it. Turning
+        // the whole class away meant every save in a .NET Framework or WebForms solution evicted
+        // the workspace — most of what "it reloads constantly" amounted to off SDK-style projects.
+        string key = Path.GetFullPath(projectPath);
+        string target = Path.GetFullPath(filePath);
+
+        List<CachedWorkspaceEntry> entries;
+        await s_cacheLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (!s_projectToCacheKey.TryGetValue(key, out var cacheKeys)
+                || cacheKeys.Select(k => s_cache.TryGetValue(k, out var e) ? e : null)
+                    .OfType<CachedWorkspaceEntry>().ToList() is not { Count: > 0 } found)
+            {
+                // Nothing loaded for it, so there is nothing to bring up to date and nothing worth
+                // evicting. Deliberately not "applied": telling the editor to re-pull everything
+                // because a file changed in a project nobody has opened is the cost this avoids.
+                return FileSyncResult.NothingToDo;
+            }
+
+            entries = found;
+        }
+        finally { s_cacheLock.Release(); }
+
+        // Every workspace that holds this project, not one of them. Two solutions can both load
+        // it, and Roslyn pulls a referenced project into whichever workspace asked for its
+        // consumer — so applying to the first the index yields left the others missing the file
+        // entirely, with no eviction (the call reported success) and no second watcher event (the
+        // write was recognised as ours) to ever correct them.
+        var results = new List<FileSyncResult>();
+
+        foreach (var entry in entries)
+        {
+            if (entry.Workspace is not MSBuildWorkspace live)
+            {
+                results.Add(FileSyncResult.CannotApply);
+                continue;
+            }
+
+            results.Add(await ApplyToWorkspaceAsync(entry, live, key, target, change, authoritative, cancellationToken));
+        }
+
+        // One workspace that cannot decide in place decides for all of them: the caller falls back
+        // and MSBuild answers for every entry at once.
+        if (results.Contains(FileSyncResult.CannotApply))
+            return FileSyncResult.CannotApply;
+
+        if (!results.Contains(FileSyncResult.Applied))
+            return FileSyncResult.NothingToDo;
+
+        if (OpenDocumentStore.IsOpen(target))
+            await ReconcileOpenBufferAsync(target);
+
+        NotifyProjectSetChanged();
+        return FileSyncResult.Applied;
+    }
+
+    private static async Task<FileSyncResult> ApplyToWorkspaceAsync(
+        CachedWorkspaceEntry entry,
+        MSBuildWorkspace live,
+        string key,
+        string target,
+        FileChange change,
+        bool authoritative,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Every project sharing this file path, not one: a multi-targeted project is several
+            // Projects with the same FilePath, and updating only the one the path index happens to
+            // hold leaves the other frameworks with a document over a file that is gone.
+            //
+            // Bounded for the same reason the buffer bridge is: disposing this gate on eviction
+            // does not complete a pending waiter, so an unbounded wait leaks the caller forever.
+            // A load holding the gate means "come back later", not "MSBuild must decide". Reporting
+            // the timeout as undecidable made the caller evict — and evict the workspace that was
+            // still loading, which faults the request that started the load and then reloads the
+            // solution from scratch. Saving any file ten seconds into an F12 was enough. The buffer
+            // bridge already treats this timeout as a skip; so does this now, for the same reason:
+            // a load ends by rebuilding what it holds.
+            if (!await entry.LoadGate.WaitAsync(LoadGateWait, cancellationToken))
+                return FileSyncResult.NothingToDo;
+
+            try
+            {
+                // The project the caller named, plus every other project that already holds a
+                // document for this exact path. A linked item puts the same file in a project that
+                // no upward directory walk from it would ever reach, so updating only the named one
+                // left every linking project answering from pre-edit text, with nothing to correct
+                // it. Eviction used to cover this by accident, by discarding the whole solution.
+                var byPath = live.CurrentSolution.GetDocumentIdsWithFilePath(target)
+                    .Select(id => live.CurrentSolution.GetProject(id.ProjectId))
+                    .OfType<Project>();
+
+                var namedProjects = live.CurrentSolution.Projects
+                    .Where(p => p.FilePath is { Length: > 0 } fp
+                        && string.Equals(Path.GetFullPath(fp), key, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                var namedIds = namedProjects.Select(p => p.Id).ToHashSet();
+
+                var projects = namedProjects
+                    .Concat(byPath)
+                    .DistinctBy(p => p.Id)
+                    .ToList();
+
+                if (projects.Count == 0)
+                    return FileSyncResult.CannotApply;
+
+                bool applied = false;
+                foreach (var project in projects)
+                {
+                    // A .cs beside a .vbproj belongs to neither the VB project nor this method.
+                    if (!IsProjectLanguageFor(project, target))
+                        continue;
+
+                    // Authority reaches only the project the caller named. Excluding a file from
+                    // project A writes a Compile Remove in A; a project B that links the same file
+                    // still compiles it, and removing B's document too would unresolve every type
+                    // in that file across B, with nothing to put it back.
+                    bool named = authoritative && namedIds.Contains(project.Id);
+
+                    var result = change switch
+                    {
+                        FileChange.Deleted => await RemoveDocumentsAsync(live, project.Id, target, named),
+                        FileChange.Created => await TryAddDocumentAsync(live, project.Id, target, named),
+                        _ => await ReloadDocumentTextAsync(live, project.Id, target, named),
+                    };
+
+                    // One project that cannot be decided in place decides the whole call: the
+                    // caller must fall back so MSBuild answers for every project at once.
+                    if (result == FileSyncResult.CannotApply)
+                        return FileSyncResult.CannotApply;
+
+                    applied |= result == FileSyncResult.Applied;
+                }
+
+                if (!applied)
+                    return FileSyncResult.NothingToDo;
+            }
+            finally
+            {
+                // Releasing a gate the eviction already disposed must not turn a change that was
+                // applied into "nothing happened" — the editor would never be told to re-pull it.
+                try { entry.LoadGate.Release(); }
+                catch (ObjectDisposedException) { }
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // The entry was evicted while we waited on its gate — a branch switch racing an
+            // analyzer rebuild does this. It is already gone, so there is nothing left to apply.
+            return FileSyncResult.NothingToDo;
+        }
+
+        return FileSyncResult.Applied;
+    }
+
+    /// <summary>Whether the file's extension is the language this project compiles.</summary>
+    private static bool IsProjectLanguageFor(Project project, string filePath) =>
+        Path.GetExtension(filePath.AsSpan()) switch
+        {
+            var ext when ext.Equals(".cs", StringComparison.OrdinalIgnoreCase) =>
+                project.Language == LanguageNames.CSharp,
+            var ext when ext.Equals(".vb", StringComparison.OrdinalIgnoreCase) =>
+                project.Language == LanguageNames.VisualBasic,
+            _ => false,
+        };
+
+    private static List<Document> DocumentsAt(Solution solution, ProjectId projectId, string fullPath) =>
+        solution.GetProject(projectId)?.Documents
+            .Where(d => d.FilePath is { Length: > 0 } fp
+                && string.Equals(Path.GetFullPath(fp), fullPath, StringComparison.OrdinalIgnoreCase))
+            .ToList()
+        ?? [];
+
+    private static async Task<FileSyncResult> RemoveDocumentsAsync(
+        MSBuildWorkspace live, ProjectId projectId, string fullPath, bool authoritative)
+    {
+        // The file is still there. Many writers replace a file by unlinking and recreating it, or
+        // by renaming a temporary over it, which produces a delete and a create for a file that
+        // never actually went away. Dropping the document then would unresolve every type it
+        // declares, solution-wide, with nothing to ever put it back — so this is a content change,
+        // and the new bytes still have to be read rather than the event being discarded.
+        //
+        // Unless the caller is what removed it from the project: "exclude from project" leaves the
+        // file exactly where it is, and is the one case where a file on disk really has stopped
+        // being compiled.
+        if (!authoritative && File.Exists(fullPath))
+            return await ReloadDocumentTextAsync(live, projectId, fullPath);
+
+        bool any = false;
+        foreach (var document in DocumentsAt(live.CurrentSolution, projectId, fullPath))
+        {
+            Lsp.AnalyzerDiagnosticCache.Evict(document.Id);
+            live.OnDocumentRemoved(document.Id);
+            any = true;
+        }
+        return any ? FileSyncResult.Applied : FileSyncResult.NothingToDo;
+    }
+
+    /// <summary>Whether <paramref name="path"/> sits inside <paramref name="root"/>.</summary>
+    private static bool IsUnderDirectory(string path, string root)
+    {
+        string normalized = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        return path.Length >= normalized.Length
+            && path.StartsWith(normalized, StringComparison.OrdinalIgnoreCase)
+            && (path.Length == normalized.Length
+                || path[normalized.Length] == Path.DirectorySeparatorChar
+                || path[normalized.Length] == Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>The file's text, or null when it cannot be read right now.</summary>
+    private static SourceText? TryReadDisk(string fullPath)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return SourceText.From(stream);
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
+    /// Re-reads a closed file from disk. This is the case an external edit produces — a checkout, a
+    /// formatter, another agent — and it is a text change, not a document-set change, so no
+    /// re-evaluation is needed and the projects stay loaded.
+    /// </summary>
+    private static async Task<FileSyncResult> ReloadDocumentTextAsync(
+        MSBuildWorkspace live, ProjectId projectId, string fullPath, bool authoritative = false)
+    {
+        if (!File.Exists(fullPath))
+            return FileSyncResult.NothingToDo;
+
+        // An open buffer outranks disk: the editor's unsaved text is the truth, and the buffer
+        // bridge already put it in the workspace. This is also what makes saving free — the text
+        // reached the workspace on didChange, and the watcher event the save produces is a
+        // restatement of what is already there.
+        //
+        // Checked after the document lookup below rather than before it, because a file with no
+        // document yet has nothing for the buffer to outrank: a .designer.cs open in the editor
+        // when it is generated for the first time would otherwise be declined here and never enter
+        // the workspace at all.
+        bool isOpen = OpenDocumentStore.IsOpen(fullPath);
+
+        var documents = DocumentsAt(live.CurrentSolution, projectId, fullPath);
+
+        if (isOpen && documents.Count > 0)
+            return FileSyncResult.NothingToDo;
+
+        // What the file says now, so a write that changed nothing costs nothing. A formatter that
+        // reformats to the same text, a generator re-emitting identical output, and a checkout that
+        // restores a file to the content it already had all land here — and re-applying the loader
+        // would give the document a new version, move its project's dependent semantic version, and
+        // invalidate the analyzer results and pull-diagnostics ids of every file in it.
+        var disk = TryReadDisk(fullPath);
+
+        // A watcher can report a file it was not previously watching as merely Changed — after a
+        // recursive-watch reset, or for a file created inside a directory created in the same
+        // batch. Nothing else would ever pick it up, so treat it as the arrival it is.
+        // Carried through: a caller that owns this file — the designer generator regenerating a
+        // partial for the first time — is telling us it is compiled, and dropping the flag here
+        // sent it straight into the legacy-project refusal it was passed to override.
+        if (documents.Count == 0)
+            return await TryAddDocumentAsync(live, projectId, fullPath, authoritative);
+
+        bool any = false;
+        foreach (var document in documents)
+        {
+            // Materialized rather than probed: TryGetText answers false for a document whose
+            // text was never realized, which on a cold solution is most of them — the guard would
+            // be skipped and every file in a checkout re-stamped, unchanged bytes included.
+            if (disk is not null && (await document.GetTextAsync()).ContentEquals(disk))
+                continue;
+
+            // The cached analyzer results describe the previous text, and the entry is keyed by
+            // DocumentId — which an in-place text change keeps. Nothing else drops them, so
+            // without this the sweep would serve pre-change diagnostics, at pre-change line
+            // positions, for the rest of the session.
+            Lsp.AnalyzerDiagnosticCache.Evict(document.Id);
+
+            live.OnDocumentTextLoaderChanged(
+                document.Id, new FileTextLoader(fullPath, defaultEncoding: null));
+            any = true;
+        }
+        return any ? FileSyncResult.Applied : FileSyncResult.NothingToDo;
+    }
+
+    /// <summary>
+    /// Adds a document for a newly created file, but only where the project's own contents show
+    /// that files in that directory are compiled.
+    /// </summary>
+    /// <remarks>
+    /// An SDK project globs its compile items, but the glob honours <c>Compile Remove</c>,
+    /// <c>DefaultItemExcludes</c> and <c>EnableDefaultCompileItems=false</c>, so "it is under the
+    /// project directory" does not mean "it is compiled" — inventing a document for an excluded file
+    /// produces duplicate-definition errors against the code that legitimately owns those types. A
+    /// sibling document in the same directory is evidence the glob reaches there; without one the
+    /// caller falls back to letting MSBuild decide.
+    /// </remarks>
+    private static async Task<FileSyncResult> TryAddDocumentAsync(
+        MSBuildWorkspace live, ProjectId projectId, string fullPath, bool authoritative = false)
+    {
+        // A create event for a file that is already gone again: adding it would hand the project a
+        // document whose loader throws the first time anything reads it.
+        if (!File.Exists(fullPath))
+            return FileSyncResult.NothingToDo;
+
+        var solution = live.CurrentSolution;
+
+        // The project already lists it — a file restored after being deleted, or one the project
+        // named before it existed. The document is there; what changed is that it is now readable.
+        if (DocumentsAt(solution, projectId, fullPath).Count > 0)
+            return await ReloadDocumentTextAsync(live, projectId, fullPath, authoritative);
+
+        var project = solution.GetProject(projectId);
+        if (project is null || Path.GetDirectoryName(fullPath) is not { Length: > 0 } directory)
+            return FileSyncResult.CannotApply;
+
+        // A legacy project compiles what it lists, and a file that just appeared is not listed —
+        // so it is not compiled, and reloading would reach that same conclusion after several
+        // seconds of MSBuild. Whoever adds it to the project has to write the .csproj to do so,
+        // and that write is its own event, handled by the reload above.
+        //
+        // That reasoning only holds while we are guessing. A caller that has just written the
+        // Compile item is telling us the file is compiled, and answering "nothing to do" left it
+        // invisible: the caller reads that as success so no fallback runs, and its own .csproj
+        // write is then suppressed as an echo of itself.
+        if (!authoritative && PathHelper.RequiresMsBuild(project.FilePath ?? ""))
+            return FileSyncResult.NothingToDo;
+
+        if (!authoritative && !GlobReaches(project, directory))
+            return FileSyncResult.CannotApply;
+
+        live.OnDocumentAdded(DocumentInfo.Create(
+            DocumentId.CreateNewId(projectId, Path.GetFileName(fullPath)),
+            Path.GetFileName(fullPath),
+            // Folders is what namespace-sync and the file-scoped-namespace fixes read to compute a
+            // default namespace; an empty list makes them propose the wrong one.
+            folders: FoldersFor(project, fullPath),
+            loader: new FileTextLoader(fullPath, defaultEncoding: null),
+            filePath: fullPath));
+
+        return FileSyncResult.Applied;
+    }
+
+    /// <summary>
+    /// Whether the project's compile glob reaches <paramref name="directory"/>.
+    /// </summary>
+    /// <remarks>
+    /// A document already in that directory settles it outright. Without one — a brand-new folder,
+    /// which is an ordinary thing to make — the project file decides: the SDK's default glob takes
+    /// every <c>.cs</c> under the project unless the author turned defaults off or excluded
+    /// something, and only then can the answer be anything but yes. Being unsure returns false and
+    /// the caller lets MSBuild answer, because inventing a document for a file the compiler does
+    /// not see produces duplicate-definition errors against whatever legitimately owns those types.
+    /// </remarks>
+    private static bool GlobReaches(Project project, string directory)
+    {
+        // Only inside the project's own tree. A linked item — <Compile Include="..\Shared\X.cs" /> —
+        // puts a document in a directory the glob does not cover, so treating it as evidence would
+        // add every new file dropped beside it, and those types then collide with the project that
+        // legitimately owns them.
+        string? projectDir = Path.GetDirectoryName(project.FilePath);
+        if (projectDir is not { Length: > 0 }
+            || !IsUnderDirectory(directory, Path.GetFullPath(projectDir)))
+        {
+            return false;
+        }
+
+        if (project.Documents.Any(d =>
+                d.FilePath is { Length: > 0 } fp
+                && string.Equals(
+                    Path.GetDirectoryName(Path.GetFullPath(fp)), directory, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        return project.FilePath is { Length: > 0 } projectPath && HasPlainDefaultCompileGlob(projectPath);
+    }
+
+    /// <summary>Project file path → (stamp it was read at, whether its compile glob is unqualified).</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, bool Plain)>
+        s_plainGlob = new(StringComparer.OrdinalIgnoreCase);
+
+    private static bool HasPlainDefaultCompileGlob(string projectPath)
+    {
+        try
+        {
+            long ticks = new FileInfo(projectPath).LastWriteTimeUtc.Ticks;
+            if (s_plainGlob.TryGetValue(projectPath, out var cached) && cached.Ticks == ticks)
+                return cached.Plain;
+
+            // A Directory.Build.props above the project can set EnableDefaultCompileItems,
+            // DefaultItemExcludes or repo-wide Compile Remove items, none of which are visible in
+            // the project file — so those files are read too. Their mere existence is not enough
+            // to refuse: nearly every real repository has one, and treating that as "unknowable"
+            // meant the first file in any new folder fell back to reloading the whole solution.
+            if (ImportsConstrainTheGlob(projectPath))
+            {
+                s_plainGlob[projectPath] = (ticks, false);
+                return false;
+            }
+
+            var document = System.Xml.Linq.XDocument.Load(projectPath);
+            bool plain = document.Root is { } root
+                && (root.Attribute("Sdk") is not null
+                    || root.Elements().Any(e => e.Name.LocalName == "Sdk"))
+                && !root.Descendants().Any(e =>
+                    (e.Name.LocalName == "EnableDefaultCompileItems"
+                        && string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase))
+                    || e.Name.LocalName == "DefaultItemExcludes"
+                    || (e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null));
+
+            s_plainGlob[projectPath] = (ticks, plain);
+            return plain;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Whether a <c>Directory.Build.props</c> at or above the project says anything that could
+    /// narrow the default compile glob.
+    /// </summary>
+    /// <remarks>
+    /// Only the three things that can: turning defaults off, excluding item patterns, or removing
+    /// compile items. A props file that merely sets a version or a target framework — which is what
+    /// most of them do — leaves the glob exactly as the SDK defines it, and refusing to reason
+    /// about those projects would cost a full reload every time someone makes a folder.
+    /// </remarks>
+    private static bool ImportsConstrainTheGlob(string projectPath)
+    {
+        try
+        {
+            var pending = new HashSet<string>(
+                ["Directory.Build.props", "Directory.Build.targets"], StringComparer.OrdinalIgnoreCase);
+
+            for (var dir = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(projectPath))!);
+                 dir is not null;
+                 dir = dir.Parent)
+            {
+                foreach (string name in (string[])["Directory.Build.props", "Directory.Build.targets"])
+                {
+                    if (!pending.Contains(name))
+                        continue;
+
+                    string path = Path.Combine(dir.FullName, name);
+                    if (!File.Exists(path))
+                        continue;
+
+                    // MSBuild stops at the first one it finds rather than merging every ancestor,
+                    // so this does too — walking to the filesystem root let a stray props file in a
+                    // user profile quietly force every project on the machine into the slow path.
+                    //
+                    // Per file name, because MSBuild runs two independent searches: props imported
+                    // at the top, targets at the bottom. Sharing one flag meant a Directory.Build
+                    // .targets beside the project ended the search for a Directory.Build.props at
+                    // the repo root, so its DefaultItemExcludes went unseen.
+                    pending.Remove(name);
+
+                    var root = System.Xml.Linq.XDocument.Load(path).Root;
+                    if (root is not null && root.Descendants().Any(IsGlobConstraint))
+                        return true;
+                }
+
+                if (pending.Count == 0)
+                    return false;
+            }
+        }
+        catch
+        {
+            // Unreadable is unknowable, and guessing wrong here invents documents.
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsGlobConstraint(System.Xml.Linq.XElement e) =>
+        (e.Name.LocalName == "EnableDefaultCompileItems"
+            && string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase))
+        || e.Name.LocalName == "DefaultItemExcludes"
+        || (e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null);
+
+    private static IReadOnlyList<string> FoldersFor(Project project, string fullPath)
+    {
+        if (Path.GetDirectoryName(project.FilePath) is not { Length: > 0 } projectDir)
+            return [];
+
+        string relative = Path.GetRelativePath(projectDir, Path.GetDirectoryName(fullPath)!);
+        if (relative is "." || relative.StartsWith("..", StringComparison.Ordinal))
+            return [];
+
+        return relative.Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries);
+    }
+
+
+    /// <summary>
+    /// Returns an immutable project snapshot with refreshed text for
+    /// <paramref name="filePath"/> when the file on disk really differs from what the workspace
+    /// holds. The workspace's internal solution is unchanged.
+    /// </summary>
+    /// <remarks>
+    /// The content check is what makes this affordable. The trigger is a modification timestamp,
+    /// and <see cref="CachedWorkspaceEntry.CachedAtUtc"/> is set once and never advanced — so after
+    /// any build or checkout touched a file, every subsequent request forked the solution again,
+    /// forever. Each fork re-stamped the document, which moved its project's dependent semantic
+    /// version, which invalidated the analyzer cache and the pull-diagnostics result id of every
+    /// document in that project and every project depending on it. A timestamp that moved without
+    /// the bytes moving — which is what a rebuild produces — must cost nothing.
+    /// </remarks>
     private static Project RefreshDocumentIfStale(
         Project project, string filePath, DateTime cacheTime)
     {
@@ -1498,8 +2324,21 @@ internal static class WorkspaceService
         if (!fileInfo.Exists || fileInfo.LastWriteTimeUtc <= cacheTime)
             return project;
 
-        using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        var text = SourceText.From(stream);
+        SourceText text;
+        try
+        {
+            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            text = SourceText.From(stream);
+        }
+        catch (IOException)
+        {
+            // Mid-write on disk. What the workspace holds is the better answer than no answer.
+            return project;
+        }
+
+        if (document.TryGetText(out var current) && current.ContentEquals(text))
+            return project;
+
         var updatedSolution = project.Solution.WithDocumentText(document.Id, text);
         return updatedSolution.GetProject(project.Id) ?? project;
     }
@@ -1507,8 +2346,11 @@ internal static class WorkspaceService
     private static bool TryGetValidCachedEntryLocked(string normalizedProjectPath, out CachedWorkspaceEntry? entry)
     {
         entry = null;
-        if (!s_projectToCacheKey.TryGetValue(normalizedProjectPath, out var cacheKey))
+        if (!s_projectToCacheKey.TryGetValue(normalizedProjectPath, out var cacheKeys)
+            || cacheKeys.FirstOrDefault(k => s_cache.ContainsKey(k)) is not { } cacheKey)
+        {
             return false;
+        }
 
         if (!s_cache.TryGetValue(cacheKey, out entry))
         {
@@ -1530,13 +2372,17 @@ internal static class WorkspaceService
 
     private static void EvictEntryLocked(string cacheKey, CachedWorkspaceEntry entry)
     {
-        s_cache.Remove(cacheKey);
+        s_cache.TryRemove(cacheKey, out _);
 
-        // Remove every reverse-index mapping that points at this entry.
-        foreach (var p in s_projectToCacheKey
-                     .Where(kv => string.Equals(kv.Value, cacheKey, StringComparison.OrdinalIgnoreCase))
-                     .Select(kv => kv.Key).ToList())
-            s_projectToCacheKey.Remove(p);
+        // Only this entry's membership. A project that another loaded workspace also serves keeps
+        // its mapping to that one — dropping the whole row made every other entry holding it
+        // unreachable, so nothing could ever invalidate them again.
+        foreach (var (project, keys) in s_projectToCacheKey.ToList())
+        {
+            keys.Remove(cacheKey);
+            if (keys.Count == 0)
+                s_projectToCacheKey.Remove(project);
+        }
 
         UnregisterShadowDirsLocked(cacheKey, entry.ShadowDirs);
         entry.Dispose();
@@ -1563,11 +2409,11 @@ internal static class WorkspaceService
     private static void RegisterProjectMappingsLocked(
         string cacheKey, string requestedProjectPath, Workspace workspace)
     {
-        s_projectToCacheKey[requestedProjectPath] = cacheKey;
+        Register(requestedProjectPath, cacheKey);
         foreach (var project in workspace.CurrentSolution.Projects)
         {
             if (!string.IsNullOrEmpty(project.FilePath))
-                s_projectToCacheKey[Path.GetFullPath(project.FilePath!)] = cacheKey;
+                Register(Path.GetFullPath(project.FilePath!), cacheKey);
         }
     }
 
@@ -1696,11 +2542,36 @@ internal static class WorkspaceService
     /// file (the <c>.sln</c> for a solution entry, or the same <c>.csproj</c> otherwise) was
     /// modified after the entry was cached.
     /// </summary>
+    private static void Register(string projectPath, string cacheKey)
+    {
+        if (!s_projectToCacheKey.TryGetValue(projectPath, out var keys))
+            s_projectToCacheKey[projectPath] = keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        keys.Add(cacheKey);
+    }
+
     private static bool IsEntryStale(string cacheKey, string normalizedProjectPath, CachedWorkspaceEntry entry)
     {
-        return IsFileNewerThan(normalizedProjectPath, entry.CachedAtUtc)
-            || IsFileNewerThan(cacheKey, entry.CachedAtUtc);
+        return IsChangedBySomeoneElse(normalizedProjectPath, entry.CachedAtUtc)
+            || IsChangedBySomeoneElse(cacheKey, entry.CachedAtUtc);
     }
+
+    /// <summary>
+    /// Whether the file is newer than the snapshot <em>and</em> that is not simply our own write.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="CachedWorkspaceEntry.CachedAtUtc"/> is stamped once and never advanced, so any
+    /// write to a project or solution file makes its entry stale forever after — and every
+    /// mutating operation this server performs ends by writing one. Adding a package, renaming a
+    /// solution folder, excluding a file: each already invalidated exactly what it changed, and
+    /// then the next request that happened to touch that project threw the whole workspace away
+    /// again and reloaded it from MSBuild.
+    ///
+    /// Suppressed only for writes we can still recognise as ours, byte for byte. Anyone else's
+    /// edit — another editor, a script, a checkout — is a real change and still evicts.
+    /// </remarks>
+    private static bool IsChangedBySomeoneElse(string path, DateTime cacheTime) =>
+        IsFileNewerThan(path, cacheTime) && !SelfWriteTracker.WasWrittenByUs(path);
 
     private static bool IsFileNewerThan(string path, DateTime cacheTime)
     {
@@ -1729,11 +2600,23 @@ internal static class WorkspaceService
     /// generation — rebuilding it on every request would re-fork N documents each call.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// <see cref="OpenDocumentStore.OverlayGeneration"/> rather than
     /// <see cref="OpenDocumentStore.Generation"/>: a rebuild that produces the same texts still
     /// produces a <em>new</em> <see cref="Solution"/>, and every compilation, semantic version and
     /// downstream cache keyed on one goes with it. Only a buffer this method could actually apply
     /// is allowed to cause that.
+    /// </para>
+    /// <para>
+    /// When a rebuild is unavoidable it re-applies onto the <em>previous overlay</em> and touches
+    /// only the buffers whose text object actually moved. Restarting from the base solution each
+    /// time re-stamped every open document — <c>WithDocumentText</c> compares texts by reference,
+    /// and the store's <see cref="SourceText"/> is never the one the base solution loaded from
+    /// disk, so all of them came back with a fresh version. That is what made opening one file
+    /// look like a full reload: every other open document's dependent semantic version moved with
+    /// it, which invalidated its cached analyzer run and changed its pull-diagnostics resultId, so
+    /// the editor dropped the squiggles it had and asked for all of them again.
+    /// </para>
     /// </remarks>
     private static Project ApplyOpenDocumentOverlay(CachedWorkspaceEntry entry, Project project)
     {
@@ -1753,28 +2636,91 @@ internal static class WorkspaceService
             }
             else
             {
-                overlay = null;
-                var solution = baseSolution;
-                bool any = false;
-                foreach (var (path, text) in OpenDocumentStore.SnapshotAll())
+                var open = OpenDocumentStore.SnapshotAll();
+
+                // Reusing the previous overlay is only sound while it is a strict subset of what
+                // is open now: a closed buffer has to revert to the text on disk, and the only way
+                // back to that is the base solution.
+                bool reusable =
+                    entry.OverlaySolution is not null
+                    && ReferenceEquals(entry.OverlayBase, baseSolution)
+                    && entry.OverlayTexts.Count > 0
+                    && StillCoversEveryOverlaidDocument(entry, open, baseSolution);
+
+                var solution = reusable ? entry.OverlaySolution! : baseSolution;
+                var applied = reusable
+                    ? new Dictionary<DocumentId, SourceText>(entry.OverlayTexts)
+                    : new Dictionary<DocumentId, SourceText>();
+
+                bool any = reusable;
+                foreach (var (path, text) in open)
                 {
                     // Multi-targeting: the same file can back several DocumentIds.
                     foreach (var docId in solution.GetDocumentIdsWithFilePath(path))
                     {
+                        // Reference equality, matching what WithDocumentText itself compares:
+                        // an untouched buffer must not be re-applied, or it takes a new version
+                        // stamp and drags every dependent project's semantic version with it.
+                        if (applied.TryGetValue(docId, out var current) && ReferenceEquals(current, text))
+                            continue;
+
+                        // Already reconciled into the workspace itself, which is the normal case —
+                        // the fork exists only for buffers whose project loaded after they opened.
+                        //
+                        // Content, not reference: a buffer that matches disk is deliberately never
+                        // pushed into the workspace, so the instance there is the one loaded from
+                        // the file. Comparing identity would fork for every such buffer and undo
+                        // the reconcile's whole point.
+                        if (solution.GetDocument(docId) is { } live
+                            && live.TryGetText(out var inWorkspace)
+                            && inWorkspace.ContentEquals(text))
+                        {
+                            applied[docId] = text;
+                            continue;
+                        }
+
                         solution = solution.WithDocumentText(docId, text);
+                        applied[docId] = text;
                         any = true;
                     }
                 }
-                if (any)
-                    overlay = solution;
+
+                overlay = any ? solution : null;
 
                 entry.OverlaySolution = overlay;
                 entry.OverlayBase = baseSolution;
                 entry.OverlayGeneration = generation;
+                entry.OverlayTexts = overlay is null
+                    ? new Dictionary<DocumentId, SourceText>()
+                    : applied;
             }
         }
 
         return overlay?.GetProject(project.Id) ?? project;
+    }
+
+    /// <summary>
+    /// Whether every document the memoized overlay has text for is still open. False means a
+    /// buffer was closed (or its project reloaded out from under it) and the overlay has to be
+    /// rebuilt from disk state rather than extended.
+    /// </summary>
+    private static bool StillCoversEveryOverlaidDocument(
+        CachedWorkspaceEntry entry, List<(string Path, SourceText Text)> open, Solution baseSolution)
+    {
+        var live = new HashSet<DocumentId>();
+        foreach (var (path, _) in open)
+        {
+            foreach (var docId in baseSolution.GetDocumentIdsWithFilePath(path))
+                live.Add(docId);
+        }
+
+        foreach (var docId in entry.OverlayTexts.Keys)
+        {
+            if (!live.Contains(docId))
+                return false;
+        }
+
+        return true;
     }
 
     private static void EvictExpiredEntries(object? state)
@@ -2251,7 +3197,13 @@ internal static class WorkspaceService
 
         /// <summary>Normalized .csproj path → ProjectId, for every project this workspace
         /// holds (the whole solution closure for a solution entry).</summary>
-        public Dictionary<string, ProjectId> ProjectIds { get; }
+        /// <remarks>
+        /// Concurrent because it is read outside <c>s_cacheLock</c> — by the snapshot path and by
+        /// watched-file processing — while an incremental project load rewrites it under the lock.
+        /// A plain <see cref="Dictionary{TKey,TValue}"/> read during a resize can return a wrong
+        /// value, throw, or spin, and a branch switch arriving mid-load hits exactly that.
+        /// </remarks>
+        public System.Collections.Concurrent.ConcurrentDictionary<string, ProjectId> ProjectIds { get; }
 
         public DateTime CachedAtUtc { get; }
         public DateTime LastAccessedUtc { get; set; }
@@ -2278,6 +3230,10 @@ internal static class WorkspaceService
         public Solution? OverlayBase { get; set; }
         public long OverlayGeneration { get; set; } = -1;
 
+        /// <summary>The text each document in <see cref="OverlaySolution"/> was overlaid with, so
+        /// the next rebuild can re-apply only the buffers that moved instead of all of them.</summary>
+        public Dictionary<DocumentId, SourceText> OverlayTexts { get; set; } = new();
+
         public CachedWorkspaceEntry(
             string cacheKey,
             Workspace workspace,
@@ -2295,7 +3251,8 @@ internal static class WorkspaceService
             ShadowDirs = shadowDirs is null ? null : new HashSet<string>(shadowDirs, StringComparer.OrdinalIgnoreCase);
             TempDirs = tempDirs;
 
-            ProjectIds = new Dictionary<string, ProjectId>(StringComparer.OrdinalIgnoreCase);
+            ProjectIds = new System.Collections.Concurrent.ConcurrentDictionary<string, ProjectId>(
+                StringComparer.OrdinalIgnoreCase);
             RefreshProjectIds();
         }
 

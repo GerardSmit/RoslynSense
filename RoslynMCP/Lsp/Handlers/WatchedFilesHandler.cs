@@ -1,4 +1,4 @@
-using RoslynMCP.Languages;
+﻿using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 
@@ -17,53 +17,131 @@ internal static class WatchedFilesHandler
 {
     private static readonly TimeSpan Coalesce = TimeSpan.FromMilliseconds(500);
 
+    /// <summary>
+    /// How long a burst may hold off processing before it is flushed anyway.
+    /// </summary>
+    /// <remarks>
+    /// The quiet window alone is a trailing debounce: every new event restarts it, so a process
+    /// that keeps writing — an agent editing a hundred files, a long checkout, a code generator —
+    /// holds it off indefinitely and the workspace stays stale for as long as the writing lasts.
+    /// This bounds that, so a sustained stream is handled in periodic batches instead of one batch
+    /// after everything finally stops.
+    /// </remarks>
+    private static readonly TimeSpan MaximumWait = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Serializes the flushes themselves.
+    /// </summary>
+    /// <remarks>
+    /// The debounce token only guards the delay, and once <see cref="MaximumWait"/> forces an
+    /// immediate flush there is no delay to cancel — so a burst could have two batches applying at
+    /// once. Collapse only orders events within a batch, so a delete from the first could land
+    /// after a create from the second for the same file, leaving the document removed for a file
+    /// that exists and nothing to ever re-drive it.
+    /// </remarks>
+    private static readonly SemaphoreSlim s_flushGate = new(1, 1);
+
     private static readonly object s_gate = new();
     private static readonly List<FileEvent> s_pending = [];
     private static CancellationTokenSource? s_debounce;
+    private static DateTime s_firstPendingUtc;
 
     /// <summary>What a batch of events did — returned for tests and logging.</summary>
     internal sealed record Outcome(
         bool ReloadedWorkspace,
         IReadOnlyList<string> EvictedProjects,
-        IReadOnlyList<string>? InvalidatedMarkup = null)
+        IReadOnlyList<string>? InvalidatedMarkup = null,
+        IReadOnlyList<string>? AppliedDocumentChanges = null)
     {
         public bool DidAnything =>
-            ReloadedWorkspace || EvictedProjects.Count > 0 || InvalidatedMarkup is { Count: > 0 };
+            ReloadedWorkspace
+            || EvictedProjects.Count > 0
+            || InvalidatedMarkup is { Count: > 0 }
+            || AppliedDocumentChanges is { Count: > 0 };
     }
 
     public static void Handle(DidChangeWatchedFilesParams p)
     {
         lock (s_gate)
         {
+            if (s_pending.Count == 0)
+                s_firstPendingUtc = DateTime.UtcNow;
+
             s_pending.AddRange(p.Changes);
             s_debounce?.Cancel();
             var cts = s_debounce = new CancellationTokenSource();
-            _ = FlushAfterDelayAsync(cts.Token);
+
+            var delay = DateTime.UtcNow - s_firstPendingUtc >= MaximumWait ? TimeSpan.Zero : Coalesce;
+            _ = FlushAfterDelayAsync(delay, cts.Token);
         }
     }
 
-    private static async Task FlushAfterDelayAsync(CancellationToken ct)
+    private static async Task FlushAfterDelayAsync(TimeSpan delay, CancellationToken ct)
     {
         try
         {
-            await Task.Delay(Coalesce, ct);
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, ct);
 
             FileEvent[] batch;
             lock (s_gate)
             {
-                batch = s_pending.ToArray();
+                batch = Collapse(s_pending);
                 s_pending.Clear();
+                s_firstPendingUtc = DateTime.UtcNow;
             }
 
-            var outcome = await ProcessAsync(batch, CancellationToken.None);
+            Outcome outcome;
+            await s_flushGate.WaitAsync();
+            try
+            {
+                outcome = await ProcessAsync(batch, CancellationToken.None);
+            }
+            finally
+            {
+                s_flushGate.Release();
+            }
+
+            // Coalesced: several batches can land in a row during a checkout, and a refresh costs
+            // the client a re-pull of every open document plus a workspace sweep.
             if (outcome.DidAnything)
-                await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, CancellationToken.None);
+                LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Lsp] Watched-file processing failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// One event per file: the last thing that happened to it.
+    /// </summary>
+    /// <remarks>
+    /// A tool that rewrites a file several times — a formatter, a code generator, an agent working
+    /// through a change — produces an event per write, and each one used to be processed on its
+    /// own. Collapsing first means the work is proportional to the number of files touched rather
+    /// than the number of writes.
+    /// </remarks>
+    internal static FileEvent[] Collapse(IReadOnlyList<FileEvent> events)
+    {
+        var byPath = new Dictionary<string, FileEvent>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var e in events)
+        {
+            // Keyed on the resolved path rather than the URI text: two clients can encode the same
+            // file differently (an escaped drive letter, say) and would otherwise not collapse.
+            string key = LspConverters.UriToPath(e.Uri);
+
+            // Last one wins. Order is the only thing that distinguishes a file being replaced —
+            // which many writers do by unlinking and recreating, or renaming a temporary over the
+            // top — from one being deleted for good. Ranking by severity instead made every such
+            // save look like a delete: the document was dropped from the project, every type it
+            // declared went unresolved solution-wide, and nothing ever put it back.
+            byPath[key] = e;
+        }
+
+        return [.. byPath.Values];
     }
 
     /// <summary>The whole decision, without the debounce — the unit under test.</summary>
@@ -73,6 +151,10 @@ internal static class WatchedFilesHandler
         var events = changes
             .Select(c => (Path: LspConverters.UriToPath(c.Uri), Change: KindOf(c.Type)))
             .Where(e => !IsIgnored(e.Path))
+            // The echo of our own writes. Every mutating operation invalidates what it changed and
+            // then writes a .sln or .csproj; without this the watcher reports that write back and
+            // the whole workspace is evicted a second time, for a change already accounted for.
+            .Where(e => !SelfWriteTracker.WasWrittenByUs(e.Path))
             .ToList();
         var paths = events.Select(e => e.Path).ToList();
 
@@ -108,11 +190,11 @@ internal static class WatchedFilesHandler
                 invalidatedMarkup.Add(path);
         }
 
-        // A project-shaping file changed: nothing short of a reload is correct, because
-        // references, analyzers, and compile items all come from MSBuild evaluation.
-        // Analyzer configuration changed: severities and analyzer options are baked into the
-        // loaded project, and every cached analyzer result was computed under the old rules.
-        if (paths.Any(IsProjectShaping) || paths.Any(IsAnalyzerConfig))
+        // Analyzer configuration changed: severities and analyzer options are baked into the loaded
+        // project, and every cached analyzer result was computed under the old rules. An
+        // .editorconfig also applies to a whole directory tree rather than to one project, so this
+        // is the one case where dropping everything is the honest answer.
+        if (paths.Any(IsAnalyzerConfig))
         {
             await using var progress = await ProgressReporter.BeginAsync("Reloading workspace", ct);
             AnalyzerDiagnosticCache.Clear();
@@ -120,16 +202,86 @@ internal static class WatchedFilesHandler
             return new Outcome(true, []);
         }
 
-        // Source files added or removed on disk: the owning project's document set is wrong,
-        // so evict just that project rather than the whole solution.
-        var evicted = new List<string>();
-        foreach (var projectPath in paths
-                     .Where(IsSourceFile)
-                     .SelectMany(FindNearestProjectFiles)
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        // A project-shaping file changed: references, analyzers and compile items all come from
+        // MSBuild evaluation, so nothing short of a reload is correct for the projects it shapes.
+        // Which projects those are is the question that used to be skipped — a single .csproj
+        // reloaded every solution the process had open, including ones in other windows that
+        // shared nothing with it. A .sln or an imported .props reaches further than one project,
+        // so those still take everything.
+        var projectFiles = paths.Where(IsProjectFile).ToList();
+        var reachesEverything = paths.Any(p => IsProjectShaping(p) && !IsProjectFile(p));
+
+        if (reachesEverything)
         {
-            await WorkspaceService.EvictProjectAsync(projectPath, ct);
-            evicted.Add(projectPath);
+            await using var progress = await ProgressReporter.BeginAsync("Reloading workspace", ct);
+            await WorkspaceService.EvictAllAsync(ct);
+            return new Outcome(true, []);
+        }
+
+        bool reloadedProjects = false;
+        if (projectFiles.Count > 0)
+        {
+            await using var progress = await ProgressReporter.BeginAsync("Reloading projects", ct);
+
+            foreach (string projectFile in projectFiles)
+                await WorkspaceService.EvictProjectAsync(projectFile, ct);
+
+            // No analyzer-cache clear: its entries are keyed by DocumentId, and the reload gives
+            // this project's documents new ids, so its stale results age out on their own while
+            // every other project's stay valid.
+            //
+            // Deliberately falling through rather than returning. One batch can carry a .csproj
+            // from one solution and source edits from another — the daemon serves several at once,
+            // and a checkout touches whatever it touches. Returning here dropped every source
+            // event that happened to arrive alongside a project file, leaving those workspaces on
+            // the pre-checkout text with nothing to correct them.
+            reloadedProjects = true;
+        }
+
+        // Source files added or removed on disk: the owning project's document set is wrong.
+        // Applied to the live workspace where that is sound, because eviction is not the local
+        // operation its name suggests — one cache entry serves a whole solution, so evicting "just
+        // this project" discards every compilation and analyzer result in the solution. A branch
+        // switch went through here.
+        var evicted = new List<string>();
+        var applied = new List<string>();
+        foreach (var (path, change) in events.Where(e => IsSourceFile(e.Path)))
+        {
+            var kind = change switch
+            {
+                WatchedFileChange.Created => FileChange.Created,
+                WatchedFileChange.Deleted => FileChange.Deleted,
+                _ => FileChange.Changed,
+            };
+
+            foreach (var projectPath in FindNearestProjectFiles(path))
+            {
+                var result = await WorkspaceService.TryApplyFileChangeAsync(projectPath, path, kind, ct);
+
+                switch (result)
+                {
+                    case FileSyncResult.Applied:
+                        applied.Add(path);
+                        break;
+
+                    // Nothing moved, so nothing downstream is stale. Counting this as work is how
+                    // a formatter or an agent writing files bought a full workspace re-pull for a
+                    // change the server had already accounted for.
+                    case FileSyncResult.NothingToDo:
+                        break;
+
+                    case FileSyncResult.CannotApply:
+                        // Once per project, not once per file: a legacy project with fifty new
+                        // files in one checkout would otherwise take fifty sequential reloads of
+                        // the same workspace.
+                        if (!evicted.Contains(projectPath, StringComparer.OrdinalIgnoreCase))
+                        {
+                            await WorkspaceService.EvictProjectAsync(projectPath, ct);
+                            evicted.Add(projectPath);
+                        }
+                        break;
+                }
+            }
         }
 
         // No analyzer-cache clear here, and deliberately so: eviction reloads the solution under
@@ -137,7 +289,7 @@ internal static class WatchedFilesHandler
         // for again and ages out of the cap on its own. Clearing would also drop every other
         // solution's still-valid results.
 
-        return new Outcome(false, evicted, invalidatedMarkup);
+        return new Outcome(reloadedProjects, [.. evicted, .. projectFiles], invalidatedMarkup, applied);
     }
 
     private static WatchedFileChange KindOf(int type) => type switch
@@ -162,6 +314,14 @@ internal static class WatchedFilesHandler
         Path.GetExtension(path).ToLowerInvariant() is
             ".csproj" or ".vbproj" or ".fsproj" or ".props" or ".targets" or ".sln" or ".slnx" or ".slnf";
 
+    /// <summary>
+    /// A project file, as opposed to something a project file imports or lists. The distinction is
+    /// how far the reload has to reach: a <c>.csproj</c> shapes one project, while an imported
+    /// <c>.props</c> or a <c>.sln</c> can shape every project that sees it.
+    /// </summary>
+    private static bool IsProjectFile(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() is ".csproj" or ".vbproj" or ".fsproj";
+
     private static bool IsNuGetConfig(string path) =>
         Path.GetFileName(path).Equals("nuget.config", StringComparison.OrdinalIgnoreCase);
 
@@ -172,8 +332,16 @@ internal static class WatchedFilesHandler
             name.EndsWith(".globalconfig", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsSourceFile(string path) =>
-        Path.GetExtension(path).Equals(".cs", StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// A file the workspace compiles. VB is included for symmetry with the apply path, which
+    /// handles it — though the extension currently registers watchers for <c>**/*.cs</c> and the
+    /// project globs only, so no <c>.vb</c> event reaches here today.
+    /// </summary>
+    private static bool IsSourceFile(string path) => IsCompiledSource(path);
+
+    /// <summary>Whether the workspace compiles this file, and so has a document for it.</summary>
+    internal static bool IsCompiledSource(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() is ".cs" or ".vb";
 
     /// <summary>Project files in the nearest ancestor directory that has any. Deliberately a
     /// disk walk rather than <see cref="WorkspaceService.FindContainingProjectAsync"/>: a

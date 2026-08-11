@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Microsoft.VisualStudio.SolutionPersistence.Model;
 using Microsoft.VisualStudio.SolutionPersistence.Serializer;
 
@@ -80,6 +80,11 @@ public static class SolutionFileService
     internal static void Save(string solutionPath, SolutionModel model)
     {
         SerializerFor(solutionPath).SaveAsync(solutionPath, model, default).GetAwaiter().GetResult();
+
+        // Stamped from what actually landed on disk, so the watcher's report of our own write is
+        // recognised and does not evict every loaded workspace a second time — on top of whatever
+        // narrower invalidation the caller already performed.
+        SelfWriteTracker.Note(solutionPath);
 
         // The stamp check would catch this too, but not within the same timestamp granularity —
         // and the caller is about to re-read what it just wrote.

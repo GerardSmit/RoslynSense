@@ -86,6 +86,22 @@ public sealed record RenameFile(
     public string Kind => "rename";
 }
 
+/// <summary>
+/// A file the edit brings into existence inside <see cref="WorkspaceEdit.DocumentChanges"/>,
+/// ordered before the edits that fill it.
+/// </summary>
+/// <remarks>
+/// <c>overwrite</c> and <c>ignoreIfExists</c> are left at their defaults, which means the client
+/// fails the whole edit if the file is already there — the right answer for a fix that decided
+/// the file was missing.
+/// </remarks>
+public sealed record CreateFile(
+    [property: JsonPropertyName("uri")] string Uri)
+{
+    [JsonPropertyName("kind")]
+    public string Kind => "create";
+}
+
 public sealed record MarkupContent(
     [property: JsonPropertyName("kind")] string Kind, // "plaintext" | "markdown"
     [property: JsonPropertyName("value")] string Value);

@@ -286,6 +286,26 @@ which file and symbol you are looking at, your selection, and the diagnostics al
 so asking "why does this fail?" resolves to what is on your screen. It sends paths, the cursor,
 the selection, and those diagnostics; never whole file contents. Turn it off in settings.
 
+## Colours
+
+The server classifies C# more finely than the LSP standard vocabulary can express. The standard
+has a single `variable`, so a field, a local and a parameter arrive at the editor
+indistinguishable and every theme paints the three of them one colour. RoslynSense sends `field`,
+`local`, `constant`, `delegate` and `extensionMethod` as their own token types instead, each
+declared with a `superType` so a theme that has never heard of them still colours them as the
+standard type they refine.
+
+Your existing theme therefore keeps working and gets slightly better. To get the full separation,
+pick **RoslynSense Rider Islands Dark** (Preferences → Color Theme) — a port of Rider's Islands
+Dark scheme that has a colour for each of them: fields and properties cyan, methods green, types
+purple, locals and parameters plain grey.
+
+Hovers are coloured by a different mechanism — VS Code renders the fenced code in a hover with
+the C# TextMate grammar, and semantic tokens never reach it. The grammar only matches real
+declaration syntax, so hovers are written as declarations: modifiers and accessibility included,
+attributes above, a terminating `;`, and the containing type on its own line underneath rather
+than glued to the member name.
+
 ## Coexistence with the C# extension / C# Dev Kit
 
 The Microsoft C# extension (`ms-dotnettools.csharp`) runs its own language server. Running

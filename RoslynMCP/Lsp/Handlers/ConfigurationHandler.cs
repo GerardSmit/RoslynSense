@@ -130,6 +130,18 @@ internal static class ConfigurationHandler
         !TrySection(settings, out var section) || Bool(section, "registerCommands") is not false;
 
     /// <summary>
+    /// Whether this client implements <see cref="CodeActionHandler.PickNestedActionCommand"/> and
+    /// can therefore be handed a collapsed group instead of its flattened children.
+    /// </summary>
+    /// <remarks>
+    /// Absent means no, the opposite of every other option here. This one describes something the
+    /// client has to *do*, and a client that cannot do it would show an entry that goes nowhere
+    /// when clicked — a worse outcome than the long menu the flattening produces.
+    /// </remarks>
+    public static bool ReadNestedCodeActions(JsonElement? settings) =>
+        TrySection(settings, out var section) && Bool(section, "nestedCodeActions") is true;
+
+    /// <summary>
     /// Unwraps the settings block. The client may send the whole settings tree or just our
     /// section, and both <c>initialize</c> and <c>didChangeConfiguration</c> take either.
     /// </summary>

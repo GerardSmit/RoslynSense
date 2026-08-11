@@ -31,6 +31,14 @@ internal sealed class LspServer : IDisposable
     private LanguageSession _languages = LanguageSession.Empty;
     private JsonRpc? _rpc;
     private DiagnosticsPublisher? _diagnostics;
+    /// <summary>
+    /// Set from the client's initialization options and read on every code-action request: it
+    /// decides whether a Roslyn action group is collapsed to one entry with a picker or flattened
+    /// into its children. Per connection, because two windows on the same daemon can be different
+    /// editors.
+    /// </summary>
+    private bool _clientPicksNestedActions;
+
     private bool _clientPullsDiagnostics;
     private bool _clientRefreshesCodeLens;
     private bool _clientRefreshesInlayHints;
@@ -105,6 +113,7 @@ internal sealed class LspServer : IDisposable
         LspSessionRegistry.Register(SessionId, rpc, this);
         LspProgress.Install();
         LspWorkspaceRefresh.Install();
+        WorkspaceService.InstallOpenBufferBridge();
         LspLog.Install();
         LspNuGetCredentials.Install();
         Handlers.NuGetHandler.InstallMutationHook();
@@ -132,6 +141,8 @@ internal sealed class LspServer : IDisposable
         // what publishes it to the handlers that run outside DI. A server built without services
         // — every test that constructs one directly — gets pure C#.
         bool registerCommands = Handlers.ConfigurationHandler.ReadRegisterCommands(p.InitializationOptions);
+        _clientPicksNestedActions =
+            Handlers.ConfigurationHandler.ReadNestedCodeActions(p.InitializationOptions);
 
         var activation = Handlers.ConfigurationHandler.ReadLanguages(p.InitializationOptions);
         _languages = new LanguageSession(
@@ -853,7 +864,8 @@ internal sealed class LspServer : IDisposable
             ? Handlers.BindingRedirectHandler.CodeActionsAsync(p, ct)
             : Route<ILanguageCodeActionProvider, Protocol.CodeAction[]>(p.TextDocument,
                 l => l.CodeActionsAsync(p, ct),
-                () => Handlers.CodeActionHandler.CodeActionsAsync(p, _resolveCache, ct));
+                () => Handlers.CodeActionHandler.CodeActionsAsync(
+                    p, _resolveCache, ct, _clientPicksNestedActions));
 
     [JsonRpcMethod("codeAction/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeAction> CodeActionResolve(Protocol.CodeAction action, CancellationToken ct) =>

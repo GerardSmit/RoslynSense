@@ -99,6 +99,58 @@
         "path": "./syntaxes/proto.tmLanguage.json"
       }
     ],
+    "themes": [
+      {
+        "label": "RoslynSense Rider Islands Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/rider-islands-dark.json"
+      }
+    ],
+    "semanticTokenTypes": [
+      {
+        "id": "field",
+        "superType": "property",
+        "description": "A C# field. Split out from `variable` so it can be coloured apart from locals and parameters."
+      },
+      {
+        "id": "constant",
+        "superType": "variable",
+        "description": "A C# const field or const local."
+      },
+      {
+        "id": "local",
+        "superType": "variable",
+        "description": "A C# local variable, as distinct from a field."
+      },
+      {
+        "id": "delegate",
+        "superType": "type",
+        "description": "A C# delegate type."
+      },
+      {
+        "id": "extensionMethod",
+        "superType": "method",
+        "description": "A method invoked in extension form."
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "reassigned",
+        "description": "A local or parameter that is written to after its initial assignment."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "csharp",
+        "scopes": {
+          "field": ["variable.other.property"],
+          "constant": ["variable.other.constant"],
+          "local": ["variable.other.readwrite"],
+          "delegate": ["entity.name.type.delegate"],
+          "extensionMethod": ["entity.name.function"]
+        }
+      }
+    ],
     "commands": [
       {
         "command": "roslynSense.searchEverywhere",

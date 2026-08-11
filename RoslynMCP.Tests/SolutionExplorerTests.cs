@@ -630,6 +630,55 @@ public class SolutionExplorerTests
     }
 
     /// <summary>
+    /// Every id the reveal chain names has to be a row the tree actually lists, because the client
+    /// walks the chain by listing each level and looking the next id up in it.
+    /// </summary>
+    /// <remarks>
+    /// Including when the URI spells the path differently from the solution file, which on Windows
+    /// is always: VS Code lower-cases the drive letter in every URI it sends, and the tree names
+    /// its rows after the solution's own path. The two ids are the same path and different
+    /// strings, so the walk missed at the first folder and "Focus Current File" reported that the
+    /// file was not in the solution — for every file, in every project.
+    /// </remarks>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TheRevealChainNamesRowsTheTreeActuallyLists(bool lowerCaseDrive)
+    {
+        string? previous = WorkspaceService.BoundSolutionPath;
+        try
+        {
+            WorkspaceService.BindSolution(FixturePaths.MultiSolutionFile);
+
+            string file = Path.Combine(FixturePaths.MultiSolutionDir, "ProjectA", "Class1.cs");
+            if (lowerCaseDrive)
+                file = char.ToLowerInvariant(file[0]) + file[1..];
+
+            var chain = (await SolutionTreeSearchHandler.RevealAsync(
+                new SolutionTreeRevealParams(LspConverters.PathToUri(file), FileNesting: true),
+                default)).Path;
+
+            Assert.NotEmpty(chain);
+
+            string? parent = null;
+            foreach (string id in chain)
+            {
+                var children = await SolutionTreeHandler.ChildrenAsync(
+                    new SolutionTreeParams(parent), default);
+                Assert.True(
+                    children.Any(c => c.Id == id),
+                    $"'{id}' is not among the children of '{parent ?? "<roots>"}': " +
+                    string.Join(", ", children.Select(c => c.Id)));
+                parent = id;
+            }
+        }
+        finally
+        {
+            WorkspaceService.BindSolution(previous);
+        }
+    }
+
+    /// <summary>
     /// A file can be both a solution item and a file of the project that compiles it. The client
     /// keys its tree items by id, and two nodes sharing one id makes the second branch fail to
     /// render — so a solution item is not called what the project's own file is called.

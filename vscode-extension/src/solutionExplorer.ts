@@ -547,6 +547,11 @@ export function registerSolutionExplorer(
         // way down. A cached node whose parent is unrecorded — or recorded as somebody else, which
         // happens for a project reference listed under two projects — is re-fetched rather than
         // trusted, because `getParent` is about to be asked the same question.
+        //
+        // A level the tree does not draw stops the walk but not the reveal: the file may be hidden
+        // by "Show All Files" being off, or nested under a row the current settings put elsewhere.
+        // Landing on the folder that holds it is the useful answer there, and infinitely better
+        // than telling the user the file is not in their solution.
         let parent: SolutionTreeNode | undefined;
         for (const id of chain) {
             const cached = nodesById.get(id);
@@ -555,12 +560,27 @@ export function registerSolutionExplorer(
                     ? cached
                     : (await fetchChildren(parent?.id ?? null)).find((child) => child.id === id);
             if (!node) {
-                return false;
+                break;
             }
             parent = node;
         }
 
-        await view.reveal(parent!, { select: true, focus: false, expand: true });
+        if (!parent) {
+            return false;
+        }
+
+        // Revealing can still fail — a row VS Code has since dropped from its own model, most of
+        // all — and an unhandled rejection here would take the command's fallback message with it.
+        try {
+            await view.reveal(parent, { select: true, focus: false, expand: true });
+        } catch (error) {
+            log.appendLine(
+                `reveal(${parent.id}) failed: ${
+                    error instanceof Error ? error.message : String(error)
+                }`
+            );
+            return false;
+        }
         return true;
     }
 
@@ -693,6 +713,15 @@ export function registerSolutionExplorer(
         vscode.commands.registerCommand(
             'roslynSense.solutionExplorer.focusCurrentFile',
             async () => {
+                // A filter replaces the root listing with what matched it, so there is no chain
+                // from the solution down to anything while one is on. Asking to be taken to the
+                // current file is asking to stop looking at a filtered tree.
+                if (filter) {
+                    filter = undefined;
+                    view.message = undefined;
+                    refresh();
+                }
+
                 if (await revealActiveEditor()) {
                     return;
                 }

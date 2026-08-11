@@ -139,9 +139,11 @@ internal static class SolutionTreeSearchHandler
         chain.AddRange(ancestors);
         chain.Add($"project:{owner.Path}");
 
-        // Then each directory between the project and the file.
+        // Then each directory between the project and the file, spelled the way the tree spells
+        // them — see RebaseOnto.
         string projectDirectory = Path.GetDirectoryName(owner.Path)!;
-        string? current = Path.GetDirectoryName(Path.GetFullPath(path));
+        path = RebaseOnto(projectDirectory, Path.GetFullPath(path));
+        string? current = Path.GetDirectoryName(path);
         var directories = new List<string>();
         while (current is not null &&
                !current.Equals(projectDirectory, StringComparison.OrdinalIgnoreCase) &&
@@ -160,9 +162,44 @@ internal static class SolutionTreeSearchHandler
             chain.Add($"file:{Path.GetFullPath(ancestor)}");
         }
 
-        chain.Add($"file:{Path.GetFullPath(path)}");
+        chain.Add($"file:{path}");
 
         return Task.FromResult(new SolutionTreeRevealResult(chain.ToArray()));
+    }
+
+    /// <summary>
+    /// A path respelled with the casing the file system actually uses, below a directory that is
+    /// itself already spelled that way.
+    /// </summary>
+    /// <remarks>
+    /// The client matches the ids in this chain against the ids of the rows it listed, character
+    /// for character — so a path that differs only in case names a row the tree never drew. Which
+    /// is not a corner case on Windows: every URI VS Code sends carries a lower-cased drive
+    /// letter, while the tree builds its ids from the solution file's own path. So the chain said
+    /// <c>d:\src\App\Program.cs</c> where the tree had said <c>D:\src\App\Program.cs</c>, and
+    /// "Focus Current File" answered that the file was not in the solution — for every file in
+    /// every project, on every solution opened from a capitalised drive.
+    /// </remarks>
+    private static string RebaseOnto(string directory, string path)
+    {
+        string relative = Path.GetRelativePath(directory, path);
+        if (Path.IsPathRooted(relative) || relative.StartsWith("..", StringComparison.Ordinal))
+            return path;
+
+        string current = directory;
+        foreach (string segment in relative.Split(
+                     [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+                     StringSplitOptions.RemoveEmptyEntries))
+        {
+            // Enumerating by name is what recovers the on-disk spelling: the match is the file
+            // system's own (case-insensitive on Windows, exact elsewhere), and what comes back is
+            // how the entry is really written. A segment that no longer exists is kept as given.
+            current = Directory.Exists(current)
+                ? Directory.EnumerateFileSystemEntries(current, segment).FirstOrDefault()
+                  ?? Path.Combine(current, segment)
+                : Path.Combine(current, segment);
+        }
+        return current;
     }
 
     /// <summary>

@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Reflection;
 using System.Runtime.Loader;
 using Microsoft.CodeAnalysis;
@@ -81,23 +81,47 @@ internal static class AnalyzerService
     }
 
     /// <summary>
-    /// Runs analyzers for a single document using Roslyn's per-tree entry points, which
-    /// analyze only this file rather than the whole compilation — the difference between
-    /// usable and unusable on an editor path.
-    /// Returns an empty set (never throws) when analyzers fail or exceed their time budget.
+    /// What a run produced, and whether it actually finished.
+    /// </summary>
+    /// <remarks>
+    /// A timeout returns an empty result so the caller can still show compiler diagnostics, but
+    /// empty-because-we-stopped-looking and empty-because-the-file-is-clean are different facts.
+    /// Caching the first as the second means the file is never analysed again at that version, and
+    /// the cache serves any result whose text checksum matches — so one timeout blanked that file's
+    /// analyzer diagnostics until somebody edited it.
+    ///
+    /// Returned rather than parked in a [ThreadStatic]. The failure is recorded inside a catch that
+    /// runs on whatever pool thread resumed the await, and read after another await on whatever
+    /// thread resumed that — so a thread-local neither reaches the reader (the timeout is cached as
+    /// clean anyway) nor stays put (a stale true on a reused thread discards a later good result).
+    /// </remarks>
+    public readonly record struct AnalyzerRun(ImmutableArray<Diagnostic> Diagnostics, bool Failed);
+
+    /// <summary>
+    /// Runs analyzers for a single document using Roslyn's per-tree entry points, which analyze
+    /// only this file rather than the whole compilation — the difference between usable and
+    /// unusable on an editor path. Returns an empty set (never throws) when analyzers fail or
+    /// exceed their time budget; callers that cache the result want
+    /// <see cref="RunDocumentAnalyzersWithStatusAsync"/> instead, so they can tell those two
+    /// kinds of empty apart.
     /// </summary>
     public static async Task<ImmutableArray<Diagnostic>> RunDocumentAnalyzersAsync(
+        Document document, CancellationToken cancellationToken = default) =>
+        (await RunDocumentAnalyzersWithStatusAsync(document, cancellationToken)).Diagnostics;
+
+    /// <summary>As above, and says whether the run finished or gave up.</summary>
+    public static async Task<AnalyzerRun> RunDocumentAnalyzersWithStatusAsync(
         Document document, CancellationToken cancellationToken = default)
     {
         var project = document.Project;
         var analyzers = GetAnalyzersFor(project);
         if (analyzers.IsDefaultOrEmpty)
-            return ImmutableArray<Diagnostic>.Empty;
+            return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: false);
 
         var compilation = await project.GetCompilationAsync(cancellationToken);
         var model = await document.GetSemanticModelAsync(cancellationToken);
         if (compilation is null || model is null)
-            return ImmutableArray<Diagnostic>.Empty;
+            return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: false);
 
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(LspFeatureOptions.AnalyzerTimeout);
@@ -108,9 +132,11 @@ internal static class AnalyzerService
             var syntax = await withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(model.SyntaxTree, budget.Token);
             var semantic = await withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(model, null, budget.Token);
 
-            return syntax.AddRange(semantic)
-                .Where(d => d.Location.SourceTree == model.SyntaxTree)
-                .ToImmutableArray();
+            return new AnalyzerRun(
+                syntax.AddRange(semantic)
+                    .Where(d => d.Location.SourceTree == model.SyntaxTree)
+                    .ToImmutableArray(),
+                Failed: false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -122,12 +148,12 @@ internal static class AnalyzerService
                 $"Analyzers timed out after {LspFeatureOptions.AnalyzerTimeout.TotalSeconds:0}s " +
                 $"for '{document.Name}'; showing compiler diagnostics only.",
                 key: "analyzer-timeout");
-            return ImmutableArray<Diagnostic>.Empty;
+            return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
         }
         catch (Exception ex)
         {
             ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex.Message}", key: "analyzer-failure");
-            return ImmutableArray<Diagnostic>.Empty;
+            return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
         }
     }
 

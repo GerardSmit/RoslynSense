@@ -103,6 +103,8 @@ internal static class FixturePaths
     public static string MultiSolutionFile => Path.Combine(MultiSolutionDir, "MultiSolution.sln");
     public static string MultiProjectAFile => Path.Combine(MultiSolutionDir, "ProjectA", "ProjectA.csproj");
     public static string MultiProjectBFile => Path.Combine(MultiSolutionDir, "ProjectB", "ProjectB.csproj");
+    public static string MultiProjectAClassFile => Path.Combine(MultiSolutionDir, "ProjectA", "Class1.cs");
+    public static string MultiProjectBClassFile => Path.Combine(MultiSolutionDir, "ProjectB", "Class2.cs");
 
     /// <summary>Central Package Management. Never restored: the point is that versions resolve
     /// from the evaluated item model alone.</summary>
@@ -231,6 +233,27 @@ internal static class FixturePaths
     public static string LayeredAppSolutionFile => Path.Combine(LayeredAppDir, "LayeredApp.sln");
     public static string LayeredAppWarehouseModuleFile => Path.Combine(LayeredAppDir, "Warehouse", "WarehouseModule.cs");
     public static string LayeredAppStartupFile => Path.Combine(LayeredAppDir, "Storefront", "Startup.cs");
+
+    /// <summary>
+    /// The VS Code extension folder in the source tree, or null when the tests run from output
+    /// with no repository above them. The theme lives there but has to agree with the token
+    /// legend that lives here, so one test reads across.
+    /// </summary>
+    public static string? VsCodeExtensionDir { get; } = FindRepositoryFolder("vscode-extension");
+
+    private static string? FindRepositoryFolder(string name)
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "RoslynMCP.sln"))
+                && Directory.Exists(Path.Combine(dir.FullName, name)))
+            {
+                return Path.Combine(dir.FullName, name);
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Walks up from the test assembly location to find the Fixtures directory.

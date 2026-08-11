@@ -1,4 +1,4 @@
-namespace RoslynMCP.Services.Packages;
+﻿namespace RoslynMCP.Services.Packages;
 
 /// <summary>
 /// Collects the fallout of package changes so a batch pays for it once.
@@ -44,10 +44,14 @@ public sealed class PackageMutationScope : IAsyncDisposable
         if (_projects.Count == 0)
             return;
 
+        // Scoped to the workspaces serving the projects that actually changed. A package added to
+        // one solution has nothing to do with another solution open in a second window, which was
+        // being reloaded too.
         foreach (string project in _projects)
+        {
             ProjectModel.ProjectEvaluationService.Evict(project);
-
-        await WorkspaceService.EvictAllAsync(_ct);
+            await WorkspaceService.EvictProjectAsync(project, _ct);
+        }
 
         if (AfterMutation is { } after)
         {

@@ -42,6 +42,61 @@ public class LspNavigationTests
         Assert.Equal("markdown", hover.Contents.Kind);
     }
 
+    /// <summary>
+    /// The client colours a fenced <c>csharp</c> block with its TextMate grammar, and that grammar
+    /// only matches declaration syntax — so the fence has to hold a declaration, with the
+    /// containing type moved out below it rather than glued onto the member name.
+    /// </summary>
+    [Fact]
+    public async Task HoverSignatureIsShapedLikeADeclaration()
+    {
+        var p = await PositionOf(FixturePaths.CalculatorFile, "Add(int a, int b)");
+        var hover = await HoverHandler.HoverAsync(p, default);
+
+        Assert.NotNull(hover);
+        string markdown = hover!.Contents.Value;
+
+        string fenced = markdown.Split("```")[1];
+        Assert.Contains("public int Add(int a, int b)", fenced);
+        Assert.DoesNotContain("Calculator.Add", fenced);
+
+        Assert.Contains("in class `SampleProject.Calculator`", markdown);
+    }
+
+    /// <summary>
+    /// The cases <see cref="SymbolDisplayFormat"/> does not cover. A type came back as the bare
+    /// identifier `StatisticsCalculator` — no accessibility, no `class` — which the grammar has no
+    /// rule for, so hovering a type was the one thing that stayed uncoloured.
+    /// </summary>
+    [Theory]
+    [InlineData("class StatisticsCalculator", "public class StatisticsCalculator : IStringFormatter")]
+    [InlineData("enum ProcessingStatus", "public enum ProcessingStatus")]
+    [InlineData("interface IStringFormatter", "public interface IStringFormatter")]
+    public async Task HoverWritesTypesAsTheirDeclaration(string anchor, string expected)
+    {
+        var p = await PositionOf(FixturePaths.ServicesFile, anchor);
+        var hover = await HoverHandler.HoverAsync(
+            new TextDocumentPositionParams(
+                p.TextDocument,
+                new Position(p.Position.Line, p.Position.Character + anchor.IndexOf(' ') + 1)),
+            default);
+
+        Assert.NotNull(hover);
+        Assert.Contains(expected, hover!.Contents.Value.Split("```")[1]);
+    }
+
+    /// <summary>Members that are not properties need the semicolon, or the grammar reads the
+    /// declaration as unfinished and stops colouring at the signature.</summary>
+    [Fact]
+    public async Task HoverTerminatesFieldsAndMethods()
+    {
+        var p = await PositionOf(FixturePaths.ServicesFile, "_results = []");
+        var hover = await HoverHandler.HoverAsync(p, default);
+
+        Assert.NotNull(hover);
+        Assert.Contains("private readonly List<Result> _results;", hover!.Contents.Value);
+    }
+
     [Fact]
     public async Task DocumentSymbolsReturnTypeWithMembers()
     {

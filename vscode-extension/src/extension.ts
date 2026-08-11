@@ -27,6 +27,7 @@ import { createRedactingTraceChannel, wireNuGetCredentials } from './nuget/crede
 import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
+import { bindNestedCodeActions, registerNestedCodeActions } from './nestedCodeActions';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -287,6 +288,12 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
         // than by suppressing the registration here, because the feature that does the
         // registering is built into the client and reads the capability directly.
         registerCommands,
+        // This extension implements the picker command, so the server may collapse a Roslyn
+        // action group — "Configure IDE0074 severity" and its five severities — into one
+        // lightbulb entry rather than flattening it into five siblings. Unconditional: unlike
+        // registerCommands this is a property of the client, not of which client came first,
+        // and the command is registered once for the window whatever connections exist.
+        nestedCodeActions: true,
         analyzerDiagnostics: config.get('analyzerDiagnostics'),
         codeStyleDiagnostics: config.get('codeStyleDiagnostics'),
         analyzerTimeoutSeconds: config.get('analyzerTimeoutSeconds'),
@@ -483,6 +490,8 @@ async function startClient(
             ...enabledFileLanguages().map(watchGlob),
         ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
     }
+    const clientKey = bindingKey(solutionPath, binding?.folder);
+
     const clientOptions: LanguageClientOptions = {
         // Source-generated documents are C# too. Without them here VS Code sends the server
         // nothing for a generated file, so it opens as an inert buffer — no hover, no
@@ -502,6 +511,17 @@ async function startClient(
             ...enabledFileLanguages().map((language) => fileFilter(language.id, binding?.folder)),
         ],
         uriConverters: { code2Protocol, protocol2Code },
+        middleware: {
+            // A collapsed group's ids live in this connection's resolve cache and nowhere else,
+            // so the entry has to say which connection it came from. Stamped here rather than
+            // built into the server's payload because the key is the editor's idea of a client,
+            // which the server has no name for.
+            provideCodeActions: async (document, range, context, token, next) => {
+                const actions = await next(document, range, context, token);
+                bindNestedCodeActions(actions, clientKey);
+                return actions;
+            },
+        },
         // Sent at initialize so the very first analyzer pass already runs under the user's
         // settings; changes afterwards go through workspace/didChangeConfiguration.
         initializationOptions: serverSettings(ownsCommands),
@@ -543,7 +563,7 @@ async function startClient(
     };
 
     client = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
-    clientsBySolution.set(bindingKey(solutionPath, binding?.folder), client);
+    clientsBySolution.set(clientKey, client);
     wireEditorDebugCommandHandler(client);
     wireNuGetCredentials(client, context);
     client.onDidChangeState((e) => {
@@ -2333,6 +2353,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
     registerHotReload(context, () => client);
+    // Falls back to the most recent client for a group that predates the middleware's stamp —
+    // and in the single-client window that is every window, they are the same object anyway.
+    registerNestedCodeActions(context, (key) =>
+        (key !== undefined ? clientsBySolution.get(key) : undefined) ?? client);
     registerEditorContext(
         context,
         () => client,

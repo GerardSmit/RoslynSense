@@ -112,6 +112,16 @@ public sealed record CodeAction(
 public sealed record CodeActionData(
     [property: JsonPropertyName("id")] long Id);
 
+/// <summary>
+/// One node of a code-action group, sent as the argument of the client-side picker command.
+/// A node has either <paramref name="Children"/> (another level to choose from) or an
+/// <paramref name="Id"/> (a leaf, resolvable through <c>codeAction/resolve</c>), never both.
+/// </summary>
+public sealed record NestedCodeActionGroup(
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("id")] long? Id,
+    [property: JsonPropertyName("children")] NestedCodeActionGroup[]? Children);
+
 public sealed record CodeActionOptions(
     [property: JsonPropertyName("resolveProvider")] bool ResolveProvider);
 

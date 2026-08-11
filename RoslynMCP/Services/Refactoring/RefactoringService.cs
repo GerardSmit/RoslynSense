@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.ChangeSignature;
 using Microsoft.CodeAnalysis.CodeRefactorings.MoveType;
@@ -192,9 +192,80 @@ internal static class RefactoringService
             }
         }
 
-        if (!after.Workspace.TryApplyChanges(target))
-            return RefactoringResult.Failed("The workspace refused the edit; nothing was changed.");
+        // Retried, because CurrentSolution now moves on every keystroke: open buffers are pushed
+        // into the workspace as they are typed, and TryApplyChanges refuses a solution derived from
+        // a version that has since been superseded. Computing a rename on a real solution takes
+        // seconds, so losing that race — and discarding the whole refactoring with it — is ordinary
+        // rather than rare. Each attempt rebases onto whatever the workspace holds now.
+        const int Attempts = 3;
+        for (int attempt = 1; ; attempt++)
+        {
+            if (after.Workspace.TryApplyChanges(target))
+                break;
+
+            if (attempt == Attempts)
+                return RefactoringResult.Failed("The workspace refused the edit; nothing was changed.");
+
+            target = Rebase(after, before, target, after.Workspace.CurrentSolution);
+        }
+
+        // The edits landed on disk for any file that was not open. A file that was open keeps the
+        // editor's buffer as the truth, and the buffer bridge would otherwise push that pre-refactor
+        // text straight back over what was just written.
+        foreach (string path in changed)
+        {
+            string file = path.EndsWith(" (new)", StringComparison.Ordinal)
+                ? path[..^" (new)".Length]
+                : path.EndsWith(" (removed)", StringComparison.Ordinal)
+                    ? path[..^" (removed)".Length]
+                    : path;
+
+            SelfWriteTracker.Note(file);
+        }
 
         return new RefactoringResult(true, message, changed);
+    }
+
+    /// <summary>
+    /// Re-applies the refactoring's document changes onto a newer workspace solution.
+    /// </summary>
+    /// <remarks>
+    /// Used when <c>TryApplyChanges</c> loses a version race. The refactoring's own result
+    /// (<paramref name="after"/>) is still what should land; only the base it is expressed against
+    /// has moved, so the same set of edits is replayed onto the current one.
+    /// </remarks>
+    private static Solution Rebase(
+        Solution after, Solution before, Solution previousTarget, Solution current)
+    {
+        var target = current;
+
+        foreach (var projectChange in after.GetChanges(before).GetProjectChanges())
+        {
+            foreach (var id in projectChange.GetChangedDocuments())
+            {
+                if (previousTarget.GetDocument(id) is { } document && target.ContainsDocument(id))
+                    target = target.WithDocumentText(id, document.GetTextSynchronously(default));
+            }
+
+            foreach (var id in projectChange.GetAddedDocuments())
+            {
+                if (target.ContainsDocument(id) || previousTarget.GetDocument(id) is not { } document)
+                    continue;
+
+                target = target.AddDocument(DocumentInfo.Create(
+                    id, document.Name, document.Folders, SourceCodeKind.Regular,
+                    TextLoader.From(TextAndVersion.Create(
+                        document.GetTextSynchronously(default), VersionStamp.Create())),
+                    document.FilePath));
+            }
+
+            foreach (var id in projectChange.GetRemovedDocuments())
+            {
+                if (target.ContainsDocument(id))
+                    target = target.RemoveDocument(id);
+            }
+        }
+
+        return target;
     }
 }

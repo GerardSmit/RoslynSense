@@ -24,21 +24,34 @@ internal static class LspProgress
         string token = $"roslyn-sense/{Guid.NewGuid():N}";
         var live = new List<JsonRpc>(sessions.Count);
 
-        foreach (var rpc in sessions)
+        try
         {
-            try
+            foreach (var rpc in sessions)
             {
-                // The client must create the token before any $/progress for it is valid.
-                await rpc.InvokeWithParameterObjectAsync<object?>(
-                    "window/workDoneProgress/create", new WorkDoneProgressCreateParams(token), ct);
-                await rpc.NotifyWithParameterObjectAsync("$/progress",
-                    new ProgressParams(token, WorkDoneProgress.Begin(title)));
-                live.Add(rpc);
+                try
+                {
+                    // The client must create the token before any $/progress for it is valid.
+                    await rpc.InvokeWithParameterObjectAsync<object?>(
+                        "window/workDoneProgress/create", new WorkDoneProgressCreateParams(token), ct);
+                    await rpc.NotifyWithParameterObjectAsync("$/progress",
+                        new ProgressParams(token, WorkDoneProgress.Begin(title)));
+                    live.Add(rpc);
+                }
+                catch (Exception ex) when (ex is RemoteInvocationException or ConnectionLostException or ObjectDisposedException)
+                {
+                    // Client can't or won't render progress — carry on silently.
+                }
             }
-            catch (Exception ex) when (ex is RemoteInvocationException or ConnectionLostException or ObjectDisposedException)
-            {
-                // Client can't or won't render progress — carry on silently.
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation part-way through the loop is the normal case for a deferred scope: it
+            // cancels at the moment the work finishes, which is exactly when this loop is likely to
+            // be running. Every session already told to begin must be told to end, or it shows a
+            // spinner that never goes away.
+            if (live.Count > 0)
+                await new Scope(token, live).DisposeAsync();
+            throw;
         }
 
         return live.Count == 0 ? new NoopScope() : new Scope(token, live);

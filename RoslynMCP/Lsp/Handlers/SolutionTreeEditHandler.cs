@@ -1,4 +1,4 @@
-using RoslynMCP.Lsp.Protocol;
+﻿using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using RoslynMCP.Services.ProjectModel;
 
@@ -323,7 +323,9 @@ internal static class SolutionTreeEditHandler
             return new SolutionTreeEditResult(false, $"Could not move the project: {ex.Message}");
         }
 
-        await WorkspaceService.EvictAllAsync(ct);
+        // Deliberately nothing to invalidate: a solution folder is a grouping written into
+        // the .sln, so no project file moves, the project set is identical, and every
+        // compilation stays valid. This used to evict every loaded workspace in the process.
 
         return new SolutionTreeEditResult(
             true,
@@ -360,7 +362,9 @@ internal static class SolutionTreeEditHandler
             return new SolutionTreeEditResult(false, $"Could not edit the solution: {ex.Message}");
         }
 
-        await WorkspaceService.EvictAllAsync(ct);
+        // Deliberately nothing to invalidate: a solution folder is a grouping written into
+        // the .sln, so no project file moves, the project set is identical, and every
+        // compilation stays valid. This used to evict every loaded workspace in the process.
 
         return new SolutionTreeEditResult(
             true,
@@ -391,7 +395,9 @@ internal static class SolutionTreeEditHandler
             return new SolutionTreeEditResult(false, $"Could not rename the folder: {ex.Message}");
         }
 
-        await WorkspaceService.EvictAllAsync(ct);
+        // Deliberately nothing to invalidate: a solution folder is a grouping written into
+        // the .sln, so no project file moves, the project set is identical, and every
+        // compilation stays valid. This used to evict every loaded workspace in the process.
         return new SolutionTreeEditResult(true, $"Renamed the folder to {name}.");
     }
 
@@ -413,7 +419,9 @@ internal static class SolutionTreeEditHandler
             return new SolutionTreeEditResult(false, $"Could not remove the folder: {ex.Message}");
         }
 
-        await WorkspaceService.EvictAllAsync(ct);
+        // Deliberately nothing to invalidate: a solution folder is a grouping written into
+        // the .sln, so no project file moves, the project set is identical, and every
+        // compilation stays valid. This used to evict every loaded workspace in the process.
         return new SolutionTreeEditResult(
             true,
             detached == 0
@@ -438,7 +446,13 @@ internal static class SolutionTreeEditHandler
 
         await ProjectMutationService.IncludeExistingFileAsync(project, file, ct);
         ProjectEvaluationService.Evict(project);
-        await WorkspaceService.EvictAllAsync(ct);
+
+        // One document joined the project; nothing else in the solution changed.
+        if (await WorkspaceService.TryApplyFileChangeAsync(
+                project, file, FileChange.Created, ct, authoritative: true) == FileSyncResult.CannotApply)
+        {
+            await WorkspaceService.EvictProjectAsync(project, ct);
+        }
 
         return new SolutionTreeEditResult(
             true, $"Added {Path.GetFileName(file)}.", LspConverters.PathToUri(file));
@@ -461,7 +475,14 @@ internal static class SolutionTreeEditHandler
         if (result.Ok)
         {
             ProjectEvaluationService.Evict(project);
-            await WorkspaceService.EvictAllAsync(ct);
+
+            // Excluding writes a Compile Remove, so the file is on disk but out of the project.
+            // Dropping the document says exactly that, and leaves the rest of the solution alone.
+            if (await WorkspaceService.TryApplyFileChangeAsync(
+                    project, file, FileChange.Deleted, ct, authoritative: true) == FileSyncResult.CannotApply)
+            {
+                await WorkspaceService.EvictProjectAsync(project, ct);
+            }
         }
 
         return new SolutionTreeEditResult(result.Ok, result.Message);
@@ -480,7 +501,10 @@ internal static class SolutionTreeEditHandler
         if (result.Ok)
         {
             ProjectEvaluationService.Evict(project);
-            await WorkspaceService.EvictAllAsync(ct);
+
+            // References come from MSBuild evaluation, so this genuinely needs a reload — but of
+            // the workspace serving this project, not of every solution the process has open.
+            await WorkspaceService.EvictProjectAsync(project, ct);
         }
 
         return new SolutionTreeEditResult(result.Ok, result.Message);
@@ -584,8 +608,15 @@ internal static class SolutionTreeEditHandler
         {
             await ProjectMutationService.IncludeExistingFileAsync(project, destination, ct);
             ProjectEvaluationService.Evict(project);
+
+            // One document appeared. Adding it to the live workspace keeps every compilation in
+            // the solution, where evicting threw all of them away for a single new file.
+            if (await WorkspaceService.TryApplyFileChangeAsync(
+                    project, destination, FileChange.Created, ct, authoritative: true) == FileSyncResult.CannotApply)
+            {
+                await WorkspaceService.EvictProjectAsync(project, ct);
+            }
         }
-        await WorkspaceService.EvictAllAsync(ct);
 
         return new SolutionTreeEditResult(
             true, $"Copied to {Path.GetFileName(destination)}.",
@@ -648,8 +679,30 @@ internal static class SolutionTreeEditHandler
         {
             await ProjectMutationService.RenameFileItemAsync(source, destination, ct);
             ProjectEvaluationService.Evict(project);
+
+            // A move is a document leaving one path and arriving at another, applied to the live
+            // workspace so the rest of the solution stays compiled — but only when a document is
+            // involved at all, and at either end. Renaming an .aspx or a .json changes no
+            // compilation, so requiring the workspace to report work done would evict the whole
+            // solution for a file it never had; and testing only the source would miss
+            // Notes.txt → Notes.cs, leaving a brand-new C# file invisible with its .csproj write
+            // suppressed as our own echo. Directories are handled by the branch below, which
+            // cannot reason per document and so reloads.
+            bool needsDocumentMove = !isDirectory
+                && (WatchedFilesHandler.IsCompiledSource(source)
+                    || WatchedFilesHandler.IsCompiledSource(destination));
+
+            bool applied = needsDocumentMove
+                && await WorkspaceService.TryApplyFileChangeAsync(
+                    project, source, FileChange.Deleted, ct, authoritative: true) == FileSyncResult.Applied
+                && await WorkspaceService.TryApplyFileChangeAsync(
+                    project, destination, FileChange.Created, ct, authoritative: true) == FileSyncResult.Applied;
+
+            if (needsDocumentMove && !applied)
+                await WorkspaceService.EvictProjectAsync(project, ct);
+            else if (isDirectory)
+                await WorkspaceService.EvictProjectAsync(project, ct);
         }
-        await WorkspaceService.EvictAllAsync(ct);
 
         // The type and namespace fixups are the LSP's own, so a tree rename and an editor rename
         // leave the code in the same state.

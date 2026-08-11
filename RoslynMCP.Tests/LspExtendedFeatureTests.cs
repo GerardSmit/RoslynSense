@@ -147,6 +147,77 @@ public class LspExtendedFeatureTests
         }
     }
 
+    /// <summary>
+    /// The distinction the client cannot make for itself. LSP's standard vocabulary has one
+    /// <c>variable</c>, so a field, a local and a parameter arrive indistinguishable and every
+    /// theme paints them one colour — which is what this asserts is no longer true.
+    /// </summary>
+    [Fact]
+    public async Task SemanticTokensSeparateFieldsParametersAndProperties()
+    {
+        string text = await File.ReadAllTextAsync(FixturePaths.ServicesFile);
+        var tokens = await SemanticTokensHandler.SemanticTokensFullAsync(
+            "session",
+            new SemanticTokensParams(new TextDocumentIdentifier(
+                LspConverters.PathToUri(FixturePaths.ServicesFile))),
+            default);
+
+        string TypeAt(string anchor, int offsetInAnchor = 0)
+        {
+            var (line, character) = PositionOf(text, anchor);
+            return TokenTypeAt(tokens.Data, line, character + offsetInAnchor);
+        }
+
+        Assert.Equal("field", TypeAt("_results.Add(result)"));
+        Assert.Equal("parameter", TypeAt("result) => _results"));
+        Assert.Equal("property", TypeAt("Sum)"));
+        Assert.Equal("enumMember", TypeAt("Pending,"));
+        Assert.Equal("interface", TypeAt("IStringFormatter"));
+        Assert.Equal("method", TypeAt("AddResult(Result result)"));
+    }
+
+    /// <summary>
+    /// The token types only mean something if the shipped theme has an opinion about them.
+    /// Adding a type to the legend without adding it here is the easy way to reintroduce exactly
+    /// the flat colouring the split was for.
+    /// </summary>
+    [Fact]
+    public void ShippedThemeColoursEveryTokenTypeInTheLegend()
+    {
+        if (FixturePaths.VsCodeExtensionDir is not { } extension)
+            return; // Running from output with no source tree above; nothing to read.
+
+        using var theme = System.Text.Json.JsonDocument.Parse(
+            File.ReadAllText(Path.Combine(extension, "themes", "rider-islands-dark.json")));
+        var colours = theme.RootElement.GetProperty("semanticTokenColors");
+
+        var missing = SemanticTokensHandler.TokenTypes
+            .Where(type => !colours.TryGetProperty(type, out _))
+            .ToArray();
+
+        Assert.True(missing.Length == 0, $"theme has no colour for: {string.Join(", ", missing)}");
+    }
+
+    /// <summary>Decodes the delta encoding far enough to name the token covering a position.</summary>
+    private static string TokenTypeAt(int[] data, int line, int character)
+    {
+        int currentLine = 0, currentChar = 0;
+        for (int i = 0; i < data.Length; i += 5)
+        {
+            currentLine += data[i];
+            currentChar = data[i] == 0 ? currentChar + data[i + 1] : data[i + 1];
+
+            if (currentLine == line
+                && character >= currentChar
+                && character < currentChar + data[i + 2])
+            {
+                return SemanticTokensHandler.TokenTypes[data[i + 3]];
+            }
+        }
+
+        return $"(no token at {line}:{character})";
+    }
+
     private static (int Line, int Character) PositionOf(string text, string anchor)
     {
         int index = text.IndexOf(anchor, StringComparison.Ordinal);

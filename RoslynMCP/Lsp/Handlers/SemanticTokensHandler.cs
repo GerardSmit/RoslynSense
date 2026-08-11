@@ -17,18 +17,27 @@ internal static class SemanticTokensHandler
 {
     /// <summary>Legend advertised in server capabilities. Indexes into this array are the
     /// token type values in the encoded data.</summary>
+    /// <remarks>
+    /// Append only. Language packs are handed the indices after this array, so inserting in the
+    /// middle silently renumbers every pack token. The tail past <c>label</c> is where C# stops
+    /// speaking the LSP standard vocabulary: the standard has one <c>variable</c> for what C#
+    /// (and Rider, and Visual Studio) colour as four different things, so the distinctions get
+    /// their own names and the client is told how to degrade them in
+    /// <c>contributes.semanticTokenTypes</c>.
+    /// </remarks>
     public static readonly string[] TokenTypes =
     [
         "namespace", "class", "struct", "interface", "enum", "enumMember", "typeParameter",
         "method", "property", "event", "parameter", "variable", "keyword", "comment",
         "string", "number", "operator", "macro", "type", "label",
+        "field", "constant", "local", "delegate", "extensionMethod",
     ];
 
     /// <summary>Legend of modifier bits. Index i in this array is bit 1&lt;&lt;i in the encoded
     /// modifier field.</summary>
     public static readonly string[] TokenModifiers =
     [
-        "static", "readonly", "declaration",
+        "static", "readonly", "declaration", "reassigned",
     ];
 
     private static readonly Dictionary<string, int> s_typeIndex =
@@ -36,6 +45,7 @@ internal static class SemanticTokensHandler
 
     private const int StaticModifier = 1 << 0;
     private const int ReadonlyModifier = 1 << 1;
+    private const int ReassignedModifier = 1 << 3;
 
     /// <summary>
     /// Roslyn emits additive classifications as spans that overlap the primary one — a static
@@ -48,6 +58,7 @@ internal static class SemanticTokensHandler
         [ClassificationTypeNames.StaticSymbol] = StaticModifier,
         ["static symbol"] = StaticModifier,
         [ClassificationTypeNames.ConstantName] = ReadonlyModifier,
+        [ClassificationTypeNames.ReassignedVariable] = ReassignedModifier,
     };
 
     /// <summary>Roslyn classification type → legend token type. Additive classifications
@@ -64,15 +75,18 @@ internal static class SemanticTokensHandler
         [ClassificationTypeNames.EnumName] = "enum",
         [ClassificationTypeNames.EnumMemberName] = "enumMember",
         [ClassificationTypeNames.TypeParameterName] = "typeParameter",
-        [ClassificationTypeNames.DelegateName] = "type",
+        [ClassificationTypeNames.DelegateName] = "delegate",
         [ClassificationTypeNames.MethodName] = "method",
-        [ClassificationTypeNames.ExtensionMethodName] = "method",
+        [ClassificationTypeNames.ExtensionMethodName] = "extensionMethod",
         [ClassificationTypeNames.PropertyName] = "property",
         [ClassificationTypeNames.EventName] = "event",
         [ClassificationTypeNames.ParameterName] = "parameter",
-        [ClassificationTypeNames.LocalName] = "variable",
-        [ClassificationTypeNames.FieldName] = "variable",
-        [ClassificationTypeNames.ConstantName] = "variable",
+        [ClassificationTypeNames.LocalName] = "local",
+        [ClassificationTypeNames.FieldName] = "field",
+        [ClassificationTypeNames.ConstantName] = "constant",
+        // Query range variables (`from x in …`). Spelled out because the constant is not on the
+        // ClassificationTypeNames surface this Roslyn version exposes.
+        ["range variable name"] = "variable",
         [ClassificationTypeNames.Keyword] = "keyword",
         [ClassificationTypeNames.ControlKeyword] = "keyword",
         [ClassificationTypeNames.PreprocessorKeyword] = "macro",

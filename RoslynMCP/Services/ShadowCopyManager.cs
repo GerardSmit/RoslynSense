@@ -1,4 +1,4 @@
-namespace RoslynMCP.Services;
+﻿namespace RoslynMCP.Services;
 
 /// <summary>
 /// Manages shadow-copying of analyzer DLLs to a temporary directory so that the
@@ -32,6 +32,14 @@ internal sealed class ShadowCopyManager : IDisposable
     /// <summary>Source directory → debounce timer for coalescing rapid FS events.</summary>
     private readonly Dictionary<string, Timer> _debounceTimers = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Source directory → content hash of its DLLs when it was last accepted. What
+    /// decides whether a write was a real rebuild; see <see cref="OnQuiet"/>.</summary>
+    private readonly Dictionary<string, string> _fingerprints = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How long a watched directory must stop changing before it is judged. A build
+    /// writes its outputs in bursts, and each burst used to be its own eviction.</summary>
+    private static readonly TimeSpan RebuildQuiet = TimeSpan.FromMilliseconds(1000);
+
     private readonly string _nugetPackagesDir;
 
     /// <summary>Directory trees a build never writes to, so analyzers in them can be loaded in
@@ -47,11 +55,23 @@ internal sealed class ShadowCopyManager : IDisposable
     /// </summary>
     public event Action<string>? AnalyzerDirectoryChanged;
 
-    public ShadowCopyManager()
+    public ShadowCopyManager() : this(cleanupStaleInstances: true)
+    {
+    }
+
+    /// <summary>
+    /// <paramref name="cleanupStaleInstances"/> is for tests that need a second manager in this
+    /// process. The cleanup reclaims shadow directories left by crashed instances, which it
+    /// identifies by being able to take their lock — a reasonable thing to do once at startup, and
+    /// a destructive one for a manager created alongside the live one, whose copies it can delete
+    /// out from under whatever is loading analyzers at the time.
+    /// </summary>
+    internal ShadowCopyManager(bool cleanupStaleInstances)
     {
         _nugetPackagesDir = GetNuGetPackagesDirectory();
         _immutableRoots = BuildImmutableRoots(_nugetPackagesDir);
-        CleanupStaleInstances();
+        if (cleanupStaleInstances)
+            CleanupStaleInstances();
 
         _instanceDir = Path.Combine(BaseDir, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_instanceDir);
@@ -245,6 +265,7 @@ internal sealed class ShadowCopyManager : IDisposable
         Directory.CreateDirectory(shadowDir);
 
         // Copy all DLLs, PDBs, and JSON metadata (e.g. .deps.json, .runtimeconfig.json)
+        bool copiedEverything = true;
         foreach (var file in Directory.GetFiles(sourceDir))
         {
             string ext = Path.GetExtension(file).ToLowerInvariant();
@@ -256,6 +277,7 @@ internal sealed class ShadowCopyManager : IDisposable
                 }
                 catch (Exception ex)
                 {
+                    copiedEverything = false;
                     Console.Error.WriteLine(
                         $"[ShadowCopy] Failed to copy '{Path.GetFileName(file)}': {ex.Message}");
                 }
@@ -263,6 +285,28 @@ internal sealed class ShadowCopyManager : IDisposable
         }
 
         _shadowDirectories[sourceDir] = shadowDir;
+
+        // Recorded before the watcher is armed: without a baseline the first write of any kind
+        // counts as a rebuild, which is the case this is meant to stop.
+        //
+        // Only when every file actually copied. A DLL locked mid-build is skipped above, and
+        // stamping the source's fingerprint anyway claims a shadow copy we do not have — the next
+        // quiet period then matches, reports "rewritten with identical content", and never
+        // invalidates, so the analyzer the user just rebuilt never takes effect all session.
+        if (copiedEverything && TryFingerprint(sourceDir) is { } fingerprint)
+        {
+            _fingerprints[sourceDir] = fingerprint;
+        }
+        else
+        {
+            // Dropped, not merely left unwritten. A rebuild records the source's new fingerprint
+            // before re-copying, so an incomplete copy would leave a stamp that matches what is on
+            // disk — and the next rebuild of unchanged sources produces those same bytes, is judged
+            // "identical content", and never invalidates. The half-copied analyzer would then stay
+            // broken for the rest of the session.
+            _fingerprints.Remove(sourceDir);
+        }
+
         EnsureWatcher(sourceDir);
 
         Console.Error.WriteLine($"[ShadowCopy] Copied '{sourceDir}' → '{shadowDir}'");
@@ -303,13 +347,78 @@ internal sealed class ShadowCopyManager : IDisposable
             if (_debounceTimers.TryGetValue(directory, out var existing))
                 existing.Dispose();
 
-            _debounceTimers[directory] = new Timer(_ =>
+            _debounceTimers[directory] = new Timer(
+                _ => OnQuiet(directory), null, RebuildQuiet, Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    /// <summary>
+    /// The directory stopped changing. Invalidate only if what it holds is actually different.
+    /// </summary>
+    /// <remarks>
+    /// The watcher fires on writes, and a build writes an analyzer's DLL whether or not the
+    /// analyzer changed — so building anything evicted every workspace that had pinned it, which
+    /// meant a full MSBuild reload of the solution after every build. The compiler is deterministic
+    /// for unchanged input, so comparing content tells a real rebuild from a rewrite of the same
+    /// bytes, and only a real one is worth throwing a workspace away for.
+    /// </remarks>
+    private void OnQuiet(string directory)
+    {
+        string? fingerprint = TryFingerprint(directory);
+
+        lock (_lock)
+        {
+            if (_disposed)
+                return;
+
+            if (fingerprint is not null
+                && _fingerprints.TryGetValue(directory, out var previous)
+                && previous == fingerprint)
             {
-                Invalidate(directory);
                 Console.Error.WriteLine(
-                    $"[ShadowCopy] Detected rebuild in '{directory}', invalidated shadow copy.");
-                AnalyzerDirectoryChanged?.Invoke(directory);
-            }, null, TimeSpan.FromMilliseconds(500), Timeout.InfiniteTimeSpan);
+                    $"[ShadowCopy] '{directory}' was rewritten with identical content; keeping the workspace.");
+                return;
+            }
+
+            if (fingerprint is not null)
+                _fingerprints[directory] = fingerprint;
+        }
+
+        Invalidate(directory);
+        Console.Error.WriteLine(
+            $"[ShadowCopy] Detected rebuild in '{directory}', invalidated shadow copy.");
+        AnalyzerDirectoryChanged?.Invoke(directory);
+    }
+
+    /// <summary>
+    /// A content hash over the directory's DLLs, or null if it could not be read — mid-build the
+    /// files are locked, and an unreadable directory must not be mistaken for an unchanged one.
+    /// </summary>
+    private static string? TryFingerprint(string directory)
+    {
+        try
+        {
+            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(
+                System.Security.Cryptography.HashAlgorithmName.SHA256);
+
+            foreach (string file in Directory.EnumerateFiles(directory, "*.dll")
+                         .OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+            {
+                hash.AppendData(System.Text.Encoding.UTF8.GetBytes(Path.GetFileName(file)));
+
+                using var stream = new FileStream(
+                    file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var buffer = new byte[81920];
+                int read;
+                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    hash.AppendData(buffer, 0, read);
+            }
+
+            return Convert.ToHexString(hash.GetHashAndReset());
+        }
+        catch
+        {
+            return null;
         }
     }
 

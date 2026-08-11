@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using NuGet.Common;
 using NuGet.Protocol.Core.Types;
 using NuGet.Versioning;
@@ -361,8 +361,14 @@ public static class NuGetService
 
             var (exitCode, output) = await RunDotnetAsync(argumentsFor(project), ct);
             if (exitCode != 0)
+            {
                 failures.Add($"{Path.GetFileName(project)}: {FirstLine(output)}");
+                continue;
+            }
 
+            // Only on success. A rejected version or an unreachable feed changes nothing on disk,
+            // and reloading the workspace to discover that is pure cost — the other per-project
+            // paths already gate on this.
             scope.Touch(project);
         }
 

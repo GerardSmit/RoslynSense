@@ -405,13 +405,18 @@ internal static class ProjectIndexCacheService
         bool isCSharp = ext.Equals(".cs", StringComparison.OrdinalIgnoreCase);
         bool isResx = ext.Equals(".resx", StringComparison.OrdinalIgnoreCase);
 
-        if (isAspx || isCSharp)
+        // A .cs only counts when one appeared or disappeared. The index maps markup files to the
+        // code-behind beside them, so the set of .cs files can change it — but editing the contents
+        // of one cannot, and treating every save as a change rebuilt the whole site: a recursive
+        // walk over six extensions, then a read and a full parse of every .aspx/.ascx/.master in
+        // it. On a large site that is thousands of files for a keystroke's worth of saved text.
+        if (isAspx || (isCSharp && movedFiles))
         {
             entry.AspxDirty = true;
             Interlocked.Increment(ref entry.AspxGeneration);
         }
 
-        if (isRazor || isCSharp)
+        if (isRazor || (isCSharp && movedFiles))
         {
             entry.RazorDirty = true;
             Interlocked.Increment(ref entry.RazorGeneration);

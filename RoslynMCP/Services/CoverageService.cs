@@ -295,7 +295,11 @@ public static class CoverageService
         }
     }
 
-    private static async Task<string?> FindOrProvisionDotnetCoverageAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// The <c>dotnet-coverage</c> executable, installing it as a global tool if it is missing.
+    /// Shared with the per-test attribution builder, which drives the same tool in session mode.
+    /// </summary>
+    internal static async Task<string?> FindOrProvisionDotnetCoverageAsync(CancellationToken cancellationToken)
     {
         // Check if dotnet-coverage is on PATH
         try
@@ -490,6 +494,17 @@ public static class CoverageService
         Span<byte> hash = stackalloc byte[32];
         hasher.GetHashAndReset(hash);
         return Convert.ToHexString(hash);
+    }
+
+    /// <summary>
+    /// Parses one Cobertura document without touching the session's cached coverage — for the
+    /// attribution builder, which reads one document per group of tests.
+    /// </summary>
+    internal static CoverageData ParseCoberturaFile(string path)
+    {
+        var data = ParseCoberturaXml(path);
+        ComputeSourceHashes(data);
+        return data;
     }
 
     private static CoverageData ParseCoberturaXml(string path)

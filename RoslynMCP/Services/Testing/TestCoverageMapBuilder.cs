@@ -23,6 +23,17 @@ public sealed record CoverageMapProgress(
 /// </remarks>
 public static class TestCoverageMapBuilder
 {
+    /// <summary>"Namespace.Class.Method(args)" — everything before the last dot outside the
+    /// parameter list, which is how a test's name names its class.</summary>
+    internal static string ClassNameOf(string fullyQualifiedName)
+    {
+        int cut = fullyQualifiedName.IndexOf('(');
+        string withoutArguments = cut >= 0 ? fullyQualifiedName[..cut] : fullyQualifiedName;
+
+        int lastDot = withoutArguments.LastIndexOf('.');
+        return lastDot > 0 ? withoutArguments[..lastDot] : withoutArguments;
+    }
+
     public static async Task<CoverageMapBuildResult> BuildAsync(
         string projectPath,
         bool force = false,

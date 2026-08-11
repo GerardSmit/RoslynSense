@@ -10,13 +10,15 @@ using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 namespace RoslynMCP.Lsp.Handlers;
 
 /// <summary>
-/// textDocument/codeLens + codeLens/resolve. Two lens kinds per member:
+/// textDocument/codeLens + codeLens/resolve. Lens kinds per member:
 /// - reference count — returned unresolved (Data only); codeLens/resolve runs the
 ///   workspace-wide FindReferencesAsync, so only lenses actually visible in the editor pay it
+/// - "N tests" — how many tests the per-test coverage map says execute this member; inline,
+///   because it is a lookup in an already-loaded file rather than a search
 /// - "Run test" on xUnit/NUnit/MSTest methods — inline
 /// (Inheritance relations are gutter markers via roslynSense/inheritanceMarkers, not lenses.)
-/// Commands are client-side: roslynSense.runTest, roslynSense.showReferences
-/// (see the VSCode extension).
+/// Commands are client-side: roslynSense.runTest, roslynSense.showReferences,
+/// roslynSense.showTestsAt (see the VSCode extension).
 /// </summary>
 internal static class CodeLensHandler
 {
@@ -46,10 +48,30 @@ internal static class CodeLensHandler
         string? projectPath = document.Project.FilePath;
         var lenses = new List<LspCodeLens>();
 
+        // Read once for the whole document: the coverage map is a solution-wide file, and the
+        // rows for this file are all any member in it can match against.
+        var coverageRows = TestCoverageLenses.ForFile(document.FilePath);
+
         foreach (var (declaration, identifier) in EnumerateMembers(root))
         {
             var range = LspConverters.ToRange(text.Lines, identifier);
             var identifierPosition = text.Lines.GetLinePosition(identifier.Start);
+
+            // "N tests" — which tests are known to execute this member. Absent entirely when
+            // nothing covers it, rather than a lens per method reading "0 tests".
+            if (coverageRows.Count > 0)
+            {
+                int testCount = TestCoverageLenses.CountTests(
+                    coverageRows, TestCoverageLenses.LineRangeOf(declaration));
+
+                if (testCount > 0)
+                {
+                    lenses.Add(new LspCodeLens(range, new Command(
+                        testCount == 1 ? "1 test" : $"{testCount} tests",
+                        "roslynSense.showTestsAt",
+                        [p.TextDocument.Uri, identifierPosition.Line, identifierPosition.Character])));
+                }
+            }
 
             // Reference count: deferred to codeLens/resolve.
             lenses.Add(new LspCodeLens(range, Command: null)

@@ -173,6 +173,208 @@ internal static class TestHandler
     }
 
     /// <summary>
+    /// The tests that execute the member at a position, from the per-test coverage map — what
+    /// the per-method lens counts, and what clicking it lists.
+    /// </summary>
+    public static async Task<CoveringTestInfo[]> TestsCoveringAsync(
+        TestsCoveringParams p, CancellationToken ct)
+    {
+        string path = LspConverters.UriToPath(p.Uri);
+        var map = TestCoverageMapStore.LoadNearest(path);
+        if (map.IsEmpty)
+            return [];
+
+        var document = await LspDocumentResolver.ResolveAsync(path, ct);
+        if (document is null)
+            return [];
+
+        var root = await document.GetSyntaxRootAsync(ct);
+        var text = await document.GetTextAsync(ct);
+        if (root is null)
+            return [];
+
+        // The member the position is in, not the position itself: a lens sits on the identifier
+        // and the tests that matter are the ones that ran anything in the body below it.
+        var range = TestCoverageLenses.MemberLineRange(root, text, p.Line, p.Character);
+        if (range is not { } lines)
+            return [];
+
+        var covering = map.EntriesCovering(path, [lines]);
+        if (covering.Count == 0)
+            return [];
+
+        // Located from the test project's own discovery so the client can jump to each test;
+        // the map stores names, not positions, because positions go stale and names do not.
+        var locations = new Dictionary<string, DiscoveredTest>(StringComparer.Ordinal);
+        foreach (string project in covering.Select(e => e.ProjectPath).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrEmpty(project))
+                continue;
+
+            try
+            {
+                foreach (var test in await TestDiscoveryService.DiscoverAsync(project, cancellationToken: ct))
+                    locations[test.FullyQualifiedName] = test;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn(
+                    $"Could not locate tests in '{Path.GetFileName(project)}': {ex.Message}",
+                    key: "tests-covering");
+            }
+        }
+
+        var results = new List<CoveringTestInfo>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var entry in covering)
+        {
+            foreach (string test in entry.Tests)
+            {
+                if (!seen.Add(test))
+                    continue;
+
+                locations.TryGetValue(test, out var located);
+                results.Add(new CoveringTestInfo(
+                    test,
+                    located?.DisplayName ?? test[(test.LastIndexOf('.') + 1)..],
+                    entry.ClassFullName,
+                    entry.ProjectPath,
+                    located?.FilePath ?? entry.SourceFilePath,
+                    located?.StartLine ?? 1));
+            }
+        }
+
+        return [.. results.OrderBy(t => t.FullyQualifiedName, StringComparer.Ordinal)];
+    }
+
+    /// <summary>
+    /// What the coverage view shows: the last measurement of every method, with the number of
+    /// tests the per-test map attributes to it.
+    /// </summary>
+    public static CoverageSnapshotResult CoverageSnapshot(CoverageSnapshotParams p)
+    {
+        string anchor = p.AnchorPath is { Length: > 0 } given
+            ? given
+            : WorkspaceService.BoundSolutionPath ?? Environment.CurrentDirectory;
+
+        var snapshot = CoverageSnapshotStore.LoadNearest(anchor);
+        var map = TestCoverageMapStore.LoadNearest(anchor);
+
+        // One pass over the map per file rather than per method: a solution's snapshot holds
+        // tens of thousands of methods, and the map is walked for each of them otherwise.
+        var rowsByFile = new Dictionary<string, IReadOnlyList<(CoverageMapEntry Entry, CoveredFile File)>>(
+            StringComparer.OrdinalIgnoreCase);
+
+        var methods = snapshot.Methods.Select(method =>
+        {
+            int tests = 0;
+            if (!map.IsEmpty && method.FilePath is { Length: > 0 })
+            {
+                if (!rowsByFile.TryGetValue(method.FilePath, out var rows))
+                    rowsByFile[method.FilePath] = rows = map.EntriesForFile(method.FilePath);
+
+                // The method's own line span is not recorded in the snapshot; its first and last
+                // measured statements bound it closely enough to attribute tests to it.
+                tests = TestCoverageLenses.CountTests(
+                    rows, new LineRange(method.Line, method.Line + Math.Max(0, method.TotalStatements - 1)));
+            }
+
+            return new CoverageMethodInfo(
+                method.Namespace, method.ClassFullName, method.MethodName,
+                method.FilePath, method.Line,
+                method.CoveredStatements, method.TotalStatements,
+                method.CoveredBranches, method.TotalBranches,
+                tests);
+        }).ToArray();
+
+        return new CoverageSnapshotResult(
+            snapshot.IsEmpty ? null : snapshot.CollectedAtUtc.ToString("O"),
+            methods,
+            map.TestCount);
+    }
+
+    /// <summary>
+    /// Builds the per-test coverage map the lens and the impacted-test run read from. Long —
+    /// one coverage run per test class — so it reports progress per class.
+    /// </summary>
+    public static async Task<BuildCoverageMapResult> BuildCoverageMapAsync(
+        BuildCoverageMapParams p, CancellationToken ct)
+    {
+        await using var progress = await ProgressReporter.BeginAsync("Building test coverage map", ct);
+
+        var projects = p.ProjectPath is { Length: > 0 } given
+            ? [given]
+            : (await TestDiscoveryService.FindTestProjectsAsync(ct)).Select(t => t.ProjectPath).ToList();
+
+        if (projects.Count == 0)
+            return new BuildCoverageMapResult(0, 0, 0, [], "No test projects were found.");
+
+        int run = 0, reused = 0, mapped = 0;
+        var failures = new List<string>();
+        string? error = null;
+
+        foreach (string project in projects)
+        {
+            string label = Path.GetFileNameWithoutExtension(project);
+            var result = await TestCoverageMapBuilder.BuildAsync(
+                project, p.Force, classFilter: null, ct: ct,
+                onProgress: item => progress.Report(
+                    $"{label}: {item.ClassFullName} ({item.Index}/{item.Total})",
+                    item.Total == 0 ? null : item.Index * 100 / item.Total));
+
+            if (result.Error is not null)
+            {
+                // One project failing is not the whole build failing: another may still map.
+                error ??= result.Error;
+                continue;
+            }
+
+            run += result.ClassesRun;
+            reused += result.ClassesReused;
+            mapped = result.Map.TestCount;
+            failures.AddRange(result.Failures);
+        }
+
+        return new BuildCoverageMapResult(
+            run, reused, mapped, [.. failures], run + reused == 0 ? error : null);
+    }
+
+    /// <summary>
+    /// The tests the working copy's changes can affect. The editor runs these through the Test
+    /// Explorer, so this answers with names and leaves the running to the existing path.
+    /// </summary>
+    public static async Task<ImpactedTestsResult> ImpactedAsync(ImpactedTestsParams p, CancellationToken ct)
+    {
+        await using var progress = await ProgressReporter.BeginAsync("Finding impacted tests", ct);
+
+        string anchor = p.AnchorPath is { Length: > 0 } given
+            ? given
+            : WorkspaceService.BoundSolutionPath ?? Environment.CurrentDirectory;
+
+        var scope = p.Scope?.Trim().ToLowerInvariant() switch
+        {
+            "branch" => GitChangeScope.Branch,
+            "ref" or "reference" => GitChangeScope.Ref,
+            _ => GitChangeScope.Uncommitted,
+        };
+
+        var selection = await TestImpactService.SelectAsync(anchor, scope, p.GitRef, ct: ct);
+
+        return new ImpactedTestsResult(
+            selection.Tests
+                .Select(t => new ImpactedTestInfo(
+                    t.FullyQualifiedName, t.ClassFullName, t.ProjectPath, t.Reason.ToString(), t.Because))
+                .ToArray(),
+            selection.ChangedFiles.Select(f => f.FilePath).ToArray(),
+            [.. selection.UncoveredFiles],
+            selection.Description,
+            selection.MapWasEmpty,
+            selection.Error);
+    }
+
+    /// <summary>
     /// Cobertura reports conditions as the string "50% (1/2)"; the counts are what the editor's
     /// coverage view needs, so they are pulled back out of it.
     /// </summary>

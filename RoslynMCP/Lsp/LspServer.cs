@@ -505,6 +505,22 @@ internal sealed class LspServer : IDisposable
     public FileCoverageInfo[] TestCoverage(TestCoverageParams p) =>
         Handlers.TestHandler.Coverage(p);
 
+    [JsonRpcMethod("roslynSense/testsCovering", UseSingleObjectParameterDeserialization = true)]
+    public Task<CoveringTestInfo[]> TestsCovering(TestsCoveringParams p, CancellationToken ct) =>
+        Handlers.TestHandler.TestsCoveringAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/coverageSnapshot", UseSingleObjectParameterDeserialization = true)]
+    public CoverageSnapshotResult CoverageSnapshot(CoverageSnapshotParams p) =>
+        Handlers.TestHandler.CoverageSnapshot(p);
+
+    [JsonRpcMethod("roslynSense/buildCoverageMap", UseSingleObjectParameterDeserialization = true)]
+    public Task<BuildCoverageMapResult> BuildCoverageMap(BuildCoverageMapParams p, CancellationToken ct) =>
+        Handlers.TestHandler.BuildCoverageMapAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/impactedTests", UseSingleObjectParameterDeserialization = true)]
+    public Task<ImpactedTestsResult> ImpactedTests(ImpactedTestsParams p, CancellationToken ct) =>
+        Handlers.TestHandler.ImpactedAsync(p, ct);
+
     [JsonRpcMethod("workspace/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceDiagnosticReport> WorkspaceDiagnostic(
         WorkspaceDiagnosticParams p, CancellationToken ct) =>

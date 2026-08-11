@@ -104,6 +104,50 @@ export async function runTestById(
     return true;
 }
 
+/**
+ * Runs a named set of tests as one Test Explorer run — what "run the tests my changes affect"
+ * needs, since the selection is a list of fully-qualified names spread across projects rather
+ * than a subtree the user clicked.
+ *
+ * Returns the names it could not find in the tree; a caller that changed a test's name since
+ * the coverage map was built will see them, and they are worth saying out loud rather than
+ * silently running fewer tests than were selected.
+ */
+export async function runTestsByName(
+    fullyQualifiedNames: string[],
+    mode: 'run' | 'debug' = 'run'
+): Promise<{ ran: number; missing: string[] } | undefined> {
+    if (!activeController || !activeGetClient?.()) {
+        return undefined;
+    }
+
+    await activeEnsureDiscovered?.();
+
+    const items: vscode.TestItem[] = [];
+    const missing: string[] = [];
+    for (const name of fullyQualifiedNames) {
+        const item = findTestItem(activeController, name);
+        if (item) {
+            items.push(item);
+        } else {
+            missing.push(name);
+        }
+    }
+
+    if (items.length === 0) {
+        return { ran: 0, missing };
+    }
+
+    const profile = mode === 'debug' ? activeDebugProfile : activeRunProfile;
+    if (!profile) {
+        return undefined;
+    }
+
+    const request = new vscode.TestRunRequest(items, undefined, profile);
+    await profile.runHandler(request, new vscode.CancellationTokenSource().token);
+    return { ran: items.length, missing };
+}
+
 let activeController: vscode.TestController | undefined;
 let activeGetClient: (() => LanguageClient | undefined) | undefined;
 let activeRunProfile: vscode.TestRunProfile | undefined;

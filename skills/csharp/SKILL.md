@@ -117,6 +117,13 @@ Reach for `dotnet build` / `dotnet publish` / `MSBuild` directly only for someth
 - Use the **RunCoverage** MCP tool to collect coverage, then **GetCoverage** to query results by file, class, or method.
 - Re-run RunCoverage after code changes that affect coverage.
 
+### Running only the tests your changes affect
+
+- **RunImpactedTests** runs the tests the current git changes can reach, instead of the whole suite. Use it as the inner loop while iterating; run the full suite before you call the work done.
+- Set `dryRun: true` first when you want to see the selection and why each test was picked.
+- `scope` is `uncommitted` by default; use `branch` for everything since the merge base with main, or `ref` with `gitRef` for an explicit revision.
+- The selection is only as good as the per-test coverage map — **BuildCoverageMap** builds it (one coverage run per test class, incremental afterwards). Without a map the selection falls back to walking references, which cannot see calls made through DI or reflection.
+
 ## Test framework
 
 - **Use the framework already in the solution** (xUnit/NUnit/MSTest) for new tests. Check with **GetProjectStructure** which detects the test framework automatically.
@@ -249,6 +256,11 @@ Use these tools to trace code flows and understand relationships:
 1. **RunCoverage** — collect coverage data. Must be called before GetCoverage. Set `background: true` for background collection.
 2. **GetCoverage** — query results by file, class, or method. Shows line and branch coverage with uncovered lines.
 - Re-run RunCoverage after code changes that affect coverage.
+
+### Test impact
+
+1. **BuildCoverageMap** — record which tests execute which lines. Slow the first time (one coverage run per test class), incremental after.
+2. **RunImpactedTests** — run only what the current git changes affect. `dryRun: true` shows the selection without running it.
 
 ## Workflow: Running an Application
 
@@ -397,6 +409,7 @@ For long-running operations (tests, builds, coverage), set `background: true` to
 | Apply a code fix | **GetCodeActions** with `applyIndex` | Manual editing |
 | Run a specific test | **RunTests** with `filter` | `dotnet test --filter` (use RunTests instead) |
 | Check test coverage | **RunCoverage** then **GetCoverage** | Manual inspection |
+| Re-run tests after an edit | **RunImpactedTests** | Running the whole suite for a one-file change |
 | Debug a failing test | **DebugStartTest** | Adding Console.WriteLine |
 | Fix a missing control field in a code-behind | **RegenerateDesigner** | Editing the `.designer.cs`, or declaring the field by hand |
 | Update code after editing ASPX markup or a `.dbml` | **RegenerateDesigner** (or let **OpenSolution** watch) | Hand-writing the generated file |

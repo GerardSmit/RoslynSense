@@ -74,6 +74,84 @@ public sealed record TestDebugResult(
 public sealed record TestCoverageParams(
     [property: JsonPropertyName("projectPath")] string ProjectPath);
 
+/// <summary>Which tests execute the code at one position — what the per-method lens counts and
+/// what its click lists.</summary>
+public sealed record TestsCoveringParams(
+    [property: JsonPropertyName("uri")] string Uri,
+    [property: JsonPropertyName("line")] int Line,
+    [property: JsonPropertyName("character")] int Character);
+
+public sealed record CoveringTestInfo(
+    [property: JsonPropertyName("fullyQualifiedName")] string FullyQualifiedName,
+    [property: JsonPropertyName("displayName")] string DisplayName,
+    [property: JsonPropertyName("className")] string ClassName,
+    [property: JsonPropertyName("projectPath")] string ProjectPath,
+    [property: JsonPropertyName("filePath")] string? FilePath,
+    [property: JsonPropertyName("line")] int Line);
+
+/// <param name="Scope">uncommitted | branch | ref</param>
+public sealed record ImpactedTestsParams(
+    [property: JsonPropertyName("scope")] string Scope = "uncommitted",
+    [property: JsonPropertyName("gitRef")] string? GitRef = null,
+    /// <summary>Any path inside the repository; the workspace root when the client has one.</summary>
+    [property: JsonPropertyName("anchorPath")] string? AnchorPath = null);
+
+public sealed record ImpactedTestInfo(
+    [property: JsonPropertyName("fullyQualifiedName")] string FullyQualifiedName,
+    [property: JsonPropertyName("className")] string ClassName,
+    [property: JsonPropertyName("projectPath")] string ProjectPath,
+    [property: JsonPropertyName("reason")] string Reason,
+    [property: JsonPropertyName("because")] string? Because);
+
+public sealed record CoverageSnapshotParams(
+    /// <summary>Any path in the solution; the workspace root when the client has one.</summary>
+    [property: JsonPropertyName("anchorPath")] string? AnchorPath = null);
+
+/// <summary>
+/// The coverage view's data: every measured method, flat. The namespace/class nesting is the
+/// client's to build — it is a rendering choice, not a fact about the measurement.
+/// </summary>
+public sealed record CoverageSnapshotResult(
+    [property: JsonPropertyName("collectedAtUtc")] string? CollectedAtUtc,
+    [property: JsonPropertyName("methods")] CoverageMethodInfo[] Methods,
+    /// <summary>How many tests the per-test map knows about, so the view can say whether the
+    /// "N tests" figures behind it exist at all.</summary>
+    [property: JsonPropertyName("mappedTests")] int MappedTests);
+
+public sealed record CoverageMethodInfo(
+    [property: JsonPropertyName("namespace")] string Namespace,
+    [property: JsonPropertyName("className")] string ClassName,
+    [property: JsonPropertyName("methodName")] string MethodName,
+    [property: JsonPropertyName("filePath")] string FilePath,
+    [property: JsonPropertyName("line")] int Line,
+    [property: JsonPropertyName("coveredStatements")] int CoveredStatements,
+    [property: JsonPropertyName("totalStatements")] int TotalStatements,
+    [property: JsonPropertyName("coveredBranches")] int CoveredBranches,
+    [property: JsonPropertyName("totalBranches")] int TotalBranches,
+    /// <summary>Tests known to execute this method, from the per-test map. Zero when no map has
+    /// been built — not the same as "nothing covers it", which is what 0 statements means.</summary>
+    [property: JsonPropertyName("tests")] int Tests);
+
+public sealed record BuildCoverageMapParams(
+    /// <summary>The test project to map. Null maps every test project in the solution.</summary>
+    [property: JsonPropertyName("projectPath")] string? ProjectPath = null,
+    [property: JsonPropertyName("force")] bool Force = false);
+
+public sealed record BuildCoverageMapResult(
+    [property: JsonPropertyName("classesRun")] int ClassesRun,
+    [property: JsonPropertyName("classesReused")] int ClassesReused,
+    [property: JsonPropertyName("testsMapped")] int TestsMapped,
+    [property: JsonPropertyName("failures")] string[] Failures,
+    [property: JsonPropertyName("error")] string? Error);
+
+public sealed record ImpactedTestsResult(
+    [property: JsonPropertyName("tests")] ImpactedTestInfo[] Tests,
+    [property: JsonPropertyName("changedFiles")] string[] ChangedFiles,
+    [property: JsonPropertyName("uncoveredFiles")] string[] UncoveredFiles,
+    [property: JsonPropertyName("description")] string Description,
+    [property: JsonPropertyName("mapWasEmpty")] bool MapWasEmpty,
+    [property: JsonPropertyName("error")] string? Error);
+
 public sealed record FileCoverageInfo(
     [property: JsonPropertyName("filePath")] string FilePath,
     [property: JsonPropertyName("lines")] LineCoverageInfo[] Lines);

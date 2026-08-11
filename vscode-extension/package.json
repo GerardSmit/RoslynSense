@@ -149,6 +149,25 @@
         "title": "RoslynSense: Show Inheritance"
       },
       {
+        "command": "roslynSense.showTestsAt",
+        "title": "RoslynSense: Show Tests Covering This Member"
+      },
+      {
+        "command": "roslynSense.runImpactedTests",
+        "title": "RoslynSense: Run Tests for Git Changes",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "roslynSense.buildCoverageMap",
+        "title": "RoslynSense: Build Test Coverage Map",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "roslynSense.refreshCoverage",
+        "title": "RoslynSense: Refresh Coverage View",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "roslynSense.showDebugSession",
         "title": "RoslynSense: Show AI Debug Session"
       },
@@ -387,6 +406,11 @@
           "id": "roslynSense.solutionExplorer",
           "name": "Solution",
           "contextualTitle": "Solution Explorer"
+        },
+        {
+          "id": "roslynSense.coverage",
+          "name": "Coverage",
+          "contextualTitle": "Test Coverage"
         }
       ]
     },
@@ -560,6 +584,10 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.showTestsAt",
+          "when": "false"
+        },
+        {
           "command": "roslynSense.showReferences",
           "when": "false"
         },
@@ -624,6 +652,21 @@
         }
       ],
       "view/title": [
+        {
+          "command": "roslynSense.runImpactedTests",
+          "when": "view == workbench.view.testing",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.refreshCoverage",
+          "when": "view == roslynSense.coverage",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.buildCoverageMap",
+          "when": "view == roslynSense.coverage",
+          "group": "navigation@2"
+        },
         {
           "command": "roslynSense.solutionExplorer.goToNode",
           "when": "view == roslynSense.solutionExplorer",

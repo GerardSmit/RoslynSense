@@ -16,6 +16,8 @@ import {
 } from 'vscode-languageclient/node';
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
 import { registerTestController, runTestById } from './testController';
+import { registerImpactedTests } from './impactedTests';
+import { registerCoverageExplorer } from './coverageExplorer';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerSearchEverywhere } from './searchEverywhere';
 import { registerVirtualDocuments } from './virtualDocuments';
@@ -2322,6 +2324,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerAiDebugAdapter(context);
     registerDebugLaunch(context, () => client);
     registerTestController(context, () => client);
+    registerImpactedTests(context, () => client);
+    registerCoverageExplorer(context, () => client);
     registerSolutionExplorer(context, () => client);
     registerVirtualDocuments(context, () => client);
     registerEmbeddedLanguages(context);

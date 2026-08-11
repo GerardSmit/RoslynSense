@@ -378,6 +378,8 @@ Capabilities: definition (incl. type definition), references, implementation, ho
 
 **Debugging and tests in the editor.** The VSCode extension contributes a `roslynsense` debug type backed by netcoredbg's DAP mode, so F5 builds and launches your app — with watch, locals, conditional breakpoints, exception filters, and variable editing — without the Microsoft C# extension. It also registers a Test Explorer (discovery via Roslyn against the loaded solution, runs via `dotnet test`, plus Debug Test and coverage gutters). Custom methods behind these: `roslynSense/debuggerPath`, `roslynSense/launchTargets`, `roslynSense/attachTargets`, `roslynSense/testProjects`, `roslynSense/testDiscover`, `roslynSense/testRun`, `roslynSense/testDebug`, `roslynSense/testCoverage`.
 
+**Test impact and coverage.** Each member carries an "N tests" code lens — how many tests are known to execute it — and clicking it lists them and offers to run the lot. A **Run Tests for Git Changes** button in the Testing view's toolbar runs only the tests your working copy's changes can affect, and a **Coverage** view in the RoslynSense sidebar shows namespace → class → method coverage with statement counts, worst first. All three read a per-test coverage map (built once per test class, refreshed incrementally) rather than an ordinary coverage report, which cannot say which test hit which line. Custom methods: `roslynSense/testsCovering`, `roslynSense/impactedTests`, `roslynSense/buildCoverageMap`, `roslynSense/coverageSnapshot`.
+
 The VSCode extension also shows a status-bar counter of applications launched by AI chats (`run_project`), with click-to-inspect and kill (custom `roslynSense/runningProcesses` / `roslynSense/killProcess`, backed by a cross-process registry — launches stay per-chat, visibility is machine-wide).
 
 Options: `--solution <path>` pins the solution explicitly; otherwise the nearest solution to the working directory is used.
@@ -475,6 +477,8 @@ it, so two chats never fight over one process.
 | **RunCoverage** | Collect code coverage for a test project using coverlet. Caches results for querying. Set `background: true` for background collection. |
 | **GetCoverage** | Query coverage by project, file, class, or method. Shows line and branch coverage with uncovered lines. |
 | **GetMethodCoverage** | Get per-line coverage detail for a specific method. Shows every executable line with hit count and source code. Lines marked with `!` have partial branch coverage. |
+| **BuildCoverageMap** | Build the per-test coverage map — which tests execute which lines. Runs coverage once per test class, then rebuilds only the classes whose source changed. |
+| **RunImpactedTests** | Run only the tests your current git changes can affect. Matches changed lines against the coverage map, and walks references for code the map has not seen yet. `scope`: `uncommitted` (default), `branch`, or `ref`. Set `dryRun: true` to see the selection and why each test was picked. |
 
 ### Debugging
 

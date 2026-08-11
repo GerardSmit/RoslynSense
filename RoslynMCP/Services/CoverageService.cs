@@ -25,6 +25,32 @@ public static class CoverageService
         string projectPath, string? filter = null, int timeoutSeconds = 300,
         CancellationToken cancellationToken = default, BuildWarningsStore? warningsStore = null)
     {
+        var result = await CollectAsync(projectPath, filter, timeoutSeconds, cancellationToken, warningsStore);
+        if (result.Data is null)
+            return result;
+
+        lock (Lock)
+        {
+            _cachedData = result.Data;
+            _cachedProjectPath = result.ProjectPath ?? projectPath;
+            _cachedAt = DateTime.UtcNow;
+        }
+
+        // Also to disk, so the coverage view has something to show in a process that did not run
+        // the tests — the editor's, most of the time.
+        Testing.CoverageSnapshotStore.Record(result.ProjectPath ?? projectPath, result.Data);
+
+        return result with { Message = FormatSummary(result.Data, result.ProjectPath ?? projectPath) };
+    }
+
+    /// <summary>
+    /// One coverage run, parsed but not cached — for callers that run many filtered passes in a
+    /// row and must not have each one overwrite the session's "current" coverage.
+    /// </summary>
+    public static async Task<CoverageResult> CollectAsync(
+        string projectPath, string? filter = null, int timeoutSeconds = 300,
+        CancellationToken cancellationToken = default, BuildWarningsStore? warningsStore = null)
+    {
         string csprojPath;
         if (projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) && File.Exists(projectPath))
         {
@@ -128,14 +154,7 @@ public static class CoverageService
             var data = ParseCoberturaXml(coberturaFile);
             ComputeSourceHashes(data);
 
-            lock (Lock)
-            {
-                _cachedData = data;
-                _cachedProjectPath = csprojPath;
-                _cachedAt = DateTime.UtcNow;
-            }
-
-            return new CoverageResult(true, FormatSummary(data, csprojPath), data);
+            return new CoverageResult(true, "", data, csprojPath);
         }
         finally
         {
@@ -268,13 +287,7 @@ public static class CoverageService
 
             var data = ParseCoberturaXml(outputPath);
             ComputeSourceHashes(data);
-            lock (Lock)
-            {
-                _cachedData = data;
-                _cachedProjectPath = csprojPath;
-                _cachedAt = DateTime.UtcNow;
-            }
-            return new CoverageResult(true, FormatSummary(data, csprojPath), data);
+            return new CoverageResult(true, "", data, csprojPath);
         }
         finally
         {
@@ -770,4 +783,6 @@ public class LineCoverage
     }
 }
 
-public record CoverageResult(bool Success, string Message, CoverageData? Data);
+/// <param name="ProjectPath">The .csproj the run resolved to, which is not always what the
+/// caller passed — it may have been a source file inside the project.</param>
+public record CoverageResult(bool Success, string Message, CoverageData? Data, string? ProjectPath = null);

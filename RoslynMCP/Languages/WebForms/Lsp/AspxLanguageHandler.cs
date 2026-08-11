@@ -568,13 +568,34 @@ internal static class AspxLanguageHandler
     /// naming a handler that does not exist — the one that carries a fix — and resource keys no
     /// <c>.resx</c> in their probe order defines.
     /// </summary>
-    public static async Task<Protocol.Diagnostic[]> DiagnosticsAsync(string filePath, CancellationToken ct)
+    public static Task<Protocol.Diagnostic[]> DiagnosticsAsync(string filePath, CancellationToken ct) =>
+        DiagnosticsAsync(filePath, graph: null, ct);
+
+    /// <summary>
+    /// The <paramref name="graph"/> overload exists for the workspace sweep, which asks for every
+    /// file in the project and should not rebuild the include graph per file.
+    /// </summary>
+    public static async Task<Protocol.Diagnostic[]> DiagnosticsAsync(
+        string filePath, AspxIncludeGraph? graph, CancellationToken ct)
     {
         var document = await AspxDocumentService.GetAsync(filePath, ct);
         if (document is null)
             return [];
 
+        // A file someone includes runs inline in the including page — its prefixes registered
+        // there, its closing tags matching tags the page opened — so its standalone parse
+        // reports errors the runtime can never produce. Answer from the includers' parses
+        // instead, keeping only what is located in this file.
+        graph ??= AspxIncludeService.GetGraph(document.Project);
+        var rootIncluders = graph.RootIncluders(document.FilePath);
+        if (rootIncluders.Length > 0)
+            return await IncludeScopedDiagnosticsAsync(document, rootIncluders, ct);
+
         var parse = document.Parse.RawDiagnostics
+            // The parse inlines what this file includes, so diagnostics raised inside included
+            // content carry the include's path — and its offsets, which mean nothing in this
+            // buffer. They are reported on the include file itself, above.
+            .Where(d => OwnedByDocument(d, document.FilePath))
             .Select(d => (Microsoft.CodeAnalysis.Diagnostic)d)
             .Where(d => d.Severity != DiagnosticSeverity.Hidden)
             .Select(d => new Protocol.Diagnostic(
@@ -587,7 +608,64 @@ internal static class AspxLanguageHandler
 
         var resources = await AspxResourceHandler.DiagnosticsAsync(document, ct);
 
-return resources.Length == 0 ? parse : [.. parse, .. resources];
+        return resources.Length == 0 ? parse : [.. parse, .. resources];
+    }
+
+    /// <summary>A diagnostic with no file belongs to the parse that raised it; one with a file
+    /// belongs where it says.</summary>
+    private static bool OwnedByDocument(
+        WebFormsCore.SourceGenerator.Models.ReportedDiagnostic diagnostic, string filePath)
+    {
+        string? path = diagnostic.FileLineSpan.Path;
+        return string.IsNullOrEmpty(path) || PathsEqual(path, filePath);
+    }
+
+    private static bool PathsEqual(string a, string b) =>
+        string.Equals(
+            a.Replace('\\', '/'), b.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Diagnostics for an include-only fragment: each root includer's parse inlined this file
+    /// with the includer's registrations and open tags in scope; what that parse reported inside
+    /// this file — spans are offsets in this file's own text — is this file's diagnostics. Two
+    /// pages including the same fragment usually raise the same finding, hence the dedupe.
+    /// </summary>
+    private static async Task<Protocol.Diagnostic[]> IncludeScopedDiagnosticsAsync(
+        AspxDocument document, IReadOnlyList<string> includers, CancellationToken ct)
+    {
+        var results = new List<Protocol.Diagnostic>();
+        var seen = new HashSet<(string Id, int Start, int End, string Message)>();
+
+        foreach (string includer in includers)
+        {
+            var parent = await AspxDocumentService.GetAsync(includer, ct);
+            if (parent is null)
+                continue;
+
+            foreach (var reported in parent.Parse.RawDiagnostics)
+            {
+                if (string.IsNullOrEmpty(reported.FileLineSpan.Path)
+                    || !PathsEqual(reported.FileLineSpan.Path, document.FilePath))
+                    continue;
+
+                Microsoft.CodeAnalysis.Diagnostic diagnostic = reported;
+                if (diagnostic.Severity == DiagnosticSeverity.Hidden)
+                    continue;
+
+                string message = diagnostic.GetMessage();
+                if (!seen.Add((diagnostic.Id, reported.TextSpan.Start, reported.TextSpan.End, message)))
+                    continue;
+
+                results.Add(new Protocol.Diagnostic(
+                    ToRange(document, reported.TextSpan),
+                    LspConverters.ToLspSeverity(diagnostic.Severity),
+                    diagnostic.Id,
+                    "roslyn-sense",
+                    message));
+            }
+        }
+
+        return [.. results];
     }
 
     // ---- Rename ----------------------------------------------------------------------------

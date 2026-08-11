@@ -49,6 +49,10 @@ internal static class AspxReferenceService
     private static readonly ConcurrentDictionary<string, FileListEntry> s_files =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Forgets every cached directory listing, so the next call re-walks. For callers —
+    /// and tests — that just created or deleted markup files and cannot wait out the lifetime.</summary>
+    public static void ResetFileListCache() => s_files.Clear();
+
     private static readonly TimeSpan FileListLifetime = TimeSpan.FromSeconds(30);
 
     /// <summary>

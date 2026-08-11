@@ -35,6 +35,10 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
         // what makes that visible to a content hash.
         var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
 
+        // Built once for the sweep: which files are include targets — answered from includer
+        // scope, never their own — and which files' contents feed into which result ids.
+        var graph = AspxIncludeService.GetGraph(project);
+
         var reports = new List<object>(files.Count);
 
         foreach (string file in files)
@@ -42,7 +46,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
             ct.ThrowIfCancellationRequested();
 
             string uri = LspConverters.PathToUri(file);
-            string? resultId = ResultId(file, semanticVersion);
+            string? resultId = ResultId(file, semanticVersion, graph);
 
             if (resultId is not null
                 && previousResultIds.TryGetValue(uri, out string? previous)
@@ -52,7 +56,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
                 continue;
             }
 
-            var items = await AspxLanguageHandler.DiagnosticsAsync(file, ct);
+            var items = await AspxLanguageHandler.DiagnosticsAsync(file, graph, ct);
             reports.Add(new WorkspaceFullDocumentDiagnosticReport("full", uri, items)
             {
                 ResultId = resultId,
@@ -72,15 +76,38 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
     /// re-reporting a solution's worth of markup is exactly what the unchanged report exists to
     /// avoid. The open buffer wins over the disk for the same reason every other read here does.
     /// </remarks>
-    private static string? ResultId(string path, VersionStamp semanticVersion)
+    private static string? ResultId(string path, VersionStamp semanticVersion, AspxIncludeGraph graph)
+    {
+        byte[]? content = ReadAllBytes(path);
+        if (content is null)
+            return null;
+
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        hash.AppendData(content);
+
+        // A file's diagnostics also move when a fragment it includes is edited, and — for an
+        // include target — when the page whose scope it is judged in changes. Fold those files
+        // in, or the sweep answers "unchanged" over a stale report. For the common file with no
+        // include edges the closure is the file itself and this loop appends nothing.
+        foreach (string member in graph.Closure(path))
+        {
+            if (string.Equals(member, path, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            hash.AppendData(Encoding.UTF8.GetBytes(member.ToUpperInvariant()));
+            hash.AppendData(ReadAllBytes(member) ?? "missing"u8.ToArray());
+        }
+
+        return $"{Convert.ToHexString(hash.GetHashAndReset())}:{semanticVersion}";
+    }
+
+    private static byte[]? ReadAllBytes(string path)
     {
         try
         {
-            byte[] content = OpenDocumentStore.TryGet(path, out var open)
+            return OpenDocumentStore.TryGet(path, out var open)
                 ? Encoding.UTF8.GetBytes(open.ToString())
                 : File.ReadAllBytes(path);
-
-            return $"{Convert.ToHexString(SHA256.HashData(content))}:{semanticVersion}";
         }
         catch (IOException)
         {

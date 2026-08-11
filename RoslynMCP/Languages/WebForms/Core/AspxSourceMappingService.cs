@@ -135,7 +135,8 @@ internal static class AspxSourceMappingService
             text: text,
             namespaces: namespaces,
             rootDirectory: rootDirectory,
-            generateHash: false);
+            generateHash: false,
+            readFile: ReadIncludeText);
 
         if (rootNode is null)
             return new AspxParseResult(filePath, [], [], [], [], [], diagnostics, null);
@@ -152,10 +153,44 @@ internal static class AspxSourceMappingService
         foreach (var diag in diagnostics)
         {
             Diagnostic d = diag;
-            errors.Add(d.GetMessage());
+            string? diagPath = diag.FileLineSpan.Path;
+
+            // The parse inlines <!--#include --> targets, so a diagnostic can be located in a
+            // different file than the one parsed; name it, or the message reads as this file's.
+            errors.Add(string.IsNullOrEmpty(diagPath) || PathsEqual(diagPath, filePath)
+                ? d.GetMessage()
+                : $"{Path.GetFileName(diagPath)}: {d.GetMessage()}");
         }
 
         return new AspxParseResult(filePath, directives, controls, expressions, codeBlocks, errors, diagnostics, rootNode);
+    }
+
+    private static bool PathsEqual(string a, string b) =>
+        string.Equals(
+            a.Replace('\\', '/'), b.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// How the parser reads an <c>&lt;!--#include --&gt;</c> target: the open editor buffer when
+    /// there is one — an unsaved edit in a fragment must be what its includers are parsed
+    /// against — the disk otherwise.
+    /// </summary>
+    internal static string? ReadIncludeText(string path)
+    {
+        if (OpenDocumentStore.TryGet(path, out var open))
+            return open.ToString();
+
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

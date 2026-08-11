@@ -20,4 +20,5 @@ public static class Descriptors
     public static readonly DiagnosticDescriptor DuplicateAttribute = new("WFC0009", "Duplicate attribute", "The attribute '{0}' is written more than once on this tag; the first is used", Category, DiagnosticSeverity.Warning, true);
     public static readonly DiagnosticDescriptor InheritsTypeNotFound = new("WFC0010", "Code-behind class not found", "Could not find the class '{0}' named by Inherits; the page is read as '{1}'", Category, DiagnosticSeverity.Warning, true);
     public static readonly DiagnosticDescriptor ClosingTagWithNothingOpen = new("WFC0011", "Closing tag with nothing open", "Unexpected closing tag '{0}': nothing is open here", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor IncludeFileNotFound = new("WFC0012", "Include file not found", "Could not find include file '{0}'", Category, DiagnosticSeverity.Warning, true);
 }

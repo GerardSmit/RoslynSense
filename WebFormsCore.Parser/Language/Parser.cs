@@ -47,14 +47,35 @@ public class Parser
     private bool _inheritsFallback;
     private readonly bool _addFields;
     private readonly string? _rootDirectory;
+    private readonly Func<string, string?> _readFile;
+    private readonly HashSet<string> _activeFiles = new(StringComparer.OrdinalIgnoreCase);
 
-    public Parser(Compilation compilation, string? rootNamespace, bool addFields, string? rootDirectory = null)
+    public Parser(
+        Compilation compilation, string? rootNamespace, bool addFields, string? rootDirectory = null,
+        Func<string, string?>? readFile = null)
     {
         _compilation = compilation;
         _rootNamespace = rootNamespace;
         _container = _rootContainer;
         _addFields = addFields;
         _rootDirectory = rootDirectory?.Replace('\\', '/');
+        _readFile = readFile ?? DefaultReadFile;
+    }
+
+    private static string? DefaultReadFile(string path)
+    {
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     public static ReadOnlySpan<char> IncludeSpan => "include".AsSpan();
@@ -77,12 +98,44 @@ public class Parser
 
     public void Parse(ref Lexer lexer)
     {
-        while (lexer.Next() is { } token)
+        // Guards include cycles: a file including itself, directly or through a chain, would
+        // recurse without end. Keyed on the file rather than the include record, and removed on
+        // the way out, so a diamond — two pages both including the same fragment — still inlines
+        // the fragment for each of them.
+        var fileKey = FileKey(lexer.File);
+
+        if (!_activeFiles.Add(fileKey))
         {
-            Consume(ref lexer, token);
+            return;
         }
 
-        Diagnostics.AddRange(lexer.Diagnostics);
+        try
+        {
+            while (lexer.Next() is { } token)
+            {
+                Consume(ref lexer, token);
+            }
+
+            Diagnostics.AddRange(lexer.Diagnostics);
+        }
+        finally
+        {
+            _activeFiles.Remove(fileKey);
+        }
+    }
+
+    private static string FileKey(string file)
+    {
+        try
+        {
+            return Path.GetFullPath(file);
+        }
+        catch (Exception)
+        {
+            // Not every parse names a real path — tests and in-memory callers use placeholders
+            // that GetFullPath may reject. The raw string still guards a self-include.
+            return file;
+        }
     }
 
     private void Consume(ref Lexer lexer, Token token)
@@ -127,49 +180,96 @@ public class Parser
 
     private void ConsumeComment(ref Lexer lexer, Token token)
     {
-        var span = token.Text.Value.AsSpan().TrimStart();
-
-        if (span.Length == 0 || span[0] != '#')
+        if (!TryParseIncludePath(token.Text.Value, out var path))
         {
             return;
         }
 
-        // Check for include
+        var fullPath = ResolveIncludePath(lexer.File, path, _rootDirectory);
+
+        if (fullPath is null)
+        {
+            return;
+        }
+
+        var text = _readFile(fullPath);
+
+        var normalizedFullPath = fullPath.Replace('\\', '/');
+        var includePathRelative = _rootDirectory != null
+            && normalizedFullPath.StartsWith(_rootDirectory, StringComparison.OrdinalIgnoreCase)
+            ? normalizedFullPath.Substring(_rootDirectory.Length).TrimStart('/')
+            : path;
+
+        if (Root.IncludeFiles.All(i => !string.Equals(i.FullPath, fullPath, StringComparison.OrdinalIgnoreCase)))
+        {
+            Root.IncludeFiles.Add(new IncludeFile(
+                includePathRelative, fullPath, text is null ? null : RootNode.GenerateHash(text)));
+        }
+
+        if (text is null)
+        {
+            Diagnostics.Add(ReportedDiagnostic.Create(Descriptors.IncludeFileNotFound, token.Range, path));
+            return;
+        }
+
+        var newLexer = new Lexer(fullPath, text.AsSpan());
+        Parse(ref newLexer);
+    }
+
+    /// <summary>
+    /// Reads the target path out of a server-side include comment —
+    /// <c>#include file="..."</c> or <c>#include virtual="..."</c> — given the comment's inner
+    /// text (without the <c>&lt;!--</c>/<c>--&gt;</c> delimiters). Shared with the include
+    /// scanner on the tooling side so both read the directive identically.
+    /// </summary>
+    public static bool TryParseIncludePath(string commentText, out string path)
+    {
+        path = string.Empty;
+
+        var span = commentText.AsSpan().TrimStart();
+
+        if (span.Length == 0 || span[0] != '#')
+        {
+            return false;
+        }
+
         span = span.Slice(1).TrimStart();
 
         if (!span.StartsWith(IncludeSpan, StringComparison.OrdinalIgnoreCase))
         {
-            return;
+            return false;
         }
 
-        // Check for file
+        span = span.Slice(IncludeSpan.Length);
+
         var index = span.IndexOf(FileSpan, StringComparison.OrdinalIgnoreCase);
+        var keywordLength = FileSpan.Length;
 
         if (index == -1)
         {
             index = span.IndexOf(VirtualSpan, StringComparison.OrdinalIgnoreCase);
+            keywordLength = VirtualSpan.Length;
         }
 
         if (index == -1)
         {
-            return;
+            return false;
         }
 
-        span = span.Slice(index + FileSpan.Length);
+        span = span.Slice(index + keywordLength);
 
-        // Find attribute value
         index = span.IndexOf('=');
 
         if (index == -1)
         {
-            return;
+            return false;
         }
 
         span = span.Slice(index + 1).TrimStart();
 
         if (span.Length == 0 || span[0] is not ('"' or '\''))
         {
-            return;
+            return false;
         }
 
         var quote = span[0];
@@ -179,40 +279,72 @@ public class Parser
 
         if (end == -1)
         {
-            return;
+            return false;
         }
 
-        var path = span.Slice(0, end).ToString();
-        var directoryName = Path.GetDirectoryName(lexer.File);
+        path = span.Slice(0, end).ToString();
+        return path.Length > 0;
+    }
 
-        if (directoryName is null)
+    /// <summary>
+    /// Resolves an include path to an absolute path: <c>~/</c> and rooted paths against
+    /// <paramref name="rootDirectory"/> the way the runtime resolves a virtual path, anything
+    /// else against the including file's own directory. Null when there is nothing to resolve
+    /// against or the path is malformed.
+    /// </summary>
+    public static string? ResolveIncludePath(string includingFile, string includePath, string? rootDirectory)
+    {
+        var path = includePath.Trim();
+
+        if (path.Length == 0)
         {
-            return;
+            return null;
         }
 
-        var fullPath = Path.Combine(directoryName, path);
+        string? baseDirectory;
 
-        if (!File.Exists(fullPath))
+        if (path[0] == '~')
         {
-            return;
+            baseDirectory = rootDirectory;
+            path = path.Substring(1).TrimStart('/', '\\');
         }
-
-        var text = File.ReadAllText(fullPath);
-
-        var newLexer = new Lexer(fullPath, text.AsSpan());
-
-        fullPath = Path.GetFullPath(fullPath).Replace('\\', '/');
-
-        var includePathRelative = _rootDirectory != null && fullPath.StartsWith(_rootDirectory)
-            ? fullPath.Substring(_rootDirectory.Length).TrimStart('/')
-            : path;
-
-        if (Root.IncludeFiles.All(i => i.Path != includePathRelative))
+        else if (path[0] is '/' or '\\')
         {
-            Root.IncludeFiles.Add(new IncludeFile(includePathRelative, RootNode.GenerateHash(text)));
+            baseDirectory = rootDirectory;
+            path = path.TrimStart('/', '\\');
+        }
+        else
+        {
+            baseDirectory = GetDirectoryNameSafe(includingFile);
         }
 
-        Parse(ref newLexer);
+        if (string.IsNullOrEmpty(baseDirectory))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFullPath(Path.Combine(baseDirectory, path));
+        }
+        catch (Exception)
+        {
+            // Invalid characters, an unsupported format, a path past the OS limit — a directive
+            // whose target cannot be a file resolves to nothing rather than throwing mid-parse.
+            return null;
+        }
+    }
+
+    private static string? GetDirectoryNameSafe(string file)
+    {
+        try
+        {
+            return Path.GetDirectoryName(file);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private void ConsumeText(Token token)

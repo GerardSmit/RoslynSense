@@ -103,7 +103,8 @@ internal static class AspxDocumentService
         if (s_cache.TryGetValue(path, out var cached)
             && cached.SemanticVersion.Equals(semanticVersion)
             && cached.Checksum.SequenceEqual(checksum)
-            && await UnchangedAsync(project, cached.CodeBehindVersions, ct))
+            && await UnchangedAsync(project, cached.CodeBehindVersions, ct)
+            && IncludesUnchanged(cached.Document))
         {
             return cached.Document;
         }
@@ -149,6 +150,29 @@ internal static class AspxDocumentService
         }
 
         return versions.ToImmutable();
+    }
+
+    /// <summary>
+    /// The parse inlined each <c>&lt;!--#include --&gt;</c> target's text, so the entry is stale
+    /// the moment a target's content moves — an edit the entry's own checksum cannot see, because
+    /// it is the fragment's file that changed, not this one. Re-hashing the targets on every read
+    /// is the price; only documents that actually include something pay it.
+    /// </summary>
+    private static bool IncludesUnchanged(AspxDocument document)
+    {
+        if (document.Tree is not { IncludeFiles.Count: > 0 } tree)
+            return true;
+
+        foreach (var include in tree.IncludeFiles)
+        {
+            string? text = AspxSourceMappingService.ReadIncludeText(include.FullPath);
+            string? hash = text is null ? null : RootNode.GenerateHash(text);
+
+            if (!string.Equals(hash, include.Hash, StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
     }
 
     private static async Task<bool> UnchangedAsync(

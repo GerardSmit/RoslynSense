@@ -31,9 +31,14 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
             return [];
 
         // Markup binds against the code-behind, so a handler appearing or disappearing changes a
-        // page's diagnostics without touching its own text. The project's semantic version is
-        // what makes that visible to a content hash.
-        var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
+        // page's diagnostics without touching its own text — and that has to reach the result id.
+        //
+        // Per page, not per project. The project's dependent semantic version moves for any edit
+        // anywhere in it, and saving one .ascx regenerates its own .designer.cs, which is a .cs —
+        // so every markup file in the site got a new id and the whole site was re-parsed and
+        // re-diagnosed because one control changed. A page's own code-behind and designer are what
+        // its markup binds against.
+        var codeBehind = await CodeBehindVersionsAsync(project, ct);
 
         // Built once for the sweep: which files are include targets — answered from includer
         // scope, never their own — and which files' contents feed into which result ids.
@@ -46,7 +51,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
             ct.ThrowIfCancellationRequested();
 
             string uri = LspConverters.PathToUri(file);
-            string? resultId = ResultId(file, semanticVersion, graph);
+            string? resultId = ResultId(file, codeBehind, graph);
 
             if (resultId is not null
                 && previousResultIds.TryGetValue(uri, out string? previous)
@@ -67,6 +72,45 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
     }
 
     /// <summary>
+    /// Each markup file's own code-behind and designer, by the version that moves when their
+    /// declarations do.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Document.GetTopLevelChangeTextVersionAsync"/> rather than a text version: editing
+    /// a method body cannot change what markup binds to, and a page whose handler set is unchanged
+    /// should not be re-diagnosed for it.
+    /// </remarks>
+    private static async Task<IReadOnlyDictionary<string, VersionStamp>> CodeBehindVersionsAsync(
+        Project project, CancellationToken ct)
+    {
+        var versions = new Dictionary<string, VersionStamp>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var document in project.Documents)
+        {
+            if (document.FilePath is not { Length: > 0 } path)
+                continue;
+
+            // Foo.aspx.cs and Foo.aspx.designer.cs both belong to Foo.aspx.
+            string owner = path.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase)
+                ? path[..^".designer.cs".Length]
+                : path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
+                    ? path[..^".cs".Length]
+                    : "";
+
+            if (owner.Length == 0 || !AspxDocumentService.IsAspxFile(owner))
+                continue;
+
+            var version = await document.GetTopLevelChangeTextVersionAsync(ct);
+
+            versions[owner] = versions.TryGetValue(owner, out var existing)
+                ? version.GetNewerVersion(existing)
+                : version;
+        }
+
+        return versions;
+    }
+
+    /// <summary>
     /// The version the client hands back on the next sweep, or null when the file cannot be read
     /// — in which case the report is sent in full rather than claimed unchanged.
     /// </summary>
@@ -76,7 +120,8 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
     /// re-reporting a solution's worth of markup is exactly what the unchanged report exists to
     /// avoid. The open buffer wins over the disk for the same reason every other read here does.
     /// </remarks>
-    private static string? ResultId(string path, VersionStamp semanticVersion, AspxIncludeGraph graph)
+    private static string? ResultId(
+        string path, IReadOnlyDictionary<string, VersionStamp> codeBehind, AspxIncludeGraph graph)
     {
         byte[]? content = ContentHash(path);
         if (content is null)
@@ -98,7 +143,9 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
             hash.AppendData(ContentHash(member) ?? "missing"u8.ToArray());
         }
 
-        return $"{Convert.ToHexString(hash.GetHashAndReset())}:{semanticVersion}";
+        // A page with no code-behind — a plain fragment — depends on nothing but its own bytes.
+        string semantic = codeBehind.TryGetValue(path, out var version) ? version.ToString() : "none";
+        return $"{Convert.ToHexString(hash.GetHashAndReset())}:{semantic}";
     }
 
     private static byte[]? ReadAllBytes(string path)

@@ -162,6 +162,84 @@ public class WorkspaceDiagnosticsTests : IDisposable
     }
 
     /// <summary>
+    /// Editing one page's code-behind re-diagnoses that page and leaves the rest of the site
+    /// alone.
+    /// </summary>
+    /// <remarks>
+    /// A markup file's result id has to fold in the code-behind it binds against, or renaming a
+    /// handler would leave every page that calls it reported as unchanged against a stale answer.
+    /// The whole project's dependent semantic version was what did that folding, and it moves for
+    /// any edit anywhere in the project — so every page in the site got a new id and was re-parsed
+    /// and re-diagnosed whenever a single <c>.cs</c> moved. Saving an <c>.ascx</c> was enough on
+    /// its own, because that regenerates its <c>.designer.cs</c>. Each page now carries its own
+    /// code-behind and designer instead.
+    /// </remarks>
+    [Fact]
+    public async Task EditingOneCodeBehindLeavesTheOtherPagesResultIdsAlone()
+    {
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "solution";
+        await UseWebFormsAsync();
+
+        var first = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(), default);
+
+        var previous = first.Items
+            .OfType<WorkspaceFullDocumentDiagnosticReport>()
+            .Where(r => r.ResultId is not null && IsMarkup(r.Uri))
+            .Select(r => new PreviousResultId(r.Uri, r.ResultId!))
+            .ToArray();
+
+        Assert.True(previous.Length > 1, "This needs a site with more than one page to say anything.");
+
+        string codeBehind = FixturePaths.EventWiringCodeBehindFile;
+        string text = await File.ReadAllTextAsync(codeBehind);
+        OpenDocumentStore.Open(_session, codeBehind, SourceText.From(text), version: 1);
+        try
+        {
+            // A declaration, so this is a change markup could in principle bind differently
+            // against — the case the result id genuinely has to notice.
+            OpenDocumentStore.Change(
+                codeBehind,
+                version: 2,
+                _ => SourceText.From(
+                    text + "\nnamespace Added { public class Marker { } }\n"));
+
+            var second = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+                new WorkspaceDiagnosticParams(previous), default);
+
+            var unchanged = second.Items
+                .OfType<WorkspaceUnchangedDocumentDiagnosticReport>()
+                .Select(r => r.Uri)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var id in previous)
+            {
+                if (id.Uri.EndsWith("EventWiring.aspx", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                Assert.True(
+                    unchanged.Contains(id.Uri),
+                    $"Editing EventWiring's code-behind re-diagnosed '{id.Uri}', which does not "
+                    + "bind against it. This is the whole-site sweep coming back.");
+            }
+        }
+        finally
+        {
+            // The buffer edit is undone, and so is everything derived from it while it was open:
+            // the markup index cached for this project was built against the edited compilation,
+            // and every later test in this collection reads the same process-wide cache.
+            OpenDocumentStore.Close(_session, codeBehind);
+            ProjectIndexCacheService.InvalidateProject(FixturePaths.AspxProjectFile);
+            await WorkspaceService.EvictProjectForTests(FixturePaths.AspxProjectFile);
+        }
+    }
+
+    private static bool IsMarkup(string uri) =>
+        uri.EndsWith(".aspx", StringComparison.OrdinalIgnoreCase)
+        || uri.EndsWith(".ascx", StringComparison.OrdinalIgnoreCase)
+        || uri.EndsWith(".master", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// The sweep asks the registered packs. Calling the handler directly means no host has built a
     /// registry, so this stands in for one.
     /// </summary>

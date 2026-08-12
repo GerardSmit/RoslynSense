@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -368,55 +368,119 @@ internal static class AspxSourceMappingService
         {
             ct.ThrowIfCancellationRequested();
 
-            // Fast path: skip documents that don't contain "FindControl" at all.
-            var docText = await document.GetTextAsync(ct);
-            if (!docText.ToString().Contains("FindControl", StringComparison.Ordinal))
-                continue;
-
-            var root = await document.GetSyntaxRootAsync(ct);
-            if (root is null) continue;
-
-            foreach (var inv in root.DescendantNodes()
-                         .OfType<InvocationExpressionSyntax>())
+            foreach (var wrapper in await ScanForAccessorMethodsAsync(document, ct))
             {
-                if (!IsInvocationNamed(inv, "FindControl")) continue;
-
-                var args = inv.ArgumentList.Arguments;
-                if (args.Count == 0) continue;
-
-                // The argument must be a plain identifier (i.e. a forwarded parameter, not a literal).
-                var argExpr = args[0].Expression;
-                if (argExpr is not IdentifierNameSyntax ident) continue;
-
-                var methodDecl = inv.AncestorsAndSelf()
-                    .OfType<MethodDeclarationSyntax>()
-                    .FirstOrDefault();
-                if (methodDecl is null) continue;
-
-                // Find which parameter index corresponds to the identifier — syntax-only, no semantic model needed.
-                var paramList = methodDecl.ParameterList.Parameters;
-                int paramIndex = -1;
-                for (int i = 0; i < paramList.Count; i++)
-                {
-                    if (paramList[i].Identifier.Text == ident.Identifier.Text)
-                    {
-                        paramIndex = i;
-                        break;
-                    }
-                }
-                if (paramIndex < 0) continue;
-
-                bool isExtension = paramList.Count > 0
-                    && paramList[0].Modifiers.Any(m => m.IsKind(SyntaxKind.ThisKeyword));
-
-                string methodName = methodDecl.Identifier.Text;
-                var key = $"{methodName}:{paramIndex}";
-                if (seen.Add(key))
-                    wrappers.Add((methodName, paramIndex, isExtension));
+                if (seen.Add($"{wrapper.MethodName}:{wrapper.ParamIndex}"))
+                    wrappers.Add(wrapper);
             }
         }
 
         return wrappers;
+    }
+
+    /// <summary>What one document contributes, against the version it contributed it at.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        DocumentId, (VersionStamp Version, ImmutableArray<(string MethodName, int ParamIndex, bool IsExtension)> Wrappers)>
+        s_accessorScans = new();
+
+    /// <summary>Bounds the memo. Documents outlive no solution in particular, so without a cap this
+    /// grows for the life of the process; dropping all of it costs one rebuild, which is what every
+    /// rebuild used to cost anyway.</summary>
+    private const int MaxAccessorScans = 8192;
+
+    private static long s_accessorScanCount;
+
+    /// <summary>
+    /// How many documents have actually been scanned, as opposed to answered from the memo.
+    /// </summary>
+    /// <remarks>
+    /// A test hook (exposed via InternalsVisibleTo). "Only the file that changed was re-read" is
+    /// the whole property this memo exists for, and it is invisible from the returned list — the
+    /// same wrappers come back either way. Timing it would be the alternative, and a timing
+    /// assertion on a machine running a test suite is a flake generator.
+    /// </remarks>
+    internal static long AccessorScanCount => Interlocked.Read(ref s_accessorScanCount);
+
+    /// <summary>
+    /// The wrapper methods one document declares, remembered against its text version.
+    /// </summary>
+    /// <remarks>
+    /// Any <c>.cs</c> write marks this project-wide list stale, and rebuilding it read the entire
+    /// text of every document in the project and in each referenced project — a whole-string
+    /// allocation per file, then a syntax walk for the ones that matched — to answer a question
+    /// only the edited file can have changed the answer to. On a site the size of DNN that is
+    /// thousands of files for one save. Whether a document declares a wrapper is a function of its
+    /// own text alone, so an unchanged one costs a version comparison.
+    /// </remarks>
+    private static async Task<ImmutableArray<(string MethodName, int ParamIndex, bool IsExtension)>>
+        ScanForAccessorMethodsAsync(Document document, CancellationToken ct)
+    {
+        var version = await document.GetTextVersionAsync(ct);
+
+        if (s_accessorScans.TryGetValue(document.Id, out var cached) && cached.Version.Equals(version))
+            return cached.Wrappers;
+
+        Interlocked.Increment(ref s_accessorScanCount);
+        var scanned = await ScanCoreAsync(document, ct);
+
+        if (s_accessorScans.Count >= MaxAccessorScans)
+            s_accessorScans.Clear();
+
+        s_accessorScans[document.Id] = (version, scanned);
+        return scanned;
+    }
+
+    private static async Task<ImmutableArray<(string MethodName, int ParamIndex, bool IsExtension)>>
+        ScanCoreAsync(Document document, CancellationToken ct)
+    {
+        // Fast path: skip documents that don't contain "FindControl" at all.
+        var docText = await document.GetTextAsync(ct);
+        if (!docText.ToString().Contains("FindControl", StringComparison.Ordinal))
+            return [];
+
+        var root = await document.GetSyntaxRootAsync(ct);
+        if (root is null)
+            return [];
+
+        var found = ImmutableArray.CreateBuilder<(string MethodName, int ParamIndex, bool IsExtension)>();
+
+        foreach (var inv in root.DescendantNodes()
+                     .OfType<InvocationExpressionSyntax>())
+        {
+            if (!IsInvocationNamed(inv, "FindControl")) continue;
+
+            var args = inv.ArgumentList.Arguments;
+            if (args.Count == 0) continue;
+
+            // The argument must be a plain identifier (i.e. a forwarded parameter, not a literal).
+            var argExpr = args[0].Expression;
+            if (argExpr is not IdentifierNameSyntax ident) continue;
+
+            var methodDecl = inv.AncestorsAndSelf()
+                .OfType<MethodDeclarationSyntax>()
+                .FirstOrDefault();
+            if (methodDecl is null) continue;
+
+            // Find which parameter index corresponds to the identifier — syntax-only, no semantic model needed.
+            var paramList = methodDecl.ParameterList.Parameters;
+            int paramIndex = -1;
+            for (int i = 0; i < paramList.Count; i++)
+            {
+                if (paramList[i].Identifier.Text == ident.Identifier.Text)
+                {
+                    paramIndex = i;
+                    break;
+                }
+            }
+            if (paramIndex < 0) continue;
+
+            bool isExtension = paramList.Count > 0
+                && paramList[0].Modifiers.Any(m => m.IsKind(SyntaxKind.ThisKeyword));
+
+            found.Add((methodDecl.Identifier.Text, paramIndex, isExtension));
+        }
+
+        return found.ToImmutable();
     }
 
     /// <summary>
@@ -664,6 +728,67 @@ internal static class AspxSourceMappingService
     /// Reads web.config for globally registered tag prefixes and passes them to the parser.
     /// Skips obj/bin directories.
     /// </summary>
+    /// <summary>
+    /// The previous index with only the named files re-parsed.
+    /// </summary>
+    /// <remarks>
+    /// Editing one control used to mark the whole index dirty, and rebuilding it walks the site
+    /// directory and re-parses every markup file in it — thousands, on a real WebForms site, to
+    /// account for one save. A parse result describes exactly one file and nothing else, so the
+    /// rest of the index is still true and can simply be carried over.
+    ///
+    /// Falls back to a full build when there is no previous index, or when a file that changed is
+    /// one every parse depends on (<c>web.config</c> registers the tag prefixes every page binds
+    /// through).
+    /// </remarks>
+    public static async Task<AspxProjectIndex> UpdateProjectIndexAsync(
+        Project project,
+        AspxProjectIndex previous,
+        IReadOnlyCollection<string> changed,
+        CancellationToken cancellationToken = default,
+        Compilation? compilation = null)
+    {
+        var projectDir = Path.GetDirectoryName(project.FilePath);
+        if (projectDir is null || !Directory.Exists(projectDir))
+            return previous;
+
+        compilation ??= await project.GetCompilationAsync(cancellationToken);
+        if (compilation is null)
+            return previous;
+
+        var webConfigNamespaces = LoadWebConfigNamespaces(projectDir);
+
+        var kept = previous.Files
+            .Where(f => !changed.Contains(f.FilePath, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        var reparsed = new System.Collections.Concurrent.ConcurrentBag<AspxParseResult>();
+
+        await Parallel.ForEachAsync(
+            changed.Where(File.Exists),
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = cancellationToken,
+            },
+            async (file, ct) =>
+            {
+                try
+                {
+                    var text = await File.ReadAllTextAsync(file, ct);
+                    reparsed.Add(Parse(file, text, compilation,
+                        namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
+                        rootDirectory: projectDir));
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[AspxIndex] Error parsing '{file}': {ex.Message}");
+                }
+            });
+
+        return new AspxProjectIndex([.. kept, .. reparsed]);
+    }
+
     public static async Task<AspxProjectIndex> BuildProjectIndexAsync(
         Project project, CancellationToken cancellationToken = default,
         Compilation? compilation = null)

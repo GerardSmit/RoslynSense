@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.Proto.Core;
 using RoslynMCP.Languages.Resources.Core;
 using RoslynMCP.Languages.WebForms.Core;
@@ -119,25 +119,55 @@ internal static class ProjectIndexCacheService
     {
         var entry = await GetOrCreateEntryAsync(project, cancellationToken);
 
-        if (entry.AspxIndex is { } cached && !entry.AspxDirty)
-            return cached;
+        if (entry.AspxIndex is { } current && !entry.AspxDirty && entry.AspxChanged.IsEmpty)
+            return current;
 
         // Capture generation before building; if it changes during the build,
         // we know a file changed and must leave the dirty flag set
+        // Both read together: the generation says whether anything moved while the build ran, and
+        // the changed set says what to re-parse. A markup parse describes one file, so the rest of
+        // the index is still true — rebuilding it re-walked the site and re-parsed every page to
+        // account for one save.
         int genBefore;
+        string[] changed;
         await s_lock.WaitAsync(cancellationToken);
-        try { genBefore = entry.AspxGeneration; }
+        try
+        {
+            genBefore = entry.AspxGeneration;
+            changed = [.. entry.AspxChanged.Keys];
+        }
         finally { s_lock.Release(); }
 
-        var index = await AspxSourceMappingService.BuildProjectIndexAsync(project, cancellationToken, compilation);
+        // A parse is not a function of its file alone: it resolves every tag prefix against the
+        // project's types, so `<asp:TextBox ID="x">` becomes a control with an id only because the
+        // compilation says what asp:TextBox is. Carrying results over is therefore only sound while
+        // that answer is the same, and this is the version that moves when it changes — a
+        // declaration appearing or disappearing, including in the .designer.cs a markup save
+        // regenerates. Editing a method body does not move it, so the ordinary case stays
+        // incremental.
+        var semantic = await project.GetDependentSemanticVersionAsync(cancellationToken);
+
+        var index = entry.AspxIndex is { } previous
+            && !entry.AspxDirty
+            && changed.Length > 0
+            && entry.AspxIndexSemantic is { } built
+            && built.Equals(semantic)
+            ? await AspxSourceMappingService.UpdateProjectIndexAsync(
+                project, previous, changed, cancellationToken, compilation)
+            : await AspxSourceMappingService.BuildProjectIndexAsync(project, cancellationToken, compilation);
 
         await s_lock.WaitAsync(cancellationToken);
         try
         {
             entry.AspxIndex = index;
-            // Only clear dirty if no file changed during the build
+            entry.AspxIndexSemantic = semantic;
+            // Only clear if no file changed during the build
             if (entry.AspxGeneration == genBefore)
+            {
                 entry.AspxDirty = false;
+                foreach (string file in changed)
+                    entry.AspxChanged.TryRemove(file, out _);
+            }
         }
         finally
         {
@@ -317,6 +347,37 @@ internal static class ProjectIndexCacheService
         }
     }
 
+    // ---- Test hooks (exposed via InternalsVisibleTo) ----
+
+    /// <summary>
+    /// Raises the same file-change the <see cref="FileSystemWatcher"/> would for
+    /// <paramref name="filePath"/>, against the cache entry for <paramref name="projectPath"/>.
+    /// </summary>
+    /// <remarks>
+    /// The invalidation policy is the thing under test — which of these flags a given extension
+    /// sets is exactly what decides whether a save costs one file or the whole site. Driving it
+    /// through the real watcher instead would mean writing a file and waiting for an OS event
+    /// that arrives on its own schedule, coalesced with its neighbours, which tests a
+    /// <see cref="FileSystemWatcher"/> rather than this policy and flakes while doing it.
+    /// Returns false when the project has no cache entry, so a test cannot silently assert
+    /// nothing.
+    /// </remarks>
+    internal static bool NotifyFileChangedForTests(string projectPath, string filePath, bool movedFiles)
+    {
+        var key = Path.GetFullPath(projectPath);
+
+        CachedProjectEntry? entry;
+        s_lock.Wait();
+        try { s_cache.TryGetValue(key, out entry); }
+        finally { s_lock.Release(); }
+
+        if (entry is null)
+            return false;
+
+        OnFileChanged(entry, Path.GetFullPath(filePath), movedFiles);
+        return true;
+    }
+
     private static async Task<CachedProjectEntry> GetOrCreateEntryAsync(
         Project project, CancellationToken cancellationToken)
     {
@@ -410,7 +471,14 @@ internal static class ProjectIndexCacheService
         // of one cannot, and treating every save as a change rebuilt the whole site: a recursive
         // walk over six extensions, then a read and a full parse of every .aspx/.ascx/.master in
         // it. On a large site that is thousands of files for a keystroke's worth of saved text.
-        if (isAspx || (isCSharp && movedFiles))
+        if (isAspx && !movedFiles)
+        {
+            // One file changed, so one file needs re-parsing. The whole-index flag is for changes
+            // that alter what every parse would produce, or which files there are at all.
+            entry.AspxChanged[filePath] = 0;
+            Interlocked.Increment(ref entry.AspxGeneration);
+        }
+        else if (isAspx || (isCSharp && movedFiles))
         {
             entry.AspxDirty = true;
             Interlocked.Increment(ref entry.AspxGeneration);
@@ -468,6 +536,16 @@ internal static class ProjectIndexCacheService
         public IReadOnlyList<(string MethodName, int ParamIndex, bool IsExtension)>? FindControlWrappers { get; set; }
         public ResourceCatalog? Resources { get; set; }
         public volatile bool AspxDirty = true;
+
+        /// <summary>The project's dependent semantic version when <see cref="AspxIndex"/> was
+        /// built. Null until one has been. Guards carrying parses over a change to what the tag
+        /// prefixes in them resolve to.</summary>
+        public VersionStamp? AspxIndexSemantic;
+
+        /// <summary>Markup files whose own contents moved, awaiting a re-parse. Empty means the
+        /// index is either current or wholly dirty; see <see cref="AspxDirty"/>.</summary>
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> AspxChanged =
+            new(StringComparer.OrdinalIgnoreCase);
         public volatile bool RazorDirty = true;
         public volatile bool ProtoDirty = true;
         public volatile bool WrappersDirty = true;

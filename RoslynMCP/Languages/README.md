@@ -485,12 +485,22 @@ only — and the missing-key rule ships behind a second switch on top of that
 key across a guessed file set is silent corruption. References stay available at `Ambiguous`, marked
 as proximity matches, since over-reporting is a nuisance rather than corruption.
 
-There is a second refusal, and it comes from the reader rather than the resolver. `ResxReader` walks
-the XML with `XmlReader` positioned by `ReadAttributeValue()` rather than loading an `XDocument`,
-because `XDocument` normalises entities — `A&amp;B` is four characters shorter decoded than on disk,
-so every span derived from it is wrong. When a `name=` cannot be verified character-for-character
-against the source, the entry's `KeySpan` is `default`: hover and definition fall back to the head of
-the file, and rename declines. No rename beats a rename with a wrong span.
+There is a second refusal, and it comes from the reader rather than the resolver. `ResxReader` parses
+with `Microsoft.Language.Xml`, a full-fidelity tree in which every character of the source is a node,
+so a span already *is* the range in the buffer — nothing is rebuilt from line and column, and a
+half-typed file still yields its entries rather than stopping at the first malformation.
+
+What the reader still has to be careful about is that a span is the text *as written* while `Key` is
+the text *as decoded*. A name written `A&amp;B` is the key `A&B` — which is what a `GetString` call
+in C# passes — but it occupies five more characters than that on disk. So the two are not
+interchangeable, and a caller rewriting a key in place checks `KeySpan.Length != Key.Length` before
+editing: an entity-carrying name is spanned and navigable, but declines an in-place rename. No rename
+beats a rename with a wrong span.
+
+`XmlSpans` holds the two edges every XML reader in this repo shares: an attribute's value node spans
+its quotes (so a value range is bounded by the quote *tokens*, which matters because the closing one
+is synthesized and zero-width while the user is still typing), and `Decode` resolves the five entity
+references XML predefines.
 
 ### Adding a convention or a lookup
 

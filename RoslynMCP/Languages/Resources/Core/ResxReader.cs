@@ -1,7 +1,7 @@
 using System.Collections.Immutable;
-using System.Text;
-using System.Xml;
 using Microsoft.CodeAnalysis.Text;
+using Microsoft.Language.Xml;
+using TextSpan = Microsoft.CodeAnalysis.Text.TextSpan;
 
 namespace RoslynMCP.Languages.Resources.Core;
 
@@ -14,99 +14,72 @@ internal readonly record struct ResxContents(
 /// buffer.
 /// </summary>
 /// <remarks>
-/// <see cref="XmlReader"/> rather than <c>XDocument</c>, on three counts. <c>XDocument.Save</c> is a
-/// whole-file rewrite where what is needed is a range edit against a buffer that may never be
-/// saved; <see cref="IXmlLineInfo"/> on an <c>XAttribute</c> reports the position of the attribute
-/// <em>name</em> and no end position at all; and <c>XDocument</c> normalizes entities, so
-/// <c>A&amp;amp;B</c> comes back four characters shorter than the text on disk and every span
-/// derived from it is wrong. <see cref="XmlReader.ReadAttributeValue"/> is the one API that
-/// positions the reader on the attribute's value node instead of its name.
+/// A full-fidelity parse rather than <see cref="System.Xml.XmlReader"/> or <c>XDocument</c>. Every
+/// character of the source is in the tree, so a node's span already <em>is</em> the range in the
+/// buffer and nothing has to be rebuilt from line and column. That matters most where the two older
+/// approaches were weakest: <c>XDocument</c> normalizes entities, so <c>A&amp;amp;B</c> comes back
+/// four characters shorter than the text on disk and every span derived from it is wrong; and an
+/// <see cref="System.Xml.XmlReader"/> stops at the first malformation, which in an open document is
+/// wherever the caret is. This parser is error-tolerant, so a half-typed buffer — the normal state
+/// of a file being edited — still yields every entry, including the ones after the break.
+///
+/// Spans come from <see cref="XmlSpans"/>, which carries the one sharp edge worth knowing: an
+/// attribute's value node spans its quotes too.
 /// </remarks>
 internal static class ResxReader
 {
-    private static readonly XmlReaderSettings s_settings = new()
-    {
-        DtdProcessing = DtdProcessing.Prohibit,
-        IgnoreComments = true,
-        CloseInput = true,
-    };
-
     public static ResxContents Read(SourceText text)
     {
         var entries = ImmutableDictionary.CreateBuilder<string, ResourceEntry>(StringComparer.Ordinal);
         var duplicates = ImmutableArray.CreateBuilder<string>();
 
-        try
+        foreach (var element in Parser.ParseText(text.ToString()).DescendantNodes().OfType<XmlElementSyntax>())
         {
-            using var reader = XmlReader.Create(new StringReader(text.ToString()), s_settings);
-            var info = reader as IXmlLineInfo;
+            if (!element.Name.Equals("data", StringComparison.Ordinal))
+                continue;
 
-            while (reader.Read())
+            if (ReadData(element) is not { } entry)
+                continue;
+
+            if (entries.ContainsKey(entry.Key))
             {
-                if (reader.NodeType != XmlNodeType.Element
-                    || !reader.LocalName.Equals("data", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (ReadData(reader, info, text) is not { } entry)
-                    continue;
-
-                if (entries.ContainsKey(entry.Key))
-                {
-                    if (!duplicates.Contains(entry.Key))
-                        duplicates.Add(entry.Key);
-                    continue;
-                }
-
-                entries.Add(entry.Key, entry);
+                if (!duplicates.Contains(entry.Key))
+                    duplicates.Add(entry.Key);
+                continue;
             }
-        }
-        catch (XmlException)
-        {
-            // A half-typed buffer is the normal state of an open document; report the entries
-            // that were read before the text stopped being XML.
+
+            entries.Add(entry.Key, entry);
         }
 
         return new ResxContents(entries.ToImmutable(), duplicates.ToImmutable());
     }
 
-    private static ResourceEntry? ReadData(XmlReader reader, IXmlLineInfo? info, SourceText text)
+    private static ResourceEntry? ReadData(XmlElementSyntax data)
     {
         string? key = null;
         TextSpan keySpan = default;
+
+        // A ResXFileRef or a serialized object. The key is still a key — a rename has to move it and
+        // a missing-key diagnostic must not fire on it — but there is no string to show, so the
+        // value stays null.
         bool typed = false;
-        int depth = reader.Depth;
-        bool empty = reader.IsEmptyElement;
 
-        if (reader.MoveToFirstAttribute())
+        foreach (var attribute in data.Attributes)
         {
-            do
+            switch (attribute.Name)
             {
-                switch (reader.LocalName)
-                {
-                    case "name":
-                        key = reader.Value;
-                        break;
+                case "name":
+                    // Decoded, because this key is compared against the one a `GetString` call in C#
+                    // passes. The span stays raw — it is where the characters are.
+                    key = attribute.DecodedValue();
+                    keySpan = attribute.ValueSpan();
+                    break;
 
-                    // A ResXFileRef or a serialized object. The key is still a key — a rename has
-                    // to move it and a missing-key diagnostic must not fire on it — but there is no
-                    // string to show, so the value stays null.
-                    case "type":
-                    case "mimetype":
-                        typed = true;
-                        break;
-                }
+                case "type":
+                case "mimetype":
+                    typed = true;
+                    break;
             }
-            while (reader.MoveToNextAttribute());
-
-            // Spanning the name is left until the attribute walk is finished, because it leaves the
-            // reader on a value node rather than on an attribute and MoveToElement is the only
-            // documented way back out.
-            if (key is { Length: > 0 } && reader.MoveToAttribute("name"))
-                keySpan = AttributeValueSpan(reader, info, text, key);
-
-            reader.MoveToElement();
         }
 
         if (key is not { Length: > 0 })
@@ -116,137 +89,20 @@ internal static class ResxReader
         string? comment = null;
         TextSpan valueSpan = default;
 
-        if (!empty)
+        foreach (var child in data.Elements)
         {
-            while (reader.Read())
+            switch (child.Name)
             {
-                if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth)
+                case "value":
+                    value = child.DecodedValue();
+                    valueSpan = child.ContentSpan();
                     break;
-
-                if (reader.NodeType != XmlNodeType.Element || reader.Depth != depth + 1)
-                    continue;
-
-                switch (reader.LocalName)
-                {
-                    case "value":
-                        ReadElementText(reader, info, text, out value, out valueSpan);
-                        break;
-                    case "comment":
-                        ReadElementText(reader, info, text, out comment, out _);
-                        break;
-                }
+                case "comment":
+                    comment = child.DecodedValue();
+                    break;
             }
         }
 
         return new ResourceEntry(key, typed ? null : value, comment, keySpan, valueSpan);
-    }
-
-    /// <summary>
-    /// The span of the attribute value the reader is positioned on, or <see langword="default"/>
-    /// when it cannot be pinned down exactly.
-    /// </summary>
-    /// <remarks>
-    /// More than one value node means the name carries an entity reference, and the decoded text no
-    /// longer lines up with the file. The slice check catches the rest of that family — a resolved
-    /// <c>&amp;amp;</c> arrives as a single node whose length is four characters short of the
-    /// source. Either way the caller gets nothing and declines to rename the key: no rename beats a
-    /// rename applied to the wrong range.
-    /// </remarks>
-    private static TextSpan AttributeValueSpan(
-        XmlReader reader, IXmlLineInfo? info, SourceText text, string value)
-    {
-        if (info is null)
-            return default;
-
-        int start = -1;
-        int nodes = 0;
-
-        while (reader.ReadAttributeValue())
-        {
-            if (nodes == 0)
-                start = Offset(text, info);
-            nodes++;
-        }
-
-        return nodes == 1 && Matches(text, start, value)
-            ? new TextSpan(start, value.Length)
-            : default;
-    }
-
-    private static void ReadElementText(
-        XmlReader reader, IXmlLineInfo? info, SourceText text, out string? value, out TextSpan span)
-    {
-        span = default;
-
-        if (reader.IsEmptyElement)
-        {
-            value = string.Empty;
-            return;
-        }
-
-        value = null;
-
-        int depth = reader.Depth;
-        var builder = new StringBuilder();
-        int start = -1;
-
-        while (reader.Read())
-        {
-            if (reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth)
-            {
-                // LinePosition on an end tag points at the name, past the "</".
-                int end = info is null ? -1 : Offset(text, info) - 2;
-                if (start < 0)
-                    start = end;
-
-                if (start >= 0 && end >= start)
-                    span = TextSpan.FromBounds(start, end);
-
-                value = builder.ToString();
-                return;
-            }
-
-            switch (reader.NodeType)
-            {
-                case XmlNodeType.Text:
-                case XmlNodeType.CDATA:
-                case XmlNodeType.SignificantWhitespace:
-                case XmlNodeType.Whitespace:
-                    if (start < 0 && info is not null)
-                        start = Offset(text, info);
-                    builder.Append(reader.Value);
-                    break;
-            }
-        }
-    }
-
-    /// <summary>The 1-based line and column the reader reports, as an offset into the buffer.</summary>
-    private static int Offset(SourceText text, IXmlLineInfo info)
-    {
-        if (!info.HasLineInfo())
-            return -1;
-
-        int line = info.LineNumber - 1;
-        int character = info.LinePosition - 1;
-
-        if (line < 0 || line >= text.Lines.Count || character < 0)
-            return -1;
-
-        var span = text.Lines[line].SpanIncludingLineBreak;
-        return character > span.Length ? -1 : text.Lines.GetPosition(new LinePosition(line, character));
-    }
-
-    private static bool Matches(SourceText text, int start, string value)
-    {
-        if (start < 0 || start + value.Length > text.Length)
-            return false;
-
-        for (int i = 0; i < value.Length; i++)
-        {
-            if (text[start + i] != value[i])
-                return false;
-        }
-
-        return true;
     }
 }

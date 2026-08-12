@@ -771,6 +771,20 @@ internal static class WorkspaceService
                 Console.Error.WriteLine(
                     $"[WorkspaceService] Cached workspace for '{cacheKey}' ({newEntry.ProjectIds.Count} project(s)).");
 
+                // Said out loud, through ServiceLog, and only when it is a re-load. A first load is
+                // what opening a solution costs and nobody needs telling; a *second* one is the
+                // thing that reads as "it reloaded everything again" with no visible cause, and the
+                // cause was recorded when the unload happened rather than guessed at now.
+                if (LastEvictionOf(cacheKey) is { } previous)
+                {
+                    ServiceLog.Warn(
+                        $"Re-loaded '{Path.GetFileNameWithoutExtension(cacheKey)}' "
+                        + $"({newEntry.ProjectIds.Count} project(s)) because "
+                        + $"{Requested(normalizedPath, targetFilePath)} needed it. It was unloaded "
+                        + $"{(DateTime.UtcNow - previous.When).TotalSeconds:F0}s ago: {previous.Reason}.",
+                        key: $"reload:{cacheKey}");
+                }
+
                 result = CreateProjectSnapshot(newEntry, normalizedPath, targetFilePath);
             }
         }
@@ -1559,7 +1573,7 @@ internal static class WorkspaceService
                 foreach (string ck in cks.ToList())
                 {
                     if (s_cache.TryGetValue(ck, out var entry))
-                        EvictEntryLocked(ck, entry);
+                        EvictEntryLocked(ck, entry, $"'{Path.GetFileName(key)}' was written");
                 }
             }
         }
@@ -2365,13 +2379,46 @@ internal static class WorkspaceService
 
         Console.Error.WriteLine(
             $"[WorkspaceService] Project/solution file changed, evicting cache for '{cacheKey}'.");
-        EvictEntryLocked(cacheKey, entry);
+        EvictEntryLocked(cacheKey, entry, "its project or solution file changed on disk");
         entry = null;
         return false;
     }
 
-    private static void EvictEntryLocked(string cacheKey, CachedWorkspaceEntry entry)
+    /// <summary>Why each cache key was last evicted, and when.</summary>
+    /// <remarks>
+    /// A reload is only ever surprising because the unload that made it necessary happened
+    /// somewhere else, minutes earlier, for a reason nobody recorded. Keeping the reason means the
+    /// load can say what it is recovering from instead of announcing itself as if it were the
+    /// first time. Bounded because a long-lived daemon opens and drops many solutions.
+    /// </remarks>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Reason, DateTime When)>
+        s_lastEviction = new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxRememberedEvictions = 64;
+
+    /// <summary>The reason <paramref name="cacheKey"/> was last unloaded, if it was.</summary>
+    internal static (string Reason, DateTime When)? LastEvictionOf(string cacheKey) =>
+        s_lastEviction.TryGetValue(cacheKey, out var last) ? last : null;
+
+    /// <summary>What a load was for, in the terms the user would recognise: the file they were
+    /// looking at when it happened, or the project itself when nothing narrower is known.</summary>
+    private static string Requested(string projectPath, string? targetFilePath) =>
+        targetFilePath is { Length: > 0 } target
+            ? $"'{Path.GetFileName(target)}'"
+            : $"'{Path.GetFileName(projectPath)}'";
+
+    private static void RecordEviction(string cacheKey, string reason)
     {
+        if (s_lastEviction.Count >= MaxRememberedEvictions)
+            s_lastEviction.Clear();
+
+        s_lastEviction[cacheKey] = (reason, DateTime.UtcNow);
+    }
+
+    private static void EvictEntryLocked(string cacheKey, CachedWorkspaceEntry entry, string reason)
+    {
+        RecordEviction(cacheKey, reason);
+
         s_cache.TryRemove(cacheKey, out _);
 
         // Only this entry's membership. A project that another loaded workspace also serves keeps
@@ -2532,7 +2579,7 @@ internal static class WorkspaceService
             {
                 Console.Error.WriteLine(
                     $"[WorkspaceService] Analyzer rebuild in '{sourceDir}', evicting workspace for '{cacheKey}'.");
-                EvictEntryLocked(cacheKey, entry);
+                EvictEntryLocked(cacheKey, entry, $"analyzers were rebuilt in '{sourceDir}'");
             }
         }
     }
@@ -2797,7 +2844,7 @@ internal static class WorkspaceService
             return;
         try
         {
-            EvictEntryLocked(key, entry);
+            EvictEntryLocked(key, entry, label);
 
             // Through ServiceLog, not Console.Error. Under the shared daemon the console is a temp
             // file in a process the user is not looking at, so unloading a solution — the single

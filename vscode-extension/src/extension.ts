@@ -68,13 +68,43 @@ export interface ExtraLanguage {
      * means a file the server tracks that the gutter refuses, or the reverse.
      */
     readonly extensions: readonly string[];
+    /**
+     * Whole file names the language owns, for the file types whose extension says less than their
+     * name does — `packages.config` is NuGet's while `web.config` beside it is not, and no
+     * extension distinguishes them.
+     */
+    readonly filenames?: readonly string[];
     /** Whether the gutter offers breakpoints in these documents. */
     readonly breakpoints: boolean;
+    /**
+     * Extensions already covered by a watcher outside this table, and so left out of this
+     * language's own glob. Two watchers over one pattern means two `didChangeWatchedFiles` for
+     * every save, and the server does its reload work per event.
+     */
+    readonly watchedElsewhere?: readonly string[];
 }
 
 /** Files whose content the server tracks even while no editor has them open. */
-function watchGlob(language: ExtraLanguage): string {
-    return `**/*.{${language.extensions.map((extension) => extension.slice(1)).join(',')}}`;
+function watchGlobs(language: ExtraLanguage): string[] {
+    const globs: string[] = [];
+    const own = language.extensions.filter(
+        (extension) => !(language.watchedElsewhere ?? []).includes(extension),
+    );
+
+    if (own.length > 0) {
+        globs.push(`**/*.{${own.map((extension) => extension.slice(1)).join(',')}}`);
+    }
+
+    // Case-insensitively, because NuGet writes `NuGet.Config` and the CLI writes `nuget.config`,
+    // and a tree can contain both. A VS Code glob has no case-insensitive flag, so each letter
+    // that varies becomes a class.
+    for (const name of language.filenames ?? []) {
+        globs.push(
+            `**/${[...name].map((c) => (/[a-z]/i.test(c) ? `[${c.toLowerCase()}${c.toUpperCase()}]` : c)).join('')}`,
+        );
+    }
+
+    return globs;
 }
 
 /**
@@ -110,6 +140,24 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         id: 'mediator',
         extensions: [],
         breakpoints: false,
+    },
+    {
+        // Project files. Contributed as their own language for the same reason as resx: without
+        // the id in `contributes.languages` VS Code opens a .csproj as `xml`, the selector below
+        // never matches it, and the server is never told the buffer was opened.
+        //
+        // Taking .csproj away from `xml` costs the XML extension's formatting and folding, which
+        // `contributes.xmlLanguageParticipants` in package.json hands back — it tells
+        // redhat.vscode-xml to treat these documents as XML as well.
+        id: 'msbuild',
+        extensions: ['.csproj', '.fsproj', '.vbproj', '.props', '.targets'],
+        // packages.config and nuget.config are NuGet's; web.config and app.config beside them
+        // belong to the binding-redirect handler, and claiming `.config` would take all four.
+        filenames: ['packages.config', 'nuget.config'],
+        breakpoints: false,
+        // Every project extension is already in the workspace watcher list below, which predates
+        // this pack and is not gated on it being enabled.
+        watchedElsewhere: ['.csproj', '.fsproj', '.vbproj', '.props', '.targets'],
     },
 ];
 
@@ -487,7 +535,7 @@ async function startClient(
             // project file, and the tag prefixes it registers re-bind every control for the
             // other sessions sharing this daemon.
             '**/[wW]eb.config',
-            ...enabledFileLanguages().map(watchGlob),
+            ...enabledFileLanguages().flatMap(watchGlobs),
         ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
     }
     const clientKey = bindingKey(solutionPath, binding?.folder);

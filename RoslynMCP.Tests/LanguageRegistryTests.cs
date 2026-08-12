@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis;
 using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.Mediator;
+using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
@@ -134,7 +135,8 @@ public class LanguageRegistryTests
             pack => Assert.IsType<RazorLanguage>(pack),
             pack => Assert.IsType<ProtoLanguage>(pack),
             pack => Assert.IsType<MediatorLanguage>(pack),
-            pack => Assert.IsType<ResourcesLanguage>(pack));
+            pack => Assert.IsType<ResourcesLanguage>(pack),
+            pack => Assert.IsType<MsBuildLanguage>(pack));
 
         foreach (var handlers in new IEnumerable<object>[]
         {
@@ -203,7 +205,8 @@ public class LanguageRegistryTests
             pack => Assert.IsType<WebFormsLanguage>(pack),
             pack => Assert.IsType<RazorLanguage>(pack),
             pack => Assert.IsType<ProtoLanguage>(pack),
-            pack => Assert.IsType<ResourcesLanguage>(pack));
+            pack => Assert.IsType<ResourcesLanguage>(pack),
+            pack => Assert.IsType<MsBuildLanguage>(pack));
     }
 
     [Fact]
@@ -242,7 +245,8 @@ public class LanguageRegistryTests
             pack => Assert.IsType<RazorLanguage>(pack),
             pack => Assert.IsType<ProtoLanguage>(pack),
             pack => Assert.IsType<MediatorLanguage>(pack),
-            pack => Assert.IsType<ResourcesLanguage>(pack));
+            pack => Assert.IsType<ResourcesLanguage>(pack),
+            pack => Assert.IsType<MsBuildLanguage>(pack));
         Assert.IsType<RazorLanguage>(registry.Resolve(@"C:\app\Counter.razor"));
     }
 

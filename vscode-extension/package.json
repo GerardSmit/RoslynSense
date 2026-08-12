@@ -18,6 +18,7 @@
     "onLanguage:webforms",
     "onLanguage:resx",
     "onLanguage:proto",
+    "onLanguage:msbuild",
     "workspaceContains:**/*.{sln,slnx,csproj}"
   ],
   "main": "./out/extension.js",
@@ -66,6 +67,24 @@
           ".proto"
         ],
         "configuration": "./language-configuration/proto.json"
+      },
+      {
+        "id": "msbuild",
+        "aliases": [
+          "MSBuild"
+        ],
+        "extensions": [
+          ".csproj",
+          ".fsproj",
+          ".vbproj",
+          ".props",
+          ".targets"
+        ],
+        "filenamePatterns": [
+          "**/[pP]ackages.[cC]onfig",
+          "**/[nN]u[gG]et.[cC]onfig"
+        ],
+        "configuration": "./language-configuration/msbuild.json"
       }
     ],
     "grammars": [
@@ -97,6 +116,23 @@
         "language": "proto",
         "scopeName": "source.proto",
         "path": "./syntaxes/proto.tmLanguage.json"
+      },
+      {
+        "language": "msbuild",
+        "scopeName": "text.xml.msbuild",
+        "path": "./syntaxes/msbuild.tmLanguage.json"
+      },
+      {
+        "scopeName": "text.xml.msbuild.expression",
+        "path": "./syntaxes/msbuild.expression.json",
+        "injectTo": [
+          "text.xml.msbuild"
+        ]
+      }
+    ],
+    "xmlLanguageParticipants": [
+      {
+        "languageId": "msbuild"
       }
     ],
     "themes": [
@@ -1056,6 +1092,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Resolve `Send`, `Publish` and the generated mediator extension methods to the handler that runs, and count those calls as usages of the handler. Supports MediatR and Zapto.Mediator. Off leaves them resolving to the mediator interface in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.msbuild": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.csproj`, `.props`, `.targets`, `packages.config` and `nuget.config`: completion for properties, target frameworks, assembly references and item paths, NuGet package and version completion, hints when a package is outdated, warnings when a pinned version has a published advisory, and go-to-definition from a `PackageReference` to the `Directory.Packages.props` line that sets its version. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.solutionExplorer.fileIcons": {
           "type": "string",

@@ -29,7 +29,14 @@ public class LanguageCapabilityTests
     /// WebForms' absence. A quote opens an attribute value and an <c>import</c> path both, and the
     /// union hands the server one list rather than one per language.
     /// </summary>
-    private static readonly string[] MarkupOnlyTriggers = ["<", ":", "=", "'"];
+    /// <remarks>
+    /// Shrinks as packs are added, and has to: the MSBuild pack opens an element with <c>&lt;</c>
+    /// and an attribute value with <c>'</c>, so neither says anything about WebForms any more. A
+    /// character left here after another pack claims it asserts that switching WebForms off
+    /// withdraws a trigger the server still needs — which passes only until someone tries to
+    /// complete in the other language.
+    /// </remarks>
+    private static readonly string[] MarkupOnlyTriggers = [":", "="];
 
     /// <summary>
     /// The proto triggers C# does not already ask for: the space that ends a field's label and then
@@ -169,12 +176,15 @@ public class LanguageCapabilityTests
         var completion = capabilities.CompletionProvider;
         Assert.NotNull(completion);
 
-        // The space and the slash belong to no other pack, so their absence is proto's absence.
+        // The space belongs to no other pack, so its absence is proto's absence. The slash used to
+        // qualify too and no longer does — the MSBuild pack opens the next segment of an Include=
+        // path with it — which is why it is asserted present rather than absent below.
         Assert.DoesNotContain(" ", completion!.TriggerCharacters);
-        Assert.DoesNotContain("/", completion.TriggerCharacters);
 
-        // The quote is WebForms' too, and WebForms is one flag away and still on.
+        // Both of these are another pack's as well, and both of those packs are one flag away and
+        // still on: the quote is WebForms', the slash is MSBuild's.
         Assert.Contains("\"", completion.TriggerCharacters);
+        Assert.Contains("/", completion.TriggerCharacters);
 
         // A colour cannot be withdrawn after initialize, so a legend entry surviving here is a
         // number the server would never emit and a theme entry the user cannot use.

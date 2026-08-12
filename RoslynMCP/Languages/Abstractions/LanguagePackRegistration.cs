@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Languages.Mediator;
+using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
@@ -34,6 +35,8 @@ internal static class LanguagePackRegistration
             packs.Add(new MediatorLanguage());
         if (settings.Resources.Enabled)
             packs.Add(new ResourcesLanguage(settings));
+        if (settings.MsBuild)
+            packs.Add(new MsBuildLanguage());
 
         return packs;
     }
@@ -51,6 +54,8 @@ internal static class LanguagePackRegistration
             AddPack<MediatorLanguage>(services);
         if (settings.Resources.Enabled)
             AddPack<ResourcesLanguage>(services);
+        if (settings.MsBuild)
+            AddPack<MsBuildLanguage>(services);
 
         services.AddSingleton(sp => new LanguageRegistry(sp.GetServices<ILanguagePack>()).Publish());
     }

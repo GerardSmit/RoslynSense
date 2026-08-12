@@ -34,6 +34,7 @@ public sealed class ToolsConfig
     public bool Proto { get; init; } = true;
     public bool Mediator { get; init; } = true;
     public bool Resources { get; init; } = true;
+    public bool MsBuild { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;
     public bool Database { get; init; } = true;

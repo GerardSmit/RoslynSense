@@ -84,6 +84,14 @@
       <None Include="..\README.md" Pack="true" PackagePath="\" Link="README.md" />
     </ItemGroup>
 
+    <!-- MSBuild's own documentation, read by the project-file pack's completion and hover.
+         Embedded rather than copied beside the binary: this ships as a tool package, where a
+         loose file is one more thing to declare, publish and find at runtime. Provenance and
+         licence are in Languages/MsBuild/Help/README.md. -->
+    <ItemGroup>
+      <EmbeddedResource Include="Languages\MsBuild\Help\*.json" />
+    </ItemGroup>
+
     <!--
       ICorDebug cannot attach across x86/x64, so a target whose bitness differs from this host is
       debugged through a worker of the target's bitness. The RID's apphost is what fixes a

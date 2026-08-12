@@ -167,6 +167,11 @@ internal static class WatchedFilesHandler
         {
             Services.Packages.NuGetFeedContext.Invalidate();
             Services.Packages.PackageUpdateService.Invalidate();
+
+            // The project-file squiggles too: they distinguish "no such version" from "no feed
+            // answered", and that distinction is exactly what a config change moves. Fixing a
+            // credential has to be able to clear the errors it was causing.
+            Languages.MsBuild.Core.PackageStatusCache.Invalidate();
         }
 
         // A pack's file changed under us. Which paths those are, and what has to be dropped for

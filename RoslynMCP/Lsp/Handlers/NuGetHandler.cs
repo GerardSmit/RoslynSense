@@ -261,11 +261,15 @@ internal static class NuGetHandler
             _ => new PackageOperationResult(false, $"Unknown action '{p.Action}'."),
         };
 
-        // A feed change invalidates every cached answer that came from one.
+        // A feed change invalidates every cached answer that came from one — including the project
+        // file squiggles, whose whole job is to distinguish "no such version" from "no feed
+        // answered". Leaving them would keep reporting the state of a feed list that no longer
+        // exists, and a fixed credential would look like it changed nothing.
         if (result.Success)
         {
             PackageUpdateService.Invalidate();
             NuGetMetadataService.Invalidate();
+            Languages.MsBuild.Core.PackageStatusCache.Invalidate();
         }
 
         return new NuGetSourceEditResultDto(result.Success, result.Message, Sources());
@@ -278,6 +282,12 @@ internal static class NuGetHandler
             .ToArray();
 
     /// <summary>A package change invalidates every audit and update answer we are holding.</summary>
+    /// <remarks>
+    /// The project-file squiggles are not dropped here. What a mutation changes is which version a
+    /// file names, not what the feeds say about any version — and the file itself is about to be
+    /// rewritten, which invalidates its parse and re-derives them anyway. Clearing the status cache
+    /// would throw away several hundred correct entries to no purpose.
+    /// </remarks>
     private static void AfterMutation()
     {
         PackageAuditService.Invalidate();

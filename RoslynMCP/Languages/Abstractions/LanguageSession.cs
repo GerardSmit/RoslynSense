@@ -22,8 +22,7 @@ internal sealed class LanguageSession
     /// <summary>No packs: every request goes to the C# handlers.</summary>
     public static LanguageSession Empty { get; } = new([]);
 
-    private readonly Dictionary<string, ILanguagePack> _byExtension =
-        new(StringComparer.OrdinalIgnoreCase);
+    private readonly LanguageFileMap _files;
     private readonly Dictionary<string, int> _tokenTypeOffsets = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _tokenModifierOffsets = new(StringComparer.Ordinal);
 
@@ -35,12 +34,7 @@ internal sealed class LanguageSession
     public LanguageSession(IEnumerable<ILanguagePack> packs, Func<ILanguagePack, bool> isEnabled)
     {
         Packs = [.. packs.Where(isEnabled)];
-
-        foreach (var pack in Packs)
-        {
-            foreach (string extension in pack.FileExtensions)
-                _byExtension.TryAdd(extension, pack);
-        }
+        _files = new LanguageFileMap(Packs);
 
         var types = new List<string>(SemanticTokensHandler.TokenTypes);
         var modifiers = new List<string>(SemanticTokensHandler.TokenModifiers);
@@ -71,14 +65,7 @@ internal sealed class LanguageSession
         Packs.Any(pack => pack.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The enabled pack owning this document, or null when C# should answer.</summary>
-    public ILanguagePack? Resolve(string? uriOrPath)
-    {
-        if (uriOrPath is not { Length: > 0 } candidate || IsVirtual(candidate))
-            return null;
-
-        string extension = Path.GetExtension(candidate);
-        return extension.Length > 0 && _byExtension.TryGetValue(extension, out var pack) ? pack : null;
-    }
+    public ILanguagePack? Resolve(string? uriOrPath) => _files.Resolve(uriOrPath);
 
     /// <summary>The enabled pack owning this document, if it can answer
     /// <typeparamref name="TProvider"/>.</summary>
@@ -121,7 +108,4 @@ internal sealed class LanguageSession
 
     /// <summary>Mirrors <see cref="LanguageRegistry"/>: generated and decompiled documents belong
     /// to no pack whatever their extension looks like.</summary>
-    private static bool IsVirtual(string uriOrPath) =>
-        uriOrPath.StartsWith(VirtualDocumentHandler.GeneratedScheme + ":", StringComparison.Ordinal)
-        || uriOrPath.StartsWith(VirtualDocumentHandler.MetadataScheme + ":", StringComparison.Ordinal);
 }

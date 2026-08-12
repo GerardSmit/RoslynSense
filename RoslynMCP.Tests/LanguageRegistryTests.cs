@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+using Microsoft.CodeAnalysis;
 using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.Mediator;
@@ -260,6 +262,72 @@ public class LanguageRegistryTests
 
         Assert.Null(registry.Resolve(@"C:\site\Default.aspx"));
         Assert.False(registry.IsProjectionPath(@"C:\site\Default.aspx.aspx-inline.g.cs"));
+    }
+
+    /// <summary>
+    /// A whole file name beats an extension, which is the point of declaring one.
+    /// </summary>
+    /// <remarks>
+    /// The case that forced this: <c>packages.config</c> and <c>nuget.config</c> belong to whoever
+    /// reads NuGet state, while <c>web.config</c> and <c>app.config</c> beside them belong to
+    /// <see cref="BindingRedirectHandler"/> — and a pack that claimed <c>.config</c> to reach the
+    /// first two would take all four.
+    /// </remarks>
+    [Theory]
+    [InlineData(@"C:\src\packages.config")]
+    [InlineData(@"C:\src\PACKAGES.CONFIG")]     // matched case-insensitively, like extensions
+    [InlineData(@"C:\src\nuget.config")]
+    [InlineData(@"C:\src\NuGet.Config")]        // the casing NuGet itself writes
+    public void ADeclaredFileNameResolvesToThePackThatDeclaredIt(string path) =>
+        Assert.IsType<NamedFilePack>(new LanguageRegistry([new NamedFilePack()]).Resolve(path));
+
+    [Theory]
+    [InlineData(@"C:\src\web.config")]
+    [InlineData(@"C:\src\Web.config")]
+    [InlineData(@"C:\src\app.config")]
+    public void ConfigFilesThePackDidNotNameAreLeftAlone(string path)
+    {
+        // Not merely unclaimed by this pack — unclaimed full stop, because the binding-redirect
+        // handler sits in front of pack dispatch and answers these itself. A pack that swallowed
+        // them would take the diagnostics and quick fixes with it.
+        Assert.Null(new LanguageRegistry([new NamedFilePack()]).Resolve(path));
+        Assert.Null(Registry().Resolve(path));
+    }
+
+    [Fact]
+    public void AFileNameResolvesTheSameThroughASessionAsThroughTheRegistry()
+    {
+        // The two carry separate maps over different pack sets — every registered pack, and the
+        // ones one editor connection switched on — so a routing rule added to one and not the other
+        // would serve the AI session and not the editor, or the reverse.
+        const string path = @"C:\src\packages.config";
+
+        Assert.IsType<NamedFilePack>(new LanguageRegistry([new NamedFilePack()]).Resolve(path));
+        Assert.IsType<NamedFilePack>(new LanguageSession([new NamedFilePack()]).Resolve(path));
+
+        // And a pack the connection switched off answers nothing, by either route.
+        Assert.Null(new LanguageSession([new NamedFilePack()], _ => false).Resolve(path));
+    }
+
+    /// <summary>A pack that owns files by name as well as by extension, which no real pack did
+    /// until project files needed both.</summary>
+    private sealed class NamedFilePack : ILanguagePack
+    {
+        public string Id => "namedfile";
+
+        public string DisplayName => "Named File Test Pack";
+
+        public ImmutableArray<string> FileExtensions { get; } = [".namedtest"];
+
+        public ImmutableArray<string> FileNames { get; } = ["packages.config", "nuget.config"];
+
+        public LanguageCapabilities Capabilities => LanguageCapabilities.None;
+
+        public ImmutableArray<string> WellKnownTypeNames { get; } = [];
+
+        public ImmutableArray<SymbolKind> InterestingSymbolKinds { get; } = [];
+
+        public bool IsProjectionPath(string? filePath) => false;
     }
 
     /// <summary>

@@ -30,6 +30,18 @@ internal interface ILanguagePack
     /// <summary>Extensions this pack owns, each with its leading dot. Matched case-insensitively.</summary>
     ImmutableArray<string> FileExtensions { get; }
 
+    /// <summary>
+    /// Whole file names this pack owns, matched case-insensitively and ahead of
+    /// <see cref="FileExtensions"/>.
+    /// </summary>
+    /// <remarks>
+    /// For the file types whose extension says less than their name does. <c>packages.config</c> and
+    /// <c>nuget.config</c> are NuGet's, while <c>web.config</c> and <c>app.config</c> beside them
+    /// belong to the binding-redirect handler — a pack claiming <c>.config</c> would take all four.
+    /// Empty for a pack whose extensions already say everything, which is most of them.
+    /// </remarks>
+    ImmutableArray<string> FileNames => [];
+
     /// <summary>What the pack adds to the server's advertised capabilities when it is enabled.</summary>
     LanguageCapabilities Capabilities { get; }
 

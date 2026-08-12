@@ -28,18 +28,12 @@ internal sealed class LanguageRegistry
     /// </summary>
     public static LanguageRegistry Current { get; private set; } = Empty;
 
-    private readonly Dictionary<string, ILanguagePack> _byExtension =
-        new(StringComparer.OrdinalIgnoreCase);
+    private readonly LanguageFileMap _files;
 
     public LanguageRegistry(IEnumerable<ILanguagePack> packs)
     {
         Packs = [.. packs];
-
-        foreach (var pack in Packs)
-        {
-            foreach (string extension in pack.FileExtensions)
-                _byExtension.TryAdd(extension, pack);
-        }
+        _files = new LanguageFileMap(Packs);
     }
 
     public ImmutableArray<ILanguagePack> Packs { get; }
@@ -53,14 +47,7 @@ internal sealed class LanguageRegistry
     }
 
     /// <summary>The pack owning this document, or null when C# should answer.</summary>
-    public ILanguagePack? Resolve(string? uriOrPath)
-    {
-        if (uriOrPath is not { Length: > 0 } candidate || IsVirtual(candidate))
-            return null;
-
-        string extension = Path.GetExtension(candidate);
-        return extension.Length > 0 && _byExtension.TryGetValue(extension, out var pack) ? pack : null;
-    }
+    public ILanguagePack? Resolve(string? uriOrPath) => _files.Resolve(uriOrPath);
 
     /// <summary>The pack owning this document, if it can answer <typeparamref name="TProvider"/>.</summary>
     public TProvider? Resolve<TProvider>(string? uriOrPath) where TProvider : class =>
@@ -96,12 +83,4 @@ internal sealed class LanguageRegistry
     public IReadOnlyList<IDiagnosticsHandler> DiagnosticsHandlers =>
         Contributors<IDiagnosticsHandler>();
 
-    /// <summary>
-    /// Documents served from memory rather than from disk — generated sources and decompiled
-    /// metadata. Their URIs are not file paths and their extension says C#, so no pack may claim
-    /// one; the exclusion lives here so every pack inherits it.
-    /// </summary>
-    private static bool IsVirtual(string uriOrPath) =>
-        uriOrPath.StartsWith(VirtualDocumentHandler.GeneratedScheme + ":", StringComparison.Ordinal)
-        || uriOrPath.StartsWith(VirtualDocumentHandler.MetadataScheme + ":", StringComparison.Ordinal);
 }

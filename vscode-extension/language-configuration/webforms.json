@@ -32,6 +32,10 @@
         }
     },
     "wordPattern": "(-?\\d*\\.\\d\\w*)|([^\\`\\~\\!\\@\\$\\^\\&\\*\\(\\)\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\'\\\"\\,\\.\\<\\>\\/\\s]+)",
+    "indentationRules": {
+        "increaseIndentPattern": "<(?!\\?|[^>]*/>)([-_\\.A-Za-z0-9]+)(?=\\s|>)\\b[^>]*>(?!.*</\\1>)|<!--(?!.*-->)|\\{[^}\"']*$",
+        "decreaseIndentPattern": "^\\s*(<\\/[-_\\.A-Za-z0-9]+\\s*>|-->|\\})"
+    },
     "onEnterRules": [
         {
             "beforeText": "<(?!(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr))([_:\\w][_:\\w\\-.\\d]*)(?:(?:[^'\"/>]|\"[^\"]*\"|'[^']*')*?(?!\\/)>)[^<]*$",

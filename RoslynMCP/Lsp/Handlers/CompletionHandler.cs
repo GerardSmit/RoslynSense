@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages;
@@ -93,6 +93,13 @@ internal static class CompletionHandler
         if (trigger.Kind == CompletionTriggerKind.Insertion
             && !service.ShouldTriggerCompletion(text, offset, trigger))
             return new CompletionList(false, Array.Empty<CompletionItem>());
+
+        // Every "(" opens an expression position, but Roslyn's providers answer a typed one only
+        // inside an argument list: asked about the "(" of an if, while or switch they agree it is
+        // a trigger and then return nothing. The character has already decided a list is wanted,
+        // so ask for it the way Ctrl+Space would. In an argument list the two agree anyway.
+        if (trigger is { Kind: CompletionTriggerKind.Insertion, Character: '(' })
+            trigger = CompletionTrigger.Invoke;
 
         var completions = await service.GetCompletionsAsync(
             document, offset, s_options, document.Project.Solution.Options, trigger,

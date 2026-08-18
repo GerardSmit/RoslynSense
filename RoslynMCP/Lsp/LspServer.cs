@@ -93,10 +93,14 @@ internal sealed class LspServer : IDisposable
     }
 
     /// <summary>
-    /// C#'s own completion triggers. No " " or "(": space fires on every keystroke boundary — junk
-    /// requests that burn Roslyn's provider time budgets — and "(" belongs to signature help.
+    /// C#'s own completion triggers. "(" opens the list on <c>if (</c>, <c>while (</c>,
+    /// <c>switch (</c> and a call's first argument, which is where VS and Rider open theirs; it is
+    /// a signature-help trigger as well, and the two coexist there the same way. Still no " ":
+    /// Roslyn accepts a space almost anywhere a statement can continue — after a plain <c>;</c>
+    /// included — so registering it means a request per keystroke boundary, burning the provider
+    /// time budgets that decide how complete the next real list is.
     /// </summary>
-    private static readonly string[] CSharpCompletionTriggers = [".", "["];
+    private static readonly string[] CSharpCompletionTriggers = [".", "(", "["];
 
     /// <summary>C#'s own signature-help triggers; "&lt;" opens a type argument list.</summary>
     private static readonly string[] CSharpSignatureHelpTriggers = ["(", ",", "<"];
@@ -189,11 +193,12 @@ internal sealed class LspServer : IDisposable
             CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
             DocumentRangeFormattingProvider = true,
-            // Not newline: see FormatOnTypeAsync. Registering it made Enter unindent the line
-            // it had just created.
+            // "{" is what moves an opening brace onto its own line as it is typed. Not newline:
+            // see FormatOnTypeAsync. Registering it made Enter unindent the line it had just
+            // created.
             DocumentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions(
                 FirstTriggerCharacter: ";",
-                MoreTriggerCharacter: ["}"]),
+                MoreTriggerCharacter: ["}", "{"]),
             FoldingRangeProvider = true,
             CallHierarchyProvider = true,
             TypeHierarchyProvider = true,

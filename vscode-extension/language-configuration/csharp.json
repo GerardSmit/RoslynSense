@@ -1,0 +1,22 @@
+{
+    // Layered on top of VS Code's own csharp configuration, which supplies brackets, comments
+    // and the "///" rules but no indentation rules at all. A field left out here keeps whatever
+    // that configuration set; only what is named below is replaced.
+    //
+    // Without these, Enter copies the previous line's whitespace verbatim, so pressing it on a
+    // blank line inside a method lands the caret at column zero. With them the editor walks back
+    // to the last line that has something on it and works the indent out from there, which is
+    // what Rider and Visual Studio do.
+    //
+    // Deliberately no indentNextLinePattern: it would indent the line after a braceless
+    // "if (x)", and in C# the thing typed there is usually the brace, which belongs at the
+    // "if"'s own indent. A braceless body costs one Tab; a misplaced brace costs an argument
+    // with the formatter on every block.
+    "indentationRules": {
+        // A line whose last unclosed opener is "{", "(" or "[" opens a level. The quote classes
+        // keep an opener inside a string from counting, the leading (?!//) a commented-out one.
+        "increaseIndentPattern": "^((?!\\/\\/).)*(\\{[^}\"'`]*|\\([^)\"'`]*|\\[[^\\]\"'`]*)$",
+        // A line that starts with a closer sits one level back out.
+        "decreaseIndentPattern": "^((?!.*?\\/\\*).*\\*\\/)?\\s*[\\}\\]\\)].*$"
+    }
+}

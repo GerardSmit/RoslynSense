@@ -1,6 +1,6 @@
 # RoslynSense
 
-A Model Context Protocol (MCP) server that provides C# code analysis, navigation, refactoring, testing, and debugging capabilities using the Roslyn compiler platform. Includes extensible support for WebForms (ASPX/ASCX), Razor (.razor/.cshtml) and Protobuf (.proto) files.
+A Model Context Protocol (MCP) server that provides C# code analysis, navigation, refactoring, testing, and debugging capabilities using the Roslyn compiler platform. Includes extensible support for WebForms (ASPX/ASCX), Razor (.razor/.cshtml), Protobuf (.proto) and LINQ to SQL (.dbml) files.
 
 Inspired by [egorpavlikhin/roslyn-mcp](https://github.com/egorpavlikhin/roslyn-mcp).
 
@@ -176,6 +176,7 @@ Use the following server configuration:
 | `--no-razor` | Disable Razor (.razor/.cshtml) support. |
 | `--no-proto` | Disable Protobuf/gRPC (.proto) support: no navigation between a `.proto` and the C# protoc generated from it. |
 | `--no-resources` | Disable `.resx` support: no resource catalog, no key navigation. |
+| `--no-dbml` | Disable LINQ to SQL (`.dbml`) support: no navigation between a model and the C# SqlMetal generated from it, no reference counts, no table refresh. |
 | `--no-debugger` | Disable all debugger tools (see [Debugging](#debugging)). |
 | `--no-profiling` | Disable all profiling tools (see [Profiling](#profiling)). |
 | `--toon` | Use TOON (Token-Optimized Object Notation) output format instead of markdown. Reduces token usage. |
@@ -209,6 +210,7 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
         "razor": true,
         "proto": true,
         "resources": true,
+        "dbml": true,
         "debugger": true,
         "profiling": true,
         "database": true
@@ -242,6 +244,7 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
 | `tools.razor` | bool | `true` | `--no-razor` forces `false` |
 | `tools.proto` | bool | `true` | `--no-proto` forces `false` |
 | `tools.resources` | bool | `true` | `--no-resources` forces `false` |
+| `tools.dbml` | bool | `true` | `--no-dbml` forces `false` |
 | `tools.debugger` | bool | `true` | `--no-debugger` forces `false` |
 | `tools.profiling` | bool | `true` | `--no-profiling` forces `false` |
 | `tools.database` | bool | `true` | `--no-db` forces `false` |
@@ -294,6 +297,21 @@ Drop a `roslynsense.json` next to your solution (or anywhere up the tree from wh
 </details>
 
 <details>
+<summary>LINQ to SQL (<code>.dbml</code>)</summary>
+
+A `.dbml` is the model and `Foo.designer.cs` is SqlMetal's re-emission of it, so F12 on a generated entity property lands on the `<Column>` rather than in a file the next regeneration overwrites — and the designer's own line is withdrawn, so it is a jump and not a picker. Shift+F12 does the same, which is the point: the two features cannot disagree about which file is generated.
+
+Everything is joined by the anchors SqlMetal left in its own output — `[Table(Name=…)]`, `[Column(Name=…)]`, `[Association(Name=…)]`, `[Function(Name=…)]` — so no name is predicted. The path from `Foo.designer.cs` back to `Foo.dbml` is only ever a *candidate*: LINQ to SQL replaces the extension where WebForms appends to it, so the same spelling is what a `.resx` and a `.settings` produce. The binding is what confirms it, and nothing is withdrawn from F12 on the strength of a path.
+
+Inside the file: an outline, hover showing the database half and the generated C# signature together, F12 into the generated member, Shift+F12 to every call site, and an **N references** lens over each table, type, column, association and function — counting call sites with the designer's own five or six mentions of each property excluded. The counts are absent rather than zero when the project has not been built, and an informational diagnostic on the root says why.
+
+**Refresh table** re-syncs one `<Table>` against a registered RoslynSense connection: columns added and updated, foreign keys generated as `<Association>` pairs, and removals confirmed modally before anything is deleted. The connection is picked from RoslynSense's own registered connections — the model's `<Connection>` element is deliberately never used, since it commonly names a machine that no longer exists. The file is written to disk first so the watcher regenerates the designer from it, and a dirty buffer that differs from disk is refused rather than clobbered.
+
+`--no-dbml` (or `"tools": { "dbml": false }`) removes the pack from the daemon; editors can switch it off per window with `roslynSense.languages.dbml`.
+
+</details>
+
+<details>
 <summary>Connection entry formats</summary>
 
 Two equivalent forms — pick whichever reads better. The string form mirrors `--db <provider>:<connstr>` shorthand.
@@ -328,6 +346,7 @@ The connection-string portion accepts the same `xml:` / `json:` indirection and 
 - Lenient JSON: line/block comments, trailing commas, and unknown properties are accepted. Unknown properties are silently ignored for forward compatibility.
 - Invalid JSON is logged to stderr; the server starts with defaults.
 - Per-connection parse failures (unknown provider, empty value) are logged as warnings and the entry is skipped.
+- **Live reload.** The shared host watches the file (and the working directory, in case one appears closer to the solution) and applies edits without a restart: feature toggles, database connections, resource settings, `maxWorkspaces`, `hostIdleMinutes`. The host log names what changed. Running apps, background tasks and profiling sessions survive the reload; a file that stops parsing keeps the current settings until it parses again. Already-connected MCP chats keep their advertised tool *list* until the chat restarts (behavior behind the tools updates immediately), and an editor's advertised capabilities update on its next reconnect. Without the shared host (in-process mode), a change is detected and logged but needs a restart to apply.
 
 </details>
 
@@ -368,11 +387,11 @@ editor ──stdio──> roslyn-sense --lsp ──named pipe──> per-solutio
 
 The `--lsp` process is a thin proxy: it connects to (or spawns) the per-solution daemon and forwards LSP JSON-RPC over the daemon's pipe. Without a resolvable solution or reachable daemon it hosts the LSP session in-process.
 
-Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), diagnostics (push, or pull for LSP 3.17 clients), completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, semantic tokens, inlay hints (parameter names + implicit types), code lens (reference counts, override/implements links, run/debug test), watched-file sync (`workspace/didChangeWatchedFiles`), progress reporting (`$/progress`), workspace commands (`roslynSense.restore`, `roslynSense.reloadWorkspace`, `roslynSense.build`, `roslynSense.completionAccepted`), doc-comment generation on `///` (custom `roslynSense/onAutoInsert`), and ranked one-box search (custom `roslynSense/searchEverywhere`). Position encoding is UTF-16.
+Capabilities: definition (incl. type definition), references, implementation, hover, document/workspace symbols, document highlight, rename (with prepare), diagnostics (push, or pull for LSP 3.17 clients), completion, code actions (quick fixes + refactorings), document + range formatting, folding ranges, call hierarchy, type hierarchy, semantic tokens, inlay hints (parameter names + implicit types), code lens (reference counts, override/implements links, run/debug test), watched-file sync (`workspace/didChangeWatchedFiles`), progress reporting (`$/progress`), workspace commands (`roslynSense.restore`, `roslynSense.reloadWorkspace`, `roslynSense.build`, `roslynSense.completionAccepted`), doc-comment generation on `///` (custom `roslynSense/onAutoInsert`), and ranked one-box search (custom `roslynSense/searchEverywhere`, plus `roslynSense/searchText` for the literal scan behind its Text tab). Position encoding is UTF-16.
 
 **Completion is ranked, not alphabetical.** Roslyn decides what is in scope; the order is computed here, ReSharper-style. What you type is matched with a CamelHumps matcher (`sb` → `StringBuilder`, `tolower` → `ToLowerInvariant`, one typo tolerated on longer words — and typo hits vanish the moment a clean one exists), and the match quality feeds a 64-bit relevance word whose bit order *is* the ranking: match quality first, then target-type fit, then kind (locals and parameters > fields and properties > methods > extension methods > keywords > types), then provenance: the type's own members beat inherited ones, `object`'s members (`ToString`, `GetHashCode`, …) sink below every real member, `[Obsolete]` sinks below its peers, and unimported items sink below everything already in scope. Among equals, the local declared nearest above the caret wins. Declaring types and that nearest local come from one pass over the type being completed on, not a symbol resolve per item. Unimported extension methods are offered too (`value.Shout` finds an extension in a namespace you have not imported) and commit adds the `using`, same as unimported types. Accepted items are remembered per context (`roslynSense.completionAccepted`) and promote one item inside its tier only, so usage never reorders across tiers. The order also survives the client: editors sort by their own fuzzy score before `sortText`, so each item's `filterText` is prefixed with the typed characters — every item then scores identically there and the server's ranking is what you see.
 
-**Search Everywhere (Ctrl+T).** One box over types, members and files, ranked server-side the way ReSharper's Go to Everything ranks: match quality feeds a tier, and one tier step outweighs every possible match score, so an exact type beats an exact member beats a fuzzy type, with the shorter name winning ties (`List` before `ListView`). `Namespace.Type.Member` and `dir/file` narrow — each word but the last must match a container segment — and `t:`, `m:`, `f:` restrict to types, members or files. Names are matched before symbols are materialised, so a query costs a pass over declaration names rather than a pass over symbols. The VSCode extension renders the list itself (`roslynSense/searchEverywhere`); the built-in picker re-sorts what a server sends and has nowhere to put files. `workspace/symbol` uses the same ranking, so clients without the extension get the order too.
+**Search Everywhere (Ctrl+T).** One box over types, members, files, IDE actions and plain text, ranked server-side the way ReSharper's Go to Everything ranks: match quality feeds a tier, and one tier step outweighs every possible match score, so an exact type beats an exact member beats a fuzzy type, with the shorter name winning ties (`List` before `ListView`). `Namespace.Type.Member` and `dir/file` narrow — each word but the last must match a container segment — and `t:`, `m:`, `f:` restrict to types, members or files. Names are matched before symbols are materialised, so a query costs a pass over declaration names rather than a pass over symbols. The VSCode extension renders a Rider-style popup (`roslynSense/searchEverywhere`): tabs for All / Classes / Files / Symbols / Actions / Text (Tab cycles them, and each tab forces its kind server-side via the request's `only` field), a preview pane under the list, Ctrl+Enter or "Open in Right Split", and an **include non-solution items** switch that also searches the public types of every referenced assembly — read straight from their metadata tables, ranked below all solution code, and opened as decompiled source through the `roslynsense-metadata` scheme. The Text tab is a literal case-insensitive scan (`roslynSense/searchText`) over the same directory walk the file search uses, so a hit in a `.proto` or a `.config` is as reachable as one in a `.cs`. `workspace/symbol` uses the same ranking, so clients without the extension get the order too.
 
 **Diagnostics include analyzers.** Project analyzers (StyleCop, Roslynator, in-house) and Roslyn's built-in `IDE0xxx` code-style rules run alongside compiler diagnostics, with `.editorconfig` / `.globalconfig` severities honored. They are computed off the typing loop: compiler squiggles publish after ~400 ms as before, analyzer results follow once typing pauses, cached per document version. Turn them off with `ROSLYNMCP_ANALYZER_DIAGNOSTICS=0` (all analyzers) or `ROSLYNMCP_CODE_STYLE_DIAGNOSTICS=0` (IDE rules only); `ROSLYNMCP_ANALYZER_TIMEOUT_SECONDS` caps a pass (default 15).
 
@@ -448,6 +467,15 @@ WebForms designers are generated from the resolved control tree, so each server 
 so no duplicate member is emitted. `.dbml` regeneration shells out to `SqlMetal.exe` from the
 Windows SDK.
 
+Template-nested controls stay navigable despite having no field: F12 on the `"id"` literal in a
+`FindControl("id")` call jumps to the `ID` in the markup — scoped to the right naming container
+when the containing method is wired as a control's event handler (`OnItemDataBound="list_ItemDataBound"`
+means the lookup searches `list`'s templates first) — and F12 or Shift+F12 on the template-nested
+`ID` itself lists the `FindControl` call sites. Wrapper methods that forward a string parameter to
+`FindControl` (`FindControl<T>(control, id)`, `SetText(control, id, …)`, and the like) are
+discovered by scanning the project and its referenced projects, so the same navigation works
+through a shared utility library's extension methods.
+
 ### Running Applications
 
 Applications are per-chat: they are launched by the client that asked for them and torn down with
@@ -477,7 +505,7 @@ it, so two chats never fight over one process.
 | **RunCoverage** | Collect code coverage for a test project using coverlet. Caches results for querying. Set `background: true` for background collection. |
 | **GetCoverage** | Query coverage by project, file, class, or method. Shows line and branch coverage with uncovered lines. |
 | **GetMethodCoverage** | Get per-line coverage detail for a specific method. Shows every executable line with hit count and source code. Lines marked with `!` have partial branch coverage. |
-| **BuildCoverageMap** | Build the per-test coverage map — which tests execute which lines. Runs coverage once per test class, then rebuilds only the classes whose source changed. |
+| **BuildCoverageMap** | Build the per-test coverage map — which tests execute which lines. Compiles once, runs coverage per test class (concurrently where the collector allows), then rebuilds only the classes whose source changed. |
 | **RunImpactedTests** | Run only the tests your current git changes can affect. Matches changed lines against the coverage map, and walks references for code the map has not seen yet. `scope`: `uncommitted` (default), `branch`, or `ref`. Set `dryRun: true` to see the selection and why each test was picked. |
 
 ### Debugging
@@ -519,8 +547,7 @@ tests, then `DebugAttach` to the test host.
 | **DebugAttach** | Attach the debugger to a running .NET or .NET Framework process by PID. |
 | **DebugSetBreakpoint** | Set a breakpoint at a file and line. Supports conditions and batch mode. |
 | **DebugRemoveBreakpoint** | Remove a breakpoint by ID. Supports batch removal. |
-| **DebugContinue** | Continue, step in, step over, or step out. |
-| **DebugRunUntil** | Run until a specific location, with optional condition. |
+| **DebugContinue** | Continue, step in/over/out, pause, run until/to a line, or move the instruction pointer — selected with the `action` parameter. |
 | **DebugEvaluate** | Evaluate expressions in the current debug context. Supports batch evaluation with semicolons. |
 | **DebugStatus** | Get debugger status, breakpoints, and current pause position with optional locals and stack trace. |
 | **DebugStop** | Stop the debug session and clean up. |
@@ -535,8 +562,7 @@ Profiling uses [dotnet-trace](https://learn.microsoft.com/en-us/dotnet/core/diag
 | **ProfileApp** | Profile a .NET application for a specified duration. |
 | **ListProfilingSessions** | List recent profiling sessions with IDs for investigation. |
 | **ProfileSearchMethods** | Search profiled methods by name pattern. |
-| **ProfileCallers** | Show which methods called a given method and how much time was spent. |
-| **ProfileCallees** | Show which methods a given method calls and how much time was spent. |
+| **ProfileCalls** | Show the direct callers or callees of a method and how much time was spent in each. |
 | **ProfileHotPaths** | Show the hottest call paths through a method. |
 
 ### Background Tasks
@@ -699,18 +725,21 @@ The provider for each connection string is resolved in this order — first matc
 | **validate-after-edit** | Step-by-step instructions to validate a C# file after editing. |
 | **investigate-symbol** | Multi-step investigation workflow for a symbol. |
 
-## Skill
+## Skills
 
-Installing via the Claude Code plugin also installs a **`csharp` skill** (`skills/csharp/SKILL.md`).
-Claude loads it automatically when working in a C# project; you can also invoke it explicitly as
+Installing via the Claude Code plugin also installs a set of skills (`skills/*/SKILL.md`). Claude
+loads them automatically when the work matches; you can also invoke one explicitly, e.g.
 `/roslyn-sense:csharp`.
 
-It carries the C#/.NET conventions plus guidance on driving these tools — which tool to reach for
-instead of grep or a shell build, when to regenerate designer files rather than editing them, and
-how to run and debug an app on either runtime.
+| Skill | Covers |
+|-------|--------|
+| **`csharp`** | The core: C#/.NET conventions plus navigation, editing, refactoring, building, packages, and running apps — which tool to reach for instead of grep or a shell build, and when to regenerate designer files rather than editing them. Points at the skills below. |
+| **`csharp-testing`** | Test conventions, discovering and running tests, coverage, and impacted-test selection. |
+| **`csharp-debugging`** | Breakpoints, stepping, evaluating, watching values — on either runtime, including IIS Express. |
+| **`csharp-profiling`** | CPU sampling and heap snapshots: hot paths, callers/callees, and leak hunting. |
 
-Skills are a Claude Code feature. On other MCP clients, point your agent at that file directly —
-it is plain Markdown with no Claude-Code-specific syntax in the body.
+Skills are a Claude Code feature. On other MCP clients, point your agent at those files directly —
+they are plain Markdown with no Claude-Code-specific syntax in the body.
 
 ### Keeping the tool up to date
 
@@ -729,7 +758,7 @@ even when there is nothing to update, on every single session.
 |---------|--------|
 | `ROSLYNMCP_NO_UPDATE_CHECK` | `1`/`true`/`on` disables the version check entirely. |
 
-If the tool is missing altogether, the skill tells the agent to install it and ask for a restart.
+If the tool is missing altogether, the `csharp` skill tells the agent to install it and ask for a restart.
 
 ## Markup Snippet Convention
 

@@ -1,6 +1,6 @@
 {
   "name": "roslyn-sense",
-  "description": "Roslyn-powered C# code analysis, navigation, refactoring, building, running, testing, debugging, and profiling. Provides IDE-like intelligence for C# projects — modern .NET and .NET Framework — through MCP tools, plus a csharp skill with the conventions and tool workflows.",
+  "description": "Roslyn-powered C# code analysis, navigation, refactoring, building, running, testing, debugging, and profiling. Provides IDE-like intelligence for C# projects — modern .NET and .NET Framework — through MCP tools, plus csharp skills with the conventions and tool workflows.",
   "version": "0.3.0",
   "author": {
     "name": "Gerard Smit",

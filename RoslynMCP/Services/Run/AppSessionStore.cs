@@ -39,6 +39,16 @@ public sealed class AppSession : IDisposable
     public int? Port { get; init; }
     public DebugRuntime DebugRuntime { get; init; }
 
+    /// <summary>
+    /// Whether an edit session is open for this app, and so whether ApplyHotReload can work.
+    /// </summary>
+    /// <remarks>
+    /// Recorded at launch rather than asked afterwards: the session usually lives in the daemon,
+    /// which owns the agent connection, so this process asking its own tables would answer "no"
+    /// for an app that is perfectly reloadable.
+    /// </remarks>
+    public bool HotReloadOpen { get; set; }
+
     /// <summary>The command this session started, quoted so it can be pasted into a shell.</summary>
     public string CommandLine =>
         string.Join(' ', new[] { Quote(Process.StartInfo.FileName) }

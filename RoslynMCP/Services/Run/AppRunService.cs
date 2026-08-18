@@ -55,10 +55,18 @@ public sealed class AppRunService(AppSessionStore store)
 
         // A profile that turns hot reload off means it: the app is expected to run without the
         // startup hook, and injecting one anyway changes what is being tested.
-        bool hotReloadInjected =
+        bool wantsHotReload =
             hotReload && spec.HotReloadEnabled != false &&
-            spec.DebugRuntime != DebugRuntime.NetFramework &&
-            HotReload.HotReloadLauncher.Inject(startInfo);
+            spec.DebugRuntime != DebugRuntime.NetFramework;
+
+        // The daemon's agent server, not this process's: an app has one owner for the rest of its
+        // life, and the daemon is the only one both the editor and every chat can reach.
+        string? agentPipe = wantsHotReload
+            ? await HotReload.HotReloadRouting.SharedPipeNameAsync(spec.ProjectPath, cancellationToken)
+            : null;
+
+        bool hotReloadInjected =
+            wantsHotReload && HotReload.HotReloadLauncher.Inject(startInfo, agentPipe);
 
         var session = new AppSession
         {
@@ -104,7 +112,20 @@ public sealed class AppRunService(AppSessionStore store)
             // source as its baseline and report the edit as "no changes to apply".
             try
             {
-                await HotReload.HotReloadService.StartAsync(spec.ProjectPath, cancellationToken);
+                // In the process that owns the agent — the daemon when there is one, so that the
+                // session and the connection it applies through are never in different processes.
+                if (agentPipe is not null)
+                {
+                    session.HotReloadOpen =
+                        await HotReload.HotReloadRouting.StartSessionAsync(spec.ProjectPath, cancellationToken)
+                            is not null;
+                }
+                else
+                {
+                    var (opened, _) = await HotReload.HotReloadService.StartAsync(
+                        spec.ProjectPath, cancellationToken);
+                    session.HotReloadOpen = opened is not null;
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {

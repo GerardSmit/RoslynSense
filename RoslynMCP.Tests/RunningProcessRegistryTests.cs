@@ -57,6 +57,61 @@ public class RunningProcessRegistryTests
         Assert.DoesNotContain(RunningProcessRegistry.List(), e => e.SessionId == session.Id);
     }
 
+    /// <summary>
+    /// The editor's own launches arrive as loose values rather than an AppSession, and are
+    /// unregistered by session id when the debug session ends.
+    /// </summary>
+    [Fact]
+    public void RegistersAProcessTheDaemonDidNotStart()
+    {
+        string sessionId = $"editor-{Guid.NewGuid():N}";
+        RunningProcessRegistry.Register(
+            sessionId, Environment.ProcessId, @"C:\fake\Editor.csproj",
+            "http://localhost:5099", DateTime.UtcNow);
+        try
+        {
+            var entry = RunningProcessRegistry.List().FirstOrDefault(e => e.SessionId == sessionId);
+            Assert.NotNull(entry);
+            Assert.Equal("http://localhost:5099", entry!.Url);
+        }
+        finally
+        {
+            RunningProcessRegistry.Unregister(sessionId);
+        }
+
+        Assert.DoesNotContain(RunningProcessRegistry.List(), e => e.SessionId == sessionId);
+    }
+
+    /// <summary>
+    /// Output logged for an app this process did not launch comes back as a tail, so a chat can
+    /// read what the user's app printed.
+    /// </summary>
+    [Fact]
+    public void ForeignProcessOutputIsTailed()
+    {
+        // This process: the log is keyed by pid and only the registry prunes, so a live pid with
+        // no registry entry is a stable key that cannot collide with a real app's log.
+        int pid = Environment.ProcessId;
+        ProcessOutputLog.Delete(pid);
+        try
+        {
+            for (int i = 1; i <= 10; i++)
+                ProcessOutputLog.Append(pid, $"line {i}{Environment.NewLine}");
+
+            string tail = ProcessOutputLog.Tail(pid, 3);
+
+            Assert.DoesNotContain("line 7", tail);
+            Assert.Contains("line 8", tail);
+            Assert.Contains("line 10", tail);
+        }
+        finally
+        {
+            ProcessOutputLog.Delete(pid);
+        }
+
+        Assert.Equal("", ProcessOutputLog.Tail(pid, 3));
+    }
+
     [Fact]
     public void KillRejectsUnregisteredPid()
     {

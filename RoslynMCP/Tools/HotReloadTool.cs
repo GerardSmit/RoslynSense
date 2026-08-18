@@ -10,13 +10,14 @@ namespace RoslynMCP.Tools;
 /// Edit-and-Continue against a running application.
 /// </summary>
 /// <remarks>
-/// <c>[InProcessOnly]</c> because an apply can only reach apps this process prepared: the agent
-/// connects to the pipe named in the environment at launch, and <c>RunProject</c> is in-process
-/// too, so the launcher and the applier have to be the same process. The editor's own launches go
-/// through the daemon's copy of the same machinery via <c>roslynSense/hotReloadApply</c>.
+/// An apply can only run where the agent connection lives, and that is the daemon: every launcher
+/// points its app at the daemon's agent server (<see cref="HotReloadRouting"/>), so these tools
+/// forward there like any other rather than being <c>[InProcessOnly]</c>. That is what lets a chat
+/// apply to the app the user started, and the editor to one a chat started. With no daemon —
+/// <c>--cli</c>, or <c>ROSLYNMCP_SHARED_HOST=0</c> — the forward falls back in-process, where the
+/// only agent server is also the local one.
 /// </remarks>
 [McpServerToolType]
-[InProcessOnly]
 public static class HotReloadTool
 {
     [McpServerTool, Description(
@@ -107,7 +108,7 @@ public static class HotReloadTool
     private static string Describe(HotReloadOutcome outcome, IOutputFormatter fmt)
     {
         var sb = new StringBuilder();
-        sb.AppendLine(outcome.Ok ? "# Hot reload applied" : "# Hot reload did not apply");
+        sb.AppendLine(outcome.Ok ? "**Hot reload applied**" : "**Hot reload did not apply**");
         sb.AppendLine();
         sb.AppendLine(outcome.Summary);
 

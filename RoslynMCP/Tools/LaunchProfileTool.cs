@@ -30,7 +30,7 @@ public static class LaunchProfileTool
         var spec = RunConfigResolver.Resolve(resolved);
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Launch profiles — {Path.GetFileNameWithoutExtension(resolved)}");
+        sb.AppendLine($"**Launch profiles — {Path.GetFileNameWithoutExtension(resolved)}**");
         sb.AppendLine();
 
         if (settings is null || settings.Profiles.Count == 0)

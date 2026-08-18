@@ -28,14 +28,21 @@ public static class RunningProcessRegistry
     private static string FileFor(int ownerPid, string sessionId) =>
         Path.Combine(Directory, $"{ownerPid}-{sessionId}.json");
 
-    public static void Register(AppSession session)
+    public static void Register(AppSession session) =>
+        Register(session.Id, session.Pid, session.ProjectPath, session.Url, session.StartedAtUtc);
+
+    /// <summary>
+    /// Registers a process this daemon did not start — the editor's own F5/Run launches, which
+    /// belong to VS Code but should be visible to chats and to the status bar all the same.
+    /// </summary>
+    public static void Register(
+        string sessionId, int pid, string projectPath, string? url, DateTime startedAtUtc)
     {
         try
         {
             System.IO.Directory.CreateDirectory(Directory);
             var entry = new Entry(
-                session.Id, session.Pid, session.ProjectPath, session.Url,
-                session.StartedAtUtc, Environment.ProcessId);
+                sessionId, pid, projectPath, url, startedAtUtc, Environment.ProcessId);
             File.WriteAllText(FileFor(entry.OwnerPid, entry.SessionId),
                 JsonSerializer.Serialize(entry, s_json));
         }
@@ -45,9 +52,11 @@ public static class RunningProcessRegistry
         }
     }
 
-    public static void Unregister(AppSession session)
+    public static void Unregister(AppSession session) => Unregister(session.Id);
+
+    public static void Unregister(string sessionId)
     {
-        try { File.Delete(FileFor(Environment.ProcessId, session.Id)); }
+        try { File.Delete(FileFor(Environment.ProcessId, sessionId)); }
         catch { }
     }
 
@@ -78,6 +87,8 @@ public static class RunningProcessRegistry
                 if (entry is null || !IsAlive(entry.Pid))
                 {
                     try { File.Delete(file); } catch { }
+                    if (entry is not null)
+                        ProcessOutputLog.Delete(entry.Pid);
                     continue;
                 }
                 entries.Add(entry);

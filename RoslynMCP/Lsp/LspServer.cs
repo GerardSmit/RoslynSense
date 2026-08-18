@@ -1047,6 +1047,43 @@ internal sealed class LspServer : IDisposable
     public string KillProcess(KillProcessParams p) =>
         Services.Run.RunningProcessRegistry.Kill(p.Pid);
 
+    /// <summary>
+    /// The editor announcing an app it started itself (F5, or Run from the solution explorer).
+    /// It goes in the same registry as chat launches, so that a chat asked to "look at the app
+    /// I have running" finds it, and so the status bar treats both kinds alike.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/registerProcess", UseSingleObjectParameterDeserialization = true)]
+    public string RegisterProcess(RegisterProcessParams p)
+    {
+        Services.Run.RunningProcessRegistry.Register(
+            EditorSessionId(p.Pid), p.Pid, p.ProjectPath, p.Url, DateTime.UtcNow);
+        return EditorSessionId(p.Pid);
+    }
+
+    [JsonRpcMethod("roslynSense/unregisterProcess", UseSingleObjectParameterDeserialization = true)]
+    public void UnregisterProcess(KillProcessParams p)
+    {
+        Services.Run.RunningProcessRegistry.Unregister(EditorSessionId(p.Pid));
+
+        // The log outlives the app on purpose — a chat asking why it stopped needs what it
+        // printed on the way out. Old ones are swept here rather than on a timer.
+        Services.Run.ProcessOutputLog.Sweep();
+    }
+
+    /// <summary>
+    /// The editor forwarding a launched app's console output, so that GetProjectOutput answers
+    /// for the user's apps as well as the chat's own.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/processOutput", UseSingleObjectParameterDeserialization = true)]
+    public void ProcessOutput(ProcessOutputParams p) =>
+        Services.Run.ProcessOutputLog.Append(p.Pid, p.Text);
+
+    /// <summary>
+    /// Session id for an editor-owned launch. The prefix is load-bearing: it is how both the
+    /// status bar and <c>ListRunningProjects</c> tell "the user started this" from "a chat did".
+    /// </summary>
+    internal static string EditorSessionId(int pid) => $"editor-{pid}";
+
     // ---- Debug bridge ----------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/debugSessions")]

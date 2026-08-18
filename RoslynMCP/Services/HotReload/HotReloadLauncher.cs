@@ -38,15 +38,19 @@ internal static class HotReloadLauncher
     /// <summary>
     /// Adds the agent to a launch, leaving any startup hook the user already configured in place.
     /// </summary>
+    /// <param name="pipeName">
+    /// The agent server to point the app at. Null uses this process's own, which is right only
+    /// when there is no daemon to host it — see <see cref="HotReloadRouting"/>.
+    /// </param>
     /// <returns>Whether hot reload will be available in the launched process.</returns>
-    public static bool Inject(ProcessStartInfo startInfo)
+    public static bool Inject(ProcessStartInfo startInfo, string? pipeName = null)
     {
         if (FindAgent() is not { } agent)
             return false;
 
         startInfo.Environment["DOTNET_MODIFIABLE_ASSEMBLIES"] = "debug";
         startInfo.Environment[HotReloadAgentServer.PipeVariableName] =
-            HotReloadAgentServer.Instance.PipeName;
+            pipeName ?? HotReloadAgentServer.Instance.PipeName;
 
         // Appending rather than assigning: a project may already run a hook of its own, and
         // replacing it would change how the app starts.

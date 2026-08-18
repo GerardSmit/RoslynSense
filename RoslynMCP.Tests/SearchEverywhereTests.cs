@@ -176,12 +176,170 @@ public class SearchEverywhereTests
     }
 
     [Theory]
+    [InlineData("Calculator.cs:12")]
+    [InlineData("Calculator.cs:line 12")]
+    [InlineData("Calculator.cs:regel 12")]
+    [InlineData("Calculator.cs:Zeile 12")]
+    [InlineData("Calculator.cs:ligne 12")]
+    [InlineData("Calculator.cs(12)")]
+    [InlineData("Calculator.cs line 12")]
+    [InlineData("Calculator.cs regel 12")]
+    public async Task ALineReferenceNarrowsToFilesAndCarriesTheLine(string query)
+    {
+        // The shapes a pasted stack trace or compiler message produces, including .NET's
+        // localised "line" (Dutch regel, German Zeile, French ligne, …).
+        var hits = await SearchAsync(query);
+
+        Assert.NotEmpty(hits);
+        Assert.All(hits, h => Assert.Equal(SearchItemKind.File, h.Kind));
+
+        var file = hits.First(h => h.Name.Equals("Calculator.cs", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(11, file.Line);
+    }
+
+    [Theory]
+    [InlineData("Calculator.cs:12:5")]
+    [InlineData("Calculator.cs(12,5)")]
+    public async Task AColumnInTheLineReferenceIsCarriedToo(string query)
+    {
+        var hits = await SearchAsync(query);
+
+        var file = hits.First(h => h.Name.Equals("Calculator.cs", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(11, file.Line);
+        Assert.Equal(4, file.Character);
+    }
+
+    [Theory]
+    [InlineData("Add(0")]
+    [InlineData("Calculator:2")]
+    public async Task TrailingDigitsOnASymbolishQueryKeepSymbolResults(string query)
+    {
+        // "Parse(0" is someone typing a signature, "Foo:2" maybe a habit from elsewhere —
+        // neither names a file, so the trailing digits strip without dropping the symbols.
+        var hits = await SearchAsync(query);
+
+        Assert.Contains(hits, h => h.Kind != SearchItemKind.File);
+    }
+
+    [Fact]
+    public async Task ABareExtensionWithALineCarriesTheLine()
+    {
+        // ".cs:12" narrows to files by extension and still opens on the line.
+        var hits = await SearchAsync(".cs:12");
+
+        Assert.NotEmpty(hits);
+        Assert.All(hits, h => Assert.Equal(SearchItemKind.File, h.Kind));
+        Assert.All(hits, h => Assert.Equal(11, h.Line));
+    }
+
+    [Fact]
+    public async Task ANameEndingInDigitsIsNotALineReference()
+    {
+        // "Form 12" would be, "Warnings" is not — digits inside a name must not be eaten.
+        var hits = await SearchAsync("Warnings");
+
+        Assert.Contains(hits, h => h.Kind != SearchItemKind.File);
+    }
+
+    [Fact]
+    public async Task AForcedKindOverridesThePrefix()
+    {
+        // The panel's Classes tab forces types even though the query says members.
+        var solution = await SolutionAsync(FixturePaths.SampleProjectFile);
+        var hits = await SearchEverywhere.SearchAsync(
+            solution, "m:Calculator", maxResults: 50, default, only: SearchItemKind.Type);
+
+        Assert.NotEmpty(hits);
+        Assert.All(hits, h => Assert.Equal(SearchItemKind.Type, h.Kind));
+    }
+
+    [Fact]
+    public async Task MetadataTypesAppearOnlyWhenAskedFor()
+    {
+        var solution = await SolutionAsync(FixturePaths.SampleProjectFile);
+
+        var without = await SearchEverywhere.SearchAsync(
+            solution, "Stopwatch", maxResults: 50, default);
+        Assert.DoesNotContain(without, h => h.Uri is not null);
+
+        var with = await SearchEverywhere.SearchAsync(
+            solution, "Stopwatch", maxResults: 50, default, includeMetadata: true);
+        var metadata = with.FirstOrDefault(h => h.Uri is not null);
+
+        Assert.NotNull(metadata);
+        Assert.Equal(SearchItemKind.Type, metadata!.Kind);
+        Assert.StartsWith("roslynsense-metadata:", metadata.Uri);
+        Assert.Equal("Stopwatch", metadata.Name);
+        Assert.Equal("System.Diagnostics", metadata.Container);
+    }
+
+    [Fact]
+    public async Task MetadataTypesSharingANameSurviveDedup()
+    {
+        // Func`1..Func`17 share the stripped name, the namespace and the assembly — only the
+        // reflection name in the Uri tells them apart, so it must be part of the dedup key.
+        var solution = await SolutionAsync(FixturePaths.SampleProjectFile);
+        var hits = await SearchEverywhere.SearchAsync(
+            solution, "t:Func", maxResults: 50, default, includeMetadata: true);
+
+        var uris = hits
+            .Where(h => h.Uri is not null && h.Name == "Func")
+            .Select(h => h.Uri)
+            .Distinct()
+            .ToList();
+        Assert.True(uris.Count > 1, $"expected several Func arities, got {uris.Count}");
+    }
+
+    [Fact]
+    public async Task ASolutionTypeOutranksAMetadataTypeOfTheSameName()
+    {
+        // "Calculator" exists in the fixture; every metadata hit must sit below every source hit.
+        var solution = await SolutionAsync(FixturePaths.SampleProjectFile);
+        var hits = await SearchEverywhere.SearchAsync(
+            solution, "Calculator", maxResults: 50, default, includeMetadata: true);
+
+        Assert.Null(hits[0].Uri);
+        int firstMetadata = hits.ToList().FindIndex(h => h.Uri is not null);
+        int lastSource = hits.ToList().FindLastIndex(h => h.Uri is null && h.Kind != SearchItemKind.File);
+        if (firstMetadata >= 0)
+            Assert.True(lastSource < firstMetadata,
+                $"metadata hit at {firstMetadata} before source hit at {lastSource}");
+    }
+
+    [Theory]
     [InlineData(@"C:\src\App\obj\Debug\App.AssemblyInfo.cs", true)]
     [InlineData(@"C:\src\App\bin\Release\App.dll", true)]
     [InlineData(@"C:\src\App\node_modules\x\index.js", true)]
     [InlineData(@"C:\src\App\Models\Result.cs", false)]
     public void BuildOutputIsRecognisedByPath(string path, bool excluded) =>
         Assert.Equal(excluded, SearchFileRules.IsExcluded(path));
+
+    [Fact]
+    public async Task ABinaryAssetNeverOutranksSourceCode()
+    {
+        // Calc.png matches "calc" exactly, Calculator only by prefix — yet nobody searching
+        // "calc" wants an image ahead of code, so the asset must sit below every code hit.
+        var hits = (await SearchAsync("calc")).ToList();
+
+        int asset = hits.FindIndex(h => h.Name.Equals("Calc.png", StringComparison.OrdinalIgnoreCase));
+        int lastCode = hits.FindLastIndex(h =>
+            h.Kind != SearchItemKind.File
+            || h.Name.EndsWith(".cs", StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(asset >= 0, $"Calc.png missing: {string.Join(", ", hits.Select(h => h.Name))}");
+        Assert.True(lastCode < asset,
+            $"asset at {asset} outranked code at {lastCode}: {string.Join(", ", hits.Select(h => h.Name))}");
+    }
+
+    [Theory]
+    [InlineData("logo.png", true)]
+    [InlineData("Archive.ZIP", true)]
+    [InlineData("App.dll", true)]
+    [InlineData("Calculator.cs", false)]
+    [InlineData("web.config", false)]
+    [InlineData("widgets.proto", false)]
+    public void BinaryAssetsAreRecognisedByExtension(string name, bool binary) =>
+        Assert.Equal(binary, SearchFileRules.IsBinaryAsset(name));
 
     [Theory]
     [InlineData("Form1.Designer.cs", true)]

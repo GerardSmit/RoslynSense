@@ -13,6 +13,8 @@ public enum SearchItemKind
 }
 
 /// <summary>One ranked result. <paramref name="Score"/> is lower-is-better.</summary>
+/// <param name="Uri">Set for results with no file behind them (decompiled metadata); when null
+/// the client derives the URI from <paramref name="FilePath"/>.</param>
 public sealed record SearchHit(
     SearchItemKind Kind,
     string Name,
@@ -23,7 +25,8 @@ public sealed record SearchHit(
     int EndLine,
     int EndCharacter,
     int SymbolKind,
-    int Score);
+    int Score,
+    string? Uri = null);
 
 /// <summary>
 /// Search Everywhere: one query box over types, members and files, ranked the way ReSharper's
@@ -56,15 +59,32 @@ public static class SearchEverywhere
     /// </summary>
     private const int GeneratedPenalty = TierUnit * 8;
 
+    /// <summary>
+    /// Images, archives, media: named like anything else, but nobody searching "Sho" wants a
+    /// screenshot ahead of ShopController. Below generated code — an asset is not even code —
+    /// yet still above metadata, because it is at least part of the solution.
+    /// </summary>
+    private const int BinaryAssetPenalty = TierUnit * 12;
+
+    /// <summary>
+    /// Below even generated solution code: a type from a referenced assembly is an answer of
+    /// last resort, the way Rider ranks non-project items once they are included at all.
+    /// </summary>
+    private const int MetadataPenalty = TierUnit * 16;
+
     private static readonly char[] s_wordSeparators = ['.', '/', '\\', ' ', '+'];
 
     /// <param name="includeFiles">workspace/symbol has no kind for a file, so it asks for
     /// symbols only; the extension's own Search Everywhere wants both.</param>
+    /// <param name="only">Restricts to one kind — the panel's Classes/Files/Symbols tabs. Wins
+    /// over a <c>t:</c>/<c>m:</c>/<c>f:</c> prefix in the query.</param>
+    /// <param name="includeMetadata">Also searches the public types of referenced assemblies —
+    /// Rider's "include non-solution items". Those hits open as decompiled documents.</param>
     public static async Task<IReadOnlyList<SearchHit>> SearchAsync(
         Solution solution, string query, int maxResults, CancellationToken ct,
-        bool includeFiles = true)
+        bool includeFiles = true, SearchItemKind? only = null, bool includeMetadata = false)
     {
-        var request = SearchQuery.Parse(query, includeFiles);
+        var request = SearchQuery.Parse(query, includeFiles, only);
         if (request is null)
             return [];
 
@@ -76,15 +96,20 @@ public static class SearchEverywhere
         if (request.IncludesFiles)
             hits.AddRange(await FindFilesAsync(solution, request, ct));
 
+        if (includeMetadata && request.IncludesTypes)
+            hits.AddRange(await Task.Run(() => FindMetadataTypes(solution, request, ct), ct));
+
         hits.Sort(Compare);
 
         // Linked documents (one file in several target frameworks) declare the same symbol once
-        // per project; the user wants one row.
-        var seen = new HashSet<(string, string, int, int)>();
+        // per project; the user wants one row. The Uri is part of the key because metadata hits
+        // all share position 0 in the same assembly: Func`1..Func`17 and every nested Builder
+        // differ only in the reflection name their Uri carries.
+        var seen = new HashSet<(string, string?, string, int, int, string?)>();
         var deduped = new List<SearchHit>(Math.Min(hits.Count, maxResults));
         foreach (var hit in hits)
         {
-            if (!seen.Add((hit.Name, hit.FilePath, hit.Line, hit.Character)))
+            if (!seen.Add((hit.Name, hit.Container, hit.FilePath, hit.Line, hit.Character, hit.Uri)))
                 continue;
 
             deduped.Add(hit);
@@ -225,12 +250,55 @@ public static class SearchEverywhere
                 fileName,
                 directory.Length == 0 ? null : directory,
                 path,
-                0,
-                0,
-                0,
-                0,
+                request.TargetLine ?? 0,
+                request.TargetColumn ?? 0,
+                request.TargetLine ?? 0,
+                request.TargetColumn ?? 0,
                 LspSymbolKind.File,
-                Score(match.Value.Score, tier, containerScore, SearchFileRules.IsGenerated(path))));
+                Score(match.Value.Score, tier, containerScore, SearchFileRules.IsGenerated(path))
+                    + (SearchFileRules.IsBinaryAsset(path) ? BinaryAssetPenalty : 0)));
+        }
+
+        return hits;
+    }
+
+    /// <summary>
+    /// Public types of every referenced assembly, matched against the same query. Synchronous on
+    /// purpose — the index is metadata-table reads and string matching, no compilation involved.
+    /// </summary>
+    private static List<SearchHit> FindMetadataTypes(
+        Solution solution, SearchQuery request, CancellationToken ct)
+    {
+        var matcher = request.NameMatcher;
+        var hits = new List<SearchHit>();
+
+        foreach (var (assemblyPath, types) in MetadataTypeIndex.ForSolution(solution, ct))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            foreach (var type in types)
+            {
+                if (matcher.Match(type.Name) is not { } match)
+                    continue;
+
+                if (!request.TryScoreContainer(type.Namespace, out int containerScore))
+                    continue;
+
+                int tier = match.Score.IsExactMatch() ? TierExactType : TierType;
+                hits.Add(new SearchHit(
+                    SearchItemKind.Type,
+                    type.Name,
+                    type.Namespace.Length == 0 ? null : type.Namespace,
+                    assemblyPath,
+                    0,
+                    0,
+                    0,
+                    0,
+                    LspSymbolKind.Class,
+                    Score(match.Score, tier, containerScore, isGenerated: false) + MetadataPenalty,
+                    Handlers.VirtualDocumentHandler.UriFor(
+                        Handlers.VirtualDocumentHandler.MetadataScheme, assemblyPath, type.ReflectionName)));
+            }
         }
 
         return hits;
@@ -254,6 +322,21 @@ public static class SearchEverywhere
     /// </summary>
     private sealed class SearchQuery
     {
+        /// <summary>"line" in the languages .NET localises compiler messages to.</summary>
+        private const string LineWords =
+            "line|regel|zeile|ligne|línea|linea|riga|linha|linia|wiersz|rad|linje|rivi|satır|строка|行";
+
+        /// <summary>
+        /// A trailing line reference, the shapes a pasted stack trace or compiler message uses:
+        /// <c>Customer.cs:851</c>, <c>Customer.cs:851:12</c>, <c>Customer.cs(851,12)</c>, and the
+        /// worded form <c>Customer.cs:line 851</c> / <c>:regel 851</c>. The word is required when
+        /// only a space separates it — "Form 12" is a name, "Form line 12" is a location.
+        /// </summary>
+        private static readonly System.Text.RegularExpressions.Regex s_lineReference = new(
+            $@"^(?<rest>.*?)(?:[:(]\s*(?<word>{LineWords})?\s*(?<line>\d+)(?:\s*[:,]\s*(?<column>\d+))?\s*\)?|\s+(?<word>{LineWords})\s*(?<line>\d+)(?:\s*[:,]\s*(?<column>\d+))?)$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            | System.Text.RegularExpressions.RegexOptions.CultureInvariant
+            | System.Text.RegularExpressions.RegexOptions.Compiled);
         private readonly IdentifierMatcher[] _containerMatchers;
 
         private readonly bool _allowFiles;
@@ -280,6 +363,11 @@ public static class SearchEverywhere
         /// <summary>Set when the query is a bare extension (".proto"): match extensions, not names.</summary>
         public IdentifierMatcher? ExtensionQuery { get; private init; }
 
+        /// <summary>0-based line from a trailing <c>:851</c> / <c>:line 851</c>; file hits open there.</summary>
+        public int? TargetLine { get; private init; }
+
+        public int? TargetColumn { get; private init; }
+
         public SearchItemKind? Only { get; }
 
         public bool IncludesTypes => Only is null or SearchItemKind.Type;
@@ -291,7 +379,7 @@ public static class SearchEverywhere
         /// Splits "Ns.Type.Member" or "dir/file" into container words plus the final name.
         /// Returns null for a query with nothing to search for.
         /// </summary>
-        public static SearchQuery? Parse(string query, bool allowFiles = true)
+        public static SearchQuery? Parse(string query, bool allowFiles = true, SearchItemKind? forcedOnly = null)
         {
             query = query.Trim();
             if (query.Length == 0)
@@ -311,19 +399,47 @@ public static class SearchEverywhere
                     query = query[2..].Trim();
             }
 
+            // A tab in the panel is a stronger statement than a prefix in the query.
+            if (forcedOnly is not null)
+                only = forcedOnly;
+
+            int? targetLine = null;
+            int? targetColumn = null;
+            if (allowFiles
+                && only is null or SearchItemKind.File
+                && s_lineReference.Match(query) is { Success: true } lineRef
+                && lineRef.Groups["rest"].Value.Trim() is { Length: > 0 } beforeLine
+                && int.TryParse(lineRef.Groups["line"].Value, out int oneBasedLine))
+            {
+                targetLine = Math.Max(0, oneBasedLine - 1);
+                if (int.TryParse(lineRef.Groups["column"].Value, out int oneBasedColumn))
+                    targetColumn = Math.Max(0, oneBasedColumn - 1);
+                query = beforeLine;
+
+                // "Customer.cs:851" is a navigation, not a name: the line applies to files, so
+                // the search narrows to them. But "Parse(0" or "Foo:2" names no file — without a
+                // dot or a "line" word, the trailing digits still strip (so the symbol is found)
+                // while the symbol results stay.
+                if (lineRef.Groups["word"].Success || beforeLine.Contains('.'))
+                    only = SearchItemKind.File;
+            }
+
             var words = query.Split(s_wordSeparators, StringSplitOptions.RemoveEmptyEntries);
             if (words.Length == 0)
                 return null;
 
             // A query that is nothing but an extension asks for a kind of file. Symbols are
-            // excluded outright: nobody typing ".proto" wants a type called Proto.
-            if (query[0] == '.' && words.Length == 1)
+            // excluded outright: nobody typing ".proto" wants a type called Proto — unless a
+            // symbols-only tab is forced, where a file answer would be the wrong kind entirely.
+            if (query[0] == '.' && words.Length == 1 && only is null or SearchItemKind.File)
             {
                 return new SearchQuery(
                     new IdentifierMatcher(words[0]), new IdentifierMatcher(query), [],
                     SearchItemKind.File, allowFiles)
                 {
                     ExtensionQuery = new IdentifierMatcher(words[0]),
+                    TargetLine = targetLine,
+                    TargetColumn = targetColumn,
                 };
             }
 
@@ -332,7 +448,11 @@ public static class SearchEverywhere
                 .ToArray();
 
             return new SearchQuery(
-                new IdentifierMatcher(words[^1]), new IdentifierMatcher(query), containers, only, allowFiles);
+                new IdentifierMatcher(words[^1]), new IdentifierMatcher(query), containers, only, allowFiles)
+            {
+                TargetLine = targetLine,
+                TargetColumn = targetColumn,
+            };
         }
 
         /// <summary>

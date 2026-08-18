@@ -1,0 +1,372 @@
+/* Search Everywhere panel. Colors come from the editor theme's variables throughout, so the
+   popup reads as part of the IDE in any theme. */
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+}
+
+/* ---- Header ---- */
+
+.chrome {
+    flex: none;
+    position: relative;
+    /* The progress bar overlays this strip instead of occupying it, so the layout is the
+       same whether the bar exists, animates, or is gone. */
+    padding-bottom: 2px;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.query-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 10px 4px;
+}
+
+#query {
+    flex: 1;
+    padding: 5px 8px;
+    font-size: 1.1em;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 3px;
+    outline: none;
+}
+
+#query:focus {
+    border-color: var(--vscode-focusBorder);
+}
+
+.check {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+    color: var(--vscode-descriptionForeground);
+    user-select: none;
+}
+
+nav[role='tablist'] {
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+    padding: 4px 10px 0;
+}
+
+nav [role='tab'] {
+    padding: 4px 10px;
+    font-family: inherit;
+    font-size: inherit;
+    color: var(--vscode-foreground);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+}
+
+nav [role='tab'][aria-selected='true'] {
+    color: var(--vscode-panelTitle-activeForeground);
+    border-bottom-color: var(--vscode-panelTitle-activeBorder, var(--vscode-focusBorder));
+}
+
+nav .hint {
+    margin-left: auto;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+}
+
+.progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    pointer-events: none;
+}
+
+.progress.busy {
+    background: linear-gradient(
+        90deg,
+        transparent,
+        var(--vscode-progressBar-background) 30%,
+        transparent 60%
+    );
+    background-size: 200% 100%;
+    animation: slide 1.2s linear infinite;
+}
+
+@keyframes slide {
+    from {
+        background-position: 200% 0;
+    }
+    to {
+        background-position: -100% 0;
+    }
+}
+
+/* ---- Results ---- */
+
+#results {
+    flex: 1;
+    min-height: 80px;
+    margin: 0;
+    padding: 4px 0;
+    overflow-y: auto;
+    list-style: none;
+}
+
+#results li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 10px;
+    white-space: nowrap;
+    cursor: default;
+    line-height: 22px;
+}
+
+#results li.selected {
+    color: var(--vscode-list-activeSelectionForeground);
+    background: var(--vscode-list-activeSelectionBackground);
+}
+
+#results li.placeholder {
+    color: var(--vscode-descriptionForeground);
+    cursor: default;
+}
+
+#results .name {
+    flex: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#results .name b {
+    font-weight: 600;
+    color: var(--vscode-editor-findMatchHighlightForeground, inherit);
+    background: var(--vscode-editor-findMatchHighlightBackground, transparent);
+}
+
+#results .muted {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--vscode-descriptionForeground);
+}
+
+#results li.selected .muted,
+#results li.selected .location {
+    color: inherit;
+    opacity: 0.8;
+}
+
+#results .location {
+    flex: none;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+#results kbd,
+footer kbd {
+    padding: 1px 5px;
+    font-family: inherit;
+    font-size: 0.85em;
+    color: var(--vscode-keybindingLabel-foreground, inherit);
+    background: var(--vscode-keybindingLabel-background, rgba(128, 128, 128, 0.17));
+    border: 1px solid var(--vscode-keybindingLabel-border, transparent);
+    border-radius: 3px;
+}
+
+.spacer {
+    flex: 1;
+}
+
+/* ---- Kind badges ---- */
+
+.badge {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 3px;
+    color: #fff;
+}
+
+.badge.class {
+    background: #ee9d28;
+}
+.badge.interface {
+    background: #007acc;
+}
+.badge.struct {
+    background: #1a9985;
+}
+.badge.enum {
+    background: #ee9d28;
+}
+.badge.method {
+    background: #b180d7;
+}
+.badge.property,
+.badge.event {
+    background: #75beff;
+}
+.badge.field {
+    background: #4d9de5;
+}
+.badge.namespace {
+    background: #8a8a8a;
+}
+.badge.file,
+.badge.text {
+    background: #8a8a8a;
+}
+.badge.action {
+    background: #d67e3c;
+}
+
+/* ---- Preview ---- */
+
+#splitter {
+    flex: none;
+    height: 4px;
+    cursor: ns-resize;
+    background: var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    background-clip: content-box;
+    padding: 1px 0;
+}
+
+#preview {
+    flex: 0 0 38%;
+    min-height: 0;
+    overflow: auto;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    background: var(--vscode-editor-background);
+}
+
+#preview-code {
+    margin: 0;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, 13px);
+}
+
+#preview .placeholder {
+    display: block;
+    padding: 8px 10px;
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-font-family);
+}
+
+#preview .line {
+    display: flex;
+    line-height: 1.5;
+}
+
+#preview .line.target {
+    background: var(--vscode-editor-rangeHighlightBackground, rgba(128, 128, 255, 0.12));
+}
+
+#preview .line-number {
+    flex: none;
+    width: 5ch;
+    padding-right: 1ch;
+    text-align: right;
+    color: var(--vscode-editorLineNumber-foreground);
+    user-select: none;
+}
+
+#preview .line-text {
+    white-space: pre;
+}
+
+#preview .line-text b {
+    font-weight: 600;
+    background: var(--vscode-editor-findMatchHighlightBackground, rgba(255, 200, 0, 0.3));
+}
+
+/* Preview tokens: theme-derived so both light and dark themes read naturally. */
+
+.tok-kw {
+    color: var(--vscode-charts-blue, #569cd6);
+}
+
+.tok-type {
+    color: var(--vscode-symbolIcon-classForeground, #ee9d28);
+}
+
+.tok-meth {
+    color: var(--vscode-symbolIcon-methodForeground, #b180d7);
+}
+
+.tok-str {
+    color: var(--vscode-debugTokenExpression-string, #ce9178);
+}
+
+.tok-num {
+    color: var(--vscode-debugTokenExpression-number, #b5cea8);
+}
+
+.tok-com {
+    color: var(--vscode-descriptionForeground);
+    font-style: italic;
+}
+
+.tok-attr {
+    color: var(--vscode-symbolIcon-fieldForeground, #75beff);
+}
+
+/* ---- Footer ---- */
+
+footer.status {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 10px;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+.truncate {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.linklike {
+    padding: 0;
+    font-family: inherit;
+    font-size: inherit;
+    color: var(--vscode-textLink-foreground);
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.linklike:hover {
+    text-decoration: underline;
+}

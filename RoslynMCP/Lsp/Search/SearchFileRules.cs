@@ -24,6 +24,20 @@ public static class SearchFileRules
 
     private static readonly char[] s_separators = ['/', '\\'];
 
+    /// <summary>
+    /// Extensions with no text inside: images, archives, compiled and media files. Shared with
+    /// <see cref="TextSearch"/>, which skips them — the name search still lists them, ranked last.
+    /// </summary>
+    private static readonly HashSet<string> s_binaryExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".dll", ".exe", ".pdb", ".zip", ".nupkg", ".snupkg", ".7z", ".gz", ".tar",
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svgz",
+        ".woff", ".woff2", ".ttf", ".otf", ".eot",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov",
+        ".db", ".sqlite", ".mdf", ".ldf", ".cache", ".bin", ".dat", ".snk", ".pfx",
+        ".xlsx", ".docx", ".pptx", ".pdf",
+    };
+
     /// <summary>Build output and tooling directories: never a search result.</summary>
     public static bool IsExcluded(string path)
     {
@@ -51,4 +65,8 @@ public static class SearchFileRules
 
         return name.StartsWith("TemporaryGeneratedFile_", StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>An asset rather than something anyone reads: listed, but never ahead of code.</summary>
+    public static bool IsBinaryAsset(string path) =>
+        s_binaryExtensions.Contains(Path.GetExtension(path));
 }

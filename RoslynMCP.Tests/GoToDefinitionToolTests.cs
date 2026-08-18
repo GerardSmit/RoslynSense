@@ -4,6 +4,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public class GoToDefinitionToolTests
 {
     [Fact]
@@ -19,6 +20,8 @@ public class GoToDefinitionToolTests
     [Fact]
     public async Task WhenFrameworkTypeTargetedThenReturnsDecompiledSource()
     {
+        using var offline = ExternalSourceScope.Offline();
+
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
             symbolName: "System.Object",

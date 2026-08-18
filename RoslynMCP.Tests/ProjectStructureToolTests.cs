@@ -26,7 +26,7 @@ public class ProjectStructureToolTests
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
             FixturePaths.SampleProjectFile, new MarkdownFormatter());
 
-        Assert.Contains("# Project: SampleProject", result);
+        Assert.Contains("**Project: SampleProject**", result);
         Assert.Contains("Framework", result);
         Assert.Contains("Types", result);
     }
@@ -37,7 +37,7 @@ public class ProjectStructureToolTests
         var result = await RoslynMCP.Tools.ProjectStructureTool.GetProjectStructure(
             FixturePaths.CalculatorFile, new MarkdownFormatter());
 
-        Assert.Contains("# Project: SampleProject", result);
+        Assert.Contains("**Project: SampleProject**", result);
         Assert.Contains("Calculator", result);
     }
 

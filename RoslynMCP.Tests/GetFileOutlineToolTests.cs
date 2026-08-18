@@ -73,7 +73,7 @@ public class GetFileOutlineToolTests
     {
         var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.CalculatorFile, fmt: new MarkdownFormatter());
 
-        Assert.Contains("# Outline:", result);
+        Assert.Contains("**Outline:", result);
         Assert.Contains("Calculator.cs", result);
     }
 
@@ -180,7 +180,7 @@ public class GetFileOutlineToolTests
         var result = await GetFileOutlineTool.GetFileOutline(filePath: FixturePaths.BrokenSyntaxFile, fmt: new MarkdownFormatter());
 
         // Should still produce some outline even for broken syntax
-        Assert.Contains("# Outline:", result);
+        Assert.Contains("**Outline:", result);
     }
 
     [Fact]

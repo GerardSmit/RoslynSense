@@ -4,6 +4,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public class GoToDefinitionSnippetToolTests
 {
     [Fact]
@@ -85,6 +86,8 @@ public class GoToDefinitionSnippetToolTests
     [Fact]
     public async Task WhenFrameworkMethodTargetedThenReturnsMetadataPreview()
     {
+        using var offline = ExternalSourceScope.Offline();
+
         var result = await GoToDefinitionSnippetTool.GoToDefinitionSnippet(
             filePath: FixturePaths.FrameworkReferencesFile,
             markupSnippet: "Console.[|WriteLine|](value);",
@@ -100,6 +103,8 @@ public class GoToDefinitionSnippetToolTests
     [Fact]
     public async Task WhenFrameworkTypeTargetedThenReturnsDecompiledTypeSource()
     {
+        using var offline = ExternalSourceScope.Offline();
+
         var result = await GoToDefinitionSnippetTool.GoToDefinitionSnippet(
             filePath: FixturePaths.FrameworkReferencesFile,
             markupSnippet: "new [|StringBuilder|]();",

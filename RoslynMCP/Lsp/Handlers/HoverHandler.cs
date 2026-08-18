@@ -114,7 +114,10 @@ internal static class HoverHandler
         if (token is { } t && t.Span.Contains(Math.Min(offset, Math.Max(0, text.Length - 1))))
             range = LspConverters.ToRange(text.Lines, t.Span);
 
-        var markdown = new StringBuilder(Describe(symbol, ct));
+        // Crefs in the documentation are metadata ids; the compilation is what turns them back
+        // into the type as it is written. It is already built by the time hover runs.
+        var compilation = await document.Project.GetCompilationAsync(ct);
+        var markdown = new StringBuilder(Describe(symbol, ct, compilation));
 
         // Appended rather than merged, and after Roslyn's own description: what the pack knows is
         // where the symbol came from, which reads as provenance under the signature rather than in
@@ -130,7 +133,7 @@ internal static class HoverHandler
 
     /// <summary>The signature-plus-summary markdown shown for a symbol. Shared with the markup
     /// languages, whose symbols do not come from a syntax position.</summary>
-    public static string Describe(ISymbol symbol, CancellationToken ct)
+    public static string Describe(ISymbol symbol, CancellationToken ct, Compilation? compilation = null)
     {
         var sb = new StringBuilder();
         sb.Append("```csharp\n");
@@ -147,11 +150,11 @@ internal static class HoverHandler
         var xmlDoc = symbol.GetDocumentationCommentXml(cancellationToken: ct);
         if (!string.IsNullOrWhiteSpace(xmlDoc))
         {
-            var summary = SymbolFormatter.ExtractXmlDocSection(xmlDoc, "summary");
+            var summary = SymbolFormatter.ExtractXmlDocSection(xmlDoc, "summary", compilation);
             if (!string.IsNullOrWhiteSpace(summary))
                 sb.Append("\n\n").Append(summary);
 
-            var returns = SymbolFormatter.ExtractXmlDocSection(xmlDoc, "returns");
+            var returns = SymbolFormatter.ExtractXmlDocSection(xmlDoc, "returns", compilation);
             if (!string.IsNullOrWhiteSpace(returns))
                 sb.Append("\n\n**Returns:** ").Append(returns);
         }

@@ -36,6 +36,25 @@ public class DecompiledSourceServiceTests
     }
 
     [Fact]
+    public async Task WhenATypeIsDecompiledToFileThenTheFileExistsAndThePositionPointsAtIt()
+    {
+        // The Search Everywhere metadata hits resolve through this: the same physical file F12
+        // lands on, with the declaration's position so the editor opens on the type.
+        string assemblyPath = typeof(System.Diagnostics.Stopwatch).Assembly.Location;
+
+        var resolved = await DecompiledSourceService.TryDecompileTypeToFileAsync(
+            assemblyPath, "System.Diagnostics.Stopwatch");
+
+        Assert.NotNull(resolved);
+        var (filePath, line, character) = resolved!.Value;
+        Assert.EndsWith("Decompiled.cs", filePath);
+        Assert.True(File.Exists(filePath));
+
+        string declarationLine = (await File.ReadAllLinesAsync(filePath))[line];
+        Assert.Equal("Stopwatch", declarationLine.Substring(character, "Stopwatch".Length));
+    }
+
+    [Fact]
     public void WhenFileInRealDirectoryWithoutManifestThenTryGetGeneratedProjectPathReturnsNull()
     {
         // Use a known directory that doesn't have a manifest

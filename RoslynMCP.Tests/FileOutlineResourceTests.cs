@@ -29,7 +29,7 @@ public class FileOutlineResourceTests
     {
         var result = await FileOutlineResource.GetFileOutlineAsync(FixturePaths.CalculatorFile, new MarkdownFormatter());
 
-        Assert.Contains("# Outline:", result);
+        Assert.Contains("**Outline:", result);
         Assert.Contains("Calculator.cs", result);
     }
 

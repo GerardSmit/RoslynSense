@@ -40,10 +40,44 @@ public static class LspFeatureOptions
         TimeSpan.FromSeconds(EnvInt("ROSLYNMCP_ANALYZER_TIMEOUT_SECONDS", 15));
 
     /// <summary>
+    /// The master switch for reading a dependency's real source rather than a decompilation of
+    /// it. Off means navigation never reaches the network and always decompiles.
+    /// </summary>
+    /// <remarks>
+    /// Source embedded in a PDB is deliberately exempt: it is already on disk, so none of the
+    /// reasons to turn this off apply to it.
+    /// </remarks>
+    public static bool ExternalSource { get; set; } = EnvFlag("ROSLYNMCP_EXTERNAL_SOURCE", true);
+
+    /// <summary>
     /// Fetch a dependency's real source when its PDB says where to get it, instead of
     /// decompiling. Off means navigation never reaches the network.
     /// </summary>
     public static bool SourceLink { get; set; } = EnvFlag("ROSLYNMCP_SOURCE_LINK", true);
+
+    /// <summary>
+    /// Download PDBs from the Microsoft and NuGet symbol servers. Without this, Source Link only
+    /// works for assemblies that ship or embed their own PDB — which the .NET framework
+    /// assemblies do not, so this is what makes F12 into the BCL reach real source.
+    /// </summary>
+    public static bool SymbolServer { get; set; } = EnvFlag("ROSLYNMCP_SYMBOL_SERVER", true);
+
+    /// <summary>
+    /// For .NET Framework assemblies, which carry no Source Link: read the matching snapshot of
+    /// <c>microsoft/referencesource</c> instead of decompiling.
+    /// </summary>
+    public static bool ReferenceSource { get; set; } = EnvFlag("ROSLYNMCP_REFERENCE_SOURCE", true);
+
+    /// <summary>
+    /// A GitHub token, raising the reference-source lookup's API budget from 60 requests an hour
+    /// to 5000. Read from the environment only, never from a settings file that might sync.
+    /// </summary>
+    public static string? GitHubToken { get; } =
+        Environment.GetEnvironmentVariable("ROSLYNMCP_GITHUB_TOKEN") is { Length: > 0 } own
+            ? own
+            : Environment.GetEnvironmentVariable("GITHUB_TOKEN") is { Length: > 0 } shared
+                ? shared
+                : null;
 
     private static bool EnvFlag(string name, bool fallback) =>
         Environment.GetEnvironmentVariable(name) switch

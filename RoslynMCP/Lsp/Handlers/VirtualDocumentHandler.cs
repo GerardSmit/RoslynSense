@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Services;
+using RoslynMCP.Services.ExternalSource;
 
 namespace RoslynMCP.Lsp.Handlers;
 
@@ -97,13 +98,25 @@ internal static class VirtualDocumentHandler
     private static async Task<VirtualDocumentResult?> MetadataAsync(
         string assemblyPath, string typeName, CancellationToken ct)
     {
-        var decompiled = await DecompiledSourceService.TryDecompileTypeAsync(assemblyPath, typeName, ct);
-        if (decompiled is null)
+        // The same resolution the search panel and F12 use, so the three provably agree about
+        // what "the source of this type" is rather than happening to agree.
+        var external = await ExternalSourceService.TryResolveTypeAsync(assemblyPath, typeName, ct);
+        if (external is null)
             return null;
 
+        string text;
+        try
+        {
+            text = await File.ReadAllTextAsync(external.FilePath, ct);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+
         return new VirtualDocumentResult(
-            decompiled,
-            $"Decompiled from {Path.GetFileName(assemblyPath)} — read-only");
+            text,
+            $"{external.Title} for {Path.GetFileName(assemblyPath)} — {external.Provenance}, read-only");
     }
 
     public static string UriFor(string scheme, string owner, string name) =>

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
@@ -5,11 +6,13 @@ using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
+using RoslynMCP.Services.ExternalSource;
 
 namespace RoslynMCP.Services;
 
 /// <summary>Where a metadata symbol's real source lives, once it has been fetched.</summary>
-public sealed record SourceLinkResult(string FilePath, int Line, string Url);
+/// <param name="Url">Where it came from, or null when the PDB carried the source itself.</param>
+public sealed record SourceLinkResult(string FilePath, int Line, string? Url, bool Embedded = false);
 
 /// <summary>
 /// Resolves a symbol that came from a NuGet package or the framework to the source file it was
@@ -41,15 +44,16 @@ public static class SourceLinkService
     /// <summary>A source file larger than this is not a source file.</summary>
     private const int MaxDownloadBytes = 16 * 1024 * 1024;
 
-    private static readonly HttpClient s_http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    /// <summary>
+    /// Type lookups and Source Link maps, keyed by the assembly and when it was last written.
+    /// CoreLib declares some seven thousand types and <see cref="FindType"/> walks them all, which
+    /// is not a thing to do on every keystroke-driven navigation.
+    /// </summary>
+    private static readonly ConcurrentDictionary<(string Assembly, long Stamp, string Type), int> s_typeRows = new();
 
-    /// <summary>Hosts that answered, so one unreachable feed does not slow every navigation.</summary>
-    private static readonly HashSet<string> s_failedHosts = [];
+    private static readonly ConcurrentDictionary<(string Assembly, long Stamp), string?> s_maps = new();
 
-    private static readonly SemaphoreSlim s_gate = new(1, 1);
-
-    public static string CacheDirectory { get; } =
-        Path.Combine(Path.GetTempPath(), "RoslynMCP", "SourceLink");
+    public static string CacheDirectory => ExternalSourceCache.SourceLinkDirectory;
 
     /// <summary>
     /// The real source for <paramref name="symbol"/>, or null when this assembly does not
@@ -63,15 +67,18 @@ public static class SourceLinkService
 
         try
         {
-            if (AssemblyPath(symbol, project) is not { } assemblyPath)
+            if (SourceMemberLocator.GetOwningType(symbol) is not { } owningType)
                 return null;
 
-            var located = Locate(symbol, assemblyPath);
-            if (located is not var (documentPath, line, url, hash, algorithm) || url is null)
+            if (await SourceMemberLocator.AssemblyPathAsync(symbol, project, ct).ConfigureAwait(false)
+                is not { } assemblyPath)
                 return null;
 
-            string? local = await FetchAsync(url, documentPath, hash, algorithm, ct);
-            return local is null ? null : new SourceLinkResult(local, line, url);
+            return await ResolveCoreAsync(
+                assemblyPath,
+                symbol,
+                SourceMemberLocator.GetReflectionTypeName(owningType),
+                ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -81,67 +88,201 @@ public static class SourceLinkService
         }
     }
 
-    /// <summary>The file the compiler read this symbol from, and where to get it.</summary>
-    private static (string DocumentPath, int Line, string? Url, byte[] Hash, Guid Algorithm)? Locate(
-        ISymbol symbol, string assemblyPath)
+    /// <summary>
+    /// The real source for a type named in an assembly, for callers that never had an
+    /// <see cref="ISymbol"/> — the search panel and the metadata document handler.
+    /// </summary>
+    public static async Task<SourceLinkResult?> TryResolveForAssemblyAsync(
+        string assemblyPath, string reflectionTypeName, CancellationToken ct)
     {
+        if (!Config.LspFeatureOptions.SourceLink)
+            return null;
+
+        try
+        {
+            return await ResolveCoreAsync(assemblyPath, symbol: null, reflectionTypeName, ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn($"Source Link lookup failed: {ex.Message}", key: "sourcelink");
+            return null;
+        }
+    }
+
+    private static async Task<SourceLinkResult?> ResolveCoreAsync(
+        string assemblyPath, ISymbol? symbol, string reflectionTypeName, CancellationToken ct)
+    {
+        // The compilation references a reference assembly, whose method bodies are all `throw
+        // null` and which therefore has no sequence points and no PDB anywhere. The implementation
+        // assembly is the one that was compiled from the source we are looking for. This has to
+        // happen before the PE is opened, because everything below reads tokens out of that PE and
+        // resolves them against that PE's PDB.
+        assemblyPath = ReferenceAssemblyRedirector.RedirectToImplementation(assemblyPath, reflectionTypeName);
+        if (!File.Exists(assemblyPath))
+            return null;
+
         using var stream = File.OpenRead(assemblyPath);
         using var peReader = new PEReader(stream);
 
-        if (!peReader.TryOpenAssociatedPortablePdb(
-                assemblyPath,
-                path => File.Exists(path) ? File.OpenRead(path) : null,
-                out var pdbProvider,
-                out _)
-            || pdbProvider is null)
+        using var pdb = await PdbLocator.OpenAsync(peReader, assemblyPath, ct).ConfigureAwait(false);
+        if (pdb is null)
+            return null;
+
+        var pdbReader = pdb.Provider.GetMetadataReader();
+        var metadata = peReader.GetMetadataReader();
+
+        var methods = MethodsOf(symbol, reflectionTypeName, assemblyPath, metadata);
+        if (methods.IsEmpty)
+            return null;
+
+        var (typeSimpleName, _) = SourceMemberLocator.SplitReflectionName(reflectionTypeName);
+
+        if (BestDocument(pdbReader, methods, symbol is IMethodSymbol, typeSimpleName)
+                is not var (documentHandle, line)
+            || documentHandle.IsNil)
         {
             return null;
         }
 
-        using (pdbProvider)
+        var document = pdbReader.GetDocument(documentHandle);
+        string documentPath = pdbReader.GetString(document.Name);
+        byte[] hash = pdbReader.GetBlobBytes(document.Hash);
+        var algorithm = pdbReader.GetGuid(document.HashAlgorithm);
+
+        // Source the PDB carries needs no network, no URL and no host that might be down.
+        if (EmbeddedSourceReader.TryRead(pdbReader, documentHandle) is { } embedded
+            && Reconcile(embedded, hash, algorithm) is { } verifiedEmbedded)
         {
-            var pdb = pdbProvider.GetMetadataReader();
-            string? map = ReadSourceLinkMap(pdb);
-            if (map is null)
-                return null;
-
-            var metadata = peReader.GetMetadataReader();
-            var methods = MethodsOf(symbol, metadata);
-            if (methods.IsEmpty)
-                return null;
-
-            // The declaration is the earliest line any of the symbol's methods was compiled
-            // from — for a type that is close to its own declaration, and for a method it is
-            // its signature.
-            (DocumentHandle Document, int Line)? best = null;
-            foreach (var handle in methods)
-            {
-                var debugInformation = pdb.GetMethodDebugInformation(
-                    MetadataTokens.MethodDebugInformationHandle(
-                        MetadataTokens.GetRowNumber(handle)));
-
-                foreach (var point in debugInformation.GetSequencePoints())
-                {
-                    if (point.IsHidden)
-                        continue;
-                    if (best is null || point.StartLine < best.Value.Line)
-                        best = (point.Document, point.StartLine);
-                    break;
-                }
-            }
-
-            if (best is not var (documentHandle, line) || documentHandle.IsNil)
-                return null;
-
-            var document = pdb.GetDocument(documentHandle);
-            string documentPath = pdb.GetString(document.Name);
-
-            return (documentPath, line, ResolveUrl(map, documentPath),
-                pdb.GetBlobBytes(document.Hash), pdb.GetGuid(document.HashAlgorithm));
+            string? saved = SaveEmbedded(assemblyPath, documentPath, verifiedEmbedded);
+            if (saved is not null)
+                return new SourceLinkResult(saved, line, Url: null, Embedded: true);
         }
+
+        if (!Config.LspFeatureOptions.ExternalSource)
+            return null;
+
+        string? map = ReadSourceLinkMap(pdbReader, assemblyPath);
+        if (map is null || ResolveUrl(map, documentPath) is not { } url)
+            return null;
+
+        string? local = await FetchAsync(url, documentPath, hash, algorithm, ct).ConfigureAwait(false);
+        return local is null ? null : new SourceLinkResult(local, line, url);
     }
 
-    private static string? ReadSourceLinkMap(MetadataReader pdb)
+    /// <summary>
+    /// The document a type is declared in, and the line to land on.
+    /// </summary>
+    /// <remarks>
+    /// A partial type is compiled from several files — <c>String</c> comes from <c>String.cs</c>,
+    /// <c>String.Manipulation.cs</c>, <c>String.Searching.cs</c> and more — and its methods are
+    /// spread across all of them. Taking the earliest line across every document picks whichever
+    /// file happens to hold a method declared near its top, which is arbitrary. The file that most
+    /// of the type's methods were compiled from is the one a reader means by "where is this type".
+    /// </remarks>
+    private static (DocumentHandle Document, int Line)? BestDocument(
+        MetadataReader pdb,
+        ImmutableArray<MethodDefinitionHandle> methods,
+        bool singleMethod,
+        string typeSimpleName)
+    {
+        var firstPoints = new List<(int Document, int Line, string Name)>(methods.Length);
+
+        foreach (var handle in methods)
+        {
+            var debugInformation = pdb.GetMethodDebugInformation(
+                MetadataTokens.MethodDebugInformationHandle(MetadataTokens.GetRowNumber(handle)));
+
+            foreach (var point in debugInformation.GetSequencePoints())
+            {
+                if (point.IsHidden)
+                    continue;
+
+                string name = pdb.GetString(pdb.GetDocument(point.Document).Name);
+                firstPoints.Add((MetadataTokens.GetRowNumber(point.Document), point.StartLine, name));
+                break;
+            }
+        }
+
+        if (ChooseDeclarationPoint(firstPoints, singleMethod, typeSimpleName) is not var (documentRow, line))
+            return null;
+
+        return (MetadataTokens.DocumentHandle(documentRow), line);
+    }
+
+    /// <summary>
+    /// Picks the declaration point from each method's first sequence point. Separated from the
+    /// metadata reading so the choice can be tested without building a PDB.
+    /// </summary>
+    /// <param name="singleMethod">
+    /// True when the caller asked about one method rather than a whole type, in which case there
+    /// is nothing to choose between — that method's own file is the answer.
+    /// </param>
+    internal static (int Document, int Line)? ChooseDeclarationPoint(
+        IReadOnlyList<(int Document, int Line, string Name)> firstPoints,
+        bool singleMethod,
+        string typeSimpleName)
+    {
+        if (firstPoints.Count == 0)
+            return null;
+
+        if (singleMethod)
+            return (firstPoints[0].Document, firstPoints[0].Line);
+
+        var byDocument = new Dictionary<int, (int Count, int MinLine, bool Named)>();
+        foreach (var (document, line, name) in firstPoints)
+        {
+            if (byDocument.TryGetValue(document, out var tally))
+            {
+                byDocument[document] = tally with
+                {
+                    Count = tally.Count + 1,
+                    MinLine = Math.Min(tally.MinLine, line),
+                };
+            }
+            else
+            {
+                byDocument[document] = (1, line, NamesTheType(name, typeSimpleName));
+            }
+        }
+
+        int bestDocument = 0;
+        (int Count, int MinLine, bool Named) best = (0, int.MaxValue, false);
+
+        foreach (var (document, tally) in byDocument)
+        {
+            // A file named after the type outranks any count. Most of String's methods live in
+            // String.Manipulation.cs, but a reader who asked for String means String.cs; falling
+            // back to the count is for types whose file is not named after them at all.
+            bool better = tally.Named != best.Named
+                ? tally.Named
+                : tally.Count > best.Count
+                    || (tally.Count == best.Count && tally.MinLine < best.MinLine)
+                    // Settled on the row so the answer never depends on dictionary ordering.
+                    || (tally.Count == best.Count && tally.MinLine == best.MinLine && document < bestDocument);
+
+            if (better)
+                (bestDocument, best) = (document, tally);
+        }
+
+        return (bestDocument, best.MinLine);
+    }
+
+    /// <summary>Whether a document is the one named after the type: <c>.../String.cs</c>.</summary>
+    private static bool NamesTheType(string documentPath, string typeSimpleName)
+    {
+        if (typeSimpleName.Length == 0)
+            return false;
+
+        string stem = Path.GetFileNameWithoutExtension(documentPath.Replace('\\', '/'));
+        return string.Equals(stem, typeSimpleName, StringComparison.Ordinal);
+    }
+
+    private static string? ReadSourceLinkMap(MetadataReader pdb, string assemblyPath) =>
+        s_maps.GetOrAdd(CacheKey(assemblyPath), _ => ReadSourceLinkMap(pdb));
+
+    internal static string? ReadSourceLinkMap(MetadataReader pdb)
     {
         foreach (var handle in pdb.GetCustomDebugInformation(EntityHandle.ModuleDefinition))
         {
@@ -207,14 +348,9 @@ public static class SourceLinkService
     /// metadata token.
     /// </summary>
     private static ImmutableArray<MethodDefinitionHandle> MethodsOf(
-        ISymbol symbol, MetadataReader metadata)
+        ISymbol? symbol, string reflectionTypeName, string assemblyPath, MetadataReader metadata)
     {
-        var containingType = symbol as INamedTypeSymbol ?? symbol.ContainingType;
-        if (containingType is null)
-            return [];
-
-        var typeDefinition = FindType(containingType, metadata);
-        if (typeDefinition is not { } type)
+        if (FindType(reflectionTypeName, assemblyPath, metadata) is not { } type)
             return [];
 
         var all = metadata.GetTypeDefinition(type).GetMethods();
@@ -237,23 +373,42 @@ public static class SourceLinkService
         return matches.IsEmpty ? [.. all] : matches;
     }
 
-    private static TypeDefinitionHandle? FindType(INamedTypeSymbol symbol, MetadataReader metadata)
+    private static TypeDefinitionHandle? FindType(
+        string reflectionTypeName, string assemblyPath, MetadataReader metadata)
     {
-        string @namespace = symbol.ContainingNamespace?.IsGlobalNamespace == false
-            ? symbol.ContainingNamespace.ToDisplayString()
-            : "";
+        var (assembly, stamp) = CacheKey(assemblyPath);
+        int row = s_typeRows.GetOrAdd(
+            (assembly, stamp, reflectionTypeName),
+            _ => FindType(reflectionTypeName, metadata) is { } handle
+                ? MetadataTokens.GetRowNumber(handle)
+                : 0);
 
-        // Nested types carry only their own name in metadata, with the nesting held separately.
-        string name = symbol.MetadataName;
-        var outer = symbol.ContainingType;
+        return row == 0 ? null : MetadataTokens.TypeDefinitionHandle(row);
+    }
+
+    /// <summary>Locates a type by its metadata name, following the nesting chain outwards.</summary>
+    internal static TypeDefinitionHandle? FindType(string reflectionTypeName, MetadataReader metadata)
+    {
+        string[] nesting = reflectionTypeName.Split('+');
+        string outermost = nesting[0];
+
+        int lastDot = outermost.LastIndexOf('.');
+        string @namespace = lastDot < 0 ? "" : outermost[..lastDot];
+        string name = lastDot < 0 ? outermost : outermost[(lastDot + 1)..];
+
+        // Nested types carry only their own name in metadata, with the nesting held separately —
+        // and the namespace only ever sits on the outermost one, so the enclosing name to match
+        // against is the bare name when the parent is that outermost type.
+        string wanted = nesting.Length == 1 ? name : nesting[^1];
+        string enclosing = nesting.Length == 2 ? name : nesting.Length > 2 ? nesting[^2] : string.Empty;
 
         foreach (var handle in metadata.TypeDefinitions)
         {
             var definition = metadata.GetTypeDefinition(handle);
-            if (metadata.GetString(definition.Name) != name)
+            if (metadata.GetString(definition.Name) != wanted)
                 continue;
 
-            if (outer is null)
+            if (nesting.Length == 1)
             {
                 if (metadata.GetString(definition.Namespace) == @namespace)
                     return handle;
@@ -265,23 +420,25 @@ public static class SourceLinkService
                 continue;
 
             var parent = metadata.GetTypeDefinition(declaring);
-            if (metadata.GetString(parent.Name) == outer.MetadataName)
+            if (metadata.GetString(parent.Name) == enclosing)
                 return handle;
         }
 
         return null;
     }
 
-    private static string? AssemblyPath(ISymbol symbol, Project project)
+    /// <summary>Writes source unpacked from a PDB to the cache, so an editor has a file to open.</summary>
+    private static string? SaveEmbedded(string assemblyPath, string documentPath, byte[] content)
     {
-        if (symbol.ContainingAssembly is not { } assembly)
-            return null;
+        string target = Path.Combine(
+            ExternalSourceCache.EmbeddedDirectory,
+            ExternalSourceCache.Fingerprint($"{assemblyPath}\n{documentPath}"),
+            Path.GetFileName(documentPath.Replace('\\', '/')));
 
-        var compilation = project.GetCompilationAsync().GetAwaiter().GetResult();
-        if (compilation?.GetMetadataReference(assembly) is not PortableExecutableReference reference)
-            return null;
+        if (File.Exists(target))
+            return target;
 
-        return reference.FilePath is { Length: > 0 } path && File.Exists(path) ? path : null;
+        return ExternalSourceCache.WriteReadOnly(target, content) ? target : null;
     }
 
     /// <summary>
@@ -292,56 +449,21 @@ public static class SourceLinkService
         string url, string documentPath, byte[] expectedHash, Guid algorithm, CancellationToken ct)
     {
         string cached = Path.Combine(
-            CacheDirectory, Fingerprint(url), Path.GetFileName(documentPath.Replace('\\', '/')));
+            CacheDirectory,
+            ExternalSourceCache.Fingerprint(url),
+            Path.GetFileName(documentPath.Replace('\\', '/')));
 
         if (File.Exists(cached))
             return cached;
 
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
-            || uri.Scheme != Uri.UriSchemeHttps)
-        {
-            // http would let anything on the path serve the source that gets read as the
-            // dependency's; the format's own convention is https.
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
             return null;
-        }
 
-        await s_gate.WaitAsync(ct);
-        try
-        {
-            if (s_failedHosts.Contains(uri.Host))
-                return null;
-        }
-        finally
-        {
-            s_gate.Release();
-        }
-
-        byte[] content;
-        try
-        {
-            using var response = await s_http.GetAsync(
-                uri, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (!response.IsSuccessStatusCode)
-                return null;
-            if (response.Content.Headers.ContentLength > MaxDownloadBytes)
-                return null;
-
-            content = await response.Content.ReadAsByteArrayAsync(ct);
-            if (content.Length > MaxDownloadBytes)
-                return null;
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            await RememberFailureAsync(uri.Host);
+        byte[]? content = await HttpFetch.GetAsync(uri, MaxDownloadBytes, ct).ConfigureAwait(false);
+        if (content is null)
             return null;
-        }
-        catch (HttpRequestException)
-        {
-            await RememberFailureAsync(uri.Host);
-            return null;
-        }
 
-        if (!Matches(content, expectedHash, algorithm))
+        if (Reconcile(content, expectedHash, algorithm) is not { } verified)
         {
             ServiceLog.Warn(
                 $"Source Link content for {Path.GetFileName(documentPath)} did not match the " +
@@ -350,26 +472,7 @@ public static class SourceLinkService
             return null;
         }
 
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(cached)!);
-            await File.WriteAllBytesAsync(cached, content, ct);
-            File.SetAttributes(cached, FileAttributes.ReadOnly);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception)
-        {
-            return null;
-        }
-
-        return cached;
-    }
-
-    private static async Task RememberFailureAsync(string host)
-    {
-        await s_gate.WaitAsync();
-        try { s_failedHosts.Add(host); }
-        finally { s_gate.Release(); }
+        return ExternalSourceCache.WriteReadOnly(cached, verified) ? cached : null;
     }
 
     /// <summary>
@@ -393,8 +496,74 @@ public static class SourceLinkService
         return actual.AsSpan().SequenceEqual(expected);
     }
 
-    private static string Fingerprint(string url) =>
-        Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(url)))[..16];
+    /// <summary>
+    /// The form of <paramref name="content"/> that the PDB's checksum attests to, or null when no
+    /// form of it does.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A checksum is over bytes, but the bytes a build machine compiled are not always the bytes a
+    /// host serves. .NET's own repositories are built on Windows with git's line-ending conversion
+    /// on, so every checksum in the framework's PDBs is over CRLF text — while
+    /// <c>raw.githubusercontent.com</c> serves the LF bytes that are actually committed. Comparing
+    /// strictly rejects the genuine article for every file in the BCL, which is the difference
+    /// between this feature working and not.
+    /// </para>
+    /// <para>
+    /// This is not a weakening of the check. Each candidate is still required to hash to exactly
+    /// what the PDB recorded; all that is admitted is that the same text can be spelled with
+    /// different line terminators. Line numbers are identical across the variants, so navigation
+    /// is unaffected, and the variant that actually matches is the one written to the cache.
+    /// </para>
+    /// </remarks>
+    internal static byte[]? Reconcile(byte[] content, byte[] expected, Guid algorithm)
+    {
+        foreach (byte[] candidate in Variants(content))
+        {
+            if (Matches(candidate, expected, algorithm))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<byte[]> Variants(byte[] content)
+    {
+        // Overwhelmingly the common case, and the only one most packages need.
+        yield return content;
+
+        bool hasBom = content.Length >= 3 && content[0] == 0xEF && content[1] == 0xBB && content[2] == 0xBF;
+        byte[] body = hasBom ? content[3..] : content;
+
+        string text = System.Text.Encoding.UTF8.GetString(body);
+        string lf = text.Replace("\r\n", "\n", StringComparison.Ordinal);
+        string crlf = lf.Replace("\n", "\r\n", StringComparison.Ordinal);
+
+        foreach (string spelling in (string[])[crlf, lf])
+        {
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(spelling);
+            yield return hasBom ? [0xEF, 0xBB, 0xBF, .. bytes] : bytes;
+
+            // The build machine may also have disagreed about the byte order mark.
+            yield return hasBom ? bytes : [0xEF, 0xBB, 0xBF, .. bytes];
+        }
+    }
+
+    /// <summary>Identifies a build of an assembly, so a rebuild does not reuse stale lookups.</summary>
+    private static (string Assembly, long Stamp) CacheKey(string assemblyPath)
+    {
+        long stamp;
+        try
+        {
+            stamp = File.GetLastWriteTimeUtc(assemblyPath).Ticks;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            stamp = 0;
+        }
+
+        return (assemblyPath, stamp);
+    }
 
     private static bool PathsEqual(string a, string b) =>
         string.Equals(a.Replace('\\', '/'), b.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase);

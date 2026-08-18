@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.CodeAnalysis;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Services.ExternalSource;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Handlers;
 
@@ -58,6 +59,23 @@ public static class GoToDefinitionSnippetTool
             if (ctx is null)
                 return errors.ToString();
 
+            // The editor's F12 asks the embedded languages before Roslyn (NavigationHandlers does
+            // exactly this), and it matters ahead of the symbol answer too: a caret inside a
+            // FindControl("id") literal resolves to System.String, which is never what the caller
+            // marked. Costs a syntax lookup when the caret is not in a claimed literal.
+            if (ctx.Resolution.Position is { } markedPosition
+                && ctx.File.Document is { } markedDocument
+                && await RoslynEmbeddedLanguages.Current.DetectAsync(
+                    markedDocument, markedPosition, cancellationToken) is
+                    { Language: IEmbeddedDefinitionProvider embedded } embeddedContext
+                && await embedded.DefinitionAsync(
+                    embeddedContext, typeDefinition: false, cancellationToken) is
+                    { Length: > 0 } embeddedLocations)
+            {
+                return await FormatEmbeddedLocationsAsync(
+                    embeddedLocations, contextLines, cancellationToken);
+            }
+
             if (!ctx.IsResolved)
                 return ToolHelper.FormatResolutionError(ctx.Resolution);
 
@@ -79,7 +97,7 @@ public static class GoToDefinitionSnippetTool
                 // A notification has as many handlers as subscribe to it, and choosing one to show
                 // would be a guess. Every one, each rendered the way a single definition is.
                 var all = new StringBuilder();
-                all.AppendLine($"# {redirected.Count} handlers");
+                all.AppendLine($"**{redirected.Count} handlers**");
                 all.AppendLine();
 
                 foreach (var target in redirected)
@@ -104,6 +122,57 @@ public static class GoToDefinitionSnippetTool
         }
     }
 
+    /// <summary>
+    /// Definitions an embedded string language answered with — file positions rather than
+    /// symbols, so they are rendered from the files directly.
+    /// </summary>
+    internal static async Task<string> FormatEmbeddedLocationsAsync(
+        RoslynMCP.Lsp.Protocol.Location[] locations, int contextLines,
+        CancellationToken cancellationToken)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(locations.Length == 1
+            ? "**Definition**"
+            : $"**{locations.Length} definitions**");
+        sb.AppendLine();
+
+        foreach (var location in locations)
+        {
+            string path = RoslynMCP.Lsp.LspConverters.UriToPath(location.Uri);
+            int targetLine = location.Range.Start.Line;
+
+            sb.AppendLine($"**File**: {path}");
+            sb.AppendLine($"**Line**: {targetLine + 1}");
+            sb.AppendLine();
+
+            string[] lines;
+            try
+            {
+                lines = await File.ReadAllLinesAsync(path, cancellationToken);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+
+            int start = Math.Max(0, targetLine - contextLines);
+            int end = Math.Min(lines.Length - 1, targetLine + contextLines);
+
+            sb.AppendLine("```");
+            for (int line = start; line <= end; line++)
+            {
+                sb.AppendLine(line == targetLine
+                    ? $"{line + 1}: > {lines[line]}"
+                    : $"{line + 1}:   {lines[line]}");
+            }
+
+            sb.AppendLine("```");
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
     internal static async Task<string> FormatDefinitionAsync(
         ISymbol symbol, Project project, int contextLines, IOutputFormatter fmt, CancellationToken cancellationToken = default)
     {
@@ -113,7 +182,7 @@ public static class GoToDefinitionSnippetTool
             : symbol.Name;
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Definition: {displayName}");
+        sb.AppendLine($"**Definition: {displayName}**");
         sb.AppendLine();
 
         sb.AppendLine($"- **Symbol**: {symbol.ToDisplayString()}");
@@ -150,36 +219,12 @@ public static class GoToDefinitionSnippetTool
         }
         else if (metadataLocations.Count > 0)
         {
-            var decompiled = await DecompiledSourceService.TryDecompileSymbolAsync(
-                symbol,
-                project,
-                cancellationToken);
+            var external = await ExternalSourceService.TryResolveAsync(symbol, project, cancellationToken);
 
-            if (decompiled is not null)
-            {
-                var decompiledLocations = decompiled.Locations.ToList();
-                if (decompiledLocations.Count > 0)
-                {
-                    await AppendLocationsAsync(
-                        sb,
-                        decompiledLocations,
-                        decompiled.Project.Solution,
-                        "Decompiled Source",
-                        provenance: "auto-decompiled",
-                        assemblyPath: decompiled.AssemblyPath,
-                        includeCodeContext: true,
-                        contextLines,
-                        cancellationToken);
-                }
-                else
-                {
-                    sb.Append(MetadataSourceFormatter.FormatExternalDefinition(symbol));
-                }
-            }
+            if (external is { Positions.Count: > 0 })
+                await AppendExternalSourceAsync(sb, external, contextLines, cancellationToken);
             else
-            {
                 sb.Append(MetadataSourceFormatter.FormatExternalDefinition(symbol));
-            }
         }
         else
         {
@@ -196,6 +241,64 @@ public static class GoToDefinitionSnippetTool
             "Use GetCallHierarchy to see callers and callees");
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// A dependency's source, read from the file rather than through a workspace.
+    /// </summary>
+    /// <remarks>
+    /// Opening it as a Roslyn document would mean standing up an ad-hoc workspace with a full
+    /// reference set for what is, here, a few lines of text. The heading and the provenance line
+    /// carry how the source was obtained, because a checksum-verified file and a decompilation are
+    /// not equally strong evidence of what the assembly actually does.
+    /// </remarks>
+    private static async Task AppendExternalSourceAsync(
+        StringBuilder sb,
+        ExternalSourceResult external,
+        int contextLines,
+        CancellationToken cancellationToken)
+    {
+        string[] lines;
+        try
+        {
+            lines = await File.ReadAllLinesAsync(external.FilePath, cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        for (int i = 0; i < external.Positions.Count; i++)
+        {
+            sb.AppendLine(external.Positions.Count > 1
+                ? $"## {external.Title} {i + 1}"
+                : $"## {external.Title}");
+            sb.AppendLine();
+
+            sb.AppendLine(
+                $"**Provenance**: {external.Provenance} from "
+                + $"`{Path.GetFileNameWithoutExtension(external.AssemblyPath)}`");
+            sb.AppendLine($"**Assembly Path**: {external.AssemblyPath}");
+
+            int targetLine = external.Positions[i].Line;
+            sb.AppendLine($"**File**: {external.FilePath}");
+            sb.AppendLine($"**Line**: {targetLine + 1}");
+            sb.AppendLine();
+
+            int start = Math.Max(0, targetLine - contextLines);
+            int end = Math.Min(lines.Length - 1, targetLine + contextLines);
+
+            sb.AppendLine("```csharp");
+            for (int line = start; line <= end; line++)
+            {
+                sb.AppendLine(line == targetLine
+                    ? $"{line + 1}: > {lines[line]}"
+                    : $"{line + 1}:   {lines[line]}");
+            }
+
+            sb.AppendLine("```");
+            sb.AppendLine();
+        }
     }
 
     private static async Task AppendLocationsAsync(

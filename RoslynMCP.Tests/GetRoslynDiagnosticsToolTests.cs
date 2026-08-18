@@ -30,7 +30,7 @@ public class GetRoslynDiagnosticsToolTests
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.CalculatorFile, runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
         Assert.Contains("Calculator.cs", result);
         Assert.Contains("**Project**:", result);
     }
@@ -62,7 +62,7 @@ public class GetRoslynDiagnosticsToolTests
         var result = await GetRoslynDiagnosticsTool.GetRoslynDiagnostics(fmt: new RoslynMCP.Services.MarkdownFormatter(),
             filePath: FixturePaths.WarningsFile, runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
         Assert.Contains("Warnings.cs", result);
     }
 
@@ -75,8 +75,8 @@ public class GetRoslynDiagnosticsToolTests
             filePath: FixturePaths.CalculatorFile, severityFilter: "hidden", runAnalyzers: false);
 
         // Hidden-only results should differ from all results (or both be empty)
-        Assert.Contains("# Diagnostics:", allResult);
-        Assert.Contains("# Diagnostics:", hiddenResult);
+        Assert.Contains("**Diagnostics:", allResult);
+        Assert.Contains("**Diagnostics:", hiddenResult);
     }
 
     [Fact]
@@ -86,7 +86,7 @@ public class GetRoslynDiagnosticsToolTests
             filePath: FixturePaths.BrokenSyntaxFile,
             runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
         Assert.Contains("BrokenSyntax.cs", result);
         Assert.Contains("Error", result);
         Assert.Contains("CS", result);
@@ -99,7 +99,7 @@ public class GetRoslynDiagnosticsToolTests
             filePath: FixturePaths.BrokenSemanticFile,
             runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
         Assert.Contains("BrokenSemantic.cs", result);
         Assert.Contains("Error", result);
         Assert.Contains("CS", result);
@@ -137,7 +137,7 @@ public class GetRoslynDiagnosticsToolTests
             severityFilter: "info",
             runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
     }
 
     [Fact]
@@ -148,7 +148,7 @@ public class GetRoslynDiagnosticsToolTests
             severityFilter: "warning",
             runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
         Assert.Contains("Warning", result);
     }
 }

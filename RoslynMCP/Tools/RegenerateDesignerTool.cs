@@ -59,8 +59,8 @@ public static class RegenerateDesignerTool
         var failed = considered.Where(r => r.Outcome == DesignerOutcome.Failed).ToList();
 
         sb.AppendLine(dryRun
-            ? $"# Designer regeneration (dry run) — {updated} would change, {unchanged} unchanged, {failed.Count} failed"
-            : $"# Designer regeneration — {updated} updated, {unchanged} unchanged, {failed.Count} failed");
+            ? $"**Designer regeneration (dry run) — {updated} would change, {unchanged} unchanged, {failed.Count} failed**"
+            : $"**Designer regeneration — {updated} updated, {unchanged} unchanged, {failed.Count} failed**");
         sb.AppendLine();
 
         // An all-unchanged sweep is the common case; listing every file would be noise.

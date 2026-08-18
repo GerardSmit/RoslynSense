@@ -45,7 +45,7 @@ internal class ProtoOutline : IOutlineHandler
         var index = view.Index;
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Proto File: {Path.GetFileName(parse.FilePath)}");
+        sb.AppendLine($"**Proto File: {Path.GetFileName(parse.FilePath)}**");
         sb.AppendLine();
 
         AppendFileInfo(sb, view);

@@ -60,7 +60,7 @@ public static class TypeHierarchyTool
         CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Type Hierarchy: {typeSymbol.Name}");
+        sb.AppendLine($"**Type Hierarchy: {typeSymbol.Name}**");
         sb.AppendLine();
         sb.AppendLine($"- **Type**: {typeSymbol.ToDisplayString()}");
         sb.AppendLine($"- **Kind**: {typeSymbol.TypeKind}");

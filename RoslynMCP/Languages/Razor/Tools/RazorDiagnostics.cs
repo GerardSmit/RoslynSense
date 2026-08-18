@@ -33,7 +33,7 @@ internal class RazorDiagnostics : IDiagnosticsHandler
             return "Error: Unable to produce compilation for project.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Razor Validation: {Path.GetFileName(filePath)}");
+        sb.AppendLine($"**Razor Validation: {Path.GetFileName(filePath)}**");
         sb.AppendLine();
 
         var allDiagnostics = compilation.GetDiagnostics();

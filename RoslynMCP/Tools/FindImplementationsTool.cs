@@ -80,7 +80,7 @@ public static class FindImplementationsTool
         bool isInterface = typeSymbol.TypeKind == TypeKind.Interface;
         string symbolLabel = isInterface ? "Interface" : "Class";
 
-        sb.AppendLine($"# Implementations: {typeSymbol.Name}");
+        sb.AppendLine($"**Implementations: {typeSymbol.Name}**");
         sb.AppendLine();
         sb.AppendLine($"- **{symbolLabel}**: {typeSymbol.ToDisplayString()}");
         sb.AppendLine($"- **Kind**: {typeSymbol.TypeKind}");
@@ -188,7 +188,7 @@ public static class FindImplementationsTool
         CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Implementations: {memberSymbol.Name}");
+        sb.AppendLine($"**Implementations: {memberSymbol.Name}**");
         sb.AppendLine();
         sb.AppendLine($"- **Symbol**: {memberSymbol.ToDisplayString()}");
         sb.AppendLine($"- **Kind**: {memberSymbol.Kind}");

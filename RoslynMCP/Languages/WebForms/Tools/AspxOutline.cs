@@ -42,7 +42,7 @@ internal class AspxOutline : IOutlineHandler
 
         var parse = document.Parse;
         var sb = new StringBuilder();
-        sb.AppendLine($"# ASPX File: {Path.GetFileName(document.FilePath)}");
+        sb.AppendLine($"**ASPX File: {Path.GetFileName(document.FilePath)}**");
         sb.AppendLine();
 
         AppendDirectives(sb, parse.Directives);

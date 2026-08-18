@@ -50,7 +50,7 @@ public static class CallHierarchyTool
             var solution = ctx.Workspace.CurrentSolution;
 
             var sb = new StringBuilder();
-            sb.AppendLine($"# Call Hierarchy: {symbol.Name}");
+            sb.AppendLine($"**Call Hierarchy: {symbol.Name}**");
             sb.AppendLine();
             SymbolFormatter.AppendSymbolInfo(sb, symbol);
             sb.AppendLine();

@@ -105,7 +105,7 @@ internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandle
         var file = hit.TargetFile ?? view.Parse;
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Definition: {target.Name.Value}");
+        sb.AppendLine($"**Definition: {target.Name.Value}**");
         sb.AppendLine();
 
         sb.AppendLine($"- **Proto**: {target.FullName}");
@@ -137,7 +137,7 @@ internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandle
         string path = hit.Name ?? markup.MarkedText;
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Definition: {path}");
+        sb.AppendLine($"**Definition: {path}**");
         sb.AppendLine();
         sb.AppendLine($"- **Import**: {path}");
 
@@ -185,7 +185,7 @@ internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandle
     private static string FormatUnresolved(ProtoHit hit, MarkupString markup)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# No definition for: {markup.MarkedText}");
+        sb.AppendLine($"**No definition for: {markup.MarkedText}**");
         sb.AppendLine();
         sb.AppendLine($"- **Caret is on**: {hit.Kind}");
 

@@ -39,7 +39,7 @@ internal class RazorOutline : IOutlineHandler
         string filePath, string text, Microsoft.CodeAnalysis.Project project, CancellationToken cancellationToken)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Razor File: {Path.GetFileName(filePath)}");
+        sb.AppendLine($"**Razor File: {Path.GetFileName(filePath)}**");
         sb.AppendLine();
 
         // Parse Razor file using the official Razor Language parser

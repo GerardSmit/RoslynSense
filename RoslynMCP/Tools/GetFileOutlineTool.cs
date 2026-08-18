@@ -108,7 +108,7 @@ public static class GetFileOutlineTool
 
         var root = await syntaxTree.GetRootAsync(cancellationToken);
         var sb = new StringBuilder();
-        sb.AppendLine($"# Outline: {Path.GetFileName(fileCtx.SystemPath)}");
+        sb.AppendLine($"**Outline: {Path.GetFileName(fileCtx.SystemPath)}**");
         sb.AppendLine();
         sb.AppendLine("```");
         AppendOutline(sb, root, depth: 0);

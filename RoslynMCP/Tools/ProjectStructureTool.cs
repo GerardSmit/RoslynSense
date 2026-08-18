@@ -69,7 +69,7 @@ public static class ProjectStructureTool
     {
         var sb = new StringBuilder();
 
-        sb.AppendLine($"# Project: {project.Name}");
+        sb.AppendLine($"**Project: {project.Name}**");
         sb.AppendLine();
 
         // Basic info

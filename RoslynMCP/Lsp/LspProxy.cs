@@ -137,6 +137,29 @@ internal static class LspProxy
         IOutputFormatter formatter = useToon ? new ToonFormatter() : new MarkdownFormatter();
         await using var services = Daemon.ToolHostServices.Build(settings, formatter, workingDir);
 
+        // The in-process fallback is its own host, so it watches the config itself. The running
+        // session keeps the provider it initialized with; what a reload can move is everything
+        // routed through LanguageRegistry.Current — which is nearly every handler — so the
+        // rebuilt registry is published and the editor asked to re-pull. Replaced providers are
+        // parked undisposed: disposing one would take the carried stores with it, and this
+        // process exits with the session anyway.
+        var replaced = new List<Microsoft.Extensions.DependencyInjection.ServiceProvider>();
+        var currentProvider = services;
+        using var configWatcher = Daemon.ConfigWatcher.Start(workingDir, [], settings, reload =>
+        {
+            Console.Error.WriteLine(
+                $"[Lsp] {RoslynSenseConfigLoader.FileName} changed: {string.Join("; ", reload.Changes)}. Applying.");
+            bool toon = string.Equals(reload.Settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
+            IOutputFormatter fmt = toon ? new ToonFormatter() : new MarkdownFormatter();
+            // Build resolves the new LanguageRegistry as it finishes, which publishes it as
+            // LanguageRegistry.Current — the swap the static handlers see.
+            var fresh = Daemon.ToolHostServices.Build(reload.Settings, fmt, workingDir, carryFrom: currentProvider);
+            replaced.Add(currentProvider);
+            currentProvider = fresh;
+            WorkspaceService.MaxCachedWorkspaces = reload.Settings.MaxWorkspaces;
+            LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
+        });
+
         await LspSessionHost.RunAsync(stdin, stdout, services, cts.Token);
         await WorkspaceService.ShutdownAsync();
         return 0;

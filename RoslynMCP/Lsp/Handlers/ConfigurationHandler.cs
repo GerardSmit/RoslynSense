@@ -61,8 +61,17 @@ internal static class ConfigurationHandler
         if (Int(section, "analyzerTimeoutSeconds") is > 0 and int seconds)
             LspFeatureOptions.AnalyzerTimeout = TimeSpan.FromSeconds(seconds);
 
+        if (Bool(section, "externalSource") is { } externalSource)
+            LspFeatureOptions.ExternalSource = externalSource;
+
         if (Bool(section, "sourceLink") is { } sourceLink)
             LspFeatureOptions.SourceLink = sourceLink;
+
+        if (Bool(section, "symbolServer") is { } symbolServer)
+            LspFeatureOptions.SymbolServer = symbolServer;
+
+        if (Bool(section, "referenceSource") is { } referenceSource)
+            LspFeatureOptions.ReferenceSource = referenceSource;
 
         ApplyFileNestingRules(section);
 

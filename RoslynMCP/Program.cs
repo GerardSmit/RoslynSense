@@ -198,7 +198,26 @@ class Program
             logger.LogInformation("Loaded roslynsense.json from {Path}", configPath);
         }
 
-        await host.RunAsync();
+        // Shared-host mode: the daemon watches roslynsense.json itself and applies changes live.
+        // In-process mode the MCP SDK owns the container, so a change cannot be applied without
+        // a restart — but silently ignoring the edit is worse than saying so.
+        RoslynMCP.Daemon.ConfigWatcher? configWatcher = null;
+        if (sharedHostSolution is null)
+        {
+            var reloadLogger = host.Services.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("RoslynMCP.Config");
+            configWatcher = RoslynMCP.Daemon.ConfigWatcher.Start(
+                Directory.GetCurrentDirectory(), args, settings, reload =>
+                    reloadLogger.LogWarning(
+                        "roslynsense.json changed ({Changes}); restart this server to apply it. "
+                        + "(The shared host applies config changes live.)",
+                        string.Join("; ", reload.Changes)));
+        }
+
+        using (configWatcher)
+        {
+            await host.RunAsync();
+        }
         return 0;
     }
 

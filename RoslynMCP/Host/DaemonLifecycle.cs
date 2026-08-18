@@ -9,7 +9,7 @@ namespace RoslynMCP.Daemon;
 /// </summary>
 internal sealed class DaemonLifecycle : IDisposable
 {
-    private readonly TimeSpan _idleTimeout;
+    private TimeSpan _idleTimeout;
     private readonly Action _onIdle;
     private readonly object _gate = new();
     private int _activeConnections;
@@ -35,6 +35,22 @@ internal sealed class DaemonLifecycle : IDisposable
         _lockStream.Flush();
 
         lock (_gate) StartIdleTimerLocked();
+    }
+
+    /// <summary>
+    /// Applies a new idle timeout — a configuration reload changed <c>hostIdleMinutes</c>. When
+    /// the timer is already armed it is restarted under the new duration; a shortened timeout
+    /// would otherwise not bite until the old one had run its full course.
+    /// </summary>
+    public void UpdateIdleTimeout(TimeSpan idleTimeout)
+    {
+        lock (_gate)
+        {
+            if (_idleTimeout == idleTimeout) return;
+            _idleTimeout = idleTimeout;
+            if (_idleTimer is not null)
+                StartIdleTimerLocked();
+        }
     }
 
     public void OnConnectionOpened()

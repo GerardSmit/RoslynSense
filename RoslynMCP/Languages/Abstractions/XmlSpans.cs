@@ -61,6 +61,14 @@ internal static class XmlSpans
     }
 
     /// <summary>
+    /// The range of an element's tag name — what a document symbol selects and what a hover over the
+    /// tag is about. Falls back to the whole element when the name token is missing, which is the
+    /// state of a tag mid-keystroke.
+    /// </summary>
+    public static TextSpan NameSpan(this XmlElementBaseSyntax element) =>
+        (element.NameNode?.Span ?? element.Span).ToRoslyn();
+
+    /// <summary>
     /// The string an attribute declares, with entity references resolved.
     /// </summary>
     /// <remarks>

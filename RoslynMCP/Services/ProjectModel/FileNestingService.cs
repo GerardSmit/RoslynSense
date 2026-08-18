@@ -19,6 +19,9 @@ public static partial class FileNestingService
     private static readonly (Regex Pattern, string ParentExtension)[] s_rules =
     [
         (SuffixRule(@"\.designer\.cs"), ".cs"),
+        // LINQ to SQL replaces the extension rather than appending to it, so a model's designer is
+        // spelled exactly like a WinForms one and both rules have to be present.
+        (SuffixRule(@"\.designer\.cs"), ".dbml"),
         (SuffixRule(@"\.g\.cs"), ".cs"),
         (SuffixRule(@"\.generated\.cs"), ".cs"),
         (SuffixRule(@"\.razor\.cs"), ".razor"),
@@ -80,11 +83,16 @@ public static partial class FileNestingService
                 continue;
             }
 
-            if (InferParentName(name) is { } inferred &&
-                byName.TryGetValue(inferred, out string? parent) &&
-                !PathsEqual(parent, file))
+            // The first candidate that is actually there. A suffix can have more than one possible
+            // parent, and a rule naming a file the project does not contain must not stop the next
+            // rule from naming one it does.
+            foreach (string inferred in InferParentNames(name))
             {
-                parentOf[file] = parent;
+                if (byName.TryGetValue(inferred, out string? parent) && !PathsEqual(parent, file))
+                {
+                    parentOf[file] = parent;
+                    break;
+                }
             }
         }
 
@@ -160,18 +168,46 @@ public static partial class FileNestingService
     }
 
     /// <summary>The file name this one should nest under, or null.</summary>
-    internal static string? InferParentName(string fileName)
+    /// <remarks>
+    /// The first candidate, for callers that want a single answer whether or not it exists. The
+    /// nesting itself uses <see cref="InferParentNames"/>, which is the distinction that matters when
+    /// one suffix has several possible parents.
+    /// </remarks>
+    internal static string? InferParentName(string fileName) =>
+        InferParentNames(fileName).FirstOrDefault();
+
+    /// <summary>
+    /// The file names this one could nest under, best first.
+    /// </summary>
+    /// <remarks>
+    /// Plural because one suffix does not imply one parent. <c>Shop.designer.cs</c> is generated
+    /// from <c>Shop.cs</c> by WinForms and from <c>Shop.dbml</c> by LINQ to SQL — the model
+    /// <em>replaces</em> the extension rather than appending to it, which is what makes the two
+    /// collide — and neither rule can be dropped. Answering with the first match alone left the
+    /// second case un-nested, since a rule that matched claimed the file and then named a parent that
+    /// was not there.
+    /// </remarks>
+    internal static IEnumerable<string> InferParentNames(string fileName)
     {
         if (s_exactPairs.TryGetValue(fileName, out string? exact))
-            return exact;
+        {
+            yield return exact;
+            yield break;
+        }
 
         foreach (var (pattern, parentExtension) in s_customRules.Concat(s_rules))
         {
             var match = pattern.Match(fileName);
             if (match.Success)
-                return match.Groups["stem"].Value + parentExtension;
+                yield return match.Groups["stem"].Value + parentExtension;
         }
 
+        if (Fallback(fileName) is { } fallback)
+            yield return fallback;
+    }
+
+    private static string? Fallback(string fileName)
+    {
         string extension = Path.GetExtension(fileName);
 
         // A translation carries culture and customization segments rather than one dotted suffix,

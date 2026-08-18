@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
+using RoslynMCP.Languages.Dbml;
 using RoslynMCP.Languages.Mediator;
 using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
@@ -37,6 +38,8 @@ internal static class LanguagePackRegistration
             packs.Add(new ResourcesLanguage(settings));
         if (settings.MsBuild)
             packs.Add(new MsBuildLanguage());
+        if (settings.Dbml)
+            packs.Add(new DbmlLanguage());
 
         return packs;
     }
@@ -56,6 +59,8 @@ internal static class LanguagePackRegistration
             AddPack<ResourcesLanguage>(services);
         if (settings.MsBuild)
             AddPack<MsBuildLanguage>(services);
+        if (settings.Dbml)
+            AddPack<DbmlLanguage>(services);
 
         services.AddSingleton(sp => new LanguageRegistry(sp.GetServices<ILanguagePack>()).Publish());
     }

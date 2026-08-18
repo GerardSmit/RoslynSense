@@ -33,6 +33,10 @@ public sealed record EffectiveSettings(
     /// <see cref="Resources"/>.</summary>
     internal bool MsBuild { get; init; } = true;
 
+    /// <summary>The LINQ to SQL pack's gate. Init-only for the same reason as
+    /// <see cref="Resources"/>.</summary>
+    internal bool Dbml { get; init; } = true;
+
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
         warnings = new List<string>();
@@ -62,6 +66,7 @@ public sealed record EffectiveSettings(
         var resources = ResourceSettings.Resolve(
             !HasFlag("--no-resources") && tools.Resources, config?.Resources, warnings);
         bool msBuild = !HasFlag("--no-msbuild") && tools.MsBuild;
+        bool dbml = !HasFlag("--no-dbml") && tools.Dbml;
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -117,6 +122,7 @@ public sealed record EffectiveSettings(
         {
             Resources = resources,
             MsBuild = msBuild,
+            Dbml = dbml,
         };
     }
 

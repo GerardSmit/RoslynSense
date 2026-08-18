@@ -95,12 +95,7 @@ internal readonly record struct MsBuildContext(
     /// <c>Include=</c> beside it, on a tag that is still being typed and has no closing bracket yet,
     /// which no amount of walking the finished tree can supply.
     /// </remarks>
-    public string? Sibling(string name) => Element switch
-    {
-        XmlElementSyntax element => Empty(element.GetAttributeValue(name, null)),
-        XmlEmptyElementSyntax empty => Empty(empty.GetAttributeValue(name, null)),
-        _ => null,
-    };
+    public string? Sibling(string name) => Empty(Element?.GetAttributeValue(name));
 
     private static string? Empty(string? value) => value is { Length: > 0 } ? XmlSpans.Decode(value) : null;
 }
@@ -251,12 +246,7 @@ internal static class MsBuildContextResolver
         return node is SyntaxTrivia { Kind: SyntaxKind.XmlComment };
     }
 
-    private static string NameOf(XmlElementBaseSyntax? element) => element switch
-    {
-        XmlElementSyntax e => e.Name ?? string.Empty,
-        XmlEmptyElementSyntax e => e.Name ?? string.Empty,
-        _ => string.Empty,
-    };
+    private static string NameOf(XmlElementBaseSyntax? element) => element?.Name ?? string.Empty;
 
     /// <summary>The element path from the root, slash-separated.</summary>
     /// <remarks>

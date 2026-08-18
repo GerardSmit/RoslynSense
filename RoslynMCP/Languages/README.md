@@ -528,6 +528,17 @@ it:
 }
 ```
 
+`parameterTypes` accepts either spelling of a built-in — `"string"` and `"System.String"` both name
+the same parameter — because which one a configuration reaches for is house style, and a lookup that
+binds nothing over it gives no sign of why.
+
+`containingType` may be omitted, and then the lookup matches on the method name and signature alone.
+That is for a codebase where each module declares its own wrapper — a `protected string
+GetString(string key)` on the page itself, which no list of type names can keep up with — and it is
+deliberately not the default: a bare name binds every method so called in the solution, including
+ones that have nothing to do with resources. Give it a `parameterTypes`, which is then the only thing
+telling the intended call apart from the rest.
+
 Three different merge rules, each following from what the thing is: **lookups append** (a lookup is
 identified by nothing, so there is nothing to replace); **conventions merge by `id`**, so redeclaring
 `local` replaces that one and leaves `localShared` and `global` alone; **overrides replace the

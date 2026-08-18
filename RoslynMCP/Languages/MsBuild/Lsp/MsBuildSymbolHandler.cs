@@ -46,7 +46,7 @@ internal static class MsBuildSymbolHandler
                     Detail(child),
                     Kind(child.Name),
                     LspConverters.ToRange(lines, child.Span.ToRoslyn()),
-                    LspConverters.ToRange(lines, NameSpan(child)),
+                    LspConverters.ToRange(lines, XmlSpans.NameSpan(child)),
                     []));
             }
 
@@ -55,7 +55,7 @@ internal static class MsBuildSymbolHandler
                 null,
                 Kind(group.Name),
                 LspConverters.ToRange(lines, group.Span.ToRoslyn()),
-                LspConverters.ToRange(lines, NameSpan(group)),
+                LspConverters.ToRange(lines, XmlSpans.NameSpan(group)),
                 [.. children]));
         }
 
@@ -64,38 +64,23 @@ internal static class MsBuildSymbolHandler
 
     /// <summary>A package's version, shown beside it the way a signature is beside a method.</summary>
     private static string? Detail(XmlElementBaseSyntax element) =>
-        (element.GetAttributeValue("Version", null)
-         ?? element.GetAttributeValue("VersionOverride", null)) is { Length: > 0 } version
+        (element.GetAttributeValue("Version")
+         ?? element.GetAttributeValue("VersionOverride")) is { Length: > 0 } version
             ? XmlSpans.Decode(version)
             : null;
 
     /// <summary>A group's condition, which is usually the only thing distinguishing two of them.</summary>
     private static string Label(XmlElementBaseSyntax element) =>
-        element.GetAttributeValue("Condition", null) is { Length: > 0 } condition
-            ? $"{NameOf(element)} when {XmlSpans.Decode(condition)}"
-            : NameOf(element);
+        element.GetAttributeValue("Condition") is { Length: > 0 } condition
+            ? $"{element.Name} when {XmlSpans.Decode(condition)}"
+            : element.Name;
 
     private static string? Spec(XmlElementBaseSyntax element) =>
-        (element.GetAttributeValue("Include", null)
-         ?? element.GetAttributeValue("Update", null)
-         ?? element.GetAttributeValue("Remove", null)) is { Length: > 0 } spec
+        (element.GetAttributeValue("Include")
+         ?? element.GetAttributeValue("Update")
+         ?? element.GetAttributeValue("Remove")) is { Length: > 0 } spec
             ? XmlSpans.Decode(spec)
             : null;
-
-    private static string NameOf(XmlElementBaseSyntax element) => element switch
-    {
-        XmlElementSyntax e => e.Name ?? string.Empty,
-        XmlEmptyElementSyntax e => e.Name ?? string.Empty,
-        _ => string.Empty,
-    };
-
-    private static Microsoft.CodeAnalysis.Text.TextSpan NameSpan(XmlElementBaseSyntax element) =>
-        (element switch
-        {
-            XmlElementSyntax { StartTag.NameNode: { } name } => name.Span,
-            XmlEmptyElementSyntax { NameNode: { } name } => name.Span,
-            _ => element.Span,
-        }).ToRoslyn();
 
     private static int Kind(string name) => name switch
     {

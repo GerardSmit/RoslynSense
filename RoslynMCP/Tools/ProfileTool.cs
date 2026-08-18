@@ -22,7 +22,7 @@ public static class ProfileTool
         "Profile a .NET test project to find CPU hotspots. Runs tests under dotnet-trace " +
         "CPU sampling and returns the hottest methods by self-time. " +
         "The profile session is saved for follow-up investigation with ProfileSearchMethods, " +
-        "ProfileCallers, ProfileCallees, and ProfileHotPaths. " +
+        "ProfileCalls and ProfileHotPaths. " +
         "Requires dotnet-trace (auto-installed if missing).")]
     public static async Task<string> ProfileTests(
         [Description("Path to the test project (.csproj) or a source file in the test project.")]
@@ -99,7 +99,7 @@ public static class ProfileTool
         "dotTrace command-line profiler. For web apps, pass hitUrls so the pages under " +
         "investigation are actually exercised during the profiling window. " +
         "The profile session is saved for follow-up investigation with ProfileSearchMethods, " +
-        "ProfileCallers, ProfileCallees, and ProfileHotPaths. " +
+        "ProfileCalls and ProfileHotPaths. " +
         "Uses existing build output — build the project first.")]
     public static async Task<string> ProfileApp(
         [Description("Path to the project (.csproj) or a source file in the project.")]
@@ -182,7 +182,7 @@ public static class ProfileTool
         "or w3wp.exe (dotTrace attach) — use the PID returned by RunProject. For web apps, pass " +
         "hitUrls so the pages under investigation are exercised during the profiling window. " +
         "The profile session is saved for follow-up investigation with ProfileSearchMethods, " +
-        "ProfileCallers, ProfileCallees, and ProfileHotPaths.")]
+        "ProfileCalls and ProfileHotPaths.")]
     public static async Task<string> ProfileProcess(
         [Description("PID of the process to attach to (e.g. from RunProject).")]
         int processId,
@@ -391,7 +391,7 @@ public static class ProfileTool
     [McpServerTool, Description(
         "Stop a recording started with ProfileStart, parse the collected profile, and return " +
         "the hottest methods. The result is stored as a session for ProfileSearchMethods, " +
-        "ProfileCallers, ProfileCallees, and ProfileHotPaths.")]
+        "ProfileCalls and ProfileHotPaths.")]
     public static async Task<string> ProfileStop(
         IOutputFormatter fmt,
         ProfileRecordingStore recordings,
@@ -876,7 +876,7 @@ public static class ProfileTool
         if (sessionId is not null)
         {
             hints.Add($"Use ProfileSearchMethods with session '{sessionId}' to search for specific methods");
-            hints.Add($"Use ProfileCallers/ProfileCallees to investigate call relationships");
+            hints.Add($"Use ProfileCalls to investigate call relationships");
             hints.Add($"Use ProfileHotPaths to see the hottest execution paths through a method");
             if (hidden > 0)
                 hints.Add("The session keeps ALL methods, including hidden ones — investigation tools search everything");

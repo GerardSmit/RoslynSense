@@ -723,7 +723,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
             "pg", "SELECT id FROM plan_widgets", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var summary = DatabaseTool.DbPlanSummary(planId, store, s_fmt);
+        var summary = await DatabaseTool.DbPlan(planId, store, reg, s_fmt);
         Assert.Contains("Total estimated cost", summary);
         Assert.Contains("Operator count", summary);
         Assert.Contains("Format", summary);
@@ -740,7 +740,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
             "pg", "SELECT id FROM plan_widgets ORDER BY id", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var ops = DatabaseTool.DbPlanOperators(planId, store, s_fmt);
+        var ops = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "operators");
         Assert.Contains("PhysicalOp", ops);
         Assert.Contains("Scan", ops);
     }
@@ -755,7 +755,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
             "pg", "SELECT id FROM plan_widgets", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var result = DatabaseTool.DbPlanQuery(planId, "$..['Node Type']", store, s_fmt);
+        var result = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "query", query: "$..['Node Type']");
         Assert.DoesNotContain("No nodes matched", result);
     }
 
@@ -772,7 +772,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
             reg, s_fmt, store, includeExecutionPlan: true);
         var planId = store.List().First().Id;
 
-        var output = await DatabaseTool.DbPlanSuggestIndexes(planId, store, reg, s_fmt);
+        var output = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "suggest_indexes");
         Assert.Contains("Heuristic candidates", output);
         Assert.Contains("plan_widgets", output);
         Assert.Contains("hypopg", output);
@@ -794,7 +794,7 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
             reg, s_fmt, store, includeExecutionPlan: true);
         var planId = store.List().First().Id;
 
-        var output = await DatabaseTool.DbPlanSuggestIndexes(planId, store, reg, s_fmt);
+        var output = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "suggest_indexes");
         Assert.Contains("Heuristic candidates", output);
         Assert.Contains("hypopg validated", output);
     }
@@ -903,7 +903,7 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
             "sql", "SELECT TOP 5 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var summary = DatabaseTool.DbPlanSummary(planId, store, s_fmt);
+        var summary = await DatabaseTool.DbPlan(planId, store, reg, s_fmt);
         Assert.Contains("Total estimated cost", summary);
         Assert.Contains("Operator count", summary);
     }
@@ -917,7 +917,7 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
             "sql", "SELECT TOP 10 * FROM INFORMATION_SCHEMA.TABLES", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var ops = DatabaseTool.DbPlanOperators(planId, store, s_fmt);
+        var ops = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "operators");
         Assert.Contains("PhysicalOp", ops);
     }
 
@@ -930,7 +930,7 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
             "sql", "SELECT TOP 1 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var w = DatabaseTool.DbPlanWarnings(planId, store, s_fmt);
+        var w = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "warnings");
         Assert.Contains("No warnings", w);
     }
 
@@ -943,16 +943,16 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
             "sql", "SELECT TOP 5 name FROM sys.tables", reg, s_fmt, store, includeExecutionPlan: true);
 
         var planId = store.List().First().Id;
-        var result = DatabaseTool.DbPlanQuery(planId, "//sp:RelOp", store, s_fmt);
+        var result = await DatabaseTool.DbPlan(planId, store, reg, s_fmt, view: "query", query: "//sp:RelOp");
         Assert.DoesNotContain("No nodes matched", result);
         Assert.Contains("RelOp", result);
     }
 
     [Fact]
-    public void Mssql_DbPlanSummary_UnknownId_ReturnsNotFound()
+    public async Task Mssql_DbPlanSummary_UnknownId_ReturnsNotFound()
     {
         var store = new ExecutionPlanStore();
-        var output = DatabaseTool.DbPlanSummary("plan-nonexistent", store, s_fmt);
+        var output = await DatabaseTool.DbPlan("plan-nonexistent", store, new DbConnectionRegistry([]), s_fmt);
         Assert.Contains("Plan not found", output);
     }
 }

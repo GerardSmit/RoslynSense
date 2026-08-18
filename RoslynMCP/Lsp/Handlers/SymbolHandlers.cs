@@ -126,6 +126,23 @@ internal static class SymbolHandlers
         }
     }
 
+    /// <summary>
+    /// The outline with every unnamed entry taken out, its children lifted into its place.
+    /// </summary>
+    /// <remarks>
+    /// The protocol requires a name, and the client validates the whole response: one nameless
+    /// entry anywhere in the tree throws "name must not be falsy" and costs the entire outline.
+    /// The producers each have their own way of arriving at an empty name — markup that writes
+    /// <c>ID=""</c>, a resource key that is only a prefix, a declaration that did not parse — so
+    /// the guard sits here, on everything that leaves the server, rather than in each of them.
+    /// </remarks>
+    public static DocumentSymbol[] Named(IEnumerable<DocumentSymbol> symbols) =>
+    [
+        .. symbols.SelectMany(symbol => string.IsNullOrWhiteSpace(symbol.Name)
+            ? Named(symbol.Children)
+            : new[] { symbol with { Children = Named(symbol.Children) } }),
+    ];
+
     private static string? TypeDetail(TypeDeclarationSyntax type) =>
         type.TypeParameterList is { Parameters.Count: > 0 } tp ? $"<{tp.Parameters}>" : null;
 

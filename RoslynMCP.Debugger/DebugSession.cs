@@ -3185,6 +3185,7 @@ public sealed class DebugSession : IDebugSession
             RequestedLocation = requestedLocation,
             ActualLocation = actualLocation,
             BreakpointId = breakpointId,
+            ProcessId = Pid,
         });
 
     private static T? Safe<T>(Func<T> f)

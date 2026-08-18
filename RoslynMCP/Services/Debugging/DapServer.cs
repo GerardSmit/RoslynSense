@@ -171,7 +171,9 @@ internal sealed class DapServer
                     bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
                     _sessionStarted.TrySetResult();
                     await RespondAsync(message, null, ok, ok ? null : result);
-                    if (!ok)
+                    if (ok)
+                        await ProcessEventAsync(arguments, startMethod: "launch");
+                    else
                         await EventAsync("terminated", null);
                     break;
                 }
@@ -189,7 +191,9 @@ internal sealed class DapServer
                     bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
                     _sessionStarted.TrySetResult();
                     await RespondAsync(message, null, ok, ok ? null : result);
-                    if (!ok)
+                    if (ok)
+                        await ProcessEventAsync(arguments, startMethod: "attach");
+                    else
                         await EventAsync("terminated", null);
                     break;
                 }
@@ -722,6 +726,7 @@ internal sealed class DapServer
         DebugNoticeKind.Diagnostic => OutputAsync("console", notice.Message),
         DebugNoticeKind.Module => OutputAsync("console", $"Loaded '{notice.Message}'."),
         DebugNoticeKind.Stopped => ReportUnaskedStopAsync(notice),
+        DebugNoticeKind.Resumed => ReportUnaskedResumeAsync(),
         DebugNoticeKind.Exited => EndSessionAsync(),
         _ => BreakpointChangedAsync(notice),
     };
@@ -753,6 +758,30 @@ internal sealed class DapServer
         }
 
         await ReportStopAsync(notice.Message.Length > 0 ? notice.Message : "breakpoint");
+    }
+
+    /// <summary>
+    /// Announces a resume the adapter did not ask for — the chat continuing a session this
+    /// editor is attached to over the command pipe. Unsolicited stops were already pushed;
+    /// without the matching push here the editor kept showing the old stop until the next one,
+    /// and forever if none came.
+    /// </summary>
+    private async Task ReportUnaskedResumeAsync()
+    {
+        // A resume this adapter issued is narrated by its own command handler.
+        if (Volatile.Read(ref _resuming) > 0)
+            return;
+
+        // Stopped again already: that stop's own notice sits behind this one in the queue (or
+        // its command already reported it), and a late "continued" would overwrite it.
+        if (_backend.CurrentFrame is not null)
+            return;
+
+        await EventAsync("continued", new JsonObject
+        {
+            ["threadId"] = 1,
+            ["allThreadsContinued"] = true,
+        });
     }
 
     /// <summary>The debuggee ended on its own — the site was stopped, or it crashed. Without this
@@ -1065,6 +1094,36 @@ internal sealed class DapServer
             response["message"] = message;
 
         return SendAsync(response);
+    }
+
+    /// <summary>
+    /// The DAP <c>process</c> event: which process this session is now debugging.
+    /// </summary>
+    /// <remarks>
+    /// Part of the protocol, and load-bearing here — the editor registers the app it launched
+    /// from this event, and without it a .NET Framework launch is invisible to everything that
+    /// reads the running-process registry.
+    /// </remarks>
+    private async Task ProcessEventAsync(JsonNode? arguments, string startMethod)
+    {
+        // The launch path has to ask the backend: only it knows the PID of a process the engine
+        // started. Attach was handed one, and reports it even if the backend is slow to record it.
+        int pid = _backend.DebuggeePid
+            ?? arguments?["processId"]?.GetValue<int>()
+            ?? 0;
+        if (pid <= 0)
+            return;
+
+        string? name = arguments?["program"]?.GetValue<string>()
+            ?? arguments?["projectPath"]?.GetValue<string>();
+
+        await EventAsync("process", new JsonObject
+        {
+            ["name"] = name ?? $"pid {pid}",
+            ["systemProcessId"] = pid,
+            ["isLocalProcess"] = true,
+            ["startMethod"] = startMethod,
+        });
     }
 
     private Task EventAsync(string name, JsonNode? body)

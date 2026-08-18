@@ -17,6 +17,16 @@ internal interface IDebugBackend : IDisposable
     /// <summary>Where execution is currently suspended, or <c>null</c> when running.</summary>
     DebuggerService.StoppedFrame? CurrentFrame { get; }
 
+    /// <summary>
+    /// The debuggee's PID once the session has one, or <c>null</c> before that.
+    /// </summary>
+    /// <remarks>
+    /// A launch is the case that needs this: attach was given the PID, but a launched debuggee's
+    /// only exists after the engine starts it, and the DAP client has to be told which process it
+    /// is now debugging.
+    /// </remarks>
+    int? DebuggeePid => null;
+
     Task<string> StartTestSessionAsync(
         string csprojPath,
         string? filter,

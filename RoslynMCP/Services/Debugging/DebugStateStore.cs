@@ -26,7 +26,10 @@ public static class DebugStateStore
         string? FilePath,
         int Line,
         DateTime UpdatedAtUtc,
-        IReadOnlyList<Breakpoint>? Breakpoints = null);
+        IReadOnlyList<Breakpoint>? Breakpoints = null,
+        // Numbers the stops, so a mirror can tell a fresh stop on the same line (a loop
+        // iteration) from the one it already showed. 0 when the engine does not count.
+        long StopSequence = 0);
 
     private static readonly JsonSerializerOptions s_json = new() { WriteIndented = false };
 

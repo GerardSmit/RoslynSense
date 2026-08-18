@@ -19,7 +19,10 @@ public sealed record DebugSessionInfo(
     [property: JsonPropertyName("filePath")] string? FilePath,
     [property: JsonPropertyName("line")] int Line,
     [property: JsonPropertyName("updatedAtUtc")] string UpdatedAtUtc,
-    [property: JsonPropertyName("breakpoints")] DebugBreakpointInfo[] Breakpoints);
+    [property: JsonPropertyName("breakpoints")] DebugBreakpointInfo[] Breakpoints,
+    // Numbers the stops, so a mirror can tell a fresh stop on the same line from the one it
+    // already showed. 0 when the engine does not count.
+    [property: JsonPropertyName("stopSequence")] long StopSequence = 0);
 
 /// <summary>Editor command against an LLM-owned debug session (roslynSense/debugCommand).</summary>
 public sealed record DebugCommandParams(

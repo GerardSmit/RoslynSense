@@ -22,6 +22,11 @@ internal enum DebugNoticeKind
     /// <summary>The debuggee suspended. <see cref="DebugNotice.Message"/> carries the DAP reason.</summary>
     Stopped,
 
+    /// <summary>A resuming command started. Raised by the publishing decorator rather than the
+    /// engine, so an adapter can announce a resume some other client of the shared backend
+    /// issued — its own resumes it narrates itself.</summary>
+    Resumed,
+
     /// <summary>The debuggee ended.</summary>
     Exited,
 }

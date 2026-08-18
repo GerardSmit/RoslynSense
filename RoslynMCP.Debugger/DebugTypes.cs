@@ -93,6 +93,13 @@ public sealed class DebugEvent
     public SourceRange? RequestedLocation { get; set; }
     public SourceRange? ActualLocation { get; set; }
     public string BreakpointId { get; set; } = "";
+
+    /// <summary>
+    /// The debuggee's PID, once there is one. Carried on every event because a worker-hosted
+    /// session runs in another process: this channel is the only way the PID reaches the host,
+    /// and the host needs it to report the process to its own client.
+    /// </summary>
+    public int ProcessId { get; set; }
 }
 
 /// <summary>A breakpoint request, which may bind now or when a matching module loads.</summary>

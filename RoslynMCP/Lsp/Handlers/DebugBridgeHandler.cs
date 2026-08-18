@@ -17,7 +17,8 @@ internal static class DebugBridgeHandler
                 e.OwnerPid, e.Kind, e.Target, e.State, e.Reason, e.Function,
                 e.FilePath, e.Line, e.UpdatedAtUtc.ToString("O"),
                 (e.Breakpoints ?? []).Select(b =>
-                    new DebugBreakpointInfo(b.Id, b.File, b.Line, b.Condition)).ToArray()))
+                    new DebugBreakpointInfo(b.Id, b.File, b.Line, b.Condition)).ToArray(),
+                e.StopSequence))
             .ToArray();
 
     public static async Task<DebugCommandResult> CommandAsync(DebugCommandParams p, CancellationToken ct)

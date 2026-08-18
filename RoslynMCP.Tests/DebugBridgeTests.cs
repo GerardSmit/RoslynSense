@@ -94,6 +94,42 @@ public class DebugBridgeTests
     }
 
     [Fact]
+    public async Task AResumeInFlightPublishesRunningAndRefusesASecond()
+    {
+        var fake = new FakeBackend
+        {
+            Frame = new DebuggerService.StoppedFrame("breakpoint-hit", "Main", @"C:\x\P.cs", 3, 1),
+            ContinueGate = new SemaphoreSlim(0),
+        };
+        var publishing = new PublishingDebugBackend(fake);
+        try
+        {
+            await publishing.StartTestSessionAsync("proj.csproj", null);
+
+            var resume = publishing.ContinueAsync();
+
+            // The editor's mirror polls the state file, so the file must say running before the
+            // stop lands — stopped→stopped on the same line is invisible to it.
+            var entry = DebugStateStore.List().First(e => e.OwnerPid == Environment.ProcessId);
+            Assert.Equal("running", entry.State);
+
+            // The chat and the mirror drive this same backend, and the engine has one stop
+            // signal — a second resume fails fast rather than stealing the first one's release.
+            string refused = await publishing.ContinueAsync();
+            Assert.StartsWith("Error", refused);
+
+            fake.ContinueGate.Release();
+            await resume;
+            entry = DebugStateStore.List().First(e => e.OwnerPid == Environment.ProcessId);
+            Assert.Equal("stopped", entry.State);
+        }
+        finally
+        {
+            publishing.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task CommandPipeServerExecutesAgainstProvidedSession()
     {
         var fake = new FakeBackend
@@ -231,12 +267,18 @@ public class DebugBridgeTests
         /// <summary>Frames the session reports as it is resumed, one per stop.</summary>
         public Queue<DebuggerService.StoppedFrame> StopSequence = new();
 
-        public Task<string> ContinueAsync(CancellationToken cancellationToken = default)
+        /// <summary>When set, ContinueAsync waits on it — lets a test observe the mid-resume
+        /// state before the stop lands.</summary>
+        public SemaphoreSlim? ContinueGate;
+
+        public async Task<string> ContinueAsync(CancellationToken cancellationToken = default)
         {
+            if (ContinueGate is not null)
+                await ContinueGate.WaitAsync(cancellationToken);
             Continues++;
             if (StopSequence.TryDequeue(out var next))
                 Frame = next;
-            return Task.FromResult("continued");
+            return "continued";
         }
 
         public Task<string> StepInAsync(CancellationToken cancellationToken = default) =>

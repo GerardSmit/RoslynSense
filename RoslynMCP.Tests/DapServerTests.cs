@@ -213,6 +213,24 @@ public class DapServerTests
         Assert.Contains("no symbols", body["output"]!.GetValue<string>());
     }
 
+    /// <summary>
+    /// The editor registers a running app from this event; a .NET Framework session that never
+    /// sends one is invisible to the process registry, and so to every chat.
+    /// </summary>
+    [Fact]
+    public async Task TheSessionReportsWhichProcessItDebugs()
+    {
+        var messages = await ConverseUntilAsync(
+            new NoticeBackend(),
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "process"));
+
+        var body = messages.Single(m => m["event"]?.GetValue<string>() == "process")["body"]!;
+
+        Assert.Equal(4242, body["systemProcessId"]!.GetValue<int>());
+        Assert.Equal("attach", body["startMethod"]!.GetValue<string>());
+    }
+
     [Fact]
     public async Task TheDebuggeesOwnOutputIsNotLabelledAsTheAdaptersOwn()
     {
@@ -366,6 +384,44 @@ public class DapServerTests
             m => m.Any(x => x["event"]?.GetValue<string>() == "stopped"));
 
         Assert.Equal(1, messages.Count(m => m["event"]?.GetValue<string>() == "stopped"));
+    }
+
+    [Fact]
+    public async Task AResumeAnotherClientIssuedIsAnnouncedAsContinued()
+    {
+        // The chat can resume a session this editor is attached to (over the command pipe). The
+        // stop it left was already pushed; without the matching continued the editor kept showing
+        // that stale stop until the next one arrived — and forever if none did.
+        var backend = new NoticeBackend { Frame = null };
+        backend.OnAttach = () => backend.Raise(new DebugNotice(DebugNoticeKind.Resumed, ""));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "continued"));
+
+        var continued = messages.Single(m => m["event"]?.GetValue<string>() == "continued")["body"]!;
+        Assert.True(continued["allThreadsContinued"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task AResumeThatAlreadyLandedIsNotAnnounced()
+    {
+        // By the time the pump reads the resume notice the target has stopped again; that stop's
+        // own notice is behind it in the queue, and a late continued would overwrite the stop.
+        var backend = new NoticeBackend
+        {
+            Frame = new DebuggerService.StoppedFrame(
+                "breakpoint", "Cart.Total", @"C:\src\Default.aspx.cs", 17, 1),
+        };
+        backend.OnAttach = () => backend.Raise(new DebugNotice(DebugNoticeKind.Resumed, ""));
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "attach", new JsonObject { ["processId"] = 4242 })],
+            m => m.Any(x => x["command"]?.GetValue<string>() == "attach"));
+
+        Assert.DoesNotContain(messages, m => m["event"]?.GetValue<string>() == "continued");
     }
 
     [Fact]

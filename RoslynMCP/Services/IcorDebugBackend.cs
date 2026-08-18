@@ -43,6 +43,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     }
 
     /// <inheritdoc />
+    public int? DebuggeePid => _debuggeePid == 0 ? null : _debuggeePid;
+
+    private int _debuggeePid;
+
+    /// <inheritdoc />
     public event Action<DebugNotice>? Notice;
 
     /// <inheritdoc />
@@ -693,6 +698,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         {
             await foreach (var e in Engine.Events.ReadAllAsync())
             {
+                // Every event carries it, and the first one to do so is the launch: recorded here
+                // so a worker-hosted session reports the same PID as an in-process one.
+                if (e.ProcessId != 0)
+                    Interlocked.Exchange(ref _debuggeePid, e.ProcessId);
+
                 switch (e.Kind)
                 {
                     case DebugEventKind.Breakpoint:

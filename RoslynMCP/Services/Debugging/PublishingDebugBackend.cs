@@ -31,6 +31,15 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     private string _target = "";
     private bool _started;
 
+    /// <summary>Set while a resuming command is in flight. The chat and the editor's mirror
+    /// adapter drive this same backend, and the engine has a single stop signal — two racing
+    /// resumes can steal each other's release, so the second fails fast instead.</summary>
+    private int _resuming;
+
+    /// <summary>Listeners for the decorator's own notices (<see cref="DebugNoticeKind.Resumed"/>);
+    /// the engine's notices reach listeners directly via the pass-through subscription.</summary>
+    private Action<DebugNotice>? _ownNotice;
+
     public PublishingDebugBackend(IDebugBackend inner)
     {
         _inner = inner;
@@ -40,13 +49,22 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     /// <summary>The wrapped engine — for engine-selection assertions and diagnostics.</summary>
     public IDebugBackend Inner => _inner;
 
-    /// <summary>Passed straight through: notices are the engine's, and nothing here changes them.
-    /// An engine that reports none leaves this silent rather than absent, so a caller does not
-    /// have to know which engine it got.</summary>
+    /// <summary>The engine's notices pass straight through, unchanged; the decorator adds only
+    /// <see cref="DebugNoticeKind.Resumed"/>, which no engine reports. An engine that reports
+    /// nothing leaves this silent rather than absent, so a caller does not have to know which
+    /// engine it got.</summary>
     public event Action<DebugNotice>? Notice
     {
-        add { if (_inner is IDebugNoticeSource source) source.Notice += value; }
-        remove { if (_inner is IDebugNoticeSource source) source.Notice -= value; }
+        add
+        {
+            _ownNotice += value;
+            if (_inner is IDebugNoticeSource source) source.Notice += value;
+        }
+        remove
+        {
+            _ownNotice -= value;
+            if (_inner is IDebugNoticeSource source) source.Notice -= value;
+        }
     }
 
     /// <inheritdoc />
@@ -57,6 +75,9 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public DataBreakpointWatcher DataBreakpoints => _watcher;
 
     public DebuggerService.StoppedFrame? CurrentFrame => _inner.CurrentFrame;
+
+    /// <inheritdoc />
+    public int? DebuggeePid => _inner.DebuggeePid;
 
     public async Task<string> StartTestSessionAsync(
         string csprojPath, string? filter,
@@ -168,9 +189,8 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     /// Continue, when a data breakpoint is armed, is a step-and-compare walk rather than a resume:
     /// a plain continue would run straight past the write we are waiting for.
     /// </summary>
-    private async Task<string> WatchedContinueAsync(CancellationToken cancellationToken)
-    {
-        try
+    private Task<string> WatchedContinueAsync(CancellationToken cancellationToken) =>
+        GuardedResumeAsync(async () =>
         {
             var (outcome, message) = await _watcher.ContinueAsync(
                 async () => !await ShouldResumeThroughAsync(cancellationToken),
@@ -181,12 +201,7 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
                 DataWatchOutcome.Changed => $"Data breakpoint hit — {message}",
                 _ => message,
             };
-        }
-        finally
-        {
-            Publish();
-        }
-    }
+        });
 
     public Task<string> StepInAsync(CancellationToken cancellationToken = default) =>
         ResumeAsync(() => _inner.StepInAsync(cancellationToken), cancellationToken);
@@ -239,7 +254,7 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
 
     public Task<string> RunToLocationAsync(
         string filePath, int line, CancellationToken cancellationToken = default) =>
-        PublishAfter(_inner.RunToLocationAsync(filePath, line, cancellationToken));
+        GuardedResumeAsync(() => _inner.RunToLocationAsync(filePath, line, cancellationToken));
 
     public Task<string> SetNextStatementAsync(
         string filePath, int line, CancellationToken cancellationToken = default) =>
@@ -277,9 +292,8 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     /// ICorDebug's hit skipping is set-once at bind time. Doing it here means both the MCP tools
     /// and the editor's mirror adapter get the same behavior for free.
     /// </remarks>
-    private async Task<string> ResumeAsync(Func<Task<string>> operation, CancellationToken cancellationToken)
-    {
-        try
+    private Task<string> ResumeAsync(Func<Task<string>> operation, CancellationToken cancellationToken) =>
+        GuardedResumeAsync(async () =>
         {
             string result = await operation();
 
@@ -302,9 +316,29 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
             }
 
             return result;
+        });
+
+    /// <summary>
+    /// Wraps every resuming command: refuses a second concurrent resume, announces the
+    /// transition — the state file for the polling mirror, a <see cref="DebugNoticeKind.Resumed"/>
+    /// notice for a DAP host — and publishes the landing state when the command ends. This is
+    /// what lets an attached editor follow a resume some other client issued.
+    /// </summary>
+    private async Task<string> GuardedResumeAsync(Func<Task<string>> operation)
+    {
+        if (Interlocked.CompareExchange(ref _resuming, 1, 0) != 0)
+            return "Error: another client of this debug session is already resuming it; " +
+                   "wait for the target to stop.";
+
+        try
+        {
+            PublishRunning();
+            _ownNotice?.Invoke(new DebugNotice(DebugNoticeKind.Resumed, ""));
+            return await operation();
         }
         finally
         {
+            Volatile.Write(ref _resuming, 0);
             Publish();
         }
     }
@@ -479,7 +513,28 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
             _kind, _target, state,
             frame?.Reason, frame?.Function, frame?.FilePath, frame?.Line ?? 0,
             DateTime.UtcNow,
-            Snapshot()));
+            Snapshot(),
+            StopSequence));
+    }
+
+    /// <summary>
+    /// Publishes the in-between state a resume enters. <see cref="Publish"/> reads the engine's
+    /// frame, which still holds the previous stop until the resume lands — without this the
+    /// mirror sees stopped→stopped and never learns the session moved.
+    /// </summary>
+    private void PublishRunning()
+    {
+        if (!_started)
+            return;
+
+        DebugStateStore.Publish(new DebugStateStore.Entry(
+            Environment.ProcessId,
+            DebugStateStore.PipeNameFor(Environment.ProcessId),
+            _kind, _target, "running",
+            null, null, null, 0,
+            DateTime.UtcNow,
+            Snapshot(),
+            StopSequence));
     }
 
     /// <summary>The mirrored breakpoints, copied under the gate.</summary>

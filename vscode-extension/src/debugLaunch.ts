@@ -341,6 +341,11 @@ export function registerDebugLaunch(
                     return undefined;
                 }
 
+                // Not used by the adapter: it travels on the configuration so that, once the
+                // process reports its pid, the launch can be registered with its address — which
+                // is what makes "Open URL" work for the user's own launches too.
+                config.appUrl = target.url?.split(';')[0] ?? null;
+
                 config.program = config.program ?? target.program;
                 config.args = config.args ?? target.args;
                 config.cwd = config.cwd ?? target.cwd;

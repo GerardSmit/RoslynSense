@@ -985,6 +985,39 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// Which of <paramref name="projectPaths"/> are not served by any live cached workspace yet.
+    /// </summary>
+    /// <remarks>
+    /// Exists so an explicit open can skip its warm-up — including the restore probe and the seed
+    /// load — when an editor session has already loaded everything. The daemon serves the editor
+    /// and MCP clients from one cache, so "open the solution" arriving second is the common case,
+    /// and re-walking a solution that is already being served is what made it look like the whole
+    /// solution loaded twice.
+    /// </remarks>
+    internal static async Task<List<string>> ProjectsNotYetLoadedAsync(
+        IEnumerable<string> projectPaths, CancellationToken cancellationToken = default)
+    {
+        var missing = new List<string>();
+
+        await s_cacheLock.WaitAsync(cancellationToken);
+        try
+        {
+            foreach (var path in projectPaths)
+            {
+                string key = Path.GetFullPath(path);
+                if (!(s_projectToCacheKey.TryGetValue(key, out var cks) && cks.Any(s_cache.ContainsKey)))
+                    missing.Add(path);
+            }
+        }
+        finally
+        {
+            s_cacheLock.Release();
+        }
+
+        return missing;
+    }
+
+    /// <summary>
     /// Loads several projects of one solution in a single Roslyn batch instead of one call each.
     /// </summary>
     /// <remarks>
@@ -1419,14 +1452,14 @@ internal static class WorkspaceService
         // held across the bookkeeping at the end of a project load, so taking it here stalled
         // those requests behind whatever was loading. The dictionary is concurrent.
         //
-        // Synthetic entries are skipped. Opening a decompiled file caches an ad-hoc workspace
+        // Synthetic entries are skipped. Opening a dependency's source caches an ad-hoc workspace
         // keyed by its manifest, and it is by definition the most recently used one — so the
         // Solution Explorer, which asks this for the solution to list, emptied itself every
-        // time someone looked at decompiled source.
+        // time someone looked at a framework type.
         Solution? snapshot = null;
         foreach (var (key, e) in s_cache)
         {
-            if (DecompiledSourceService.IsDecompiledPath(key))
+            if (ExternalSource.ExternalSourceCache.IsExternalSourcePath(key))
                 continue;
             if (entry is not null && e.LastAccessedUtc <= entry.LastAccessedUtc)
                 continue;

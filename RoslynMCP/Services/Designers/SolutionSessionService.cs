@@ -71,6 +71,15 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
     {
         lock (_gate)
         {
+            // Reopening what is already open must not restart the watchers: the editor arms them
+            // at initialize, and an MCP open_solution arriving afterwards would otherwise tear
+            // them down mid-debounce and lose whatever regeneration was pending.
+            if (string.Equals(SolutionPath, solutionPath, StringComparison.OrdinalIgnoreCase)
+                && IsWatching == watch)
+            {
+                return;
+            }
+
             StopWatchersLocked();
 
             SolutionPath = solutionPath;

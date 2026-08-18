@@ -47,9 +47,16 @@ public static class SolutionSessionTool
             session.Open(resolved, directories, watch);
 
             var classifications = projects.Select(ProjectClassifier.Classify).ToList();
-            await WarmWorkspaceAsync(projects, cancellationToken);
 
-            return Format(resolved, classifications, session, watch, fmt);
+            // The editor and MCP clients share one daemon, so by the time a chat calls
+            // open_solution the editor has usually loaded some or all of it. Warming only the
+            // projects that are actually missing is what keeps this call from reloading a
+            // solution that is already being served.
+            var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects, cancellationToken);
+            if (missing.Count > 0)
+                await WarmWorkspaceAsync(missing, cancellationToken);
+
+            return Format(resolved, classifications, session, watch, fmt, alreadyLoaded: missing.Count == 0);
         }
         catch (OperationCanceledException)
         {
@@ -83,7 +90,7 @@ public static class SolutionSessionTool
             return "No solution is open. Call OpenSolution first.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# {Path.GetFileName(solutionPath)}");
+        sb.AppendLine($"**{Path.GetFileName(solutionPath)}**");
         sb.AppendLine();
         sb.AppendLine($"- **Path**: {solutionPath}");
         sb.AppendLine($"- **Watching designers**: {(session.IsWatching ? "yes" : "no")}");
@@ -171,11 +178,20 @@ public static class SolutionSessionTool
         List<ProjectClassification> projects,
         SolutionSessionService session,
         bool watch,
-        IOutputFormatter fmt)
+        IOutputFormatter fmt,
+        bool alreadyLoaded)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Opened {Path.GetFileName(solutionPath)}");
+        sb.AppendLine(alreadyLoaded
+            ? $"**{Path.GetFileName(solutionPath)} is already open**"
+            : $"**Opened {Path.GetFileName(solutionPath)}**");
         sb.AppendLine();
+
+        if (alreadyLoaded)
+        {
+            sb.AppendLine("Every project is already loaded in the shared workspace; nothing was reloaded.");
+            sb.AppendLine();
+        }
 
         sb.AppendLine("| Project | Framework | Kind | Builds with |");
         sb.AppendLine("|---------|-----------|------|-------------|");

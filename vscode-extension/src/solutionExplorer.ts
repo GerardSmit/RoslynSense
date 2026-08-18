@@ -1646,24 +1646,56 @@ function solutionItemFolderOf(id: string): string | undefined {
     return separator < 0 ? undefined : rest.slice(0, separator);
 }
 
-/** What a row can be drawn with: a codicon, or one of the shipped language badges. */
-type NodeIcon = vscode.ThemeIcon | vscode.Uri;
+/** What a row can be drawn with: a codicon, a shipped badge, or a light/dark icon pair. */
+type NodeIcon = vscode.ThemeIcon | vscode.Uri | { light: vscode.Uri; dark: vscode.Uri };
 
 /**
- * The badge a project is drawn with, by the extension of its project file.
+ * One of the shipped structural icons, per theme.
+ *
+ * These are drawn rather than themed the way the codicons are: a codicon is a single glyph in a
+ * single colour, and the structural rows want what ReSharper and Rider give them — a neutral
+ * outline carrying one small accent, and composites like a folder with a package cube in the
+ * corner. Two variants because "neutral" is a different grey on a light background.
+ */
+function treeIcon(name: string, extensionUri: vscode.Uri): NodeIcon {
+    return {
+        light: vscode.Uri.joinPath(extensionUri, 'media', 'tree', 'light', `${name}.svg`),
+        dark: vscode.Uri.joinPath(extensionUri, 'media', 'tree', 'dark', `${name}.svg`),
+    };
+}
+
+/**
+ * Folders that mean something beyond their name, recognised the way Visual Studio recognises
+ * them: by the name itself. `Properties` holds the app designer files; `wwwroot` is the web
+ * root. A directory that merely shares the name gets the badge too, which is the trade Visual
+ * Studio makes as well.
+ */
+function folderIconName(label: string): string {
+    switch (label.toLowerCase()) {
+        case 'properties':
+        case 'my project':
+            return 'folder-properties';
+        case 'wwwroot':
+            return 'folder-www';
+        default:
+            return 'folder';
+    }
+}
+
+/**
+ * The icon a project is drawn with, by the extension of its project file.
  *
  * Codicons have one project glyph and no notion of language, so a C# and a Visual Basic project
- * used to be the same grey box — the one distinction Visual Studio, Rider and ReSharper all draw
- * first. These are shipped as SVGs for that reason, and are coloured rather than themed, since a
- * language badge means the same under a light theme as under a dark one.
+ * would be the same grey box — the one distinction Visual Studio, Rider and ReSharper all draw
+ * first. Each has a `-dim` variant for when the project is unloaded.
  *
- * Projects only. A solid badge on every `.cs` as well makes a project row indistinguishable from
- * the files inside it, and drowns out the one row in the branch that the badge is there to mark.
+ * Projects only. A language mark on every `.cs` as well makes a project row indistinguishable
+ * from the files inside it, and drowns out the one row in the branch that the mark is there for.
  */
-const PROJECT_BADGES: Record<string, string> = {
-    '.csproj': 'csharp',
-    '.vbproj': 'vb',
-    '.fsproj': 'fsharp',
+const PROJECT_ICONS: Record<string, string> = {
+    '.csproj': 'project-csharp',
+    '.vbproj': 'project-vb',
+    '.fsproj': 'project-fsharp',
 };
 
 /**
@@ -1738,10 +1770,9 @@ function badgeUri(name: string, extensionUri: vscode.Uri): vscode.Uri {
     return vscode.Uri.joinPath(extensionUri, 'media', `lang-${name}.svg`);
 }
 
-/** The badge for a project, by the language it is written in. */
+/** The icon for a project, by the language it is written in. */
 function languageIcon(resourceUri: string | null, extensionUri: vscode.Uri): NodeIcon {
-    const badge = PROJECT_BADGES[extensionOf(resourceUri)];
-    return badge ? badgeUri(badge, extensionUri) : tinted('project', 'charts.blue');
+    return treeIcon(PROJECT_ICONS[extensionOf(resourceUri)] ?? 'project', extensionUri);
 }
 
 /**
@@ -1774,8 +1805,9 @@ function fileIcon(
 /**
  * A codicon with a tint, the way Rider and Visual Studio colour their tree.
  *
- * Blue, green and purple only. `charts.orange` and `charts.yellow` resolve to #d18616 and
- * #cca700, which at 16px on a dark background read as brown rather than as a colour anyone chose.
+ * From the charts palette, blue, green and purple only. `charts.orange` and `charts.yellow`
+ * resolve to #d18616 and #cca700, which at 16px on a dark background read as brown rather than
+ * as a colour anyone chose.
  */
 function tinted(id: string, color: string): vscode.ThemeIcon {
     return new vscode.ThemeIcon(id, new vscode.ThemeColor(color));
@@ -1788,13 +1820,19 @@ function tinted(id: string, color: string): vscode.ThemeIcon {
  * reads as one undifferentiated list. A project carries the language badge; the files inside it
  * carry a glyph tinted in the same family, so the project is still the row that stands out.
  *
- * Every expandable row must end up with an icon, and that is why folders are a codicon rather
- * than `ThemeIcon.Folder`. Most file icon themes — Seti, the default — ship file icons and no
- * folder icons, so `ThemeIcon.Folder` resolves to nothing under them. VS Code reacts to an
- * expandable row without an icon by collapsing the twistie column on its *leaf* siblings, to line
- * their icons up with the arrows; a row that does have one keeps the column. Mixing the two,
- * which is what happened while folders came from the icon theme, indents the icon-bearing rows a
- * whole extra level and lines up nothing with anything.
+ * Every expandable row must end up with an icon, and that is why folders are shipped SVGs and
+ * never `ThemeIcon('folder')`. VS Code special-cases the *id* `folder` (and `file`) on any row
+ * that has a resourceUri: `ThemeIcon.isFolder` compares the id alone, colour and all, and hands
+ * the row to the user's file icon theme. Most file icon themes — Seti, the default — ship file
+ * icons and no folder icons, so the row renders with no icon at all. VS Code reacts to an
+ * expandable row without an icon by collapsing the twistie column on its *leaf* siblings, to
+ * line their icons up with the arrows; a row that does have one keeps the column. Mixing the two
+ * indents the icon-bearing rows a whole extra level and lines up nothing with anything.
+ *
+ * Colour is deliberately sparse, the way ReSharper draws the same tree: a neutral outline with
+ * at most one accent per icon. Blue is the dependency family end to end, purple is the solution's
+ * mark and generated code, grey is what is dimmed or merely transitive. Language badges and file
+ * glyphs carry their own colour; the structure around them stays quiet so they can.
  */
 function iconFor(
     node: SolutionTreeNode,
@@ -1805,57 +1843,64 @@ function iconFor(
     // value says which, and an unloaded one is drawn greyed the way its label already is.
     switch (node.kind === 'project' ? node.contextValue : node.kind) {
         case 'solution':
-            return tinted('versions', 'charts.purple');
+            return treeIcon('solution', extensionUri);
         // A solution folder is not a directory — it exists only in the .sln — so it is drawn
-        // apart from the real folders it sits beside.
+        // apart from the real folders it sits beside: the folder shape, carrying the solution's
+        // purple mark.
         case 'solutionFolder':
-            return tinted('folder-library', 'charts.blue');
+            return treeIcon('solution-folder', extensionUri);
         case 'folder':
-            return new vscode.ThemeIcon('folder');
+            return treeIcon(folderIconName(node.label), extensionUri);
         case 'project':
         case 'projectRunnable':
         case 'projectRef':
             return languageIcon(node.resourceUri, extensionUri);
         case 'projectUnloaded':
             // Nothing about an unloaded project is live, and a full-colour icon says otherwise.
-            return tinted('project', 'descriptionForeground');
+            return treeIcon(
+                `${PROJECT_ICONS[extensionOf(node.resourceUri)] ?? 'project'}-dim`,
+                extensionUri
+            );
+        // A graph of nodes, the way ReSharper and Rider draw it — Dependencies is the
+        // relationships between things, not a list of references.
         case 'dependencies':
         case 'dependenciesNetFx':
-            return tinted('references', 'charts.blue');
+            return treeIcon('dependencies', extensionUri);
         case 'imports':
         case 'import':
-            return new vscode.ThemeIcon('file-symlink-file');
+            return tinted('file-symlink-file', 'charts.blue');
         case 'framework':
-            return tinted('layers', 'charts.green');
+            return tinted('layers', 'charts.blue');
         case 'packages':
+            return treeIcon('packages-folder', extensionUri);
         case 'package':
-            return tinted('package', 'charts.blue');
+            return treeIcon('package', extensionUri);
         case 'transitive':
         case 'transitivePackage':
-            // Distinct from a direct reference on purpose: nothing in the project file names
-            // these, so they are not something to right-click and uninstall.
-            return tinted('git-merge', 'descriptionForeground');
+            // The same cube, faint and dashed: these are packages too, just not ones the project
+            // file names — so not something to right-click and uninstall.
+            return treeIcon('package-transitive', extensionUri);
         case 'projects':
-            return tinted('type-hierarchy', 'charts.blue');
+            return treeIcon('projects-folder', extensionUri);
         case 'assemblies':
         case 'assembly':
-            return tinted('library', 'charts.green');
+            return tinted('library', 'charts.blue');
         case 'analyzers':
         case 'analyzer':
-            return tinted('circuit-board', 'charts.purple');
+            return tinted('circuit-board', 'charts.blue');
         case 'generator':
             return tinted('wand', 'charts.purple');
         // Generated output is a file the user never wrote, and telling it apart from one they
         // did is the whole point of showing it separately.
         case 'generatedFile':
-            return tinted('file-code', 'charts.purple');
+            return treeIcon('generated-code', extensionUri);
         case 'file':
         case 'solutionItem':
             return fileIcon(node.resourceUri, extensionUri, fileIconsFromTheme);
         default:
             // An unknown kind is still a row, and a row still needs its slot filled.
             return node.hasChildren
-                ? new vscode.ThemeIcon('folder')
+                ? treeIcon('folder', extensionUri)
                 : node.resourceUri
                   ? fileIcon(node.resourceUri, extensionUri, fileIconsFromTheme)
                   : tinted('circle-outline', 'descriptionForeground');

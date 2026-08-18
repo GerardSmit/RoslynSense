@@ -85,7 +85,7 @@ public class AspxSourceMappingServiceTests
     {
         var outline = await AspxOutline.FormatAsync(FixturePaths.DefaultAspxFile, default);
 
-        Assert.Contains("# ASPX File:", outline);
+        Assert.Contains("**ASPX File:", outline);
         Assert.Contains("Directives", outline);
         Assert.Contains("Server Controls", outline);
     }
@@ -202,7 +202,7 @@ public class AspxSourceMappingServiceTests
     {
         var outline = await AspxOutline.FormatAsync(FixturePaths.SiteMasterFile, default);
 
-        Assert.Contains("# ASPX File:", outline);
+        Assert.Contains("**ASPX File:", outline);
         Assert.Contains("Directives", outline);
     }
 
@@ -311,6 +311,60 @@ public class AspxSourceMappingServiceTests
         var namespaces = AspxSourceMappingService.LoadWebConfigNamespaces(@"C:\nonexistent\directory");
 
         Assert.True(namespaces.IsDefaultOrEmpty);
+    }
+
+    [Fact]
+    public void LoadWebConfigImports_WhenWebConfigHasPagesNamespacesThenReturnsThem()
+    {
+        var imports = AspxSourceMappingService.LoadWebConfigImports(FixturePaths.AspxProjectDir);
+
+        Assert.Contains("AspxProject", imports);
+        Assert.Contains("System.Collections.Generic", imports);
+    }
+
+    [Fact]
+    public void LoadWebConfigImports_WhenNoWebConfigThenReturnsEmpty()
+    {
+        var imports = AspxSourceMappingService.LoadWebConfigImports(FixturePaths.SampleProjectDir);
+
+        Assert.True(imports.IsDefaultOrEmpty);
+    }
+
+    [Fact]
+    public void GetPageNamespaces_HonorsRemoveAndClear()
+    {
+        var imports = WebFormsCore.Nodes.RootNode.GetPageNamespaces("""
+            <configuration>
+              <system.web>
+                <pages>
+                  <namespaces>
+                    <add namespace="First" />
+                    <clear />
+                    <add namespace="Kept" />
+                    <add namespace="Dropped" />
+                    <remove namespace="Dropped" />
+                  </namespaces>
+                </pages>
+              </system.web>
+            </configuration>
+            """);
+
+        Assert.Equal(["Kept"], imports.ToArray());
+    }
+
+    [Fact]
+    public void Parse_WithImports_AddsThemToTheParseTree()
+    {
+        var text = File.ReadAllText(FixturePaths.DefaultAspxFile);
+        var compilation = CreateMinimalCompilation();
+
+        var result = AspxSourceMappingService.Parse(
+            FixturePaths.DefaultAspxFile, text, compilation,
+            rootDirectory: FixturePaths.AspxProjectDir,
+            imports: ["Fixture.Helpers"]);
+
+        Assert.NotNull(result.ParseTree);
+        Assert.Contains("Fixture.Helpers", result.ParseTree!.Namespaces);
     }
 
     [Fact]

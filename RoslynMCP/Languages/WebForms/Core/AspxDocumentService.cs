@@ -64,7 +64,10 @@ internal static class AspxDocumentService
     private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
         new(StringComparer.OrdinalIgnoreCase);
 
-    private sealed record WebConfigEntry(DateTime WriteTimeUtc, ImmutableArray<KeyValuePair<string, string>> Namespaces);
+    private sealed record WebConfigEntry(
+        DateTime WriteTimeUtc,
+        ImmutableArray<KeyValuePair<string, string>> Namespaces,
+        ImmutableArray<string> Imports);
 
     private static readonly ConcurrentDictionary<string, WebConfigEntry> s_webConfig =
         new(StringComparer.OrdinalIgnoreCase);
@@ -114,13 +117,14 @@ internal static class AspxDocumentService
             return null;
 
         string? projectDir = Path.GetDirectoryName(projectPath);
-        var namespaces = projectDir is null ? default : WebConfigNamespaces(projectDir);
+        var (namespaces, imports) = projectDir is null ? default : WebConfigEntries(projectDir);
 
         string text = sourceText.ToString();
         var parse = AspxSourceMappingService.Parse(
             path, text, compilation,
             namespaces: namespaces.IsDefaultOrEmpty ? null : namespaces,
-            rootDirectory: projectDir);
+            rootDirectory: projectDir,
+            imports: imports);
 
         var document = new AspxDocument(
             path, text, sourceText, project, compilation, parse);
@@ -213,10 +217,12 @@ internal static class AspxDocumentService
     }
 
     /// <summary>
-    /// web.config tag-prefix registrations, re-read only when the file's timestamp moves. Every
-    /// keystroke in a markup file goes through here, and the parse needs them to bind a prefix.
+    /// web.config tag-prefix registrations and <c>&lt;pages&gt;&lt;namespaces&gt;</c> imports,
+    /// re-read only when the file's timestamp moves. Every keystroke in a markup file goes
+    /// through here, and the parse needs them to bind a prefix and an inline name.
     /// </summary>
-    private static ImmutableArray<KeyValuePair<string, string>> WebConfigNamespaces(string projectDir)
+    private static (ImmutableArray<KeyValuePair<string, string>> Namespaces, ImmutableArray<string> Imports)
+        WebConfigEntries(string projectDir)
     {
         DateTime writeTime = default;
         foreach (string name in new[] { "web.config", "Web.config" })
@@ -230,11 +236,12 @@ internal static class AspxDocumentService
         }
 
         if (s_webConfig.TryGetValue(projectDir, out var entry) && entry.WriteTimeUtc == writeTime)
-            return entry.Namespaces;
+            return (entry.Namespaces, entry.Imports);
 
         var namespaces = AspxSourceMappingService.LoadWebConfigNamespaces(projectDir);
-        s_webConfig[projectDir] = new WebConfigEntry(writeTime, namespaces);
-        return namespaces;
+        var imports = AspxSourceMappingService.LoadWebConfigImports(projectDir);
+        s_webConfig[projectDir] = new WebConfigEntry(writeTime, namespaces, imports);
+        return (namespaces, imports);
     }
 
     /// <summary>

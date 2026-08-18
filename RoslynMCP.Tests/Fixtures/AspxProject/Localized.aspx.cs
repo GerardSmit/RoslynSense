@@ -19,5 +19,12 @@ namespace AspxProject
         /// what sits near the call.</summary>
         protected string FromAnUnknownFile(string resourceFile) =>
             Localization.GetString("Heading", resourceFile);
+
+        /// <summary>A wrapper this page declares for itself, of the kind a codebase grows one of
+        /// per module. No configured type name reaches it, which is what a lookup with no
+        /// containingType is for.</summary>
+        protected string GetString(string key) => Localization.GetString(key, this);
+
+        protected string FromTheWrapper() => GetString("Greeting");
     }
 }

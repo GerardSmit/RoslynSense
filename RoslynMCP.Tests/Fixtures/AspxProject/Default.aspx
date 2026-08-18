@@ -12,6 +12,9 @@
             <%= DateTime.Now.ToString() %>
         </div>
         <div>
+            <%= DotNetNuke.Services.Localization.Localization.GetString("Greeting", this) %>
+        </div>
+        <div>
             <%: HttpUtility.HtmlEncode("test") %>
         </div>
         <% if (IsPostBack) { %>

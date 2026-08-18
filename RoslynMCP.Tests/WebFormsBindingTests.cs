@@ -153,6 +153,61 @@ public class WebFormsBindingTests
         Assert.Equal("SamplePage", symbol?.ContainingType.Name);
     }
 
+    [Fact]
+    public async Task WebConfigPagesNamespacesReachInlineCode()
+    {
+        // `Formatting` is qualified nowhere: no @Import, no using in the code-behind. The only
+        // thing making the bare name visible is web.config's <pages><namespaces> entry, the way
+        // the runtime would make it visible to every page of the site.
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Label ID="lblPrice" runat="server" Text='<%# Forma|tting.Money(42) %>' />
+            """,
+            """
+            namespace Fixture
+            {
+                public partial class SamplePage : System.Web.UI.Page
+                {
+                }
+            }
+
+            namespace Fixture.Helpers
+            {
+                public static class Formatting
+                {
+                    public static string Money(int value) => value.ToString();
+                }
+            }
+            """,
+            files:
+            [
+                ("web.config", """
+                    <configuration>
+                      <system.web>
+                        <pages>
+                          <namespaces>
+                            <add namespace="Fixture.Helpers" />
+                          </namespaces>
+                        </pages>
+                      </system.web>
+                    </configuration>
+                    """),
+            ]);
+
+        var projection = AspxProjectionService.Get(scenario.Document);
+        Assert.NotNull(projection);
+
+        int? projected = projection!.ToProjected(scenario.Caret);
+        Assert.NotNull(projected);
+
+        var symbol = await SymbolFinder.FindSymbolAtPositionAsync(
+            projection.Document, projected!.Value, default);
+
+        Assert.Equal("Formatting", symbol?.Name);
+        Assert.Equal("Helpers", symbol?.ContainingNamespace.Name);
+    }
+
     // ---- Register directive ----------------------------------------------------------------
 
     [Fact]
@@ -239,11 +294,18 @@ public class WebFormsBindingTests
     private const string ItemCodeBehind = """
         namespace Fixture
         {
+            public class Client
+            {
+                public string Name { get; set; } = "";
+            }
+
             public class Order
             {
                 public string Customer { get; set; } = "";
                 public decimal Amount { get; set; }
                 public int Id;
+
+                public Client Buyer { get; set; } = new Client();
 
                 private string Secret { get; set; } = "";
             }
@@ -315,6 +377,241 @@ public class WebFormsBindingTests
         Assert.Empty((await scenario.CompleteAsync()).Items);
     }
 
+    // ---- F12 on a binding path ---------------------------------------------------------------
+
+    private const string TypedRepeater = """
+        <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+        <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+            <ItemTemplate>
+                <asp:Label ID="lblCustomer" runat="server" Text='<%# Eval("{0}") %>' />
+            </ItemTemplate>
+        </asp:Repeater>
+        """;
+
+    [Fact]
+    public async Task DefinitionOnABindingPathReachesTheProperty()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(TypedRepeater, "Cust|omer"), ItemCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        // The projection binds this literal to System.String, which is never what the caret meant.
+        Assert.NotNull(member);
+        Assert.Equal("Customer", member!.Name);
+        Assert.Equal("Order", member.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task DefinitionOnANestedSegmentReachesThePropertyOfTheTypeBeforeIt()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(TypedRepeater, "Buyer.Na|me"), ItemCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        // Resolved through Buyer, so the answer is Client.Name and not the item's own.
+        Assert.NotNull(member);
+        Assert.Equal("Name", member!.Name);
+        Assert.Equal("Client", member.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task DefinitionOnTheFirstHalfOfAPathReachesThatHalf()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(TypedRepeater, "Buy|er.Name"), ItemCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        Assert.NotNull(member);
+        Assert.Equal("Buyer", member!.Name);
+    }
+
+    [Fact]
+    public async Task ASegmentNoMemberDeclaresResolvesToNothing()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(TypedRepeater, "Custo|mner"), ItemCodeBehind);
+
+        Assert.Null(await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default));
+    }
+
+    // ---- Indexed paths -------------------------------------------------------------------------
+
+    private const string IndexedCodeBehind = """
+        using System.Collections.Generic;
+
+        namespace Fixture
+        {
+            public class Client
+            {
+                public string Name { get; set; } = "";
+            }
+
+            public class Order
+            {
+                public string this[string key] => "";
+
+                public List<Client> Lines { get; set; } = new List<Client>();
+            }
+
+            public partial class SamplePage : System.Web.UI.Page
+            {
+            }
+        }
+        """;
+
+    [Fact]
+    public async Task AnIndexedSegmentResolvesToTheIndexer()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(TypedRepeater, "It|em['index']"), IndexedCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        // `Item` is the name C# gives an indexer, and DataBinder's `Item['index']` is a call to
+        // exactly that member.
+        Assert.NotNull(member);
+        Assert.True(Assert.IsAssignableFrom<IPropertySymbol>(member).IsIndexer);
+        Assert.Equal("Order", member!.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task APathContinuingThroughAnIndexerResolvesAgainstTheIndexedType()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(TypedRepeater, "Lines[0].Na|me"), IndexedCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        // `Lines[0]` is a Client, so the segment after it is Client's.
+        Assert.NotNull(member);
+        Assert.Equal("Name", member!.Name);
+        Assert.Equal("Client", member.ContainingType.Name);
+    }
+
+    [Fact]
+    public void ADotInsideBracketsDoesNotSplitTheSegment()
+    {
+        const string text = """<%# Eval("Item['a.b'].Name") %>""";
+
+        var argument = Assert.Single(DataBindingService.AllArguments(text));
+        var segments = DataBindingService.Segments(text, argument, itemType: null);
+
+        Assert.Equal(["Item", "Name"], segments.Select(s => s.Name));
+    }
+
+    // ---- The item type, when nothing declares one ---------------------------------------------
+
+    private const string DataSourceCodeBehind = """
+        using System.Collections.Generic;
+
+        namespace Fixture
+        {
+            public class Client
+            {
+                public string Name { get; set; } = "";
+            }
+
+            public class Order
+            {
+                public string Customer { get; set; } = "";
+                public Client Buyer { get; set; } = new Client();
+            }
+
+            public partial class SamplePage : System.Web.UI.Page
+            {
+                private List<Order> GetOrders() => new List<Order>();
+
+                protected void Bind()
+                {
+                    rptOrders.DataSource = GetOrders();
+                }
+            }
+        }
+        """;
+
+    private const string UntypedRepeater = """
+        <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+        <asp:Repeater ID="rptOrders" runat="server">
+            <ItemTemplate>
+                <asp:Label ID="lblCustomer" runat="server" Text='<%# Eval("{0}") %>' />
+            </ItemTemplate>
+        </asp:Repeater>
+        """;
+
+    [Fact]
+    public async Task TheItemTypeIsInferredFromWhatTheCodeBehindAssignsToDataSource()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(UntypedRepeater, "Cust|omer"), DataSourceCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        // Nothing on the page says what it binds. `List<Order>` from the code-behind does.
+        Assert.NotNull(member);
+        Assert.Equal("Customer", member!.Name);
+        Assert.Equal("Order", member.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task AnInferredItemTypeAlsoOffersCompletions()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(UntypedRepeater, "|"), DataSourceCodeBehind);
+
+        var labels = (await scenario.CompleteAsync()).Items.Select(i => i.Label).ToList();
+
+        Assert.Contains("Customer", labels);
+        Assert.Contains("Buyer", labels);
+    }
+
+    [Fact]
+    public async Task TwoDataSourcesOfDifferentTypesInferNothing()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(UntypedRepeater, "Cust|omer"),
+            DataSourceCodeBehind.Replace(
+                "rptOrders.DataSource = GetOrders();",
+                """
+                rptOrders.DataSource = GetOrders();
+                        rptOrders.DataSource = new List<Client>();
+                """));
+
+        // Two answers is no answer: colouring the page's fields against whichever assignment was
+        // found first would be wrong half the time, and silently.
+        Assert.Null(await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default));
+    }
+
+    // ---- What the colouring pass sees ----------------------------------------------------------
+
+    [Fact]
+    public void EveryBindingLiteralInTheFileIsFound()
+    {
+        string text = string.Join(
+            "\n",
+            """<asp:Label runat="server" Text='<%# Eval("Customer") %>' />""",
+            """<%# Bind("Buyer.Name") %>""",
+            """<asp:Label runat="server" Text="<%# Eval('Amount') %>" />""",
+            """<asp:Label runat="server" Text="plain" ToolTip='not a binding' />""");
+
+        var found = DataBindingService.AllArguments(text)
+            .Select(span => text.Substring(span.Start, span.Length))
+            .ToList();
+
+        // Both quote styles, and nothing that merely looks like a string.
+        Assert.Equal(["Customer", "Buyer.Name", "Amount"], found);
+    }
+
     /// <summary>
     /// An in-memory WebForms page written to a directory of its own, so that the files a page
     /// points at — a master page, an <c>.ascx</c> — resolve the way they do on disk.
@@ -358,7 +655,8 @@ public class WebFormsBindingTests
             var compilation = project.GetCompilationAsync().GetAwaiter().GetResult()!;
 
             var parse = AspxSourceMappingService.Parse(
-                markupPath, text, compilation, rootDirectory: directory);
+                markupPath, text, compilation, rootDirectory: directory,
+                imports: AspxSourceMappingService.LoadWebConfigImports(directory));
 
             return new Scenario
             {

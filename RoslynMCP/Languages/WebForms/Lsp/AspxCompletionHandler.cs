@@ -68,7 +68,7 @@ internal static class AspxCompletionHandler
     {
         // `Eval("…")` names a field of the bound item, not a C# symbol, so Roslyn has nothing to
         // say about it and the answer has to come from the container's item type instead.
-        if (DataBoundFields(document, offset) is { } fields)
+        if (await DataBoundFieldsAsync(document, offset, ct) is { } fields)
             return fields;
 
         if (AspxProjectionService.Get(document) is not { } projection)
@@ -557,21 +557,42 @@ internal static class AspxCompletionHandler
     /// statically known: the alternative is guessing from names seen elsewhere in the page, and a
     /// wrong field here fails at runtime rather than at build.
     /// </summary>
-    private static CompletionList? DataBoundFields(AspxDocument document, int offset)
+    private static async Task<CompletionList?> DataBoundFieldsAsync(
+        AspxDocument document, int offset, CancellationToken ct)
     {
-        if (BindingArgument(document.Text, offset) is not { } span)
+        if (DataBindingService.ArgumentAt(document.Text, offset) is not { } span)
             return null;
 
-        if (ContainerItemType(document, offset) is not { } itemType)
+        // The path's own dots are walked too, so `Eval("Buyer.` offers the members of Buyer
+        // rather than the members of the item all over again.
+        var itemType = await DataBindingService.ItemTypeAsync(document, offset, ct);
+        var segments = DataBindingService.Segments(document.Text, span, itemType);
+
+        if (DataBindingService.SegmentAt(segments, offset) is not { } segment)
             return Empty;
 
-        var range = AspxLanguageHandler.ToRange(document, span);
+        int index = segments.IndexOf(segment);
 
-        var items = DataFields(itemType)
+        // What the segment before it resolved to, or the item itself at the head of the path. A
+        // segment after one that resolved to nothing has no scope to offer, which is not the same
+        // as an empty one.
+        var scope = index == 0
+            ? itemType
+            : segments[index - 1].Symbol is { } previous
+                ? DataBindingService.MemberType(previous)
+                : null;
+
+        if (scope is null)
+            return Empty;
+
+        var range = AspxLanguageHandler.ToRange(document, segment.Span);
+
+        var items = DataBindingService.Fields(scope)
             .Select(member => new CompletionItem(
                 member.Name,
                 member is IPropertySymbol ? LspCompletionItemKind.Property : LspCompletionItemKind.Field,
-                MemberType(member).ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+                DataBindingService.MemberType(member)?
+                    .ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat) ?? string.Empty,
                 "0" + member.Name,
                 member.Name,
                 new TextEdit(range, member.Name)))
@@ -580,126 +601,6 @@ internal static class AspxCompletionHandler
         return items.Length == 0 ? Empty : new CompletionList(false, items);
     }
 
-    /// <summary>The span of the string literal the caret is in, when that literal is the argument
-    /// of a data-binding call.</summary>
-    private static TextSpan? BindingArgument(string text, int offset)
-    {
-        int quote = -1;
-        for (int i = Math.Min(offset, text.Length) - 1; i >= 0; i--)
-        {
-            if (text[i] is '\n' or '\r')
-                return null;
-            if (text[i] is '"' or '\'')
-            {
-                quote = i;
-                break;
-            }
-        }
-
-        if (quote < 0)
-            return null;
-
-        int j = quote - 1;
-        while (j >= 0 && char.IsWhiteSpace(text[j]))
-            j--;
-
-        if (j < 0 || text[j] != '(')
-            return null;
-
-        j--;
-        while (j >= 0 && char.IsWhiteSpace(text[j]))
-            j--;
-
-        int nameEnd = j + 1;
-        while (j >= 0 && (char.IsLetterOrDigit(text[j]) || text[j] == '_'))
-            j--;
-
-        if (text[(j + 1)..nameEnd] is not ("Eval" or "Bind" or "XPath"))
-            return null;
-
-        int close = text.IndexOf(text[quote], quote + 1);
-        int end = close < 0 || close < offset ? offset : close;
-        return TextSpan.FromBounds(quote + 1, Math.Max(quote + 1, end));
-    }
-
-    /// <summary>
-    /// The item type bound to the innermost container around the caret, from an
-    /// <c>ItemType</c> attribute. <c>null</c> when nothing declares one, which is the common case
-    /// on an untyped <c>DataSource</c>.
-    /// </summary>
-    private static INamedTypeSymbol? ContainerItemType(AspxDocument document, int offset)
-    {
-        if (document.Tree is not { } root)
-            return null;
-
-        ElementNode? innermost = null;
-        foreach (var element in AspxSymbolResolver.EnumerateElements(root))
-        {
-            if (!Spans(element, offset))
-                continue;
-            if (innermost is null || element.StartTag.Range.Start.Offset >= innermost.StartTag.Range.Start.Offset)
-                innermost = element;
-        }
-
-        for (var node = innermost; node is not null; node = node.Parent)
-        {
-            var itemType = node switch
-            {
-                TemplateNode template => template.ItemType,
-                ControlNode control => control.ItemType,
-                _ => null,
-            };
-
-            if (itemType is not null)
-                return itemType;
-        }
-
-        return null;
-    }
-
-    private static bool Spans(ElementNode element, int offset)
-    {
-        int start = element.StartTag.Range.Start.Offset;
-        int end = Math.Max(
-            element.StartTag.Range.End.Offset,
-            element.EndTag?.Range.End.Offset ?? 0);
-        return offset >= start && offset <= end;
-    }
-
-    /// <summary>What <c>Eval</c> can read off an item: its public properties and fields.</summary>
-    private static IEnumerable<ISymbol> DataFields(INamedTypeSymbol itemType)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        for (var current = itemType; current is not null; current = current.BaseType)
-        {
-            if (current.SpecialType == SpecialType.System_Object)
-                yield break;
-
-            foreach (var member in current.GetMembers())
-            {
-                if (member.IsStatic || member.DeclaredAccessibility != Accessibility.Public)
-                    continue;
-
-                bool readable = member switch
-                {
-                    IPropertySymbol { IsIndexer: false, GetMethod.DeclaredAccessibility: Accessibility.Public } => true,
-                    IFieldSymbol { AssociatedSymbol: null } => true,
-                    _ => false,
-                };
-
-                if (readable && seen.Add(member.Name))
-                    yield return member;
-            }
-        }
-    }
-
-    private static ITypeSymbol MemberType(ISymbol member) => member switch
-    {
-        IPropertySymbol property => property.Type,
-        IFieldSymbol field => field.Type,
-        _ => throw new ArgumentOutOfRangeException(nameof(member)),
-    };
 
     // ---- Shared ----------------------------------------------------------------------------
 

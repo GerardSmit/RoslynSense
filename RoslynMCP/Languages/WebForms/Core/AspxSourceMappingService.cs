@@ -69,6 +69,12 @@ internal static class AspxSourceMappingService
     /// <c>&lt;pages&gt;&lt;controls&gt;&lt;add tagPrefix="..." namespace="..."/&gt;</c>.
     /// Use <see cref="LoadWebConfigNamespaces"/> to obtain these.
     /// </param>
+    /// <param name="imports">
+    /// Optional namespaces every page imports implicitly, from web.config
+    /// <c>&lt;pages&gt;&lt;namespaces&gt;&lt;add namespace="..."/&gt;</c>. Merged into the parse
+    /// result's imports as if each were an <c>@Import</c> directive, so inline code sees the same
+    /// names the runtime would. Use <see cref="LoadWebConfigImports"/> to obtain these.
+    /// </param>
     /// <param name="rootDirectory">
     /// Optional project root directory used to resolve <c>@Register src="~/..."</c> paths.
     /// </param>
@@ -97,11 +103,12 @@ internal static class AspxSourceMappingService
         string text,
         Compilation compilation,
         IEnumerable<KeyValuePair<string, string>>? namespaces = null,
-        string? rootDirectory = null)
+        string? rootDirectory = null,
+        ImmutableArray<string> imports = default)
     {
         try
         {
-            return ParseCore(filePath, text, compilation, namespaces, rootDirectory);
+            return ParseCore(filePath, text, compilation, namespaces, rootDirectory, imports);
         }
         catch (Exception ex)
         {
@@ -121,7 +128,8 @@ internal static class AspxSourceMappingService
         string text,
         Compilation compilation,
         IEnumerable<KeyValuePair<string, string>>? namespaces,
-        string? rootDirectory)
+        string? rootDirectory,
+        ImmutableArray<string> imports)
     {
         // Auto-inject default ASP.NET namespace mappings when the compilation
         // references System.Web. In traditional ASP.NET, the 'asp' prefix is
@@ -140,6 +148,14 @@ internal static class AspxSourceMappingService
 
         if (rootNode is null)
             return new AspxParseResult(filePath, [], [], [], [], [], diagnostics, null);
+
+        // web.config imports go in front of the markup's own @Import directives, mirroring the
+        // runtime, where the config-level set is established before the page is compiled.
+        if (!imports.IsDefaultOrEmpty)
+        {
+            rootNode.Namespaces.InsertRange(
+                0, imports.Where(import => !rootNode.Namespaces.Contains(import)));
+        }
 
         var directives = new List<AspxDirectiveInfo>();
         var controls = new List<AspxControlInfo>();
@@ -527,7 +543,7 @@ internal static class AspxSourceMappingService
                     && args.Count >= 1
                     && IsStringLiteralWithValue(args[0].Expression, controlId))
                 {
-                    AddFindControlRef(references, filePath, inv);
+                    AddFindControlRef(references, filePath, inv, args[0].Expression);
                     continue;
                 }
 
@@ -546,7 +562,7 @@ internal static class AspxSourceMappingService
                     if (effectiveIdx < 0 || args.Count <= effectiveIdx) continue;
                     if (!IsStringLiteralWithValue(args[effectiveIdx].Expression, controlId)) continue;
 
-                    AddFindControlRef(references, filePath, inv);
+                    AddFindControlRef(references, filePath, inv, args[effectiveIdx].Expression);
                     break;
                 }
             }
@@ -559,7 +575,7 @@ internal static class AspxSourceMappingService
         InvocationExpressionSyntax inv, string name)
         => GetInvocationMemberName(inv) is { } n && string.Equals(n, name, StringComparison.Ordinal);
 
-    private static string? GetInvocationMemberName(
+    internal static string? GetInvocationMemberName(
         InvocationExpressionSyntax inv)
         => inv.Expression switch
         {
@@ -578,15 +594,31 @@ internal static class AspxSourceMappingService
 
     private static void AddFindControlRef(
         List<AspxSymbolReference> list, string filePath,
-        InvocationExpressionSyntax inv)
+        InvocationExpressionSyntax inv, ExpressionSyntax idLiteral)
     {
         var loc = inv.GetLocation().GetLineSpan();
+
+        // The id string without its quotes, so a navigation that uses the span selects the id
+        // the way F12 on the markup ID selects the attribute value.
+        Microsoft.CodeAnalysis.Text.LinePositionSpan? literalSpan = null;
+        if (idLiteral is LiteralExpressionSyntax literal
+            && literal.Token.GetLocation().GetLineSpan().Span is
+                { Start.Line: var line } span
+            && span.End.Line == line
+            && span.End.Character - span.Start.Character >= 2)
+        {
+            literalSpan = new Microsoft.CodeAnalysis.Text.LinePositionSpan(
+                new Microsoft.CodeAnalysis.Text.LinePosition(line, span.Start.Character + 1),
+                new Microsoft.CodeAnalysis.Text.LinePosition(line, span.End.Character - 1));
+        }
+
         list.Add(new AspxSymbolReference(
             filePath,
             loc.StartLinePosition.Line + 1,
             loc.StartLinePosition.Character + 1,
             inv.ToString(),
-            AspxCodeLocationType.FindControlCall));
+            AspxCodeLocationType.FindControlCall,
+            literalSpan));
     }
 
     private static void CollectDirectives(RootNode root, List<AspxDirectiveInfo> directives)
@@ -696,30 +728,56 @@ internal static class AspxSourceMappingService
     /// </returns>
     public static ImmutableArray<KeyValuePair<string, string>> LoadWebConfigNamespaces(string projectDirectory)
     {
+        if (ReadWebConfig(projectDirectory) is not { } config)
+            return [];
+
+        var namespaces = RootNode.GetNamespaces(config.Text);
+        if (!namespaces.IsDefaultOrEmpty)
+        {
+            Console.Error.WriteLine(
+                $"[AspxSourceMapping] Loaded {namespaces.Length} control registration(s) from '{config.Path}'.");
+        }
+        return namespaces.IsDefault ? [] : namespaces;
+    }
+
+    /// <summary>
+    /// Loads the implicit page imports from a web.config file.
+    /// Reads <c>&lt;system.web&gt;&lt;pages&gt;&lt;namespaces&gt;&lt;add namespace="..."/&gt;</c>.
+    /// </summary>
+    /// <param name="projectDirectory">Project root directory to search for web.config.</param>
+    /// <returns>
+    /// Namespaces every page imports, or an empty array if no web.config is found or it
+    /// registers none.
+    /// </returns>
+    public static ImmutableArray<string> LoadWebConfigImports(string projectDirectory)
+    {
+        if (ReadWebConfig(projectDirectory) is not { } config)
+            return [];
+
+        var imports = RootNode.GetPageNamespaces(config.Text);
+        return imports.IsDefault ? [] : imports;
+    }
+
+    /// <summary>Both spellings, because only one of them exists on a case-sensitive file
+    /// system.</summary>
+    private static (string Path, string Text)? ReadWebConfig(string projectDirectory)
+    {
         var webConfigPath = Path.Combine(projectDirectory, "web.config");
         if (!File.Exists(webConfigPath))
         {
-            // Try Web.config (case-sensitive file systems)
             webConfigPath = Path.Combine(projectDirectory, "Web.config");
             if (!File.Exists(webConfigPath))
-                return [];
+                return null;
         }
 
         try
         {
-            var webConfigText = File.ReadAllText(webConfigPath);
-            var namespaces = RootNode.GetNamespaces(webConfigText);
-            if (!namespaces.IsDefaultOrEmpty)
-            {
-                Console.Error.WriteLine(
-                    $"[AspxSourceMapping] Loaded {namespaces.Length} control registration(s) from '{webConfigPath}'.");
-            }
-            return namespaces;
+            return (webConfigPath, File.ReadAllText(webConfigPath));
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[AspxSourceMapping] Error reading web.config: {ex.Message}");
-            return [];
+            return null;
         }
     }
 
@@ -757,6 +815,7 @@ internal static class AspxSourceMappingService
             return previous;
 
         var webConfigNamespaces = LoadWebConfigNamespaces(projectDir);
+        var webConfigImports = LoadWebConfigImports(projectDir);
 
         var kept = previous.Files
             .Where(f => !changed.Contains(f.FilePath, StringComparer.OrdinalIgnoreCase))
@@ -778,7 +837,8 @@ internal static class AspxSourceMappingService
                     var text = await File.ReadAllTextAsync(file, ct);
                     reparsed.Add(Parse(file, text, compilation,
                         namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
-                        rootDirectory: projectDir));
+                        rootDirectory: projectDir,
+                        imports: webConfigImports));
                 }
                 catch (Exception ex)
                 {
@@ -801,8 +861,9 @@ internal static class AspxSourceMappingService
         if (compilation is null)
             return new AspxProjectIndex([]);
 
-        // Load globally registered tag prefixes from web.config
+        // Load globally registered tag prefixes and implicit imports from web.config
         var webConfigNamespaces = LoadWebConfigNamespaces(projectDir);
+        var webConfigImports = LoadWebConfigImports(projectDir);
 
         // Collect all ASPX-family files up front (excluding obj/bin)
         var allFiles = new List<string>();
@@ -836,7 +897,8 @@ internal static class AspxSourceMappingService
                     var text = await File.ReadAllTextAsync(file, ct);
                     var result = Parse(file, text, compilation,
                         namespaces: webConfigNamespaces.IsDefaultOrEmpty ? null : webConfigNamespaces,
-                        rootDirectory: projectDir);
+                        rootDirectory: projectDir,
+                        imports: webConfigImports);
                     results.Add(result);
                 }
                 catch (Exception ex)
@@ -883,6 +945,10 @@ internal enum AspxCodeLocationType { Expression, CodeBlock, FindControlCall }
 internal record AspxProjectIndex(List<AspxParseResult> Files);
 
 /// <summary>A reference to a symbol found in an ASPX file.</summary>
+/// <param name="LiteralSpan">For a <see cref="AspxCodeLocationType.FindControlCall"/>, the span of
+/// the id string itself (quotes excluded), so navigation can select the id rather than the whole
+/// invocation. Null for the other kinds, and for call sites recorded before it existed.</param>
 internal record AspxSymbolReference(
     string FilePath, int Line, int Column,
-    string CodeSnippet, AspxCodeLocationType LocationType);
+    string CodeSnippet, AspxCodeLocationType LocationType,
+    Microsoft.CodeAnalysis.Text.LinePositionSpan? LiteralSpan = null);

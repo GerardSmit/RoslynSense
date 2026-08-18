@@ -103,6 +103,8 @@ internal sealed partial class WebFormsLanguage : ILanguageSemanticTokensProvider
             }
         }
 
+        await ColourBindingPathsAsync(document, Add, property, unknownControl, ct);
+
         return Encode(tokens);
 
         void Add(TextSpan span, int type)
@@ -118,6 +120,49 @@ internal sealed partial class WebFormsLanguage : ILanguageSemanticTokensProvider
                 int end = line == lines.End.Line ? span.End : textLine.End;
                 if (end > start)
                     tokens.Add((line, start - textLine.Start, end - start, type));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Colours the segments of every <c>Eval("Entity.Images")</c> in the file: the ones that
+    /// resolve as properties, the ones that do not as unknown.
+    /// </summary>
+    /// <remarks>
+    /// The same argument as colouring a mistyped tag. The grammar paints the whole path as one
+    /// string, so <c>Eval("Entty.Images")</c> looks exactly as settled as the correct spelling
+    /// until the page is requested and <c>DataBinder</c> throws at render time — the one class of
+    /// mistake in a WebForms page that no compiler has ever caught. Marking the resolved half
+    /// makes the unresolved half visible by contrast.
+    /// <para>
+    /// Whole-file rather than windowed: <see cref="DataBindingService.ItemTypeAsync"/> is memoized
+    /// per container by nothing, and a range request that recomputed the item type per visible
+    /// binding would do the same work as the full pass anyway. <c>Add</c> drops what falls outside
+    /// the window.
+    /// </para>
+    /// </remarks>
+    private static async Task ColourBindingPathsAsync(
+        AspxDocument document, Action<TextSpan, int> add, int property, int unknown,
+        CancellationToken ct)
+    {
+        foreach (var argument in DataBindingService.AllArguments(document.Text))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var itemType = await DataBindingService.ItemTypeAsync(document, argument.Start, ct);
+
+            // Nothing said what the page binds. Every segment would come back unresolved, and a
+            // page-wide wash of error colour for a page that merely never declared an ItemType is
+            // worse than leaving the grammar's string colour alone.
+            if (itemType is null)
+                continue;
+
+            foreach (var segment in DataBindingService.Segments(document.Text, argument, itemType))
+            {
+                if (segment.Span.IsEmpty)
+                    continue;
+
+                add(segment.Span, segment.Symbol is null ? unknown : property);
             }
         }
     }

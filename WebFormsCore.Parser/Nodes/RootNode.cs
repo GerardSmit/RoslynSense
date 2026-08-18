@@ -316,4 +316,59 @@ public class RootNode : ContainerNode
 
         return namespaces.ToImmutableArray();
     }
+
+    /// <summary>
+    /// Reads the implicit page imports from a web.config:
+    /// <c>&lt;system.web&gt;&lt;pages&gt;&lt;namespaces&gt;&lt;add namespace="..."/&gt;</c>.
+    /// The runtime makes these visible to inline code on every page, the way an
+    /// <c>@Import</c> directive would. <c>&lt;remove&gt;</c> and <c>&lt;clear&gt;</c> are honored
+    /// against the entries collected so far; machine-level inheritance is not modeled.
+    /// </summary>
+    public static ImmutableArray<string> GetPageNamespaces(string? webConfigText)
+    {
+        if (string.IsNullOrEmpty(webConfigText))
+        {
+            return default;
+        }
+
+        var namespaces = new List<string>();
+
+        try
+        {
+            var section = XElement.Parse(webConfigText)
+                .Descendants("system.web").FirstOrDefault()
+                ?.Descendants("pages").FirstOrDefault()
+                ?.Descendants("namespaces").FirstOrDefault();
+
+            if (section != null)
+            {
+                foreach (var element in section.Elements())
+                {
+                    switch (element.Name.LocalName)
+                    {
+                        case "add" when element.Attribute("namespace")?.Value is { Length: > 0 } added:
+                            if (!namespaces.Contains(added))
+                            {
+                                namespaces.Add(added);
+                            }
+                            break;
+
+                        case "remove" when element.Attribute("namespace")?.Value is { } removed:
+                            namespaces.Remove(removed);
+                            break;
+
+                        case "clear":
+                            namespaces.Clear();
+                            break;
+                    }
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // TODO: Diagnostic
+        }
+
+        return namespaces.ToImmutableArray();
+    }
 }

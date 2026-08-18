@@ -26,29 +26,55 @@ internal static class HandlerHelpers
             .Distinct().ToArray();
 
     /// <summary>
-    /// Converts locations, first learning the URIs of <paramref name="project"/>'s generated
-    /// documents if any of them turn out to live in one.
+    /// Converts locations, first learning the URIs of the generated documents any of them turn out
+    /// to live in.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Enumerating generated documents runs the generators, so it is done only when a result
     /// actually landed in generated code — which is also the only time the answer differs.
+    /// </para>
+    /// <para>
+    /// The project asked is the one that owns the tree and not <paramref name="project"/>, because
+    /// the two differ exactly when the request followed a project reference: a mediator's Send
+    /// resolves to an extension method generated in the project that declares the request, and
+    /// enumerating the caller's generated documents finds nothing that maps it. The result was a
+    /// link under the callee's <c>obj\</c> that opens nothing.
+    /// </para>
     /// </remarks>
     public static async Task<LspLocation[]> ToLocationsAsync(
         IEnumerable<Microsoft.CodeAnalysis.Location> locations, Project project, CancellationToken ct)
     {
         var all = locations.ToList();
+        var unwarmed = new HashSet<ProjectId>();
+        var considered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        bool needsWarming = all.Any(l =>
-            l.SourceTree?.FilePath is { Length: > 0 } path
-            && GeneratedDocumentRegistry.LooksGenerated(path)
-            && !GeneratedDocumentRegistry.TryGetUri(path, out _));
-
-        if (needsWarming && project.FilePath is { Length: > 0 } projectPath)
+        foreach (var location in all)
         {
+            if (location.SourceTree is not { } tree
+                || tree.FilePath is not { Length: > 0 } path
+                || !considered.Add(path)
+                || GeneratedDocumentRegistry.TryGetUri(path, out _)
+                || !GeneratedDocumentRegistry.LooksGenerated(path))
+            {
+                continue;
+            }
+
+            unwarmed.Add(project.Solution.GetDocumentId(tree)?.ProjectId ?? project.Id);
+        }
+
+        foreach (var id in unwarmed)
+        {
+            if (project.Solution.GetProject(id) is not { } owner
+                || owner.FilePath is not { Length: > 0 } projectPath)
+            {
+                continue;
+            }
+
             try
             {
                 GeneratedDocumentRegistry.Register(
-                    projectPath, await project.GetSourceGeneratedDocumentsAsync(ct));
+                    projectPath, await owner.GetSourceGeneratedDocumentsAsync(ct));
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)

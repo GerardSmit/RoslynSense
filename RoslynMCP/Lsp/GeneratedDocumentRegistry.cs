@@ -48,8 +48,14 @@ internal static class GeneratedDocumentRegistry
     /// miss is worth an enumeration, so the cost is paid only when generated code is actually
     /// in the results.
     /// </summary>
-    public static bool LooksGenerated(string path) =>
-        path.Length > 0 && !Path.IsPathRooted(path) && !File.Exists(path);
+    /// <remarks>
+    /// Being rooted proves nothing. MSBuildWorkspace fills in
+    /// <c>CompilationOutputInfo.GeneratedFilesOutputDirectory</c>, so Roslyn synthesizes the path
+    /// under the project's <c>obj\</c> — rooted, and still nothing on disk unless
+    /// <c>EmitCompilerGeneratedFiles</c> happened to write a copy there. Treating rooted as real
+    /// is what sent F12 on a generated member to a path no build had ever produced.
+    /// </remarks>
+    public static bool LooksGenerated(string path) => path.Length > 0 && !File.Exists(path);
 
     internal static string HintName(SourceGeneratedDocument document) =>
         document.HintName is { Length: > 0 } hint ? hint : document.Name;

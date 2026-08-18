@@ -12,4 +12,17 @@
     <ProjectReference Include="..\Messaging\Messaging.csproj" />
   </ItemGroup>
 
+  <!--
+    The generator runs here and nowhere else, which is the shape under test. Zapto's real generator
+    emits SenderExtensions beside the message, so a dispatch in Api binds to an extension method
+    whose syntax tree belongs to *this* project's compilation — the case where reading the emitted
+    body from the caller's compilation finds nothing to read. Analyzers do not flow across a
+    ProjectReference, so Api, Inventory and Billing get no generator of their own.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\MediatorGenerator\MediatorGenerator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
 </Project>

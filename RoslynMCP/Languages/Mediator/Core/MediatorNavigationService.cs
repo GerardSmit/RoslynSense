@@ -157,11 +157,13 @@ internal static class MediatorNavigationService
         if (ReadGeneratedBody(definition, compilation, ct) is { } fromBody)
             return fromBody;
 
-        // Metadata here, source in the project that declares the message: the generated class lives
-        // beside its message, so re-resolve into that compilation and read the body where there is
-        // one to read.
-        if (definition.DeclaringSyntaxReferences.Length == 0
-            && definition.ContainingAssembly is { } assembly
+        // The body is in the compilation that generated it, which is not this one whenever the
+        // dispatch crossed a project reference: the generated class lives beside its message, so a
+        // Send in one project reaches an extension whose syntax tree belongs to another and
+        // ReadGeneratedBody could not bind it. Metadata references land here too, having no syntax
+        // at all. Both are answered the same way — re-resolve into the declaring project and read
+        // the body where there is one to read.
+        if (definition.ContainingAssembly is { } assembly
             && project.Solution.GetProject(assembly, ct) is { } declaring)
         {
             var declaringCompilation = await declaring.GetCompilationAsync(ct);

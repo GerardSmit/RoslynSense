@@ -88,6 +88,22 @@ public class CrossProjectNavigationTests
         AssertHandlerIn(locations, FixturePaths.MediatorModulesBillingHandlerFile);
     }
 
+    [Fact]
+    public async Task DefinitionOnAGeneratedExtensionFromAnotherProjectReachesTheHandlers()
+    {
+        var locations = await NavigationHandlers.DefinitionAsync(
+            At(FixturePaths.MediatorModulesEndpointFile,
+                "zapto.SyncCustomersCommandAsync(region, ct)", "zapto.".Length),
+            typeDefinition: false, default, s_session);
+
+        // The generator runs in Contracts, so the emitted body naming the message belongs to that
+        // project's compilation and not to Api's. Reading it only where the caret's own compilation
+        // could bind it left the message unknown, the redirect empty, and F12 on the line below
+        // pointed at a generated path under Contracts' obj\ that no build had written.
+        AssertHandlerIn(locations, FixturePaths.MediatorModulesInventoryHandlerFile);
+        AssertHandlerIn(locations, FixturePaths.MediatorModulesBillingHandlerFile);
+    }
+
     private static void AssertHandlerIn(LspLocation[] locations, string handlerFile)
     {
         var inFile = locations.Where(l => IsFile(l, handlerFile)).ToArray();

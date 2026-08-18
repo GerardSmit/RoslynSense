@@ -17,9 +17,10 @@ import {
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
 import { registerTestController, runTestById } from './testController';
 import { registerImpactedTests } from './impactedTests';
+import { registerCoverageMapProgress } from './coverageMapProgress';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerSolutionExplorer } from './solutionExplorer';
-import { registerSearchEverywhere } from './searchEverywhere';
+import { registerSearchEverywhere } from './search';
 import { registerVirtualDocuments } from './virtualDocuments';
 import { registerEmbeddedLanguages } from './embeddedLanguages';
 import { registerNuGetPanel } from './nuget';
@@ -82,6 +83,15 @@ export interface ExtraLanguage {
      * every save, and the server does its reload work per event.
      */
     readonly watchedElsewhere?: readonly string[];
+    /**
+     * Name globs the language owns inside a file type it does not — `appsettings*.json` is this
+     * server's while `package.json` beside it stays the editor's. A row with patterns selects
+     * documents by glob under `patternLanguages` instead of by its own language id, because the
+     * files keep the host language's id and its highlighting.
+     */
+    readonly patterns?: readonly string[];
+    /** The VS Code language ids the patterned files open under. */
+    readonly patternLanguages?: readonly string[];
 }
 
 /** Files whose content the server tracks even while no editor has them open. */
@@ -103,6 +113,8 @@ function watchGlobs(language: ExtraLanguage): string[] {
             `**/${[...name].map((c) => (/[a-z]/i.test(c) ? `[${c.toLowerCase()}${c.toUpperCase()}]` : c)).join('')}`,
         );
     }
+
+    globs.push(...(language.patterns ?? []));
 
     return globs;
 }
@@ -159,6 +171,27 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         // this pack and is not gated on it being enabled.
         watchedElsewhere: ['.csproj', '.fsproj', '.vbproj', '.props', '.targets'],
     },
+    {
+        // LINQ to SQL models. Contributed as their own language for the same reason as resx and
+        // msbuild: as `xml` the selector never matches and the server is never told the buffer
+        // was opened.
+        //
+        // No breakpoints: a .dbml declares a schema mapping, and the generated designer the
+        // debugger does bind to is a real compiled document Roslyn already owns.
+        id: 'dbml',
+        extensions: ['.dbml'],
+        breakpoints: false,
+    },
+    {
+        // Application configuration. Not a language of its own: the files are JSON and stay
+        // JSON — the selector matches them by name shape so the server hears about exactly the
+        // ones that feed IConfiguration, and package.json beside them stays untouched.
+        id: 'appsettings',
+        extensions: [],
+        patterns: ['**/appsettings*.json', '**/secrets.json'],
+        patternLanguages: ['json', 'jsonc'],
+        breakpoints: false,
+    },
 ];
 
 /**
@@ -177,7 +210,9 @@ function enabledLanguages(): readonly ExtraLanguage[] {
  * switches it off.
  */
 function enabledFileLanguages(): readonly ExtraLanguage[] {
-    return enabledLanguages().filter((language) => language.extensions.length > 0);
+    return enabledLanguages().filter(
+        (language) => language.extensions.length > 0 || (language.patterns?.length ?? 0) > 0,
+    );
 }
 
 /**
@@ -346,7 +381,10 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
         codeStyleDiagnostics: config.get('codeStyleDiagnostics'),
         analyzerTimeoutSeconds: config.get('analyzerTimeoutSeconds'),
         workspaceDiagnostics: config.get('workspaceDiagnostics'),
+        externalSource: config.get('externalSource'),
         sourceLink: config.get('sourceLink'),
+        symbolServer: config.get('symbolServer'),
+        referenceSource: config.get('referenceSource'),
         fileNesting: { rules: config.get('fileNesting.rules') },
         // Which language packs this connection wants. Per connection on the server too: the
         // daemon is shared, so another window — or an AI session on the same daemon — keeps
@@ -556,7 +594,15 @@ async function startClient(
             // The other languages the same server serves — WebForms markup, whose controls,
             // properties and event handlers are C# symbols, and whose <% %> blocks are C#.
             // A language switched off still highlights, it just answers nothing.
-            ...enabledFileLanguages().map((language) => fileFilter(language.id, binding?.folder)),
+            ...enabledFileLanguages().flatMap((language) =>
+                language.patterns?.length
+                    ? (language.patternLanguages ?? []).flatMap((hostLanguage) =>
+                          language.patterns!.map((pattern) =>
+                              patternFilter(hostLanguage, pattern, binding?.folder),
+                          ),
+                      )
+                    : [fileFilter(language.id, binding?.folder)],
+            ),
         ],
         uriConverters: { code2Protocol, protocol2Code },
         middleware: {
@@ -680,6 +726,20 @@ function fileFilter(language: string, folder: vscode.WorkspaceFolder | undefined
     return folder
         ? { scheme: 'file', language, pattern: `${folder.uri.fsPath.replace(/\\/g, '/')}/**/*` }
         : { scheme: 'file', language };
+}
+
+/**
+ * A filter for files a host language owns by name shape — `appsettings*.json` under `json`. The
+ * glob is rooted under the client's folder when it has one, the way {@link fileFilter}'s is.
+ */
+function patternFilter(language: string, glob: string, folder: vscode.WorkspaceFolder | undefined) {
+    return folder
+        ? {
+              scheme: 'file',
+              language,
+              pattern: `${folder.uri.fsPath.replace(/\\/g, '/')}/${glob}`,
+          }
+        : { scheme: 'file', language, pattern: glob };
 }
 
 function bindingKey(solutionPath: string | undefined, folder: vscode.WorkspaceFolder | undefined): string {
@@ -997,8 +1057,142 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
                 arguments: [],
             });
             void vscode.window.showInformationMessage(`RoslynSense: ${result}`);
-        })
+        }),
+        // CodeLens "Refresh table" on a .dbml <Table>. The id differs from the three server
+        // commands for the reason above, and the flow lives here rather than on the server
+        // because both of its decisions — which connection, and whether to drop columns — are
+        // questions only the user can answer.
+        vscode.commands.registerCommand(
+            'roslynSense.dbmlRefreshTable',
+            (uri: string, tableName: string) => refreshDbmlTable(uri, tableName)
+        )
     );
+}
+
+interface DbmlConnection {
+    alias: string;
+    provider: string;
+}
+
+interface DbmlConnectionList {
+    connections: DbmlConnection[];
+    unsupported: string[];
+}
+
+interface DbmlPlannedColumn {
+    name: string;
+    detail: string;
+}
+
+interface DbmlRefreshPlan {
+    ok: boolean;
+    message: string;
+    table?: string;
+    added?: DbmlPlannedColumn[];
+    updated?: DbmlPlannedColumn[];
+    removed?: DbmlPlannedColumn[];
+    associations?: DbmlPlannedColumn[];
+    notes?: string[];
+}
+
+interface DbmlRefreshResult {
+    ok: boolean;
+    message: string;
+}
+
+/**
+ * Re-syncs one <Table> in a .dbml against a registered RoslynSense database connection.
+ *
+ * Three steps and two of them are questions. The connection is asked for rather than read from
+ * the model's own <Connection> element, which commonly names a machine that no longer exists.
+ * The removals are confirmed modally and separately from the rest, because dropping a <Column>
+ * deletes a property the solution may be full of references to — the database knowing the column
+ * is gone does not mean the model is finished being edited.
+ */
+async function refreshDbmlTable(uri: string, tableName: string): Promise<void> {
+    if (!client) {
+        return;
+    }
+
+    const list = await client.sendRequest<DbmlConnectionList>('workspace/executeCommand', {
+        command: 'roslynSense.dbmlConnections',
+        arguments: [],
+    });
+
+    const available = list?.connections ?? [];
+
+    if (available.length === 0) {
+        const unsupported = (list?.unsupported ?? []).join(', ');
+        void vscode.window.showErrorMessage(
+            unsupported
+                ? `RoslynSense: no SQL Server connection is registered. ${unsupported} cannot describe a schema.`
+                : 'RoslynSense: no database connection is registered. Add one with db_add_connection or --db.'
+        );
+        return;
+    }
+
+    let alias = available[0].alias;
+
+    if (available.length > 1) {
+        const picked = await vscode.window.showQuickPick(
+            available.map((c) => ({ label: c.alias, description: c.provider })),
+            { title: `Refresh ${tableName} from…`, placeHolder: 'Database connection' }
+        );
+        if (!picked) {
+            return;
+        }
+        alias = picked.label;
+    }
+
+    const plan = await client.sendRequest<DbmlRefreshPlan>('workspace/executeCommand', {
+        command: 'roslynSense.dbmlPlanRefresh',
+        arguments: [uri, tableName, alias],
+    });
+
+    if (!plan?.ok) {
+        void vscode.window.showErrorMessage(`RoslynSense: ${plan?.message ?? 'the refresh failed.'}`);
+        return;
+    }
+
+    for (const note of plan.notes ?? []) {
+        void vscode.window.showWarningMessage(`RoslynSense: ${note}`);
+    }
+
+    const removed = plan.removed ?? [];
+    const changes =
+        (plan.added?.length ?? 0) + (plan.updated?.length ?? 0) + removed.length + (plan.associations?.length ?? 0);
+
+    if (changes === 0) {
+        void vscode.window.showInformationMessage(`RoslynSense: ${plan.message}`);
+        return;
+    }
+
+    let includeRemovals = false;
+
+    if (removed.length > 0) {
+        const names = removed.map((c) => c.name).join(', ');
+        const answer = await vscode.window.showWarningMessage(
+            `${tableName}: the database no longer has ${names}.`,
+            { modal: true, detail: 'Removing them deletes the generated properties too.' },
+            'Remove them',
+            'Keep them'
+        );
+        if (!answer) {
+            return;
+        }
+        includeRemovals = answer === 'Remove them';
+    }
+
+    const result = await client.sendRequest<DbmlRefreshResult>('workspace/executeCommand', {
+        command: 'roslynSense.dbmlApplyRefresh',
+        arguments: [uri, tableName, alias, includeRemovals],
+    });
+
+    if (result?.ok) {
+        void vscode.window.showInformationMessage(`RoslynSense: ${result.message}`);
+    } else {
+        void vscode.window.showErrorMessage(`RoslynSense: ${result?.message ?? 'the refresh failed.'}`);
+    }
 }
 
 interface LspLocation {
@@ -1089,8 +1283,16 @@ function registerInheritanceMarkers(context: vscode.ExtensionContext): void {
                 true
             );
             hover.isTrusted = true;
+
+            // The member's own name, not its line. A decoration carrying a hoverMessage becomes a
+            // part of whatever hover opens inside its range, and the widget highlights the union of
+            // every part — so a line-wide range lit up the whole line and stapled this marker's
+            // "implements" link onto a hover about some other identifier that shared the line. The
+            // gutter icon is drawn per line whatever the range is, so narrowing costs nothing.
             const line = Math.min(marker.line, editor.document.lineCount - 1);
-            return { range: editor.document.lineAt(line).range, hoverMessage: hover };
+            const anchor = editor.document.validatePosition(new vscode.Position(line, marker.character));
+            const range = editor.document.getWordRangeAtPosition(anchor) ?? new vscode.Range(anchor, anchor);
+            return { range, hoverMessage: hover };
         };
 
         editor.setDecorations(
@@ -1126,9 +1328,92 @@ function registerInheritanceMarkers(context: vscode.ExtensionContext): void {
 let processStatusItem: vscode.StatusBarItem | undefined;
 let processPollTimer: NodeJS.Timeout | undefined;
 
+/**
+ * Attach sessions this window owns, by the pid they are attached to.
+ *
+ * Kept here rather than derived from vscode.debug on demand: the API exposes only the *active*
+ * session, and an app being debugged in the background is exactly the case the process list has
+ * to get right.
+ */
+const attachedSessions = new Map<number, vscode.DebugSession>();
+
+/**
+ * Apps this window launched (F5, or Run from the solution explorer), by pid.
+ *
+ * Two jobs: the daemon is told about them so chats can see the app the user has running, and
+ * "restart" on such an entry goes back through the debug session that owns it rather than
+ * killing a process VS Code still believes it is supervising.
+ */
+const editorLaunches = new Map<number, vscode.DebugSession>();
+let refreshProcessStatus: () => void = () => {};
+
+function registerEditorProcess(session: vscode.DebugSession, pid: unknown): void {
+    if (!client || typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+        return;
+    }
+    const projectPath: string | undefined = session.configuration.projectPath;
+    if (!projectPath) {
+        return;
+    }
+    editorLaunches.set(pid, session);
+    client
+        .sendRequest('roslynSense/registerProcess', {
+            pid,
+            projectPath,
+            url: session.configuration.appUrl ?? null,
+        })
+        .then(() => refreshProcessStatus(), () => {
+            // Advisory: the app runs either way, so a daemon that is restarting is not an error
+            // worth showing.
+        });
+}
+
+/**
+ * Sends one debug-console line to the daemon, tagged with the app's pid.
+ *
+ * Only the debuggee's own streams: adapter chatter ("console") is this window's business, and
+ * mixing it into what a chat reads as the app's output invites the wrong diagnosis.
+ */
+function forwardProcessOutput(session: vscode.DebugSession, body: any): void {
+    const category: string | undefined = body?.category;
+    if (category !== 'stdout' && category !== 'stderr') {
+        return;
+    }
+    const text: string | undefined = body?.output;
+    if (!client || !text) {
+        return;
+    }
+    for (const [pid, owner] of editorLaunches) {
+        if (owner === session) {
+            void client.sendNotification('roslynSense/processOutput', { pid, text });
+            return;
+        }
+    }
+}
+
+function unregisterEditorProcess(session: vscode.DebugSession): void {
+    for (const [pid, owner] of editorLaunches) {
+        if (owner === session) {
+            editorLaunches.delete(pid);
+            void client?.sendRequest('roslynSense/unregisterProcess', { pid }).then(
+                () => refreshProcessStatus(),
+                () => {}
+            );
+        }
+    }
+}
+
+function attachedPid(session: vscode.DebugSession): number | undefined {
+    if (session.type !== DEBUG_TYPE || session.configuration.request !== 'attach') {
+        return undefined;
+    }
+    const pid = Number(session.configuration.processId);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 // Status bar counter for applications launched via the shared daemon's MCP chats
-// (run_project). Click → list with kill / open-URL actions. Polls the server because
-// launches happen in other processes (MCP chat clients), not this editor.
+// (run_project). Click → list with attach / detach / kill / open-URL actions. Polls the server
+// because launches happen in other processes (MCP chat clients), not this editor.
 function registerProcessStatusBar(context: vscode.ExtensionContext): void {
     processStatusItem = vscode.window.createStatusBarItem(
         'roslynSense.processes', vscode.StatusBarAlignment.Left, 90);
@@ -1147,10 +1432,16 @@ function registerProcessStatusBar(context: vscode.ExtensionContext): void {
             if (processes.length === 0) {
                 processStatusItem?.hide();
             } else if (processStatusItem) {
-                processStatusItem.text = `$(rocket) ${processes.length}`;
+                const attached = processes.filter((p) => attachedSessions.has(p.pid)).length;
+                processStatusItem.text = attached > 0
+                    ? `$(rocket) ${processes.length} $(debug-alt) ${attached}`
+                    : `$(rocket) ${processes.length}`;
                 processStatusItem.tooltip =
                     'RoslynSense: running processes\n' +
-                    processes.map((p) => `${p.projectName} (pid ${p.pid})`).join('\n');
+                    processes
+                        .map((p) => `${p.projectName} (pid ${p.pid})` +
+                            (attachedSessions.has(p.pid) ? ' — debugger attached' : ''))
+                        .join('\n');
                 processStatusItem.show();
             }
         } catch {
@@ -1159,7 +1450,28 @@ function registerProcessStatusBar(context: vscode.ExtensionContext): void {
     };
     processPollTimer = setInterval(() => void poll(), 5000);
     context.subscriptions.push({ dispose: () => clearInterval(processPollTimer) });
+    refreshProcessStatus = () => void poll();
     void poll();
+
+    // Attaching and detaching happen through the normal debug UI too (F5 on an attach
+    // configuration, the stop button), so the map follows VS Code rather than only our commands.
+    context.subscriptions.push(
+        vscode.debug.onDidStartDebugSession((session) => {
+            const pid = attachedPid(session);
+            if (pid !== undefined) {
+                attachedSessions.set(pid, session);
+                void poll();
+            }
+        }),
+        vscode.debug.onDidTerminateDebugSession((session) => {
+            const pid = attachedPid(session);
+            if (pid !== undefined && attachedSessions.get(pid) === session) {
+                attachedSessions.delete(pid);
+                void poll();
+            }
+            unregisterEditorProcess(session);
+        })
+    );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('roslynSense.showProcesses', async () => {
@@ -1180,8 +1492,11 @@ function registerProcessStatusBar(context: vscode.ExtensionContext): void {
 
             const picked = await vscode.window.showQuickPick(
                 processes.map((p) => ({
-                    label: `$(rocket) ${p.projectName}`,
-                    description: `pid ${p.pid}${p.url ? ` — ${p.url}` : ''}`,
+                    label: attachedSessions.has(p.pid)
+                        ? `$(debug-alt) ${p.projectName}`
+                        : `$(rocket) ${p.projectName}`,
+                    description: `pid ${p.pid}${p.url ? ` — ${p.url}` : ''}` +
+                        (attachedSessions.has(p.pid) ? ' — debugging' : ''),
                     detail: `${p.projectPath} — started ${new Date(p.startedAtUtc).toLocaleTimeString()}`,
                     process: p,
                 })),
@@ -1191,25 +1506,134 @@ function registerProcessStatusBar(context: vscode.ExtensionContext): void {
                 return;
             }
 
-            const actions: { label: string; action: 'kill' | 'open' }[] = [
-                { label: '$(trash) Kill process', action: 'kill' },
-            ];
+            const session = attachedSessions.get(picked.process.pid);
+            // An app this window launched *under* the debugger already has one; a second
+            // debugger cannot attach, so that entry offers neither action.
+            const launchedDebugging =
+                editorLaunches.get(picked.process.pid)?.configuration.noDebug !== true &&
+                editorLaunches.has(picked.process.pid);
+            const actions: {
+                label: string;
+                action: 'attach' | 'detach' | 'stop' | 'restart' | 'open';
+            }[] = session
+                ? [{ label: '$(debug-disconnect) Detach debugger', action: 'detach' }]
+                : launchedDebugging
+                    ? []
+                    : [{ label: '$(debug-alt) Attach debugger', action: 'attach' }];
             if (picked.process.url) {
                 actions.push({ label: '$(globe) Open URL', action: 'open' });
             }
+            actions.push(
+                { label: '$(debug-restart) Restart', action: 'restart' },
+                { label: '$(debug-stop) Stop', action: 'stop' }
+            );
+
             const action = await vscode.window.showQuickPick(actions, {
                 placeHolder: `${picked.process.projectName} (pid ${picked.process.pid})`,
             });
-            if (action?.action === 'kill') {
-                const result = await client.sendRequest<string>('roslynSense/killProcess', {
-                    pid: picked.process.pid,
+            if (action?.action === 'restart') {
+                await restartProcess(picked.process);
+            } else if (action?.action === 'attach') {
+                // projectPath is not used by the attach itself; it tells the adapter factory
+                // whether this process needs the .NET Framework debugger instead of netcoredbg.
+                const started = await vscode.debug.startDebugging(undefined, {
+                    type: DEBUG_TYPE,
+                    request: 'attach',
+                    name: `C#: ${picked.process.projectName} (pid ${picked.process.pid})`,
+                    processId: String(picked.process.pid),
+                    projectPath: picked.process.projectPath,
                 });
-                void vscode.window.showInformationMessage(`RoslynSense: ${result}`);
+                if (!started) {
+                    void vscode.window.showErrorMessage(
+                        `RoslynSense: could not attach to ${picked.process.projectName} (pid ${picked.process.pid}).`
+                    );
+                }
+            } else if (action?.action === 'detach' && session) {
+                // Detach, not terminate: the app was launched by a chat and outlives the
+                // debugger. stopDebugging disconnects without killing an attached debuggee.
+                await vscode.debug.stopDebugging(session);
+            } else if (action?.action === 'stop') {
+                await stopProcess(picked.process);
             } else if (action?.action === 'open' && picked.process.url) {
                 void vscode.env.openExternal(vscode.Uri.parse(picked.process.url));
             }
         })
     );
+}
+
+/**
+ * Stops a running app, through whoever owns it.
+ *
+ * An app this window launched is stopped by ending its debug session: killing the pid behind
+ * VS Code's back leaves the session hanging and the debug toolbar live. Everything else is a
+ * chat's, and goes through the daemon — which also tells that chat why its app disappeared.
+ */
+async function stopProcess(process: RunningProcess): Promise<void> {
+    const owned = editorLaunches.get(process.pid);
+    if (owned) {
+        await vscode.debug.stopDebugging(owned);
+        return;
+    }
+    if (!client) {
+        return;
+    }
+    const result = await client.sendRequest<string>('roslynSense/killProcess', {
+        pid: process.pid,
+    });
+    void vscode.window.showInformationMessage(`RoslynSense: ${result}`);
+}
+
+/**
+ * Stop, then start the same project again from this window.
+ *
+ * The restart is always an editor launch, even for a chat's app: this window cannot ask another
+ * process to re-run its session. The chat is told its app was stopped (the daemon's kill does
+ * that), and the new one is registered back, so it stays visible on both sides.
+ */
+async function restartProcess(process: RunningProcess): Promise<void> {
+    const owned = editorLaunches.get(process.pid);
+    const configuration = owned?.configuration;
+
+    await stopProcess(process);
+
+    // A web app that has not released its port yet fails the relaunch with a bind error, so the
+    // restart waits for the process to actually be gone rather than assuming stop is synchronous.
+    await waitForExit(process.pid);
+
+    const started = await vscode.debug.startDebugging(
+        undefined,
+        configuration ?? {
+            type: DEBUG_TYPE,
+            request: 'launch',
+            name: `C#: ${process.projectName}`,
+            projectPath: process.projectPath,
+        },
+        { noDebug: configuration ? configuration.noDebug === true : true }
+    );
+    if (!started) {
+        void vscode.window.showErrorMessage(
+            `RoslynSense: could not restart ${process.projectName}.`
+        );
+    }
+}
+
+/** Polls the daemon until the pid leaves the registry, up to ~5s. */
+async function waitForExit(pid: number): Promise<void> {
+    for (let attempt = 0; attempt < 25; attempt++) {
+        if (!client) {
+            return;
+        }
+        try {
+            const processes = await client.sendRequest<RunningProcess[]>(
+                'roslynSense/runningProcesses');
+            if (!processes.some((p) => p.pid === pid)) {
+                return;
+            }
+        } catch {
+            return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+    }
 }
 
 // ---- Debug bridge -------------------------------------------------------------------
@@ -1240,6 +1664,8 @@ interface DebugSessionInfo {
     line: number; // 1-based
     updatedAtUtc: string;
     breakpoints: DebugBreakpointInfo[];
+    // Numbers the stops; 0 (or absent, from an older server) when the engine does not count.
+    stopSequence?: number;
 }
 
 interface DebugCommandResult {
@@ -1652,6 +2078,10 @@ class AiDebugAdapter implements vscode.DebugAdapter {
     private seq = 1;
     private ownerPid: number | undefined;
     private lastState: string | undefined;
+    // The last stop announced to VSCode, by the server's stop number — the state string alone
+    // cannot tell two stops on the same line apart, and a chat-issued step lands on a new stop
+    // faster than the poll can see the running state in between.
+    private lastStopSeq = 0;
     private pollTimer: NodeJS.Timeout | undefined;
     private disposed = false;
 
@@ -1765,6 +2195,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.ownerPid = session.ownerPid;
                 this.respond(request);
                 this.startPolling();
+                this.lastStopSeq = session.stopSequence ?? 0;
                 if (session.state === 'stopped') {
                     this.event('stopped', {
                         reason: session.reason ?? 'breakpoint',
@@ -1922,7 +2353,16 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.respond(request, request.command === 'continue' ? { allThreadsContinued: true } : undefined);
                 const session = await this.currentSession();
                 if (session?.state === 'stopped') {
+                    // The poll may have announced this same stop already — skip the duplicate,
+                    // which would otherwise re-enter the state VSCode just left.
+                    const stopSeq = session.stopSequence ?? 0;
+                    const announced = stopSeq !== 0 &&
+                        stopSeq === this.lastStopSeq && this.lastState === 'stopped';
                     this.lastState = 'stopped';
+                    this.lastStopSeq = stopSeq;
+                    if (announced) {
+                        return;
+                    }
                     // A watched value changing outranks the reason the resume started with: the
                     // user pressed Continue, but the watch is what stopped them.
                     const hit = await this.structured<{ description: string }>('data_hit');
@@ -2040,6 +2480,8 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.respond(request, undefined, result.ok, result.ok ? undefined : result.result);
                 if (result.ok) {
                     this.lastState = 'stopped';
+                    // Claim the stop before announcing it, or the next poll re-announces it.
+                    this.lastStopSeq = (await this.currentSession())?.stopSequence ?? this.lastStopSeq;
                     this.event('stopped', { reason: 'pause', threadId: 1, allThreadsStopped: true });
                 }
                 return;
@@ -2084,8 +2526,15 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.dispose();
                 return;
             }
-            if (session.state !== this.lastState) {
+            // The stop number catches what the state string cannot: a chat-issued step lands
+            // on a new stop faster than the poll can see the running state in between, and the
+            // string reads "stopped" on both sides of it.
+            const stopSeq = session.stopSequence ?? 0;
+            const newStop = session.state === 'stopped' &&
+                stopSeq !== 0 && stopSeq !== this.lastStopSeq;
+            if (session.state !== this.lastState || newStop) {
                 this.lastState = session.state;
+                this.lastStopSeq = stopSeq;
                 if (session.state === 'stopped') {
                     this.event('stopped', {
                         reason: session.reason ?? 'breakpoint',
@@ -2170,6 +2619,27 @@ function registerEditorDebugTracker(context: vscode.ExtensionContext): void {
                     onDidSendMessage: (message: any) => {
                         if (message.type !== 'event') {
                             return;
+                        }
+                        // The one place the debuggee's PID is knowable for a launch: the adapter
+                        // reports it once the process exists. Announcing it puts the user's own
+                        // F5 in the same registry as a chat's run_project, so chats can see it.
+                        if (message.event === 'process' &&
+                            session.type === DEBUG_TYPE &&
+                            session.configuration.request === 'launch') {
+                            registerEditorProcess(session, message.body?.systemProcessId);
+                        }
+                        // The app's own console. It exists only in this window otherwise, so a
+                        // chat asked what the app printed has nothing to read.
+                        if (message.event === 'output' && session.type === DEBUG_TYPE) {
+                            forwardProcessOutput(session, message.body);
+                        }
+                        // How it ended, in the same log: the registry keeps only live processes,
+                        // so this is the one place an exit code survives the exit.
+                        if (message.event === 'exited' && session.type === DEBUG_TYPE) {
+                            forwardProcessOutput(session, {
+                                category: 'stdout',
+                                output: `\n[roslyn-sense] the process exited with code ${message.body?.exitCode ?? '?'}.\n`,
+                            });
                         }
                         if (message.event === 'stopped') {
                             const threadId: number | undefined = message.body?.threadId;
@@ -2392,6 +2862,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerAiDebugAdapter(context);
     registerDebugLaunch(context, () => client);
     registerTestController(context, () => client);
+    registerCoverageMapProgress(context, () => client);
     registerImpactedTests(context, () => client);
     registerCoverageExplorer(context, () => client);
     registerSolutionExplorer(context, () => client);

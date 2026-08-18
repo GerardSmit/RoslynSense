@@ -25,10 +25,15 @@
   "contributes": {
     "languages": [
       {
+        "id": "csharp",
+        "configuration": "./language-configuration/csharp.json"
+      },
+      {
         "id": "cs-embedded",
         "aliases": [
           "Embedded C#"
-        ]
+        ],
+        "configuration": "./language-configuration/csharp.json"
       },
       {
         "id": "webforms",
@@ -85,6 +90,16 @@
           "**/[nN]u[gG]et.[cC]onfig"
         ],
         "configuration": "./language-configuration/msbuild.json"
+      },
+      {
+        "id": "dbml",
+        "aliases": [
+          "LINQ to SQL"
+        ],
+        "extensions": [
+          ".dbml"
+        ],
+        "configuration": "./language-configuration/dbml.json"
       }
     ],
     "grammars": [
@@ -123,6 +138,11 @@
         "path": "./syntaxes/msbuild.tmLanguage.json"
       },
       {
+        "language": "dbml",
+        "scopeName": "text.xml.dbml",
+        "path": "./syntaxes/dbml.tmLanguage.json"
+      },
+      {
         "scopeName": "text.xml.msbuild.expression",
         "path": "./syntaxes/msbuild.expression.json",
         "injectTo": [
@@ -133,6 +153,9 @@
     "xmlLanguageParticipants": [
       {
         "languageId": "msbuild"
+      },
+      {
+        "languageId": "dbml"
       }
     ],
     "themes": [
@@ -179,11 +202,21 @@
       {
         "language": "csharp",
         "scopes": {
-          "field": ["variable.other.property"],
-          "constant": ["variable.other.constant"],
-          "local": ["variable.other.readwrite"],
-          "delegate": ["entity.name.type.delegate"],
-          "extensionMethod": ["entity.name.function"]
+          "field": [
+            "variable.other.property"
+          ],
+          "constant": [
+            "variable.other.constant"
+          ],
+          "local": [
+            "variable.other.readwrite"
+          ],
+          "delegate": [
+            "entity.name.type.delegate"
+          ],
+          "extensionMethod": [
+            "entity.name.function"
+          ]
         }
       }
     ],
@@ -248,7 +281,13 @@
       {
         "command": "roslynSense.buildCoverageMap",
         "title": "RoslynSense: Build Test Coverage Map",
-        "icon": "$(list-tree)"
+        "icon": "$(map)"
+      },
+      {
+        "command": "roslynSense.coverageMapBuilding",
+        "title": "RoslynSense: Building Test Coverage Map…",
+        "icon": "$(loading~spin)",
+        "enablement": "false"
       },
       {
         "command": "roslynSense.refreshCoverage",
@@ -493,12 +532,14 @@
         {
           "id": "roslynSense.solutionExplorer",
           "name": "Solution",
-          "contextualTitle": "Solution Explorer"
+          "contextualTitle": "Solution Explorer",
+          "icon": "media/solution.svg"
         },
         {
           "id": "roslynSense.coverage",
           "name": "Coverage",
-          "contextualTitle": "Test Coverage"
+          "contextualTitle": "Test Coverage",
+          "icon": "media/coverage.svg"
         }
       ]
     },
@@ -672,6 +713,10 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.coverageMapBuilding",
+          "when": "false"
+        },
+        {
           "command": "roslynSense.showTestsAt",
           "when": "false"
         },
@@ -752,7 +797,12 @@
         },
         {
           "command": "roslynSense.buildCoverageMap",
-          "when": "view == roslynSense.coverage",
+          "when": "view == roslynSense.coverage && !roslynSense.coverageBuilding",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.coverageMapBuilding",
+          "when": "view == roslynSense.coverage && roslynSense.coverageBuilding",
           "group": "navigation@2"
         },
         {
@@ -1051,7 +1101,7 @@
           "default": 15,
           "minimum": 1,
           "maximum": 300,
-          "description": "How long one document’s analyzer pass may take before reporting what it has. A slow analyzer delays squiggles, never typing."
+          "description": "How long an ordinary document’s analyzer pass may take before reporting what it has. Large files scale up from this, to at most four times it, because the work grows with the file. A slow analyzer delays squiggles, never typing."
         },
         "roslynSense.workspaceDiagnostics": {
           "type": "string",
@@ -1068,10 +1118,25 @@
           "default": "openProjects",
           "description": "How much of the solution is swept for the Problems panel."
         },
+        "roslynSense.externalSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "When navigating into a package or framework type, read the source it was compiled from rather than a decompilation of it. Off decompiles everything and never reaches the network. Source embedded in a PDB is always used, since it needs no network."
+        },
         "roslynSense.sourceLink": {
           "type": "boolean",
           "default": true,
-          "description": "When navigating into a package or framework type, fetch the source it was compiled from if its PDB says where to get it. Off decompiles instead and never reaches the network. Downloads are checksum-verified against the PDB."
+          "description": "Fetch source from where a PDB's Source Link map points. Downloads are checksum-verified against the PDB, so a file that does not match the assembly is never shown."
+        },
+        "roslynSense.symbolServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Download PDBs from the Microsoft and NuGet symbol servers for assemblies that ship without them — which is all of the shared .NET framework. Without this, Source Link has nothing to read."
+        },
+        "roslynSense.referenceSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "For .NET Framework, read Microsoft's published reference source for the exact version installed. It carries no checksum, so a file is accepted only if it really declares the type; it is labelled as unverified and is never used for debugging."
         },
         "roslynSense.languages.webforms": {
           "type": "boolean",
@@ -1097,6 +1162,16 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Language features for `.csproj`, `.props`, `.targets`, `packages.config` and `nuget.config`: completion for properties, target frameworks, assembly references and item paths, NuGet package and version completion, hints when a package is outdated, warnings when a pinned version has a published advisory, and go-to-definition from a `PackageReference` to the `Directory.Packages.props` line that sets its version. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.dbml": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for LINQ to SQL models (`.dbml`): an outline of the model, navigation from a generated designer member to the `<Table>`, `<Column>` or `<Association>` it came from, reference counts above each of them, and a lens that refreshes a table from a configured database. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.appsettings": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Reference counts, navigation and completion in `appsettings*.json` and user secrets, joined to the C# that reads them — `GetSection`, indexers, `GetValue`, `Configure<T>` bindings. Off disables it for this window; `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.solutionExplorer.fileIcons": {
           "type": "string",
@@ -1165,18 +1240,18 @@
           ],
           "enumDescriptions": [
             "Start with the projects that were selected last time.",
-            "Start empty unless the panel was opened from a project node.",
-            "Start with no project selected."
+            "Start with all projects unless the panel was opened from a project node.",
+            "Start with all projects."
           ],
           "default": "lastUsed",
-          "description": "Which projects the NuGet panel targets when it opens. A single-project solution always selects that project."
+          "description": "Which projects the NuGet panel targets when it opens. Selecting none means all projects: Update and Uninstall then act on every project that references the package, while Install still asks you to choose. A single-project solution always selects that project."
         }
       }
     }
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "compile:webview": "tsc -p ./tsconfig.webview.json",
+    "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json",
     "build": "npm run compile && npm run compile:webview",
     "vscode:prepublish": "npm run build",
     "watch": "tsc -watch -p ./",
@@ -1185,7 +1260,9 @@
     "check:embedded": "node scripts/checkEmbedded.mjs"
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^9.0.1",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -185,15 +185,22 @@ public class AnalyzerDiagnosticsTests
     public async Task APullRepeatedWithItsOwnResultIdAnswersUnchanged()
     {
         var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
-        AnalyzerDiagnosticCache.Evict(document.Id);
 
         string uri = LspConverters.PathToUri(FixturePaths.WarningsFile);
+
+        // Analysed first, deliberately. The id carries whether analysers are still pending — `:c`
+        // before the pass lands, `:a` after — so pulling twice across the landing is two different
+        // worlds and full-with-a-new-id is the right answer, not a bug. Letting the pass finish
+        // first is what makes "same world" true; without it this asserted that analysis was slower
+        // than two round trips, which held only until analysis got faster.
+        await AnalyzerDiagnosticCache.GetOrComputeAsync(document, default);
 
         var first = await DiagnosticsHandler.PullAsync(
             new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)), default);
 
         var full = Assert.IsType<FullDocumentDiagnosticReport>(first);
         Assert.NotNull(full.ResultId);
+        Assert.EndsWith(":a", full.ResultId);
 
         var second = await DiagnosticsHandler.PullAsync(
             new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)) { PreviousResultId = full.ResultId },

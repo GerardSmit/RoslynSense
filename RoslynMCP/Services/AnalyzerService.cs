@@ -1,8 +1,10 @@
 ﻿using System.Collections.Immutable;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
 
 namespace RoslynMCP.Services;
@@ -123,38 +125,128 @@ internal static class AnalyzerService
         if (compilation is null || model is null)
             return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: false);
 
-        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        budget.CancelAfter(LspFeatureOptions.AnalyzerTimeout);
+        var text = await document.GetTextAsync(cancellationToken);
 
+        // Waiting for a slot is not analysis, so the budget cannot be ticking during it. Every pass
+        // used to start its clock at the top of the method: pull several large files at once and
+        // they all spent most of their 15s queued behind each other, then reported a timeout for
+        // work that had barely started.
+        await s_passes.WaitAsync(cancellationToken);
         try
         {
-            var withAnalyzers = compilation.WithAnalyzers(analyzers, CreateOptions(project));
-            var syntax = await withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(model.SyntaxTree, budget.Token);
-            var semantic = await withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(model, null, budget.Token);
+            var window = BudgetFor(text);
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            budget.CancelAfter(window);
 
-            return new AnalyzerRun(
-                syntax.AddRange(semantic)
-                    .Where(d => d.Location.SourceTree == model.SyntaxTree)
-                    .ToImmutableArray(),
-                Failed: false);
+            var syntaxOnly = ImmutableArray<Diagnostic>.Empty;
+            try
+            {
+                var withAnalyzers = DriverFor(compilation, project, analyzers);
+
+                var syntax = await withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(model.SyntaxTree, budget.Token);
+                syntaxOnly = syntax;
+                var semantic = await withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(model, null, budget.Token);
+
+                return new AnalyzerRun(ForThisTree(syntax.AddRange(semantic), model), Failed: false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                // The syntax pass is the cheap half and is usually already done when the semantic
+                // half runs out of time. Reporting it beats reporting nothing, and Failed still
+                // keeps the caller from caching this as a clean file.
+                ServiceLog.Warn(
+                    $"Analyzers timed out after {window.TotalSeconds:0}s for '{document.Name}' "
+                    + $"({text.Lines.Count} lines, {analyzers.Length} analyzers); "
+                    + "showing compiler and syntax diagnostics only.",
+                    key: "analyzer-timeout");
+                return new AnalyzerRun(ForThisTree(syntaxOnly, model), Failed: true);
+            }
+            catch (Exception ex)
+            {
+                ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex.Message}", key: "analyzer-failure");
+                return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
+            }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        finally
         {
-            throw;
+            s_passes.Release();
         }
-        catch (OperationCanceledException)
-        {
-            ServiceLog.Warn(
-                $"Analyzers timed out after {LspFeatureOptions.AnalyzerTimeout.TotalSeconds:0}s " +
-                $"for '{document.Name}'; showing compiler diagnostics only.",
-                key: "analyzer-timeout");
-            return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
-        }
-        catch (Exception ex)
-        {
-            ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex.Message}", key: "analyzer-failure");
-            return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
-        }
+    }
+
+    private static ImmutableArray<Diagnostic> ForThisTree(
+        ImmutableArray<Diagnostic> diagnostics, SemanticModel model) =>
+        [.. diagnostics.Where(d => d.Location.SourceTree == model.SyntaxTree)];
+
+    /// <summary>
+    /// How many analyzer passes may run at once.
+    /// </summary>
+    /// <remarks>
+    /// A pass already parallelises across analyzers internally (<c>concurrentAnalysis</c>), so
+    /// running many at once does not finish more work — it divides one machine's cores among them
+    /// and makes every one of them slower, which with a per-pass deadline means they miss it
+    /// together rather than completing one after another. Two, so a keystroke in the open file is
+    /// not stuck behind a workspace sweep of some other project.
+    /// </remarks>
+    private static readonly SemaphoreSlim s_passes = new(2, 2);
+
+    /// <summary>
+    /// The time budget for one file. <see cref="LspFeatureOptions.AnalyzerTimeout"/> is what an
+    /// ordinary file gets; past a few thousand lines the work is roughly linear in size, and a flat
+    /// deadline is one that only large files can miss — so they get proportionally more, up to a
+    /// ceiling that keeps a pathological file from occupying a slot indefinitely.
+    /// </summary>
+    private static TimeSpan BudgetFor(SourceText text)
+    {
+        var baseline = LspFeatureOptions.AnalyzerTimeout;
+        int lines = text.Lines.Count;
+        if (lines <= OrdinaryFileLines)
+            return baseline;
+
+        var scaled = baseline + TimeSpan.FromMilliseconds((lines - OrdinaryFileLines) * MillisecondsPerLine);
+        var ceiling = baseline * MaxBudgetMultiple;
+        return scaled < ceiling ? scaled : ceiling;
+    }
+
+    private const int OrdinaryFileLines = 2_000;
+    private const double MillisecondsPerLine = 1.5;
+    private const int MaxBudgetMultiple = 4;
+
+    internal static TimeSpan BudgetForTesting(SourceText text) => BudgetFor(text);
+
+    internal static CompilationWithAnalyzers DriverForTesting(
+        Compilation compilation, Project project, ImmutableArray<DiagnosticAnalyzer> analyzers) =>
+        DriverFor(compilation, project, analyzers);
+
+    /// <summary>
+    /// One analyzer driver per compilation, instead of one per request.
+    /// </summary>
+    /// <remarks>
+    /// A <see cref="CompilationWithAnalyzers"/> carries the per-analyzer state Roslyn builds on
+    /// first use — every analyzer's <c>Initialize</c> and every compilation-start action — and
+    /// throwing it away after one file makes the next file rebuild all of it. Keyed on the
+    /// compilation by reference and held weakly: compilations are immutable and a new one appears
+    /// on every edit, so an entry becomes garbage exactly when the edit that replaced it does, and
+    /// nothing has to decide when to evict.
+    /// </remarks>
+    private static readonly ConditionalWeakTable<Compilation, DriverEntry> s_drivers = new();
+
+    private sealed record DriverEntry(ImmutableArray<DiagnosticAnalyzer> Analyzers, CompilationWithAnalyzers Driver);
+
+    private static CompilationWithAnalyzers DriverFor(
+        Compilation compilation, Project project, ImmutableArray<DiagnosticAnalyzer> analyzers)
+    {
+        if (s_drivers.TryGetValue(compilation, out var entry) && entry.Analyzers.SequenceEqual(analyzers))
+            return entry.Driver;
+
+        // Rebuilt rather than reused when the analyzer set changed under us — toggling code-style
+        // diagnostics, or a project whose analyzer references were reloaded.
+        var driver = compilation.WithAnalyzers(analyzers, CreateOptions(project));
+        s_drivers.AddOrUpdate(compilation, new DriverEntry(analyzers, driver));
+        return driver;
     }
 
     /// <summary>

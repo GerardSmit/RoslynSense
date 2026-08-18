@@ -229,4 +229,61 @@ public class AnalyzerInfrastructureTests
             Directory.Delete(sourceDir, recursive: true);
         }
     }
+
+    /// <summary>
+    /// A large file gets proportionally longer to analyse. A flat deadline is one only large files
+    /// can miss, which is the shape the timeouts had: the same handful of generated 8k–21k-line
+    /// files failed every pull while everything else passed.
+    /// </summary>
+    [Fact]
+    public void WhenFileIsLargeThenAnalyzerBudgetGrowsWithItUpToACeiling()
+    {
+        var previous = LspFeatureOptions.AnalyzerTimeout;
+        try
+        {
+            LspFeatureOptions.AnalyzerTimeout = TimeSpan.FromSeconds(15);
+
+            var ordinary = Budget(500);
+            var large = Budget(12_000);
+            var pathological = Budget(500_000);
+
+            Assert.Equal(TimeSpan.FromSeconds(15), ordinary);
+            Assert.True(large > ordinary, $"12k lines got {large}, no more than an ordinary file");
+            Assert.True(pathological <= TimeSpan.FromSeconds(60), $"uncapped: {pathological}");
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerTimeout = previous;
+        }
+
+        static TimeSpan Budget(int lines) =>
+            AnalyzerService.BudgetForTesting(
+                Microsoft.CodeAnalysis.Text.SourceText.From(string.Join('\n', new string[lines])));
+    }
+
+    /// <summary>
+    /// Two documents of the same compilation share one analyzer driver. Rebuilding it per request
+    /// re-ran every analyzer's initialization, which measured as roughly a third of the cost of a
+    /// pass on a large file.
+    /// </summary>
+    [Fact]
+    public async Task WhenTwoDocumentsShareACompilationThenTheyShareTheAnalyzerDriver()
+    {
+        var project = await RoslynTestHelpers.OpenProjectAsync(
+            FixturePaths.SampleProjectFile, FixturePaths.WarningsFile);
+        var analyzers = AnalyzerService.GetAnalyzersFor(project);
+        Assert.False(analyzers.IsDefaultOrEmpty);
+
+        var compilation = await project.GetCompilationAsync();
+        Assert.NotNull(compilation);
+
+        var first = AnalyzerService.DriverForTesting(compilation!, project, analyzers);
+        var second = AnalyzerService.DriverForTesting(compilation!, project, analyzers);
+        Assert.Same(first, second);
+
+        // A different analyzer set is a different driver, or a toggled option would keep serving
+        // results from the set it was turned off for.
+        var narrowed = analyzers.RemoveAt(0);
+        Assert.NotSame(first, AnalyzerService.DriverForTesting(compilation!, project, narrowed));
+    }
 }

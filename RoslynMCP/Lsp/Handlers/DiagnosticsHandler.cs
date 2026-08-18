@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis;
 using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.ExternalSource;
 using RoslynDiagnostic = Microsoft.CodeAnalysis.Diagnostic;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -17,11 +18,12 @@ internal static class DiagnosticsHandler
     public static async Task<Protocol.Diagnostic[]> ComputeAsync(
         string filePath, CancellationToken ct, LanguageSession? languages = null)
     {
-        // Decompiled source is a reading aid, not a compilable file: it is a best-effort
-        // reconstruction that legitimately references internals and compiler-generated names, and
-        // squiggling it reports on the decompiler rather than on the user's code. Visual Studio
-        // and Rider do not diagnose it either.
-        if (Services.DecompiledSourceService.IsDecompiledPath(filePath))
+        // A dependency's source is a reading aid, not a compilable file. A decompilation
+        // legitimately references internals and compiler-generated names; real framework source
+        // needs partials and preprocessor symbols no single file carries. Either way the squiggles
+        // would report on how the file was obtained rather than on the user's code, and neither
+        // Visual Studio nor Rider diagnoses it.
+        if (ExternalSourceCache.IsExternalSourcePath(filePath))
             return Array.Empty<Protocol.Diagnostic>();
 
         // A web.config belongs to no project in Roslyn's sense, so it has to be claimed before the
@@ -46,11 +48,12 @@ internal static class DiagnosticsHandler
     public static async Task<Protocol.Diagnostic[]> ComputeWithAnalyzersAsync(
         string filePath, CancellationToken ct, LanguageSession? languages = null)
     {
-        // Decompiled source is a reading aid, not a compilable file: it is a best-effort
-        // reconstruction that legitimately references internals and compiler-generated names, and
-        // squiggling it reports on the decompiler rather than on the user's code. Visual Studio
-        // and Rider do not diagnose it either.
-        if (Services.DecompiledSourceService.IsDecompiledPath(filePath))
+        // A dependency's source is a reading aid, not a compilable file. A decompilation
+        // legitimately references internals and compiler-generated names; real framework source
+        // needs partials and preprocessor symbols no single file carries. Either way the squiggles
+        // would report on how the file was obtained rather than on the user's code, and neither
+        // Visual Studio nor Rider diagnoses it.
+        if (ExternalSourceCache.IsExternalSourcePath(filePath))
             return Array.Empty<Protocol.Diagnostic>();
 
         // A web.config belongs to no project in Roslyn's sense, so it has to be claimed before the

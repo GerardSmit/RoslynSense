@@ -12,6 +12,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RoslynMCP.DebugWorker", "Ro
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RoslynMCP.HotReloadAgent", "RoslynMCP.HotReloadAgent\RoslynMCP.HotReloadAgent.csproj", "{CAB40215-C3D3-420E-8EBB-454FCF447934}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RoslynSense.Tray", "RoslynSense.Tray\RoslynSense.Tray.csproj", "{386050FA-BD0E-484F-9411-B806F663F2BE}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -94,6 +96,18 @@ Global
 		{CAB40215-C3D3-420E-8EBB-454FCF447934}.Release|x64.Build.0 = Release|Any CPU
 		{CAB40215-C3D3-420E-8EBB-454FCF447934}.Release|x86.ActiveCfg = Release|Any CPU
 		{CAB40215-C3D3-420E-8EBB-454FCF447934}.Release|x86.Build.0 = Release|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Debug|x64.Build.0 = Debug|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Debug|x86.Build.0 = Debug|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Release|x64.ActiveCfg = Release|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Release|x64.Build.0 = Release|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Release|x86.ActiveCfg = Release|Any CPU
+		{386050FA-BD0E-484F-9411-B806F663F2BE}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

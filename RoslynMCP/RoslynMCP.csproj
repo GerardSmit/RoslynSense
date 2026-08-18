@@ -19,7 +19,7 @@
            exact characters in the buffer and an edit rewrites one value without reformatting the
            file. Error-tolerant, which is what an open document needs — `Version="` with no closing
            quote still parses, and the attribute node is still there to complete against. -->
-      <PackageReference Include="GerardSmit.Language.Xml" Version="2.0.8" />
+      <PackageReference Include="GerardSmit.Language.Xml" Version="2.1.0" />
       <PackageReference Include="ICSharpCode.Decompiler" Version="10.1.1.8388" />
       <PackageReference Include="JsonPath.Net" Version="2.1.1" />
       <PackageReference Include="Microsoft.AspNetCore.Razor.Language" Version="6.0.36" />
@@ -167,6 +167,48 @@
       <ItemGroup>
         <ResolvedFileToPublish Include="@(_HotReloadAgentPublish)">
           <RelativePath>hotreload\%(Filename)%(Extension)</RelativePath>
+          <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </ResolvedFileToPublish>
+      </ItemGroup>
+    </Target>
+
+    <!--
+      The tray icon, shipped as a payload beside the tool rather than referenced. It is a WinForms
+      app on net10.0-windows and this tool is cross-platform net10.0, so a ProjectReference would
+      make the whole package Windows-only; the daemon starts it by path (Host/TrayLauncher.cs) and
+      simply does without when the file is absent, which is what a non-Windows publish produces.
+
+      Set BuildTrayIcon=false to skip it.
+    -->
+    <PropertyGroup>
+      <BuildTrayIcon Condition="'$(BuildTrayIcon)' == ''">true</BuildTrayIcon>
+      <TrayStagingDir>$(MSBuildThisFileDirectory)$(BaseIntermediateOutputPath)tray\$(Configuration)\</TrayStagingDir>
+      <_BuildTrayIcon>false</_BuildTrayIcon>
+      <_BuildTrayIcon Condition="'$(BuildTrayIcon)' == 'true' AND '$(OS)' == 'Windows_NT'">true</_BuildTrayIcon>
+    </PropertyGroup>
+
+    <!-- Published, not built: the tray has to be launchable from the staging directory, which
+         means the apphost, deps.json and runtimeconfig.json alongside the assembly. -->
+    <Target Name="PublishTrayIcon" Condition="'$(_BuildTrayIcon)' == 'true'">
+      <!-- As with the hot reload agent: strip the outer TFM and publish globals so the tray
+           builds as net10.0-windows rather than being forced to this project's net10.0. -->
+      <MSBuild Projects="..\RoslynSense.Tray\RoslynSense.Tray.csproj" Targets="Publish"
+               Properties="Configuration=$(Configuration);PublishDir=$(TrayStagingDir)"
+               RemoveProperties="TargetFramework;NoBuild;RuntimeIdentifier;SelfContained;PublishProfile" />
+    </Target>
+
+    <Target Name="CopyTrayIconToOutput" AfterTargets="Build" DependsOnTargets="PublishTrayIcon" Condition="'$(_BuildTrayIcon)' == 'true'">
+      <ItemGroup>
+        <_StagedTray Include="$(TrayStagingDir)**\*" />
+      </ItemGroup>
+      <Copy SourceFiles="@(_StagedTray)" DestinationFiles="@(_StagedTray->'$(OutputPath)tray\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    </Target>
+
+    <Target Name="AddTrayIconToPublish" AfterTargets="ComputeFilesToPublish" DependsOnTargets="PublishTrayIcon" Condition="'$(_BuildTrayIcon)' == 'true'">
+      <ItemGroup>
+        <_StagedTray Include="$(TrayStagingDir)**\*" />
+        <ResolvedFileToPublish Include="@(_StagedTray)">
+          <RelativePath>tray\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
           <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
         </ResolvedFileToPublish>
       </ItemGroup>

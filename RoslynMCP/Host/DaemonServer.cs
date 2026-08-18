@@ -73,6 +73,11 @@ internal sealed class DaemonServer
         string pipeName = HostPaths.PipeName(solutionKey);
         Console.Error.WriteLine($"[Daemon] Host started for '{solutionKey}' (pipe '{pipeName}', idle {settings.HostIdleMinutes}m).");
 
+        // Say who we are, then make sure something is showing it. Both are advisory and neither
+        // can fail the host.
+        HostRegistry.Publish(solutionKey);
+        TrayLauncher.EnsureRunning();
+
         // No eager warm-up: projects load lazily on the first tool call that touches them
         // (open file X -> load X + its references only). Warming the whole solution here would
         // reintroduce the all-projects load the incremental workspace exists to avoid.
@@ -90,6 +95,7 @@ internal sealed class DaemonServer
         catch (OperationCanceledException) { /* idle shutdown */ }
 
         Console.Error.WriteLine("[Daemon] Idle/shutdown; disposing workspaces.");
+        HostRegistry.Withdraw(solutionKey);
         await WorkspaceService.ShutdownAsync();
         AnalyzerService.DisposeHost();
         ProjectIndexCacheService.DisposeAll();

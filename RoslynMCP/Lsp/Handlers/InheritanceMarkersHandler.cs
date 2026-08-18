@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Services.ExternalSource;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -98,10 +99,15 @@ internal static class InheritanceMarkersHandler
         if (sourceLocation is not null)
             return LspConverters.ToLocation(sourceLocation);
 
-        var decompiled = await DecompiledSourceService.TryDecompileSymbolAsync(
-            target, document.Project, ct);
-        var location = decompiled?.Locations.FirstOrDefault(l => l.IsInSource);
-        return location is null ? null : LspConverters.ToLocation(location);
+        var external = await ExternalSourceService.TryResolveAsync(target, document.Project, ct);
+        if (external is null)
+            return null;
+
+        return new LspLocation(
+            LspConverters.PathToUri(external.FilePath),
+            new Protocol.Range(
+                new Position(external.Primary.Line, external.Primary.Character),
+                new Position(external.Primary.Line, external.Primary.Character)));
     }
 
     internal static IEnumerable<string> ApplicableUpKinds(ISymbol symbol)

@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.ExternalSource;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -158,26 +159,23 @@ internal static class NavigationHandlers
         if (locations.Length > 0)
             return locations;
 
-        // Metadata symbol (framework/package type). Its own source first, if the assembly says
-        // where to get it: Source Link gives the file the author wrote, comments and all, where
-        // decompilation gives a faithful but stripped reconstruction of it.
-        if (await Services.SourceLinkService.TryResolveAsync(symbol, project, ct) is { } linked)
-        {
-            var line = Math.Max(0, linked.Line - 1);
-            return
-            [
-                new LspLocation(
-                    LspConverters.PathToUri(linked.FilePath),
-                    new Protocol.Range(new Position(line, 0), new Position(line, 0))),
-            ];
-        }
+        // Metadata symbol (framework/package type). Real source where it can be had, a
+        // decompilation where it cannot — the facade decides, and always answers.
+        var external = await ExternalSourceService.TryResolveAsync(symbol, project, ct);
+        if (external is null)
+            return [];
 
-        var decompiled = await Services.DecompiledSourceService.TryDecompileSymbolAsync(
-            symbol, project, ct);
-        var location = decompiled?.Locations.FirstOrDefault(l => l.IsInSource);
-        return location is not null && LspConverters.ToLocation(location) is { } lsp
-            ? [lsp]
-            : Array.Empty<LspLocation>();
+        // Every position, not just the first: a partial framework type is declared in several
+        // files, and offering them all is what lets the editor peek rather than guess.
+        var uri = LspConverters.PathToUri(external.FilePath);
+        return
+        [
+            .. external.Positions.Select(position => new LspLocation(
+                uri,
+                new Protocol.Range(
+                    new Position(position.Line, position.Character),
+                    new Position(position.Line, position.Character)))),
+        ];
     }
 
     /// <summary>

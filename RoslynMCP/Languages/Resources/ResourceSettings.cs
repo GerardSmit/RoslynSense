@@ -153,14 +153,16 @@ internal sealed record ResourceSettings
 
         foreach (var lookup in configured)
         {
-            if (lookup.ContainingType is not { Length: > 0 } containingType
-                || lookup.MethodName is not { Length: > 0 } methodName)
+            if (lookup.MethodName is not { Length: > 0 } methodName)
             {
-                warnings.Add("resources.lookups: an entry has no containingType or methodName; skipped.");
+                warnings.Add("resources.lookups: an entry has no methodName; skipped.");
                 continue;
             }
 
-            string member = $"{containingType}.{methodName}";
+            // Omitted containingType is the documented way to catch a helper each module
+            // redeclares for itself; the entry stays, matched on name and signature alone.
+            string? containingType = lookup.ContainingType is { Length: > 0 } declared ? declared : null;
+            string member = containingType is null ? methodName : $"{containingType}.{methodName}";
 
             if (!Parse<RootSource>(lookup.RootSource, member, "rootSource", warnings, out var source)
                 || !Parse<RootInterpretation>(

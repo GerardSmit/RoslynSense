@@ -8,6 +8,7 @@ using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Tools;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -126,7 +127,66 @@ public class ResourceKeyEditorTests
         Assert.NotEqual(locations[0].Range.Start.Line, locations[1].Range.Start.Line);
     }
 
+    [Fact]
+    public async Task DefinitionFromAKeyInsideAnInlineCodeBlockReachesTheResx()
+    {
+        Publish();
+
+        var locations = await AspxLanguageHandler.DefinitionAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.DefaultAspxFile),
+                PositionOf(FixturePaths.DefaultAspxFile, "GetString(\"Greeting\"", "GetString(\"".Length)),
+            typeDefinition: false,
+            default);
+
+        // The caret is in a string literal, which binds to nothing, so the projection's symbol
+        // lookup answers null and this is the whole feature: without the markup path asking the
+        // embedded languages, F12 here does nothing while the identical call in the code-behind
+        // beside it navigates.
+        Assert.Equal(
+            ["Default.aspx.resx"],
+            locations.Select(l => FileNameOf(l.Uri)));
+    }
+
+    [Fact]
+    public async Task TheDefinitionToolReachesTheResxFromInsideAnInlineCodeBlockToo()
+    {
+        Publish();
+
+        var result = await GoToDefinitionSnippetTool.GoToDefinitionSnippet(
+            filePath: FixturePaths.DefaultAspxFile,
+            markupSnippet: "GetString(\"[|Greeting|]\", this)",
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.GoToDefinition);
+
+        // The tool surface answered "No symbol found" here for the same reason F12 answered
+        // nothing: a key is not a symbol. A session and the editor must not resolve one caret two
+        // different ways.
+        Assert.Contains("Default.aspx.resx", result, StringComparison.Ordinal);
+        Assert.Contains("Greeting.Text", result, StringComparison.Ordinal);
+    }
+
     // ---- Hover -------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task HoverOnAKeyInsideAnInlineCodeBlockDescribesIt()
+    {
+        Publish();
+
+        var hover = await AspxLanguageHandler.HoverAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.DefaultAspxFile),
+                PositionOf(FixturePaths.DefaultAspxFile, "GetString(\"Greeting\"", "GetString(\"".Length)),
+            default);
+
+        Assert.NotNull(hover);
+        Assert.Contains("Greeting.Text", hover!.Contents.Value, StringComparison.Ordinal);
+
+        // The pack computed it against the projection, whose offsets name characters no one can
+        // see. Reporting it would highlight the wrong run of markup.
+        Assert.Null(hover.Range);
+    }
+
 
     [Fact]
     public async Task HoverOnAKeyNamesTheTranslationsAndTheCustomizationsBesideIt()
@@ -253,5 +313,77 @@ public class ResourceKeyEditorTests
         // Both write the same key: DNN appends `.Text` when the key carries no dot of its own.
         Assert.Equal("Greeting.Text", byPath.Key);
         Assert.Equal("Greeting.Text", byControl.Key);
+    }
+
+    // ---- A lookup that names no type ---------------------------------------------------------
+
+    [Fact]
+    public async Task ALookupWithNoContainingTypeMatchesAWrapperTheConfigurationCannotName()
+    {
+        var pack = Publish();
+
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.LocalizedCodeBehindFile);
+        var root = await document.GetSyntaxRootAsync(default);
+        var semanticModel = await document.GetSemanticModelAsync(default);
+        var catalog = await pack.CatalogAsync(document.Project, default);
+        string text = await File.ReadAllTextAsync(FixturePaths.LocalizedCodeBehindFile);
+
+        int offset = text.IndexOf("GetString(\"Greeting\")", StringComparison.Ordinal);
+        Assert.True(offset >= 0, "the wrapper call is not in the code-behind.");
+        var token = root!.FindToken(offset + "GetString(\"".Length);
+
+        async Task<ResourceKeySearch.CodeMatch?> KeyAtAsync(ResourceSettings settings) =>
+            await ResourceKeySearch.KeyAtAsync(
+                settings, catalog, document.Project, semanticModel!, token, default);
+
+        // The page declares the wrapper itself, so no preset lookup — every one of which names the
+        // type declaring the member — reaches it.
+        Assert.Null(await KeyAtAsync(pack.Settings));
+
+        // Matched on the shape of the call alone — and the root still comes from the containing
+        // type, so it lands on the page's own family rather than on a guess.
+        var match = await KeyAtAsync(TypelessGetString("string"));
+
+        Assert.NotNull(match);
+        Assert.Equal("Greeting.Text", match!.Key);
+        Assert.Equal(RootConfidence.Exact, match.Confidence);
+        Assert.Equal("Localized.aspx", Assert.Single(match.Candidates).BaseName);
+
+        // The same signature in the other spelling. A configuration reaching for the framework
+        // name is writing house style, not a different claim about the code, and a lookup that
+        // binds nothing because of it says nothing about why.
+        var framework = await KeyAtAsync(TypelessGetString("System.String"));
+
+        Assert.NotNull(framework);
+        Assert.Equal("Greeting.Text", framework!.Key);
+    }
+
+    /// <summary>A <c>GetString(key)</c> lookup that names no declaring type, with its one
+    /// parameter spelled as given.</summary>
+    private static ResourceSettings TypelessGetString(string parameterType)
+    {
+        var warnings = new List<string>();
+
+        var settings = ResourceSettings.Resolve(
+            enabled: true,
+            new ResourcesConfig
+            {
+                Lookups =
+                [
+                    new ResourceLookupConfig
+                    {
+                        MethodName = "GetString",
+                        ParameterTypes = [parameterType],
+                        KeyIndex = 0,
+                        RootSource = "containingType",
+                        RootInterpretation = "virtualPath",
+                        DefaultKeySuffix = ".Text",
+                    },
+                ],
+            },
+            warnings);
+
+        Assert.Empty(warnings);
+        return settings;
     }
 }

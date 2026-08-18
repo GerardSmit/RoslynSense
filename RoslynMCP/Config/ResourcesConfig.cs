@@ -77,7 +77,11 @@ public sealed class ResourceConventionConfig
 /// <summary>A call shape that carries a resource key, and where its root comes from.</summary>
 public sealed class ResourceLookupConfig
 {
-    /// <summary>Fully-qualified name of the type declaring the member.</summary>
+    /// <summary>
+    /// Fully-qualified name of the type declaring the member. Omitted matches any type that
+    /// declares a member of this name and signature — for a codebase where each module wraps
+    /// localization in its own private helper, which no list of type names can keep up with.
+    /// </summary>
     public string? ContainingType { get; init; }
 
     /// <summary>The method name, or <c>Item</c> for an indexer.</summary>

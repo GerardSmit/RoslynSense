@@ -238,8 +238,13 @@ internal static class ResourceKeySearch
     {
         var definition = member.OriginalDefinition;
 
-        if (definition.ContainingType is not { } containing || !DeclaredBy(containing, lookup.ContainingType))
+        // A lookup with no containingType asks only about the shape of the call. See
+        // ResourceLookup.ContainingType for why that is opt-in rather than the default.
+        if (lookup.ContainingType is { Length: > 0 } declaring
+            && (definition.ContainingType is not { } containing || !DeclaredBy(containing, declaring)))
+        {
             return false;
+        }
 
         return lookup.ParameterTypes is not { } expected || Signature(definition, expected);
     }
@@ -292,12 +297,26 @@ internal static class ResourceKeySearch
             if (expected[i].Equals(Wildcard, StringComparison.Ordinal))
                 continue;
 
-            if (!parameters[i].Type.ToDisplayString(s_typeName).Equals(expected[i], StringComparison.Ordinal))
+            if (!Named(parameters[i].Type, expected[i]))
                 return false;
         }
 
         return true;
     }
+
+    /// <summary>
+    /// Whether a parameter's type is the one a configured signature named, in either spelling.
+    /// </summary>
+    /// <remarks>
+    /// <c>string</c> and <c>System.String</c> both, because the alternative is a lookup that binds
+    /// nothing and says nothing about why. Every other field of a lookup is a name that either
+    /// resolves or does not; the keyword-versus-framework spelling of a built-in is the one place
+    /// where a correct-looking entry is silently inert, and which of the two a configuration
+    /// reaches for is a house style rather than a statement about the code.
+    /// </remarks>
+    private static bool Named(ITypeSymbol type, string expected) =>
+        type.ToDisplayString(s_typeName).Equals(expected, StringComparison.Ordinal)
+        || type.ToDisplayString(s_frameworkTypeName).Equals(expected, StringComparison.Ordinal);
 
     /// <summary>
     /// The literal without its quotes — the key is the content, not the syntax around it. Falls
@@ -326,6 +345,12 @@ internal static class ResourceKeySearch
         typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
         genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
         miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
+
+    /// <summary>The same, with the built-ins under their framework names — <c>System.String</c>
+    /// rather than <c>string</c>.</summary>
+    private static readonly SymbolDisplayFormat s_frameworkTypeName = new(
+        typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+        genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters);
 
     /// <summary>Fully qualified with the type arguments dropped, so a call through
     /// <c>IStringLocalizer&lt;Home&gt;</c> matches a lookup written against

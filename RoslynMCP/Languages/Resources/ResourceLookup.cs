@@ -63,7 +63,19 @@ internal enum RootInterpretation
 /// </remarks>
 internal sealed record ResourceLookup
 {
-    public required string ContainingType { get; init; }
+    /// <summary>
+    /// Fully-qualified name of the type declaring the member, or null to match on the name and
+    /// signature alone.
+    /// </summary>
+    /// <remarks>
+    /// Omitting it is the escape hatch for a codebase that wraps localization per module: a page
+    /// declaring its own <c>protected string GetString(string key)</c> is declared by nothing the
+    /// configuration can name, and one such wrapper per module is a list nobody will keep current.
+    /// It is deliberately not the default — every preset lookup names its type, because a bare
+    /// name matches any method called <c>GetString</c> in the solution, including one that has
+    /// nothing to do with resources.
+    /// </remarks>
+    public string? ContainingType { get; init; }
 
     public required string MethodName { get; init; }
 

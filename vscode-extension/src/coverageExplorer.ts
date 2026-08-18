@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
+import { onCoverageMapProgress } from './coverageMapProgress';
 
 /**
  * The Coverage view: a dotCover-style tree of namespace → class → method, each row carrying its
@@ -167,6 +168,33 @@ export function registerCoverageExplorer(
         vscode.commands.registerCommand('roslynSense.refreshCoverage', refresh)
     );
 
+    // A map build in any window shows in this view: a textual bar in the header (tree views
+    // have no determinate progress API) and the view's own busy indicator, then a refresh so
+    // the finished build's numbers appear without being asked for.
+    let endBusy: (() => void) | undefined;
+    context.subscriptions.push(
+        onCoverageMapProgress((event) => {
+            if (event.done) {
+                view.message = undefined;
+                endBusy?.();
+                endBusy = undefined;
+                void refresh();
+                return;
+            }
+
+            view.message = `${textBar(event.percentage)} ${event.percentage}% — ${event.message}`;
+            if (!endBusy) {
+                void vscode.window.withProgress(
+                    { location: { viewId: 'roslynSense.coverage' } },
+                    () => new Promise<void>((resolve) => {
+                        endBusy = resolve;
+                    })
+                );
+            }
+        }),
+        { dispose: () => endBusy?.() }
+    );
+
     // Filled in when the view is first shown rather than on activation: the snapshot is a file
     // read, but there is no reason to do it for a window that never opens the view.
     context.subscriptions.push(
@@ -246,6 +274,12 @@ function ratio(node: Node): number {
 
 function sum<T>(items: T[], select: (item: T) => number): number {
     return items.reduce((total, item) => total + select(item), 0);
+}
+
+/** A ten-segment bar in text, because TreeView.message renders nothing richer. */
+function textBar(percentage: number): string {
+    const filled = Math.max(0, Math.min(10, Math.round(percentage / 10)));
+    return '▰'.repeat(filled) + '▱'.repeat(10 - filled);
 }
 
 function percent(covered: number, total: number): string {

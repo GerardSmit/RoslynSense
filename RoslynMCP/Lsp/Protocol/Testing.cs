@@ -137,6 +137,16 @@ public sealed record BuildCoverageMapParams(
     [property: JsonPropertyName("projectPath")] string? ProjectPath = null,
     [property: JsonPropertyName("force")] bool Force = false);
 
+/// <summary>
+/// One tick of a coverage-map build, pushed as <c>roslynSense/coverageMapProgress</c>. The
+/// percentage spans the whole build across every project; <c>done</c> is always the last event,
+/// whatever way the build ended.
+/// </summary>
+public sealed record CoverageMapProgressEvent(
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("percentage")] int Percentage,
+    [property: JsonPropertyName("done")] bool Done);
+
 public sealed record BuildCoverageMapResult(
     [property: JsonPropertyName("classesRun")] int ClassesRun,
     [property: JsonPropertyName("classesReused")] int ClassesReused,

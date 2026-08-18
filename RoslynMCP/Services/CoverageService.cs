@@ -47,9 +47,19 @@ public static class CoverageService
     /// One coverage run, parsed but not cached — for callers that run many filtered passes in a
     /// row and must not have each one overwrite the session's "current" coverage.
     /// </summary>
+    /// <param name="noBuild">Skip building — for callers that built once and run many passes.</param>
+    /// <param name="dynamicInstrumentation">
+    /// Use the profiler-based "Code Coverage" collector (ships with Microsoft.NET.Test.Sdk)
+    /// instead of coverlet. Coverlet rewrites the assemblies on disk for the duration of the run,
+    /// so two coverlet runs on the same output directory corrupt each other; the dynamic
+    /// collector instruments in memory, which is what makes concurrent passes safe. Old SDKs
+    /// cannot write Cobertura from it — that run comes back with
+    /// <see cref="CoverageResult.NoCoverageFile"/> so the caller can fall back.
+    /// </param>
     public static async Task<CoverageResult> CollectAsync(
         string projectPath, string? filter = null, int timeoutSeconds = 300,
-        CancellationToken cancellationToken = default, BuildWarningsStore? warningsStore = null)
+        CancellationToken cancellationToken = default, BuildWarningsStore? warningsStore = null,
+        bool noBuild = false, bool dynamicInstrumentation = false)
     {
         string csprojPath;
         if (projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) && File.Exists(projectPath))
@@ -65,7 +75,7 @@ public static class CoverageService
         }
 
         if (PathHelper.RequiresMsBuild(csprojPath))
-            return await RunLegacyCoverageAsync(csprojPath, filter, timeoutSeconds, cancellationToken, warningsStore);
+            return await RunLegacyCoverageAsync(csprojPath, filter, timeoutSeconds, cancellationToken, warningsStore, noBuild);
 
         // Create a temp directory for results to avoid conflicts
         string resultsDir = Path.Combine(Path.GetTempPath(), "roslyn-mcp-coverage", Guid.NewGuid().ToString("N"));
@@ -78,15 +88,25 @@ public static class CoverageService
             args.Append('"');
             args.Append(csprojPath);
             args.Append('"');
-            args.Append(" --collect:\"XPlat Code Coverage\"");
+            args.Append(dynamicInstrumentation
+                ? " --collect:\"Code Coverage;Format=cobertura\""
+                : " --collect:\"XPlat Code Coverage\"");
             args.Append($" --results-directory \"{resultsDir}\"");
             args.Append(" --nologo");
+            if (noBuild)
+            {
+                args.Append(" --no-build");
+            }
             if (!string.IsNullOrWhiteSpace(filter))
             {
                 args.Append($" --filter \"{filter.Replace("\"", "\\\"")}\"");
             }
-            // Include test assembly in coverage (for projects with code and tests together)
-            args.Append(" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeTestAssembly=true");
+            if (!dynamicInstrumentation)
+            {
+                // Include test assembly in coverage (for projects with code and tests together);
+                // the dynamic collector includes it on its own.
+                args.Append(" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeTestAssembly=true");
+            }
 
             using var process = new Process
             {
@@ -144,12 +164,16 @@ public static class CoverageService
                 return new CoverageResult(false, $"Tests failed (exit code {process.ExitCode}).\n{output}", null);
             }
 
-            // Find the coverage.cobertura.xml file
-            var coberturaFile = Directory.GetFiles(resultsDir, "coverage.cobertura.xml", SearchOption.AllDirectories)
+            // coverlet writes coverage.cobertura.xml; the dynamic collector writes <guid>.cobertura.xml
+            var coberturaFile = Directory.GetFiles(resultsDir, "*.cobertura.xml", SearchOption.AllDirectories)
                 .FirstOrDefault();
 
             if (coberturaFile is null)
-                return new CoverageResult(false, "Coverage file not found. Ensure coverlet.collector is referenced in the test project.", null);
+                return new CoverageResult(false,
+                    dynamicInstrumentation
+                        ? "Coverage file not found. The 'Code Coverage' collector could not write Cobertura on this SDK."
+                        : "Coverage file not found. Ensure coverlet.collector is referenced in the test project.",
+                    null, NoCoverageFile: true);
 
             var data = ParseCoberturaXml(coberturaFile);
             ComputeSourceHashes(data);
@@ -169,7 +193,7 @@ public static class CoverageService
     /// </summary>
     private static async Task<CoverageResult> RunLegacyCoverageAsync(
         string csprojPath, string? filter, int timeoutSeconds, CancellationToken cancellationToken,
-        BuildWarningsStore? warningsStore = null)
+        BuildWarningsStore? warningsStore = null, bool noBuild = false)
     {
         var msbuild = MsBuildLocator.FindMsBuild();
         if (msbuild is null)
@@ -191,21 +215,23 @@ public static class CoverageService
                 : "Coverage collection was cancelled.";
 
         // Build the project
-        var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
-        using (var buildProcess = new Process
+        if (!noBuild)
         {
-            StartInfo = new ProcessStartInfo
+            var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
+            using var buildProcess = new Process
             {
-                FileName = msbuild,
-                Arguments = buildArgs,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = workingDirectory
-            }
-        })
-        {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = msbuild,
+                    Arguments = buildArgs,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = workingDirectory
+                }
+            };
+
             BuildProcessHelper.ConfigureMsBuildEnvironment(buildProcess.StartInfo);
             MsBuildLocator.SetVsEnvironment(buildProcess.StartInfo, msbuild);
             var buildOut = new StringBuilder();
@@ -637,7 +663,7 @@ public static class CoverageService
     private static string FormatSummary(CoverageData data, string projectPath)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Coverage Report: {Path.GetFileName(projectPath)}");
+        sb.AppendLine($"**Coverage Report: {Path.GetFileName(projectPath)}**");
         sb.AppendLine();
         sb.AppendLine($"**Line Coverage**: {data.LineCoverageRate:P1} ({data.LinesCovered}/{data.LinesValid})");
         sb.AppendLine($"**Branch Coverage**: {data.BranchCoverageRate:P1} ({data.BranchesCovered}/{data.BranchesValid})");
@@ -800,4 +826,8 @@ public class LineCoverage
 
 /// <param name="ProjectPath">The .csproj the run resolved to, which is not always what the
 /// caller passed — it may have been a source file inside the project.</param>
-public record CoverageResult(bool Success, string Message, CoverageData? Data, string? ProjectPath = null);
+/// <param name="NoCoverageFile">The tests ran but no Cobertura report appeared — the collector
+/// is missing or cannot write the format, as opposed to the tests having failed.</param>
+public record CoverageResult(
+    bool Success, string Message, CoverageData? Data, string? ProjectPath = null,
+    bool NoCoverageFile = false);

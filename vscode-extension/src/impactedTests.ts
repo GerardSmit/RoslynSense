@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { runTestsByName } from './testController';
+import { onCoverageMapProgress } from './coverageMapProgress';
 
 /**
  * Test impact: run only what the working copy's changes can affect, and see per-method which
@@ -288,13 +289,31 @@ async function buildCoverageMap(
         return;
     }
 
+    // The context key swaps the coverage view's build button for a spinner while the map is
+    // being built — the notification's progress is easy to dismiss, and then nothing anywhere
+    // said the build was still running.
+    await vscode.commands.executeCommand('setContext', 'roslynSense.coverageBuilding', true);
     const result = await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
             title: 'RoslynSense: building test coverage map',
             cancellable: false,
         },
-        async () => {
+        async (progress) => {
+            // The server pushes one event per test class; the bar wants increments, so each
+            // event contributes only what the percentage grew by since the last one.
+            let reported = 0;
+            const subscription = onCoverageMapProgress((event) => {
+                if (event.done) {
+                    return;
+                }
+                progress.report({
+                    message: event.message,
+                    increment: Math.max(0, event.percentage - reported),
+                });
+                reported = Math.max(reported, event.percentage);
+            });
+
             try {
                 return await client.sendRequest<BuildCoverageMapResult>(
                     'roslynSense/buildCoverageMap',
@@ -303,6 +322,10 @@ async function buildCoverageMap(
             } catch (error) {
                 void vscode.window.showErrorMessage(`RoslynSense: ${describe(error)}`);
                 return undefined;
+            } finally {
+                subscription.dispose();
+                await vscode.commands.executeCommand(
+                    'setContext', 'roslynSense.coverageBuilding', false);
             }
         }
     );

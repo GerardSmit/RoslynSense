@@ -302,8 +302,6 @@ internal static class TestHandler
     public static async Task<BuildCoverageMapResult> BuildCoverageMapAsync(
         BuildCoverageMapParams p, CancellationToken ct)
     {
-        await using var progress = await ProgressReporter.BeginAsync("Building test coverage map", ct);
-
         var projects = p.ProjectPath is { Length: > 0 } given
             ? [given]
             : (await TestDiscoveryService.FindTestProjectsAsync(ct)).Select(t => t.ProjectPath).ToList();
@@ -315,30 +313,66 @@ internal static class TestHandler
         var failures = new List<string>();
         string? error = null;
 
-        foreach (string project in projects)
+        try
         {
-            string label = Path.GetFileNameWithoutExtension(project);
-            var result = await TestCoverageMapBuilder.BuildAsync(
-                project, p.Force, classFilter: null, ct: ct,
-                onProgress: item => progress.Report(
-                    $"{label}: {item.ClassFullName} ({item.Index}/{item.Total})",
-                    item.Total == 0 ? null : item.Index * 100 / item.Total));
-
-            if (result.Error is not null)
+            for (int i = 0; i < projects.Count; i++)
             {
-                // One project failing is not the whole build failing: another may still map.
-                error ??= result.Error;
-                continue;
-            }
+                string project = projects[i];
+                string label = Path.GetFileNameWithoutExtension(project);
+                int completedProjects = i;
+                var result = await TestCoverageMapBuilder.BuildAsync(
+                    project, p.Force, classFilter: null, ct: ct,
+                    onProgress: item => PublishCoverageMapProgress(
+                        $"{label}: {item.ClassFullName} ({item.Index}/{item.Total})",
+                        // The bar spans the whole build, so a project's classes fill only its
+                        // share of it — the bar must not restart at each project boundary.
+                        (completedProjects * 100 + (item.Total == 0 ? 0 : item.Index * 100 / item.Total))
+                            / projects.Count));
 
-            run += result.ClassesRun;
-            reused += result.ClassesReused;
-            mapped = result.Map.TestCount;
-            failures.AddRange(result.Failures);
+                if (result.Error is not null)
+                {
+                    // One project failing is not the whole build failing: another may still map.
+                    error ??= result.Error;
+                    continue;
+                }
+
+                run += result.ClassesRun;
+                reused += result.ClassesReused;
+                mapped = result.Map.TestCount;
+                failures.AddRange(result.Failures);
+            }
+        }
+        finally
+        {
+            // Always closed out, even on failure or cancellation: a view showing a progress bar
+            // for a build that died would show it forever.
+            PublishCoverageMapProgress("done", 100, done: true);
         }
 
         return new BuildCoverageMapResult(
             run, reused, mapped, [.. failures], run + reused == 0 ? error : null);
+    }
+
+    /// <summary>
+    /// Sends coverage-map build progress to every connected editor, and drops it if that fails.
+    /// The editor renders this itself — in its notification and in the coverage view — which is
+    /// why it is a dedicated event rather than generic <c>$/progress</c>.
+    /// </summary>
+    private static void PublishCoverageMapProgress(string message, int percentage, bool done = false)
+    {
+        var notification = new CoverageMapProgressEvent(message, percentage, done);
+
+        foreach (var rpc in LspSessionRegistry.ActiveSessions())
+        {
+            try
+            {
+                _ = rpc.NotifyWithParameterObjectAsync("roslynSense/coverageMapProgress", notification);
+            }
+            catch
+            {
+                // Session gone. The final results still arrive over the request itself.
+            }
+        }
     }
 
     /// <summary>

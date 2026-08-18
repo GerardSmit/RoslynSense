@@ -20,8 +20,9 @@ namespace NG {
     const unchecked = new Set<string>();
 
     /** The induced-update rows currently in the DOM. Never part of `rows` — keyboard navigation,
-     * select-all and the tab count must not see them. */
-    let inducedRows: HTMLLIElement[] = [];
+     * select-all and the tab count must not see them. They do go into `secondaryRows`, which is
+     * only about icons. */
+    let inducedRows: Row[] = [];
     let plannedInduced: NuGetMsg.InducedUpdate[] = [];
     let planTimer: number | undefined;
     /** The list generation the outstanding plan request was made against. A slow plan reply must
@@ -30,68 +31,81 @@ namespace NG {
     /** What the last Update click actually asked for, to tell selected from induced in the outcome. */
     let lastRequested = new Set<string>();
 
+    /**
+     * The grouped updates behind the rows, keyed `id|latestVersion` lowercase.
+     *
+     * Populated before the rows are built rather than patched onto them afterwards, so that
+     * `buildRow` can finish an Updates row in one pass. Building them one at a time meant one
+     * `appendRows` call — and so one full filter and empty-state pass — per package.
+     */
+    const groups = new Map<string, NuGetMsg.PackageUpdate[]>();
+
+    export function updateGroupFor(pkg: NuGetMsg.PackageSummary): NuGetMsg.PackageUpdate[] {
+        return groups.get(`${pkg.id}|${pkg.version}`.toLowerCase()) ?? [];
+    }
+
+    /** Whether this row starts ticked: patch and minor are safe, a major is a decision. */
+    export function preselected(group: NuGetMsg.PackageUpdate[]): boolean {
+        const key = `${group[0].id}|${group[0].latestVersion}`.toLowerCase();
+        return precheck(group[0].severity) && !unchecked.has(key);
+    }
+
     export function showUpdates(updates: NuGetMsg.PackageUpdate[]): void {
         // One row per package; the projects it affects ride along, because the same package can be
         // behind by different amounts in different projects.
-        const byPackage = new Map<string, NuGetMsg.PackageUpdate[]>();
+        groups.clear();
         for (const update of updates) {
-            const key = `${update.id}|${update.latestVersion}`;
-            const existing = byPackage.get(key);
+            const key = `${update.id}|${update.latestVersion}`.toLowerCase();
+            const existing = groups.get(key);
             if (existing) {
                 existing.push(update);
             } else {
-                byPackage.set(key, [update]);
+                groups.set(key, [update]);
             }
         }
 
         resetList();
         clearPlan();
 
-        if (byPackage.size === 0) {
-            // The loop below never runs, so nothing would draw the "everything is up to date"
-            // state and the tab would simply look broken.
-            appendRows([]);
-            onSelectionChanged();
-            return;
-        }
+        // Empty is a real state with its own message, so it goes through appendRows like any other.
+        // The selection is settled from there once the last chunk lands, not here: with more than
+        // a hundred updates the later rows do not exist yet at this point.
+        appendRows([...groups.values()].map(summaryOf));
+        setCount('updates', groups.size);
+    }
 
-        for (const [key, group] of byPackage) {
-            const first = group[0];
-            const summary: NuGetMsg.PackageSummary = {
-                id: first.id,
-                version: first.latestVersion,
-                authors: null,
-                description: `${first.currentVersion} → ${first.latestVersion} in ${group
-                    .map((u) => u.projectName)
-                    .join(', ')}`,
-                downloads: null,
-                iconUrl: null,
-                deprecated: false,
-                vulnerable: false,
-                installedVersion: first.currentVersion,
-                installedVersions: [...new Set(group.map((u) => u.currentVersion))],
-                isCentrallyManaged: first.isCentrallyManaged,
-                isGlobalPackageReference: first.isGlobalPackageReference,
-                versionSource: first.versionSource,
-                sourceName: null,
-            };
+    /**
+     * The row text for one grouped update: which versions move, and where to.
+     *
+     * Only the versions. The project names used to be spelled out here, which on a solution-wide
+     * update meant every row ended in a list of thirty names — the part of the line that overflows
+     * first and helps least. They are on the row's tooltip instead.
+     */
+    function summaryOf(group: NuGetMsg.PackageUpdate[]): NuGetMsg.PackageSummary {
+        const first = group[0];
+        const currents = [...new Set(group.map((u) => u.currentVersion))];
 
-            appendRows([summary]);
-            const row = rows[rows.length - 1];
-            row.severity = first.severity;
-            row.update = first;
-            row.projectPaths = group.map((u) => u.projectPath);
-            decorateRow(row);
+        return {
+            id: first.id,
+            version: first.latestVersion,
+            authors: null,
+            description: `${describeVersions(currents)} → ${first.latestVersion}`,
+            downloads: null,
+            iconUrl: null,
+            deprecated: false,
+            vulnerable: false,
+            installedVersion: first.currentVersion,
+            installedVersions: currents,
+            isCentrallyManaged: first.isCentrallyManaged,
+            isGlobalPackageReference: first.isGlobalPackageReference,
+            versionSource: first.versionSource,
+            sourceName: null,
+        };
+    }
 
-            if (row.check) {
-                // Patch and minor moves are pre-checked; a major is a decision, so it waits for
-                // one — its badge says why it starts unticked.
-                row.check.checked = precheck(first.severity) && !unchecked.has(key.toLowerCase());
-            }
-        }
-
-        setCount('updates', byPackage.size);
-        onSelectionChanged();
+    /** One version reads as itself; several read as the set they are. */
+    export function describeVersions(versions: string[]): string {
+        return versions.length === 1 ? versions[0] : `[${versions.join(', ')}]`;
     }
 
     function precheck(severity: NuGetMsg.Severity): boolean {
@@ -165,8 +179,12 @@ namespace NG {
             return;
         }
 
-        for (const li of inducedRows) {
-            li.remove();
+        for (const row of inducedRows) {
+            row.li.remove();
+            const at = secondaryRows.indexOf(row);
+            if (at >= 0) {
+                secondaryRows.splice(at, 1);
+            }
         }
         inducedRows = [];
         plannedInduced = induced;
@@ -188,10 +206,25 @@ namespace NG {
             const li = make('li', 'row row-induced');
             li.setAttribute('role', 'presentation');
             li.dataset.pkgId = first.id.toLowerCase();
+            li.title = [...new Set(group.map((item) => item.projectName))].join(', ');
+
+            // An induced row is a package like any other: it gets the same icon slot, so the list
+            // does not go ragged where the dependencies are, and the same click-through, because
+            // "what is this thing you are about to move?" is exactly the question it raises.
+            const icon = make('span', 'icon');
+            icon.setAttribute('aria-hidden', 'true');
+            const fallback = make('span', 'icon-fallback', (first.id[0] ?? '?').toUpperCase());
+            const img = make('img', 'icon-img') as HTMLImageElement;
+            img.alt = '';
+            img.hidden = true;
+            img.decoding = 'async';
+            icon.appendChild(fallback);
+            icon.appendChild(img);
+            li.appendChild(icon);
 
             const text = make('span', 'row-text');
             const title = make('span', 'row-title');
-            title.appendChild(make('span', 'id', first.id));
+            title.appendChild(packageLink(first.id));
             const badges = make('span', 'badges');
             badges.appendChild(make('span', 'badge', `${first.currentVersion} → ${first.version}`));
             title.appendChild(badges);
@@ -200,11 +233,11 @@ namespace NG {
                 make(
                     'span',
                     'muted row-meta',
-                    `required by ${first.requiredBy} ${first.requiredByVersion} — ` +
-                        [...new Set(group.map((item) => item.projectName))].join(', ')
+                    `required by ${first.requiredBy} ${first.requiredByVersion}`
                 )
             );
             li.appendChild(text);
+            li.addEventListener('click', () => openPackage(first.id));
 
             // Under the row that asked for it, so cause and effect read top to bottom.
             const anchor = rows.find(
@@ -215,7 +248,18 @@ namespace NG {
             } else {
                 el<HTMLUListElement>('list').appendChild(li);
             }
-            inducedRows.push(li);
+
+            const row: Row = {
+                pkg: inducedSummary(first),
+                li,
+                iconImg: img,
+                iconFallback: fallback,
+                badges,
+                projectPaths: group.map((item) => item.projectPath),
+            };
+            inducedRows.push(row);
+            secondaryRows.push(row);
+            attachIcon(row);
         }
 
         const note = el<HTMLElement>('plan-note');
@@ -225,6 +269,26 @@ namespace NG {
                 : `+ ${grouped.size} ${grouped.size === 1 ? 'dependency' : 'dependencies'} will move too`;
 
         updateButtonLabel();
+    }
+
+    /** Just enough of a summary for the icon plumbing, which keys on id and iconUrl. */
+    function inducedSummary(item: NuGetMsg.InducedUpdate): NuGetMsg.PackageSummary {
+        return {
+            id: item.id,
+            version: item.version,
+            authors: null,
+            description: null,
+            downloads: null,
+            iconUrl: null,
+            deprecated: false,
+            vulnerable: false,
+            installedVersion: item.currentVersion,
+            installedVersions: [item.currentVersion],
+            isCentrallyManaged: false,
+            isGlobalPackageReference: false,
+            versionSource: null,
+            sourceName: null,
+        };
     }
 
     function clearPlan(): void {
@@ -281,8 +345,8 @@ namespace NG {
                     row.li.classList.add('row-working');
                 }
             }
-            for (const li of inducedRows) {
-                li.classList.add('row-working');
+            for (const row of inducedRows) {
+                row.li.classList.add('row-working');
             }
 
             el<HTMLButtonElement>('update-selected').disabled = true;
@@ -304,8 +368,12 @@ namespace NG {
             includePrerelease: el<HTMLInputElement>('prerelease').checked,
             versionLock: el<HTMLSelectElement>('version-lock').value as NuGetMsg.Lock,
             // The scope chip narrows this tab like every other: updating a project you filtered
-            // out is the kind of surprise the chip exists to prevent.
+            // out is the kind of surprise the chip exists to prevent. An empty scope is every
+            // project, which is what the chip now says when nothing is chosen.
             projectPaths: state.scope,
+            // The server answers as though this were the only feed configured, so a package the
+            // feed does not carry is absent rather than offered a version from somewhere else.
+            source: selectedSource(),
         });
     }
 
@@ -322,12 +390,14 @@ namespace NG {
             }
         }
 
-        for (const li of inducedRows) {
-            li.classList.remove('row-working');
-            const failed = failures.filter((f) => f.id.toLowerCase() === li.dataset.pkgId);
+        for (const row of inducedRows) {
+            row.li.classList.remove('row-working');
+            const failed = failures.filter((f) => f.id.toLowerCase() === row.li.dataset.pkgId);
             if (failed.length > 0) {
-                li.classList.add('row-failed');
-                li.title = failed.map((f) => `${fileName(f.projectPath)}: ${f.message}`).join('\n');
+                row.li.classList.add('row-failed');
+                row.li.title = failed
+                    .map((f) => `${fileName(f.projectPath)}: ${f.message}`)
+                    .join('\n');
             }
         }
 

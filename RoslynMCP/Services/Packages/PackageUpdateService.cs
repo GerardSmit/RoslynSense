@@ -50,6 +50,11 @@ public enum UpdateSeverity
 /// .NET major the project targets. On by default: a net8.0 project asking for "latest" almost
 /// never means "move Microsoft.Extensions.* a band ahead of the runtime".
 /// </param>
+/// <param name="Source">
+/// A feed name to answer as though it were the only one configured. Packages that feed does not
+/// carry are left out entirely, and the candidate version is chosen from its listing alone —
+/// offering a version from a feed the user has filtered out is worse than offering nothing.
+/// </param>
 public sealed record UpdateQuery(
     bool IncludePrerelease = false,
     VersionLock Lock = VersionLock.None,
@@ -57,7 +62,8 @@ public sealed record UpdateQuery(
     string? PrereleaseLabel = null,
     IReadOnlyList<string>? ProjectPaths = null,
     bool Refresh = false,
-    bool AlignPlatform = true);
+    bool AlignPlatform = true,
+    string? Source = null);
 
 /// <param name="LatestUncapped">
 /// The newest usable version beyond the platform band, when the band cap held
@@ -96,7 +102,7 @@ public sealed record PackageUpdateResult(
 /// </remarks>
 public static class PackageUpdateService
 {
-    private static readonly ConcurrentDictionary<string, Lazy<Task<FeedResults<NuGetVersion>>>> s_versions =
+    private static readonly ConcurrentDictionary<string, Lazy<Task<FeedResults<SourcedVersion>>>> s_versions =
         new(StringComparer.OrdinalIgnoreCase);
 
     public static void Invalidate() => s_versions.Clear();
@@ -168,9 +174,14 @@ public static class PackageUpdateService
                 if (Current(package.Version) is not { } current)
                     return;
 
-                if (lookup.Results.Count == 0)
+                // Scoped to one feed, a package that feed does not carry is absent rather than
+                // Unknown: "no feed answered" is a fault worth reporting, "you filtered it out" is
+                // not.
+                var available = NuGetService.Distinct(lookup.Results, query.Source);
+                if (available.Count == 0)
                 {
-                    updates.Add(Row(project, package, package.Version, UpdateSeverity.Unknown));
+                    if (query.Source is not { Length: > 0 })
+                        updates.Add(Row(project, package, package.Version, UpdateSeverity.Unknown));
                     return;
                 }
 
@@ -180,14 +191,14 @@ public static class PackageUpdateService
                     ? FrameworkVersionPolicy.PlatformMajor(projectFrameworks)
                     : null;
 
-                var latest = Resolve(current, package.Version, lookup.Results, query, cap);
+                var latest = Resolve(current, package.Version, available, query, cap);
                 if (latest is null || latest <= current)
                     return;
 
                 // Unconditional: a version whose assets no target framework can use is not an
                 // update under any lock — offering it is just NU1202 with extra steps.
                 latest = await CompatibleAsync(
-                    package.Id, current, latest, lookup.Results, projectFrameworks, token);
+                    package.Id, current, latest, available, projectFrameworks, token);
 
                 if (latest is null || latest <= current)
                     return;
@@ -197,12 +208,12 @@ public static class PackageUpdateService
                 // who knows the newer band exists.
                 NuGetVersion? uncapped = null;
                 if (cap is not null &&
-                    Resolve(current, package.Version, lookup.Results, query, platformMajor: null)
+                    Resolve(current, package.Version, available, query, platformMajor: null)
                         is { } beyond &&
                     beyond > latest)
                 {
                     uncapped = await CompatibleAsync(
-                        package.Id, current, beyond, lookup.Results, projectFrameworks, token);
+                        package.Id, current, beyond, available, projectFrameworks, token);
 
                     if (uncapped is not null && uncapped <= latest)
                         uncapped = null;
@@ -561,15 +572,17 @@ public static class PackageUpdateService
     /// Every version of a package, fetched once however many projects reference it. A solution
     /// with forty projects on the same package would otherwise issue forty identical lookups.
     /// </summary>
-    internal static Task<FeedResults<NuGetVersion>> VersionsAsync(
+    internal static Task<FeedResults<SourcedVersion>> VersionsAsync(
         string id, UpdateQuery query, CancellationToken ct)
     {
         // The listing is not filtered by target framework, so the framework is deliberately not
-        // part of the key — including it would fragment the cache for nothing.
+        // part of the key — including it would fragment the cache for nothing. Nor is the source:
+        // the entry carries every feed's answer, so one cached lookup serves every source
+        // selection, and switching feeds in the panel costs no network at all.
         string key = $"{id}|{query.Refresh}";
 
-        var entry = s_versions.GetOrAdd(key, _ => new Lazy<Task<FeedResults<NuGetVersion>>>(
-            () => NuGetService.AllVersionsAsync(id, includePrerelease: true, query.Refresh, ct),
+        var entry = s_versions.GetOrAdd(key, _ => new Lazy<Task<FeedResults<SourcedVersion>>>(
+            () => NuGetService.AllVersionsBySourceAsync(id, includePrerelease: true, query.Refresh, ct),
             LazyThreadSafetyMode.ExecutionAndPublication));
 
         var task = entry.Value;
@@ -580,10 +593,37 @@ public static class PackageUpdateService
         if (task.IsCompleted && !task.IsCompletedSuccessfully)
         {
             s_versions.TryRemove(key, out _);
-            return Task.FromResult(new FeedResults<NuGetVersion>([], []));
+            return Task.FromResult(new FeedResults<SourcedVersion>([], []));
         }
 
         return task;
+    }
+
+    /// <summary>The feeds that carry a package, for the panel's source filter.</summary>
+    /// <remarks>
+    /// Shares <see cref="VersionsAsync"/>'s cache with the update check, so filtering the Installed
+    /// tab right after an update check is answered from memory.
+    /// </remarks>
+    public static async Task<IReadOnlyDictionary<string, IReadOnlyList<string>>> SourcesOfAsync(
+        IReadOnlyList<string> ids, CancellationToken ct)
+    {
+        var map = new ConcurrentDictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        var query = new UpdateQuery();
+
+        await Parallel.ForEachAsync(
+            ids.Distinct(StringComparer.OrdinalIgnoreCase),
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Min(8, Environment.ProcessorCount),
+                CancellationToken = ct,
+            },
+            async (id, token) =>
+            {
+                var lookup = await VersionsAsync(id, query, token);
+                map[id] = NuGetService.SourcesOf(lookup.Results);
+            });
+
+        return map;
     }
 
     private static PackageUpdate Row(

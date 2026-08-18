@@ -15,13 +15,40 @@ namespace RoslynMCP.Tools;
 public static class PackageTool
 {
     [McpServerTool, Description(
-        "List NuGet packages referenced by the solution's projects, with their versions.")]
+        "NuGet packages in the solution. view: installed (default) lists direct references with " +
+        "versions; outdated lists packages with a newer version available per project — the dry " +
+        "run for UpdatePackages; audit lists known vulnerabilities and deprecations, including " +
+        "transitive packages.")]
     public static async Task<string> ListPackages(
         IOutputFormatter fmt,
-        [Description("Optional project path. Omit for every project in the solution.")]
+        [Description("View: installed (default), outdated, or audit.")]
+        string view = "installed",
+        [Description("Optional project path. Omit for every project in the solution. Ignored for view=audit.")]
         string? projectPath = null,
+        [Description("view=outdated: include prerelease versions (default: false).")]
+        bool includePrerelease = false,
+        [Description("view=outdated: how far a version may move: none, major (stay on the current major), minor.")]
+        string versionLock = "none",
+        [Description("view=outdated: keep platform-tracking packages (Microsoft.Extensions.*, System.*, ...) on " +
+            "the .NET major the project targets (default: true).")]
+        bool alignPlatform = true,
+        [Description("view=audit: re-run the audit instead of reusing a recent result.")]
+        bool refresh = false,
         CancellationToken cancellationToken = default)
     {
+        switch (view.ToLowerInvariant())
+        {
+            case "installed":
+                break;
+            case "outdated":
+                return await ListOutdatedAsync(
+                    fmt, projectPath, includePrerelease, versionLock, alignPlatform, cancellationToken);
+            case "audit":
+                return await AuditAsync(fmt, refresh, cancellationToken);
+            default:
+                return $"Error: Unknown view '{view}'. Use: installed, outdated, audit.";
+        }
+
         var projects = await NuGetService.InstalledAsync(cancellationToken);
         if (projectPath is { Length: > 0 })
         {
@@ -162,20 +189,13 @@ public static class PackageTool
         return sb.ToString();
     }
 
-    [McpServerTool, Description(
-        "Packages with a newer version available, per project, and how far behind they are. " +
-        "This is the dry run for UpdatePackages.")]
-    public static async Task<string> ListOutdatedPackages(
+    private static async Task<string> ListOutdatedAsync(
         IOutputFormatter fmt,
-        [Description("Optional project path(s), semicolon-separated. Omit for the whole solution.")]
-        string? projectPath = null,
-        [Description("Include prerelease versions (default: false).")] bool includePrerelease = false,
-        [Description("How far a version may move: none, major (stay on the current major), minor.")]
-        string versionLock = "none",
-        [Description("Keep platform-tracking packages (Microsoft.Extensions.*, System.*, ...) on " +
-            "the .NET major the project targets (default: true).")]
-        bool alignPlatform = true,
-        CancellationToken cancellationToken = default)
+        string? projectPath,
+        bool includePrerelease,
+        string versionLock,
+        bool alignPlatform,
+        CancellationToken cancellationToken)
     {
         var found = await PackageUpdateService.OutdatedAsync(
             BuildQuery(projectPath, includePrerelease, versionLock, refresh: false, alignPlatform),
@@ -265,12 +285,10 @@ public static class PackageTool
         return sb.ToString();
     }
 
-    [McpServerTool, Description(
-        "Known vulnerabilities and deprecations across the solution, including transitive packages.")]
-    public static async Task<string> AuditPackages(
+    private static async Task<string> AuditAsync(
         IOutputFormatter fmt,
-        [Description("Re-run the audit instead of reusing a recent result.")] bool refresh = false,
-        CancellationToken cancellationToken = default)
+        bool refresh,
+        CancellationToken cancellationToken)
     {
         var audit = await PackageAuditService.AuditAsync(refresh, cancellationToken);
 

@@ -31,6 +31,9 @@ public sealed record ProjectPackages(
     string ProjectName,
     IReadOnlyList<PackageSummary> Packages);
 
+/// <summary>A version, and the feed that served it.</summary>
+public sealed record SourcedVersion(NuGetVersion Version, string Source);
+
 public sealed record PackageVersionUse(string ProjectPath, string ProjectName, string Version);
 
 public sealed record Consolidation(string Id, IReadOnlyList<PackageVersionUse> Versions);
@@ -121,27 +124,69 @@ public static class NuGetService
     internal static async Task<FeedResults<NuGetVersion>> AllVersionsAsync(
         string id, bool includePrerelease, bool refresh, CancellationToken ct)
     {
+        var found = await AllVersionsBySourceAsync(id, includePrerelease, refresh, ct);
+        return new FeedResults<NuGetVersion>(Distinct(found.Results), found.Feeds);
+    }
+
+    /// <summary>
+    /// The same listing, keeping the feed each version came from.
+    /// </summary>
+    /// <remarks>
+    /// The fan-out already asks every feed; only the answer to "which one had it" was being thrown
+    /// away by the flatten. Keeping it is what lets the panel scope Installed and Updates to a
+    /// chosen source without a second round of network calls — and what stops it offering a version
+    /// that only exists on a feed the user filtered out.
+    ///
+    /// One entry per (version, feed): a package carried by two feeds appears twice, deliberately,
+    /// because the whole point is to answer per feed.
+    /// </remarks>
+    internal static async Task<FeedResults<SourcedVersion>> AllVersionsBySourceAsync(
+        string id, bool includePrerelease, bool refresh, CancellationToken ct)
+    {
         using var cache = NuGetFeedContext.RentCache(refresh);
 
-        var found = await NuGetFeedContext.FanOutAsync<NuGetVersion>(
+        var found = await NuGetFeedContext.FanOutAsync<SourcedVersion>(
             id,
             async (repository, token) =>
             {
                 var finder = await repository.GetResourceAsync<FindPackageByIdResource>(token);
-                return finder is null
-                    ? []
-                    : await finder.GetAllVersionsAsync(id, cache, NullLogger.Instance, token);
+                if (finder is null)
+                    return [];
+
+                var versions = await finder.GetAllVersionsAsync(id, cache, NullLogger.Instance, token);
+                return versions.Select(v => new SourcedVersion(v, repository.PackageSource.Name));
             },
             ct);
 
-        var versions = found.Results
-            .Where(v => includePrerelease || !v.IsPrerelease)
+        var results = found.Results
+            .Where(v => includePrerelease || !v.Version.IsPrerelease)
+            .ToList();
+
+        return new FeedResults<SourcedVersion>(results, found.Feeds);
+    }
+
+    /// <summary>
+    /// The distinct versions in a sourced listing, newest first, optionally narrowed to one feed.
+    /// </summary>
+    /// <param name="source">A feed name, or <c>null</c> for "every feed", which is not the same as
+    /// an empty result — a package absent from the named feed has no versions at all.</param>
+    internal static IReadOnlyList<NuGetVersion> Distinct(
+        IEnumerable<SourcedVersion> versions, string? source = null) =>
+        versions
+            .Where(v => source is not { Length: > 0 } ||
+                        v.Source.Equals(source, StringComparison.OrdinalIgnoreCase))
+            .Select(v => v.Version)
             .Distinct()
             .OrderByDescending(v => v)
             .ToList();
 
-        return new FeedResults<NuGetVersion>(versions, found.Feeds);
-    }
+    /// <summary>The feeds that carry a package at all, from a sourced listing.</summary>
+    internal static IReadOnlyList<string> SourcesOf(IEnumerable<SourcedVersion> versions) =>
+        versions
+            .Select(v => v.Source)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
     /// <summary>
     /// The first feed that can hand over a .nupkg, for the packages.config installer — which

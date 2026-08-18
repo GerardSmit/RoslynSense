@@ -50,27 +50,13 @@ internal static class MsBuildPackageReader
 
         foreach (var element in document.Root.DescendantNodes().OfType<XmlElementBaseSyntax>())
         {
-            string name = element switch
-            {
-                XmlElementSyntax e => e.Name,
-                XmlEmptyElementSyntax e => e.Name,
-                _ => string.Empty,
-            };
-
-            if (!Elements.Contains(name))
+            if (!Elements.Contains(element.Name))
                 continue;
-
-            var attributes = element switch
-            {
-                XmlElementSyntax e => e.Attributes,
-                XmlEmptyElementSyntax e => e.Attributes,
-                _ => [],
-            };
 
             XmlAttributeSyntax? id = null;
             XmlAttributeSyntax? version = null;
 
-            foreach (var attribute in attributes)
+            foreach (var attribute in element.Attributes)
             {
                 switch (attribute.Name)
                 {
@@ -109,27 +95,13 @@ internal static class MsBuildPackageReader
 
         foreach (var element in document.Root.DescendantNodes().OfType<XmlElementBaseSyntax>())
         {
-            string name = element switch
-            {
-                XmlElementSyntax e => e.Name,
-                XmlEmptyElementSyntax e => e.Name,
-                _ => string.Empty,
-            };
-
-            if (!name.Equals("package", StringComparison.OrdinalIgnoreCase))
+            if (!element.Name.Equals("package", StringComparison.OrdinalIgnoreCase))
                 continue;
-
-            var attributes = element switch
-            {
-                XmlElementSyntax e => e.Attributes,
-                XmlEmptyElementSyntax e => e.Attributes,
-                _ => [],
-            };
 
             XmlAttributeSyntax? id = null;
             XmlAttributeSyntax? version = null;
 
-            foreach (var attribute in attributes)
+            foreach (var attribute in element.Attributes)
             {
                 if (attribute.Name.Equals("id", StringComparison.OrdinalIgnoreCase))
                     id ??= attribute;

@@ -40,17 +40,24 @@ body {
 
 .chrome { flex: 0 0 auto; }
 
-.search-row,
-.scope-row {
+.search-row {
   display: flex;
   align-items: center;
   gap: var(--gap);
-  padding: var(--gap) var(--pad) 0;
+  padding: var(--gap) var(--pad);
 }
 
-.scope-row { padding-bottom: var(--gap); }
-
 .search-field { position: relative; flex: 1 1 auto; min-width: 0; }
+
+/* The scope button leads the row: it is the "where" that everything to its right answers about.
+   It never wraps — a 30-project selection reads as a count, with the names in the tooltip. */
+#scope {
+  flex: 0 0 auto;
+  max-width: 30%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 input[type="search"],
 select {
@@ -114,7 +121,6 @@ label.check { display: inline-flex; align-items: center; gap: 4px; white-space: 
   border-color: var(--vscode-button-background);
 }
 
-.truncate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 nav {
   display: flex;
@@ -286,7 +292,7 @@ li.row.row-failed { border-left-color: var(--vscode-charts-red); }
 li.row.row-induced {
   padding-left: 34px;
   opacity: 0.92;
-  cursor: default;
+  cursor: pointer;
   border-left: 2px solid var(--vscode-tree-indentGuidesStroke, var(--vscode-widget-border));
 }
 
@@ -503,13 +509,19 @@ button.linklike:disabled { opacity: 0.35; cursor: default; }
   color: var(--vscode-descriptionForeground);
 }
 
+/* A code block is a small editor, so it takes the editor's own ground and ink rather than the
+   panel's. `textCodeBlock-background` is tuned for a one-line snippet inside prose and sits close
+   enough to the panel background that a fenced sample read as unbounded text. */
 .md-code, .md-raw {
-  background: var(--vscode-textCodeBlock-background);
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  border: var(--rule);
   padding: 9px 10px;
   border-radius: 3px;
   overflow-x: auto;
   font-family: var(--vscode-editor-font-family);
   font-size: 0.92em;
+  line-height: 1.5;
   white-space: pre-wrap;
 }
 
@@ -524,7 +536,21 @@ button.linklike:disabled { opacity: 0.35; cursor: default; }
 .md-link { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: underline; }
 .md-link:hover { color: var(--vscode-textLink-activeForeground); }
 
-/* Remote images are blocked by the CSP, so a badge becomes a chip rather than a broken box. */
+/* An in-panel link goes to another package rather than out to a browser, so it is not underlined
+   until you are on it — a README full of dependency names should not read as a wall of rules. */
+.pkg-link { text-decoration: none; }
+.pkg-link:hover, .pkg-link:focus-visible { text-decoration: underline; }
+
+.md-strike { text-decoration: line-through; opacity: 0.8; }
+
+/* Images load only from the hosts in the CSP; anything else falls back to the chip below. */
+.md-image { max-width: 100%; height: auto; vertical-align: middle; }
+
+/* A linked badge is a link whose whole label is an image. An underline across a badge reads as a
+   defect in the badge, so the rule goes away when there is no text for it to sit under. */
+.md-link:has(> .md-image) { text-decoration: none; }
+
+/* An image the allowlist refused, or one whose host answered with nothing. */
 .md-img {
   display: inline-block;
   border: 1px dashed var(--vscode-panel-border);
@@ -533,6 +559,38 @@ button.linklike:disabled { opacity: 0.35; cursor: default; }
   color: var(--vscode-descriptionForeground);
   font-size: 0.85em;
 }
+
+/* Tables scroll inside themselves. The details pane must never scroll sideways as a whole. */
+.md-table-wrap { overflow-x: auto; margin: 9px 0; }
+
+.md-table { border-collapse: collapse; font-size: 0.95em; }
+.md-table th, .md-table td {
+  border: var(--rule);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+  /* One long URL in one cell must not squeeze every other column to a letter per line. */
+  overflow-wrap: anywhere;
+}
+.md-table th { background: var(--vscode-keybindingTable-headerBackground, var(--vscode-textCodeBlock-background)); }
+.md-table .md-center { text-align: center; }
+.md-table .md-right { text-align: right; }
+
+/* Fenced-code tokens.
+ *
+ * `--tok-*` is set on the root by the webview from the active theme's own TextMate rules, which the
+ * host reads off disk — VS Code puts its colour registry in a webview's custom properties but not
+ * its token colours, so this is the only way for a code block to actually match the editor beside
+ * it. Each fallback is the chart palette, which is themed and always present: a theme that could
+ * not be read loses the exact colours, not the highlighting. */
+.tok-com { color: var(--tok-com, var(--vscode-charts-green, #6a9955)); font-style: italic; }
+.tok-str { color: var(--tok-str, var(--vscode-charts-orange, #ce9178)); }
+.tok-kw  { color: var(--tok-kw, var(--vscode-charts-blue, #569cd6)); }
+.tok-typ { color: var(--tok-typ, var(--vscode-charts-purple, #4ec9b0)); }
+.tok-num { color: var(--tok-num, var(--vscode-charts-yellow, #b5cea8)); }
+.tok-tag { color: var(--tok-tag, var(--vscode-charts-blue, #569cd6)); }
+.tok-attr { color: var(--tok-attr, var(--vscode-charts-purple, #9cdcfe)); }
+.tok-pre { color: var(--vscode-descriptionForeground); }
 
 /* ---- Narrow panel -------------------------------------------------------------------- */
 
@@ -545,6 +603,7 @@ button.linklike:disabled { opacity: 0.35; cursor: default; }
   /* A horizontal drag cannot resize a vertical stack. */
   #splitter { display: none; }
   .chip { max-width: 60%; }
+  #scope { max-width: 45%; }
 }
 
 :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }

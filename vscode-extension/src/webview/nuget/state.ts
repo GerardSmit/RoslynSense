@@ -32,7 +32,18 @@ namespace NG {
         query: '',
         selectedVersion: null as string | null,
         splitPercent: 42,
+        /**
+         * Which feeds carry each installed package id, keyed lowercase. Null while "All sources" is
+         * selected or before the answer lands — the filter treats null as "do not narrow", so the
+         * list is never wrong, only briefly wider than it will be.
+         */
+        sourceMap: null as Record<string, string[]> | null,
     };
+
+    /** The feed the top-right selector is on, or '' for all of them. */
+    export function selectedSource(): string {
+        return el<HTMLSelectElement>('source').value;
+    }
 
     /**
      * Replies are dropped unless they belong to the current request. Switching tab, editing the

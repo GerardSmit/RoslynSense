@@ -10,6 +10,14 @@
  */
 namespace NG {
     export const rows: Row[] = [];
+
+    /**
+     * Rows that are on screen but not in the list: the Updates tab's induced-dependency rows, and
+     * whatever virtual row the details pane is currently showing. They want icons like anything
+     * else, but keyboard navigation, select-all and the tab counts must not see them.
+     */
+    export const secondaryRows: Row[] = [];
+
     export let focusedRow: Row | undefined;
 
     let rowSeq = 0;
@@ -19,6 +27,7 @@ namespace NG {
         const list = el<HTMLUListElement>('list');
         list.replaceChildren();
         rows.length = 0;
+        secondaryRows.length = 0;
         focusedRow = undefined;
         sentinel = undefined;
         list.removeAttribute('aria-activedescendant');
@@ -41,6 +50,8 @@ namespace NG {
         if (packages.length === 0) {
             renderEmptyState(list);
             setCount(state.tab, 0);
+            settled();
+            applyPendingSelection();
             return;
         }
 
@@ -66,20 +77,33 @@ namespace NG {
                 return;
             }
 
-            renderEmptyState(list);
             setCount(state.tab, rows.length);
             if (state.tab === 'browse' && state.hasMore) {
                 addSentinel(list);
             }
-            if (state.tab === 'installed') {
-                // Late chunks arrive after the filter last ran; they must not surface rows the
-                // active chip hides.
-                applyInstalledFilter();
-            }
+            settled();
             applyPendingSelection();
         };
 
         flush(0);
+    }
+
+    /**
+     * Everything that has to see the whole list, once the last chunk is in.
+     *
+     * The chunking is why this is a step of its own: rows arrive across several frames, so anything
+     * that counts or plans against `rows` has to wait. The Updates tab is the one that shows it —
+     * the select-all state and the dependency plan are derived from the ticked rows, and running
+     * them after the first hundred would plan an update for the first hundred.
+     */
+    function settled(): void {
+        // Late chunks arrive after the filter last ran; they must not surface rows the query,
+        // the chip or the source filter hides.
+        applyRowFilter();
+
+        if (state.tab === 'updates') {
+            onSelectionChanged();
+        }
     }
 
     /** The tab badge. Browse has no meaningful total, so it never carries one. */
@@ -104,6 +128,7 @@ namespace NG {
         el<HTMLUListElement>('list').setAttribute('aria-activedescendant', row.li.id);
         focusedRow = row;
         row.li.scrollIntoView({ block: 'nearest' });
+        pushNav({ tab: state.tab, packageId: row.pkg.id });
 
         if (showDetails) {
             state.selectedVersion = null;
@@ -121,10 +146,94 @@ namespace NG {
         return true;
     }
 
-    function applyPendingSelection(): void {
-        if (state.pendingSelect && selectById(state.pendingSelect)) {
-            state.pendingSelect = null;
+    /**
+     * Shows a package's details, whether or not it is in the current list.
+     *
+     * A clicked dependency usually is not — it may not be installed, and Browse is showing search
+     * results for something else entirely. Refusing to open those would make dependencies links
+     * that mostly do nothing.
+     */
+    export function openPackage(id: string): void {
+        if (selectById(id)) {
+            return;
         }
+
+        focusedRow?.li.setAttribute('aria-selected', 'false');
+        focusedRow = virtualRow(id);
+        pushNav({ tab: state.tab, packageId: id });
+        state.selectedVersion = null;
+        requestDetails(focusedRow);
+        persist();
+    }
+
+    export function clearDetails(): void {
+        focusedRow?.li.setAttribute('aria-selected', 'false');
+        focusedRow = undefined;
+        const details = el<HTMLElement>('details');
+        details.replaceChildren(make('p', 'placeholder', 'Select a package to see its details.'));
+        persist();
+    }
+
+    /**
+     * A details target for a package that has no row — a clicked dependency, or a history entry
+     * whose tab no longer lists it.
+     *
+     * The `<li>` is built and never appended: `renderDetails` works from `pkg` and `projectPaths`,
+     * but the icon plumbing and the selection helpers all expect a `Row`, and a detached element is
+     * cheaper than making half of `Row` optional everywhere. Installed facts are merged in from the
+     * projects reply so Update, Uninstall and Consolidate behave exactly as they would from the
+     * Installed tab rather than treating a referenced package as brand new.
+     */
+    export function virtualRow(id: string): Row {
+        const installed = state.installed
+            .flatMap((project) => project.packages)
+            .filter((pkg) => pkg.id.toLowerCase() === id.toLowerCase());
+
+        const versions = [...new Set(installed.flatMap((pkg) => pkg.installedVersions))];
+        const known = rows.find((row) => row.pkg.id.toLowerCase() === id.toLowerCase())?.pkg;
+
+        const pkg: NuGetMsg.PackageSummary = {
+            id: installed[0]?.id ?? known?.id ?? id,
+            version: known?.version ?? installed[0]?.version ?? '',
+            authors: null,
+            description: null,
+            downloads: null,
+            iconUrl: known?.iconUrl ?? installed[0]?.iconUrl ?? null,
+            deprecated: false,
+            vulnerable: false,
+            installedVersion: installed[0]?.installedVersion ?? null,
+            installedVersions: versions,
+            isCentrallyManaged: installed.some((p) => p.isCentrallyManaged),
+            isGlobalPackageReference: installed.some((p) => p.isGlobalPackageReference),
+            versionSource: installed.find((p) => p.versionSource)?.versionSource ?? null,
+            sourceName: null,
+        };
+
+        const li = make('li', 'row');
+        li.id = `nr-${++rowSeq}`;
+        const fallback = make('span', 'icon-fallback', (pkg.id[0] ?? '?').toUpperCase());
+        const img = make('img', 'icon-img') as HTMLImageElement;
+        img.hidden = true;
+
+        return {
+            pkg,
+            li,
+            iconImg: img,
+            iconFallback: fallback,
+            badges: make('span', 'badges'),
+            projectPaths: projectsWith(pkg.id),
+        };
+    }
+
+    function applyPendingSelection(): void {
+        if (!state.pendingSelect) {
+            return;
+        }
+        // Not in this tab's list — a package can be a dependency of something installed without
+        // being installed itself. Dropping the request would make Back silently do nothing.
+        const id = state.pendingSelect;
+        state.pendingSelect = null;
+        openPackage(id);
     }
 
     function buildRow(pkg: NuGetMsg.PackageSummary): Row {
@@ -204,8 +313,20 @@ namespace NG {
             projectPaths: projectsWith(pkg.id),
         };
 
-        if (check) {
-            check.setAttribute('aria-label', `Update ${pkg.id}`);
+        // The Updates tab's rows carry what they are going to do. Reading it here rather than
+        // patching it on afterwards is what lets the whole tab be built in one appendRows call.
+        if (grid) {
+            const group = updateGroupFor(pkg);
+            if (group.length > 0) {
+                row.update = group[0];
+                row.severity = group[0].severity;
+                row.projectPaths = group.map((u) => u.projectPath);
+                li.title = [...new Set(group.map((u) => u.projectName))].join(', ');
+            }
+            if (check) {
+                check.setAttribute('aria-label', `Update ${pkg.id}`);
+                check.checked = group.length > 0 && preselected(group);
+            }
         }
 
         li.addEventListener('click', () => focusRow(row));
@@ -345,41 +466,77 @@ namespace NG {
 
     export function setInstalledFilter(filter: InstalledFilter): void {
         installedFilter = filter;
-        applyInstalledFilter();
+        applyRowFilter();
     }
 
     /**
-     * Narrows the Installed list to the rows that need attention. Hidden rows stay built —
-     * keyboard navigation already skips them (nextVisible), and toggling `hidden` is cheaper
-     * than rebuilding a thousand rows per chip click.
+     * Everything that narrows the list, applied in one pass.
+     *
+     * Three filters can be active at once — the search box, the Installed tab's chips, and the feed
+     * selector — and they compose by AND. Keeping them in one place is what makes the chip counts
+     * agree with what is on screen; when each filter owned its own pass, the last one to run
+     * decided, and the counts described a list nobody was looking at.
+     *
+     * Hidden rows stay built: keyboard navigation already skips them (`nextVisible`), and toggling
+     * `hidden` is far cheaper than rebuilding a thousand rows per keystroke.
      */
-    export function applyInstalledFilter(): void {
-        if (state.tab !== 'installed') {
-            return;
-        }
+    export function applyRowFilter(): void {
+        const query = state.query.trim().toLowerCase();
+        const source = selectedSource();
 
         let updates = 0;
         let mixed = 0;
+
         for (const row of rows) {
             const hasUpdate = updatesFor(row.pkg.id).length > 0;
             const isMixed = row.pkg.installedVersions.length > 1;
             updates += hasUpdate ? 1 : 0;
             mixed += isMixed ? 1 : 0;
-            row.li.hidden =
-                installedFilter === 'updates' ? !hasUpdate :
-                installedFilter === 'mixed' ? !isMixed : false;
+
+            // Browse already asked the feed for the query, so filtering its results again would
+            // hide packages the feed itself considered a match.
+            const matchesQuery =
+                state.tab === 'browse' || query.length === 0 || row.pkg.id.toLowerCase().includes(query);
+
+            const matchesChip =
+                state.tab !== 'installed' ||
+                (installedFilter === 'updates' ? hasUpdate :
+                 installedFilter === 'mixed' ? isMixed : true);
+
+            row.li.hidden = !(matchesQuery && matchesChip && onSelectedSource(row.pkg.id, source));
         }
 
-        const counts: Record<InstalledFilter, string> = {
-            all: `All (${rows.length})`,
-            updates: `Updates (${updates})`,
-            mixed: `Mixed versions (${mixed})`,
-        };
-        for (const chip of document.querySelectorAll<HTMLButtonElement>('#installed-toolbar .filter')) {
-            const filter = chip.dataset.filter as InstalledFilter;
-            chip.textContent = counts[filter];
-            chip.setAttribute('aria-pressed', String(filter === installedFilter));
+        if (state.tab === 'installed') {
+            const counts: Record<InstalledFilter, string> = {
+                all: `All (${rows.length})`,
+                updates: `Updates (${updates})`,
+                mixed: `Mixed versions (${mixed})`,
+            };
+            for (const chip of document.querySelectorAll<HTMLButtonElement>('#installed-toolbar .filter')) {
+                const filter = chip.dataset.filter as InstalledFilter;
+                chip.textContent = counts[filter];
+                chip.setAttribute('aria-pressed', String(filter === installedFilter));
+            }
         }
+
+        renderEmptyState();
+    }
+
+    /**
+     * Whether a feed carries this package.
+     *
+     * The Updates tab is filtered by the server, which resolves versions from the chosen feed and
+     * so knows the answer already. Only Installed needs this, and only once the map has arrived —
+     * until then nothing is hidden, so the list is briefly wider than it will be rather than
+     * briefly wrong.
+     */
+    function onSelectedSource(id: string, source: string): boolean {
+        if (source.length === 0 || state.sourceMap === null) {
+            return true;
+        }
+        return (state.sourceMap[id.toLowerCase()] ?? []).some(
+            (name) => name.toLowerCase() === source.toLowerCase()
+        );
     }
 
     export function projectsWith(id: string): string[] {
@@ -396,7 +553,29 @@ namespace NG {
         const target = list ?? el<HTMLUListElement>('list');
         target.querySelector('.empty')?.remove();
 
-        if (rows.length > 0 || state.tab === 'sources') {
+        if (state.tab === 'sources' || rows.some((row) => !row.li.hidden)) {
+            return;
+        }
+
+        // A list can be empty three different ways, and only one of them is a problem: nothing
+        // installed, nothing left after the filters, or nothing searched for yet. Saying "no
+        // packages" when a feed filter is hiding forty of them sends people looking for a bug, so
+        // the message names whichever filter is doing the hiding.
+        const source = selectedSource();
+        if (rows.length > 0) {
+            const reason =
+                state.query ? `Nothing here matches “${state.query}”`
+                : source ? `Nothing here comes from ${source}`
+                : 'Nothing matches this filter';
+            const filtered = make('li', 'empty');
+            filtered.setAttribute('role', 'presentation');
+            filtered.appendChild(make('span', 'empty-title', reason));
+            filtered.appendChild(
+                document.createTextNode(
+                    `${rows.length} package${rows.length === 1 ? ' is' : 's are'} hidden by the current filters.`
+                )
+            );
+            target.appendChild(filtered);
             return;
         }
 
@@ -405,7 +584,9 @@ namespace NG {
                 ? [`Nothing matches “${state.query}”`, 'Try a different term, or another source.']
                 : ['Search the configured feeds', 'Start typing a package name.'],
             installed: ['No packages referenced', 'Nothing in this solution references a NuGet package.'],
-            updates: ['Everything is up to date', 'No installed package has a newer version available.'],
+            updates: source
+                ? [`Nothing to update from ${source}`, 'No package on this feed has a newer version available.']
+                : ['Everything is up to date', 'No installed package has a newer version available.'],
             sources: ['', ''],
         };
 

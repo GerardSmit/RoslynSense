@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { TrustedImageHosts } from './trustedImageHosts';
 
 /**
  * The panel's document shell.
@@ -22,10 +23,14 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
     );
     const style = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'nuget.css'));
 
-    // img-src allows data: only — icons are proxied by the server, nothing is fetched here.
+    // Package icons are proxied by the server and arrive as data: URIs; the only thing fetched from
+    // the network is a README image, and only from nuget.org's own badge/CDN allowlist. The
+    // renderer checks the same list before it emits an `<img>` at all, so this is the second line
+    // rather than the only one. Everything else — script, style, font, frame, connect — is denied
+    // by default-src.
     const csp = [
         "default-src 'none'",
-        `img-src data: ${webview.cspSource}`,
+        `img-src data: ${webview.cspSource} ${TrustedImageHosts.map((host) => `https://${host}`).join(' ')}`,
         `style-src 'unsafe-inline' ${webview.cspSource}`,
         `script-src 'nonce-${nonce}'`,
     ].join('; ');
@@ -41,17 +46,13 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 
 <header class="chrome">
   <div class="search-row">
+    <button class="action secondary" id="scope">All projects</button>
     <div class="search-field">
       <input type="search" id="query" placeholder="Search packages…" aria-label="Search packages">
       <kbd class="hint" aria-hidden="true">/</kbd>
     </div>
     <label class="check"><input type="checkbox" id="prerelease"> Prerelease</label>
     <select id="source" aria-label="Package source"><option value="">All sources</option></select>
-  </div>
-
-  <div class="scope-row">
-    <button class="chip" id="scope" aria-describedby="scope-summary">Choose projects…</button>
-    <span class="muted truncate" id="scope-summary">No project selected.</span>
   </div>
 
   <nav role="tablist" aria-label="Package views">

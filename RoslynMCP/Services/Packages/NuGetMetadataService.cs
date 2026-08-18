@@ -91,11 +91,16 @@ public static class NuGetMetadataService
     /// Metadata for one package. With no <paramref name="version"/> the highest listed version is
     /// used, which is what the Browse tab wants.
     /// </summary>
+    /// <param name="source">
+    /// A feed name to read from, ignoring the rest. Without it the first feed that answers wins, so
+    /// a panel scoped to one source could otherwise report a <c>SourceName</c> — and a version
+    /// list — belonging to a different feed entirely.
+    /// </param>
     public static Task<PackageMetadataDetail?> GetAsync(
         string id, string? version, bool includePrerelease, bool includeReadme, bool refresh,
-        CancellationToken ct)
+        CancellationToken ct, string? source = null)
     {
-        string key = $"{id}/{version ?? "latest"}/{includePrerelease}/{includeReadme}";
+        string key = $"{id}/{version ?? "latest"}/{includePrerelease}/{includeReadme}/{source ?? "*"}";
 
         if (refresh)
             s_cache.TryRemove(key, out _);
@@ -111,7 +116,7 @@ public static class NuGetMetadataService
             return cached.Task;
         }
 
-        var task = LoadAsync(id, version, includePrerelease, includeReadme, refresh, ct);
+        var task = LoadAsync(id, version, includePrerelease, includeReadme, refresh, source, ct);
         s_cache[key] = (DateTime.UtcNow, task);
         return task;
     }
@@ -132,23 +137,28 @@ public static class NuGetMetadataService
 
     private static async Task<PackageMetadataDetail?> LoadAsync(
         string id, string? version, bool includePrerelease, bool includeReadme, bool refresh,
-        CancellationToken ct)
+        string? source, CancellationToken ct)
     {
         try
         {
             WorkspaceService.EnsureRegistered();
 
             using var cache = NuGetFeedContext.RentCache(refresh);
-            var (metadata, sourceName) = await FetchAsync(id, version, includePrerelease, cache, ct);
+            var (metadata, sourceName) = await FetchAsync(id, version, includePrerelease, source, cache, ct);
             if (metadata is null)
                 return null;
 
             var projected = Project(metadata, sourceName);
 
-            var versions = await NuGetService.AllVersionsAsync(id, includePrerelease: true, refresh, ct);
+            // Scoped to the same feed as the metadata: a version dropdown listing releases the
+            // chosen feed does not serve would offer installs that cannot restore.
+            var versions = await NuGetService.AllVersionsBySourceAsync(
+                id, includePrerelease: true, refresh, ct);
             projected = projected with
             {
-                AllVersions = versions.Results.Select(v => v.ToNormalizedString()).ToList(),
+                AllVersions = NuGetService.Distinct(versions.Results, source)
+                    .Select(v => v.ToNormalizedString())
+                    .ToList(),
                 Deprecation = await DeprecationAsync(metadata),
                 ReadmeMarkdown = includeReadme ? await ReadmeFromFeedAsync(metadata, ct) : null,
             };
@@ -167,13 +177,20 @@ public static class NuGetMetadataService
     }
 
     private static async Task<(IPackageSearchMetadata? Metadata, string? SourceName)> FetchAsync(
-        string id, string? version, bool includePrerelease, SourceCacheContext cache, CancellationToken ct)
+        string id, string? version, bool includePrerelease, string? source, SourceCacheContext cache,
+        CancellationToken ct)
     {
         bool exact = version is { Length: > 0 } && NuGetVersion.TryParse(version, out _);
         NuGetVersion? parsed = exact ? NuGetVersion.Parse(version!) : null;
 
         foreach (var repository in NuGetFeedContext.Repositories(id))
         {
+            if (source is { Length: > 0 } &&
+                !repository.PackageSource.Name.Equals(source, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             try
             {
                 var pending = s_resources.GetOrAdd(

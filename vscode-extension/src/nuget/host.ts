@@ -3,6 +3,8 @@ import type { LanguageClient } from 'vscode-languageclient/node';
 import { forgetCredential } from './credentials';
 import { html } from './html';
 import { pickScope, rememberScope, savedScope } from './scope';
+import { TrustedImageHosts } from './trustedImageHosts';
+import { resolveTokenColors } from './themeColors';
 
 /**
  * The extension-host half of the panel: it owns the LSP calls, anything modal, and every decision
@@ -25,6 +27,24 @@ export function wire(
     let scope: string[] = [];
 
     const post = (message: NuGetMsg.ToView) => void panel.webview.postMessage(message);
+
+    // Switching theme repaints every editor; a README code block that kept the old theme's colours
+    // would be the one surface in the window that did not get the message. Customising tokens by
+    // hand is the same story, and arrives as a configuration change rather than a theme change.
+    const restyle = () => post({ type: 'settings', settings: settings() });
+    vscode.window.onDidChangeActiveColorTheme(restyle, null, context.subscriptions);
+    vscode.workspace.onDidChangeConfiguration(
+        (event) => {
+            if (
+                event.affectsConfiguration('workbench.colorTheme') ||
+                event.affectsConfiguration('editor.tokenColorCustomizations')
+            ) {
+                restyle();
+            }
+        },
+        null,
+        context.subscriptions
+    );
 
     // A count, not a flag: the handler is async, so two requests overlap and the first to finish
     // would otherwise stop the progress bar while the second is still running.
@@ -174,12 +194,28 @@ export function wire(
                             versionLock: message.versionLock,
                             projectPaths: message.projectPaths.length > 0 ? message.projectPaths : null,
                             alignPlatform: alignPlatform(),
+                            source: message.source || null,
                         });
                         post({
                             type: 'updates',
                             gen: message.gen,
                             updates: result.updates,
                             feeds: result.feeds,
+                        });
+                        settle(started);
+                        break;
+                    }
+
+                    case 'packageSources': {
+                        start();
+                        const result = await client.sendRequest<{
+                            map: Record<string, string[]>;
+                        }>('roslynSense/nuget/packageSources', { ids: message.ids });
+                        post({
+                            type: 'packageSources',
+                            gen: message.gen,
+                            source: message.source,
+                            map: result.map,
                         });
                         settle(started);
                         break;
@@ -210,6 +246,7 @@ export function wire(
                                 id: message.id,
                                 version: message.version,
                                 includeReadme: settings().readme !== 'off',
+                                source: message.source || null,
                             }
                         );
                         post({
@@ -310,6 +347,9 @@ export function wire(
                     }
 
                     case 'uninstall': {
+                        if (!(await confirmWideRemoval(message))) {
+                            break;
+                        }
                         await run(client, panel, `Removing ${message.id}…`, 'uninstall', {
                             id: message.id,
                             projectPaths: message.projectPaths,
@@ -635,6 +675,35 @@ async function acceptLicense(message: {
     return answer === 'Accept';
 }
 
+/**
+ * Confirms a removal whose reach was inferred rather than chosen.
+ *
+ * With no project selected, Uninstall means "every project that references this" — which is the
+ * useful default, and also the one case where a single click edits files the user never named. An
+ * explicit selection is treated as intent and goes straight through however wide it is.
+ */
+async function confirmWideRemoval(message: {
+    id: string;
+    projectPaths: string[];
+    confirmAll: boolean;
+}): Promise<boolean> {
+    if (!message.confirmAll || message.projectPaths.length <= 1) {
+        return true;
+    }
+
+    const answer = await vscode.window.showWarningMessage(
+        `Remove ${message.id} from all ${message.projectPaths.length} projects that reference it?`,
+        {
+            modal: true,
+            detail: message.projectPaths
+                .map((path) => path.split(/[\\/]/).pop() ?? path)
+                .join('\n'),
+        },
+        'Remove'
+    );
+    return answer === 'Remove';
+}
+
 /** Warns before an install that restore would reject, without refusing it. */
 async function confirmFrameworks(
     client: LanguageClient,
@@ -688,6 +757,8 @@ function settings(): NuGetMsg.Settings {
         pageSize: config.get<number>('nuget.pageSize', 30),
         readme: config.get<'rendered' | 'plain' | 'off'>('nuget.readme', 'rendered'),
         showTransitive: config.get<boolean>('nuget.showTransitive', true),
+        trustedImageHosts: [...TrustedImageHosts],
+        codeTokenColors: resolveTokenColors(),
     };
 }
 

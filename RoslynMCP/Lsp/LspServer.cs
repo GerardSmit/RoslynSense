@@ -433,6 +433,11 @@ internal sealed class LspServer : IDisposable
     public Task<Handlers.NuGetUpdatesResultDto> NuGetUpdates(Handlers.NuGetUpdatesParams p, CancellationToken ct) =>
         Handlers.NuGetHandler.UpdatesAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/nuget/packageSources", UseSingleObjectParameterDeserialization = true)]
+    public Task<Handlers.NuGetPackageSourcesDto> NuGetPackageSources(
+        Handlers.NuGetPackageSourcesParams p, CancellationToken ct) =>
+        Handlers.NuGetHandler.PackageSourcesAsync(p, ct);
+
     [JsonRpcMethod("roslynSense/nuget/consolidations")]
     public Task<Handlers.ConsolidationDto[]> NuGetConsolidations(CancellationToken ct) =>
         Handlers.NuGetHandler.ConsolidationsAsync(ct);

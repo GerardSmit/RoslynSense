@@ -64,7 +64,8 @@ internal static class NuGetHandler
             Prerelease: ParsePrerelease(p.Prerelease),
             ProjectPaths: p.ProjectPaths,
             Refresh: p.Refresh,
-            AlignPlatform: p.AlignPlatform);
+            AlignPlatform: p.AlignPlatform,
+            Source: p.Source);
 
         var found = await PackageUpdateService.OutdatedAsync(query, ct);
 
@@ -97,10 +98,23 @@ internal static class NuGetHandler
     public static async Task<PackageMetadataDto?> MetadataAsync(NuGetMetadataParams p, CancellationToken ct)
     {
         var detail = await NuGetMetadataService.GetAsync(
-            p.Id, p.Version, p.IncludePrerelease, p.IncludeReadme, p.Refresh, ct);
+            p.Id, p.Version, p.IncludePrerelease, p.IncludeReadme, p.Refresh, ct, p.Source);
 
         return detail is null ? null : ToDto(detail);
     }
+
+    /// <summary>
+    /// Which feeds carry each id, so the panel can narrow Installed to a chosen source.
+    /// </summary>
+    /// <remarks>
+    /// A separate request rather than a field on <see cref="InstalledAsync"/>: reading project files
+    /// is local and instant, while this reaches every feed. Folding them together would make opening
+    /// the panel wait on the network for a filter most sessions never use — and the answer shares a
+    /// cache with the update check, so asking for it after one is free.
+    /// </remarks>
+    public static async Task<NuGetPackageSourcesDto> PackageSourcesAsync(
+        NuGetPackageSourcesParams p, CancellationToken ct) =>
+        new(await PackageUpdateService.SourcesOfAsync(p.Ids ?? [], ct));
 
     /// <summary>
     /// Whether a package version supports what the selected projects target. Advisory: the answer

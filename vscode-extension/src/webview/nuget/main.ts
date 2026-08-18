@@ -2,6 +2,7 @@
 /// <reference path="./updates.ts" />
 /// <reference path="./sources.ts" />
 /// <reference path="./splitter.ts" />
+/// <reference path="./nav.ts" />
 
 /** Boot, tab switching and the message loop. */
 namespace NG {
@@ -12,7 +13,8 @@ namespace NG {
         // completely empty with no error anywhere.
         wireMessages();
 
-        for (const step of [wireHeader, wireListKeyboard, wireUpdates, wireSources, wireSplitter]) {
+        const steps = [wireHeader, wireListKeyboard, wireUpdates, wireSources, wireSplitter, wireNavigation];
+        for (const step of steps) {
             try {
                 step();
             } catch (error) {
@@ -29,17 +31,16 @@ namespace NG {
 
         query.addEventListener('input', () => {
             window.clearTimeout(debounce);
-            debounce = window.setTimeout(() => {
-                state.query = query.value;
-                switchTab('browse');
-            }, 300);
+            debounce = window.setTimeout(() => applyQuery(query.value), 300);
         });
 
         el<HTMLInputElement>('prerelease').addEventListener('change', () => refresh());
+        // Every tab, not only Browse: a feed selector that silently means "Browse only" is worse
+        // than no feed selector, because Installed and Updates go on listing packages that feed
+        // has never heard of.
         el<HTMLSelectElement>('source').addEventListener('change', () => {
-            if (state.tab === 'browse') {
-                refresh();
-            }
+            state.sourceMap = null;
+            refresh();
         });
 
         el<HTMLButtonElement>('scope').addEventListener('click', () => post({ type: 'pickScope' }));
@@ -60,10 +61,28 @@ namespace NG {
                 query.focus();
             } else if (event.key === 'Escape' && document.activeElement === query) {
                 query.value = '';
-                state.query = '';
-                switchTab('browse');
+                applyQuery('');
             }
         });
+    }
+
+    /**
+     * The search box searches whatever tab you are on.
+     *
+     * It used to jump to Browse on the first keystroke, which meant there was no way to find a
+     * package among four hundred installed ones — the tab you were looking at vanished as soon as
+     * you typed its name. Browse still asks the feed, because that is the only list the panel does
+     * not already hold; the rest narrow in place.
+     */
+    function applyQuery(value: string): void {
+        state.query = value;
+
+        if (state.tab === 'browse') {
+            refresh();
+        } else if (state.tab !== 'sources') {
+            applyRowFilter();
+        }
+        persist();
     }
 
     export function switchTab(tab: NuGetMsg.Tab): void {
@@ -73,6 +92,7 @@ namespace NG {
             tab = 'browse';
         }
         state.tab = tab;
+        pushNav({ tab, packageId: null });
 
         for (const button of document.querySelectorAll<HTMLButtonElement>('nav button')) {
             button.setAttribute('aria-selected', String(button.dataset.tab === tab));
@@ -81,6 +101,15 @@ namespace NG {
         el<HTMLElement>('updates-toolbar').hidden = tab !== 'updates';
         el<HTMLElement>('installed-toolbar').hidden = tab !== 'installed';
         el<HTMLElement>('summary').hidden = true;
+
+        // Feeds are not packages: the box has nothing to search here, and a control that silently
+        // does nothing is worse than one that says so.
+        const query = el<HTMLInputElement>('query');
+        query.disabled = tab === 'sources';
+        query.placeholder =
+            tab === 'browse' ? 'Search packages…'
+            : tab === 'sources' ? 'Search does not apply to feeds'
+            : `Filter ${tab}…`;
 
         // Feeds are a different shape from packages, so they get their own pane rather than
         // pretending a feed is a row in the same listbox.
@@ -141,6 +170,7 @@ namespace NG {
                         state.projects = message.projects;
                         state.sources = message.sources;
                         state.settings = message.settings;
+                        applyTokenColors(message.settings.codeTokenColors);
                         setScope(message.scope);
                         fillSources(message.sources);
                         // Without this a first-ever open sits on an empty list having issued no
@@ -150,6 +180,11 @@ namespace NG {
                         } else {
                             switchTab(state.tab);
                         }
+                        break;
+
+                    case 'settings':
+                        state.settings = message.settings;
+                        applyTokenColors(message.settings.codeTokenColors);
                         break;
 
                     case 'results':
@@ -175,8 +210,22 @@ namespace NG {
                             targetFrameworks: p.targetFrameworks,
                         }));
                         if (state.tab === 'installed' && message.gen === listGen) {
-                            setRows(mergeInstalled(message.projects));
+                            const merged = mergeInstalled(message.projects);
+                            setRows(merged);
+                            requestPackageSources(merged.map((pkg) => pkg.id));
                         }
+                        break;
+
+                    case 'packageSources':
+                        // A reply for a feed the user has since moved off would filter the list by
+                        // the wrong feed entirely — worse than not filtering it at all.
+                        if (message.gen !== listGen || message.source !== selectedSource()) {
+                            return;
+                        }
+                        state.sourceMap = Object.fromEntries(
+                            Object.entries(message.map).map(([id, sources]) => [id.toLowerCase(), sources])
+                        );
+                        applyRowFilter();
                         break;
 
                     case 'updates':
@@ -195,7 +244,7 @@ namespace NG {
                             for (const row of rows) {
                                 decorateRow(row);
                             }
-                            applyInstalledFilter();
+                            applyRowFilter();
                         }
                         break;
 
@@ -309,6 +358,22 @@ namespace NG {
         });
     }
 
+    /**
+     * Asks which feeds carry each installed package, but only when a feed is actually selected.
+     *
+     * Unlike Updates, the Installed list is read from project files and knows nothing about feeds,
+     * so this is the one place the filter costs a round trip. It shares the update check's cache
+     * server-side, and "All sources" — the normal case — never asks at all.
+     */
+    function requestPackageSources(ids: string[]): void {
+        const source = selectedSource();
+        if (source.length === 0 || ids.length === 0) {
+            state.sourceMap = null;
+            return;
+        }
+        post({ type: 'packageSources', gen: listGen, ids, source });
+    }
+
     /** One row per package id, with the versions every project resolved to. */
     function mergeInstalled(projects: NuGetMsg.ProjectPackages[]): NuGetMsg.PackageSummary[] {
         const byId = new Map<string, NuGetMsg.PackageSummary>();
@@ -397,18 +462,46 @@ namespace NG {
         select.value = previous;
     }
 
+    /**
+     * The scope chip: a count, never a list.
+     *
+     * An empty scope is a valid, useful state now rather than something to be fixed before the
+     * panel works — it means "wherever this package already is" for update and uninstall. The
+     * chosen projects are on the tooltip; thirty of them spelled out next to the chip is how the
+     * header turned into a paragraph.
+     */
+    /**
+     * Paints the highlighter with the editor's own token colours.
+     *
+     * Custom properties rather than classes, because the stylesheet already names a fallback for
+     * each one: a theme the host could not read simply leaves `--tok-kw` unset and the rule behind
+     * it keeps working. The values are colours from a theme file, and they reach CSS through
+     * `setProperty`, so nothing here can inject a declaration — an unparseable value is dropped.
+     */
+    function applyTokenColors(colors: Record<string, string>): void {
+        for (const token of ['com', 'str', 'kw', 'typ', 'num', 'tag', 'attr']) {
+            const value = colors[token];
+            if (value) {
+                document.documentElement.style.setProperty(`--tok-${token}`, value);
+            } else {
+                document.documentElement.style.removeProperty(`--tok-${token}`);
+            }
+        }
+    }
+
     function setScope(scope: string[]): void {
         state.scope = scope;
 
         const button = el<HTMLButtonElement>('scope');
-        button.textContent = scope.length === 0 ? 'Choose projects…' : `${describeScope(scope)} ▾`;
-        button.classList.toggle('warn', scope.length > 3);
-
-        const summary = el<HTMLElement>('scope-summary');
-        summary.textContent =
+        button.textContent = scope.length === 0 ? 'All projects ▾' : `${describeProjects(scope)} ▾`;
+        button.title =
             scope.length === 0
-                ? 'Choose at least one project to install into.'
-                : scope.map((path) => fileName(path)).join(', ');
+                ? 'Every project. Choose projects to narrow what the panel acts on.'
+                : scope.map((path) => fileName(path)).join('\n');
+        button.setAttribute(
+            'aria-label',
+            scope.length === 0 ? 'All projects' : `Projects: ${scope.map(fileName).join(', ')}`
+        );
 
         if (focusedRow) {
             renderDetails(focusedRow, state.metadata[metadataKey(focusedRow.pkg)] ?? null);

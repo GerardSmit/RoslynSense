@@ -69,7 +69,7 @@ namespace NG {
     export function onIcon(key: string, dataUri: string | null): void {
         cache.set(key, { dataUri });
 
-        for (const row of rows) {
+        for (const row of [...rows, ...secondaryRows]) {
             if (iconKey(row.pkg) === key) {
                 apply(row, dataUri);
             }
@@ -129,6 +129,6 @@ namespace NG {
     }
 
     function rowByElement(element: HTMLElement): Row | undefined {
-        return rows.find((row) => row.li === element);
+        return [...rows, ...secondaryRows].find((row) => row.li === element);
     }
 }

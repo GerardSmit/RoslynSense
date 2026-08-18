@@ -210,6 +210,18 @@ declare namespace NuGetMsg {
         pageSize: number;
         readme: 'rendered' | 'plain' | 'off';
         showTransitive: boolean;
+        /**
+         * Hosts a README image may be loaded from, mirroring the CSP the panel was built with.
+         * The renderer checks it itself rather than emitting an `<img>` and letting the CSP block
+         * it, because a blocked image is a broken-image box and a refused one is a chip.
+         */
+        trustedImageHosts: string[];
+        /**
+         * The active theme's token colours, keyed by the highlighter's class suffix (`kw`, `str`,
+         * …). Absent keys fall through to the stylesheet's own palette, so a theme this could not
+         * read costs colour accuracy and nothing else.
+         */
+        codeTokenColors: Record<string, string>;
     }
 
     // ---- Webview to host -------------------------------------------------------------
@@ -218,17 +230,26 @@ declare namespace NuGetMsg {
         | { type: 'ready'; state: SavedState | null }
         | { type: 'search'; gen: number; query: string; includePrerelease: boolean; source: string; skip: number }
         | { type: 'installed'; gen: number }
-        | { type: 'updates'; gen: number; includePrerelease: boolean; versionLock: Lock; projectPaths: string[] }
+        | {
+              type: 'updates';
+              gen: number;
+              includePrerelease: boolean;
+              versionLock: Lock;
+              projectPaths: string[];
+              source: string;
+          }
+        | { type: 'packageSources'; gen: number; ids: string[]; source: string }
         | { type: 'audit'; gen: number; refresh: boolean }
         | { type: 'versions'; id: string; includePrerelease: boolean }
-        | { type: 'metadata'; gen: number; id: string; version: string | null }
+        | { type: 'metadata'; gen: number; id: string; version: string | null; source: string }
         | { type: 'icon'; id: string; version: string | null; iconUrl: string | null; allowDownload: boolean }
         | { type: 'transitive'; gen: number; projectPath: string; packageId: string | null }
         | { type: 'pickScope' }
         | { type: 'sources' }
         | { type: 'sourceEdit'; action: SourceAction; name?: string; source?: string; order?: string[] }
         | { type: 'install'; id: string; version: string; projectPaths: string[]; requireLicenseAcceptance: boolean; license: string | null }
-        | { type: 'uninstall'; id: string; projectPaths: string[] }
+        /** `confirmAll` when the projects were inferred from an empty scope rather than chosen. */
+        | { type: 'uninstall'; id: string; projectPaths: string[]; confirmAll: boolean }
         | { type: 'consolidate'; id: string; version: string }
         | {
               type: 'updateAll';
@@ -252,9 +273,13 @@ declare namespace NuGetMsg {
 
     type ToView =
         | { type: 'boot'; scope: string[]; projects: ProjectRef[]; sources: PackageSource[]; settings: Settings; state: SavedState | null }
+        /** Settings changed under a live panel — today, the theme the code blocks are painted in. */
+        | { type: 'settings'; settings: Settings }
         | { type: 'results'; gen: number; tab: Tab; skip: number; results: PackageSummary[]; hasMore: boolean; feeds: FeedOutcome[] }
         | { type: 'projects'; gen: number; projects: ProjectPackages[] }
         | { type: 'updates'; gen: number; updates: PackageUpdate[]; feeds: FeedOutcome[] }
+        /** Which feeds carry each requested id. `source` echoes the selection it was asked for. */
+        | { type: 'packageSources'; gen: number; source: string; map: Record<string, string[]> }
         | { type: 'updatePlan'; gen: number; induced: InducedUpdate[] }
         | { type: 'audit'; gen: number; audit: Audit }
         | { type: 'versions'; id: string; versions: string[] }

@@ -18,6 +18,9 @@ namespace NG {
             gen: nextDetailsGen(),
             id: row.pkg.id,
             version: row.pkg.installedVersion ?? row.pkg.version ?? null,
+            // Read from the feed the panel is scoped to, so the source and version list shown are
+            // the ones the rest of the panel is talking about.
+            source: selectedSource(),
         });
 
         if (state.settings.showTransitive && row.projectPaths.length > 0) {
@@ -45,7 +48,15 @@ namespace NG {
         if (metadata?.readmeMarkdown && state.settings.readme !== 'off') {
             const section = make('section', 'd-readme');
             section.appendChild(make('h3', undefined, 'Readme'));
-            section.appendChild(renderMarkdown(metadata.readmeMarkdown, state.settings.readme === 'plain'));
+            section.appendChild(
+                renderMarkdown(
+                    metadata.readmeMarkdown,
+                    state.settings.readme === 'plain',
+                    // Relative links and images in a README are written to be read inside the
+                    // repository; the project URL is what makes them resolvable here.
+                    metadata.projectUrl
+                )
+            );
             details.appendChild(section);
         } else if (row.pkg.description || metadata?.description) {
             details.appendChild(make('p', 'd-description', metadata?.description ?? row.pkg.description ?? ''));
@@ -54,6 +65,14 @@ namespace NG {
         renderDependencies(details, row, metadata);
         renderTransitive(details, row);
         renderFacts(details, row, metadata);
+    }
+
+    /** Advisory URLs, deduped — several projects hitting the same CVE is one advisory, not four. */
+    function appendAdvisoryLinks(node: HTMLElement, urls: (string | null)[]): void {
+        for (const url of new Set(urls.filter((u): u is string => !!u))) {
+            node.appendChild(document.createTextNode(' '));
+            node.appendChild(link('advisory', url));
+        }
     }
 
     function renderBanners(
@@ -66,29 +85,45 @@ namespace NG {
         );
         const fromMetadata = metadata?.vulnerabilities ?? [];
 
-        if (advisories.length > 0 || fromMetadata.length > 0) {
-            const worst = Math.max(
-                ...advisories.map((a) => a.severity),
-                ...fromMetadata.map((v) => v.severity),
-                0
-            );
-            const node = banner('error', `Known vulnerabilities — highest severity ${severityName(worst)}.`);
+        // The two sources are about two different versions, and saying so is the whole point. The
+        // audit is the restore's verdict on what is installed; the metadata's advisories belong to
+        // whichever version the dropdown is showing, which is usually the one you came here to
+        // upgrade *to*. Merged into one line they read as "this package is unsafe either way".
+        if (advisories.length > 0) {
+            const installed = [...new Set(advisories.map((a) => a.version))].sort();
+            const worst = Math.max(...advisories.map((a) => a.severity));
+            const subject =
+                installed.length === 1
+                    ? `The installed version, ${installed[0]},`
+                    : `The installed versions (${installed.join(', ')})`;
 
-            const urls = new Set(
-                [...advisories.map((a) => a.advisoryUrl), ...fromMetadata.map((v) => v.advisoryUrl)].filter(
-                    (u): u is string => !!u
+            const node = banner('error', '');
+            node.appendChild(
+                document.createTextNode(
+                    `${subject} ${installed.length === 1 ? 'has' : 'have'} known vulnerabilities — ` +
+                    `highest severity ${severityName(worst)}.`
                 )
             );
-            for (const url of urls) {
-                node.appendChild(document.createTextNode(' '));
-                node.appendChild(link('advisory', url));
-            }
+            appendAdvisoryLinks(node, advisories.map((a) => a.advisoryUrl));
 
             if (advisories.some((a) => a.isTransitive)) {
                 node.appendChild(
                     make('div', 'muted', 'Reached through a transitive dependency, not a direct reference.')
                 );
             }
+            details.appendChild(node);
+        }
+
+        if (fromMetadata.length > 0 && metadata) {
+            const worst = Math.max(...fromMetadata.map((v) => v.severity));
+            const node = banner('error', '');
+            node.appendChild(
+                document.createTextNode(
+                    `Version ${metadata.version} has known vulnerabilities — ` +
+                    `highest severity ${severityName(worst)}.`
+                )
+            );
+            appendAdvisoryLinks(node, fromMetadata.map((v) => v.advisoryUrl));
             details.appendChild(node);
         }
 
@@ -100,10 +135,15 @@ namespace NG {
             const reasons = deprecation.reasons.length > 0 ? ` (${deprecation.reasons.join(', ')})` : '';
             const node = banner('warn', `This package is deprecated${reasons}.`);
             if (deprecation.message) {
-                node.appendChild(make('div', undefined, deprecation.message));
+                // These messages end in a URL more often than not — the .NET deprecation campaign
+                // appends "you can learn more about it from <url>" to every one of them — and a
+                // URL you cannot click is the one part of a warning that had a job to do.
+                node.appendChild(make('div')).appendChild(linkify(deprecation.message));
             }
             if (deprecation.alternatePackageId) {
-                const alternate = make('div', undefined, `Use ${deprecation.alternatePackageId} `);
+                const alternate = make('div', undefined, 'Use ');
+                alternate.appendChild(packageLink(deprecation.alternatePackageId));
+                alternate.appendChild(document.createTextNode(' '));
                 alternate.appendChild(make('span', 'muted', deprecation.alternateVersionRange ?? ''));
                 node.appendChild(alternate);
             }
@@ -196,35 +236,67 @@ namespace NG {
         });
         actions.appendChild(versions);
 
-        const install = make('button', 'action') as HTMLButtonElement;
-        install.textContent = installLabel(row);
-        install.disabled =
-            state.scope.length === 0 || row.pkg.isGlobalPackageReference || known.length === 0;
-        install.addEventListener('click', () =>
-            post({
-                type: 'install',
-                id: row.pkg.id,
-                version: versions.value,
-                projectPaths: state.scope,
-                requireLicenseAcceptance: metadata?.requireLicenseAcceptance ?? false,
-                license: metadata?.licenseExpression ?? null,
-            })
-        );
-        actions.appendChild(install);
+        const targets = targetsFor(row);
+
+        const primary = make('button', 'action') as HTMLButtonElement;
+        primary.disabled = row.pkg.isGlobalPackageReference || known.length === 0;
 
         if (row.pkg.installedVersion) {
-            const targets = state.scope.filter((path) =>
-                row.projectPaths.some((p) => p.toLowerCase() === path.toLowerCase())
+            // An installed package moves version; it is never re-added. `install` shells
+            // `dotnet add package`, which would write a reference into every targeted project
+            // whether or not it had one — the same reason the Installed tab's row button goes
+            // through updateAll (see buildRowUpdate).
+            primary.textContent =
+                targets.paths.length === 0
+                    ? 'Update — not referenced by the selected projects'
+                    : `Update in ${describeProjects(targets.paths)}`;
+            primary.disabled = primary.disabled || targets.paths.length === 0;
+            primary.addEventListener('click', () =>
+                post({
+                    type: 'updateAll',
+                    packages: [{ id: row.pkg.id, version: versions.value, projectPaths: targets.paths }],
+                    versionLock: el<HTMLSelectElement>('version-lock').value as NuGetMsg.Lock,
+                    includePrerelease: el<HTMLInputElement>('prerelease').checked,
+                })
             );
+        } else {
+            // Install is the one action with nothing to infer from: there is no existing set of
+            // projects, and "every project in the solution" is how a repository ends up with a
+            // reference in places nobody meant to put one.
+            primary.textContent =
+                state.scope.length === 0
+                    ? 'Install — choose a project first'
+                    : `Install into ${describeProjects(state.scope)}`;
+            primary.disabled = primary.disabled || state.scope.length === 0;
+            primary.addEventListener('click', () =>
+                post({
+                    type: 'install',
+                    id: row.pkg.id,
+                    version: versions.value,
+                    projectPaths: state.scope,
+                    requireLicenseAcceptance: metadata?.requireLicenseAcceptance ?? false,
+                    license: metadata?.licenseExpression ?? null,
+                })
+            );
+        }
+        actions.appendChild(primary);
 
+        if (row.pkg.installedVersion) {
             const remove = make('button', 'action secondary') as HTMLButtonElement;
-            remove.textContent =
-                targets.length === state.scope.length
-                    ? `Uninstall from ${describeScope(targets)}`
-                    : `Uninstall from ${targets.length} of ${state.scope.length} selected`;
-            remove.disabled = targets.length === 0 || row.pkg.isGlobalPackageReference;
+            remove.textContent = `Uninstall from ${describeProjects(targets.paths)}`;
+            remove.title = targets.inferred
+                ? 'Every project that references this package. Choose projects above to narrow it.'
+                : targets.paths.join('\n');
+            remove.disabled = targets.paths.length === 0 || row.pkg.isGlobalPackageReference;
             remove.addEventListener('click', () =>
-                post({ type: 'uninstall', id: row.pkg.id, projectPaths: targets })
+                post({
+                    type: 'uninstall',
+                    id: row.pkg.id,
+                    projectPaths: targets.paths,
+                    // Nothing was chosen, so nothing was named: the host asks before editing
+                    // several project files the user never pointed at.
+                    confirmAll: targets.inferred,
+                })
             );
             actions.appendChild(remove);
         }
@@ -287,9 +359,12 @@ namespace NG {
         const section = make('section', 'd-deps');
         section.appendChild(make('h3', undefined, 'Dependencies'));
 
+        // The projects being acted on, which with an empty scope are the ones already referencing
+        // the package rather than none of them — otherwise no group would open in the common case.
+        const targets = targetsFor(row).paths;
         const projectFrameworks = new Set(
             state.projects
-                .filter((p) => state.scope.some((s) => s.toLowerCase() === p.projectPath.toLowerCase()))
+                .filter((p) => targets.some((t) => t.toLowerCase() === p.projectPath.toLowerCase()))
                 .flatMap((p) => p.targetFrameworks.map((f) => f.toLowerCase()))
         );
 
@@ -299,12 +374,16 @@ namespace NG {
             node.open = projectFrameworks.has(group.targetFramework.toLowerCase());
 
             const summary = make('summary', undefined,
-                `${group.targetFramework || 'any framework'} — ${group.dependencies.length} dependencies`);
+                `${group.targetFramework || 'any framework'} — ${group.dependencies.length} ` +
+                `${group.dependencies.length === 1 ? 'dependency' : 'dependencies'}`);
             node.appendChild(summary);
 
             const list = make('ul', 'd-dep-list');
             for (const dependency of group.dependencies) {
-                list.appendChild(make('li', undefined, `${dependency.id} ${dependency.versionRange}`));
+                const item = make('li');
+                item.appendChild(packageLink(dependency.id));
+                item.appendChild(make('span', 'muted', ` ${dependency.versionRange}`));
+                list.appendChild(item);
             }
             node.appendChild(list);
             section.appendChild(node);
@@ -324,7 +403,10 @@ namespace NG {
 
         const list = make('ul', 'd-dep-list');
         for (const package_ of packages) {
-            list.appendChild(make('li', undefined, `${package_.id} ${package_.version}`));
+            const item = make('li');
+            item.appendChild(packageLink(package_.id));
+            item.appendChild(make('span', 'muted', ` ${package_.version}`));
+            list.appendChild(item);
         }
         section.appendChild(list);
         details.appendChild(section);
@@ -398,19 +480,39 @@ namespace NG {
         details.appendChild(section);
     }
 
-    export function installLabel(row: Row): string {
-        const verb = row.pkg.installedVersion ? 'Update' : 'Install';
-        return state.scope.length === 0
-            ? `${verb} — choose a project first`
-            : `${verb} into ${describeScope(state.scope)}`;
+    /**
+     * The projects an action applies to.
+     *
+     * With projects chosen, the selection wins, narrowed to the ones that actually reference the
+     * package. With nothing chosen, update and uninstall mean "wherever this package already is" —
+     * which is the set they were always going to operate on, and which used to have to be
+     * hand-picked one project at a time.
+     */
+    export function targetsFor(row: Row): { paths: string[]; inferred: boolean } {
+        if (state.scope.length === 0) {
+            return { paths: row.projectPaths, inferred: true };
+        }
+
+        return {
+            paths: state.scope.filter((path) =>
+                row.projectPaths.some((p) => p.toLowerCase() === path.toLowerCase())
+            ),
+            inferred: false,
+        };
     }
 
-    export function describeScope(paths: string[]): string {
+    /**
+     * A count, never a list. Spelling out thirty project names is how the header used to become a
+     * paragraph; the names live on the tooltip of whatever this labels.
+     */
+    export function describeProjects(paths: string[]): string {
         if (paths.length === 0) {
             return 'no project';
         }
-        const names = paths.map((path) => fileName(path).replace(/\.[^.]+$/, ''));
-        return names.length <= 3 ? names.join(', ') : `${names.length} projects`;
+        if (paths.length === 1) {
+            return fileName(paths[0]).replace(/\.[^.]+$/, '');
+        }
+        return `${paths.length} projects`;
     }
 
     export function fileName(path: string): string {

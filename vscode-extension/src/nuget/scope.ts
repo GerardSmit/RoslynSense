@@ -3,10 +3,14 @@ import * as vscode from 'vscode';
 /**
  * Which projects a package operation applies to.
  *
- * There is deliberately no "all projects" value. The previous panel defaulted to it, so pressing
- * Install from the Browse tab wrote a PackageReference into every project in the solution — which
- * on a forty-project repo is a change nobody asked for and nobody notices until the next build.
- * An empty scope disables the action instead.
+ * An empty scope means "every project that already references the package" — which is the set
+ * Update and Uninstall were always going to touch, and which used to have to be hand-picked one
+ * project at a time on a forty-project solution.
+ *
+ * Install is the exception and stays disabled while nothing is chosen. It is the one action with
+ * no existing set to infer from, and the previous panel's "all projects" default meant pressing
+ * Install from the Browse tab wrote a PackageReference into every project in the solution — a
+ * change nobody asked for and nobody notices until the next build.
  */
 const SCOPE_KEY = 'roslynSense.nuget.scope';
 
@@ -65,8 +69,8 @@ export async function pickScope(
         })),
         {
             canPickMany: true,
-            title: 'Projects to install into',
-            placeHolder: 'Select one or more projects',
+            title: 'Projects the panel acts on',
+            placeHolder: 'Select projects, or none for all of them',
         }
     );
 

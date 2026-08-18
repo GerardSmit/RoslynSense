@@ -170,7 +170,8 @@ public static class PackageDependencyPlanner
         CancellationToken ct)
     {
         var lookup = await PackageUpdateService.VersionsAsync(reference.Id, query, ct);
-        if (lookup.Results.Count == 0)
+        var available = NuGetService.Distinct(lookup.Results, query.Source);
+        if (available.Count == 0)
             return required;
 
         int? cap = query.AlignPlatform &&
@@ -179,14 +180,14 @@ public static class PackageDependencyPlanner
                 : null;
 
         var resolved = PackageUpdateService.Resolve(
-            current, reference.Version, lookup.Results, query, cap);
+            current, reference.Version, available, query, cap);
 
         // The same probe the update list applies: an induced bump to a version the project's
         // frameworks cannot use trades NU1605 for NU1202.
         if (resolved is { } candidate && candidate > required)
         {
             resolved = await PackageUpdateService.CompatibleAsync(
-                reference.Id, current, candidate, lookup.Results, projectFrameworks, ct);
+                reference.Id, current, candidate, available, projectFrameworks, ct);
         }
 
         return resolved is { } best && best > required ? best : required;

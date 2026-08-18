@@ -22,7 +22,15 @@ public sealed record NuGetUpdatesParams(
     [property: JsonPropertyName("prerelease")] string? Prerelease = null,
     [property: JsonPropertyName("projectPaths")] string[]? ProjectPaths = null,
     [property: JsonPropertyName("refresh")] bool Refresh = false,
-    [property: JsonPropertyName("alignPlatform")] bool AlignPlatform = true);
+    [property: JsonPropertyName("alignPlatform")] bool AlignPlatform = true,
+    [property: JsonPropertyName("source")] string? Source = null);
+
+/// <summary>Which feeds carry each of these package ids, for the panel's source filter.</summary>
+public sealed record NuGetPackageSourcesParams(
+    [property: JsonPropertyName("ids")] string[] Ids);
+
+public sealed record NuGetPackageSourcesDto(
+    [property: JsonPropertyName("map")] IReadOnlyDictionary<string, IReadOnlyList<string>> Map);
 
 public sealed record NuGetOperationParams(
     [property: JsonPropertyName("id")] string Id,
@@ -40,7 +48,8 @@ public sealed record NuGetMetadataParams(
     [property: JsonPropertyName("version")] string? Version = null,
     [property: JsonPropertyName("includePrerelease")] bool IncludePrerelease = false,
     [property: JsonPropertyName("includeReadme")] bool IncludeReadme = true,
-    [property: JsonPropertyName("refresh")] bool Refresh = false);
+    [property: JsonPropertyName("refresh")] bool Refresh = false,
+    [property: JsonPropertyName("source")] string? Source = null);
 
 public sealed record NuGetFrameworkCheckParams(
     [property: JsonPropertyName("id")] string Id,

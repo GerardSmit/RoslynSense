@@ -42,6 +42,14 @@ internal interface ILanguagePack
     /// </remarks>
     ImmutableArray<string> FileNames => [];
 
+    /// <summary>
+    /// Whether this pack owns a file whose name neither <see cref="FileNames"/> nor
+    /// <see cref="FileExtensions"/> can express — a family like <c>appsettings*.json</c>, where
+    /// the extension would claim every JSON file and no list of exact names can cover the
+    /// environment variants. Consulted after exact names and before extensions.
+    /// </summary>
+    bool OwnsFileName(string fileName) => false;
+
     /// <summary>What the pack adds to the server's advertised capabilities when it is enabled.</summary>
     LanguageCapabilities Capabilities { get; }
 

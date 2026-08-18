@@ -19,6 +19,8 @@ internal sealed class LanguageFileMap
     private readonly Dictionary<string, ILanguagePack> _byFileName =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly List<ILanguagePack> _byNamePattern = [];
+
     public LanguageFileMap(IEnumerable<ILanguagePack> packs)
     {
         foreach (var pack in packs)
@@ -28,6 +30,10 @@ internal sealed class LanguageFileMap
 
             foreach (string fileName in pack.FileNames)
                 _byFileName.TryAdd(fileName, pack);
+
+            // Every pack is offered every unmatched name; the default answers no, so only packs
+            // overriding OwnsFileName pay anything and registration order breaks ties.
+            _byNamePattern.Add(pack);
         }
     }
 
@@ -43,8 +49,17 @@ internal sealed class LanguageFileMap
             return null;
 
         string fileName = Path.GetFileName(candidate);
-        if (fileName.Length > 0 && _byFileName.TryGetValue(fileName, out var byName))
-            return byName;
+        if (fileName.Length > 0)
+        {
+            if (_byFileName.TryGetValue(fileName, out var byName))
+                return byName;
+
+            foreach (var patterned in _byNamePattern)
+            {
+                if (patterned.OwnsFileName(fileName))
+                    return patterned;
+            }
+        }
 
         string extension = Path.GetExtension(candidate);
         return extension.Length > 0 && _byExtension.TryGetValue(extension, out var pack) ? pack : null;

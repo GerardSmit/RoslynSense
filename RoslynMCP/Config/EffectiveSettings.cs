@@ -37,6 +37,10 @@ public sealed record EffectiveSettings(
     /// <see cref="Resources"/>.</summary>
     internal bool Dbml { get; init; } = true;
 
+    /// <summary>The application-settings pack's gate. Init-only for the same reason as
+    /// <see cref="Resources"/>.</summary>
+    internal bool AppSettings { get; init; } = true;
+
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
         warnings = new List<string>();
@@ -67,6 +71,7 @@ public sealed record EffectiveSettings(
             !HasFlag("--no-resources") && tools.Resources, config?.Resources, warnings);
         bool msBuild = !HasFlag("--no-msbuild") && tools.MsBuild;
         bool dbml = !HasFlag("--no-dbml") && tools.Dbml;
+        bool appSettings = !HasFlag("--no-appsettings") && tools.AppSettings;
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -123,6 +128,7 @@ public sealed record EffectiveSettings(
             Resources = resources,
             MsBuild = msBuild,
             Dbml = dbml,
+            AppSettings = appSettings,
         };
     }
 

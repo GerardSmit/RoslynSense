@@ -36,6 +36,7 @@ public sealed class ToolsConfig
     public bool Resources { get; init; } = true;
     public bool MsBuild { get; init; } = true;
     public bool Dbml { get; init; } = true;
+    public bool AppSettings { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;
     public bool Database { get; init; } = true;

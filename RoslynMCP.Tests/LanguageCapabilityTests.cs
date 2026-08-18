@@ -31,12 +31,13 @@ public class LanguageCapabilityTests
     /// </summary>
     /// <remarks>
     /// Shrinks as packs are added, and has to: the MSBuild pack opens an element with <c>&lt;</c>
-    /// and an attribute value with <c>'</c>, so neither says anything about WebForms any more. A
-    /// character left here after another pack claims it asserts that switching WebForms off
-    /// withdraws a trigger the server still needs — which passes only until someone tries to
-    /// complete in the other language.
+    /// and an attribute value with <c>'</c>, and the appsettings pack asks for <c>:</c> between a
+    /// key and its value, so neither says anything about WebForms any more. A character left here
+    /// after another pack claims it asserts that switching WebForms off withdraws a trigger the
+    /// server still needs — which passes only until someone tries to complete in the other
+    /// language.
     /// </remarks>
-    private static readonly string[] MarkupOnlyTriggers = [":", "="];
+    private static readonly string[] MarkupOnlyTriggers = ["="];
 
     /// <summary>
     /// The proto triggers C# does not already ask for: the space that ends a field's label and then

@@ -3,6 +3,7 @@ using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Services.ExternalSource;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -98,8 +99,13 @@ public class LspSignatureAndPullTests
         }
     }
 
+    /// <summary>
+    /// Which of the two it lands in depends on whether symbols can be reached, so the assertion is
+    /// on what both must be true of: a file outside the solution that shows the real implementation
+    /// rather than the reference assembly's <c>throw null</c> bodies.
+    /// </summary>
     [Fact]
-    public async Task DefinitionOnMetadataSymbolDecompiles()
+    public async Task DefinitionOnMetadataSymbolReachesImplementationSource()
     {
         string uri = LspConverters.PathToUri(FixturePaths.FrameworkReferencesFile);
         string text = await File.ReadAllTextAsync(FixturePaths.FrameworkReferencesFile);
@@ -112,12 +118,16 @@ public class LspSignatureAndPullTests
             typeDefinition: false, default);
 
         var location = Assert.Single(locations);
-        Assert.Contains("Decompiled", location.Uri); // generated source under the temp dir
+
+        string path = LspConverters.UriToPath(location.Uri);
+        Assert.True(
+            ExternalSourceCache.IsExternalSourcePath(path),
+            $"expected a file in the external-source cache, got '{path}'");
 
         // Must be the runtime implementation, not the ref assembly whose bodies are all
         // `throw null` (ReferenceAssemblyRedirector).
-        string decompiled = await File.ReadAllTextAsync(LspConverters.UriToPath(location.Uri));
-        Assert.DoesNotContain("throw null;", decompiled);
+        string source = await File.ReadAllTextAsync(path);
+        Assert.DoesNotContain("throw null;", source);
     }
 
     private static (int Line, int Character) PositionOf(string text, string anchor)

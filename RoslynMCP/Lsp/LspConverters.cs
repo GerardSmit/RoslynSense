@@ -23,7 +23,35 @@ internal static class LspConverters
     /// gives generated files the same language features as any other.
     /// </remarks>
     public static string UriToPath(string uri) =>
-        IsVirtual(uri) ? uri : PathHelper.NormalizePath(new Uri(uri).LocalPath);
+        IsVirtual(uri) ? uri : PathHelper.NormalizePath(LocalPathOf(uri));
+
+    /// <summary>
+    /// The file a <c>file:</c> URI names, including when the drive-letter colon is percent-encoded.
+    /// </summary>
+    /// <remarks>
+    /// <c>file:///c%3A/src/Program.cs</c> is how VS Code serialises a Windows path by default, and
+    /// it is a perfectly ordinary URI — but <see cref="Uri.LocalPath"/> looks for the drive letter
+    /// before unescaping, does not find one, and answers <c>/c:/src/Program.cs</c>: still rooted at
+    /// <c>/</c>, so <c>Path.GetFullPath</c> then reads it as relative to the current drive and
+    /// produces <c>D:\c:\src\Program.cs</c>. A path under no project, no solution and no directory
+    /// that exists — which is why the Solution Explorer's "Focus Current File" could not find any
+    /// file in any solution. The extension's own <c>code2Protocol</c> converter avoids the shape
+    /// for the requests that go through it, but the server has to read what the protocol allows,
+    /// not only what one client happens to send.
+    /// </remarks>
+    private static string LocalPathOf(string uri)
+    {
+        string local = new Uri(uri).LocalPath;
+
+        // Only where a drive letter means one: elsewhere "/c:/x" is a directory named "c:".
+        return OperatingSystem.IsWindows()
+               && local.Length >= 3
+               && local[0] == '/'
+               && char.IsAsciiLetter(local[1])
+               && local[2] == ':'
+            ? local[1..]
+            : local;
+    }
 
     private static bool IsVirtual(string uri) =>
         uri.StartsWith(Handlers.VirtualDocumentHandler.GeneratedScheme + ":", StringComparison.Ordinal)

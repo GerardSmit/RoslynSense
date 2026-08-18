@@ -640,10 +640,17 @@ public class SolutionExplorerTests
     /// strings, so the walk missed at the first folder and "Focus Current File" reported that the
     /// file was not in the solution — for every file, in every project.
     /// </remarks>
+    /// <remarks>
+    /// And whichever way the client spelled the URI. <c>UriSpelling</c> covers the three that reach
+    /// this server: the one <see cref="LspConverters.PathToUri"/> produces, the one the extension's
+    /// <c>code2Protocol</c> converter produces, and VS Code's own default — which percent-encodes
+    /// the drive-letter colon, the form that made every reveal come back empty.
+    /// </remarks>
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task TheRevealChainNamesRowsTheTreeActuallyLists(bool lowerCaseDrive)
+    [InlineData(UriSpelling.Roundtrip)]
+    [InlineData(UriSpelling.UpperDrivePlainColon)]
+    [InlineData(UriSpelling.LowerDriveEncodedColon)]
+    public async Task TheRevealChainNamesRowsTheTreeActuallyLists(UriSpelling spelling)
     {
         string? previous = WorkspaceService.BoundSolutionPath;
         try
@@ -651,11 +658,8 @@ public class SolutionExplorerTests
             WorkspaceService.BindSolution(FixturePaths.MultiSolutionFile);
 
             string file = Path.Combine(FixturePaths.MultiSolutionDir, "ProjectA", "Class1.cs");
-            if (lowerCaseDrive)
-                file = char.ToLowerInvariant(file[0]) + file[1..];
-
             var chain = (await SolutionTreeSearchHandler.RevealAsync(
-                new SolutionTreeRevealParams(LspConverters.PathToUri(file), FileNesting: true),
+                new SolutionTreeRevealParams(Spell(file, spelling), FileNesting: true),
                 default)).Path;
 
             Assert.NotEmpty(chain);
@@ -676,6 +680,33 @@ public class SolutionExplorerTests
         {
             WorkspaceService.BindSolution(previous);
         }
+    }
+
+    /// <summary>How a client wrote a <c>file:</c> URI for a Windows path.</summary>
+    public enum UriSpelling
+    {
+        /// <summary>What <see cref="LspConverters.PathToUri"/> produces.</summary>
+        Roundtrip,
+
+        /// <summary>What the extension's <c>code2Protocol</c> converter produces.</summary>
+        UpperDrivePlainColon,
+
+        /// <summary>What VS Code produces on its own — <c>file:///c%3A/…</c>.</summary>
+        LowerDriveEncodedColon,
+    }
+
+    private static string Spell(string path, UriSpelling spelling)
+    {
+        if (spelling == UriSpelling.Roundtrip || !Path.IsPathRooted(path) || path.Length < 2
+            || path[1] != ':')
+        {
+            return LspConverters.PathToUri(path);
+        }
+
+        string rest = path[2..].Replace('\\', '/');
+        return spelling == UriSpelling.UpperDrivePlainColon
+            ? $"file:///{char.ToUpperInvariant(path[0])}:{rest}"
+            : $"file:///{char.ToLowerInvariant(path[0])}%3A{rest}";
     }
 
     /// <summary>

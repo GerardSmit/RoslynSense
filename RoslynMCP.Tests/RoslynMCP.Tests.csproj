@@ -116,6 +116,8 @@
         <MSBuild Projects="Fixtures\MediatorModules\Inventory\Inventory.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\MediatorModules\Billing\Billing.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\LayeredApp\Storefront\Storefront.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <!-- WebApp covers ControlLib through its ProjectReference. -->
+        <MSBuild Projects="Fixtures\ControlLibApp\WebApp\WebApp.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
     </Target>
 
 </Project>

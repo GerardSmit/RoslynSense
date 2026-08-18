@@ -278,6 +278,9 @@ internal static class ProjectIndexCacheService
         }
         finally { s_lock.Release(); }
 
+        // The synchronous snapshot the string-literal detection pass reads; see the registry.
+        Languages.WebForms.Core.FindControlWrapperRegistry.Publish(project.AssemblyName, wrappers);
+
         return wrappers;
     }
 
@@ -506,11 +509,13 @@ internal static class ProjectIndexCacheService
         if (isProto && movedFiles)
             ProtoDocumentService.Invalidate(filePath);
 
+        // All entries, not just this project's: the wrapper list is a union over the project and
+        // its referenced projects, so a save in a shared utility library changes the answer for
+        // every project that references it — and the library's own watcher is the only one that
+        // sees the save. Cheap to over-invalidate: the per-document scan memo means a rebuild
+        // re-reads only the file that changed.
         if (isCSharp)
-        {
-            entry.WrappersDirty = true;
-            Interlocked.Increment(ref entry.WrappersGeneration);
-        }
+            DirtyAllWrappers();
 
         if (isResx)
         {
@@ -526,6 +531,20 @@ internal static class ProjectIndexCacheService
             else
                 ResourceCatalogService.InvalidateContent(filePath);
         }
+    }
+
+    private static void DirtyAllWrappers()
+    {
+        s_lock.Wait();
+        try
+        {
+            foreach (var entry in s_cache.Values)
+            {
+                entry.WrappersDirty = true;
+                Interlocked.Increment(ref entry.WrappersGeneration);
+            }
+        }
+        finally { s_lock.Release(); }
     }
 
     private sealed class CachedProjectEntry : IDisposable

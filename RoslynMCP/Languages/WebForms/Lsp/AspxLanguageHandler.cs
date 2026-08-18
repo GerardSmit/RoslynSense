@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Rename;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Languages;
 using RoslynMCP.Languages.WebForms.Core;
 using WebFormsCore;
 using WebFormsCore.Models;
@@ -58,10 +59,24 @@ internal static class AspxLanguageHandler
         if (hit is not null && AspxResourceHandler.Handles(hit.Kind))
             return await AspxResourceHandler.DefinitionAsync(document, hit, ct);
 
+        // `Eval("Entity.Images")`. Also not a symbol: the argument is a string the runtime
+        // reflects over, so the projection binds it to System.String and the caret's real
+        // destination — the property the segment names — is reachable only from the item type.
+        if (await DataBoundMemberAsync(document, offset, ct) is { } bound)
+            return WithoutDesigners(
+                await NavigationHandlers.DefinitionLocationsAsync(
+                    bound, document.Project, typeDefinition, ct));
+
         // The caret is already on the declaration, so there is no definition to go to — the
         // question a user asks here is the other one. See ControlIdUsagesAsync.
         if (hit is { Kind: AspxHitKind.ControlId, Symbol: { } declared } && !typeDefinition)
             return await ControlIdUsagesAsync(document, hit, declared, ct);
+
+        // The same caret on a template-nested ID: no field is generated for it, so its usages
+        // are the FindControl("id") call sites — including the discovered wrapper methods —
+        // that reach the control at runtime.
+        if (hit is { Kind: AspxHitKind.ControlId, Symbol: null, Name.Length: > 0 } && !typeDefinition)
+            return await FindControlCallSitesAsync(document, hit.Name, ct);
 
         // A tag naming a user control: its markup is the control, not the class behind it.
         if (hit is { Kind: AspxHitKind.ControlType, Symbol: INamedTypeSymbol control }
@@ -75,6 +90,15 @@ internal static class AspxLanguageHandler
             return WithoutDesigners(
                 await NavigationHandlers.DefinitionLocationsAsync(
                     symbol, document.Project, typeDefinition, ct));
+        }
+
+        // Before the symbol lookup, for the reason the C# handler asks first: inside a literal
+        // Roslyn binds to nothing, so a resource key in a <% %> block would fall through to an
+        // empty answer. The destinations are .resx files, so nothing needs mapping back.
+        if (await ProjectedEmbeddedAsync(document, offset, ct) is
+            { Language: IEmbeddedDefinitionProvider embedded } embeddedContext)
+        {
+            return await embedded.DefinitionAsync(embeddedContext, typeDefinition, ct);
         }
 
         if (await ProjectedSymbolAsync(document, offset, ct) is { } projected)
@@ -226,6 +250,56 @@ internal static class AspxLanguageHandler
         ];
     }
 
+    /// <summary>
+    /// The <c>FindControl("id")</c> call sites that reach a template-nested control, which are
+    /// the only code references such a control has — no designer field is generated for it.
+    /// </summary>
+    /// <remarks>
+    /// The whole project is searched, but when the page's own code-behind holds any of the call
+    /// sites, only those are returned: a lookup of the same id from an unrelated page is a
+    /// different control that merely shares the name.
+    /// </remarks>
+    private static async Task<LspLocation[]> FindControlCallSitesAsync(
+        AspxDocument document, string controlId, CancellationToken ct)
+    {
+        var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
+        var wrappers = await ProjectIndexCacheService.GetFindControlWrappersAsync(current, ct);
+        var references = await AspxSourceMappingService.FindControlByIdAsync(
+            current, controlId, wrappers, ct);
+
+        if (references.Count == 0)
+            return [];
+
+        var declaringFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (document.CodeBehind is { } codeBehind)
+        {
+            foreach (var reference in codeBehind.DeclaringSyntaxReferences)
+            {
+                if (reference.SyntaxTree.FilePath is { Length: > 0 } path)
+                    declaringFiles.Add(Path.GetFullPath(path));
+            }
+        }
+
+        var own = references
+            .Where(reference => declaringFiles.Contains(Path.GetFullPath(reference.FilePath)))
+            .ToList();
+
+        return [.. (own.Count > 0 ? own : references).Select(CallSiteLocation).Distinct()];
+    }
+
+    /// <summary>A call site as a location: the id literal when its span was recorded, else the
+    /// invocation's start.</summary>
+    private static LspLocation CallSiteLocation(AspxSymbolReference reference)
+    {
+        var range = reference.LiteralSpan is { } span
+            ? LspConverters.ToRange(span)
+            : new LspRange(
+                new Position(reference.Line - 1, reference.Column - 1),
+                new Position(reference.Line - 1, reference.Column - 1));
+
+        return new LspLocation(LspConverters.PathToUri(reference.FilePath), range);
+    }
+
     /// <summary>Whether a result is the <c>ID</c> the request started on.</summary>
     private static bool IsSelf(LspLocation location, string filePath, LspRange range) =>
         location.Range.Start.Line == range.Start.Line
@@ -316,8 +390,22 @@ internal static class AspxLanguageHandler
             }
         }
 
-        var symbol = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
-            ?? await ProjectedSymbolAsync(document, offset, ct);
+        var hit = AspxSymbolResolver.ResolveAt(document, offset);
+
+        // A template-nested ID binds to no field, so its references are the FindControl call
+        // sites — the same answer go-to-definition gives for this caret.
+        if (hit is { Kind: AspxHitKind.ControlId, Symbol: null, Name.Length: > 0 })
+        {
+            var callSites = await FindControlCallSitesAsync(document, hit.Name, ct);
+
+            return p.Context.IncludeDeclaration
+                ? [new LspLocation(
+                       LspConverters.PathToUri(document.FilePath), ToRange(document, hit.Span)),
+                   .. callSites]
+                : callSites;
+        }
+
+        var symbol = hit?.Symbol ?? await ProjectedSymbolAsync(document, offset, ct);
         if (symbol is null)
             return [];
 
@@ -394,7 +482,7 @@ internal static class AspxLanguageHandler
 
         if (hit is { Symbol: { } symbol })
         {
-            string markdown = HoverHandler.Describe(symbol, ct);
+            string markdown = HoverHandler.Describe(symbol, ct, document.Compilation);
 
             // System.Web keeps what a control's property or event does in a resource key its
             // metadata points at rather than in XML documentation, so where Roslyn found nothing
@@ -421,6 +509,18 @@ internal static class AspxLanguageHandler
                     $"`{unbound.Name}` has no handler named `{hit.Name}` on "
                     + $"`{document.CodeBehind?.ToDisplayString() ?? "the code-behind"}`."),
                 ToRange(document, hit.Span));
+        }
+
+        // Same order as the definition path: a key literal binds to no symbol, so the pack that
+        // knows what it names has to be asked before the bind that will not find one.
+        if (await ProjectedEmbeddedAsync(document, offset, ct) is
+            { Language: IEmbeddedHoverProvider embedded } embeddedContext
+            && await embedded.HoverAsync(embeddedContext, ct) is { } hover)
+        {
+            // The range the pack computed is in projected coordinates, which name characters no
+            // one can see. Dropped rather than mapped: the caret's own word is what gets
+            // highlighted then, which is the span the key occupies either way.
+            return hover with { Range = null };
         }
 
         if (await ProjectedSymbolAsync(document, offset, ct) is { } projected)
@@ -808,6 +908,44 @@ internal static class AspxLanguageHandler
             return null;
 
         return (document, LspConverters.ToOffset(document.SourceText, position));
+    }
+
+    /// <summary>
+    /// The member a data-binding path names at the caret — the <c>Images</c> of
+    /// <c>Eval("Entity.Images")</c>, or the <c>Entity</c> when the caret is on that half.
+    /// </summary>
+    internal static async Task<ISymbol?> DataBoundMemberAsync(
+        AspxDocument document, int offset, CancellationToken ct)
+    {
+        if (DataBindingService.ArgumentAt(document.Text, offset) is not { } argument)
+            return null;
+
+        var itemType = await DataBindingService.ItemTypeAsync(document, offset, ct);
+        var segments = DataBindingService.Segments(document.Text, argument, itemType);
+
+        return DataBindingService.SegmentAt(segments, offset)?.Symbol;
+    }
+
+    /// <summary>
+    /// The embedded language claiming a caret that sits inside a string literal in inline C#.
+    /// </summary>
+    /// <remarks>
+    /// The same call the C# handlers make, on the projected document. Without it the projection
+    /// seam swallows every literal-borne feature in markup: a resource key inside
+    /// <c>&lt;%= GetString("Information") %&gt;</c> binds to no symbol — string literals bind to
+    /// nothing at all — so <see cref="ProjectedSymbolAsync"/> answers null and F12 lands nowhere,
+    /// while the identical call in the <c>.ascx.cs</c> beside it navigates to the <c>.resx</c>.
+    /// </remarks>
+    internal static async Task<EmbeddedStringContext?> ProjectedEmbeddedAsync(
+        AspxDocument document, int offset, CancellationToken ct)
+    {
+        if (AspxProjectionService.Get(document) is not { } projection
+            || projection.ToProjected(offset) is not { } projected)
+        {
+            return null;
+        }
+
+        return await RoslynEmbeddedLanguages.Current.DetectAsync(projection.Document, projected, ct);
     }
 
     /// <summary>The symbol under a caret that sits inside inline C#, resolved through the

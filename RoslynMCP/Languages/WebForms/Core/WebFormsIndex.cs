@@ -17,9 +17,14 @@ internal readonly record struct WebFormsControlId(
 /// <remarks>
 /// Candidates, not bound handlers: <c>OnClientClick</c> is a plain string property and only the
 /// compilation can tell the two apart. Binding is the consumer's job.
+/// <para>
+/// <paramref name="OwnerControlId"/> is the <c>ID</c> of the control carrying the attribute, or
+/// null when it has none. It is what ties a handler method back to its naming container, which is
+/// the scope a <c>FindControl("id")</c> inside that handler searches first.
+/// </para>
 /// </remarks>
 internal readonly record struct WebFormsHandler(
-    string AttributeName, string MethodName, LinePositionSpan Span);
+    string AttributeName, string MethodName, LinePositionSpan Span, string? OwnerControlId);
 
 /// <summary>A control a <c>&lt;%@ Register %&gt;</c> directive brings into scope.</summary>
 internal readonly record struct WebFormsRegistration(
@@ -198,6 +203,11 @@ internal static class WebFormsIndex
             if (!IsServerControl(element))
                 continue;
 
+            string? ownerId =
+                element.RawAttributes.TryGetValue("ID", out var id) && id.Value.Length > 0
+                    ? id.Value
+                    : null;
+
             foreach (var (key, value) in element.RawAttributes)
             {
                 if (key.Value.Equals("ID", StringComparison.OrdinalIgnoreCase))
@@ -215,7 +225,7 @@ internal static class WebFormsIndex
                 if (key.Value.Length > 2 && value.Value.Length > 0
                     && key.Value.StartsWith("On", StringComparison.OrdinalIgnoreCase))
                 {
-                    handlers.Add(new WebFormsHandler(key.Value, value.Value, value.Range));
+                    handlers.Add(new WebFormsHandler(key.Value, value.Value, value.Range, ownerId));
                 }
             }
         }

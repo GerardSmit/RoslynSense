@@ -325,6 +325,61 @@ public class IncrementalInvalidationTests
         }
     }
 
+    /// <summary>
+    /// A wrapper added in a referenced class library shows up for the project that references it,
+    /// even though the save is only ever delivered to the library's own watcher.
+    /// </summary>
+    /// <remarks>
+    /// The wrapper list is a union over the project and its references, so the library's change
+    /// has to dirty every cached entry — the referencing project's watcher never sees a file
+    /// outside its own directory. Before that, editing a shared ControlExtensions.cs left every
+    /// site project serving the stale union until something else happened to invalidate it.
+    /// </remarks>
+    [Fact]
+    public async Task AWrapperAddedInAReferencedProjectReachesTheReferencingProjectsList()
+    {
+        string session = $"incremental-{Guid.NewGuid():N}";
+        string path = FixturePaths.MultiProjectAClassFile;
+        string text = await File.ReadAllTextAsync(path);
+
+        // Both entries exist before the change: the library's, which receives it, and the
+        // referencing project's, which has to feel it.
+        await ProjectIndexCacheService.GetFindControlWrappersAsync(
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.MultiProjectAFile));
+        await ProjectIndexCacheService.GetFindControlWrappersAsync(
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.MultiProjectBFile));
+
+        OpenDocumentStore.Open(session, path, SourceText.From(text), version: 1);
+        try
+        {
+            OpenDocumentStore.Change(path, version: 2, _ => SourceText.From(text + """
+
+                public class FakeControl
+                {
+                    public object? FindControl(string id) => null;
+                }
+
+                public static class ControlWrappers
+                {
+                    public static object? Grab(FakeControl c, string id) => c.FindControl(id);
+                }
+                """));
+
+            var editedB = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.MultiProjectBFile);
+
+            Notify(FixturePaths.MultiProjectAFile, path, movedFiles: false);
+
+            var wrappers = await ProjectIndexCacheService.GetFindControlWrappersAsync(editedB);
+            Assert.Contains(("Grab", 1, false), wrappers);
+        }
+        finally
+        {
+            await RevertAsync(session, path, FixturePaths.MultiProjectAFile);
+            ProjectIndexCacheService.InvalidateProject(FixturePaths.MultiProjectBFile);
+            await WorkspaceService.EvictProjectForTests(FixturePaths.MultiProjectBFile);
+        }
+    }
+
     /// <summary>Editing markup re-reads no C# at all: the two indexes are independent.</summary>
     [Fact]
     public async Task EditingMarkupRescansNoCSharpForWrappers()

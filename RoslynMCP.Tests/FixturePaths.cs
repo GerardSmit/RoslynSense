@@ -57,6 +57,20 @@ internal static class FixturePaths
     public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");
     public static string RepeaterCodeBehindFile => Path.Combine(AspxProjectDir, "Repeater.aspx.cs");
 
+    /// <summary>Two repeaters whose templates declare the same <c>ID</c>, for the FindControl
+    /// naming-container ladder: handler-scoped, page-wide, computed.</summary>
+    public static string NamingScopeAspxFile => Path.Combine(AspxProjectDir, "NamingScope.aspx");
+    public static string NamingScopeCodeBehindFile => Path.Combine(AspxProjectDir, "NamingScope.aspx.cs");
+
+    /// <summary>The cross-project FindControl fixture: the wrappers (and the Control stubs they
+    /// extend) live in ControlLib, and WebApp reaches its template control only through them.</summary>
+    public static string ControlLibAppDir => Path.Combine(s_fixturesRoot, "ControlLibApp");
+    public static string ControlLibProjectFile => Path.Combine(ControlLibAppDir, "ControlLib", "ControlLib.csproj");
+    public static string ControlLibExtensionsFile => Path.Combine(ControlLibAppDir, "ControlLib", "ControlExtensions.cs");
+    public static string WebAppProjectFile => Path.Combine(ControlLibAppDir, "WebApp", "WebApp.csproj");
+    public static string CrossAspxFile => Path.Combine(ControlLibAppDir, "WebApp", "Cross.aspx");
+    public static string CrossCodeBehindFile => Path.Combine(ControlLibAppDir, "WebApp", "Cross.aspx.cs");
+
     /// <summary>
     /// The localization fixture: expression builders in both shapes the parser produces, an
     /// implicit-localization key in each of its two spellings, and a control that really declares
@@ -233,6 +247,17 @@ internal static class FixturePaths
     public static string LayeredAppSolutionFile => Path.Combine(LayeredAppDir, "LayeredApp.sln");
     public static string LayeredAppWarehouseModuleFile => Path.Combine(LayeredAppDir, "Warehouse", "WarehouseModule.cs");
     public static string LayeredAppStartupFile => Path.Combine(LayeredAppDir, "Storefront", "Startup.cs");
+
+    /// <summary>
+    /// The configuration fixture: every read and binding shape the usage index recognizes, over
+    /// stubbed Microsoft.Extensions.* so it compiles offline, plus the settings files they read.
+    /// </summary>
+    public static string ConfigAppDir => Path.Combine(s_fixturesRoot, "ConfigApp");
+    public static string ConfigAppProjectFile => Path.Combine(ConfigAppDir, "ConfigApp.csproj");
+    public static string ConfigAppProgramFile => Path.Combine(ConfigAppDir, "Program.cs");
+    public static string ConfigAppSettingsFile => Path.Combine(ConfigAppDir, "appsettings.json");
+    public static string ConfigAppDevelopmentSettingsFile =>
+        Path.Combine(ConfigAppDir, "appsettings.Development.json");
 
     /// <summary>
     /// The VS Code extension folder in the source tree, or null when the tests run from output

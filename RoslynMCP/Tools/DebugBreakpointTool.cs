@@ -166,11 +166,14 @@ public static class DebugBreakpointTool
         "setting this field to null?'. The expression is evaluated in the current frame, so the " +
         "target must be suspended first. Continue then steps and compares instead of running " +
         "free, which is much slower than a normal breakpoint, and the stop lands on the statement " +
-        "after the write. Only changes are detectable, never reads.")]
+        "after the write. Only changes are detectable, never reads. " +
+        "action='clear' drops every watch, so Continue runs at full speed again.")]
     public static async Task<string> DebugWatchValue(
-        [Description("Expression to watch, e.g. 'order.Total' or '_cache.Count'.")]
-        string expression,
         IOutputFormatter fmt,
+        [Description("'watch' (default) adds a watch; 'clear' drops every watched value.")]
+        string action = "watch",
+        [Description("Expression to watch, e.g. 'order.Total' or '_cache.Count'. Required for action='watch'.")]
+        string? expression = null,
         [Description("Only stop when this expression is also true at the moment of the change.")]
         string? condition = null,
         [Description("Hit-count rule for the change, e.g. '>= 3' or '% 5'.")]
@@ -181,6 +184,19 @@ public static class DebugBreakpointTool
         {
             if (DebugSessionManager.GetSession() is not Services.Debugging.PublishingDebugBackend session)
                 return "Error: No active debug session. Use DebugStartTest or DebugAttach first.";
+
+            if (action.Equals("clear", StringComparison.OrdinalIgnoreCase))
+            {
+                int count = session.DataBreakpoints.Watches.Count;
+                await session.SetDataBreakpointsAsync([], cancellationToken);
+                return count == 0 ? "No values were being watched." : $"Dropped {count} value watch(es).";
+            }
+
+            if (!action.Equals("watch", StringComparison.OrdinalIgnoreCase))
+                return $"Error: Unknown action '{action}'. Use: watch, clear.";
+
+            if (expression is not { Length: > 0 })
+                return "Error: expression is required for action='watch'.";
 
             if (session.CurrentFrame is null)
                 return "Error: The target is running. Watches read the current frame, so pause or " +
@@ -201,27 +217,8 @@ public static class DebugBreakpointTool
                 string.Join(", ", specs.Select(s => s.Expression)) + ".");
             fmt.AppendHints(sb,
                 "Use DebugContinue to run until one of them changes",
-                "Use DebugUnwatchValues to drop the watches and get normal speed back");
+                "Use DebugWatchValue with action='clear' to drop the watches and get normal speed back");
             return sb.ToString();
-        }
-        catch (Exception ex)
-        {
-            return $"Error: {ex.Message}";
-        }
-    }
-
-    [McpServerTool, Description(
-        "Drop every watched value set by DebugWatchValue, so Continue runs at full speed again.")]
-    public static async Task<string> DebugUnwatchValues(CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            if (DebugSessionManager.GetSession() is not Services.Debugging.PublishingDebugBackend session)
-                return "Error: No active debug session.";
-
-            int count = session.DataBreakpoints.Watches.Count;
-            await session.SetDataBreakpointsAsync([], cancellationToken);
-            return count == 0 ? "No values were being watched." : $"Dropped {count} value watch(es).";
         }
         catch (Exception ex)
         {

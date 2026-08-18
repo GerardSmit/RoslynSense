@@ -198,7 +198,7 @@ public class DebugToolTests
     public async Task WhenRunUntilWithoutSessionThenReturnsError()
     {
         DebugControlTool.DebugStop();
-        var result = await DebugControlTool.DebugRunUntil("test.cs", 42, new MarkdownFormatter());
+        var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), action: "run_until", filePath: "test.cs", line: 42);
 
         Assert.Contains("No active debug session", result);
     }
@@ -207,7 +207,7 @@ public class DebugToolTests
     public async Task WhenRunUntilWithConditionWithoutSessionThenReturnsError()
     {
         DebugControlTool.DebugStop();
-        var result = await DebugControlTool.DebugRunUntil("test.cs", 42, new MarkdownFormatter(), condition: "i == 5");
+        var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), action: "run_until", filePath: "test.cs", line: 42, condition: "i == 5");
 
         Assert.Contains("No active debug session", result);
     }

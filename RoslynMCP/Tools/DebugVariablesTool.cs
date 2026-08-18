@@ -16,35 +16,6 @@ namespace RoslynMCP.Tools;
 public static class DebugVariablesTool
 {
     [McpServerTool, Description(
-        "Suspend a running debug session, as the debugger's pause button does. Use this when " +
-        "execution is not reaching a breakpoint (an infinite loop, a deadlock, a long wait) and " +
-        "you need to see where it actually is.")]
-    public static async Task<string> DebugPause(
-        IOutputFormatter fmt,
-        CancellationToken cancellationToken = default)
-    {
-        var session = DebugSessionManager.GetSession();
-        if (session is null)
-        {
-            var routed = await EditorDebugRouter.TryRouteAsync("pause", ct: cancellationToken);
-            return routed ?? "Error: No active debug session.";
-        }
-
-        try
-        {
-            var sb = new StringBuilder(await session.InterruptAsync(cancellationToken));
-            fmt.AppendHints(sb,
-                "Use DebugStatus to see locals and the call stack",
-                "Use DebugContinue to resume");
-            return sb.ToString();
-        }
-        catch (Exception ex)
-        {
-            return $"Error: {ex.Message}";
-        }
-    }
-
-    [McpServerTool, Description(
         "Select which stack frame DebugEvaluate and the locals view read from. Frame 0 is where " +
         "execution stopped; higher numbers are its callers. Use this to inspect a caller's " +
         "state, then DebugStatus or DebugEvaluate to read it.")]

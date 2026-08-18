@@ -552,6 +552,14 @@ internal sealed class LspServer : IDisposable
     public Task<SearchEverywhereResult> SearchEverywhere(SearchEverywhereParams p, CancellationToken ct) =>
         Handlers.SearchEverywhereHandler.SearchAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/searchText", UseSingleObjectParameterDeserialization = true)]
+    public Task<SearchTextResult> SearchText(SearchTextParams p, CancellationToken ct) =>
+        Handlers.SearchEverywhereHandler.SearchTextAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/resolveMetadataTarget", UseSingleObjectParameterDeserialization = true)]
+    public Task<ResolveMetadataResult?> ResolveMetadataTarget(ResolveMetadataParams p, CancellationToken ct) =>
+        Handlers.SearchEverywhereHandler.ResolveMetadataAsync(p, ct);
+
     [JsonRpcMethod("roslynSense/editorContext", UseSingleObjectParameterDeserialization = true)]
     public void EditorContext(Handlers.EditorContextParams p) =>
         Handlers.EditorContextHandler.Report(p);

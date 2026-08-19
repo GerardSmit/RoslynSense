@@ -179,10 +179,25 @@ public sealed class DebugVariable
     public string Name { get; set; } = "";
     public string Value { get; set; } = "";
 
-    /// <summary><c>arg</c> or <c>local</c>.</summary>
+    /// <summary><c>arg</c>, <c>local</c>, <c>field</c>, <c>element</c>, <c>proxy</c> (a member of a
+    /// <c>DebuggerTypeProxy</c> view), <c>raw</c> (the Raw View node), or <c>diagnostic</c>.</summary>
     public string Kind { get; set; } = "";
 
+    /// <summary>The declared type name, empty when it could not be read.</summary>
+    public string Type { get; set; } = "";
+
+    /// <summary>
+    /// The expression this value is reachable by, set only when it has children worth expanding.
+    /// Pass it back to <c>ExpandAsync</c>.
+    /// </summary>
+    /// <remarks>
+    /// A path rather than a handle, so it stays valid across the process boundary to a
+    /// bitness-matched worker and can be handed to Evaluate or SetVariable unchanged. Two segments
+    /// are not members: <c>$proxy</c> steps through the type's debugger view and <c>$raw</c>
+    /// suppresses that view for one level.
+    /// </remarks>
     public string VariablesReference { get; set; } = "";
+
     public bool Settable { get; set; }
 }
 

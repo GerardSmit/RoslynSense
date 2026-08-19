@@ -178,6 +178,18 @@ internal static class WorkspaceService
     public static bool IsLegacyProjectSupported => s_legacyMsBuildDir.Value is not null;
 
     /// <summary>
+    /// The Visual Studio MSBuild <c>Bin</c> directory legacy projects are loaded through, or
+    /// <c>null</c> when this machine has none.
+    /// </summary>
+    /// <remarks>
+    /// Exposed for <see cref="RestoreService"/>, which has to restore non-SDK projects with the same
+    /// engine that evaluates them: the .NET SDK's MSBuild cannot resolve the
+    /// <c>$(MSBuildExtensionsPath)</c> imports a legacy web project is built from, so
+    /// <c>dotnet restore</c> answers with an evaluation failure rather than a restore.
+    /// </remarks>
+    public static string? LegacyMsBuildDirectory => s_legacyMsBuildDir.Value;
+
+    /// <summary>
     /// The MSBuild bin directory a legacy project's BuildHost needs, or <c>null</c> when this
     /// machine cannot build one. Probed via <c>vswhere</c> because MSBuildLocator's VS Setup COM
     /// discovery often fails in the .NET 10 host even when VS is installed.
@@ -636,6 +648,11 @@ internal static class WorkspaceService
                     progress.Report("Restoring packages");
                     phases.Start();
                     await RestoreService.EnsureRestoredAsync(normalizedPath, cancellationToken);
+                    // Same contract as the restore above: a subprocess the evaluation depends on,
+                    // run before the load so a never-built source generator exists by the time the
+                    // analyzer references resolve to it. No-op when every generator has output.
+                    await GeneratorBuildService.EnsureGeneratorsBuiltAsync(
+                        normalizedPath, cancellationToken, msg => progress.Report(msg));
                     phases.Mark(ref phases.RestoreMs);
                     progress.Report($"Opening {Path.GetFileName(normalizedPath)}");
 
@@ -891,11 +908,20 @@ internal static class WorkspaceService
         // RestoreService single-flights per solution, so N projects arriving here at once still
         // produce one restore rather than N.
         await RestoreService.EnsureRestoredAsync(normalizedProjectPath, cancellationToken);
+        // Also before the gate, for the same reason: a never-built source generator this project
+        // references is a build subprocess, and GeneratorBuildService single-flights it.
+        await GeneratorBuildService.EnsureGeneratorsBuiltAsync(normalizedProjectPath, cancellationToken);
         phases.Mark(ref phases.RestoreMs);
 
         await entry.LoadGate.WaitAsync(cancellationToken);
         try
         {
+            // Getting in says no other load is running; it does not say there is still a workspace
+            // to load into. An eviction — an idle sweep, a .csproj touch, a branch switch — can have
+            // disposed this entry while the restore above was running.
+            if (entry.IsDisposed)
+                return;
+
             if (entry.ProjectIds.ContainsKey(normalizedProjectPath))
                 return; // a concurrent caller already added it
 
@@ -937,11 +963,7 @@ internal static class WorkspaceService
         }
         finally
         {
-            // Guarded like the newer sites: an eviction can dispose this gate while the load it
-            // guards is still running, and an ObjectDisposedException here escapes into whichever
-            // request triggered the load.
-            try { entry.LoadGate.Release(); }
-            catch (ObjectDisposedException) { }
+            entry.LoadGate.Release();
         }
 
         // The single-project add is reached whenever exactly one project is missing — which is
@@ -1054,6 +1076,12 @@ internal static class WorkspaceService
         // Restore first, once, for everything: it is per solution and outside every gate, so doing
         // it here rather than inside the loop below means one subprocess for the whole batch.
         await RestoreService.EnsureRestoredAsync(normalized[0], cancellationToken);
+
+        // Per batch member rather than only the first: the members can sit in disjoint corners of
+        // the reference graph, each with its own generator. The scan is cached project XML, so the
+        // repeats cost nothing when there is nothing to build.
+        foreach (string batchProjectPath in normalized)
+            await GeneratorBuildService.EnsureGeneratorsBuiltAsync(batchProjectPath, cancellationToken);
 
         // The first project both establishes the solution workspace (via the ordinary cached path,
         // including all its fallback behaviour) and tells us which entry the rest belong in.
@@ -1213,6 +1241,12 @@ internal static class WorkspaceService
         int added;
         try
         {
+            // Evicted while the batch was being evaluated — which is minutes on a large solution.
+            // Grafting project models into a torn-down workspace is not something to attempt; the
+            // caller falls back and the projects load into whatever workspace exists by then.
+            if (entry.IsDisposed)
+                return false;
+
             gateMs = watch.ElapsedMilliseconds - evaluateMs;
 
             // A project the ProjectMap matched to one already in the solution comes back with that
@@ -1256,8 +1290,7 @@ internal static class WorkspaceService
         }
         finally
         {
-            try { entry.LoadGate.Release(); }
-            catch (ObjectDisposedException) { }
+            entry.LoadGate.Release();
         }
 
         // Anything the batch did not produce is still unloaded, so the caller is told to fall back;
@@ -1486,6 +1519,87 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// The loaded project a file belongs to, or null when nothing that could answer is open.
+    /// </summary>
+    /// <remarks>
+    /// Reads the cache and never fills it, which is the whole point: this serves questions that are
+    /// worth answering when the answer is already in memory and not worth an MSBuild evaluation when
+    /// it is not — hovering a suppressed warning code in a <c>.csproj</c> to see what it means.
+    /// <see cref="GetOrOpenProjectAsync"/> is for callers that need the project either way.
+    ///
+    /// A project file matches itself. Anything else — <c>Directory.Build.props</c>,
+    /// <c>Directory.Packages.props</c>, a <c>.targets</c> — matches the nearest loaded project
+    /// beneath it, because that is the project whose settings it is written to affect.
+    /// </remarks>
+    public static Project? TryGetLoadedProject(string filePath)
+    {
+        Project? best = null;
+
+        // Nearest wins: a Directory.Build.props at the repository root would otherwise answer with
+        // whichever project the cache happened to enumerate first.
+        foreach (var project in LoadedProjectsUnder(filePath))
+        {
+            if (best?.FilePath is { } chosen && project.FilePath is { } candidate
+                && chosen.Length > candidate.Length)
+            {
+                continue;
+            }
+
+            best = project;
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Every loaded project a file governs: itself for a project file, everything beneath it for
+    /// anything else.
+    /// </summary>
+    /// <remarks>
+    /// The scope a <c>Directory.Build.props</c> actually has. A property written there applies to
+    /// every project under that directory, so a question about what it does — how many warnings a
+    /// suppression there is hiding, say — is a question about all of them and not about whichever
+    /// one happens to be nearest.
+    ///
+    /// Cache-only, like <see cref="TryGetLoadedProject"/>: what is open answers, and what is not
+    /// stays closed.
+    /// </remarks>
+    public static ImmutableArray<Project> LoadedProjectsUnder(string filePath)
+    {
+        string full = Path.GetFullPath(filePath);
+        bool isProjectFile = full.EndsWith("proj", StringComparison.OrdinalIgnoreCase);
+        string directory = Path.GetDirectoryName(full) is { Length: > 0 } d
+            ? d + Path.DirectorySeparatorChar
+            : full;
+
+        var found = new Dictionary<string, Project>(StringComparer.OrdinalIgnoreCase);
+
+        // Lock-free for the same reason as TryGetMostRecentSolution: this runs on request threads,
+        // and s_cacheLock is held across the end of a project load.
+        foreach (var (key, entry) in s_cache)
+        {
+            if (ExternalSource.ExternalSourceCache.IsExternalSourcePath(key))
+                continue;
+
+            var solution = entry.Workspace.CurrentSolution;
+
+            foreach (var (path, id) in entry.ProjectIds)
+            {
+                bool matches = isProjectFile
+                    ? string.Equals(path, full, StringComparison.OrdinalIgnoreCase)
+                    : path.StartsWith(directory, StringComparison.OrdinalIgnoreCase);
+
+                // Keyed by path: the same project is cached under every solution that holds it, and
+                // counting it once per workspace would multiply every answer about it.
+                if (matches && !found.ContainsKey(path) && solution.GetProject(id) is { } project)
+                    found[path] = project;
+            }
+        }
+
+        return [.. found.Values];
+    }
+
+    /// <summary>
     /// Evicts all cached workspace entries immediately.
     /// </summary>
     public static async Task EvictAllAsync(CancellationToken cancellationToken = default)
@@ -1511,6 +1625,11 @@ internal static class WorkspaceService
             // .csproj timestamp — and that timestamp is the whole cache key. A .props change comes
             // through here, so this is where the stale verdict has to go.
             s_plainGlob.Clear();
+
+            // What is watched follows what is loaded: with nothing cached there is nothing for a
+            // restore to invalidate, and holding the handles would leak a tree per solution switch.
+            RestoreWatcher.StopAll();
+
             Console.Error.WriteLine("[WorkspaceService] All cached workspaces evicted.");
         }
         finally
@@ -1591,8 +1710,23 @@ internal static class WorkspaceService
     /// everything else.
     /// </summary>
     public static async Task EvictProjectAsync(
+        string projectPath, CancellationToken cancellationToken = default) =>
+        await EvictProjectIfLoadedAsync(projectPath, cancellationToken);
+
+    /// <summary>
+    /// Evicts the cached workspace entries serving <paramref name="projectPath"/> and reports
+    /// whether there were any.
+    /// </summary>
+    /// <remarks>
+    /// The answer is what lets a caller that evicts speculatively — a restore that has just written
+    /// a NuGet graph for a whole solution, over projects that may or may not be loaded — say how
+    /// much it actually invalidated instead of claiming it refreshed twenty projects it never
+    /// touched.
+    /// </remarks>
+    public static async Task<bool> EvictProjectIfLoadedAsync(
         string projectPath, CancellationToken cancellationToken = default)
     {
+        bool evictedAny = false;
         string key = Path.GetFullPath(projectPath);
         await s_cacheLock.WaitAsync(cancellationToken);
         try
@@ -1606,11 +1740,16 @@ internal static class WorkspaceService
                 foreach (string ck in cks.ToList())
                 {
                     if (s_cache.TryGetValue(ck, out var entry))
+                    {
                         EvictEntryLocked(ck, entry, $"'{Path.GetFileName(key)}' was written");
+                        evictedAny = true;
+                    }
                 }
             }
         }
         finally { s_cacheLock.Release(); }
+
+        return evictedAny;
     }
 
     /// <summary>
@@ -1705,25 +1844,22 @@ internal static class WorkspaceService
                     // silently skip the reconcile for the other, leaving it on stale text.
                     //
                     // Bounded, because an unbounded wait here is a permanent hang: a project load
-                    // holds this gate for as long as MSBuild takes, and if the entry is evicted
-                    // while we are parked on it, disposing a SemaphoreSlim does not complete its
-                    // pending waiters. That task would never finish, the finally below would never
-                    // run, and s_bufferGate — which this whole loop holds — would never be
-                    // released, silently killing the buffer bridge for the rest of the session.
-                    bool acquired;
-                    try
-                    {
-                        acquired = await entry.LoadGate.WaitAsync(LoadGateWait);
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        continue;
-                    }
-
+                    // holds this gate for as long as MSBuild takes, and s_bufferGate — which this
+                    // whole loop holds — is not released until the finally below runs. Waiting out
+                    // somebody else's MSBuild would silently kill the buffer bridge for the rest of
+                    // the session.
+                    //
                     // Whatever is holding it is mid-load, and a load ends by rebuilding this
                     // anyway. The overlay fork still covers correctness until then.
-                    if (!acquired)
+                    if (!await entry.LoadGate.WaitAsync(LoadGateWait))
                         continue;
+
+                    // Evicted while we were queued: there is no workspace left to reconcile into.
+                    if (entry.IsDisposed)
+                    {
+                        entry.LoadGate.Release();
+                        continue;
+                    }
 
                     try
                     {
@@ -1782,8 +1918,7 @@ internal static class WorkspaceService
                     }
                     finally
                     {
-                        try { entry.LoadGate.Release(); }
-                        catch (ObjectDisposedException) { /* evicted while we held it */ }
+                        entry.LoadGate.Release();
                     }
                 }
             }
@@ -1908,9 +2043,9 @@ internal static class WorkspaceService
             // Projects with the same FilePath, and updating only the one the path index happens to
             // hold leaves the other frameworks with a document over a file that is gone.
             //
-            // Bounded for the same reason the buffer bridge is: disposing this gate on eviction
-            // does not complete a pending waiter, so an unbounded wait leaks the caller forever.
-            // A load holding the gate means "come back later", not "MSBuild must decide". Reporting
+            // Bounded for the same reason the buffer bridge is: a load holding this gate holds it
+            // for as long as MSBuild takes, so an unbounded wait parks the caller behind somebody
+            // else's evaluation. It means "come back later", not "MSBuild must decide". Reporting
             // the timeout as undecidable made the caller evict — and evict the workspace that was
             // still loading, which faults the request that started the load and then reloads the
             // solution from scratch. Saving any file ten seconds into an F12 was enough. The buffer
@@ -1921,6 +2056,10 @@ internal static class WorkspaceService
 
             try
             {
+                // Evicted while we were queued behind a load; nothing left to sync into.
+                if (entry.IsDisposed)
+                    return FileSyncResult.NothingToDo;
+
                 // The project the caller named, plus every other project that already holds a
                 // document for this exact path. A linked item puts the same file in a project that
                 // no upward directory walk from it would ever reach, so updating only the named one
@@ -1978,10 +2117,7 @@ internal static class WorkspaceService
             }
             finally
             {
-                // Releasing a gate the eviction already disposed must not turn a change that was
-                // applied into "nothing happened" — the editor would never be told to re-pull it.
-                try { entry.LoadGate.Release(); }
-                catch (ObjectDisposedException) { }
+                entry.LoadGate.Release();
             }
         }
         catch (ObjectDisposedException)
@@ -2489,12 +2625,23 @@ internal static class WorkspaceService
     private static void RegisterProjectMappingsLocked(
         string cacheKey, string requestedProjectPath, Workspace workspace)
     {
+        var watched = new List<string> { requestedProjectPath };
+
         Register(requestedProjectPath, cacheKey);
         foreach (var project in workspace.CurrentSolution.Projects)
         {
             if (!string.IsNullOrEmpty(project.FilePath))
-                Register(Path.GetFullPath(project.FilePath!), cacheKey);
+            {
+                string full = Path.GetFullPath(project.FilePath!);
+                Register(full, cacheKey);
+                watched.Add(full);
+            }
         }
+
+        // Every load path funnels through here, which is what makes this the one place a project
+        // becomes "loaded" and therefore the one place its NuGet graph starts needing to be watched.
+        // The call does its work on a pool thread: this runs under the cache lock.
+        RestoreWatcher.WatchAll(watched);
     }
 
     private static void RegisterShadowDirsLocked(string cacheKey, IReadOnlyCollection<string>? dirs)
@@ -2919,20 +3066,47 @@ internal static class WorkspaceService
     /// <summary>
     /// Atomically replaces <paramref name="workspace"/>'s current solution with
     /// <paramref name="newSolution"/> without persisting any project-file changes to disk.
-    /// Goes through the protected <c>Workspace.SetCurrentSolution(Solution)</c> overload
-    /// via reflection because <see cref="Workspace.TryApplyChanges"/> would round-trip
-    /// analyzer-reference edits back to the .csproj file, polluting the user's project
-    /// with shadow-copy temp paths.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Goes through the protected <c>Workspace.SetCurrentSolution(Solution)</c> overload via
+    /// reflection because <see cref="Workspace.TryApplyChanges"/> hands every edit to
+    /// <c>MSBuildWorkspace</c>'s applier, and nothing the post-open pipeline does belongs in the
+    /// .csproj. An analyzer-reference edit is round-tripped back into the project file as a
+    /// shadow-copy temp path; an added metadata reference is written out as a <c>&lt;Reference&gt;</c>
+    /// element — 117 of them for a legacy project that had its framework references injected.
+    /// </para>
+    /// <para>
+    /// The metadata-reference path never even got that far. <c>ApplyMetadataReferenceAdded</c> asks
+    /// <c>IsInGAC</c> first, which reaches Roslyn's <c>GlobalAssemblyCacheLocation</c> and P/Invokes
+    /// the Fusion API in <c>clr.dll</c> — a .NET Framework-only native export that a .NET 10 host
+    /// process does not have. So injecting framework references through <c>TryApplyChanges</c>
+    /// failed with <c>DllNotFoundException('clr')</c>, and every legacy .NET Framework project that
+    /// needed the injection was unopenable, under a message blaming the machine's .NET Framework
+    /// install.
+    /// </para>
+    /// </remarks>
     private static void SwapCurrentSolutionInPlace(Workspace workspace, Solution newSolution)
     {
         if (s_setCurrentSolutionMethod is null)
         {
-            // Fallback to TryApplyChanges if reflection failed — accept the disk-write
-            // side effect rather than skipping the rebind entirely.
+            // Fallback to TryApplyChanges if reflection failed — accept the disk-write side effect
+            // rather than skipping the swap entirely. Guarded, because this is the path that used
+            // to be taken unconditionally: it is the one that can throw DllNotFoundException('clr')
+            // on a metadata-reference edit, and a workspace holding un-swapped analyzer or
+            // framework references is still a usable workspace, while a faulted open is not.
             Console.Error.WriteLine(
                 "[WorkspaceService] Reflection failed: Workspace.SetCurrentSolution not found; falling back to TryApplyChanges.");
-            workspace.TryApplyChanges(newSolution);
+            try
+            {
+                workspace.TryApplyChanges(newSolution);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[WorkspaceService] TryApplyChanges fallback failed ({ex.Message}); " +
+                    "the workspace keeps its current solution.");
+            }
             return;
         }
 
@@ -2955,7 +3129,7 @@ internal static class WorkspaceService
     {
         var stripped = StripUnresolvedAnalyzerReferences(workspace.CurrentSolution, newProjects);
         if (stripped != workspace.CurrentSolution)
-            workspace.TryApplyChanges(stripped);
+            SwapCurrentSolutionInPlace(workspace, stripped);
 
         // Rebind BEFORE anything can ask these projects for a compilation: Roslyn's default loader
         // opens the original analyzer DLL via PEReader on first compilation access, locking it on
@@ -2970,7 +3144,7 @@ internal static class WorkspaceService
 
         var injected = InjectMissingFrameworkReferences(workspace.CurrentSolution, newProjects);
         if (injected != workspace.CurrentSolution)
-            workspace.TryApplyChanges(injected);
+            SwapCurrentSolutionInPlace(workspace, injected);
 
         return (loader, dirs);
     }
@@ -3302,7 +3476,27 @@ internal static class WorkspaceService
         /// <summary>Serializes incremental <c>OpenProjectAsync</c> mutations of this workspace
         /// (MSBuildWorkspace is not safe for concurrent opens; reads stay safe via immutable
         /// solution snapshots).</summary>
+        /// <remarks>
+        /// Deliberately never disposed. An eviction disposes the entry while loads that captured
+        /// it are still running or still queued on this gate, and a disposed
+        /// <see cref="SemaphoreSlim"/> neither completes its pending waiters nor accepts a new
+        /// wait — so disposal turned an ordinary eviction race into an
+        /// <see cref="ObjectDisposedException"/> thrown out of whichever request triggered the
+        /// load ("Cannot access a disposed object: 'System.Threading.SemaphoreSlim'"), which is
+        /// what took the solution-wide warmup down mid-load. A SemaphoreSlim only holds an
+        /// unmanaged handle once <c>AvailableWaitHandle</c> has been read, and nothing here reads
+        /// it, so leaving it to the GC costs nothing. <see cref="IsDisposed"/> is what waiters
+        /// check instead.
+        /// </remarks>
         public SemaphoreSlim LoadGate { get; } = new(1, 1);
+
+        /// <summary>
+        /// Whether this entry has been evicted and its workspace torn down. Set inside
+        /// <see cref="Dispose"/>; read by everything that acquires <see cref="LoadGate"/>, because
+        /// acquiring it says only that no other load is running — not that there is still a
+        /// workspace to load into.
+        /// </summary>
+        public volatile bool IsDisposed;
 
         /// <summary>Memoized open-editor-buffer overlay (see ApplyOpenDocumentOverlay).</summary>
         public object OverlayLock { get; } = new();
@@ -3389,9 +3583,11 @@ internal static class WorkspaceService
 
         public void Dispose()
         {
+            // First, so a load parked on the gate sees it the moment it gets in, rather than
+            // walking into a workspace that is already being torn down.
+            IsDisposed = true;
             Workspace.Dispose();
             ShadowLoader?.Dispose();
-            LoadGate.Dispose();
             if (TempDirs is not null)
                 foreach (var dir in TempDirs)
                     DecompiledSourceService.TryDeleteTempDir(dir);

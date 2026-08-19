@@ -27,8 +27,9 @@ public sealed class WorkerRequest
     public int Id { get; set; }
 
     /// <summary>One of: attach, launch, addBreakpoint, removeBreakpoint, continue, pause, step,
-    /// stackTrace, variables, evaluate, setVariable, applyDelta, runToLocation, setNextStatement,
-    /// modules, detach, exceptionPolicy, terminate.</summary>
+    /// stackTrace, variables, expand, displayOptions, evaluate, setVariable, applyDelta,
+    /// runToLocation, setNextStatement, modules, detach, exceptionPolicy, shutdown,
+    /// terminate.</summary>
     public string Op { get; set; } = "";
 
     public int Pid { get; set; }
@@ -40,6 +41,13 @@ public sealed class WorkerRequest
     public StepKind Step { get; set; }
     public uint FrameIndex { get; set; }
     public string? Expression { get; set; }
+
+    /// <summary>Which debugger attributes the worker's engine should honour, sent by
+    /// 'displayOptions'.</summary>
+    public DebugDisplayOptions? DisplayOptions { get; set; }
+
+    /// <summary>The value to expand, as the path its <c>VariablesReference</c> carried.</summary>
+    public string? Path { get; set; }
     public string? Name { get; set; }
     public string? Value { get; set; }
     public string? Executable { get; set; }
@@ -55,6 +63,9 @@ public sealed class WorkerRequest
 
     public bool Flag { get; set; }
     public bool Force { get; set; }
+
+    /// <summary>How long a graceful shutdown may take before the debuggee is terminated.</summary>
+    public double TimeoutSeconds { get; set; }
 }
 
 public sealed class WorkerResponse
@@ -71,6 +82,9 @@ public sealed class WorkerResponse
     public DebugVariable? Variable { get; set; }
     public string? Value { get; set; }
     public bool Removed { get; set; }
+
+    /// <summary>Set by 'shutdown': whether the debuggee exited on its own.</summary>
+    public bool Graceful { get; set; }
     public List<DebugModule>? Modules { get; set; }
     public RunToLocationResponse? RunToLocation { get; set; }
     public SetNextStatementResponse? SetNextStatement { get; set; }

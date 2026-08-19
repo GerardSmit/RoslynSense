@@ -2,6 +2,7 @@
 using System.Text;
 using System.Xml.Linq;
 
+using RoslynMCP.Languages.DotSettings.Core;
 namespace RoslynMCP.Services.ProjectModel;
 
 public sealed record MutationResult(bool Ok, string Message);
@@ -812,6 +813,13 @@ public static class ProjectMutationService
     /// Root namespace plus the folders between the project and the file — the correspondence
     /// every C# codebase assumes and every analyzer checks.
     /// </summary>
+    /// <remarks>
+    /// Except where the team said otherwise. A project's <c>.DotSettings</c> can mark a folder as
+    /// one that does not create a namespace — <c>Extensions</c> and <c>Abstractions</c> beside a
+    /// project root are the usual ones — and the resulting namespace is then the folder's parent's.
+    /// Ignoring that would put every generated file in a namespace the rest of the project does not
+    /// use, and the analyzer checking the correspondence would agree with us and flag the file.
+    /// </remarks>
     private static string InferNamespace(string projectPath, string projectDirectory, string fullPath)
     {
         string root = ReadProperty(projectPath, "RootNamespace")
@@ -821,9 +829,9 @@ public static class ProjectMutationService
         if (string.IsNullOrEmpty(folders) || folders == ".")
             return Sanitize(root);
 
-        var parts = folders
-            .Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            .Where(p => p.Length > 0 && p != ".");
+        var parts = ReSharperSettings.ForProject(projectPath).NamespaceSegments(folders).ToList();
+        if (parts.Count == 0)
+            return Sanitize(root);
 
         return Sanitize(root + "." + string.Join('.', parts));
     }

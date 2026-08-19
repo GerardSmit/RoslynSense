@@ -2,11 +2,15 @@ using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Languages.AppSettings;
 using RoslynMCP.Languages.Dbml;
+using RoslynMCP.Languages.DotSettings;
+using RoslynMCP.Languages.DotSettings.Core;
 using RoslynMCP.Languages.Mediator;
 using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.WebConfig;
+using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Services;
 
@@ -43,6 +47,15 @@ internal static class LanguagePackRegistration
             packs.Add(new DbmlLanguage());
         if (settings.AppSettings)
             packs.Add(new AppSettingsLanguage());
+        if (settings.WebConfig)
+        {
+            WebConfigFile.Configure(settings.WebConfigFiles);
+            packs.Add(new WebConfigLanguage());
+        }
+        if (settings.DotSettings)
+            packs.Add(new DotSettingsLanguage());
+
+        DotSettingsExclusions.Enabled = settings.DotSettings;
 
         return packs;
     }
@@ -66,6 +79,20 @@ internal static class LanguagePackRegistration
             AddPack<DbmlLanguage>(services);
         if (settings.AppSettings)
             AddPack<AppSettingsLanguage>(services);
+        if (settings.WebConfig)
+        {
+            // Before the pack is resolved, not after: the pack reads this set for its own
+            // FileNames, and so do the static document cache and watched-file filter.
+            WebConfigFile.Configure(settings.WebConfigFiles);
+            AddPack<WebConfigLanguage>(services);
+        }
+        if (settings.DotSettings)
+            AddPack<DotSettingsLanguage>(services);
+
+        // The .DotSettings pack answers no requests of its own; what it switches on are the
+        // narrowings applied from static helpers on the search and namespace paths, which have no
+        // container to resolve it from. See DotSettingsExclusions.
+        DotSettingsExclusions.Enabled = settings.DotSettings;
 
         services.AddSingleton(sp => new LanguageRegistry(sp.GetServices<ILanguagePack>()).Publish());
     }

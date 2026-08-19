@@ -50,9 +50,20 @@ internal class AspxFindUsages(IOutputFormatter fmt) : IFindUsagesHandler
         // The current project, not the parse's snapshot: the FindControl text search and the
         // reference search both answer with positions in the files as they are now.
         var project = await AspxDocumentService.CurrentProjectAsync(document, cancellationToken);
-        var hit = AspxSourceMappingService.FindMarkedSpan(document.Text, markup!, hintLine) is { } marked
-            ? AspxSymbolResolver.ResolveAt(document, marked.Start)
-            : null;
+        var marked = AspxSourceMappingService.FindMarkedSpan(document.Text, markup!, hintLine);
+
+        // A resource key written inside an inline code block binds to nothing — and where it does
+        // bind, it binds to the call around it rather than to itself. Asked ahead of the resolve,
+        // the way the markup LSP handler asks the contributors ahead of its own.
+        if (marked is { } keySpan
+            && await SymbolFreeUsages.ReportAsync(
+                systemPath, keySpan.Start, project, markup!.MarkedText,
+                fmt, maxResults, cancellationToken) is { } keyReport)
+        {
+            return keyReport;
+        }
+
+        var hit = marked is { } span ? AspxSymbolResolver.ResolveAt(document, span.Start) : null;
         var symbol = hit?.Symbol;
 
         // The ID names a code-behind field for a top-level control and nothing for a

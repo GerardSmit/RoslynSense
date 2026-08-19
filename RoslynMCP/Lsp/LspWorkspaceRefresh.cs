@@ -43,5 +43,10 @@ internal static class LspWorkspaceRefresh
         // changes cannot hold the refresh off forever. This used to be a second, subtly different
         // implementation of the same thing, with both of those bugs.
         LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
+
+        // Not part of the debounced refresh above: that one carries LSP refresh kinds, and the
+        // Solution Explorer is a custom view the protocol has no kind for. It draws which projects
+        // are loaded, so it is stale the moment this fires.
+        LspSessionRegistry.NotifyProjectSetChanged();
     }
 }

@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.AppSettings.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.MetadataConfiguration;
 using LspCodeLens = RoslynMCP.Lsp.Protocol.CodeLens;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
@@ -54,6 +55,7 @@ internal sealed partial class AppSettingsLanguage : ILanguageCodeLensProvider, I
 
         var lines = view.Text.Lines;
         var lenses = new List<LspCodeLens>();
+        var external = await MetadataConfigurationIndex.GetAsync(view.Project, ct);
 
         foreach (var key in view.Document.Keys)
         {
@@ -63,11 +65,24 @@ internal sealed partial class AppSettingsLanguage : ILanguageCodeLensProvider, I
                 continue;
 
             var start = lines.GetLinePosition(key.NameSpan.Start);
+            var range = LspConverters.ToRange(lines, key.NameSpan);
 
-            lenses.Add(new LspCodeLens(LspConverters.ToRange(lines, key.NameSpan), Command: null)
+            lenses.Add(new LspCodeLens(range, Command: null)
             {
                 Data = new CodeLensData(uri, start.Line, start.Character, ReferencesKind),
             });
+
+            // Where else this key is decided. Counted here rather than at resolve: the chain is
+            // the other configuration files, which are read from a cache, not searched for.
+            lenses.AddRange(ConfigOverrides.Lenses(
+                AppSettingsOverrides.ChainFor(view.Project.FilePath, key.Path),
+                view.FilePath, range));
+
+            if (ExternalReferences.Lens(
+                    external.ReadsFor(MetadataConfigurationKind.Path, key.Path), uri, range) is { } lens)
+            {
+                lenses.Add(lens);
+            }
         }
 
         return [.. lenses];

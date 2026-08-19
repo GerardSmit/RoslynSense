@@ -4,11 +4,13 @@ using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.AppSettings;
 using RoslynMCP.Languages.Dbml;
+using RoslynMCP.Languages.DotSettings;
 using RoslynMCP.Languages.Mediator;
 using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.WebConfig;
 using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
@@ -45,7 +47,6 @@ public class LanguageRegistryTests
 
     [Theory]
     [InlineData(@"C:\site\Default.aspx.cs")]   // the code-behind is C#, and Roslyn owns it
-    [InlineData(@"C:\site\Web.config")]
     [InlineData(@"C:\site\readme")]            // no extension at all
     [InlineData("")]
     [InlineData(null)]
@@ -140,7 +141,9 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ResourcesLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
-            pack => Assert.IsType<AppSettingsLanguage>(pack));
+            pack => Assert.IsType<AppSettingsLanguage>(pack),
+            pack => Assert.IsType<WebConfigLanguage>(pack),
+            pack => Assert.IsType<DotSettingsLanguage>(pack));
 
         foreach (var handlers in new IEnumerable<object>[]
         {
@@ -212,7 +215,9 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ResourcesLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
-            pack => Assert.IsType<AppSettingsLanguage>(pack));
+            pack => Assert.IsType<AppSettingsLanguage>(pack),
+            pack => Assert.IsType<WebConfigLanguage>(pack),
+            pack => Assert.IsType<DotSettingsLanguage>(pack));
     }
 
     [Fact]
@@ -254,7 +259,9 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ResourcesLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
-            pack => Assert.IsType<AppSettingsLanguage>(pack));
+            pack => Assert.IsType<AppSettingsLanguage>(pack),
+            pack => Assert.IsType<WebConfigLanguage>(pack),
+            pack => Assert.IsType<DotSettingsLanguage>(pack));
         Assert.IsType<RazorLanguage>(registry.Resolve(@"C:\app\Counter.razor"));
     }
 
@@ -297,13 +304,20 @@ public class LanguageRegistryTests
     [InlineData(@"C:\src\web.config")]
     [InlineData(@"C:\src\Web.config")]
     [InlineData(@"C:\src\app.config")]
-    public void ConfigFilesThePackDidNotNameAreLeftAlone(string path)
+    public void ConfigFilesThePackDidNotNameGoToTheOneThatDid(string path)
     {
-        // Not merely unclaimed by this pack — unclaimed full stop, because the binding-redirect
-        // handler sits in front of pack dispatch and answers these itself. A pack that swallowed
-        // them would take the diagnostics and quick fixes with it.
+        // Not this pack's — the project-file pack names packages.config and nuget.config, and
+        // claiming `.config` outright would take these two as well.
         Assert.Null(new LanguageRegistry([new NamedFilePack()]).Resolve(path));
-        Assert.Null(Registry().Resolve(path));
+
+        // The settings pack names them, which the binding-redirect handler is unaffected by: it
+        // sits in front of pack dispatch for diagnostics and code actions, and this pack offers
+        // neither — so the quick fixes stay where they are while the entries get their lenses.
+        var pack = Registry().Resolve(path);
+        Assert.IsType<WebConfigLanguage>(pack);
+        Assert.False(pack is ILanguageDiagnosticProvider);
+        Assert.False(pack is ILanguageCodeActionProvider);
+        Assert.True(BindingRedirectHandler.IsConfigPath(path));
     }
 
     [Fact]

@@ -24,6 +24,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     private IDebugEngine? _engine;
     private readonly ConcurrentDictionary<int, DebuggerService.BreakpointInfo> _breakpoints = new();
     private readonly ConcurrentQueue<string> _output = new();
+
+    /// <summary>Maps the numbers DAP calls variable references onto the engine's value paths.</summary>
+    private readonly VariableHandles _handles = new();
     private readonly SemaphoreSlim _stopped = new(0);
     private readonly Lock _gate = new();
 
@@ -100,6 +103,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         try
         {
             _engine = DebugEngineFactory.ForProcess(pid);
+            Engine.SetDisplayOptions(Config.DebuggerViewOptions.Current);
             StartPump();
             _state = DebuggerService.DebugState.Starting;
             Engine.Attach(pid, specs, EngineRuntime.NetFramework);
@@ -151,6 +155,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             // The engine has to match the *target's* bitness, and a Framework build can be x86
             // while this host is x64; the factory picks the worker from the executable itself.
             _engine = DebugEngineFactory.ForExecutable(executable);
+            Engine.SetDisplayOptions(Config.DebuggerViewOptions.Current);
             StartPump();
             _state = DebuggerService.DebugState.Starting;
             Engine.Launch(
@@ -251,6 +256,10 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 
         lock (_gate) _currentFrame = null;
 
+        // Every path a reference points at describes a value in the frame that is about to be
+        // left, so the numbers must not survive the resume that invalidates them.
+        _handles.Reset();
+
         // Drain any stop signalled before this command so the wait below cannot return instantly.
         while (_stopped.CurrentCount > 0)
             await _stopped.WaitAsync(0, cancellationToken);
@@ -332,6 +341,22 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             return sb.ToString();
         });
 
+    /// <summary>
+    /// Retargets a live session at a new view policy, so turning a display string off in
+    /// configuration takes effect at the next expansion rather than at the next session.
+    /// </summary>
+    public void ApplyViewOptions(RoslynMCP.Debugger.DebugDisplayOptions options)
+    {
+        if (_engine is null)
+            return;
+
+        _engine.SetDisplayOptions(options);
+
+        // The numbers already handed out describe values filtered under the old policy; a proxy
+        // that just went away leaves paths that no longer resolve.
+        _handles.Reset();
+    }
+
     // --- Structured views ---
 
     public async Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
@@ -367,19 +392,8 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 
         try
         {
-            var variables = await Engine.VariablesAsync((uint)Math.Max(0, frameId));
-            return variables
-                .Select(v => new VariableInfo(
-                    v.Name,
-                    v.Value,
-                    Type: "",
-                    // ICorDebug reaches members by dotted path rather than by handle, so there is
-                    // nothing to expand into until the engine grows a child enumerator.
-                    VariablesReference: 0,
-                    NamedChildCount: 0,
-                    IndexedChildCount: 0,
-                    Evaluable: v.Settable))
-                .ToList();
+            var frame = (uint)Math.Max(0, frameId);
+            return Describe(await Engine.VariablesAsync(frame), frameId);
         }
         catch
         {
@@ -387,11 +401,58 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         }
     }
 
-    /// <summary>Always empty: the ICorDebug engine resolves member paths but does not enumerate
-    /// an object's children. Expand by evaluating <c>parent.member</c> instead.</summary>
-    public Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
-        int variablesReference, CancellationToken cancellationToken = default) =>
-        Task.FromResult<IReadOnlyList<VariableInfo>>([]);
+    /// <summary>
+    /// Expands one value into its children — fields, elements, or the members of the debugger view
+    /// its type declares through <c>DebuggerTypeProxy</c>.
+    /// </summary>
+    /// <remarks>
+    /// The engine addresses children by path, not by handle, so a reference is nothing more than
+    /// this session's number for one <c>frame|path</c> pair. Paths are stable across stops in a
+    /// way handles are not, which is why the reference is minted here rather than in the engine.
+    /// </remarks>
+    public async Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
+        int variablesReference, CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null)
+            return [];
+        if (_handles.Expression(variablesReference) is not { } handle)
+            return [];
+
+        var (frameId, path) = DecodeHandle(handle);
+
+        try
+        {
+            return Describe(await Engine.ExpandAsync((uint)Math.Max(0, frameId), path), frameId);
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private List<VariableInfo> Describe(IEnumerable<RoslynMCP.Debugger.DebugVariable> variables, int frameId) =>
+        variables
+            .Select(v => new VariableInfo(
+                v.Name,
+                v.Value,
+                v.Type,
+                VariablesReference: v.VariablesReference.Length == 0
+                    ? 0
+                    : _handles.For($"{frameId}|{v.VariablesReference}"),
+                // The engine reports children only when asked for them, so a count would cost a
+                // second round trip to learn what the client discovers by expanding anyway.
+                NamedChildCount: 0,
+                IndexedChildCount: 0,
+                Evaluable: v.Settable))
+            .ToList();
+
+    private static (int FrameId, string Path) DecodeHandle(string handle)
+    {
+        var separator = handle.IndexOf('|');
+        return separator < 0
+            ? (0, handle)
+            : (int.TryParse(handle[..separator], out var frame) ? frame : 0, handle[(separator + 1)..]);
+    }
 
     public async Task<string> SelectFrameAsync(int frameId, CancellationToken cancellationToken = default)
     {
@@ -639,6 +700,31 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Asks the debuggee to shut down the way the outside world would ask it to, and only kills
+    /// it if it will not go.
+    /// </summary>
+    /// <remarks>
+    /// Stopping a debug session used to be indistinguishable from the process crashing, which for
+    /// anything hosting services meant connections left open, buffers unflushed and
+    /// <c>StopAsync</c> never called. The session state is reset through <see cref="Stop"/>
+    /// either way, since the engine is finished by the time this returns.
+    /// </remarks>
+    public async Task<(bool Graceful, string Message)> ShutdownAsync(
+        TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var engine = _engine;
+        if (engine is null)
+            return (false, Stop());
+
+        var (graceful, error) = await engine.ShutdownAsync(timeout);
+        Stop();
+
+        return graceful
+            ? (true, "Debug session stopped; the debuggee shut down cleanly.")
+            : (false, $"Debug session stopped ({error}).");
+    }
+
     public string Stop()
     {
         try
@@ -652,6 +738,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 
         _engine = null;
         _breakpoints.Clear();
+        _handles.Reset();
         lock (_gate) _currentFrame = null;
         _state = DebuggerService.DebugState.NotStarted;
 

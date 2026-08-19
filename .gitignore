@@ -417,3 +417,6 @@ RoslynMCP.Tests/Fixtures/**/lib/
 # VSCode extension build output
 vscode-extension/out/
 vscode-extension/*.vsix
+
+# Personal RoslynSense settings. The committed sibling is roslynsense.json.
+roslynsense.local.json

@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Languages.DotSettings.Core;
 
 namespace RoslynMCP.Lsp.Search;
 
@@ -181,8 +182,9 @@ public static class SearchEverywhere
                 continue;
 
             // Build output is not a place anyone navigates to, and it is where every SDK
-            // project's generated AssemblyInfo lives.
-            if (SearchFileRules.IsExcluded(path))
+            // project's generated AssemblyInfo lives. A .DotSettings layer adds whatever the team
+            // excluded on top of that.
+            if (SearchFileRules.IsExcluded(path) || DotSettingsExclusions.IsExcluded(path))
                 continue;
 
             var span = location.GetLineSpan();

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis.MSBuild;
 using RoslynMCP.Services;
 
@@ -8,6 +9,26 @@ namespace RoslynMCP.Tests;
 /// </summary>
 internal static class TestEnvironment
 {
+    /// <summary>
+    /// Turns the restore watcher off for the suite, before any test runs.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It is a background daemon: it holds a directory handle on every loaded project's <c>obj</c>
+    /// and evicts workspaces asynchronously when a restore lands there. Both are right in a running
+    /// server and neither is welcome here. These tests write into fixture trees, build them and
+    /// restore them constantly, so evictions — and the editor refreshes they raise — would arrive in
+    /// whichever test happened to be running, and most of this suite runs in parallel.
+    /// </para>
+    /// <para>
+    /// <see cref="RestoreWatcher.ArmForTests"/> turns it back on for the tests that are about it,
+    /// scoped to the test that asks.
+    /// </para>
+    /// </remarks>
+    [ModuleInitializer]
+    internal static void DisableRestoreWatching() =>
+        Environment.SetEnvironmentVariable("ROSLYNMCP_NO_RESTORE_WATCH", "1");
+
     /// <summary>
     /// Returns <c>true</c> when Visual Studio or Build Tools MSBuild was registered
     /// by <see cref="WorkspaceService"/>, enabling legacy .csproj support.

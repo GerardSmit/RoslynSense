@@ -55,12 +55,15 @@ public ref struct Lexer
     private bool _isStart;
 
     // Memo for the tag scan: _scanClose is the first '>' at or after _scanStart (input length
-    // when there is none) and _scanRunAt is the first "runat" before it (-1 when there is none).
+    // when there is none), _scanRunAt is the first "runat" belonging to the tag that starts
+    // there (-1 when there is none), and _scanNested is where another tag opens inside its
+    // attribute list (-1 when none does).
     // Inline script is full of '<' with no tag around it, and without this every one of them
     // re-scanned ahead to the same faraway '>'.
     private int _scanStart;
     private int _scanClose;
     private int _scanRunAt;
+    private int _scanNested;
 
     public Lexer(string file, ReadOnlySpan<char> input)
     {
@@ -92,6 +95,7 @@ public ref struct Lexer
         _scanStart = -1;
         _scanClose = -1;
         _scanRunAt = -1;
+        _scanNested = -1;
     }
 
     public string File { get; }
@@ -254,7 +258,11 @@ public ref struct Lexer
 
     private bool IsWebFormsElement()
     {
-        if (Current != '<')
+        // `<%` opens an inline block, never an element. Saying otherwise let the scan read the
+        // rest of the tag — `Text='<%# Eval("X") %>' runat="server"` — and answer for the runat
+        // belonging to the tag the block is written inside, which turned the block into a tag of
+        // its own and cost the attribute its data binding.
+        if (Current != '<' || Peek('%', 1))
         {
             return false;
         }
@@ -265,34 +273,110 @@ public ref struct Lexer
 
     /// <summary>
     /// The offset of the first '>' at or after <paramref name="offset"/>, or the input length
-    /// when there is none, leaving <see cref="_scanRunAt"/> at the first "runat" in
-    /// [<paramref name="offset"/>, close) or -1.
+    /// when there is none, leaving <see cref="_scanRunAt"/> at the first "runat" belonging to
+    /// the tag that starts there, or -1.
     /// </summary>
     private int NextTagClose(int offset)
     {
         if (offset >= _scanStart && offset < _scanClose)
         {
-            if (_scanRunAt >= offset || _scanRunAt == -1)
+            // A window with a tag nested in it has to be walked again from the new start: the
+            // nested tag is what bounds the runat search, and whether it still lies ahead
+            // depends on where the walk begins.
+            if (_scanNested == -1 && (_scanRunAt >= offset || _scanRunAt == -1))
             {
                 return _scanClose;
             }
 
             // The memoized hit starts before this window; the window can still hold a later one.
-            var sub = _input.Slice(offset, _scanClose - offset);
-            var next = sub.IndexOf(_runAt, StringComparison.OrdinalIgnoreCase);
-            _scanStart = offset;
-            _scanRunAt = next == -1 ? -1 : offset + next;
-            return _scanClose;
+            var close = _scanClose;
+            ScanTagHeader(offset, close);
+            _scanClose = close;
+            return close;
         }
 
-        var slice = _input.Slice(offset);
-        var index = slice.IndexOf('>');
-        var close = index == -1 ? _input.Length : offset + index;
-        var runAt = slice.Slice(0, close - offset).IndexOf(_runAt, StringComparison.OrdinalIgnoreCase);
+        ScanTagHeader(offset, _input.Length);
+        return _scanClose;
+    }
+
+    /// <summary>
+    /// Walks the tag header starting at <paramref name="offset"/> and stopping at
+    /// <paramref name="stop"/>, recording where the tag closes, the first "runat" that belongs to
+    /// it, and where another tag opens inside its attribute list.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The runat search stops at a nested tag because WebForms lets a control write the host tag's
+    /// attribute list — <c>&lt;html &lt;asp:Literal runat="server" /&gt;&gt;</c> — where the runat
+    /// belongs to the literal and not to the html element. Reading it as the host's turned the
+    /// outermost tag of such a page into a server control and inverted the tree beneath it.
+    /// </para>
+    /// <para>
+    /// Quoted values are stepped over rather than read, so neither a '&gt;' nor the word "runat"
+    /// written inside one counts, and so is <c>&lt;% %&gt;</c>, whose "%&gt;" would otherwise end
+    /// the tag. A quote only opens a value when it follows '=': this walk also runs at every
+    /// '&lt;' in inline script, where a lone apostrophe would otherwise swallow the rest of the
+    /// file.
+    /// </para>
+    /// </remarks>
+    private void ScanTagHeader(int offset, int stop)
+    {
         _scanStart = offset;
-        _scanClose = close;
-        _scanRunAt = runAt == -1 ? -1 : offset + runAt;
-        return close;
+        _scanRunAt = -1;
+        _scanNested = -1;
+
+        // The last character that was not whitespace, which is what tells a quote opening an
+        // attribute value apart from one written inside something else.
+        var last = '\0';
+
+        for (var i = offset; i < stop; i++)
+        {
+            var c = _input[i];
+
+            if ((c == '"' || c == '\'') && last == '=')
+            {
+                var quote = _input.Slice(i + 1).IndexOf(c);
+                i = quote == -1 ? stop : i + 1 + quote;
+                last = '\0';
+                continue;
+            }
+
+            if (c == '<' && i > offset)
+            {
+                if (i + 1 < stop && _input[i + 1] == '%')
+                {
+                    var end = _input.Slice(i).IndexOf(_end);
+                    i = end == -1 ? stop : i + end + 1;
+                    last = '\0';
+                    continue;
+                }
+
+                if (_scanNested == -1 && i + 1 < stop &&
+                    (_input[i + 1] == '/' || char.IsLetter(_input[i + 1])))
+                {
+                    _scanNested = i;
+                }
+            }
+
+            if (c == '>')
+            {
+                _scanClose = i;
+                return;
+            }
+
+            if (_scanRunAt == -1 && _scanNested == -1 &&
+                _input.Slice(i).StartsWith(_runAt, StringComparison.OrdinalIgnoreCase))
+            {
+                _scanRunAt = i;
+            }
+
+            if (!IsSpaceCharacter(c))
+            {
+                last = c;
+            }
+        }
+
+        _scanClose = stop;
     }
 
     private bool ConsumeWebFormsTag()
@@ -377,7 +461,9 @@ public ref struct Lexer
         {
             SkipWhiteSpace();
 
-            while (ConsumeWebFormsTag() || ReadAttribute())
+            var nested = 0;
+
+            while (ConsumeNestedTag(ref nested) || ReadAttribute())
             {
                 SkipWhiteSpace();
             }
@@ -461,6 +547,57 @@ public ref struct Lexer
         return true;
     }
 
+    /// <summary>
+    /// A tag written inside another tag's attribute list, which WebForms allows so that a control
+    /// can write the host tag's attributes:
+    /// <c>&lt;html &lt;asp:Literal id="attrs" runat="server"&gt;&lt;/asp:Literal&gt;&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// The opening tag carries its own <c>runat</c> and reads like any other server tag. The
+    /// closing tag carries nothing, so it is only read while one of these is open — otherwise the
+    /// <c>&lt;/div&gt;</c> after an unterminated <c>&lt;div</c> would be read as that tag's
+    /// attributes rather than closing it. Without this the close fell through to
+    /// <see cref="ReadAttribute"/>, which left "asp:Literal&gt;&gt;" behind as text and gave the
+    /// host an attribute named "&lt;".
+    /// </remarks>
+    private bool ConsumeNestedTag(ref int depth)
+    {
+        if (Current != '<')
+        {
+            return false;
+        }
+
+        var open = _tags.Count;
+
+        if (depth > 0 && Peek('/', 1))
+        {
+            if (!ConsumeElement())
+            {
+                return false;
+            }
+
+            if (_tags.Count < open)
+            {
+                depth--;
+            }
+
+            return true;
+        }
+
+        if (ConsumeElement(true))
+        {
+            // A self-closing one leaves the stack alone and never asks for a closing tag.
+            if (_tags.Count > open)
+            {
+                depth++;
+            }
+
+            return true;
+        }
+
+        return ConsumeInline();
+    }
+
     private static bool IsVoidTag(string name)
     {
         return name is "area" or "base" or "br" or "col" or "command" or "embed"
@@ -492,7 +629,12 @@ public ref struct Lexer
             var close = NextTagClose(_offset);
             _htmlTagEnd = close;
 
-            var isSelfClosing = close > 0 && close < _input.Length && _input[close - 1] == '/';
+            // A '/' before the close is this tag's own only when nothing else opened inside its
+            // attribute list: in `<div <asp:Literal runat="server" />>` that slash closes the
+            // literal, and calling the div self-closed on the strength of it left the later
+            // `</div>` closing nothing.
+            var isSelfClosing = close > 0 && close < _input.Length && _input[close - 1] == '/' &&
+                                _scanNested == -1;
 
             _sawOpenTag = true;
 
@@ -776,14 +918,18 @@ public ref struct Lexer
 
             for (; _offset < _input.Length; Forward())
             {
-                if (Peek(_startStatement) || IsWebFormsElement())
+                // Only `<% %>` interrupts a quoted value. A '<' is an ordinary character inside
+                // one — ASP.NET reads no control there — and treating it as a tag turned
+                // `onload="if (a<b) f()" runat="server"` into a control named "b" with the host
+                // tag nested inside it, taking the rest of the file's structure with it.
+                if (Peek(_startStatement))
                 {
                     if (_offset > start.Offset)
                     {
                         AddNode(TokenType.AttributeValue, start);
                     }
 
-                    ConsumeWebFormsTag();
+                    ConsumeInline();
                     start = Position;
                 }
 

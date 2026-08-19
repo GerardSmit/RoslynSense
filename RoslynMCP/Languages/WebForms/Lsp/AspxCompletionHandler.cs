@@ -76,12 +76,63 @@ internal static class AspxCompletionHandler
         if (projection.ToProjected(offset) is not { } projected)
             return Empty;
 
+        // A caret inside a string literal that holds another language — a resource key, a
+        // configuration name — belongs to that language rather than to C#, exactly as it does in a
+        // code-behind file. `CompletionHandler` makes this check in the overload that resolves a
+        // URI, which markup never reaches: its C# lives in a projection, so the check has to be
+        // made here and the spans carried back to the file the caret is really in.
+        if (await EmbeddedAsync(document, offset, projection, projected, trigger, ct) is { } keys)
+            return keys;
+
         return await CompletionHandler.CompleteAsync(
             projection.Document, projection.Text, projected, trigger, cache,
             span => projection.ToAspx(span) is { } mapped
                 ? AspxLanguageHandler.ToRange(document, mapped)
                 : null,
             ct);
+    }
+
+    /// <summary>
+    /// The embedded language's list for a literal in the projection, with every edit mapped back
+    /// into the markup. Null when the caret is in no literal a pack owns, or when an edit lands on
+    /// generated text that the page has no place for.
+    /// </summary>
+    private static async Task<CompletionList?> EmbeddedAsync(
+        AspxDocument document, int offset, AspxProjection projection, int projected,
+        LspCompletionContext? trigger, CancellationToken ct)
+    {
+        if (await RoslynEmbeddedLanguages.Current.DetectAsync(projection.Document, projected, ct) is not
+            { Language: IEmbeddedCompletionProvider embedded } context)
+        {
+            return null;
+        }
+
+        var parameters = new CompletionParams(
+            new TextDocumentIdentifier(LspConverters.PathToUri(document.FilePath)),
+            LspConverters.ToPosition(document.SourceText.Lines.GetLinePosition(offset)),
+            trigger);
+
+        var list = await embedded.CompletionAsync(context, parameters, ct);
+        if (list.Items.Length == 0)
+            return list;
+
+        var items = new List<CompletionItem>(list.Items.Length);
+        foreach (var item in list.Items)
+        {
+            if (item.TextEdit is not { } edit)
+            {
+                items.Add(item);
+                continue;
+            }
+
+            var span = LspConverters.ToTextSpan(projection.Text, edit.Range);
+            if (projection.ToAspx(span) is not { } mapped)
+                continue;
+
+            items.Add(item with { TextEdit = edit with { Range = AspxLanguageHandler.ToRange(document, mapped) } });
+        }
+
+        return new CompletionList(list.IsIncomplete, [.. items]);
     }
 
     // ---- Tag names -------------------------------------------------------------------------

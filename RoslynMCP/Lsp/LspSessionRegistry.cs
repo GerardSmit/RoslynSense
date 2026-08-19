@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
@@ -49,6 +49,26 @@ internal static class LspSessionRegistry
             catch (Exception ex) when (ex is RemoteInvocationException or ConnectionLostException or ObjectDisposedException)
             {
                 // Session gone — the others still get their nudge.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Tells every connected editor that the set of loaded projects moved, so anything drawn from
+    /// it is redrawn. Distinct from <see cref="RequestRefreshAsync"/>, which asks the client to
+    /// re-pull the LSP-standard derived data (lenses, hints, diagnostics) and has no way to say
+    /// "your tree is stale": the Solution Explorer is a custom view and the protocol knows nothing
+    /// about it.
+    /// </summary>
+    public static void NotifyProjectSetChanged()
+    {
+        foreach (var rpc in s_sessions.Values)
+        {
+            // Not awaited and not thrown from: this runs on the tail of a background load, and a
+            // client that has gone away must not fault it.
+            try { _ = rpc.NotifyWithParameterObjectAsync("roslynSense/projectSetChanged", new { }); }
+            catch (Exception ex) when (ex is ConnectionLostException or ObjectDisposedException)
+            {
             }
         }
     }

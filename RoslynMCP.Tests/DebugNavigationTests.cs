@@ -129,11 +129,16 @@ public class DebugNavigationTests
         public void AddBreakpoint(RoslynMCP.Debugger.BreakpointSpec spec) { }
         public bool RemoveBreakpoint(string filePath, int line) => true;
         public void Continue() { }
+        public Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout) =>
+            Task.FromResult((true, ""));
         public void Pause() { }
         public void Step(RoslynMCP.Debugger.StepKind kind) { }
         public Task<List<RoslynMCP.Debugger.StackFrame>> StackTraceAsync() => Task.FromResult(new List<RoslynMCP.Debugger.StackFrame>());
         public Task<List<RoslynMCP.Debugger.DebugVariable>> VariablesAsync(uint frameIndex) =>
             Task.FromResult(new List<RoslynMCP.Debugger.DebugVariable>());
+        public Task<List<RoslynMCP.Debugger.DebugVariable>> ExpandAsync(uint frameIndex, string path) =>
+            Task.FromResult(new List<RoslynMCP.Debugger.DebugVariable>());
+        public void SetDisplayOptions(RoslynMCP.Debugger.DebugDisplayOptions options) { }
         public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
             Task.FromResult((true, "", ""));
         public Task<(bool Ok, RoslynMCP.Debugger.DebugVariable? Variable, string Error)> SetVariableAsync(

@@ -35,10 +35,19 @@ internal static class ExecuteCommandHandler
     /// </remarks>
     public const string GenerateEventHandlerCommand = "roslynSense.generateEventHandler";
 
+    /// <summary>
+    /// Brings every binding redirect in one <c>web.config</c> or <c>app.config</c> up to what the
+    /// project ships: [configPath]. Invoked by the lens at the top of that file.
+    /// </summary>
+    public const string FixBindingRedirectsCommand = "roslynSense.fixBindingRedirects";
+
     /// <summary>The commands the server answers whatever languages are enabled. A pack's own
     /// commands are appended to these when capabilities are built.</summary>
     public static readonly string[] Commands =
-        [RestoreCommand, ReloadCommand, BuildCommand, CompletionAcceptedCommand, SetLaunchUrlCommand];
+    [
+        RestoreCommand, ReloadCommand, BuildCommand, CompletionAcceptedCommand, SetLaunchUrlCommand,
+        FixBindingRedirectsCommand,
+    ];
 
     public static async Task<object> ExecuteAsync(
         ExecuteCommandParams p, CancellationToken ct, LanguageSession? languages = null)
@@ -53,6 +62,12 @@ internal static class ExecuteCommandHandler
 
             case SetLaunchUrlCommand:
                 return SetLaunchUrl(p);
+
+            case FixBindingRedirectsCommand:
+                return p.Arguments is [{ ValueKind: JsonValueKind.String } path, ..] &&
+                    path.GetString() is { Length: > 0 } configPath
+                        ? await BindingRedirectHandler.FixAllAsync(configPath, ct)
+                        : "No config file to fix binding redirects in.";
 
             case CompletionAcceptedCommand:
                 RecordCompletionAccepted(p);

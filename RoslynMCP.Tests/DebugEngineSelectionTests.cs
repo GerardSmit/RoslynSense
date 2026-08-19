@@ -132,9 +132,16 @@ internal sealed class FxTargetProcess : IDisposable
     /// cannot silently drift when the target program changes.</summary>
     private const string BreakpointStatement = "int result = input * 2;";
 
-    public static int BreakpointLine => Array.FindIndex(
+    /// <summary>The call whose Step Into reaches a <c>[DebuggerStepThrough]</c> method.</summary>
+    private const string GuardedCallStatement = "int guarded = Guarded.Twice(result);";
+
+    public static int BreakpointLine => LineOf(BreakpointStatement);
+
+    public static int GuardedCallLine => LineOf(GuardedCallStatement);
+
+    private static int LineOf(string statement) => Array.FindIndex(
         TargetSource.ReplaceLineEndings("\n").Split('\n'),
-        line => line.Contains(BreakpointStatement, StringComparison.Ordinal)) + 1;
+        line => line.Contains(statement, StringComparison.Ordinal)) + 1;
 
     private static readonly Lazy<string?> s_compiled = new(Compile);
 
@@ -174,9 +181,71 @@ internal sealed class FxTargetProcess : IDisposable
     private const string TargetSource =
         """
         using System;
+        using System.Diagnostics;
 
         namespace FxTarget
         {
+            // Renders through its display string; Id has no backing field, so producing one runs
+            // the getter in the target.
+            [DebuggerDisplay("Order {Id}: {Name,nq}")]
+            public class Order
+            {
+                private int _id;
+
+                [DebuggerBrowsable(DebuggerBrowsableState.Never)]
+                private string _secret;
+
+                public string Name;
+
+                public Order(int id, string name)
+                {
+                    _id = id;
+                    Name = name;
+                    _secret = "hidden";
+                }
+
+                public int Id { get { return _id; } }
+            }
+
+            // The shape a proxy exists for: the fields are storage, not content.
+            [DebuggerTypeProxy(typeof(BagView))]
+            public class Bag
+            {
+                internal int[] _slots = new int[] { 7, 8, 9, 0 };
+                internal int _count = 3;
+            }
+
+            public class BagView
+            {
+                private Bag _bag;
+
+                public BagView(Bag bag) { _bag = bag; }
+
+                [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
+                public int[] Items
+                {
+                    get
+                    {
+                        int[] used = new int[_bag._count];
+                        Array.Copy(_bag._slots, used, _bag._count);
+                        return used;
+                    }
+                }
+
+                public int Count { get { return _bag._count; } }
+            }
+
+            public static class Guarded
+            {
+                // A step into this should come straight back out under Just My Code.
+                [DebuggerStepThrough]
+                public static int Twice(int value)
+                {
+                    int doubled = value * 2;
+                    return doubled;
+                }
+            }
+
             public class Counter
             {
                 private int _count;
@@ -210,8 +279,11 @@ internal sealed class FxTargetProcess : IDisposable
 
                 private static int Compute(int input, Counter counter)
                 {
+                    Order order = new Order(input, "sample");
+                    Bag bag = new Bag();
                     int result = input * 2;
-                    return result;
+                    int guarded = Guarded.Twice(result);
+                    return result + guarded - guarded;
                 }
             }
         }

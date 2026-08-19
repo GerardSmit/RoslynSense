@@ -100,6 +100,13 @@
           ".dbml"
         ],
         "configuration": "./language-configuration/dbml.json"
+      },
+      {
+        "id": "jsonc",
+        "filenamePatterns": [
+          "**/appsettings*.json",
+          "**/secrets.json"
+        ]
       }
     ],
     "grammars": [
@@ -221,6 +228,12 @@
       }
     ],
     "commands": [
+      {
+        "command": "roslynSense.openSettings",
+        "title": "Settings",
+        "category": "RoslynSense",
+        "icon": "$(gear)"
+      },
       {
         "command": "roslynSense.searchEverywhere",
         "title": "RoslynSense: Search Everywhere"
@@ -439,7 +452,8 @@
       {
         "command": "roslynSense.applyHotReload",
         "title": "Apply Hot Reload",
-        "category": "RoslynSense"
+        "category": "RoslynSense",
+        "icon": "$(zap)"
       },
       {
         "command": "roslynSense.stopHotReload",
@@ -506,6 +520,31 @@
         "icon": "$(new-folder)"
       },
       {
+        "command": "roslynSense.solutionExplorer.undo",
+        "title": "Undo",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.redo",
+        "title": "Redo",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.removeReference",
+        "title": "Remove",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.removePackage",
+        "title": "Remove",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.goToProject",
+        "title": "Go to Project",
+        "category": "RoslynSense"
+      },
+      {
         "command": "roslynSense.solutionExplorer.addProjectReference",
         "title": "Add Project Reference…",
         "category": "RoslynSense",
@@ -523,7 +562,12 @@
         {
           "id": "roslynSense",
           "title": "RoslynSense",
-          "icon": "media/solution.svg"
+          "icon": "media/roslyn-sense.svg"
+        },
+        {
+          "id": "roslynSenseCoverage",
+          "title": "Test Coverage",
+          "icon": "media/coverage.svg"
         }
       ]
     },
@@ -534,7 +578,9 @@
           "name": "Solution",
           "contextualTitle": "Solution Explorer",
           "icon": "media/solution.svg"
-        },
+        }
+      ],
+      "roslynSenseCoverage": [
         {
           "id": "roslynSense.coverage",
           "name": "Coverage",
@@ -584,6 +630,14 @@
       {
         "fileMatch": "**/Properties/launchSettings.json",
         "url": "./schemas/launchSettings.schema.json"
+      },
+      {
+        "fileMatch": "**/roslynsense.json",
+        "url": "./schemas/roslynsense.schema.json"
+      },
+      {
+        "fileMatch": "**/roslynsense.local.json",
+        "url": "./schemas/roslynsense.schema.json"
       }
     ],
     "debuggers": [
@@ -729,6 +783,18 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.solutionExplorer.removeReference",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.removePackage",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToProject",
+          "when": "false"
+        },
+        {
           "command": "roslynSense.solutionExplorer.copy",
           "when": "false"
         },
@@ -769,12 +835,34 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.solutionExplorer.removeReference",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRef",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRef",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.removePackage",
+          "when": "view == roslynSense.solutionExplorer && viewItem == package",
+          "group": "2_modify@1"
+        },
+        {
           "command": "roslynSense.solutionExplorer.addProjectReference",
           "when": "false"
         },
         {
           "command": "roslynSense.solutionExplorer.newProject",
           "when": "false"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "roslynSense.applyHotReload",
+          "when": "roslynSense.hotReload.pending",
+          "group": "navigation@1"
         }
       ],
       "editor/context": [
@@ -849,6 +937,11 @@
           "command": "roslynSense.solutionExplorer.toggleFileNesting",
           "when": "view == roslynSense.solutionExplorer",
           "group": "1_view@4"
+        },
+        {
+          "command": "roslynSense.openSettings",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "5_settings"
         },
         {
           "command": "roslynSense.solutionExplorer.refresh",
@@ -966,6 +1059,23 @@
     },
     "keybindings": [
       {
+        "command": "roslynSense.solutionExplorer.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.redo",
+        "key": "ctrl+y",
+        "mac": "cmd+shift+z",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.redo",
+        "key": "ctrl+shift+z",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
         "command": "roslynSense.searchEverywhere",
         "key": "ctrl+t",
         "mac": "cmd+t",
@@ -1032,6 +1142,10 @@
       }
     ],
     "configurationDefaults": {
+      "files.associations": {
+        "*.DotSettings": "xml",
+        "*.DotSettings.user": "xml"
+      },
       "[csharp]": {
         "editor.formatOnType": true
       },
@@ -1081,10 +1195,47 @@
           "default": "off",
           "description": "Trace LSP communication between VSCode and roslyn-sense."
         },
+        "roslynSense.debugger.debuggerDisplay": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show values using their type's [DebuggerDisplay] string instead of the type name. The placeholders are evaluated in the target, so a getter named by one runs while you are stopped."
+        },
+        "roslynSense.debugger.typeProxy": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expand values through their type's [DebuggerTypeProxy] view, so a dictionary shows its entries rather than its bucket arrays. Building the view runs its constructor in the target."
+        },
+        "roslynSense.debugger.browsable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Honour [DebuggerBrowsable]: Never hides a member, RootHidden shows its children in its place. Off lists every field as it is stored."
+        },
+        "roslynSense.debugger.justMyCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Step past code marked [DebuggerStepThrough], [DebuggerHidden] or [DebuggerNonUserCode], and past frames with no symbols. Off steps into everything, including framework code."
+        },
+        "roslynSense.debugger.rawView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add a 'Raw View' child whenever a proxy or a hidden member means the listed children are not the object's own fields."
+        },
+        "roslynSense.debugger.maxChildren": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "How many children of one value to list before truncating."
+        },
         "roslynSense.hotReload.applyOnSave": {
           "type": "boolean",
           "default": false,
           "description": "Apply saved C# edits to the running application without restarting it. Rude edits (signature changes, new generic methods) are reported instead and still need a restart."
+        },
+        "roslynSense.loadEntireSolution": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load every project of the solution in the background when the server starts, so Search Everywhere, workspace symbols and find-references cover the whole solution instead of only the projects whose files you have opened. Off loads a project the first time you touch a file in it, which starts faster and uses less memory on a very large solution."
         },
         "roslynSense.analyzerDiagnostics": {
           "type": "boolean",
@@ -1173,6 +1324,11 @@
           "default": true,
           "markdownDescription": "Reference counts, navigation and completion in `appsettings*.json` and user secrets, joined to the C# that reads them — `GetSection`, indexers, `GetValue`, `Configure<T>` bindings. Off disables it for this window; `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
+        "roslynSense.languages.webconfig": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Reference counts, navigation and hover over `<appSettings>` and `<connectionStrings>` in `web.config` and `app.config`, joined to the code that reads them — `ConfigurationManager.AppSettings[\"…\"]` in C# and `<%$ AppSettings: … %>` in WebForms markup. Off disables it for this window; `roslynsense.json` is what turns it off for the whole solution. Binding redirects in the same files are unaffected — their warnings, the fix on each one, the installed version on hover over an `<assemblyIdentity>` and the lens that brings the whole file up to date are not this pack's and stay on. Takes effect on reload."
+        },
         "roslynSense.solutionExplorer.fileIcons": {
           "type": "string",
           "enum": [
@@ -1251,15 +1407,17 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json",
+    "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json && tsc -p ./tsconfig.webview.settings.json",
     "build": "npm run compile && npm run compile:webview",
     "vscode:prepublish": "npm run build",
     "watch": "tsc -watch -p ./",
     "dev": "npm run build && node scripts/dev.mjs",
     "package": "vsce package",
-    "check:embedded": "node scripts/checkEmbedded.mjs"
+    "check:embedded": "node scripts/checkEmbedded.mjs",
+    "test": "npm run compile && node --test \"out/test/*.test.js\""
   },
   "dependencies": {
+    "jsonc-parser": "^3.3.1",
     "vscode-languageclient": "^9.0.1",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"

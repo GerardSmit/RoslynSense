@@ -42,7 +42,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenSetBreakpointWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugBreakpointTool.DebugSetBreakpoint("test.cs", new MarkdownFormatter(), 10);
 
         Assert.Contains("No active debug session", result);
@@ -51,7 +51,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenRemoveBreakpointWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugBreakpointTool.DebugRemoveBreakpoint(1, new MarkdownFormatter());
 
         Assert.Contains("No active debug session", result);
@@ -60,7 +60,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenContinueWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter());
 
         Assert.Contains("No active debug session", result);
@@ -69,7 +69,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenStepInWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), "step_in");
 
         Assert.Contains("No active debug session", result);
@@ -78,7 +78,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenStepOverWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), "step_over");
 
         Assert.Contains("No active debug session", result);
@@ -87,7 +87,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenStepOutWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), "step_out");
 
         Assert.Contains("No active debug session", result);
@@ -96,7 +96,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenContinueWithInvalidActionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), "invalid_action");
 
         // No session check comes first
@@ -106,7 +106,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenEvaluateWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugInspectTool.DebugEvaluate("1 + 1", new MarkdownFormatter());
 
         Assert.Contains("No active debug session", result);
@@ -115,7 +115,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenBatchEvaluateWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugInspectTool.DebugEvaluate("x;y;z", new MarkdownFormatter());
 
         Assert.Contains("No active debug session", result);
@@ -134,7 +134,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenStatusWithoutSessionThenReturnsNoSession()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugInspectTool.DebugStatus(new MarkdownFormatter());
 
         Assert.Contains("No active debug session", result);
@@ -143,7 +143,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenStatusWithLocalsWithoutSessionThenReturnsNoSession()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugInspectTool.DebugStatus(new MarkdownFormatter(), includeLocals: true);
 
         Assert.Contains("No active debug session", result);
@@ -152,17 +152,17 @@ public class DebugToolTests
     [Fact]
     public async Task WhenStatusWithStackTraceWithoutSessionThenReturnsNoSession()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugInspectTool.DebugStatus(new MarkdownFormatter(), includeStackTrace: true);
 
         Assert.Contains("No active debug session", result);
     }
 
     [Fact]
-    public void WhenStopWithoutSessionThenReturnsNoSession()
+    public async Task WhenStopWithoutSessionThenReturnsNoSession()
     {
-        DebugControlTool.DebugStop();
-        var result = DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
+        var result = await DebugControlTool.DebugStop();
 
         Assert.Contains("No active debug session", result);
     }
@@ -170,7 +170,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenSetBreakpointWithConditionWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugBreakpointTool.DebugSetBreakpoint("test.cs", new MarkdownFormatter(), 10, condition: "x > 5");
 
         Assert.Contains("No active debug session", result);
@@ -179,7 +179,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenBatchSetBreakpointsWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugBreakpointTool.DebugSetBreakpoint("test.cs:10;other.cs:20", new MarkdownFormatter());
 
         Assert.Contains("No active debug session", result);
@@ -188,7 +188,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenBatchRemoveBreakpointsWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugBreakpointTool.DebugRemoveBreakpoint(0, new MarkdownFormatter(), breakpointIds: "1;2;3");
 
         Assert.Contains("No active debug session", result);
@@ -197,7 +197,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenRunUntilWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), action: "run_until", filePath: "test.cs", line: 42);
 
         Assert.Contains("No active debug session", result);
@@ -206,7 +206,7 @@ public class DebugToolTests
     [Fact]
     public async Task WhenRunUntilWithConditionWithoutSessionThenReturnsError()
     {
-        DebugControlTool.DebugStop();
+        await DebugControlTool.DebugStop();
         var result = await DebugControlTool.DebugContinue(new MarkdownFormatter(), action: "run_until", filePath: "test.cs", line: 42, condition: "i == 5");
 
         Assert.Contains("No active debug session", result);

@@ -102,11 +102,13 @@ public static class DebugControlTool
     }
 
     /// <summary>
-    /// Stops the active debug session.
+    /// Stops the active debug session, letting the debuggee shut itself down first.
     /// </summary>
     [McpServerTool, Description(
-        "Stop the active debug session and clean up all debugger processes.")]
-    public static string DebugStop()
+        "Stop the active debug session and clean up all debugger processes. The debuggee is asked "
+        + "to shut down cleanly — hosted services get their StopAsync — and killed only if it does "
+        + "not exit in time.")]
+    public static async Task<string> DebugStop()
     {
         var session = DebugSessionManager.GetSession();
         if (session is null)
@@ -118,10 +120,14 @@ public static class DebugControlTool
                 : "No active debug session.";
         }
 
-        var result = session.Stop();
+        var (_, message) = await session.ShutdownAsync(DebugStopTimeout);
         DebugSessionManager.DisposeSession();
-        return result;
+        return message;
     }
+
+    /// <summary>How long a debuggee gets to shut itself down before it is killed. The same budget
+    /// the editor's stop button uses, so both surfaces end a session the same way.</summary>
+    internal static readonly TimeSpan DebugStopTimeout = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// Sets a temporary breakpoint at the given location, continues execution until it is hit,

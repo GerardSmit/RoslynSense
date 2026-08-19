@@ -41,6 +41,8 @@ internal static class FixturePaths
     public static string ImageHandlerFile => Path.Combine(AspxProjectDir, "ImageHandler.ashx");
     public static string AspxPageHelperFile => Path.Combine(AspxProjectDir, "PageHelper.cs");
     public static string AspxWebConfigFile => Path.Combine(AspxProjectDir, "web.config");
+    public static string AspxSettingsReaderFile => Path.Combine(AspxProjectDir, "SettingsReader.cs");
+    public static string AspxSettingsPageFile => Path.Combine(AspxProjectDir, "Settings.aspx");
     public static string WebFormsSiteDir => Path.Combine(s_fixturesRoot, "WebFormsSite");
     public static string WebFormsSiteFile => Path.Combine(WebFormsSiteDir, "WebFormsSite.csproj");
     public static string DbmlProjectDir => Path.Combine(s_fixturesRoot, "DbmlProject");
@@ -119,6 +121,11 @@ internal static class FixturePaths
     public static string MultiProjectBFile => Path.Combine(MultiSolutionDir, "ProjectB", "ProjectB.csproj");
     public static string MultiProjectAClassFile => Path.Combine(MultiSolutionDir, "ProjectA", "Class1.cs");
     public static string MultiProjectBClassFile => Path.Combine(MultiSolutionDir, "ProjectB", "Class2.cs");
+
+    public static string SuppressedWarningsDir => Path.Combine(s_fixturesRoot, "SuppressedWarnings");
+    public static string SuppressedWarningsPropsFile => Path.Combine(SuppressedWarningsDir, "Directory.Build.props");
+    public static string SuppressedAlphaFile => Path.Combine(SuppressedWarningsDir, "Alpha", "Alpha.csproj");
+    public static string SuppressedBetaFile => Path.Combine(SuppressedWarningsDir, "Beta", "Beta.csproj");
 
     /// <summary>Central Package Management. Never restored: the point is that versions resolve
     /// from the evaluated item model alone.</summary>
@@ -260,6 +267,13 @@ internal static class FixturePaths
         Path.Combine(ConfigAppDir, "appsettings.Development.json");
 
     /// <summary>
+    /// The shared description of the configuration layering, read by both this suite and the
+    /// extension's. See the file itself for what it pins.
+    /// </summary>
+    public static string ConfigLayeringParityFile =>
+        Path.Combine(s_fixturesRoot, "ConfigLayering", "parity.json");
+
+    /// <summary>
     /// The VS Code extension folder in the source tree, or null when the tests run from output
     /// with no repository above them. The theme lives there but has to agree with the token
     /// legend that lives here, so one test reads across.
@@ -285,6 +299,31 @@ internal static class FixturePaths
     /// Prefer the source-tree fixtures so Roslyn can open the nested sample project
     /// with its real restore/build artifacts; fall back to copied output fixtures.
     /// </summary>
+    /// <summary>
+    /// The checkout this test run came from, or null when the assembly was copied somewhere else.
+    /// </summary>
+    /// <remarks>
+    /// For the handful of tests that assert about files which are checked in rather than shipped —
+    /// a generated schema whose copy must not go stale. A test that needs this skips itself when
+    /// it is null rather than failing: running the assembly outside its checkout is a legitimate
+    /// thing to do, and there is nothing to compare against there.
+    /// </remarks>
+    public static string? RepoRoot { get; } = FindRepoRoot();
+
+    private static string? FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "RoslynMCP.sln")))
+                return dir.FullName;
+
+            dir = dir.Parent;
+        }
+
+        return null;
+    }
+
     private static string FindFixturesRoot()
     {
         string? copiedFixturesRoot = null;

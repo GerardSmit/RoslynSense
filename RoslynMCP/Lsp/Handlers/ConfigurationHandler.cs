@@ -64,6 +64,19 @@ internal static class ConfigurationHandler
         if (Bool(section, "externalSource") is { } externalSource)
             LspFeatureOptions.ExternalSource = externalSource;
 
+        if (Bool(section, "loadEntireSolution") is { } loadAll
+            && loadAll != LspFeatureOptions.LoadEntireSolution)
+        {
+            LspFeatureOptions.LoadEntireSolution = loadAll;
+
+            // Turning it on mid-session means what it says: the projects nobody has opened are
+            // still missing, and the setting is how the user asked for them. Only on a real
+            // change, so the settings block replayed at initialize does not start the load before
+            // the client is ready to render its progress — initialized does that.
+            if (loadAll)
+                _ = SolutionWarmup.Start();
+        }
+
         if (Bool(section, "sourceLink") is { } sourceLink)
             LspFeatureOptions.SourceLink = sourceLink;
 
@@ -85,7 +98,47 @@ internal static class ConfigurationHandler
             analyzersChanged = true;
         }
 
+        ApplyDebuggerView(section);
+
         return analyzersChanged;
+    }
+
+    /// <summary>
+    /// Applies <c>roslynSense.debugger.*</c> — which debugger attributes the engines honour.
+    /// </summary>
+    /// <remarks>
+    /// Process-wide like the analyzer switches, and pushed into a running session rather than
+    /// waiting for the next one: the moment somebody turns a display string off, it is because
+    /// the value in front of them looks wrong and they want the raw fields now.
+    /// </remarks>
+    private static void ApplyDebuggerView(JsonElement section)
+    {
+        if (!section.TryGetProperty("debugger", out var debugger)
+            || debugger.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        var current = DebuggerViewOptions.Current;
+        var updated = current.Clone();
+
+        updated.DebuggerDisplay = Bool(debugger, "debuggerDisplay") ?? current.DebuggerDisplay;
+        updated.TypeProxy = Bool(debugger, "typeProxy") ?? current.TypeProxy;
+        updated.Browsable = Bool(debugger, "browsable") ?? current.Browsable;
+        updated.JustMyCode = Bool(debugger, "justMyCode") ?? current.JustMyCode;
+        updated.RawView = Bool(debugger, "rawView") ?? current.RawView;
+        if (debugger.TryGetProperty("maxChildren", out var max)
+            && max.ValueKind == JsonValueKind.Number
+            && max.TryGetInt32(out var count) && count > 0)
+        {
+            updated.MaxChildren = count;
+        }
+
+        if (DebuggerViewOptions.Describe(current, updated).Count == 0)
+            return;
+
+        DebuggerViewOptions.Current = updated;
+        DebugSessionManager.GetSession()?.ApplyViewOptions(updated);
     }
 
     /// <summary>

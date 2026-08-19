@@ -21,8 +21,10 @@ internal sealed partial class ResourcesLanguage : IConfiguredStringLanguage
 
     public ImmutableArray<string> StringSyntaxIdentifiers { get; } = [SyntaxIdentifier];
 
-    public string? Detect(SyntaxToken token, SemanticModel semanticModel, CancellationToken ct) =>
-        ResourceKeySearch.IsKeyLiteral(Settings, semanticModel, token, ct) ? SyntaxIdentifier : null;
+    public Task<string?> DetectAsync(
+        Document document, SyntaxToken token, SemanticModel semanticModel, CancellationToken ct) =>
+        Task.FromResult(
+            ResourceKeySearch.IsKeyLiteral(Settings, semanticModel, token, ct) ? SyntaxIdentifier : null);
 
     /// <summary>
     /// The key under the caret and the families it could be read from, or null when the literal

@@ -31,8 +31,18 @@ internal readonly record struct DataBindingSegment(TextSpan Span, string Name, I
 /// </remarks>
 internal static class DataBindingService
 {
-    /// <summary>The methods whose one string argument is a data field path.</summary>
+    /// <summary>The page methods whose first argument is a data field path.</summary>
     private static readonly string[] s_bindingMethods = ["Eval", "Bind", "XPath"];
+
+    /// <summary>
+    /// The <c>DataBinder</c> methods whose <em>second</em> argument is a data field path, the
+    /// first being the item to read it from — <c>DataBinder.Eval(Container.DataItem, "Name")</c>.
+    /// </summary>
+    /// <remarks>
+    /// The long-hand of <c>Eval("Name")</c>, and the only form available outside a data-binding
+    /// context, which is why generated and hand-written markup alike is full of it.
+    /// </remarks>
+    private static readonly string[] s_binderMethods = ["Eval", "GetPropertyValue"];
 
     /// <summary>
     /// The span of the binding literal's content when <paramref name="offset"/> is inside one.
@@ -83,26 +93,115 @@ internal static class DataBindingService
         }
     }
 
-    /// <summary>Whether the quote at <paramref name="quote"/> opens the argument of a binding
-    /// call — <c>Eval(</c>, <c>Bind(</c> or <c>XPath(</c> immediately to its left.</summary>
+    /// <summary>
+    /// Whether the quote at <paramref name="quote"/> opens a data field path: the first argument
+    /// of <c>Eval</c>, <c>Bind</c> or <c>XPath</c>, or the second of <c>DataBinder.Eval</c>.
+    /// </summary>
+    /// <remarks>
+    /// The argument's position is part of the question, not a detail. <c>Eval("Amount", "{0:c}")</c>
+    /// and <c>DataBinder.Eval(item, "Amount", "{0:c}")</c> both end in a format string, which is
+    /// not a path and must not be offered field completions or coloured as members.
+    /// </remarks>
     private static bool IsBindingCallBefore(string text, int quote)
     {
-        int j = quote - 1;
-        while (j >= 0 && char.IsWhiteSpace(text[j]))
-            j--;
-
-        if (j < 0 || text[j] != '(')
+        if (!TryReadCall(text, quote, out string name, out int argument, out bool qualified))
             return false;
 
-        j--;
-        while (j >= 0 && char.IsWhiteSpace(text[j]))
-            j--;
+        return argument switch
+        {
+            0 => Array.IndexOf(s_bindingMethods, name) >= 0,
+            // Only when written on a receiver: a page's own `Eval(item, "Name")` does not exist,
+            // whereas an unqualified two-argument call is somebody else's method.
+            1 => qualified && Array.IndexOf(s_binderMethods, name) >= 0,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// The call the quote at <paramref name="quote"/> is an argument of: the method's
+    /// <paramref name="name"/>, the zero-based <paramref name="argument"/> position the quote sits
+    /// at, and whether the name was written on a receiver — <c>DataBinder.Eval</c> rather than
+    /// <c>Eval</c>.
+    /// </summary>
+    /// <remarks>
+    /// A backward scan, because that is what the caret cases need: the text to the right of a
+    /// literal being typed does not exist yet. Nested brackets are counted so that only the
+    /// commas of this argument list are commas, and a string met on the way back is stepped over
+    /// whole, so that a comma or a bracket inside one is not read as punctuation.
+    /// </remarks>
+    /// <returns>False when the quote is not an argument at all — the value of an attribute, a
+    /// string in an expression that is not a call.</returns>
+    private static bool TryReadCall(
+        string text, int quote, out string name, out int argument, out bool qualified)
+    {
+        name = "";
+        argument = 0;
+        qualified = false;
+
+        int depth = 0;
+        int i = quote - 1;
+
+        for (; i >= 0; i--)
+        {
+            switch (text[i])
+            {
+                case ')' or ']':
+                    depth++;
+                    break;
+
+                case '(' or '[' when depth > 0:
+                    depth--;
+                    break;
+
+                // The opening bracket of the argument list the quote is in.
+                case '(':
+                    goto found;
+
+                case '[':
+                    return false;
+
+                case ',' when depth == 0:
+                    argument++;
+                    break;
+
+                case '"' or '\'':
+                    int opening = text.LastIndexOf(text[i], i - 1);
+                    if (opening < 0)
+                        return false;
+                    i = opening;
+                    break;
+
+                // The line is the bound, the way it is for the caret walk in ArgumentAt: a call
+                // spelled across two lines is rare, and without a bound every quote in the file
+                // would scan back to its start.
+                case '\n' or '\r':
+                    return false;
+            }
+        }
+
+        return false;
+
+    found:
+        int j = SkipWhitespaceBack(text, i - 1);
 
         int nameEnd = j + 1;
         while (j >= 0 && (char.IsLetterOrDigit(text[j]) || text[j] == '_'))
             j--;
 
-        return Array.IndexOf(s_bindingMethods, text[(j + 1)..nameEnd]) >= 0;
+        name = text[(j + 1)..nameEnd];
+
+        int receiver = SkipWhitespaceBack(text, j);
+        qualified = receiver >= 0 && text[receiver] == '.';
+
+        return name.Length > 0;
+    }
+
+    private static int SkipWhitespaceBack(string text, int index)
+    {
+        while (index >= 0 && char.IsWhiteSpace(text[index]))
+            index--;
+
+        return index;
     }
 
     /// <summary>

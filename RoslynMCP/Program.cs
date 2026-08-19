@@ -22,6 +22,19 @@ class Program
         if (await RoslynMCP.DevBuildRedirect.TryRunAsync(args) is { } redirected)
             return redirected;
 
+        // Schema mode: roslyn-sense --config-schema [path]
+        // Prints (or writes) the JSON Schema for roslynsense.json. The extension ships a copy for
+        // editor validation and for its settings page; a test keeps that copy honest.
+        if (args.Length > 0 && args[0].Equals("--config-schema", StringComparison.OrdinalIgnoreCase))
+        {
+            string schema = ConfigSchema.GenerateText();
+            if (args.Length > 1)
+                File.WriteAllText(args[1], schema);
+            else
+                Console.Out.Write(schema);
+            return 0;
+        }
+
         // CLI mode: roslyn-sense --cli [tool] [options]
         // Runs a single tool and prints the result, without starting the MCP server.
         if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
@@ -53,12 +66,15 @@ class Program
 
         var startupWarnings = new List<string>();
 
-        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
+        var layeredConfig = RoslynSenseConfigLoader.LoadLayers(Directory.GetCurrentDirectory());
+        var (config, configPath, configError) =
+            (layeredConfig.Config, layeredConfig.PrimaryPath, layeredConfig.LoadError);
         if (configError is not null)
-            startupWarnings.Add($"roslynsense.json ({configPath}): {configError}");
+            startupWarnings.Add(configError);
 
         var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
         startupWarnings.AddRange(settingsWarnings);
+        DebuggerViewOptions.Current = settings.DebugView;
 
         IReadOnlyList<IDbProvider> dbProviders;
         IReadOnlyList<AutoConnectionStringDiscovery.DiscoveryWarning> autoDbWarnings = Array.Empty<AutoConnectionStringDiscovery.DiscoveryWarning>();
@@ -195,7 +211,14 @@ class Program
         {
             var logger = host.Services.GetRequiredService<ILoggerFactory>()
                 .CreateLogger("RoslynMCP.Startup");
-            logger.LogInformation("Loaded roslynsense.json from {Path}", configPath);
+
+            // Every layer, weakest first — which is the order they were merged in, so a value that
+            // is not what the file next to the solution says has its explanation on this one line.
+            logger.LogInformation(
+                "Loaded roslynsense.json from {Path}",
+                string.Join(
+                    " < ",
+                    layeredConfig.Present.Select(layer => $"{layer.FilePath} [{layer.Scope}]")));
         }
 
         // Shared-host mode: the daemon watches roslynsense.json itself and applies changes live.

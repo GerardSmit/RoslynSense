@@ -45,6 +45,55 @@ public class ShadowCopyRebuildTests
         Assert.True(await fixture.SawChangeAsync());
     }
 
+    [Fact]
+    public void ShadowCopyingAMissingDirectoryDoesNotThrow()
+    {
+        // The never-built generator: the analyzer reference resolves into a bin directory no
+        // build has created. Registering it used to throw DirectoryNotFoundException out of the
+        // post-open rebind and fail the whole load.
+        using var manager = new ShadowCopyManager(cleanupStaleInstances: false);
+        string missingDir = Path.Combine(
+            Path.GetTempPath(), $"roslyn-sense-neverbuilt-{Guid.NewGuid():N}",
+            "bin", "Debug", "netstandard2.0");
+
+        string loadPath = manager.GetLoadPath(Path.Combine(missingDir, "Generator.dll"));
+
+        Assert.EndsWith("Generator.dll", loadPath);
+    }
+
+    [Fact]
+    public async Task BuildingANeverBuiltGeneratorForTheFirstTimeIsARebuild()
+    {
+        // Arm the watcher while the source directory does not exist, then let the "build" create
+        // it. Without the pending-watcher fallback nothing observes the first build, and the
+        // workspace stays wrong for the whole session.
+        string root = Path.Combine(Path.GetTempPath(), $"roslyn-sense-firstbuild-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        string sourceDir = Path.Combine(root, "bin", "Debug", "netstandard2.0");
+
+        using var manager = new ShadowCopyManager(cleanupStaleInstances: false);
+        var changed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.AnalyzerDirectoryChanged += dir =>
+        {
+            if (string.Equals(dir, sourceDir, StringComparison.OrdinalIgnoreCase))
+                changed.TrySetResult(dir);
+        };
+
+        manager.GetLoadPath(Path.Combine(sourceDir, "Generator.dll"));
+
+        Directory.CreateDirectory(sourceDir);
+        await File.WriteAllBytesAsync(Path.Combine(sourceDir, "Generator.dll"), [1, 2, 3, 4]);
+
+        // Generous versus the manager's one-second quiet period: a miss here means the signal
+        // never fires, not that it is late.
+        bool sawChange =
+            await Task.WhenAny(changed.Task, Task.Delay(TimeSpan.FromSeconds(15))) == changed.Task;
+        Assert.True(sawChange);
+
+        try { Directory.Delete(root, recursive: true); }
+        catch { /* best effort */ }
+    }
+
     /// <summary>A temp directory shadow-copied and watched, with the change signal captured.</summary>
     private sealed class WatchedAnalyzerDirectory : IAsyncDisposable
     {

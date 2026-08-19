@@ -47,6 +47,19 @@ namespace System.Web.UI
         public Type ContainerType { get; }
     }
 
+    /// <summary>The reflection-based binder every `<%# DataBinder.Eval(…) %>` in real markup goes
+    /// through.</summary>
+    public static class DataBinder
+    {
+        public static object? Eval(object container, string expression) => null;
+
+        public static string Eval(object container, string expression, string format) => "";
+
+        public static object? GetPropertyValue(object container, string propName) => null;
+
+        public static string GetPropertyValue(object container, string propName, string format) => "";
+    }
+
     public class Control
     {
         public string ID { get; set; } = "";

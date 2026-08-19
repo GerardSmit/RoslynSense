@@ -27,7 +27,7 @@ internal sealed partial class MsBuildLanguage : ILanguageCodeActionProvider
 internal sealed partial class MsBuildLanguage : ILanguageHoverProvider
 {
     public Task<Hover?> HoverAsync(TextDocumentPositionParams p, CancellationToken ct) =>
-        Task.FromResult(MsBuildHoverHandler.Compute(p));
+        MsBuildHoverHandler.ComputeAsync(p, ct);
 }
 
 /// <summary>F12 to where a version is really set, or to the file an Import names.</summary>

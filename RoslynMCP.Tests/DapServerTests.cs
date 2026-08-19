@@ -486,14 +486,78 @@ public class DapServerTests
     }
 
     [Fact]
-    public async Task DisconnectStopsTheBackendAndEndsTheSession()
+    public async Task DisconnectKillsADebuggeeThisSessionStarted()
     {
         var backend = new FakeBackend();
 
-        var messages = await ConverseAsync(backend, [Request(1, "disconnect")]);
+        var messages = await ConverseAsync(backend, [
+            Request(1, "disconnect", new JsonObject { ["terminateDebuggee"] = true }),
+        ]);
 
         Assert.True(backend.Stopped);
         Assert.Contains(messages, m => m["event"]?.GetValue<string>() == "terminated");
+    }
+
+    /// <summary>
+    /// Disconnecting from a process that was only being inspected must leave it running — killing
+    /// an attached IIS Express or w3wp worker takes the site down with the debug session.
+    /// </summary>
+    [Fact]
+    public async Task DisconnectLeavesAnAttachedProcessRunning()
+    {
+        var backend = new FakeBackend();
+
+        var messages = await ConverseAsync(backend, [
+            Request(1, "attach", new JsonObject { ["processId"] = 4242 }),
+            Request(2, "disconnect"),
+        ]);
+
+        Assert.True(backend.Detached);
+        Assert.False(backend.Stopped);
+        Assert.Contains(messages, m => m["event"]?.GetValue<string>() == "terminated");
+    }
+
+    /// <summary>
+    /// The stop button must not read as a crash to the debuggee: it is asked to shut down, so
+    /// hosted services get their StopAsync, rather than being killed where it stands.
+    /// </summary>
+    [Fact]
+    public async Task TerminateAsksTheDebuggeeToShutDownRatherThanKillingIt()
+    {
+        var backend = new FakeBackend();
+
+        var messages = await ConverseUntilAsync(
+            backend,
+            [Request(1, "terminate")],
+            m => m.Any(x => x["event"]?.GetValue<string>() == "terminated"));
+
+        Assert.True(backend.ShutdownRequested);
+        Assert.False(backend.Stopped);
+
+        var response = messages.Single(m => m["command"]?.GetValue<string>() == "terminate");
+        Assert.True(response["success"]!.GetValue<bool>());
+    }
+
+    /// <summary>
+    /// A debuggee that will not go still has to die: the editor's second stop press arrives as a
+    /// disconnect, and it must not wait behind the shutdown it is overriding.
+    /// </summary>
+    [Fact]
+    public async Task DisconnectDuringAShutdownKillsTheDebuggee()
+    {
+        var backend = new FakeBackend { ShutdownDelay = TimeSpan.FromSeconds(5) };
+
+        await ConverseUntilAsync(
+            backend,
+            [
+                Request(1, "terminate"),
+                Request(2, "disconnect", new JsonObject { ["terminateDebuggee"] = true }),
+            ],
+            _ => backend.Stopped);
+
+        // Killed while the shutdown it overrode is still running, rather than queued behind it.
+        Assert.True(backend.Stopped);
+        Assert.True(backend.ShutdownRequested);
     }
 
     // --- Harness ---
@@ -692,6 +756,11 @@ public class DapServerTests
         public string? LastLogMessage;
         public string? LastCondition;
         public bool Stopped;
+        public bool Detached;
+        public bool ShutdownRequested;
+
+        /// <summary>How long the debuggee takes to shut itself down, for the force path.</summary>
+        public TimeSpan ShutdownDelay = TimeSpan.Zero;
 
         /// <summary>Every breakpoint call in order, as the line set or 0 for a removal.</summary>
         public readonly List<int> BreakpointCalls = [];
@@ -802,8 +871,20 @@ public class DapServerTests
         public Task<IReadOnlyList<ModuleInfo>> GetModulesAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<ModuleInfo>>([]);
 
-        public Task<string> DetachAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult("detached");
+        public Task<string> DetachAsync(CancellationToken cancellationToken = default)
+        {
+            Detached = true;
+            return Task.FromResult("detached");
+        }
+
+        public async Task<(bool Graceful, string Message)> ShutdownAsync(
+            TimeSpan timeout, CancellationToken cancellationToken = default)
+        {
+            ShutdownRequested = true;
+            if (ShutdownDelay > TimeSpan.Zero)
+                await Task.Delay(ShutdownDelay, CancellationToken.None);
+            return (true, "Debug session stopped; the debuggee shut down cleanly.");
+        }
 
         public string GetStatus() => "status";
 

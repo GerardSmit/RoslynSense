@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import { State } from 'vscode-languageclient/node';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { onClientReady } from './clientReady';
+import { composite, restore, snapshot, UndoStack } from './solutionUndo';
+import type { Snapshot, UndoStep } from './solutionUndo';
 
 /**
  * Solution Explorer: the solution's *logical* structure, the way Visual Studio and Rider show
@@ -220,6 +222,15 @@ export function registerSolutionExplorer(
                     arguments: [item.resourceUri],
                 };
             }
+            // A reference row is a pointer to a project that is already in the tree, so clicking
+            // it goes there instead of opening the .csproj or expanding a second copy of it.
+            if (node.kind === 'projectRef' && node.resourceUri) {
+                item.command = {
+                    command: 'roslynSense.solutionExplorer.goToProject',
+                    title: 'Go to Project',
+                    arguments: [node],
+                };
+            }
             if (node.kind === 'generatedFile' && node.resourceUri) {
                 // Generated output has no file to open; it is fetched from the compilation.
                 item.command = {
@@ -312,6 +323,13 @@ export function registerSolutionExplorer(
     onClientReady(context, getClient, (client) => {
         refresh();
 
+        // Which projects are loaded is drawn on the rows, and the server loads them in the
+        // background — so without this the tree keeps saying "loading…" over a solution that
+        // finished loading a minute ago, until somebody presses refresh.
+        context.subscriptions.push(
+            client.onNotification('roslynSense/projectSetChanged', () => refresh())
+        );
+
         // And again on every transition into Running. Binding to another solution, or a restart,
         // puts the client through Starting — during which fetchChildren has nothing to ask and
         // answers empty. Without this the view stays empty until the user touches it.
@@ -357,17 +375,30 @@ export function registerSolutionExplorer(
 
     /// Runs one tree edit and applies whatever namespace fixups it implies. The edits come back
     /// rather than being written server-side so an open, unsaved file is changed in its buffer.
-    async function edit(params: Record<string, unknown>): Promise<TreeEditResult | undefined> {
+    ///
+    /// Also where undo is recorded, rather than at each of the fifteen commands that call it: the
+    /// inverse of an edit is a property of the edit, and a command that has to remember to record
+    /// its own is a command that will one day forget. `record: false` is for the replays undo and
+    /// redo perform, which must not push history of their own.
+    async function edit(
+        params: Record<string, unknown>,
+        options: { record?: boolean; quiet?: boolean } = {}
+    ): Promise<TreeEditResult | undefined> {
         const client = getClient();
         if (!client) {
             return undefined;
         }
 
+        // Before the edit runs: what "delete" undoes to is gone by the time it returns.
+        const plan = options.record === false ? undefined : await planUndo(params);
+
         const result = await client.sendRequest<TreeEditResult>(
             'roslynSense/solutionTreeEdit', params);
 
         if (!result.ok) {
-            void vscode.window.showErrorMessage(result.message);
+            if (!options.quiet) {
+                void vscode.window.showErrorMessage(result.message);
+            }
             return result;
         }
 
@@ -375,8 +406,236 @@ export function registerSolutionExplorer(
             await vscode.workspace.applyEdit(
                 await client.protocol2CodeConverter.asWorkspaceEdit(result.edit));
         }
+
+        const step = plan?.(result);
+        if (step) {
+            remember(step);
+        }
         return result;
     }
+
+    /// One NuGet operation, with the progress notification the NuGet view shows for the same
+    /// work. Returns whether it succeeded, because an undo step must not be recorded for a
+    /// removal that did not happen.
+    async function nuget(
+        method: 'install' | 'uninstall',
+        entry: { id: string; version?: string; project: string },
+        title: string
+    ): Promise<boolean> {
+        const client = getClient();
+        if (!client) {
+            return false;
+        }
+
+        const result = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title },
+            () =>
+                client.sendRequest<{ success: boolean; message: string }>(
+                    `roslynSense/nuget/${method}`,
+                    { id: entry.id, version: entry.version, projectPaths: [entry.project] }
+                )
+        );
+
+        if (!result?.success) {
+            void vscode.window.showErrorMessage(result?.message ?? `Could not ${method} ${entry.id}.`);
+            return false;
+        }
+        return true;
+    }
+
+    /// An edit replayed by undo or redo: no history of its own, and a failure raised rather than
+    /// shown, so the undo command reports "could not undo" instead of claiming it undid something
+    /// it did not. Silent at the edit layer for the same reason — one failure, one message.
+    async function replay(params: Record<string, unknown>): Promise<void> {
+        const result = await edit(params, { record: false, quiet: true });
+        if (!result?.ok) {
+            throw new Error(result?.message ?? 'the server did not apply the change');
+        }
+    }
+
+    /// A replay whose failure is not a failure of the undo. Putting a restored file back in its
+    /// project is the case: under an SDK-style glob the item is already there, and the edit
+    /// declining is the correct outcome rather than a reason to tell the user undo broke.
+    async function replayIfPossible(params: Record<string, unknown>): Promise<void> {
+        await edit(params, { record: false, quiet: true });
+    }
+
+    // ---- Undo ------------------------------------------------------------------------------
+
+    const history = new UndoStack();
+
+    /// Steps recorded while a batch is open, so a multi-select delete is one Ctrl+Z rather than
+    /// four. Null when nothing is batching, which is the case for a single command.
+    let batch: UndoStep[] | null = null;
+
+    function remember(step: UndoStep): void {
+        if (batch) {
+            batch.push(step);
+        } else {
+            history.push(step);
+        }
+    }
+
+    /// Everything the callback edits becomes one undo step. A nested batch joins the outer one, so
+    /// a command calling another command's helper cannot split its own step in two.
+    async function asOneStep<T>(label: string, run: () => Promise<T>): Promise<T> {
+        if (batch) {
+            return run();
+        }
+
+        const collected: UndoStep[] = [];
+        batch = collected;
+        try {
+            return await run();
+        } finally {
+            batch = null;
+            if (collected.length === 1) {
+                history.push(collected[0]);
+            } else if (collected.length > 1) {
+                history.push(composite(label, collected));
+            }
+        }
+    }
+
+    /**
+     * The inverse of an edit, decided before it runs.
+     *
+     * Returns a function rather than a step because half of these need the result — an added file
+     * is undone by deleting the path the server chose for it, which nothing knows until it
+     * answers. Returning undefined means "not undoable", and that is a deliberate answer for every
+     * action whose inverse would be approximate: undoing an edit into something *close to* the
+     * previous state is worse than not offering to undo it at all, because the difference does not
+     * show up until much later.
+     */
+    async function planUndo(
+        params: Record<string, unknown>
+    ): Promise<((result: TreeEditResult) => UndoStep | undefined) | undefined> {
+        const action = params.action as string;
+        const uri = params.targetUri as string | undefined;
+
+        const opposites: Record<string, string> = {
+            addProjectReference: 'removeProjectReference',
+            removeProjectReference: 'addProjectReference',
+            excludeFile: 'includeExistingFile',
+            includeExistingFile: 'excludeFile',
+        };
+
+        // Symmetric pairs: each is exactly the other's inverse, arguments and all.
+        if (opposites[action]) {
+            const label = describeEdit(action, params);
+            return () => ({
+                label,
+                undo: async () => {
+                    await replay({ ...params, action: opposites[action] });
+                },
+                redo: async () => {
+                    await replay(params);
+                },
+            });
+        }
+
+        switch (action) {
+            // Something new on disk. Undoing it captures what it holds first — a file created an
+            // hour ago and typed into since is not the empty file the template wrote.
+            case 'addFile':
+            case 'addFolder':
+            case 'copy':
+                return (result) =>
+                    result.uri
+                        ? removalStep(describeEdit(action, params), vscode.Uri.parse(result.uri))
+                        : undefined;
+
+            // A rename replayed backwards is a rename, which matters: it re-runs the type and
+            // namespace fixups in reverse rather than leaving the file called one thing and the
+            // class inside it called another.
+            case 'rename':
+                return (result) =>
+                    uri && result.uri
+                        ? {
+                              label: `Rename ${basenameOfUri(uri)}`,
+                              undo: async () => {
+                                  await replay({
+                                      action: 'rename',
+                                      targetUri: result.uri,
+                                      name: basenameOfUri(uri),
+                                  });
+                              },
+                              redo: async () => {
+                                  await replay(params);
+                              },
+                          }
+                        : undefined;
+
+            case 'move':
+                return (result) =>
+                    uri && result.uri
+                        ? {
+                              label: `Move ${basenameOfUri(uri)}`,
+                              undo: async () => {
+                                  await replay({
+                                      action: 'move',
+                                      targetUri: result.uri,
+                                      destinationUri: parentUriOf(uri),
+                                  });
+                              },
+                              redo: async () => {
+                                  await replay(params);
+                              },
+                          }
+                        : undefined;
+
+            case 'delete': {
+                if (!uri) {
+                    return undefined;
+                }
+                const captured = await snapshot(vscode.Uri.parse(uri));
+                if (!captured) {
+                    // Missing, or larger than the snapshot budget. No step at all rather than one
+                    // that would restore an empty file over whatever used to be there.
+                    return undefined;
+                }
+                return () => ({
+                    label: `Delete ${basenameOfUri(uri)}`,
+                    undo: async () => {
+                        await restore(captured);
+                        // Back on disk is not back in the project: an .aspx or a .resx is listed
+                        // explicitly, and a project that lost its item keeps compiling without it.
+                        await replayIfPossible({ action: 'includeExistingFile', targetUri: uri });
+                    },
+                    redo: async () => {
+                        await replay(params);
+                    },
+                });
+            }
+
+            default:
+                return undefined;
+        }
+    }
+
+    /// Undo for something that was created: capture it, delete it, and put the capture back on
+    /// redo. The capture is taken at undo time rather than at creation time, so whatever was typed
+    /// into the file in between survives the round trip.
+    function removalStep(label: string, target: vscode.Uri): UndoStep {
+        let captured: Snapshot | undefined;
+        return {
+            label,
+            undo: async () => {
+                captured = await snapshot(target);
+                await replay({ action: 'delete', targetUri: target.toString() });
+            },
+            redo: async () => {
+                if (captured) {
+                    await restore(captured);
+                    await replayIfPossible({
+                        action: 'includeExistingFile',
+                        targetUri: target.toString(),
+                    });
+                }
+            },
+        };
+    }
+
 
     /**
      * What a drop from inside the tree means, decided by what was picked up and what it landed on.
@@ -525,24 +784,30 @@ export function registerSolutionExplorer(
     /// Expands each ancestor the server names, then selects the file. Without this, revealing
     /// only works for a file whose branch the user already happened to expand.
     async function revealUri(uri: vscode.Uri): Promise<boolean> {
+        const chain = await revealChain(uri);
+        return chain.length > 0 && walkAndReveal(chain);
+    }
+
+    /// The ids from the solution root down to what the uri names, or empty when the server
+    /// cannot place it. Separate from the walk so a caller can cut the chain short — going to a
+    /// project wants the rows above it expanded and nothing below it.
+    async function revealChain(uri: vscode.Uri): Promise<string[]> {
         const client = getClient();
         if (!client) {
-            return false;
+            return [];
         }
 
-        let chain: string[];
         try {
             const result = await client.sendRequest<{ path: string[] }>(
                 'roslynSense/solutionTreeReveal',
                 { uri: uri.toString(), fileNesting: state.fileNesting });
-            chain = result?.path ?? [];
+            return result?.path ?? [];
         } catch {
-            return false;
+            return [];
         }
-        if (chain.length === 0) {
-            return false;
-        }
+    }
 
+    async function walkAndReveal(chain: string[]): Promise<boolean> {
         // Walk the chain listing each level, so `parentById` knows who listed every node on the
         // way down. A cached node whose parent is unrecorded — or recorded as somebody else, which
         // happens for a project reference listed under two projects — is re-fetched rather than
@@ -582,6 +847,21 @@ export function registerSolutionExplorer(
             return false;
         }
         return true;
+    }
+
+    /**
+     * Puts the tree on a project's own row — where "go to" from a reference lands.
+     *
+     * Built on the same server-supplied chain as revealUri and then cut short at the project,
+     * rather than asking for a second kind of chain: the walk below the project is what expands
+     * folders, and a project row wants none of that. The .csproj is what the chain is asked
+     * about because the reveal request answers about files, and a project file is the one file
+     * that is always inside exactly the project it belongs to.
+     */
+    async function revealProject(projectPath: string): Promise<boolean> {
+        const chain = await revealChain(vscode.Uri.file(projectPath));
+        const stop = chain.findIndex((id) => id.startsWith('project:'));
+        return stop < 0 ? false : walkAndReveal(chain.slice(0, stop + 1));
     }
 
     /** Puts the tree on the file being edited, if the solution has anywhere to put it. */
@@ -693,6 +973,43 @@ export function registerSolutionExplorer(
 
     context.subscriptions.push(
         vscode.commands.registerCommand('roslynSense.solutionExplorer.refresh', refresh),
+
+        // Bound to Ctrl+Z / Ctrl+Y only while this view has focus — see the keybindings in
+        // package.json. Scoped that way because the editor's own undo means something else
+        // entirely, and stealing the chord from a focused editor would be indefensible.
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.undo', async () => {
+            if (!history.canUndo) {
+                void vscode.window.showInformationMessage('Nothing to undo in the Solution Explorer.');
+                return;
+            }
+            try {
+                const label = await history.undo();
+                refresh();
+                void vscode.window.setStatusBarMessage(`Undid: ${label}`, 3000);
+            } catch (error) {
+                void vscode.window.showErrorMessage(
+                    `Could not undo: ${error instanceof Error ? error.message : String(error)}`
+                );
+                refresh();
+            }
+        }),
+
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.redo', async () => {
+            if (!history.canRedo) {
+                void vscode.window.showInformationMessage('Nothing to redo in the Solution Explorer.');
+                return;
+            }
+            try {
+                const label = await history.redo();
+                refresh();
+                void vscode.window.setStatusBarMessage(`Redid: ${label}`, 3000);
+            } catch (error) {
+                void vscode.window.showErrorMessage(
+                    `Could not redo: ${error instanceof Error ? error.message : String(error)}`
+                );
+                refresh();
+            }
+        }),
 
         vscode.commands.registerCommand('roslynSense.solutionExplorer.showAllFiles', () =>
             setToggle('showAllFiles', true)
@@ -1133,6 +1450,7 @@ export function registerSolutionExplorer(
                 }
 
                 const solutionUri = solutionUriOf();
+                await asOneStep(`Delete ${targets.length} items`, async () => {
                 for (const target of targets) {
                     if (target.id.startsWith('slnfolder:')) {
                         await edit({
@@ -1157,6 +1475,7 @@ export function registerSolutionExplorer(
                         await edit({ action: 'delete', targetUri: target.resourceUri });
                     }
                 }
+                });
                 refresh();
             }
         ),
@@ -1212,27 +1531,129 @@ export function registerSolutionExplorer(
         onNode(
             'roslynSense.solutionExplorer.excludeFile',
             async (_node, selected) => {
-                for (const uri of urisOf(selected)) {
-                    await edit({ action: 'excludeFile', targetUri: uri });
-                }
+                const uris = urisOf(selected);
+                await asOneStep(`Exclude ${uris.length} files`, async () => {
+                    for (const uri of uris) {
+                        await edit({ action: 'excludeFile', targetUri: uri });
+                    }
+                });
                 refresh(parentOf(selected[0]));
             }
         ),
         onNode(
             'roslynSense.solutionExplorer.removeReference',
-            async (node) => {
-                // A reference node is "project:<path>" under a "group:projects|<owner>" parent,
-                // so the owner comes from the parent rather than from the node itself.
-                const owner = projectPathOf(parentOf(node));
-                if (!owner || !node.resourceUri) {
+            async (_node, selected) => {
+                const references = selected
+                    .map((node) => ({
+                        node,
+                        // The id names the owner; parentOf is the fallback for a row that arrived
+                        // without a recorded parent, such as one picked out of the filter results.
+                        owner: referenceOwnerOf(node.id) ?? projectPathOf(parentOf(node)),
+                    }))
+                    .filter((entry) => entry.owner && entry.node.resourceUri);
+                if (references.length === 0) {
                     return;
                 }
-                await edit({
-                    action: 'removeProjectReference',
-                    projectPath: owner,
-                    destinationUri: node.resourceUri,
+
+                const first = references[0];
+                const confirmed = await vscode.window.showWarningMessage(
+                    references.length === 1
+                        ? `Remove the reference to ${first.node.label} from ${nameOf(first.owner!)}?`
+                        : `Remove ${references.length} project references?`,
+                    { modal: true },
+                    'Remove'
+                );
+                if (confirmed !== 'Remove') {
+                    return;
+                }
+
+                await asOneStep(`Remove ${references.length} project references`, async () => {
+                    for (const entry of references) {
+                        await edit({
+                            action: 'removeProjectReference',
+                            projectPath: entry.owner,
+                            destinationUri: entry.node.resourceUri,
+                        });
+                    }
                 });
                 refresh();
+            }
+        ),
+        // Removing a package is NuGet's own operation rather than a project-file edit, so it goes
+        // through the same server request the NuGet view uses — that is what keeps the restore,
+        // the lock file and Central Package Management moving with it.
+        onNode('roslynSense.solutionExplorer.removePackage', async (_node, selected) => {
+            const client = getClient();
+            const packages = selected
+                .filter((node) => node.kind === 'package' && projectPathOf(node))
+                .map((node) => ({
+                    id: node.label,
+                    // The row already carries the version — "13.0.3", or "13.0.3 (central)" under
+                    // Central Package Management — and it is what undo has to put back.
+                    version: node.description?.split(' ')[0],
+                    project: projectPathOf(node)!,
+                }));
+            if (!client || packages.length === 0) {
+                return;
+            }
+
+            const confirmed = await vscode.window.showWarningMessage(
+                packages.length === 1
+                    ? `Remove ${packages[0].id} from ${nameOf(packages[0].project)}?`
+                    : `Remove ${packages.length} packages?`,
+                { modal: true },
+                'Remove'
+            );
+            if (confirmed !== 'Remove') {
+                return;
+            }
+
+            await asOneStep(`Remove ${packages.length} packages`, async () => {
+                for (const entry of packages) {
+                    const removed = await nuget(
+                        'uninstall',
+                        { id: entry.id, project: entry.project },
+                        `Removing ${entry.id}…`
+                    );
+                    if (!removed) {
+                        continue;
+                    }
+
+                    // Undo puts the same version back, not "the latest" — restoring a package at a
+                    // different version than the one that was there is a different project, and it
+                    // is the kind of difference that only shows up at build time.
+                    remember({
+                        label: `Remove ${entry.id}`,
+                        undo: async () => {
+                            if (!(await nuget('install', entry, `Restoring ${entry.id}…`))) {
+                                throw new Error(`${entry.id} could not be restored`);
+                            }
+                        },
+                        redo: async () => {
+                            if (
+                                !(await nuget(
+                                    'uninstall',
+                                    { id: entry.id, project: entry.project },
+                                    `Removing ${entry.id}…`
+                                ))
+                            ) {
+                                throw new Error(`${entry.id} could not be removed again`);
+                            }
+                        },
+                    });
+                }
+            });
+            refresh();
+        }),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.goToProject',
+            async (node?: SolutionTreeNode) => {
+                const target = node && projectPathOf(node);
+                if (target && !(await revealProject(target))) {
+                    void vscode.window.showInformationMessage(
+                        `${Path.basename(target)} is not shown in this solution.`
+                    );
+                }
             }
         ),
         onNode('roslynSense.solutionExplorer.unloadProject', async (_node, selected) => {
@@ -1610,6 +2031,11 @@ function projectPathOf(node: SolutionTreeNode | undefined): string | undefined {
     if (node?.id.startsWith('project:')) {
         return node.id.slice('project:'.length);
     }
+    // A reference names two projects — "projectref:<owner>|<target>" — and the one it *is* is the
+    // target. The owner is what an edit to the reference needs; see referenceOwnerOf.
+    if (node?.id.startsWith('projectref:')) {
+        return node.id.slice('projectref:'.length).split('|')[1];
+    }
     // Dependencies and its groups are named "<projectPath>!deps" and "group:<projectPath>|...".
     if (node?.id.endsWith('!deps')) {
         return node.id.slice(0, -'!deps'.length);
@@ -1624,10 +2050,68 @@ function projectPathOf(node: SolutionTreeNode | undefined): string | undefined {
     return undefined;
 }
 
+/** The file name at the end of a uri — what an undo label calls the thing it acted on. */
+function basenameOfUri(uri: string): string {
+    return Path.basename(vscode.Uri.parse(uri).fsPath);
+}
+
+/** The directory holding what a uri names, as a uri — where "move it back" means. */
+function parentUriOf(uri: string): string {
+    return vscode.Uri.file(Path.dirname(vscode.Uri.parse(uri).fsPath)).toString();
+}
+
+/**
+ * What an edit is called in an undo notification. Says what happened, not which internal action
+ * ran: "Undid: addProjectReference" is a log line, not a message to a person.
+ */
+function describeEdit(action: string, params: Record<string, unknown>): string {
+    const target = params.targetUri as string | undefined;
+    const destination = params.destinationUri as string | undefined;
+    const name = (params.name as string | undefined) ?? (target && basenameOfUri(target));
+
+    switch (action) {
+        case 'addProjectReference':
+            return `Add reference to ${destination ? basenameOfUri(destination) : 'project'}`;
+        case 'removeProjectReference':
+            return `Remove reference to ${destination ? basenameOfUri(destination) : 'project'}`;
+        case 'excludeFile':
+            return `Exclude ${name ?? 'file'}`;
+        case 'includeExistingFile':
+            return `Include ${name ?? 'file'}`;
+        case 'addFile':
+            return `New file ${name ?? ''}`.trim();
+        case 'addFolder':
+            return `New folder ${name ?? ''}`.trim();
+        case 'copy':
+            return `Copy ${name ?? 'file'}`;
+        default:
+            return action;
+    }
+}
+
+/** A project path as it is written on its row: the file name without the .csproj. */
+function nameOf(projectPath: string): string {
+    return Path.basename(projectPath, Path.extname(projectPath));
+}
+
+/** The project that declares a reference, out of a "projectref:<owner>|<target>" id. */
+function referenceOwnerOf(id: string): string | undefined {
+    return id.startsWith('projectref:')
+        ? id.slice('projectref:'.length).split('|')[0]
+        : undefined;
+}
+
 function parentIdOf(id: string): string | undefined {
     const folder = solutionItemFolderOf(id);
     if (folder !== undefined) {
         return `slnfolder:${folder}`;
+    }
+    // Both halves of a reference id are paths, so the generic "everything before the last |"
+    // rule below would answer "projectref:<owner>" — a node that does not exist. Its parent is
+    // the Projects group of the project that declares it.
+    const owner = referenceOwnerOf(id);
+    if (owner !== undefined) {
+        return `group:projects|${owner}`;
     }
     const separator = id.lastIndexOf('|');
     return separator > 0 ? id.slice(0, separator) : undefined;
@@ -1854,7 +2338,15 @@ function iconFor(
         case 'project':
         case 'projectRunnable':
         case 'projectRef':
-            return languageIcon(node.resourceUri, extensionUri);
+            // Dimmed here does not mean unloaded-by-choice — that is the case below, with its own
+            // context value — it means the workspace has not loaded this project yet. Same icon
+            // for both because it says the same thing about the row: nothing in it can answer.
+            return node.dimmed
+                ? treeIcon(
+                    `${PROJECT_ICONS[extensionOf(node.resourceUri)] ?? 'project'}-dim`,
+                    extensionUri
+                )
+                : languageIcon(node.resourceUri, extensionUri);
         case 'projectUnloaded':
             // Nothing about an unloaded project is live, and a full-colour icon says otherwise.
             return treeIcon(

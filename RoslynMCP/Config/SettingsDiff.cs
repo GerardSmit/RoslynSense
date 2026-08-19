@@ -26,9 +26,12 @@ internal static class SettingsDiff
         Toggle("msbuild", old.MsBuild, @new.MsBuild);
         Toggle("dbml", old.Dbml, @new.Dbml);
         Toggle("appsettings", old.AppSettings, @new.AppSettings);
+        Toggle("webconfig", old.WebConfig, @new.WebConfig);
         Toggle("debugger", old.Debugger, @new.Debugger);
         Toggle("profiling", old.Profiling, @new.Profiling);
         Toggle("database", old.Database, @new.Database);
+
+        changes.AddRange(DebuggerViewOptions.Describe(old.DebugView, @new.DebugView));
 
         if (!string.Equals(old.TableFormat, @new.TableFormat, StringComparison.OrdinalIgnoreCase))
             changes.Add($"tableFormat: {old.TableFormat ?? "markdown"} → {@new.TableFormat ?? "markdown"}");
@@ -48,6 +51,9 @@ internal static class SettingsDiff
             changes.Add("database auto-discovery changed");
 
         DescribeConnections(old, @new, changes);
+
+        if (!old.WebConfigFiles.SequenceEqual(@new.WebConfigFiles, StringComparer.OrdinalIgnoreCase))
+            changes.Add("webconfig additional files changed");
 
         if (!SamePaths(old.Preload, @new.Preload))
             changes.Add("preload paths changed");

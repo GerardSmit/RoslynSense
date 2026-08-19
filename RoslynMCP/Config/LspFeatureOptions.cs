@@ -35,6 +35,19 @@ public static class LspFeatureOptions
             _ => "openProjects",
         };
 
+    /// <summary>
+    /// Load every project the solution lists as soon as an editor connects, instead of loading a
+    /// project the first time a file in it is touched.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes the solution-wide features answer about the whole solution rather than
+    /// about whatever happens to be open — Search Everywhere, workspace symbols, find-references
+    /// into a project nobody has visited. It costs one full MSBuild evaluation of the solution in
+    /// the background at start-up, and the memory to keep it; off restores the demand-driven
+    /// behaviour, which is the better trade only on a solution too large to hold at once.
+    /// </remarks>
+    public static bool LoadEntireSolution { get; set; } = EnvFlag("ROSLYNMCP_LOAD_ENTIRE_SOLUTION", true);
+
     /// <summary>Per-document time budget for an analyzer pass.</summary>
     public static TimeSpan AnalyzerTimeout { get; set; } =
         TimeSpan.FromSeconds(EnvInt("ROSLYNMCP_ANALYZER_TIMEOUT_SECONDS", 15));

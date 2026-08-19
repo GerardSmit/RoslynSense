@@ -502,4 +502,101 @@ internal static class SourceMemberLocator
             ? typeName
             : $"{type.ContainingNamespace.ToDisplayString()}.{typeName}";
     }
+
+    /// <summary>
+    /// Where a string literal is used inside decompiled output, preferring the method it was
+    /// compiled into.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// What this is for: a configuration read found in IL knows its key and the method around it,
+    /// and the decompiled file is the only source there will ever be for it. Landing on the type
+    /// declaration would make the reader hunt through a thousand-line class for the one line the
+    /// lens promised.
+    /// </para>
+    /// <para>
+    /// Matched through the syntax tree rather than by searching the text, so a key named in a
+    /// comment or spelled inside a longer string is not mistaken for the call. The method name
+    /// only ranks candidates: a decompiler may inline, rename, or lift a call into a nested
+    /// closure, and a literal in the right file is a better answer than the top of it.
+    /// </para>
+    /// </remarks>
+    /// <returns>The 0-based position of the literal, or null when the file does not contain it.</returns>
+    public static (int Line, int Character)? FindLiteral(
+        string sourceText, string literal, string? methodName, CancellationToken cancellationToken)
+    {
+        if (literal.Length == 0)
+            return null;
+
+        var tree = CSharpSyntaxTree.ParseText(sourceText, cancellationToken: cancellationToken);
+        var root = tree.GetRoot(cancellationToken);
+
+        LiteralExpressionSyntax? fallback = null;
+
+        foreach (var node in root.DescendantNodes())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (node is not LiteralExpressionSyntax
+                {
+                    RawKind: (int)SyntaxKind.StringLiteralExpression,
+                } candidate)
+            {
+                continue;
+            }
+
+            if (candidate.Token.ValueText != literal)
+                continue;
+
+            if (methodName is { Length: > 0 } && InMethod(candidate, methodName))
+                return Position(tree, candidate, cancellationToken);
+
+            fallback ??= candidate;
+        }
+
+        return fallback is null ? null : Position(tree, fallback, cancellationToken);
+    }
+
+    private static (int Line, int Character) Position(
+        SyntaxTree tree, SyntaxNode node, CancellationToken cancellationToken)
+    {
+        var line = tree.GetLineSpan(node.Span, cancellationToken).StartLinePosition;
+        return (line.Line, line.Character);
+    }
+
+    /// <summary>Whether a node sits inside a member of the given name, accessors and local
+    /// functions included — decompiled property accessors keep the property's name.</summary>
+    private static bool InMethod(SyntaxNode node, string methodName)
+    {
+        for (var current = node.Parent; current is not null; current = current.Parent)
+        {
+            string? name = current switch
+            {
+                MethodDeclarationSyntax method => method.Identifier.Text,
+                LocalFunctionStatementSyntax local => local.Identifier.Text,
+                ConstructorDeclarationSyntax constructor => constructor.Identifier.Text,
+                PropertyDeclarationSyntax property => property.Identifier.Text,
+                BaseTypeDeclarationSyntax => null,
+                _ => "",
+            };
+
+            if (name is null)
+                return false;
+
+            if (name.Length == 0)
+                continue;
+
+            if (string.Equals(name, methodName, StringComparison.Ordinal)
+                || string.Equals("get_" + name, methodName, StringComparison.Ordinal)
+                || string.Equals("set_" + name, methodName, StringComparison.Ordinal)
+                || string.Equals(".ctor", methodName, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        return false;
+    }
 }

@@ -1141,7 +1141,11 @@ public class Parser
         {
             offset++;
 
-            if (current.Type is TokenType.TagClose or TokenType.TagSlashClose)
+            // A tag opening inside this one's attribute list ends the search as surely as the
+            // close does: `<html <asp:Literal runat="server" />>` is a literal that writes the
+            // html element's attributes, and that runat is the literal's own.
+            if (current.Type is TokenType.TagClose or TokenType.TagSlashClose
+                or TokenType.TagOpen or TokenType.TagOpenSlash)
             {
                 break;
             }

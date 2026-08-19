@@ -42,6 +42,25 @@ public interface IDebugEngine : IDisposable
 
     Task<List<StackFrame>> StackTraceAsync();
     Task<List<DebugVariable>> VariablesAsync(uint frameIndex);
+
+    /// <summary>
+    /// The children of one value: an object's fields, an array's elements, or the members of the
+    /// debugger view its type asks to be shown through.
+    /// </summary>
+    /// <param name="path">The expression the value was reached by, taken from a variable's
+    /// <c>VariablesReference</c>. Empty lists the frame's own arguments and locals.</param>
+    Task<List<DebugVariable>> ExpandAsync(uint frameIndex, string path);
+
+    /// <summary>
+    /// Sets which <c>System.Diagnostics</c> debugger attributes the engine honours — display
+    /// strings, type proxies, browsable states, and Just My Code stepping.
+    /// </summary>
+    /// <remarks>
+    /// On the engine rather than on each call because it is a session-wide policy the user sets
+    /// once in configuration, and because a worker-hosted session has to be told separately: the
+    /// settings live in the host's process and the engine runs in another one.
+    /// </remarks>
+    void SetDisplayOptions(DebugDisplayOptions options);
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(
         uint frameIndex, string name, string value);
@@ -83,6 +102,17 @@ public interface IDebugEngine : IDisposable
 
     /// <summary>Whether first-chance exceptions stop. Unhandled ones always do.</summary>
     void SetExceptionPolicy(bool breakOnFirstChance);
+
+    /// <summary>
+    /// Ends the session by letting the debuggee shut itself down, terminating it only if that
+    /// runs past <paramref name="timeout"/>.
+    /// </summary>
+    /// <remarks>
+    /// The difference the caller is buying: <see cref="Terminate"/> kills the process outright,
+    /// so hosted services never see <c>StopAsync</c> and <c>finally</c> blocks never run. Only a
+    /// launched debuggee can be asked — an attached one should be detached from instead.
+    /// </remarks>
+    Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout);
 
     void Terminate();
 }

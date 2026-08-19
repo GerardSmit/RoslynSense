@@ -212,6 +212,13 @@ internal static class MsBuildContextResolver
                 PaddingFor(document.Text, offset));
         }
 
+        // A tag that is still being typed has no end tag yet, and the parser answers about the
+        // nearest one that does — the caret in `<PropertyGroup><LangVersion>|` is reported as
+        // whitespace inside the PropertyGroup. That is the state completion runs in on every
+        // keystroke, so the text is read directly rather than trusted to the tree.
+        if (whitespace && MsBuildMarkupScan.Scan(text, offset) is { } typed)
+            return Typed(text, element, path, typed, invalid);
+
         // Content, including the whitespace between two children. Whitespace is an affirmative
         // answer here, not a gap: an empty line inside a <PropertyGroup> is where the next property
         // is typed, and offering nothing there is the difference between the feature working and
@@ -225,6 +232,34 @@ internal static class MsBuildContextResolver
             flags, element, null, elementName, null, path,
             whitespace ? new TextSpan(offset, 0) : content,
             MsBuildPadding.None);
+    }
+
+    /// <summary>
+    /// The answer for a caret the parser could only place approximately.
+    /// </summary>
+    /// <remarks>
+    /// Two of them, and the difference is a newline. Content on the same line as the start tag is
+    /// the element's value — <c>&lt;LangVersion&gt;|</c> — and content on a later line is where a
+    /// child goes, which is what an unclosed <c>&lt;PropertyGroup&gt;</c> is. Both retarget the
+    /// element, because the one the parser named is the wrong one in exactly this state.
+    /// </remarks>
+    private static MsBuildContext Typed(
+        SourceText text, XmlElementBaseSyntax element, string parentPath, MsBuildMarkup typed, bool invalid)
+    {
+        var flags = MsBuildLocationFlags.Element
+                    | (typed.OnName ? MsBuildLocationFlags.Name : MsBuildLocationFlags.Value)
+                    | (typed.Whitespace ? MsBuildLocationFlags.Whitespace : 0)
+                    | (invalid ? MsBuildLocationFlags.Invalid : 0);
+
+        // On a name the element is the one being typed *into*, so the parser's answer is already
+        // the right one; on a value it is the tag the scan found.
+        string name = typed.OnName ? NameOf(element) : typed.Name;
+        string path = typed.OnName || typed.Name.Equals(NameOf(element), StringComparison.OrdinalIgnoreCase)
+            ? parentPath
+            : parentPath.Length > 0 ? parentPath + "/" + typed.Name : typed.Name;
+
+        return new MsBuildContext(
+            flags, element, null, name, null, path, typed.Span, MsBuildPadding.None);
     }
 
     /// <summary>Inclusive at both ends: a caret at either edge of a value is still in it.</summary>

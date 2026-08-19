@@ -36,19 +36,7 @@ internal sealed partial class AppSettingsLanguage : ISymbolFreeReferenceProvider
 
         // The key's declarations: the same path in every configuration file feeding this
         // project, base file first, secrets last.
-        if (project.FilePath is { Length: > 0 } projectPath)
-        {
-            foreach (string configFile in AppSettingsWorkspace.ConfigurationFilesFor(projectPath))
-            {
-                if (AppSettingsDocumentCache.Get(configFile) is { } document
-                    && document.Find(hit.Path) is { } key)
-                {
-                    locations.Add(new LspLocation(
-                        LspConverters.PathToUri(document.FilePath),
-                        LspConverters.ToRange(document.Text.Lines, key.NameSpan)));
-                }
-            }
-        }
+        locations.AddRange(AppSettingsReferenceService.Declarations(project.FilePath, hit.Path));
 
         foreach (var usage in index.UsagesFor(hit.Path))
         {

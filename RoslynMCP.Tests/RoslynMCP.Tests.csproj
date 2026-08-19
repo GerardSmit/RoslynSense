@@ -89,6 +89,13 @@
         <MSBuild Projects="Fixtures\AspxProject\AspxProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\SourceGenFixture\Consumer\Consumer.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\MultiSolution\ProjectB\ProjectB.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <!--
+          The two projects under one Directory.Build.props, for counting what a suppression written
+          there is hiding. Restore only: the count compiles them in-process, and a build would just
+          be the same compilation done twice.
+        -->
+        <MSBuild Projects="Fixtures\SuppressedWarnings\Alpha\Alpha.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\SuppressedWarnings\Beta\Beta.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\DebugTestProject\DebugTestProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\ProtoProject\ProtoProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
         <MSBuild Projects="Fixtures\ProtoNeverBuiltProject\ProtoNeverBuiltProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />

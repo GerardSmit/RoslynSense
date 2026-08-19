@@ -325,12 +325,39 @@ workflow, disable the Microsoft C# extension for the workspace (Extensions → C
   [Resources](#resources).
 - `roslynSense.trace.server` — LSP trace for debugging.
 
+These are VS Code settings: per window, synced by Settings Sync, and about this editor. Everything
+the *server* does — which language packs are on, which solutions preload, database connections —
+lives in `roslynsense.json` instead, because the daemon serves more than this window.
+
+### The settings page
+
+**RoslynSense: Settings** — from the command palette, or the `⋯` menu at the top of the Solution
+Explorer — opens a form over `roslynsense.json`, with a tab per scope:
+
+| Tab | File |
+| --- | --- |
+| Solution | `<solution>/roslynsense.json` — the team's settings, committed. |
+| Solution (personal) | `<solution>/roslynsense.local.json` — yours for this checkout. Gitignore it. |
+| Personal | `~/.roslynsense/projects/<mangled-path>/roslynsense.json` — the same, for a checkout you would rather not write into. |
+| Global | `~/.roslynsense/roslynsense.json` — every checkout on this machine. |
+
+They merge field by field, weakest first in that reverse order, so a nearer file overrides only the
+settings it names. Each row shows the value **in effect** with a chip naming the layer it came from
+— the one question a layered file cannot answer by being opened — and booleans are three-state
+(Default / On / Off), because unsetting a value is how you stop overriding a weaker layer.
+
+The form is generated from the schema the server emits, so new settings appear without the panel
+being taught about them, and the same schema is registered for `roslynsense.json` and
+`roslynsense.local.json` — hand-editing gets completion and validation too. Writes are surgical:
+comments, key order and indentation survive being touched from a form.
+
 ## Building the extension
 
 ```bash
 cd vscode-extension
 npm install
 npm run compile
+npm test          # node --test over the pure-TypeScript half
 npm run package   # produces the .vsix (requires @vscode/vsce)
 ```
 

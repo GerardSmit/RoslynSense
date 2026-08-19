@@ -26,6 +26,23 @@ internal sealed class DapServer
     /// <summary>Written by request handlers, read by the listen loop — different threads.</summary>
     private volatile bool _running = true;
 
+    /// <summary>
+    /// How long a debuggee gets to shut itself down before it is killed.
+    /// </summary>
+    /// <remarks>
+    /// Long enough for a host to drain its services (the generic host's own default shutdown
+    /// budget is 30 seconds, but one that needs all of it is hanging, not shutting down) and
+    /// short enough that a stop press does not look ignored.
+    /// </remarks>
+    private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>Set once the session is over, so the end is announced exactly once.</summary>
+    private int _ended;
+
+    /// <summary>Whether this adapter started the debuggee, as opposed to attaching to one that
+    /// was already running — which decides who owns its lifetime at disconnect.</summary>
+    private volatile bool _launched;
+
     /// <summary>The file the last <c>gotoTargets</c> asked about. DAP's <c>goto</c> carries only a
     /// target id, so the source has to be remembered from the request that produced it.</summary>
     private string? _gotoSource;
@@ -172,7 +189,10 @@ internal sealed class DapServer
                     _sessionStarted.TrySetResult();
                     await RespondAsync(message, null, ok, ok ? null : result);
                     if (ok)
+                    {
+                        _launched = true;
                         await ProcessEventAsync(arguments, startMethod: "launch");
+                    }
                     else
                         await EventAsync("terminated", null);
                     break;
@@ -539,13 +559,38 @@ internal sealed class DapServer
                     break;
                 }
 
-                case "disconnect":
                 case "terminate":
-                    _backend.Stop();
+                    // Answered before the shutdown starts, not after it: the editor gives this
+                    // request its own deadline and force-disconnects when it passes, and a clean
+                    // shutdown is exactly the case that takes seconds rather than milliseconds.
                     await RespondAsync(message, null);
-                    await EventAsync("terminated", null);
+                    _ = ShutdownAsync(ct);
+                    break;
+
+                case "disconnect":
+                {
+                    // Whether the debuggee dies with the session. The editor sets it explicitly
+                    // for Disconnect; when it says nothing, a process this adapter started is
+                    // ours to stop and one it merely attached to is not.
+                    bool terminateDebuggee = arguments?["terminateDebuggee"]?.GetValue<bool>()
+                        ?? _launched;
+
+                    if (terminateDebuggee)
+                    {
+                        // A disconnect that follows the terminate above is the editor's force
+                        // path — the debuggee has outstayed its welcome and is killed outright.
+                        _backend.Stop();
+                    }
+                    else
+                    {
+                        await _backend.DetachAsync(ct);
+                    }
+
+                    await RespondAsync(message, null);
+                    await EndSessionAsync();
                     _running = false;
                     break;
+                }
 
                 default:
                     await RespondAsync(message, null, false, $"Unsupported request '{command}'.");
@@ -786,10 +831,54 @@ internal sealed class DapServer
 
     /// <summary>The debuggee ended on its own — the site was stopped, or it crashed. Without this
     /// the editor keeps a debug session alive against a process that no longer exists.</summary>
+    /// <remarks>
+    /// Reported once per session, whoever gets there first: a clean shutdown ends the process,
+    /// which raises the engine's own exit notice, and both routes arrive here.
+    /// </remarks>
     private async Task EndSessionAsync()
     {
+        if (Interlocked.Exchange(ref _ended, 1) != 0)
+            return;
+
         await EventAsync("exited", new JsonObject { ["exitCode"] = 0 });
         await EventAsync("terminated", null);
+    }
+
+    /// <summary>
+    /// Stops the session the way the stop button means it: the debuggee is asked to shut itself
+    /// down, and killed only if it will not.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The difference this makes is everything a process does on its way out — hosted services'
+    /// <c>StopAsync</c>, <c>finally</c> blocks, flushed logs and closed connections. Terminating
+    /// the process, which is what stopping a session used to do, skips all of it.
+    /// </para>
+    /// <para>
+    /// The wait is bounded because a shutdown can hang on the very code being debugged. Pressing
+    /// stop again meanwhile sends <c>disconnect</c>, which kills the process without waiting for
+    /// this — the editor's own escalation, and the reason the timeout can afford to be generous.
+    /// </para>
+    /// </remarks>
+    private async Task ShutdownAsync(CancellationToken ct)
+    {
+        try
+        {
+            var (graceful, message) = await _backend.ShutdownAsync(ShutdownTimeout, ct);
+
+            // A clean exit needs no narration; anything else changed what the user asked for and
+            // has to say so, or a killed debuggee looks exactly like one that shut down.
+            if (!graceful)
+                await OutputAsync("console", message);
+        }
+        catch (Exception ex)
+        {
+            await OutputAsync("console", $"The debuggee could not be shut down: {ex.Message}");
+            _backend.Stop();
+        }
+
+        await EndSessionAsync();
+        _running = false;
     }
 
     private Task OutputAsync(string category, string text) =>
@@ -953,6 +1042,9 @@ internal sealed class DapServer
         ["supportsConditionalBreakpoints"] = true,
         ["supportsExceptionInfoRequest"] = true,
         ["supportsTerminateRequest"] = true,
+        // Lets the editor say on a disconnect whether the debuggee should die with the session,
+        // rather than leaving the adapter to guess it from how the session started.
+        ["supportTerminateDebuggee"] = true,
         ["supportsEvaluateForHovers"] = true,
         // These three are emulated by PublishingDebugBackend rather than by the engine.
         ["supportsHitConditionalBreakpoints"] = true,

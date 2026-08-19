@@ -27,6 +27,17 @@ internal interface IDebugBackend : IDisposable
     /// </remarks>
     int? DebuggeePid => null;
 
+    /// <summary>
+    /// Applies a changed debugger view policy — display strings, type proxies, browsable states,
+    /// Just My Code — to a session that is already running.
+    /// </summary>
+    /// <remarks>
+    /// Defaulted to a no-op because it only means something to the ICorDebug engine, which
+    /// implements these attributes itself; netcoredbg applies its own and is told what it can be
+    /// told when the session starts.
+    /// </remarks>
+    void ApplyViewOptions(RoslynMCP.Debugger.DebugDisplayOptions options) { }
+
     Task<string> StartTestSessionAsync(
         string csprojPath,
         string? filter,
@@ -134,6 +145,21 @@ internal interface IDebugBackend : IDisposable
     /// <summary>Stops debugging but leaves the target running, for a process that was only being
     /// inspected and should not die with the session.</summary>
     Task<string> DetachAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Ends the session by letting the debuggee shut itself down, terminating it only if that
+    /// runs past <paramref name="timeout"/>.
+    /// </summary>
+    /// <remarks>
+    /// What <see cref="Stop"/> costs, and why this is not it: stopping kills the process where it
+    /// stands, so hosted services never get <c>StopAsync</c>, <c>finally</c> blocks never run and
+    /// nothing gets flushed. Only an engine that launched the debuggee itself can ask it to leave
+    /// politely, so the default here is the old behaviour and the ICorDebug backend overrides it.
+    /// </remarks>
+    /// <returns>Whether the debuggee exited on its own, and a message describing how it ended.</returns>
+    Task<(bool Graceful, string Message)> ShutdownAsync(
+        TimeSpan timeout, CancellationToken cancellationToken = default)
+        => Task.FromResult((false, Stop()));
 
     string GetStatus();
     string Stop();

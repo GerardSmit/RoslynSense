@@ -193,12 +193,12 @@ internal sealed class LspServer : IDisposable
             CodeActionProvider = new Protocol.CodeActionOptions(ResolveProvider: true),
             DocumentFormattingProvider = true,
             DocumentRangeFormattingProvider = true,
-            // "{" is what moves an opening brace onto its own line as it is typed. Not newline:
-            // see FormatOnTypeAsync. Registering it made Enter unindent the line it had just
-            // created.
+            // "{" is what moves an opening brace onto its own line as it is typed, and newline
+            // repeats that when the editor cancelled it — and does nothing else, because an
+            // edit reaching the fresh line unindents it. See FormatOnTypeAsync.
             DocumentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions(
                 FirstTriggerCharacter: ";",
-                MoreTriggerCharacter: ["}", "{"]),
+                MoreTriggerCharacter: ["}", "{", "\n"]),
             FoldingRangeProvider = true,
             CallHierarchyProvider = true,
             TypeHierarchyProvider = true,
@@ -294,8 +294,13 @@ internal sealed class LspServer : IDisposable
             [.. globs.Select(glob => new FileOperationFilter("file", new FileOperationPattern(glob, "file")))]);
     }
 
+    /// <remarks>
+    /// The one thing done here rather than at <c>initialize</c>: the client is only ready to be
+    /// shown work-done progress once it has sent this, and a solution load is the longest thing
+    /// this server ever does unprompted.
+    /// </remarks>
     [JsonRpcMethod("initialized")]
-    public void Initialized() { }
+    public void Initialized() => _ = SolutionWarmup.Start();
 
     [JsonRpcMethod("shutdown")]
     public object? Shutdown() => null;
@@ -822,10 +827,21 @@ internal sealed class LspServer : IDisposable
             () => Handlers.NavigationHandlers.ImplementationAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/hover", UseSingleObjectParameterDeserialization = true)]
-    public Task<Hover?> Hover(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageHoverProvider, Hover?>(p.TextDocument,
+    public async Task<Hover?> Hover(TextDocumentPositionParams p, CancellationToken ct)
+    {
+        // Ahead of the pack rather than instead of it: only an assemblyIdentity's name answers
+        // here, and every other position in the same web.config is still the webconfig pack's.
+        if (Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri)) &&
+            await Guarded(p.TextDocument.Uri,
+                () => Handlers.BindingRedirectHandler.HoverAsync(p, ct)) is { } redirect)
+        {
+            return redirect;
+        }
+
+        return await Route<ILanguageHoverProvider, Hover?>(p.TextDocument,
             l => l.HoverAsync(p, ct),
             () => Handlers.HoverHandler.HoverAsync(p, ct, _languages));
+    }
 
     [JsonRpcMethod("textDocument/documentHighlight", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentHighlight[]> DocumentHighlight(TextDocumentPositionParams p, CancellationToken ct) =>
@@ -877,13 +893,29 @@ internal sealed class LspServer : IDisposable
         Handlers.CompletionHandler.ResolveAsync(item, _resolveCache, ct, _languages);
 
     [JsonRpcMethod("textDocument/codeAction", UseSingleObjectParameterDeserialization = true)]
-    public Task<Protocol.CodeAction[]> CodeAction(CodeActionParams p, CancellationToken ct) =>
-        Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri))
-            ? Handlers.BindingRedirectHandler.CodeActionsAsync(p, ct)
-            : Route<ILanguageCodeActionProvider, Protocol.CodeAction[]>(p.TextDocument,
+    public async Task<Protocol.CodeAction[]> CodeAction(CodeActionParams p, CancellationToken ct)
+    {
+        if (!Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri)))
+        {
+            return await Route<ILanguageCodeActionProvider, Protocol.CodeAction[]>(p.TextDocument,
                 l => l.CodeActionsAsync(p, ct),
                 () => Handlers.CodeActionHandler.CodeActionsAsync(
                     p, _resolveCache, ct, _clientPicksNestedActions));
+        }
+
+        // The redirect fixes first, then whatever the pack that owns the file has to add. The C#
+        // handler is skipped rather than routed past: a config file is no Roslyn document, and
+        // asking it costs a lookup on every lightbulb to be told so.
+        var redirects = await Guarded(p.TextDocument.Uri,
+            () => Handlers.BindingRedirectHandler.CodeActionsAsync(p, ct));
+
+        var pack = await Guarded(p.TextDocument.Uri,
+            () => _languages.Resolve<ILanguageCodeActionProvider>(p.TextDocument.Uri) is { } provider
+                ? provider.CodeActionsAsync(p, ct)
+                : Task.FromResult(Array.Empty<Protocol.CodeAction>()));
+
+        return [.. redirects, .. pack];
+    }
 
     [JsonRpcMethod("codeAction/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeAction> CodeActionResolve(Protocol.CodeAction action, CancellationToken ct) =>
@@ -1001,10 +1033,29 @@ internal sealed class LspServer : IDisposable
             whenBroken: () => new FullDocumentDiagnosticReport("full", []));
 
     [JsonRpcMethod("textDocument/codeLens", UseSingleObjectParameterDeserialization = true)]
-    public Task<Protocol.CodeLens[]> CodeLens(CodeLensParams p, CancellationToken ct) =>
-        Route<ILanguageCodeLensProvider, Protocol.CodeLens[]>(p.TextDocument,
-            l => l.CodeLensAsync(p, ct),
-            () => Handlers.CodeLensHandler.CodeLensAsync(p, ct, _languages));
+    public async Task<Protocol.CodeLens[]> CodeLens(CodeLensParams p, CancellationToken ct)
+    {
+        if (!Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri)))
+        {
+            return await Route<ILanguageCodeLensProvider, Protocol.CodeLens[]>(p.TextDocument,
+                l => l.CodeLensAsync(p, ct),
+                () => Handlers.CodeLensHandler.CodeLensAsync(p, ct, _languages));
+        }
+
+        // Added to the pack's rather than instead of them: a web.config is the webconfig pack's
+        // file, and its reference counts have to survive the one lens this contributes above them.
+        // The C# handler is skipped for the reason it is skipped in CodeAction — and it matters
+        // more here, because the client re-asks for lenses on every scroll.
+        var redirects = await Guarded(p.TextDocument.Uri,
+            () => Handlers.BindingRedirectHandler.CodeLensAsync(p, ct));
+
+        var pack = await Guarded(p.TextDocument.Uri,
+            () => _languages.Resolve<ILanguageCodeLensProvider>(p.TextDocument.Uri) is { } provider
+                ? provider.CodeLensAsync(p, ct)
+                : Task.FromResult(Array.Empty<Protocol.CodeLens>()));
+
+        return [.. redirects, .. pack];
+    }
 
     /// <summary>Routable where the other resolve endpoints are not: an unresolved lens already
     /// carries the URI it came from.</summary>
@@ -1038,6 +1089,11 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/resolveInheritanceTarget", UseSingleObjectParameterDeserialization = true)]
     public Task<Location?> ResolveInheritanceTarget(ResolveInheritanceTargetParams p, CancellationToken ct) =>
         Handlers.InheritanceMarkersHandler.ResolveTargetAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/externalConfigReads", UseSingleObjectParameterDeserialization = true)]
+    public Task<Location[]> ExternalConfigReads(
+        Handlers.ExternalConfigReadsParams p, CancellationToken ct) =>
+        Handlers.ExternalConfigReadsHandler.ReadsAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/runningProcesses")]
     public RunningProcess[] RunningProcesses() =>

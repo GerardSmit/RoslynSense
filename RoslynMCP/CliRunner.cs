@@ -94,11 +94,12 @@ internal static class CliRunner
 
         var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
         if (configError is not null)
-            Console.Error.WriteLine($"Warning: roslynsense.json ({configPath}): {configError}");
+            Console.Error.WriteLine($"Warning: {configError}");
 
         var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
         foreach (var w in settingsWarnings)
             Console.Error.WriteLine($"Warning: {w}");
+        DebuggerViewOptions.Current = settings.DebugView;
 
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         var fmt = useToon ? (IOutputFormatter)new ToonFormatter() : new MarkdownFormatter();

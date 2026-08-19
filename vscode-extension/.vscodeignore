@@ -1,7 +1,10 @@
 src/**
 tsconfig.json
 tsconfig.webview.json
+tsconfig.webview.search.json
+tsconfig.webview.settings.json
 node_modules/@types/**
 **/*.map
 .gitignore
 scripts/**
+out/test/**

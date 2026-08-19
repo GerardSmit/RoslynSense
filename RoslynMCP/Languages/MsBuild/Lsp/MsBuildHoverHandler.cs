@@ -2,6 +2,7 @@ using System.Text;
 using RoslynMCP.Languages.MsBuild.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.MsBuild.Lsp;
 
@@ -9,14 +10,15 @@ namespace RoslynMCP.Languages.MsBuild.Lsp;
 /// What the name under the cursor means.
 /// </summary>
 /// <remarks>
-/// Everything here is already in memory — the vendored corpus, or a package status the diagnostics
-/// pass has already fetched. Hover is a gesture that could afford to wait, but there is nothing
-/// worth waiting for: the same fetch the squiggle needs is already running, and answering from it
-/// keeps the two consistent rather than briefly disagreeing.
+/// Everything here is already in memory — the vendored corpora, a package status the diagnostics
+/// pass has already fetched, or the analyzers of a solution that is already open. Hover is a
+/// gesture that could afford to wait, but there is nothing worth waiting for: the same fetch the
+/// squiggle needs is already running, and answering from it keeps the two consistent rather than
+/// briefly disagreeing. Nothing here opens a solution to answer.
 /// </remarks>
 internal static class MsBuildHoverHandler
 {
-    public static Hover? Compute(TextDocumentPositionParams p)
+    public static async Task<Hover?> ComputeAsync(TextDocumentPositionParams p, CancellationToken ct)
     {
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
 
@@ -26,6 +28,26 @@ internal static class MsBuildHoverHandler
         int offset = LspConverters.ToOffset(document.Text, p.Position);
         var context = MsBuildContextResolver.Resolve(document, offset);
 
+        // A suppression list answers about the code under the caret, not about the whole value,
+        // so it carries its own span and is asked first.
+        if (MsBuildWarningList.IsWarningList(context)
+            && MsBuildWarningList.CodeAt(document.Text, context.ReplaceSpan, offset) is { } entry)
+        {
+            if (DiagnosticCodeCatalog.Lookup(entry.Code, WorkspaceService.TryGetLoadedProject(path)) is not { } info)
+                return null;
+
+            // Counted only for a property. Metadata on one reference cannot be lifted from here,
+            // and a count taken with it still applied would report zero for a suppression doing its
+            // job — see MsBuildWarningList.IsProperty.
+            var occurrences = MsBuildWarningList.IsProperty(context)
+                ? await WarningOccurrenceCache.GetAsync(path, entry.Code, CountWait, ct)
+                : null;
+
+            return new Hover(
+                new MarkupContent("markdown", Describe(info, occurrences)),
+                LspConverters.ToRange(document.Text.Lines, entry.Span));
+        }
+
         string? markdown = Describe(document, context);
         if (markdown is null)
             return null;
@@ -33,6 +55,77 @@ internal static class MsBuildHoverHandler
         return new Hover(
             new MarkupContent("markdown", markdown),
             LspConverters.ToRange(document.Text.Lines, context.ReplaceSpan));
+    }
+
+    /// <summary>
+    /// How long a hover waits for a count before answering without one.
+    /// </summary>
+    /// <remarks>
+    /// Long enough for a warm compilation of one project, short enough that the popup still feels
+    /// like a popup. Past it the count keeps going in the background and the next hover has it.
+    /// </remarks>
+    private static readonly TimeSpan CountWait = TimeSpan.FromMilliseconds(1200);
+
+    /// <summary>
+    /// A suppressed diagnostic code, as much as is known about it.
+    /// </summary>
+    /// <remarks>
+    /// The code itself is always shown, even when nothing else is: a hover that appears and says
+    /// only <c>NU9999 — no description available</c> still confirms the reader is on the token they
+    /// think they are, and the documentation link below it is the answer for a code minted after
+    /// this build shipped.
+    /// </remarks>
+    private static string Describe(in DiagnosticCodeInfo info, WarningOccurrences? occurrences = null)
+    {
+        var builder = new StringBuilder();
+        builder.Append("**").Append(info.Code).Append("**");
+
+        if (info.Severity is { } severity)
+            builder.Append(" — ").Append(severity.ToString().ToLowerInvariant());
+        if (info.Category is { Length: > 0 } category)
+            builder.Append(" (").Append(category).Append(')');
+
+        builder.AppendLine().AppendLine();
+
+        if (info.Title is { Length: > 0 } title)
+            builder.AppendLine(title).AppendLine();
+        if (info.Description is { Length: > 0 } description)
+            builder.AppendLine(description).AppendLine();
+
+        // Quoted, because it is the text the build prints rather than prose about it — and it
+        // still carries the holes ('packageId', {0}) that say which parts vary.
+        if (info.Message is { Length: > 0 } message)
+            builder.Append("> ").AppendLine(message).AppendLine();
+
+        if (Occurrences(occurrences) is { } counted)
+            builder.AppendLine(counted).AppendLine();
+
+        if (info.HelpLink is { Length: > 0 } link)
+            builder.Append("[Documentation](").Append(link).Append(')').AppendLine();
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// What the suppression is hiding, when that has been counted.
+    /// </summary>
+    /// <remarks>
+    /// The zero is the line worth reading: a suppression with nothing left to suppress is one that
+    /// can go, and nothing else in the editor will ever say so. The scope is spelled out because
+    /// the same entry means different things in a <c>.csproj</c> and in a
+    /// <c>Directory.Build.props</c>, and a bare number would read as the first in both.
+    /// </remarks>
+    private static string? Occurrences(WarningOccurrences? occurrences)
+    {
+        if (occurrences is not { } found)
+            return null;
+
+        string scope = found.Projects == 1 ? "this project" : $"{found.Projects} projects";
+        string counted = found.Partial ? $" (of {found.Scope} in scope)" : "";
+
+        return found.Count == 0
+            ? $"Not reported in {scope}{counted} — the suppression may no longer be needed."
+            : $"Suppressing {found.Count} occurrence{(found.Count == 1 ? "" : "s")} in {scope}{counted}.";
     }
 
     private static string? Describe(MsBuildDocument document, MsBuildContext context)

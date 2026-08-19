@@ -1,4 +1,4 @@
-using RoslynMCP.Lsp.Protocol;
+﻿using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Packages;
 using RoslynMCP.Services.ProjectModel;
@@ -207,12 +207,25 @@ internal static class SolutionTreeHandler
         // paying for it, and expanding it is the expensive part.
         bool unloaded = node.Path is { Length: > 0 } && IsUnloaded(node.Path, p);
 
+        // Different thing entirely, and the reason both are drawn: "unloaded" is a choice the user
+        // made and this is a fact about the workspace. A project nothing has pulled in yet answers
+        // nothing — it is invisible to Search Everywhere, to workspace symbols, to find-references
+        // — and without a mark on the row that is indistinguishable from a project with nothing in
+        // it. See SolutionWarmup, which is what normally makes this state a few seconds long.
+        bool notLoaded = !unloaded && node.Path is { Length: > 0 } path2 && !IsLoaded(path2);
+
         return new SolutionTreeNode(
             Id: $"project:{node.Path}",
             Kind: SolutionNodeKind.Project,
             Label: node.Name,
-            Description: unloaded ? "unloaded" : null,
+            Description: unloaded
+                ? "unloaded"
+                : notLoaded
+                    ? SolutionWarmup.IsLoading ? "loading…" : "not loaded"
+                    : null,
             ResourceUri: node.Path is null ? null : LspConverters.PathToUri(node.Path),
+            // Expandable, unlike an unloaded one: nothing about "not loaded yet" says the user may
+            // not look inside, and expanding it is one of the things that loads it.
             HasChildren: !unloaded,
             // The context value carries runnability so the row's Run and Debug actions are
             // shown only where they would do something. Classification is a file scan with an
@@ -222,7 +235,36 @@ internal static class SolutionTreeHandler
                 : node.Path is { Length: > 0 } path && ProjectClassifier.Classify(path).IsRunnable
                     ? SolutionNodeKind.RunnableProject
                     : SolutionNodeKind.Project,
-            Dimmed: unloaded);
+            Dimmed: unloaded || notLoaded);
+    }
+
+    /// <summary>
+    /// Whether the project is in the workspace the solution-wide requests answer from.
+    /// </summary>
+    /// <remarks>
+    /// Read off the current solution snapshot rather than through the workspace cache's own index,
+    /// deliberately: the index is guarded by the lock a load holds while it does its bookkeeping,
+    /// so asking it here would stall the tree behind exactly the load whose progress the tree is
+    /// drawing. A snapshot is immutable and free to read, and it is the same solution
+    /// <see cref="Search.SearchEverywhere"/> searches — which is what makes the mark honest.
+    /// </remarks>
+    private static bool IsLoaded(string projectPath)
+    {
+        if (WorkspaceService.TryGetMostRecentSolution() is not { } solution)
+            return false;
+
+        foreach (var project in solution.Projects)
+        {
+            if (project.FilePath is { Length: > 0 } path
+                && string.Equals(
+                    Path.GetFullPath(path), Path.GetFullPath(projectPath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsUnloaded(string projectPath, SolutionTreeParams p) =>
@@ -252,10 +294,24 @@ internal static class SolutionTreeHandler
                 isNetFramework ? SolutionNodeKind.DependenciesNetFx : SolutionNodeKind.Dependencies),
         };
 
-        nodes.AddRange(await FolderContentsAsync(
-            projectPath, Path.GetDirectoryName(projectPath) ?? projectPath, p, ct));
+        var contents = await FolderContentsAsync(
+            projectPath, Path.GetDirectoryName(projectPath) ?? projectPath, p, ct);
+
+        // Properties straight after Dependencies, ahead of the alphabet, the way Visual Studio and
+        // Rider pin both. The two are the project's own furniture rather than its content — one is
+        // what it builds against, the other is how it is launched and stamped — and left in
+        // alphabetical order Properties lands in the middle of the source folders, which is where
+        // nobody looks for launchSettings.json. Recognised by name, exactly as the icon already
+        // recognises it, so a "Properties" that is really a source folder is pinned too: the same
+        // trade Visual Studio makes.
+        nodes.AddRange(contents.Where(IsPropertiesFolder));
+        nodes.AddRange(contents.Where(node => !IsPropertiesFolder(node)));
         return nodes.ToArray();
     }
+
+    private static bool IsPropertiesFolder(SolutionTreeNode node) =>
+        node.Kind == SolutionNodeKind.Folder
+        && node.Label.ToLowerInvariant() is "properties" or "my project";
 
     private static async Task<SolutionTreeNode[]> DependencyGroupsAsync(
         string projectPath, CancellationToken ct)
@@ -408,11 +464,22 @@ internal static class SolutionTreeHandler
                 .Select(package => TransitiveNode(projectPath, "", package))
                 .ToArray(),
 
+            // A reference is a pointer, not a copy: it takes you to the project it names rather
+            // than growing a second, parallel tree of it — expandable, it drew the same project
+            // once per consumer, and a project referenced from three places was three subtrees
+            // that could all be expanded and edited as if they were different things.
+            //
+            // The id carries the owner as well as the target, and has to: it used to be
+            // "project:<path>" — character for character the id of the real project row — and the
+            // tree keys its items by id, so a referenced project that was also visible under the
+            // solution was one id claimed by two rows. That is a row that fails to render rather
+            // than one that merely looks odd, and the collision is also why the reference could
+            // not name its own owner and had to ask its parent.
             SolutionNodeKind.Projects => evaluation.ProjectReferences
                 .Select(path => new SolutionTreeNode(
-                    $"project:{path}", SolutionNodeKind.ProjectRef,
+                    $"projectref:{projectPath}|{path}", SolutionNodeKind.ProjectRef,
                     Path.GetFileNameWithoutExtension(path), null,
-                    LspConverters.PathToUri(path), HasChildren: true,
+                    LspConverters.PathToUri(path), HasChildren: false,
                     ContextValue: SolutionNodeKind.ProjectRef))
                 .ToArray(),
 

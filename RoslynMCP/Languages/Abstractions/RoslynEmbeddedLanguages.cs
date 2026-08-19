@@ -160,7 +160,7 @@ internal sealed class RoslynEmbeddedLanguages
                 token, semanticModel, ct, out string? identifier, out var options)
             || !_byIdentifier.TryGetValue(identifier, out var language))
         {
-            return Claimed(document, semanticModel, token, position, ct);
+            return await ClaimedAsync(document, semanticModel, token, position, ct);
         }
 
         return new EmbeddedStringContext(
@@ -183,13 +183,13 @@ internal sealed class RoslynEmbeddedLanguages
     /// first, always: an attribute or a <c>// lang=</c> comment says outright what the literal is,
     /// where a configured language is inferring it from the call around it.
     /// </remarks>
-    private EmbeddedStringContext? Claimed(
+    private async Task<EmbeddedStringContext?> ClaimedAsync(
         Document document, SemanticModel semanticModel, SyntaxToken token, int position,
         CancellationToken ct)
     {
         foreach (var language in _configured)
         {
-            if (language.Detect(token, semanticModel, ct) is { } identifier)
+            if (await language.DetectAsync(document, token, semanticModel, ct) is { } identifier)
             {
                 return new EmbeddedStringContext(
                     language, identifier, [], document, semanticModel, token, position);

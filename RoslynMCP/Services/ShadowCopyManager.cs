@@ -264,24 +264,35 @@ internal sealed class ShadowCopyManager : IDisposable
         string shadowDir = Path.Combine(_instanceDir, $"{ComputeDirectoryHash(sourceDir)}_{gen:x}");
         Directory.CreateDirectory(shadowDir);
 
-        // Copy all DLLs, PDBs, and JSON metadata (e.g. .deps.json, .runtimeconfig.json)
+        // Copy all DLLs, PDBs, and JSON metadata (e.g. .deps.json, .runtimeconfig.json).
+        // A source directory that does not exist yet — a generator that has never been built has
+        // no bin at all — is not an error: the shadow dir stays empty, no fingerprint baseline is
+        // recorded, and the pending watcher armed below invalidates the first time a build
+        // creates the directory.
         bool copiedEverything = true;
-        foreach (var file in Directory.GetFiles(sourceDir))
+        if (Directory.Exists(sourceDir))
         {
-            string ext = Path.GetExtension(file).ToLowerInvariant();
-            if (ext is ".dll" or ".pdb" or ".json")
+            foreach (var file in Directory.GetFiles(sourceDir))
             {
-                try
+                string ext = Path.GetExtension(file).ToLowerInvariant();
+                if (ext is ".dll" or ".pdb" or ".json")
                 {
-                    File.Copy(file, Path.Combine(shadowDir, Path.GetFileName(file)), overwrite: true);
-                }
-                catch (Exception ex)
-                {
-                    copiedEverything = false;
-                    Console.Error.WriteLine(
-                        $"[ShadowCopy] Failed to copy '{Path.GetFileName(file)}': {ex.Message}");
+                    try
+                    {
+                        File.Copy(file, Path.Combine(shadowDir, Path.GetFileName(file)), overwrite: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        copiedEverything = false;
+                        Console.Error.WriteLine(
+                            $"[ShadowCopy] Failed to copy '{Path.GetFileName(file)}': {ex.Message}");
+                    }
                 }
             }
+        }
+        else
+        {
+            copiedEverything = false;
         }
 
         _shadowDirectories[sourceDir] = shadowDir;
@@ -318,6 +329,12 @@ internal sealed class ShadowCopyManager : IDisposable
         if (_watchers.ContainsKey(directory) || _disposed)
             return;
 
+        if (!Directory.Exists(directory))
+        {
+            EnsurePendingWatcher(directory);
+            return;
+        }
+
         try
         {
             var watcher = new FileSystemWatcher(directory, "*.dll")
@@ -336,6 +353,86 @@ internal sealed class ShadowCopyManager : IDisposable
             Console.Error.WriteLine(
                 $"[ShadowCopy] Failed to create watcher for '{directory}': {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Arms a stand-in watcher for a source directory that does not exist yet.
+    /// <see cref="FileSystemWatcher"/> cannot watch a nonexistent path, and the never-built
+    /// generator is exactly the case where a watcher matters most: the first build has to be
+    /// noticed or the workspace stays wrong for the whole session. The nearest existing ancestor
+    /// is watched recursively until the directory appears; then <see cref="OnPendingSourceEvent"/>
+    /// swaps in the real per-directory watcher and treats the appearance itself as a rebuild.
+    /// </summary>
+    private void EnsurePendingWatcher(string directory)
+    {
+        string? ancestor = Path.GetDirectoryName(directory);
+        while (ancestor is not null && !Directory.Exists(ancestor))
+            ancestor = Path.GetDirectoryName(ancestor);
+
+        if (ancestor is null)
+        {
+            Console.Error.WriteLine(
+                $"[ShadowCopy] No existing ancestor to watch for missing directory '{directory}'.");
+            return;
+        }
+
+        try
+        {
+            var watcher = new FileSystemWatcher(ancestor)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.DirectoryName | NotifyFilters.FileName | NotifyFilters.LastWrite,
+                EnableRaisingEvents = true,
+            };
+
+            watcher.Created += (_, _) => OnPendingSourceEvent(directory);
+            watcher.Changed += (_, _) => OnPendingSourceEvent(directory);
+            watcher.Renamed += (_, _) => OnPendingSourceEvent(directory);
+
+            // Keyed under the missing directory, not the ancestor: the ContainsKey guard in
+            // EnsureWatcher and the swap in OnPendingSourceEvent both address it by that key.
+            _watchers[directory] = watcher;
+
+            Console.Error.WriteLine(
+                $"[ShadowCopy] '{directory}' does not exist yet; watching '{ancestor}' for it to appear.");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[ShadowCopy] Failed to create pending watcher for '{directory}' via '{ancestor}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// An event under a pending directory's watched ancestor. Once the directory actually exists,
+    /// the stand-in is swapped for the real watcher and the appearance is debounced into the
+    /// ordinary rebuild pipeline — with no fingerprint baseline recorded for a never-copied
+    /// directory, <see cref="OnQuiet"/> always judges the first build a real change.
+    /// </summary>
+    private void OnPendingSourceEvent(string directory)
+    {
+        if (!Directory.Exists(directory))
+            return;
+
+        lock (_lock)
+        {
+            if (_disposed)
+                return;
+
+            if (_watchers.TryGetValue(directory, out var standIn)
+                && !string.Equals(
+                    Path.TrimEndingDirectorySeparator(standIn.Path),
+                    Path.TrimEndingDirectorySeparator(directory),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                standIn.EnableRaisingEvents = false;
+                standIn.Dispose();
+                _watchers.Remove(directory);
+                EnsureWatcher(directory);
+            }
+        }
+
+        DebouncedInvalidate(directory);
     }
 
     private void DebouncedInvalidate(string directory)

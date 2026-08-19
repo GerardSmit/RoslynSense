@@ -13,6 +13,12 @@ internal static class SearchEverywhereHandler
     public static async Task<SearchEverywhereResult> SearchAsync(
         SearchEverywhereParams p, CancellationToken ct)
     {
+        // A search that ran while the solution was still loading used to answer out of whatever
+        // subset happened to be loaded, which reads as "Ctrl+T does not find my type" rather than
+        // as "not yet". Waiting is cancelled along with the request, so a query the user has
+        // already retyped past stops waiting with it.
+        await SolutionWarmup.WaitAsync(ct);
+
         var solution = WorkspaceService.TryGetMostRecentSolution();
         if (solution is null)
             return new SearchEverywhereResult([], false);
@@ -72,6 +78,8 @@ internal static class SearchEverywhereHandler
 
     public static async Task<SearchTextResult> SearchTextAsync(SearchTextParams p, CancellationToken ct)
     {
+        await SolutionWarmup.WaitAsync(ct);
+
         var solution = WorkspaceService.TryGetMostRecentSolution();
         if (solution is null)
             return new SearchTextResult([], false);

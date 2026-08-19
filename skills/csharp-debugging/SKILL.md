@@ -34,7 +34,7 @@ The debug engine is selected automatically from the target — never pick one:
 
 - **DebugRemoveBreakpoint** — remove breakpoints by ID. Supports batch removal.
 - **DebugDetach** — stop debugging but leave the process running. Use for a web app or service that was only being inspected and should not die with the session.
-- **DebugStop** — stop the debug session and clean up all debugger processes.
+- **DebugStop** — stop the debug session and clean up all debugger processes. The debuggee is asked to shut down cleanly first (hosted services get their `StopAsync`, `finally` blocks run) and killed only if it does not exit within ten seconds.
 
 ## Debugging tips
 

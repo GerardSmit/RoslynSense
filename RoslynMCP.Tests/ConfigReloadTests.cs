@@ -123,18 +123,31 @@ public class ToolHostServicesRebuildTests
     }
 }
 
+/// <remarks>
+/// In the serialized collection because the home directory the global and personal layers live
+/// under is an environment variable, and it is pointed at an empty directory here so that whatever
+/// the machine running the suite has in <c>~/.roslynsense</c> cannot change what these assert.
+/// </remarks>
+[Collection(SharedState.Name)]
 public class ConfigWatcherReloadTests : IDisposable
 {
     private readonly string _root;
+    private readonly string? _previousHome;
 
     public ConfigWatcherReloadTests()
     {
         _root = Path.Combine(Path.GetTempPath(), "rsense-watch-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_root);
+
+        _previousHome = Environment.GetEnvironmentVariable(ConfigPaths.HomeOverrideVariable);
+        Environment.SetEnvironmentVariable(
+            ConfigPaths.HomeOverrideVariable,
+            Directory.CreateDirectory(Path.Combine(_root, ".home")).FullName);
     }
 
     public void Dispose()
     {
+        Environment.SetEnvironmentVariable(ConfigPaths.HomeOverrideVariable, _previousHome);
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
     }
 
@@ -222,6 +235,138 @@ public class ConfigWatcherReloadTests : IDisposable
         var reload = Assert.Single(reloads);
         Assert.Equal(9, reload.Settings.MaxWorkspaces);
         Assert.Contains("maxWorkspaces: 4 → 9", reload.Changes);
+    }
+
+    /// <summary>
+    /// The personal sibling is a layer like any other, so editing it is a configuration change.
+    /// Before layers existed the watcher only ever looked at one file name.
+    /// </summary>
+    [Fact]
+    public void An_edited_local_override_reloads_too()
+    {
+        File.WriteAllText(ConfigPath, """{"tools":{"webforms":true}}""");
+        var reloads = new List<ConfigReload>();
+        using var watcher = ConfigWatcher.Start(_root, [], Current(_root), reloads.Add);
+
+        File.WriteAllText(
+            Path.Combine(_root, RoslynSenseConfigLoader.LocalFileName),
+            """{"tools":{"webforms":false}}""");
+        watcher!.Reload();
+
+        var reload = Assert.Single(reloads);
+        Assert.False(reload.Settings.WebForms);
+        Assert.Contains("webforms: on → off", reload.Changes);
+    }
+
+    /// <summary>
+    /// Deleting the nearer file falls back to the parent's value rather than to the default —
+    /// which is the difference between merging the chain and stopping at the first file found.
+    /// </summary>
+    [Fact]
+    public void A_deleted_nearer_config_falls_back_to_the_parent()
+    {
+        string nested = Directory.CreateDirectory(Path.Combine(_root, "src")).FullName;
+        File.WriteAllText(ConfigPath, """{"maxWorkspaces":9}""");
+        string nestedConfig = Path.Combine(nested, RoslynSenseConfigLoader.FileName);
+        File.WriteAllText(nestedConfig, """{"maxWorkspaces":7}""");
+
+        var reloads = new List<ConfigReload>();
+        using var watcher = ConfigWatcher.Start(nested, [], Current(nested), reloads.Add);
+        Assert.Equal(7, Current(nested).MaxWorkspaces);
+
+        File.Delete(nestedConfig);
+        watcher!.Reload();
+
+        var reload = Assert.Single(reloads);
+        Assert.Equal(9, reload.Settings.MaxWorkspaces);
+        Assert.Equal(ConfigPath, reload.ConfigPath);
+    }
+
+    /// <summary>
+    /// A file the watcher never used to look at: the global layer is outside the working
+    /// directory entirely, and an edit to it changes what every solution resolves to.
+    /// </summary>
+    [Fact]
+    public void An_edited_global_config_reloads()
+    {
+        var reloads = new List<ConfigReload>();
+        using var watcher = ConfigWatcher.Start(_root, [], Current(_root), reloads.Add);
+
+        File.WriteAllText(ConfigPaths.GlobalConfigFile!, """{"tableFormat":"toon"}""");
+        watcher!.Reload();
+
+        var reload = Assert.Single(reloads);
+        Assert.Equal("toon", reload.Settings.TableFormat);
+    }
+
+    /// <summary>
+    /// The file-system events, not just the reload body: everything above calls
+    /// <c>Reload</c> by hand, which would still pass if nothing were watching at all.
+    /// </summary>
+    /// <remarks>
+    /// The personal layer is the case that was actually broken. Its directory —
+    /// <c>&lt;home&gt;/projects/&lt;mangled-path&gt;/</c> — does not exist until the first personal
+    /// setting is saved, a watcher cannot be opened on a directory that is not there, and the save
+    /// that creates it is exactly the one nobody was listening for. One recursive watcher over the
+    /// home directory is what covers it.
+    /// </remarks>
+    [Fact]
+    public async Task A_personal_config_saved_for_the_first_time_reloads_on_its_own()
+    {
+        var reloaded = new TaskCompletionSource<ConfigReload>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var watcher = ConfigWatcher.Start(
+            _root, [], Current(_root), reload => reloaded.TrySetResult(reload));
+        Assert.NotNull(watcher);
+
+        string personal = ConfigPaths.PersonalConfigFile(_root)!;
+        Assert.False(Directory.Exists(Path.GetDirectoryName(personal)));
+
+        Directory.CreateDirectory(Path.GetDirectoryName(personal)!);
+        File.WriteAllText(personal, """{"maxWorkspaces":9}""");
+
+        Assert.Equal(9, (await WithinTimeout(reloaded.Task)).Settings.MaxWorkspaces);
+    }
+
+    [Fact]
+    public async Task An_edited_global_config_reloads_on_its_own()
+    {
+        var reloaded = new TaskCompletionSource<ConfigReload>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var watcher = ConfigWatcher.Start(
+            _root, [], Current(_root), reload => reloaded.TrySetResult(reload));
+        Assert.NotNull(watcher);
+
+        File.WriteAllText(ConfigPaths.GlobalConfigFile!, """{"tableFormat":"toon"}""");
+
+        Assert.Equal("toon", (await WithinTimeout(reloaded.Task)).Settings.TableFormat);
+    }
+
+    /// <summary>
+    /// A home directory that is not there yet is created rather than skipped — it is the one
+    /// directory this owns, and not creating it means no live reload for anyone who has not
+    /// already saved a global setting.
+    /// </summary>
+    [Fact]
+    public void A_missing_home_directory_is_created_so_that_it_can_be_watched()
+    {
+        string home = Path.Combine(_root, "not-yet");
+        Environment.SetEnvironmentVariable(ConfigPaths.HomeOverrideVariable, home);
+
+        using var watcher = ConfigWatcher.Start(_root, [], Current(_root), _ => { });
+
+        Assert.NotNull(watcher);
+        Assert.True(Directory.Exists(home));
+    }
+
+    /// <summary>Fails the test rather than hanging the run when no event ever arrives.</summary>
+    private static async Task<ConfigReload> WithinTimeout(Task<ConfigReload> reload)
+    {
+        var finished = await Task.WhenAny(reload, Task.Delay(TimeSpan.FromSeconds(20)));
+        Assert.True(finished == reload, "No configuration reload arrived; nothing was watching.");
+        return await reload;
     }
 
     [Fact]

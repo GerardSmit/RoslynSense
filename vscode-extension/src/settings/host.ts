@@ -1,0 +1,234 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { html } from './html';
+import {
+    listReferenceNames,
+    previewConnection,
+    splitProvider,
+} from './connectionPreview';
+import {
+    ConfigScope,
+    SCOPE_LABELS,
+    configFilePath,
+    loadLayers,
+    writeSetting,
+} from '../roslynsenseConfig';
+
+/**
+ * The extension-host half of the settings panel: it owns the files.
+ *
+ * The webview renders a form from the schema and reports what the person changed; every read and
+ * every write happens here. Nothing in the panel edits VS Code's own settings — `roslynSense.*`
+ * keys stay in the Settings editor where people already look for them, and this is only about
+ * `roslynsense.json`, which is a different file with a different audience.
+ */
+export function wire(
+    context: vscode.ExtensionContext,
+    panel: vscode.WebviewPanel,
+    onDispose: () => void
+): void {
+    panel.webview.html = html(panel.webview, context.extensionUri);
+
+    let scope: ConfigScope = 'repo';
+    let disposed = false;
+
+    panel.onDidDispose(() => {
+        disposed = true;
+        onDispose();
+    });
+
+    const post = (message: SettingsMsg.ToView) => {
+        if (!disposed) {
+            void panel.webview.postMessage(message);
+        }
+    };
+
+    /**
+     * The panel is one window's view of files several things write — the person's own editor, the
+     * server, another window, a git checkout. Re-sending the whole state on any change to any
+     * layer is cheap (four small files) and is the only version of this that cannot go stale.
+     */
+    const watcher = vscode.workspace.createFileSystemWatcher('**/roslynsense*.json');
+    const refresh = () => post(buildState(scope));
+    watcher.onDidChange(refresh);
+    watcher.onDidCreate(refresh);
+    watcher.onDidDelete(refresh);
+    panel.onDidDispose(() => watcher.dispose());
+
+    panel.webview.onDidReceiveMessage(async (message: SettingsMsg.ToHost) => {
+        switch (message.type) {
+            case 'selectScope':
+                scope = message.scope;
+                post(buildState(scope));
+                return;
+
+            case 'openFile': {
+                // Created empty rather than refused: "open the file I would be writing to" is a
+                // reasonable thing to ask of a scope nobody has written to yet.
+                if (!fs.existsSync(message.filePath)) {
+                    await fs.promises.mkdir(dirOf(message.filePath), { recursive: true });
+                    await fs.promises.writeFile(message.filePath, '{\n}\n', 'utf8');
+                }
+                const document = await vscode.workspace.openTextDocument(message.filePath);
+                await vscode.window.showTextDocument(document, { preview: false });
+                return;
+            }
+
+            case 'completeConnection': {
+                const items = await connectionCompletions(message.value);
+                post({ type: 'connectionCompletions', value: message.value, items });
+                return;
+            }
+
+            case 'resolveConnections': {
+                const results: Record<string, SettingsMsg.ConnectionPreview> = {};
+                for (const value of message.values) {
+                    results[value] = previewConnection(value, workingDirectory()) ?? {};
+                }
+                post({ type: 'connectionsResolved', results });
+                return;
+            }
+
+            case 'set': {
+                try {
+                    // `null` over the wire is the panel's "unset"; `undefined` does not survive
+                    // JSON, and removing the key is what puts the setting back to inherited.
+                    const value = message.value === null ? undefined : message.value;
+                    const written = await writeSetting(
+                        message.scope,
+                        workingDirectory(),
+                        message.path,
+                        value
+                    );
+                    post(buildState(scope, `Saved to ${written}`));
+                } catch (error) {
+                    post(buildState(scope, `Could not save: ${describe(error)}`));
+                }
+                return;
+            }
+        }
+    });
+
+    post(buildState(scope));
+
+    function buildState(current: ConfigScope, notice?: string): SettingsMsg.State {
+        const directory = workingDirectory();
+        const { layers, merged } = loadLayers(directory);
+
+        // The four the scope selector offers, by the path they resolve to for this directory.
+        // Every other layer — a `roslynsense.json` in some ancestor — is still shown as an origin
+        // but is edited where it lives, because "which parent did this come from" is a question
+        // the chip answers better than a fifth tab would.
+        const editablePaths = new Set(
+            (['global', 'repo', 'repoLocal', 'personal'] as const).map((s) =>
+                normalize(configFilePath(s, directory))
+            )
+        );
+
+        return {
+            type: 'state',
+            schema: readSchema(context),
+            workingDirectory: directory,
+            scope: current,
+            notice,
+            effective: merged,
+            layers: layers.map((layer) => ({
+                scope: layer.scope,
+                label: SCOPE_LABELS[layer.scope],
+                filePath: layer.filePath,
+                exists: layer.json !== undefined || layer.parseError !== undefined,
+                json: layer.json,
+                parseError: layer.parseError,
+                editable: editablePaths.has(normalize(layer.filePath)),
+            })),
+        };
+    }
+}
+
+/**
+ * Suggestions for a connection value, staged by what has been typed so far: provider → reference
+ * kind → config file → name inside the file. Every item is the full value, ready to accept.
+ */
+async function connectionCompletions(value: string): Promise<string[]> {
+    const { head, ref } = splitProvider(value);
+
+    // Still typing the provider prefix.
+    if (head === '') {
+        return ['mssql:', 'psql:', 'sqlite:'].filter((p) =>
+            p.startsWith(value.toLowerCase())
+        );
+    }
+
+    const kindMatch = /^(json|xml):/i.exec(ref);
+    if (!kindMatch) {
+        // Could become a raw connection string — offer the reference forms while it still might
+        // be one, and stop suggesting once it clearly is not.
+        const forms = [`${head}json:`, `${head}xml:`];
+        return forms.filter((form) => form.toLowerCase().startsWith(value.toLowerCase()));
+    }
+
+    const kind = kindMatch[1].toLowerCase() as 'json' | 'xml';
+    const body = ref.slice(kind.length + 1);
+    const hash = body.indexOf('#');
+
+    if (hash < 0) {
+        // Complete the file path from the config files the workspace actually has.
+        const pattern = kind === 'json' ? '**/appsettings*.json' : '**/*.config';
+        const files = await vscode.workspace.findFiles(
+            pattern,
+            '**/{node_modules,bin,obj}/**',
+            50
+        );
+        return files
+            .map((uri) => `${head}${kind}:${vscode.workspace.asRelativePath(uri)}#`)
+            .sort();
+    }
+
+    // Complete the name from inside the chosen file.
+    const filePart = body.slice(0, hash);
+    const filePath = path.isAbsolute(filePart)
+        ? filePart
+        : path.resolve(workingDirectory(), filePart);
+    return listReferenceNames(filePath, kind).map(
+        (name) => `${head}${kind}:${filePart}#${name}`
+    );
+}
+
+/**
+ * The directory the layers resolve for — the same one the server is launched in, so that what the
+ * panel shows is what the server sees.
+ */
+function workingDirectory(): string {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+}
+
+/** The schema the form is built from, shipped beside the extension. */
+function readSchema(context: vscode.ExtensionContext): unknown {
+    const schemaPath = vscode.Uri.joinPath(
+        context.extensionUri,
+        'schemas',
+        'roslynsense.schema.json'
+    ).fsPath;
+
+    try {
+        return JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+    } catch {
+        // A packaged extension always has it; a broken install gets an empty form rather than an
+        // exception on the way to one.
+        return { properties: {} };
+    }
+}
+
+function dirOf(filePath: string): string {
+    const index = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+    return index > 0 ? filePath.slice(0, index) : filePath;
+}
+
+function normalize(filePath: string): string {
+    return filePath.replace(/\\/g, '/').toLowerCase();
+}
+
+function describe(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}

@@ -19,6 +19,10 @@ public static class Program
         var connection = config.GetConnectionString("Main");
         var secret = config["Integration:ApiKey"];
 
+        // Read but never declared, inside a section that is declared: what completion offers
+        // when the caret is inside App.
+        var region = config["App:Region"];
+
         // Binding, in each of its spellings.
         services.Configure<ExampleOptions>(config.GetSection("Example"));
         services.AddOptions<ExampleOptions>().BindConfiguration("Example");

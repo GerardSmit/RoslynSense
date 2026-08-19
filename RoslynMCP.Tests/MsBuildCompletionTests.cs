@@ -285,4 +285,138 @@ public class MsBuildCompletionTests : IDisposable
 
         Assert.Null(list);
     }
+
+    /// <summary>
+    /// The state completion actually runs in: the end tag has not been typed yet.
+    /// </summary>
+    /// <remarks>
+    /// To the parser this is not an element at all — the text after the start tag is recovered as
+    /// content of the nearest ancestor that closes, so the caret comes back as whitespace inside
+    /// the PropertyGroup and the list offered is every property name, in the one position where a
+    /// property name is the wrong answer.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnclosedPropertyOffersItsValuesAndNotPropertyNames()
+    {
+        var list = await CompleteAsync("""
+            <Project>
+              <PropertyGroup>
+                <RootNamespace>App</RootNamespace>
+                <LangVersion>|
+              </PropertyGroup>
+            </Project>
+            """);
+
+        var labels = Labels(list);
+        Assert.Contains("latest", labels);
+        Assert.DoesNotContain("AllowUnsafeBlocks", labels);
+    }
+
+    /// <summary>The same, for an element outside a PropertyGroup: nothing, rather than the wrong
+    /// thing.</summary>
+    [Fact]
+    public async Task AnUnclosedElementInATargetOffersNothing()
+    {
+        var list = await CompleteAsync("""
+            <Project>
+              <Target Name="Build">
+                <Message>|
+              </Target>
+            </Project>
+            """);
+
+        Assert.Null(list);
+    }
+
+    /// <summary>
+    /// A group that has not been closed yet still knows what goes inside it.
+    /// </summary>
+    /// <remarks>
+    /// The line break is the whole distinction from the case above. Content on the start tag's own
+    /// line is that element's value; content on a later line is where its next child is typed —
+    /// which is what an unclosed <c>&lt;PropertyGroup&gt;</c> is, and offering property names there
+    /// is right.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnclosedGroupStillOffersWhatGoesInsideIt()
+    {
+        var list = await CompleteAsync("""
+            <Project>
+              <PropertyGroup>
+                |
+            </Project>
+            """);
+
+        Assert.Contains("LangVersion", Labels(list));
+    }
+
+    /// <summary>
+    /// A half-typed name is replaced, not appended to.
+    /// </summary>
+    /// <remarks>
+    /// The caret alone does not say what a completion replaces. An edit anchored at the caret turns
+    /// <c>&lt;Lang</c> plus <c>LangVersion</c> into <c>&lt;LangLangVersion</c>, which is the kind of
+    /// wrong that only shows up on acceptance.
+    /// </remarks>
+    [Fact]
+    public async Task AHalfTypedElementNameIsReplacedWhole()
+    {
+        var list = await CompleteAsync("""
+            <Project>
+              <PropertyGroup>
+                <Lang|
+              </PropertyGroup>
+            </Project>
+            """);
+
+        var item = Assert.Single(list!.Items, i => i.Label == "LangVersion");
+        var range = item.TextEdit!.Range;
+
+        Assert.Equal(2, range.Start.Line);
+        Assert.Equal(5, range.Start.Character);
+        Assert.Equal(9, range.End.Character);
+    }
+
+    /// <summary>
+    /// A <c>Directory.Build.props</c> is where these properties belong, more so than any one
+    /// project file — so the values are offered there too. The file names no language, so the
+    /// projects it sits above are asked.
+    /// </summary>
+    [Fact]
+    public async Task APropsFileAboveCSharpProjectsOffersCSharpValues()
+    {
+        Write("App/App.csproj", "<Project />");
+
+        var list = await CompleteAsync("""
+            <Project>
+              <PropertyGroup>
+                <LangVersion>|</LangVersion>
+              </PropertyGroup>
+            </Project>
+            """, "Directory.Build.props");
+
+        Assert.Contains("latest", Labels(list));
+    }
+
+    /// <summary>
+    /// Unanimity or nothing. A tree that mixes languages has no single right list, and the flavour
+    /// gate exists precisely so a value that looks authoritative is never offered where it does not
+    /// apply.
+    /// </summary>
+    [Fact]
+    public async Task APropsFileAboveAMixedTreeOffersNothing()
+    {
+        Write("App/App.csproj", "<Project />");
+        Write("Legacy/Legacy.vbproj", "<Project />");
+
+        var list = await CompleteAsync("""
+            <Project>
+              <PropertyGroup>
+                <LangVersion>|</LangVersion>
+              </PropertyGroup>
+            </Project>
+            """, "Directory.Build.props");
+
+        Assert.Null(list);
+    }
 }

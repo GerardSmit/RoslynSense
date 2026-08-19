@@ -53,6 +53,37 @@ internal static class AppSettingsReferenceService
     }
 
     /// <summary>
+    /// Every configuration file declaring a path, in probe order: the base file first, its
+    /// environment overlays after it, the secrets store last.
+    /// </summary>
+    /// <remarks>
+    /// The keyspace is one file split across several, so a key declared in more than one is
+    /// declared more than once — and which of them wins depends on the environment the
+    /// application runs under, which an editor cannot know. Answering with all of them lets the
+    /// editor show the choice rather than guessing it.
+    /// </remarks>
+    public static LspLocation[] Declarations(string? projectFilePath, string path)
+    {
+        if (projectFilePath is not { Length: > 0 })
+            return [];
+
+        var locations = new List<LspLocation>();
+
+        foreach (string configFile in AppSettingsWorkspace.ConfigurationFilesFor(projectFilePath))
+        {
+            if (AppSettingsDocumentCache.Get(configFile) is { } document
+                && document.Find(path) is { } key)
+            {
+                locations.Add(new LspLocation(
+                    LspConverters.PathToUri(document.FilePath),
+                    LspConverters.ToRange(document.Text.Lines, key.NameSpan)));
+            }
+        }
+
+        return [.. locations];
+    }
+
+    /// <summary>
     /// What "go to definition" on a key should mean: the property it binds to, when one exists —
     /// the one place its name is a symbol rather than a string.
     /// </summary>

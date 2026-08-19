@@ -293,11 +293,6 @@ internal static class WorkspaceDiagnosticsHandler
     }
 
     /// <summary>
-    /// The enabled packs' own files in this project. The C# loop cannot reach them — no markup
-    /// file is a <see cref="Document"/> — so without this a broken <c>OnClick=</c> stays invisible
-    /// until someone opens the page it is on.
-    /// </summary>
-    /// <summary>
     /// The project's <c>web.config</c> or <c>app.config</c>, checked against what it ships.
     /// </summary>
     /// <remarks>
@@ -320,6 +315,11 @@ internal static class WorkspaceDiagnosticsHandler
             BindingRedirectHandler.ToDiagnostics(report));
     }
 
+    /// <summary>
+    /// The enabled packs' own files in this project. The C# loop cannot reach them — no markup
+    /// file is a <see cref="Document"/> — so without this a broken <c>OnClick=</c> stays invisible
+    /// until someone opens the page it is on.
+    /// </summary>
     private static async Task<IReadOnlyList<object>> DiagnosePackFilesAsync(
         Project project,
         IReadOnlyDictionary<string, string> previous,

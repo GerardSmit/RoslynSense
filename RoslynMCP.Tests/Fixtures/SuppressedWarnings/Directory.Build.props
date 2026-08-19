@@ -1,0 +1,12 @@
+<Project>
+
+  <!--
+    The suppression whose reach is the point of this fixture: written once here, it governs both
+    projects beneath it, so a count taken at this file has to cover both and a count taken at either
+    .csproj has to cover only that one.
+  -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);CS0168</NoWarn>
+  </PropertyGroup>
+
+</Project>

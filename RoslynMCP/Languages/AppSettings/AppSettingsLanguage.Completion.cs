@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.AppSettings.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.MetadataConfiguration;
 
 namespace RoslynMCP.Languages.AppSettings;
 
@@ -39,8 +40,12 @@ internal sealed partial class AppSettingsLanguage : ILanguageCompletionProvider
 
         string sectionPath = view.Document.EnclosingAt(offset)?.Path ?? "";
 
+        var external = view.Project is { } project
+            ? await MetadataConfigurationIndex.GetAsync(project, ct)
+            : MetadataConfigurationIndex.Empty;
+
         var items = site.IsName
-            ? NameItems(view, sectionPath)
+            ? NameItems(view, external, sectionPath)
             : ValueItems(view, text, offset, sectionPath);
 
         if (items.Count == 0)
@@ -70,7 +75,8 @@ internal sealed partial class AppSettingsLanguage : ILanguageCompletionProvider
     /// Keys already present are left out; offering what is already there is how a list gets
     /// ignored.
     /// </summary>
-    private static IReadOnlyList<Item> NameItems(AppSettingsView view, string sectionPath)
+    private static IReadOnlyList<Item> NameItems(
+        AppSettingsView view, MetadataConfigurationIndex external, string sectionPath)
     {
         var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -96,22 +102,53 @@ internal sealed partial class AppSettingsLanguage : ILanguageCompletionProvider
             ];
         }
 
-        if (sectionPath.Length > 0)
-            return [];
+        // Every path the application reads under this section, cut to the one segment that comes
+        // next. At the top level that is the sections themselves; inside an unbound section it is
+        // the keys of it — the same question asked one level down, and the level the answer used
+        // to stop at.
+        var segments = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        // The top level of an unbound file: the sections and keys the code reads, deduplicated
-        // to their first segment.
-        var segments = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Offer(string path, string detail)
+        {
+            if (NextSegment(path, sectionPath) is { Length: > 0 } segment
+                && !existing.Contains(segment))
+            {
+                segments.TryAdd(segment, detail);
+            }
+        }
 
         foreach (var usage in view.Index.Usages)
-            segments.Add(FirstSegment(usage.Path));
+            Offer(usage.Path, "read by this solution");
 
         foreach (var binding in view.Index.Bindings)
-            segments.Add(FirstSegment(binding.SectionPath));
+            Offer(binding.SectionPath, "read by this solution");
 
-        segments.ExceptWith(existing);
+        // Sections a referenced package reads inside itself — Kestrel, Logging, Authentication.
+        // The solution's own source never names them, so without this they are the sections you
+        // have to already know about to write down.
+        foreach (var read in external.ReadsOf(MetadataConfigurationKind.Path))
+            Offer(read.Name, "read by " + read.AssemblyName);
 
-        return [.. segments.Select(segment => new Item(segment, KindModule, "read by this solution"))];
+        return [.. segments.Select(segment => new Item(segment.Key, KindModule, segment.Value))];
+    }
+
+    /// <summary>
+    /// The one segment a path contributes directly under a section, or null when the path lies
+    /// somewhere else entirely. The section itself is not a suggestion for its own inside.
+    /// </summary>
+    internal static string? NextSegment(string path, string sectionPath)
+    {
+        if (sectionPath.Length == 0)
+            return FirstSegment(path);
+
+        if (path.Length <= sectionPath.Length + 1
+            || !path.StartsWith(sectionPath, StringComparison.OrdinalIgnoreCase)
+            || path[sectionPath.Length] != ':')
+        {
+            return null;
+        }
+
+        return FirstSegment(path[(sectionPath.Length + 1)..]);
     }
 
     /// <summary>The values a bound property's type admits — booleans and enum members. Other

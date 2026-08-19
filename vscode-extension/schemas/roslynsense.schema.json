@@ -1,0 +1,452 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://roslyn-sense.dev/schemas/roslynsense.schema.json",
+  "title": "RoslynSense configuration",
+  "description": "Settings for RoslynSense. Merged from every layer that applies: the global file in ~/.roslynsense, every roslynsense.json from the filesystem root down to the working directory, each one's roslynsense.local.json sibling, and the personal file ~/.roslynsense keeps for this directory. Nearest wins, field by field.",
+  "type": [
+    "object",
+    "null"
+  ],
+  "properties": {
+    "tools": {
+      "type": "object",
+      "properties": {
+        "webForms": {
+          "type": "boolean",
+          "title": "WebForms",
+          "description": "ASPX, ASCX and master pages: controls, properties and event handlers as C# symbols."
+        },
+        "razor": {
+          "type": "boolean",
+          "title": "Razor",
+          "description": "Razor and Blazor views."
+        },
+        "proto": {
+          "type": "boolean",
+          "title": "Protobuf",
+          "description": "`.proto` files joined to the C# they generate."
+        },
+        "mediator": {
+          "type": "boolean",
+          "title": "Mediator",
+          "description": "Request and handler types joined across a mediator dispatch."
+        },
+        "resources": {
+          "type": "boolean",
+          "title": "Resources",
+          "description": "`.resx` files: which file a resource key lives in, from C# and from markup."
+        },
+        "msBuild": {
+          "type": "boolean",
+          "title": "Project files",
+          "description": "`.csproj`, `.props` and `.targets`."
+        },
+        "dbml": {
+          "type": "boolean",
+          "title": "LINQ to SQL",
+          "description": "`.dbml` designer files."
+        },
+        "appSettings": {
+          "type": "boolean",
+          "title": "appsettings.json",
+          "description": "`appsettings*.json` keys joined to the configuration reads that name them."
+        },
+        "webConfig": {
+          "type": "boolean",
+          "title": "web.config",
+          "description": "`<appSettings>` and `<connectionStrings>` joined to the C# and markup that read them."
+        },
+        "dotSettings": {
+          "type": "boolean",
+          "title": "ReSharper settings",
+          "description": "Whether a committed `.DotSettings` narrows inferred namespaces, search results and coverage."
+        },
+        "debugger": {
+          "type": "boolean",
+          "title": "Debugger",
+          "description": "Launch, breakpoints, stepping and evaluation."
+        },
+        "profiling": {
+          "type": "boolean",
+          "title": "Profiling",
+          "description": "CPU sampling, memory snapshots and coverage."
+        },
+        "database": {
+          "type": "boolean",
+          "title": "Database",
+          "description": "Querying and describing the databases the solution connects to."
+        }
+      },
+      "title": "Language packs",
+      "description": "Which parts of RoslynSense are switched on. Turning one off removes its MCP tools and stops it answering editor requests."
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "autoDiscovery": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Auto-discovery",
+          "description": "Scan the tree for connection strings. Omitted runs the scan only when nothing is registered explicitly. Production-flavoured environment names are never loaded."
+        },
+        "connections": {
+          "type": "object",
+          "title": "Connections",
+          "description": "Explicit connections by alias. Either `provider:connectionString` or an object with `provider` and `connectionString`."
+        }
+      },
+      "title": "Databases",
+      "description": "Which databases the solution can be queried against."
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "preset": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Preset",
+          "description": "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting."
+        },
+        "include": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Include",
+          "description": "Globs relative to the project directory. Empty means every `.resx` outside `bin` and `obj`."
+        },
+        "exclude": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Exclude",
+          "description": "Globs removed from what Include found, applied first."
+        },
+        "overrides": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "rank": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$"
+              }
+            },
+            "required": [
+              "pattern",
+              "rank"
+            ]
+          },
+          "title": "Overrides",
+          "description": "Customization segments beside a base file, such as DNN's `Portal-*`. Replaces the preset's set rather than adding to it."
+        },
+        "conventions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "siblingFolder": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rootFolder": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fixedName": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "suffix": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "title": "Conventions",
+          "description": "Named ways of turning a call-site file into a resx base name. Merged into the preset's by id."
+        },
+        "lookups": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "methodName": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "keyIndex": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$"
+              },
+              "rootSource": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rootInterpretation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rootIndex": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$"
+              },
+              "rootConstant": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "defaultKeySuffix": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fallbacks": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "title": "Lookups",
+          "description": "Call shapes that carry a resource key. Appended to the preset's."
+        },
+        "missingKeyDiagnostic": {
+          "type": "boolean",
+          "title": "Report missing keys",
+          "description": "Report a key that no file of its family declares. Off by default: a false report on a key that resolves fine at runtime is what gets the feature switched off wholesale."
+        }
+      },
+      "title": "Resource lookups",
+      "description": "How `.resx` files are found and which call shapes carry a resource key."
+    },
+    "webConfig": {
+      "type": "object",
+      "properties": {
+        "additionalFiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Additional files",
+          "description": "File names claimed alongside `web.config` and `app.config` — for frameworks that keep their own, such as DotNetNuke's `release.config` and `development.config`. Names only, not paths or globs."
+        }
+      },
+      "title": "web.config files",
+      "description": "Which files the web.config pack treats as Framework configuration."
+    },
+    "debugger": {
+      "type": "object",
+      "properties": {
+        "debuggerDisplay": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "DebuggerDisplay",
+          "description": "Format values using their type's `DebuggerDisplayAttribute`."
+        },
+        "typeProxy": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "DebuggerTypeProxy",
+          "description": "Expand values through their type's `DebuggerTypeProxyAttribute`."
+        },
+        "browsable": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "DebuggerBrowsable",
+          "description": "Honour `DebuggerBrowsableAttribute` when listing members."
+        },
+        "justMyCode": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Just My Code",
+          "description": "Step past `DebuggerStepThrough`, `DebuggerHidden`, `DebuggerNonUserCode`, and code with no symbols."
+        },
+        "rawView": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Raw View",
+          "description": "Offer a Raw View child whenever a proxy or a hidden member means the listed children are not the object's own fields."
+        },
+        "maxChildren": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ],
+          "pattern": "^-?(?:0|[1-9]\\d*)$",
+          "title": "Max children",
+          "description": "How many children of one value to list before truncating. Defaults to 100."
+        }
+      },
+      "title": "Debugger view",
+      "description": "Which `System.Diagnostics` attributes the debug engines honour while inspecting and stepping."
+    },
+    "tableFormat": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "title": "Table format",
+      "description": "How tabular tool output is rendered: `markdown` (default) or `toon`."
+    },
+    "preload": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "title": "Preload",
+      "description": "Solutions or projects to load on startup. Omitted auto-discovers the first solution in the working directory; an empty list disables preloading."
+    },
+    "sharedHost": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "title": "Shared host",
+      "description": "Load each solution once per machine and share it across every editor window and chat, instead of once per client."
+    },
+    "hostIdleMinutes": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ],
+      "pattern": "^-?(?:0|[1-9]\\d*)$",
+      "title": "Host idle timeout",
+      "description": "Minutes the shared host stays alive after its last client disconnects."
+    },
+    "maxWorkspaces": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ],
+      "pattern": "^-?(?:0|[1-9]\\d*)$",
+      "title": "Cached workspaces",
+      "description": "How many loaded solutions one process keeps before evicting the least recently used."
+    }
+  }
+}

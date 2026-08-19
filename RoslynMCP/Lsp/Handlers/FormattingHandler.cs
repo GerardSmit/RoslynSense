@@ -18,7 +18,7 @@ internal static class FormattingHandler
     /// <summary>
     /// textDocument/onTypeFormatting: after ";" the enclosing statement, after "{" or "}" the
     /// construct that brace belongs to — its header and its own braces, never what is between
-    /// them.
+    /// them — and after Enter, the same thing again when the character before it was "{".
     /// </summary>
     /// <remarks>
     /// <para>
@@ -33,19 +33,25 @@ internal static class FormattingHandler
     /// body — an edit the user never asked for, on code they were not typing on.
     /// </para>
     /// <para>
-    /// Newline is deliberately not a trigger. Roslyn's formatter indents lines that contain a
-    /// token, and the line under the caret after Enter contains none — so formatting a span that
-    /// reaches into it removes the indentation the editor had just inserted and the caret jumps
-    /// to column zero. Enter is the editor's job, and the extension gives C# the indentation
-    /// rules it needs to do it (language-configuration/csharp.json).
+    /// Newline is a trigger for one reason only: to finish what "{" started. The editor cancels
+    /// an on-type format the instant the next character arrives, and "{" followed straight away
+    /// by Enter is the normal way to open a block — so the brace-moving edit is exactly the one
+    /// most likely to be thrown away. Enter re-issues it.
+    /// </para>
+    /// <para>
+    /// It re-issues nothing else, and <see cref="WithoutCaretLine"/> enforces that. Roslyn's
+    /// formatter indents lines that contain a token, and the line under the caret after Enter
+    /// contains none — so any span reaching into it comes back as "replace this indentation with
+    /// nothing" and the caret jumps to column zero. That is the bug newline used to cause, and
+    /// the guard is what makes it unable to come back. Indenting the fresh line stays the
+    /// editor's job, off the indentation rules the extension gives C#
+    /// (language-configuration/csharp.json), where it costs no round trip.
     /// </para>
     /// </remarks>
     public static async Task<TextEdit[]> FormatOnTypeAsync(
         DocumentOnTypeFormattingParams p, CancellationToken ct)
     {
-        // Defensive: a client that triggers on newline anyway gets nothing rather than an edit
-        // that unindents it.
-        if (p.Character is not (";" or "}" or "{"))
+        if (p.Character is not (";" or "}" or "{" or "\n" or "\r\n"))
             return Array.Empty<TextEdit>();
 
         var resolved = await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct);
@@ -56,18 +62,40 @@ internal static class FormattingHandler
         if (root is null)
             return Array.Empty<TextEdit>();
 
-        // The caret sits just past the character that was typed.
-        var typed = root.FindToken(Math.Max(0, offset - 1));
-        var spans = p.Character is ";" ? StatementSpans(typed) : BraceSpans(typed);
+        // The caret sits just past the character that was typed — except after Enter, where what
+        // matters is the last token typed before it.
+        var typed = p.Character is "\n" or "\r\n"
+            ? root.FindToken(Math.Max(0, offset - 1)).GetPreviousToken()
+            : root.FindToken(Math.Max(0, offset - 1));
+        var spans = p.Character switch
+        {
+            ";" => StatementSpans(typed),
+            "\n" or "\r\n" => typed.IsKind(SyntaxKind.OpenBraceToken)
+                ? BraceSpans(typed)
+                : Array.Empty<TextSpan>(),
+            _ => BraceSpans(typed),
+        };
         if (spans.Length == 0)
             return Array.Empty<TextEdit>();
 
         var formatted = await Formatter.FormatAsync(document, spans, options: null, cancellationToken: ct);
         var changes = await formatted.GetTextChangesAsync(document, ct);
-        return changes
+        var edits = changes
             .Select(c => new TextEdit(LspConverters.ToRange(text.Lines, c.Span), c.NewText ?? ""))
             .ToArray();
+
+        return p.Character is "\n" or "\r\n" ? WithoutCaretLine(edits, p.Position.Line) : edits;
     }
+
+    /// <summary>
+    /// Nothing, if any edit would touch the line the caret is on. All or none rather than a
+    /// filter: a half-applied brace move is worse than none, and an edit that reaches the caret
+    /// line means the span was wrong, not that one edit was.
+    /// </summary>
+    private static TextEdit[] WithoutCaretLine(TextEdit[] edits, int caretLine) =>
+        edits.Any(e => e.Range.Start.Line <= caretLine && e.Range.End.Line >= caretLine)
+            ? Array.Empty<TextEdit>()
+            : edits;
 
     private static TextSpan[] StatementSpans(SyntaxToken typed)
     {

@@ -33,7 +33,20 @@ Languages/
   Resources/           .resx, and the resource keys C# and markup name
     Core/              the engine: discover, group, read, and resolve a key to a family
     ResourcesLanguage.*.cs
+  DotSettings/         ReSharper and Rider settings layers — answers no request about its own
+                       files, and narrows the answers to requests about other files instead
+    Core/              the engine: unescape, parse, stack the layers, resolve the four keys
+    DotSettingsLanguage.cs
 ```
+
+`DotSettings/` is the other kind of exception, and the opposite one. It owns two extensions and
+implements no provider or contributor at all: nothing asks RoslynSense anything about a
+`.DotSettings`, and if something did, the answer would be XML's. What the file changes is the
+answer to requests about *other* files — which folders make a namespace, which files a search may
+return, which types a coverage run counts — so the work happens at those three call sites and
+reaches the settings through `ReSharperSettings.ForProject`. The pack exists to be the gate: it is
+what a reader looks for when they want to know whether a committed settings file is allowed to move
+those answers, and what they switch off when it should not.
 
 Not every pack is a file type. `Mediator/` owns no extension at all: a request, its handler and the
 call joining them are ordinary C#, and what is missing is the *edge* between them, which Roslyn
@@ -372,12 +385,17 @@ Registration follows from what the language is:
   own — calls `RoslynEmbeddedLanguages.Register` instead. It cannot be a pack; there is nothing for
   a pack to own.
 - **A language Roslyn's detector cannot be made to name** implements `IConfiguredStringLanguage`
-  and answers `Detect` itself. That is the resources pack: `[StringSyntax]` would have to be written
+  and answers `DetectAsync` itself. That is the resources pack: `[StringSyntax]` would have to be written
   into an assembly we do not own, `// lang=` is not what a call site carries, and the unannotated
   well-known-API route is hardcoded to Regex and Json. `DetectAtAsync` asks the configured languages
   only for tokens Roslyn's own detector already declined, so it is one fallback in one method and
   `DetectAsync`/`DetectAllAsync` inherit it. Reject on syntax before binding — a large file
-  otherwise pays a `GetSymbolInfo` per string literal on every diagnostics pass.
+  otherwise pays a `GetSymbolInfo` per string literal on every diagnostics pass. The claim is
+  asynchronous and carries the `Document` because a literal's meaning can depend on a declaration
+  in another project: the configuration packs claim `Config.GetSetting("Test")` by reading the body
+  of the method it is passed to, which needs the solution the semantic model alone does not carry.
+  Anything that walks into another document that way memoises its answer against the syntax tree it
+  read, which the workspace replaces on every edit to that file.
 
 The same self-contained rule as above applies with more force: an embedded literal has no URI, so a
 completion item produced inside one has nothing to route a resolve request back by. Send items

@@ -58,7 +58,7 @@ internal static class Program
                 var response = await HandleAsync(request);
                 Write(response);
 
-                if (request.Op == "terminate")
+                if (request.Op is "terminate" or "shutdown")
                     break;
             }
         }
@@ -160,6 +160,14 @@ internal static class Program
                     response.Variables = await session.VariablesAsync(request.FrameIndex);
                     break;
 
+                case "expand":
+                    response.Variables = await session.ExpandAsync(request.FrameIndex, request.Path ?? "");
+                    break;
+
+                case "displayOptions":
+                    session.DisplayOptions = request.DisplayOptions ?? new DebugDisplayOptions();
+                    break;
+
                 case "evaluate":
                 {
                     var (ok, value, error) = await session.EvaluateAsync(request.FrameIndex, request.Expression ?? "");
@@ -230,6 +238,20 @@ internal static class Program
                 case "exceptionPolicy":
                     session.SetExceptionPolicy(request.Flag);
                     break;
+
+                case "shutdown":
+                {
+                    var timeout = request.TimeoutSeconds > 0
+                        ? TimeSpan.FromSeconds(request.TimeoutSeconds)
+                        : TimeSpan.FromSeconds(10);
+                    var (graceful, error) = await session.ShutdownAsync(timeout);
+
+                    // A debuggee that had to be killed is still a completed request: the caller
+                    // wants to report how the session ended, not to see it fail.
+                    response.Graceful = graceful;
+                    response.Error = error;
+                    break;
+                }
 
                 case "terminate":
                     session.Terminate();

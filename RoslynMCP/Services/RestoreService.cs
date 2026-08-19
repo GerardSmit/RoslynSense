@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using RoslynMCP.Services.Packages;
 
 namespace RoslynMCP.Services;
 
@@ -31,7 +32,7 @@ namespace RoslynMCP.Services;
 /// </para>
 /// <para>
 /// Deliberately not cached beyond the in-flight window. A completed restore leaves
-/// <c>project.assets.json</c> on disk, and <see cref="NeedsRestore"/> reads that file rather than
+/// <c>project.assets.json</c> on disk, and <see cref="DetermineNeed"/> reads that file rather than
 /// any memory of having run: a memo would go on claiming the project was restored after a
 /// <c>git clean</c>, an <c>obj/</c> wipe or a package downgrade, and the failure mode of a stale
 /// "already restored" is a solution that will not resolve anything until the process is restarted.
@@ -64,12 +65,11 @@ internal static class RestoreService
     /// option opt-in for exactly this class of project.
     /// </para>
     /// <para>
-    /// The blast radius is already narrow — legacy projects never reach here at all, since
-    /// <see cref="NeedsRestore"/> skips anything without a <c>project.assets.json</c> to want, and
-    /// <see cref="RestoreTargetFor"/> refuses a solution-level target for a solution containing one
-    /// — so this applies to an all-SDK solution or a lone SDK project. The switch exists for the
-    /// case that narrowing does not cover, so somebody hitting it can rule it out in one
-    /// environment variable instead of a bisect.
+    /// The blast radius is already narrow: this is a dotnet-CLI option, and anything non-SDK —
+    /// which is every project whose restore <see cref="EngineFor"/> hands to the Visual Studio
+    /// MSBuild — never sees it, so it applies to an all-SDK solution or a lone SDK project. The
+    /// switch exists for the case that narrowing does not cover, so somebody hitting it can rule it
+    /// out in one environment variable instead of a bisect.
     /// </para>
     /// </remarks>
     private static readonly bool s_useStaticGraph =
@@ -87,11 +87,12 @@ internal static class RestoreService
     /// </remarks>
     public static async Task EnsureRestoredAsync(string projectPath, CancellationToken cancellationToken)
     {
-        if (!NeedsRestore(projectPath))
+        var need = DetermineNeed(projectPath);
+        if (need == RestoreNeed.None)
             return;
 
-        string target = RestoreTargetFor(projectPath);
-        var run = s_inflight.GetOrAdd(target, RunAsync);
+        string target = RestoreTargetFor(projectPath, need);
+        var run = s_inflight.GetOrAdd(target, key => RunAsync(key, need));
 
         try
         {
@@ -145,7 +146,7 @@ internal static class RestoreService
             try
             {
                 var projects = PathHelper.GetProjectsFromSolution(solutionPath);
-                string? unrestored = projects.FirstOrDefault(NeedsRestore);
+                string? unrestored = projects.FirstOrDefault(p => DetermineNeed(p) != RestoreNeed.None);
                 if (unrestored is null)
                     return;
 
@@ -163,44 +164,149 @@ internal static class RestoreService
         });
     }
 
-    /// <summary>
-    /// Whether this project needs a restore at all: SDK-style, and no <c>project.assets.json</c>.
-    /// </summary>
-    /// <remarks>
-    /// Legacy (non-SDK) projects use <c>packages.config</c> and never produce a
-    /// <c>project.assets.json</c>, so testing for one would restore them on every single call.
-    /// </remarks>
-    private static bool NeedsRestore(string projectPath)
+    /// <summary>What a project wants restored, if anything.</summary>
+    internal enum RestoreNeed
     {
-        string? projectDir = Path.GetDirectoryName(projectPath);
-        if (projectDir is null)
-            return false;
+        /// <summary>Nothing to restore: already restored, or the project has no NuGet graph at all.</summary>
+        None,
 
-        if (PathHelper.RequiresMsBuild(projectPath))
-            return false;
+        /// <summary>A <c>PackageReference</c> restore, which writes <c>obj/project.assets.json</c>.</summary>
+        Assets,
 
-        return !File.Exists(Path.Combine(projectDir, "obj", "project.assets.json"));
+        /// <summary>A <c>packages.config</c> restore, which fills the <c>packages/</c> folder.</summary>
+        PackagesConfig,
     }
 
     /// <summary>
-    /// The owning solution when the project belongs to one, else the project itself.
+    /// What <paramref name="projectPath"/> needs restored before it can resolve its references.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// "Legacy means packages.config" is what this used to assume, and it is how a legacy project
+    /// with <c>PackageReference</c> items — the shape every .NET Framework solution modernised in
+    /// the last several years has, DNN Platform among them — got skipped entirely. That project
+    /// wants an <c>obj/project.assets.json</c> exactly like an SDK one, never got a restore to write
+    /// it, and evaluated with no NuGet graph: every package-provided namespace came back as
+    /// "The type or namespace name 'Extensions' does not exist in the namespace 'Microsoft'", in a
+    /// solution that builds perfectly from the command line.
+    /// </para>
+    /// <para>
+    /// So the question asked here is not "is this project SDK-style" but "which of the two restore
+    /// shapes does this project file actually use", answered from the project's own items. A legacy
+    /// project can want either, and a few want both — <see cref="RestoreNeed.PackagesConfig"/> wins
+    /// there, because the MSBuild restore that serves it also restores the
+    /// <c>PackageReference</c> half in the same pass.
+    /// </para>
+    /// </remarks>
+    internal static RestoreNeed DetermineNeed(string projectPath)
+    {
+        string? projectDir = Path.GetDirectoryName(projectPath);
+        if (projectDir is null)
+            return RestoreNeed.None;
+
+        // packages.config first: it is the one shape whose restore output is not a file in obj/, so
+        // an existing project.assets.json says nothing about whether it has been restored.
+        if (PackagesConfigService.Uses(projectPath) && PackagesConfigNeedsRestore(projectPath))
+            return RestoreNeed.PackagesConfig;
+
+        if (File.Exists(Path.Combine(projectDir, "obj", "project.assets.json")))
+            return RestoreNeed.None;
+
+        // An SDK project always has a NuGet graph, even with no PackageReference of its own: the
+        // framework references come through it, so a missing assets file always means restore.
+        if (!PathHelper.RequiresMsBuild(projectPath))
+            return RestoreNeed.Assets;
+
+        // A legacy project only has one if it actually declares PackageReference items. Read from
+        // the project XML rather than from an evaluation, because this is asked before the project
+        // has ever been loaded — that is the whole point of it.
+        return UsesPackageReference(projectPath) ? RestoreNeed.Assets : RestoreNeed.None;
+    }
+
+    /// <summary>
+    /// Whether the project file declares any <c>PackageReference</c> item, cached on the file's
+    /// identity so repeated loads of one project do not re-read it.
+    /// </summary>
+    /// <remarks>
+    /// A substring test rather than an XML parse, deliberately: the answer only has to be right
+    /// about whether a restore is worth starting, a legacy project file can be several thousand
+    /// lines (DNN's web project is 3,400), and a false positive costs one restore that writes an
+    /// assets file nothing reads while a false negative costs every package reference in the
+    /// project. <c>Directory.Packages.props</c> is not consulted for the same reason: central
+    /// versions describe versions, not whether this project references anything.
+    /// </remarks>
+    private static bool UsesPackageReference(string projectPath) =>
+        PathHelper.FileDerived<bool>.Get(projectPath, static path =>
+        {
+            try
+            {
+                return File.ReadAllText(path)
+                    .Contains("<PackageReference", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        });
+
+    /// <summary>
+    /// Whether any package the project's <c>packages.config</c> lists is missing from the packages
+    /// folder. Checked per package folder because a partially-restored tree is the normal state
+    /// after a package is added by hand.
+    /// </summary>
+    private static bool PackagesConfigNeedsRestore(string projectPath)
+    {
+        try
+        {
+            var entries = PackagesConfigService.Read(projectPath);
+            if (entries.Count == 0)
+                return false;
+
+            string root = PackagesConfigService.PackagesRootFor(projectPath);
+            return entries.Any(e => !Directory.Exists(Path.Combine(root, $"{e.Id}.{e.Version}")));
+        }
+        catch (Exception ex)
+        {
+            // A packages.config that cannot be read is not a reason to refuse to open the project;
+            // it is a reason not to claim it needs restoring.
+            Console.Error.WriteLine(
+                $"[Restore] Could not read packages.config for '{Path.GetFileName(projectPath)}': {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The owning solution when the project belongs to one and the engine that will restore it can
+    /// take a solution, else the project itself.
+    /// </summary>
+    /// <remarks>
+    /// <para>
     /// A solution-wide restore covers every project the <c>.sln</c> lists, so the N-1 loads after
     /// the first find their assets already on disk and never reach <see cref="RunAsync"/>. The
-    /// fallback matters for the cases <c>dotnet restore &lt;sln&gt;</c> cannot serve — a loose
-    /// project with no solution above it, and a project whose solution the CLI refuses because a
-    /// sibling in it is packages.config-era.
+    /// fallback matters for the cases the engine cannot serve — a loose project with no solution
+    /// above it, and a legacy solution when no Visual Studio MSBuild is installed to restore it.
+    /// </para>
+    /// <para>
+    /// A legacy solution used to be refused outright here, on the grounds that
+    /// <c>dotnet restore &lt;sln&gt;</c> chokes on a non-SDK project in it. That is true of the CLI
+    /// and not of the engine now chosen for those solutions: <c>MSBuild.exe -t:Restore</c> restores
+    /// a mixed solution in one graph walk, which is both correct and the cheap way to serve the
+    /// twenty-odd projects a legacy web solution pulls into one closure.
+    /// </para>
     /// </remarks>
-    private static string RestoreTargetFor(string projectPath)
+    private static string RestoreTargetFor(string projectPath, RestoreNeed need)
     {
         try
         {
             string? solution = PathHelper.FindNearestSolution(projectPath);
             if (solution is { Length: > 0 }
-                && !PathHelper.IsLegacySolution(solution)
                 && PathHelper.GetProjectsFromSolution(solution).Any(p =>
-                    string.Equals(Path.GetFullPath(p), Path.GetFullPath(projectPath), StringComparison.OrdinalIgnoreCase)))
+                    string.Equals(Path.GetFullPath(p), Path.GetFullPath(projectPath), StringComparison.OrdinalIgnoreCase))
+                && EngineFor(solution, need) is not null)
             {
                 return Path.GetFullPath(solution);
             }
@@ -214,31 +320,89 @@ internal static class RestoreService
     }
 
     /// <summary>
+    /// Which restore engine can serve <paramref name="target"/>, or <c>null</c> when none can.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The .NET CLI is used wherever it works, because it is on every machine that runs this and it
+    /// carries the static-graph optimisation. It does not work on a non-SDK project: the SDK's
+    /// MSBuild cannot resolve <c>$(MSBuildExtensionsPath)\...\Microsoft.WebApplication.targets</c>
+    /// and the like, so a legacy web project comes back as an evaluation failure rather than as a
+    /// restore.
+    /// </para>
+    /// <para>
+    /// Those go to the Visual Studio MSBuild already located for the legacy <c>BuildHost</c>, which
+    /// is the same engine Visual Studio itself restores them with. When there is none, there is no
+    /// engine — the project could not have been loaded in the first place on that machine.
+    /// </para>
+    /// </remarks>
+    private static RestoreEngine? EngineFor(string target, RestoreNeed need)
+    {
+        bool legacy = need == RestoreNeed.PackagesConfig || PathHelper.RequiresMsBuild(target);
+        if (!legacy)
+            return RestoreEngine.DotnetCli;
+
+        return WorkspaceService.LegacyMsBuildDirectory is { Length: > 0 }
+            ? RestoreEngine.VisualStudioMsBuild
+            : null;
+    }
+
+    /// <summary>The process that runs a restore.</summary>
+    private enum RestoreEngine
+    {
+        /// <summary><c>dotnet restore</c>, for SDK-style targets.</summary>
+        DotnetCli,
+
+        /// <summary><c>MSBuild.exe -t:Restore</c>, for anything non-SDK.</summary>
+        VisualStudioMsBuild,
+    }
+
+    /// <summary>
     /// The restore itself. Uncancellable by design: it is shared by every caller waiting on the
     /// same target, so the first one to give up must not take the others' restore down with it —
     /// <see cref="EnsureRestoredAsync"/> honours each caller's own token while it waits instead.
     /// </summary>
-    private static async Task RunAsync(string target)
+    private static async Task RunAsync(string target, RestoreNeed need)
     {
         // Off the caller's stack: GetOrAdd runs its factory inline, so without this the first
         // caller would run the whole restore synchronously inside the dictionary's update.
         await Task.Yield();
 
-        var watch = Stopwatch.StartNew();
-        Console.Error.WriteLine($"[Restore] Restoring '{Path.GetFileName(target)}'...");
+        if (EngineFor(target, need) is not { } engine)
+        {
+            // Said once, with what to do about it: on a machine with no Visual Studio MSBuild a
+            // legacy project cannot be restored at all, and every package reference in it reads as
+            // a missing assembly. Silence here is how that becomes a bug report about this tool
+            // rather than about the machine.
+            Console.Error.WriteLine(
+                $"[Restore] '{Path.GetFileName(target)}' needs a Visual Studio MSBuild to restore " +
+                "(non-SDK project) and none is installed; its package references will not resolve. " +
+                "Install 'Visual Studio Build Tools' (2017 or later) with the MSBuild component.");
+            return;
+        }
 
-        var (exitCode, output) = await RunOnceAsync(target, staticGraph: s_useStaticGraph);
+        var watch = Stopwatch.StartNew();
+        Console.Error.WriteLine(
+            $"[Restore] Restoring '{Path.GetFileName(target)}'" +
+            $"{(engine == RestoreEngine.VisualStudioMsBuild ? " with MSBuild" : "")}...");
+
+        // Static-graph evaluation is a dotnet-CLI restore option, and is left off for the MSBuild
+        // engine, whose targets are exactly the ones NuGet keeps it opt-in for.
+        bool staticGraph = engine == RestoreEngine.DotnetCli && s_useStaticGraph;
+
+        var (exitCode, output) = await RunOnceAsync(target, staticGraph, engine, need);
         if (exitCode == 0)
         {
             Console.Error.WriteLine(
                 $"[Restore] '{Path.GetFileName(target)}' restored in {watch.ElapsedMilliseconds} ms.");
+            RefreshRestoredProjects(target);
             return;
         }
 
-        if (!s_useStaticGraph)
+        if (!staticGraph)
         {
             Console.Error.WriteLine(
-                $"[Restore] 'dotnet restore \"{target}\"' failed (exit {exitCode}) after " +
+                $"[Restore] Restore of '{Path.GetFileName(target)}' failed (exit {exitCode}) after " +
                 $"{watch.ElapsedMilliseconds} ms.\n{output}");
             return;
         }
@@ -250,20 +414,74 @@ internal static class RestoreService
             $"[Restore] Static-graph restore of '{Path.GetFileName(target)}' failed (exit {exitCode}); " +
             "retrying with the default evaluation.");
 
-        (exitCode, output) = await RunOnceAsync(target, staticGraph: false);
+        (exitCode, output) = await RunOnceAsync(target, staticGraph: false, engine, need);
         if (exitCode == 0)
         {
             Console.Error.WriteLine(
                 $"[Restore] '{Path.GetFileName(target)}' restored in {watch.ElapsedMilliseconds} ms " +
                 "(static-graph evaluation did not apply).");
+            RefreshRestoredProjects(target);
             return;
         }
 
         // Both streams, and the command: a restore failure is nearly always a feed, a credential or
         // a version conflict, and none of those are diagnosable from an exit code.
         Console.Error.WriteLine(
-            $"[Restore] 'dotnet restore \"{target}\"' failed (exit {exitCode}) after " +
+            $"[Restore] Restore of '{Path.GetFileName(target)}' failed (exit {exitCode}) after " +
             $"{watch.ElapsedMilliseconds} ms.\n{output}");
+    }
+
+    /// <summary>
+    /// Drops any cached workspace built before this restore, so the next request reloads the
+    /// projects now that they have a NuGet graph to evaluate against.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ordinary path does not need this: <see cref="EnsureRestoredAsync"/> is awaited before the
+    /// load, so the first evaluation already sees the assets file. The restores that do need it are
+    /// the ones nothing was waiting on — the background solution restore started at bind time, and
+    /// the case that produced it: a project already loaded <em>without</em> a restore, because the
+    /// legacy skip meant it never got one. Those workspaces hold a compilation whose package
+    /// references are unresolved, and nothing else in the process will ever correct them — no file
+    /// the editor watches changed, and the projects' own timestamps did not move.
+    /// </para>
+    /// <para>
+    /// Eviction rather than a targeted reference fix-up, because the difference between the two
+    /// evaluations is not only the metadata references: the analysers, source generators and
+    /// framework closure a restore provides all come out of the same graph.
+    /// </para>
+    /// </remarks>
+    private static void RefreshRestoredProjects(string target)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var projects = PathHelper.IsSolutionFile(target)
+                    ? PathHelper.GetProjectsFromSolution(target)
+                    : (IReadOnlyList<string>)[target];
+
+                int evicted = 0;
+                foreach (string project in projects)
+                {
+                    if (await WorkspaceService.EvictProjectIfLoadedAsync(project))
+                        evicted++;
+                }
+
+                if (evicted > 0)
+                {
+                    Console.Error.WriteLine(
+                        $"[Restore] Evicted {evicted} workspace(s) loaded before the restore of " +
+                        $"'{Path.GetFileName(target)}'; they reload with their NuGet graph.");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Nothing awaits this. A refresh that fails leaves the workspace exactly as stale as
+                // it was before, which is the behaviour this replaced.
+                Console.Error.WriteLine($"[Restore] Post-restore refresh failed: {ex.Message}");
+            }
+        });
     }
 
     /// <summary>
@@ -275,15 +493,32 @@ internal static class RestoreService
     /// The win grows with the reference graph, because the legacy walk re-evaluates a project once
     /// per path that reaches it rather than once in total.
     /// </param>
-    private static async Task<(int ExitCode, string Output)> RunOnceAsync(string target, bool staticGraph)
+    private static async Task<(int ExitCode, string Output)> RunOnceAsync(
+        string target, bool staticGraph, RestoreEngine engine, RestoreNeed need)
     {
+        var (fileName, arguments) = engine switch
+        {
+            // -nr:false so no worker node is left behind holding the project files: a lingering node
+            // keeps handles on the tree, and the next git operation over it fails on them.
+            // RestorePackagesConfig is what makes the packages/ folder half happen at all, and is
+            // inert on a project that has no packages.config.
+            RestoreEngine.VisualStudioMsBuild => (
+                Path.Combine(WorkspaceService.LegacyMsBuildDirectory!, "MSBuild.exe"),
+                $"\"{target}\" -t:Restore -v:quiet -nologo -nr:false"
+                    + (need == RestoreNeed.PackagesConfig ? " -p:RestorePackagesConfig=true" : "")),
+
+            _ => (
+                "dotnet",
+                $"restore \"{target}\" --verbosity quiet"
+                    + (staticGraph ? " /p:RestoreUseStaticGraphEvaluation=true" : "")),
+        };
+
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
-                FileName = "dotnet",
-                Arguments = $"restore \"{target}\" --verbosity quiet"
-                    + (staticGraph ? " /p:RestoreUseStaticGraphEvaluation=true" : ""),
+                FileName = fileName,
+                Arguments = arguments,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,

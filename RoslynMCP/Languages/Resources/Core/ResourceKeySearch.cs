@@ -378,7 +378,7 @@ internal static class ResourceKeySearch
         ResourceSettings settings, ResourceCatalog catalog, Project project,
         SemanticModel semanticModel, CallSite site, CancellationToken ct)
     {
-        if (semanticModel.SyntaxTree.FilePath is not { Length: > 0 } file
+        if (Anchor(semanticModel.SyntaxTree.FilePath) is not { Length: > 0 } file
             || Path.GetDirectoryName(project.FilePath) is not { Length: > 0 } directory)
         {
             return new ResolvedRoot(RootConfidence.Unknown, null, []);
@@ -418,6 +418,20 @@ internal static class ResourceKeySearch
 
         return resolved with { Families = families.ToImmutable() };
     }
+
+    /// <summary>
+    /// The file every convention here is measured from: the syntax tree's, except for a markup
+    /// file's inline code, which is bound through a projection and so has a path of its own.
+    /// </summary>
+    /// <remarks>
+    /// The runtime reads a page's resources from <c>App_LocalResources/Default.aspx.resx</c>, so
+    /// that is the name the <c>local</c> convention has to see. Left as the projection's path it
+    /// would look for <c>Default.aspx.aspx-inline.g.cs.resx</c>, which exists nowhere: the root
+    /// resolved to nothing, and every key in every <c>&lt;%= LocalizeString("…") %&gt;</c> fell
+    /// through to proximity — the same files, found by guessing, and reported as Ambiguous.
+    /// </remarks>
+    private static string? Anchor(string? treePath) =>
+        AspxProjectionService.MarkupPathFor(treePath) ?? treePath;
 
     private static async Task<ResolvedRoot?> ReadAsync(
         ResourceSettings settings, ResourceCatalog catalog, Project project,
@@ -877,8 +891,11 @@ internal static class ResourceKeySearch
         ResourceSettings settings, string filePath, int offset, CancellationToken ct)
     {
         var document = await AspxDocumentService.GetAsync(filePath, ct);
-        if (document is null || AspxSymbolResolver.ResolveAt(document, offset) is not { } hit)
+        if (document is null)
             return null;
+
+        if (AspxSymbolResolver.ResolveAt(document, offset) is not { } hit)
+            return await InlineCodeKeyAsync(settings, document, offset, ct);
 
         var catalog = await ProjectIndexCacheService.GetResourceCatalogAsync(
             document.Project, settings.Discovery, ct);
@@ -886,7 +903,10 @@ internal static class ResourceKeySearch
         if (AspxResourceService.Reference(document, catalog, hit) is not { HasKey: true } reference
             || reference.Form is not (AspxResourceForm.Key or AspxResourceForm.ImplicitKey))
         {
-            return null;
+            // Not a builder and not an implicit-localization attribute, so the remaining way a
+            // markup file names a key is a literal in its inline code — which is where DNN pages
+            // put most of theirs.
+            return await InlineCodeKeyAsync(settings, document, offset, ct);
         }
 
         bool group = reference.Form is AspxResourceForm.ImplicitKey;
@@ -909,6 +929,44 @@ internal static class ResourceKeySearch
         };
     }
 
+    /// <summary>
+    /// A caret in a string literal inside <c>&lt;%= … %&gt;</c>, <c>&lt;%# … %&gt;</c>, a
+    /// <c>&lt;% %&gt;</c> block or a <c>&lt;script runat="server"&gt;</c> — bound through the
+    /// projection, and answered against the markup file the caret is actually in.
+    /// </summary>
+    /// <remarks>
+    /// Hover, F12 and completion already reached this literal, because the markup handlers route a
+    /// code position through the same projection and into the embedded-language providers. Rename
+    /// and find-references did not, because they start here — so a key could be navigated from a
+    /// page and then renamed out from under it.
+    /// </remarks>
+    private static async Task<ResourceKeyTarget?> InlineCodeKeyAsync(
+        ResourceSettings settings, AspxDocument document, int offset, CancellationToken ct)
+    {
+        if (AspxProjectionService.Get(document) is not { } projection
+            || projection.ToProjected(offset) is not { } projected)
+        {
+            return null;
+        }
+
+        if (await CodeKeyAsync(settings, projection.Document, projected, ct) is not { } target
+            || projection.ToAspx(target.Span) is not { } span)
+        {
+            return null;
+        }
+
+        // The markup file, not the projection: every span this target carries is going to be
+        // handed to an editor as a location or an edit, and the projection is a file nobody has
+        // open. The project is the real one for the same reason — `Scope` searches it.
+        return target with
+        {
+            Project = document.Project,
+            FilePath = document.FilePath,
+            Text = document.SourceText,
+            Span = span,
+        };
+    }
+
     /// <summary>A caret in a string literal a configured lookup reads as its key.</summary>
     private static async Task<ResourceKeyTarget?> CodeKeyAsync(
         ResourceSettings settings, string filePath, int offset, Project? project, CancellationToken ct)
@@ -917,7 +975,13 @@ internal static class ResourceKeySearch
                 d => string.Equals(d.FilePath, filePath, StringComparison.OrdinalIgnoreCase))
             ?? await LspDocumentResolver.ResolveAsync(filePath, ct);
 
-        if (document is null || await document.GetSyntaxRootAsync(ct) is not { } root)
+        return document is null ? null : await CodeKeyAsync(settings, document, offset, ct);
+    }
+
+    private static async Task<ResourceKeyTarget?> CodeKeyAsync(
+        ResourceSettings settings, Document document, int offset, CancellationToken ct)
+    {
+        if (await document.GetSyntaxRootAsync(ct) is not { } root)
             return null;
 
         var token = root.FindToken(offset);
@@ -989,7 +1053,7 @@ internal static class ResourceKeySearch
         {
             ct.ThrowIfCancellationRequested();
             complete &= await CodeSitesAsync(settings, target, project, Add, ct);
-            await MarkupSitesAsync(settings, target, project, Add, ct);
+            complete &= await MarkupSitesAsync(settings, target, project, Add, ct);
         }
 
         return ([.. sites], complete);
@@ -1076,7 +1140,12 @@ internal static class ResourceKeySearch
                     continue;
                 }
 
-                if (match.Span.Length < target.Key.Length)
+                // Only a group target measures the site against the key. It rewrites the leading
+                // segment of what the site wrote — `btnSave` out of `btnSave.Text` — so the site
+                // has to have written at least that much. A plain target replaces the literal
+                // whole, and a literal shorter than the key is the normal DNN shape rather than a
+                // problem: `Save.Text` is written `"Save"`, and the suffix goes back on with it.
+                if (target.Group && match.Span.Length < target.Key.Length)
                 {
                     complete = false;
                     continue;
@@ -1092,12 +1161,12 @@ internal static class ResourceKeySearch
         return complete;
     }
 
-    private static async Task MarkupSitesAsync(
+    private static async Task<bool> MarkupSitesAsync(
         ResourceSettings settings, ResourceKeyTarget target, Project project,
         Action<ResourceKeySite> add, CancellationToken ct)
     {
         if (!await AspxReferenceService.HostsWebFormsAsync(project, ct))
-            return;
+            return true;
 
         var written = WrittenForms(settings, target);
         var catalog = await ProjectIndexCacheService.GetResourceCatalogAsync(
@@ -1157,6 +1226,88 @@ internal static class ResourceKeySearch
                 }
             }
         }
+
+        return await InlineCodeSitesAsync(settings, target, project, add, ct);
+    }
+
+    /// <summary>
+    /// Key literals in markup inline code — <c>&lt;%= LocalizeString("Common.Header") %&gt;</c>,
+    /// and every <c>Localization.GetString</c> call a page writes into its own markup.
+    /// </summary>
+    /// <remarks>
+    /// Bound rather than matched by text, exactly as the <c>.cs</c> pass is: a page that mentions
+    /// the key in a JavaScript string is not a site, and a rename applies whatever this returns.
+    /// The whole project's markup goes into one forked compilation — the same projection a symbol
+    /// find-references uses — because a fork per page would cost a compilation per page.
+    /// </remarks>
+    private static async Task<bool> InlineCodeSitesAsync(
+        ResourceSettings settings, ResourceKeyTarget target, Project project,
+        Action<ResourceKeySite> add, CancellationToken ct)
+    {
+        if (settings.Lookups.IsDefaultOrEmpty
+            || await AspxProjectionService.GetProjectAsync(project, ct) is not { } projection)
+        {
+            return true;
+        }
+
+        var written = WrittenForms(settings, target);
+        var catalog = await ProjectIndexCacheService.GetResourceCatalogAsync(
+            project, settings.Discovery, ct);
+        bool complete = true;
+
+        foreach (var document in projection.Documents)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var text = await document.GetTextAsync(ct);
+            if (!Mentions(text, written) || await document.GetSyntaxRootAsync(ct) is not { } root)
+                continue;
+
+            SemanticModel? semanticModel = null;
+
+            foreach (var token in root.DescendantTokens())
+            {
+                if (!token.IsKind(SyntaxKind.StringLiteralToken) || !Plausible(token.ValueText, target))
+                    continue;
+
+                semanticModel ??= await document.GetSemanticModelAsync(ct);
+                if (semanticModel is null)
+                    break;
+
+                if (await KeyAtAsync(settings, catalog, project, semanticModel, token, ct)
+                        is not { } match
+                    || !Covers(target, match.Key)
+                    || !Intersects(match.Candidates, target.Families))
+                {
+                    continue;
+                }
+
+                if (target.Group && match.Span.Length < target.Key.Length)
+                {
+                    complete = false;
+                    continue;
+                }
+
+                var span = target.Group
+                    ? new TextSpan(match.Span.Start, target.Key.Length)
+                    : match.Span;
+
+                // A literal the projection cannot map back sits in scaffolding this server wrote,
+                // not in the page — so there is nothing in the file to rewrite, and saying the
+                // collection is complete would let a rename proceed without it.
+                if (projection.ToMarkup(document.Id, span) is not { } mapped)
+                {
+                    complete = false;
+                    continue;
+                }
+
+                add(new ResourceKeySite(
+                    mapped.FilePath, mapped.Text, mapped.Span,
+                    target.Group ? null : match.Suffix));
+            }
+        }
+
+        return complete;
     }
 
     /// <summary>

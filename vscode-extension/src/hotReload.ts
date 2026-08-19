@@ -36,6 +36,19 @@ let boundProject: string | undefined;
 /// about to move.
 let inFlight: Promise<void> = Promise.resolve();
 
+/// Drives the debug toolbar button: true once an edit has landed that the running process has
+/// not seen yet. Mirrored into a context key because `when` clauses are the only way a menu
+/// contribution can read extension state.
+let pending = false;
+
+function setPending(value: boolean): void {
+    if (pending === value) {
+        return;
+    }
+    pending = value;
+    void vscode.commands.executeCommand('setContext', 'roslynSense.hotReload.pending', value);
+}
+
 export function registerHotReload(
     context: vscode.ExtensionContext,
     getClient: () => LanguageClient | undefined
@@ -66,7 +79,29 @@ export function registerHotReload(
             });
             diagnostics.clear();
             boundProject = undefined;
+            setPending(false);
             void vscode.window.showInformationMessage('Hot reload session closed.');
+        }),
+
+        // An edit is only interesting once a session exists to apply it to. The button appearing
+        // is the whole notification, so nothing else announces the change.
+        vscode.workspace.onDidChangeTextDocument((event) => {
+            if (!boundProject || event.contentChanges.length === 0) {
+                return;
+            }
+            if (event.document.languageId !== 'csharp' || event.document.uri.scheme !== 'file') {
+                return;
+            }
+            setPending(true);
+        }),
+
+        // The toolbar goes away with the last session, and its process took the applied state
+        // with it; a stale button on the next F5 would offer to apply edits that are already
+        // in the freshly built output.
+        vscode.debug.onDidTerminateDebugSession(() => {
+            if (!vscode.debug.activeDebugSession) {
+                setPending(false);
+            }
         }),
 
         // Apply-on-save is the whole point of the feature for the ASP.NET inner loop: edit, save,
@@ -123,6 +158,11 @@ export async function withHotReloadEnvironment(
         // output matches the source, so the baseline predates the user's next edit. Failure is
         // non-fatal — the first apply retries.
         if (projectPath) {
+            // Binding here rather than at the first apply is what lets an edit made straight
+            // after F5 light the toolbar button: until a project is bound there is no session
+            // to attribute the change to.
+            boundProject = projectPath;
+            setPending(false);
             void client
                 .sendRequest<HotReloadResult>('roslynSense/hotReloadStart', { projectPath })
                 .catch(() => undefined);
@@ -155,6 +195,8 @@ async function apply(
     publish(diagnostics, result);
 
     if (result.ok) {
+        setPending(false);
+
         // A silent success on every save would be noise; an explicit invocation deserves an answer.
         if (explicit || result.appliedTo.length > 0) {
             void vscode.window.setStatusBarMessage(`$(zap) ${result.summary}`, 4000);

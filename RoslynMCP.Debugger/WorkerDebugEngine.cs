@@ -133,7 +133,10 @@ public sealed class WorkerDebugEngine : IDebugEngine
         }
     }
 
-    private async Task<WorkerResponse> SendAsync(WorkerRequest request)
+    private Task<WorkerResponse> SendAsync(WorkerRequest request) =>
+        SendAsync(request, RequestTimeout);
+
+    private async Task<WorkerResponse> SendAsync(WorkerRequest request, TimeSpan timeout)
     {
         if (_disposed != 0 || _worker.HasExited)
             throw new InvalidOperationException("the debug worker is not running");
@@ -152,7 +155,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
 
         try
         {
-            var response = await waiter.Task.WaitAsync(RequestTimeout);
+            var response = await waiter.Task.WaitAsync(timeout);
             return response.Ok
                 ? response
                 : throw new InvalidOperationException(
@@ -233,6 +236,18 @@ public sealed class WorkerDebugEngine : IDebugEngine
 
     public async Task<List<DebugVariable>> VariablesAsync(uint frameIndex) =>
         (await SendAsync(new WorkerRequest { Op = "variables", FrameIndex = frameIndex })).Variables ?? [];
+
+    public async Task<List<DebugVariable>> ExpandAsync(uint frameIndex, string path) =>
+        (await SendAsync(new WorkerRequest { Op = "expand", FrameIndex = frameIndex, Path = path }))
+        .Variables ?? [];
+
+    /// <summary>
+    /// Forwards the display policy to the worker's engine. Fire-and-forget, like the other
+    /// void commands: the settings are applied before anything can be inspected, and a worker
+    /// that cannot take them has already failed louder elsewhere.
+    /// </summary>
+    public void SetDisplayOptions(DebugDisplayOptions options) =>
+        Send(new WorkerRequest { Op = "displayOptions", DisplayOptions = options });
 
     public async Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression)
     {
@@ -355,6 +370,27 @@ public sealed class WorkerDebugEngine : IDebugEngine
 
     public void SetExceptionPolicy(bool breakOnFirstChance) =>
         Send(new WorkerRequest { Op = "exceptionPolicy", Flag = breakOnFirstChance });
+
+    public async Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout)
+    {
+        try
+        {
+            // The worker runs the shutdown and only answers once the debuggee is gone, so this
+            // wait has to outlast the timeout it was given rather than the usual request budget.
+            var response = await SendAsync(
+                new WorkerRequest { Op = "shutdown", TimeoutSeconds = timeout.TotalSeconds },
+                timeout + TimeSpan.FromSeconds(10));
+            return (response.Graceful, response.Error);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+        finally
+        {
+            Dispose();
+        }
+    }
 
     public void Terminate()
     {

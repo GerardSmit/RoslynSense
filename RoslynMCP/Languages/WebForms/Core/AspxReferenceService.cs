@@ -86,6 +86,7 @@ internal static class AspxReferenceService
                 continue;
 
             CollectMarkup(document, root, definition, results);
+            await CollectBindingPathsAsync(document, definition, results, ct);
         }
 
         results.AddRange(await CollectCodeAsync(symbol, project, ct));
@@ -118,6 +119,7 @@ internal static class AspxReferenceService
         AspxDocument document, ISymbol symbol, CancellationToken ct)
     {
         var results = FindInDocument(document, symbol);
+        await CollectBindingPathsAsync(document, symbol.OriginalDefinition, results, ct);
 
         if (AspxProjectionService.Get(document) is not { } projection)
             return results;
@@ -145,6 +147,46 @@ internal static class AspxReferenceService
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// The segments of <c>Eval("Buyer.Name")</c> and its long-hands that name
+    /// <paramref name="symbol"/>.
+    /// </summary>
+    /// <remarks>
+    /// A path is a string, so Roslyn's reference search over the projection cannot see it, and
+    /// nothing else in this class can either: the name is matched against a type the markup only
+    /// implies. Reporting it here is what makes F12 on a path and find-references of the property
+    /// agree — and what makes renaming the property rewrite the paths that read it, instead of
+    /// leaving markup that compiles and then throws at render time.
+    /// </remarks>
+    private static async Task CollectBindingPathsAsync(
+        AspxDocument document, ISymbol symbol, List<AspxReference> results, CancellationToken ct)
+    {
+        // The only members a path can name. Anything else spares the item-type deduction below,
+        // which reads the code-behind.
+        if (symbol is not (IPropertySymbol or IFieldSymbol))
+            return;
+
+        // A path that names this member spells its name, case aside — DataBinder's lookup goes
+        // through TypeDescriptor. Without this a find-references would deduce the item type of
+        // every binding in every markup file that got this far, to answer no.
+        if (!document.Text.Contains(symbol.Name, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        foreach (var argument in DataBindingService.AllArguments(document.Text))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (await DataBindingService.ItemTypeAsync(document, argument.Start, ct) is not { } itemType)
+                continue;
+
+            foreach (var segment in DataBindingService.Segments(document.Text, argument, itemType))
+            {
+                if (Same(segment.Symbol, symbol))
+                    results.Add(new AspxReference(document.FilePath, segment.Span, document.SourceText));
+            }
+        }
     }
 
     private static void CollectMarkup(

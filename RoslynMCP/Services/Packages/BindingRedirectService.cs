@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Xml.Linq;
 using RoslynMCP.Services.ProjectModel;
 
@@ -140,6 +141,117 @@ public static class BindingRedirectService
     }
 
     /// <summary>
+    /// The same report, reused while neither the config nor the clock has moved.
+    /// </summary>
+    /// <remarks>
+    /// For the code lens, which the client re-requests on every scroll and every keystroke in the
+    /// file — where <see cref="AnalyzeAsync"/> is a directory walk over <c>bin</c> and
+    /// <c>packages</c> per request. Invalidated by the config file's own write time, so a fix or an
+    /// edit is reflected at once; the timer is what eventually catches a rebuild, which changes
+    /// what ships without touching the config at all.
+    /// </remarks>
+    internal static async Task<BindingRedirectReport> CachedAnalyzeAsync(
+        string projectPath, CancellationToken ct)
+    {
+        var stamp = ConfigStamp(ConfigPathFor(projectPath));
+
+        if (s_reports.TryGetValue(projectPath, out var cached) &&
+            cached.Stamp == stamp &&
+            DateTime.UtcNow - cached.ReadAtUtc <= TimeSpan.FromSeconds(15))
+        {
+            return cached.Report;
+        }
+
+        var report = await AnalyzeAsync(projectPath, ct);
+        s_reports[projectPath] = (stamp, DateTime.UtcNow, report);
+
+        return report;
+    }
+
+    private static (DateTime Write, long Length) ConfigStamp(string? configPath)
+    {
+        try
+        {
+            return configPath is { Length: > 0 } && new FileInfo(configPath) is { Exists: true } info
+                ? (info.LastWriteTimeUtc, info.Length)
+                : default;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return default;
+        }
+    }
+
+    /// <inheritdoc cref="CachedAnalyzeAsync"/>
+    private static readonly ConcurrentDictionary<
+        string, ((DateTime Write, long Length) Stamp, DateTime ReadAtUtc, BindingRedirectReport Report)>
+        s_reports = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The findings a rewrite can actually resolve.
+    /// </summary>
+    /// <remarks>
+    /// An orphan is not repaired: nothing is broken by a redirect for an assembly that is no
+    /// longer shipped, and removing one is a judgement about intent — the reference may be coming
+    /// back, or be loaded reflectively from a path this never sees. An unsigned assembly is not
+    /// repaired either, because there is no identity to redirect.
+    /// </remarks>
+    internal static IEnumerable<BindingRedirectFinding> Fixable(
+        IEnumerable<BindingRedirectFinding> findings) =>
+        findings
+            .Where(f => f.Problem is BindingRedirectProblem.Stale
+                or BindingRedirectProblem.Missing
+                or BindingRedirectProblem.Narrow)
+            .Where(f => f.PublicKeyToken is { Length: > 0 });
+
+    /// <summary>
+    /// What the project ships, by simple assembly name — the version a redirect in its config
+    /// ought to be naming.
+    /// </summary>
+    /// <remarks>
+    /// By simple name rather than by full identity because the caller is a hover over an
+    /// <c>assemblyIdentity</c>'s <c>name</c>, which is all the reader has pointed at. Where a
+    /// folder holds two of the same name the highest version wins, matching what the comparison
+    /// treats as shipping.
+    /// </remarks>
+    public static async Task<IReadOnlyDictionary<string, AssemblyFileInfo>> InstalledAsync(
+        string projectPath, CancellationToken ct)
+    {
+        if (s_installed.TryGetValue(projectPath, out var cached) && !cached.IsStale)
+            return cached.Assemblies;
+
+        var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
+
+        var byName = new Dictionary<string, AssemblyFileInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in evaluation is null ? [] : Shipped(projectPath, evaluation))
+        {
+            if (!byName.TryGetValue(file.Identity.Name, out var existing) ||
+                file.Identity.Version > existing.Identity.Version)
+            {
+                byName[file.Identity.Name] = file;
+            }
+        }
+
+        s_installed[projectPath] = new InstalledCache(byName, DateTime.UtcNow);
+        return byName;
+    }
+
+    /// <summary>
+    /// Hover asks this on every mouse rest, and answering means a metadata read of every assembly
+    /// in <c>bin</c> and <c>packages</c>. The window is short enough that a build finishing during
+    /// it is not a case worth designing for, and the diagnostics path is deliberately left
+    /// uncached so the squiggles still answer from what is on disk right now.
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, InstalledCache> s_installed =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed record InstalledCache(
+        IReadOnlyDictionary<string, AssemblyFileInfo> Assemblies, DateTime ReadAtUtc)
+    {
+        public bool IsStale => DateTime.UtcNow - ReadAtUtc > TimeSpan.FromSeconds(15);
+    }
+
+    /// <summary>
     /// The config with every fixable finding resolved.
     /// </summary>
     /// <remarks>
@@ -150,15 +262,7 @@ public static class BindingRedirectService
     internal static (string? Text, IReadOnlyList<BindingRedirectFinding> Applied) Rewrite(
         string xml, IReadOnlyList<BindingRedirectFinding> findings)
     {
-        // An orphan is not repaired: nothing is broken by a redirect for an assembly that is no
-        // longer shipped, and removing one is a judgement about intent — the reference may be
-        // coming back, or be loaded reflectively from a path this never sees.
-        var applicable = findings
-            .Where(f => f.Problem is BindingRedirectProblem.Stale
-                or BindingRedirectProblem.Missing
-                or BindingRedirectProblem.Narrow)
-            .Where(f => f.PublicKeyToken is { Length: > 0 })
-            .ToList();
+        var applicable = Fixable(findings).ToList();
 
         if (applicable.Count == 0)
             return (null, []);
@@ -256,15 +360,7 @@ public static class BindingRedirectService
     {
         try
         {
-            var document = XDocument.Load(configPath, LoadOptions.SetLineInfo);
-
-            return document.Root?
-                .Elements("runtime")
-                .Elements(s_asm + "assemblyBinding")
-                .Elements(s_asm + "dependentAssembly")
-                .Select(Parse)
-                .OfType<ConfiguredRedirect>()
-                .ToList() ?? [];
+            return Redirects(XDocument.Load(configPath, LoadOptions.SetLineInfo));
         }
         catch (Exception ex)
         {
@@ -274,6 +370,32 @@ public static class BindingRedirectService
             return [];
         }
     }
+
+    /// <summary>
+    /// The same, from text the caller already has — an editor buffer, which is what a hover has to
+    /// answer about. Silent on malformed XML rather than logged: a config being typed into is
+    /// unparseable half the time, and that is not news.
+    /// </summary>
+    internal static IReadOnlyList<ConfiguredRedirect> ReadText(string xml)
+    {
+        try
+        {
+            return Redirects(XDocument.Parse(xml, LoadOptions.SetLineInfo));
+        }
+        catch (System.Xml.XmlException)
+        {
+            return [];
+        }
+    }
+
+    private static IReadOnlyList<ConfiguredRedirect> Redirects(XDocument document) =>
+        document.Root?
+            .Elements("runtime")
+            .Elements(s_asm + "assemblyBinding")
+            .Elements(s_asm + "dependentAssembly")
+            .Select(Parse)
+            .OfType<ConfiguredRedirect>()
+            .ToList() ?? [];
 
     private static ConfiguredRedirect? Parse(XElement dependentAssembly)
     {
@@ -338,12 +460,52 @@ public static class BindingRedirectService
             if (!seen.Add(Path.GetFileName(path)))
                 continue;
 
-            if (AssemblyIdentityReader.Read(path) is { } info)
+            if (Identity(path) is { } info)
                 files.Add(info);
         }
 
         return files;
     }
+
+    /// <summary>
+    /// One assembly's identity, read once per version of the file on disk.
+    /// </summary>
+    /// <remarks>
+    /// A <c>packages</c> folder holds thousands of assemblies and none of them changes, but every
+    /// pass over them used to be a full metadata read each — paid again on every diagnostics pull
+    /// and every code lens request. Keyed on write time and length rather than on a timer, so a
+    /// rebuilt output assembly is re-read the moment it changes and an untouched package is never
+    /// read twice.
+    /// </remarks>
+    internal static AssemblyFileInfo? Identity(string path)
+    {
+        FileInfo info;
+        try
+        {
+            info = new FileInfo(path);
+            if (!info.Exists)
+                return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+
+        var stamp = (info.LastWriteTimeUtc, info.Length);
+
+        if (s_identities.TryGetValue(info.FullName, out var cached) && cached.Stamp == stamp)
+            return cached.Info;
+
+        var read = AssemblyIdentityReader.Read(path);
+        s_identities[info.FullName] = (stamp, read);
+
+        return read;
+    }
+
+    /// <inheritdoc cref="Identity"/>
+    private static readonly ConcurrentDictionary<
+        string, ((DateTime Write, long Length) Stamp, AssemblyFileInfo? Info)> s_identities =
+        new(StringComparer.OrdinalIgnoreCase);
 
     private static IEnumerable<string> ProbePaths(string projectPath, ProjectEvaluation evaluation)
     {

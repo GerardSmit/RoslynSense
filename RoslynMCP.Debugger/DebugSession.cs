@@ -12,7 +12,7 @@ namespace RoslynMCP.Debugger;
 /// long-lived session thread (the runtime ties the debugger context to it); managed callbacks
 /// arrive on the runtime's own thread and push events. The debuggee stops on every callback; we
 /// auto-continue all but breakpoints/step-completes/pauses (which wait for an explicit Continue).
-public sealed class DebugSession : IDebugSession
+public sealed partial class DebugSession : IDebugSession
 {
     public uint Id { get; }
     public int Pid { get; private set; }
@@ -48,6 +48,10 @@ public sealed class DebugSession : IDebugSession
     private CorDebugProcess? _process;
     private CorDebugThread? _stoppedThread;
     private SuspendedProcess? _child;
+    /// Completed when the debuggee's process is gone, so a shutdown can wait for the real thing
+    /// rather than guess at how long its <c>StopAsync</c> takes.
+    private readonly TaskCompletionSource _exited =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Exception? _launchError;
     private Thread? _thread;
     private DebugRuntime _runtime = DebugRuntime.NetFramework;
@@ -428,6 +432,7 @@ public sealed class DebugSession : IDebugSession
             var stepper = frame.CreateStepper();
             stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
             stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            _stepOutBudget = MaxStepOuts;
             var source = frame is CorDebugILFrame ilFrame && TryGetSourceStepRange(ilFrame, out var range)
                 ? (COR_DEBUG_STEP_RANGE?)range
                 : null;
@@ -451,7 +456,8 @@ public sealed class DebugSession : IDebugSession
                     stepper.Step(false);
                     break;
             }
-            _steppers.Add(stepper);
+            lock (_stepperLock)
+                _steppers.Add(stepper);
             _stoppedThread = null;
             _process?.Continue(false);
         }
@@ -546,9 +552,7 @@ public sealed class DebugSession : IDebugSession
         if (frame is not CorDebugILFrame ilFrame)
             return variables;
 
-        var (argNames, localNames) = FrameSymbolNames(ilFrame);
-        AppendValues(variables, "arg", Safe(() => ilFrame.Arguments), argNames);
-        AppendValues(variables, "local", Safe(() => ilFrame.LocalVariables), localNames);
+        variables.AddRange(FrameVariables(ilFrame));
         return variables;
     });
 
@@ -732,7 +736,7 @@ public sealed class DebugSession : IDebugSession
         var value = ResolvePath(ilFrame, path, out _);
         if (value is null)
             return true; // unresolvable → fail-open
-        var actual = DescribeValue(value);
+        var actual = DescribeValue(value, applyDisplay: false);
         if (expected is null)
             return actual is not ("null" or "False" or "false" or "0");
 
@@ -780,7 +784,14 @@ public sealed class DebugSession : IDebugSession
             }
             else
             {
-                current = MemberValue(current!, name, isCall, out error);
+                // '$raw' and '$proxy' are the two segments that are not members: they select which
+                // *view* of the value the rest of the path walks through.
+                current = name switch
+                {
+                    RawMarker => current,
+                    ProxyMarker => ProxyValue(current!, out error),
+                    _ => MemberValue(current!, name, isCall, out error),
+                };
                 if (current is null)
                     return null;
             }
@@ -933,7 +944,16 @@ public sealed class DebugSession : IDebugSession
     /// callbacks arrive on the runtime's own thread. The debuggee is left stopped exactly where it
     /// was, because the callback is excluded from the auto-continue in <c>OnAnyEvent</c>.
     /// </remarks>
-    private CorDebugValue? InvokeFunction(CorDebugFunction function, CorDebugValue[] args, out string error)
+    private CorDebugValue? InvokeFunction(CorDebugFunction function, CorDebugValue[] args, out string error) =>
+        RunEval(eval => eval.CallFunction(function.Raw, args.Length, args.Select(a => a.Raw).ToArray()), out error);
+
+    /// <summary>
+    /// Runs one evaluation in the debuggee — a call, or a constructor for a debugger view type —
+    /// and returns what it produced.
+    /// </summary>
+    /// <param name="start">Arms the evaluation. Called before the process is resumed; whatever it
+    /// throws is reported rather than left to hang the waiting caller.</param>
+    private CorDebugValue? RunEval(Action<CorDebugEval> start, out string error)
     {
         error = string.Empty;
 
@@ -964,7 +984,7 @@ public sealed class DebugSession : IDebugSession
 
         try
         {
-            eval.CallFunction(function.Raw, args.Length, args.Select(a => a.Raw).ToArray());
+            start(eval);
             process.Continue(false);
 
             if (!done.Wait(EvalTimeout))
@@ -1092,6 +1112,83 @@ public sealed class DebugSession : IDebugSession
         return value;
     }
 
+    /// <summary>
+    /// Ends the session by letting the debuggee shut itself down, and terminates it only if that
+    /// does not finish in time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="Terminate"/> kills the process where it stands: no <c>finally</c> blocks, no
+    /// <c>Dispose</c>, and — the reason this exists — no <c>StopAsync</c> on any hosted service,
+    /// so an app under the debugger never gets the orderly shutdown it gets everywhere else.
+    /// </para>
+    /// <para>
+    /// The order matters. The target is almost always sitting at a breakpoint when a session is
+    /// stopped, so its breakpoints are disarmed and its exception policy relaxed before it is
+    /// resumed — otherwise the shutdown path would trap on the first breakpoint it crossed and
+    /// the process would sit there until the timeout killed it.
+    /// </para>
+    /// </remarks>
+    /// <returns>Whether the debuggee exited on its own, and why not when it did not.</returns>
+    public async Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout)
+    {
+        var child = _child;
+        if (child is null)
+        {
+            // An attached process was not ours to start and is not ours to end; the caller should
+            // be detaching from it instead.
+            Terminate();
+            return (false, "the debuggee was attached to, not launched by this session");
+        }
+
+        if (_thread is not null && !_exited.Task.IsCompleted)
+        {
+            try
+            {
+                await InvokeAsync(() =>
+                {
+                    _breakOnFirstChance = false;
+
+                    foreach (var breakpoint in _bound.Values)
+                    {
+                        try { breakpoint?.Activate(false); } catch { }
+                    }
+                    _bound.Clear();
+                    _boundSpecs.Clear();
+                    lock (_stepperLock)
+                        lock (_stepperLock)
+                _steppers.Clear();
+                    lock (_specLock) _specs.Clear();
+
+                    _stoppedThread = null;
+                    try { _process?.Continue(false); } catch { /* already running */ }
+                    return true;
+                }).WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (Exception ex)
+            {
+                Terminate();
+                return (false, $"the debuggee could not be resumed to shut down: {ex.Message}");
+            }
+        }
+
+        if (!child.RequestShutdown())
+        {
+            Terminate();
+            return (false, "the debuggee could not be signalled to shut down");
+        }
+
+        var exited = await Task.WhenAny(_exited.Task, Task.Delay(timeout)) == _exited.Task;
+
+        // Either way the session is over: on the graceful path this only reclaims the debugging
+        // interface, which the exit callback does not do on its own.
+        Terminate();
+
+        return exited
+            ? (true, string.Empty)
+            : (false, $"the debuggee did not exit within {timeout.TotalSeconds:0.#}s and was terminated");
+    }
+
     public void Terminate()
     {
         Enqueue(() =>
@@ -1118,6 +1215,12 @@ public sealed class DebugSession : IDebugSession
         {
             try { thread.Join(TimeSpan.FromSeconds(5)); } catch { }
         }
+
+        // A debuggee that exited on its own closed the command queue from its exit callback, so
+        // the work queued above never ran. The interface must still be released — see
+        // ShutdownCorDebug for what a session that skips it does to the next one — and with the
+        // session thread joined and the target gone, nothing is left to race here.
+        ShutdownCorDebug();
     }
 
     /// <summary>
@@ -1160,7 +1263,8 @@ public sealed class DebugSession : IDebugSession
             }
             _bound.Clear();
             _boundSpecs.Clear();
-            _steppers.Clear();
+            lock (_stepperLock)
+                _steppers.Clear();
             _stoppedThread = null;
             process.Detach();
             _process = null;
@@ -1304,6 +1408,17 @@ public sealed class DebugSession : IDebugSession
             };
             callback.OnStepComplete += (_, e) =>
             {
+                // Landing in a DebuggerStepThrough method, a framework module, or code with no
+                // symbols is not a stop the user asked for: step out and keep going, exactly as
+                // Just My Code does in Visual Studio.
+                if (_display.JustMyCode && !IsUserFrame(e.Thread) && TryStepOutOfNonUserCode(e.Thread))
+                {
+                    _stoppedThread = null;
+                    try { e.Controller.Continue(false); }
+                    catch { /* already continued / terminated */ }
+                    return;
+                }
+
                 _stoppedThread = e.Thread;
                 var (file, line, column) = ThreadLocation(e.Thread);
                 Emit(DebugEventKind.Step, "step", MethodOf(e.Thread), ThreadId(e.Thread), file, line, column);
@@ -1331,6 +1446,7 @@ public sealed class DebugSession : IDebugSession
             callback.OnExitProcess += (_, _) =>
             {
                 Emit(DebugEventKind.Exited, "process exited", string.Empty, 0);
+                _exited.TrySetResult();
                 _events.Writer.TryComplete();
                 try { _commands.CompleteAdding(); } catch { }
             };
@@ -3049,23 +3165,26 @@ public sealed class DebugSession : IDebugSession
         }
     }
 
-    private static void AppendValues(
+    private void AppendValues(
         List<DebugVariable> into, string kind, CorDebugValue[]? values, Dictionary<int, string> names)
     {
         if (values is null)
             return;
         for (var i = 0; i < values.Length; i++)
         {
-            into.Add(new DebugVariable
-            {
-                Name = names.TryGetValue(i, out var name) ? name : $"{kind}{i}",
-                Value = DescribeValue(values[i]),
-                Kind = kind,
-            });
+            var name = names.TryGetValue(i, out var symbol) ? symbol : $"{kind}{i}";
+            into.Add(Row(name, values[i], kind, name));
         }
     }
 
-    private static string DescribeValue(CorDebugValue value)
+    /// <summary>
+    /// The one-line rendering of a value: its literal for a primitive or string, its
+    /// <c>DebuggerDisplay</c> when its type asks for one, and its type name otherwise.
+    /// </summary>
+    /// <param name="applyDisplay">Whether <c>DebuggerDisplay</c> may run. Off wherever the string
+    /// is compared rather than read — a breakpoint condition tests <c>state == "Open"</c> against
+    /// the value, not against whatever the type would like that value to look like.</param>
+    private string DescribeValue(CorDebugValue value, bool applyDisplay = true)
     {
         try
         {
@@ -3082,6 +3201,12 @@ public sealed class DebugSession : IDebugSession
             var scalar = TryReadScalar(dereferenced);
             if (scalar is not null)
                 return scalar;
+            if (applyDisplay && DisplayStringFor(value) is { } display)
+                return display;
+            // No display string: the type's own name says more than the element type ("Class")
+            // the runtime reports for every object alike.
+            if (TypeNameOf(value) is { Length: > 0 } typeName)
+                return typeName;
             return Safe(() => dereferenced.Type.ToString()) ?? "?";
         }
         catch
@@ -3187,6 +3312,14 @@ public sealed class DebugSession : IDebugSession
             BreakpointId = breakpointId,
             ProcessId = Pid,
         });
+
+    /// <summary>Runs a call whose failure changes nothing — a cleanup, or a hint the runtime is
+    /// free to refuse.</summary>
+    private static void Try(Action action)
+    {
+        try { action(); }
+        catch { }
+    }
 
     private static T? Safe<T>(Func<T> f)
     {

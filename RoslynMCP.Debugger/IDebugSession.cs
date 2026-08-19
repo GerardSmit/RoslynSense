@@ -41,11 +41,14 @@ public interface IDebugSession
     Task<List<DebugThread>> ThreadsAsync();
     Task<List<DebugModule>> ModulesAsync();
     Task<List<DebugVariable>> VariablesAsync(uint frameIndex);
+    Task<List<DebugVariable>> ExpandAsync(uint frameIndex, string path);
+    DebugDisplayOptions DisplayOptions { get; set; }
     Task<List<DebugScope>> ScopesAsync(uint frameIndex);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(uint frameIndex, string name, string value);
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
     Task<(bool Ok, string Error)> ApplyDeltaAsync(
         string assemblyName, byte[] metadata, byte[] il, byte[] pdb);
     Task<(bool Ok, string Error)> DetachAsync();
+    Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout);
     void Terminate();
 }

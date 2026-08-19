@@ -67,7 +67,7 @@ internal static partial class PathHelper
     /// cache that needed to be told would serve a stale project list until restart.
     /// </para>
     /// </remarks>
-    private static class FileDerived<T>
+    internal static class FileDerived<T>
     {
         private static readonly ConcurrentDictionary<string, (FileStamp Stamp, T Value)> s_cache =
             new(StringComparer.OrdinalIgnoreCase);

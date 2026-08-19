@@ -58,6 +58,18 @@ public static class FindUsagesTool
             if (ctx is null)
                 return errors.ToString();
 
+            // A resource key, a configuration name: text that binds to nothing, or that binds to
+            // the enclosing call rather than to itself. Asked ahead of the symbol the way
+            // find-references does over LSP, so one caret is not resolved two different ways by
+            // the editor and by a session.
+            if (ctx.Resolution.Position is { } keyOffset
+                && await SymbolFreeUsages.ReportAsync(
+                    ctx.SystemPath, keyOffset, ctx.Project, ctx.Markup.MarkedText,
+                    fmt, maxResults, cancellationToken) is { } keyReport)
+            {
+                return keyReport;
+            }
+
             if (!ctx.IsResolved)
                 return ToolHelper.FormatResolutionError(ctx.Resolution);
 

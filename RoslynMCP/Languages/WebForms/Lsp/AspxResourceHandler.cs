@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.Resources.Core;
+using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Languages.WebForms.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
@@ -273,8 +274,8 @@ internal static class AspxResourceHandler
         if (single.Form is AspxResourceForm.AppSetting or AspxResourceForm.ConnectionString)
         {
             var settings = single.Form is AspxResourceForm.AppSetting
-                ? WebConfigSettings.AppSettings(document)
-                : WebConfigSettings.ConnectionStrings(document);
+                ? Settings(document, WebConfigSection.AppSettings)
+                : Settings(document, WebConfigSection.ConnectionStrings);
 
             foreach (var setting in settings)
                 items.Add(Item(setting.Name, LspCompletionItemKind.Value, Inline(setting.Value), "0", range));
@@ -559,18 +560,27 @@ internal static class AspxResourceHandler
 
     // ---- Shared plumbing -------------------------------------------------------------------
 
-    private static (WebConfigSetting Setting, bool Provider)? Setting(
+    /// <summary>The merged section a markup file sees, from the config files above it.</summary>
+    private static ImmutableArray<WebConfigEntry> Settings(
+        AspxDocument document, WebConfigSection section) =>
+        WebConfigSettings.Merged(document.FilePath, document.Project.FilePath, section);
+
+    private static (WebConfigEntry Setting, bool Provider)? Setting(
         AspxDocument document, AspxResourceReference reference)
     {
         if (reference.Form is AspxResourceForm.ConnectionString)
-            return WebConfigSettings.ConnectionString(document, reference.Key);
+        {
+            return WebConfigSettings.ConnectionString(
+                document.FilePath, document.Project.FilePath, reference.Key);
+        }
 
-        return WebConfigSettings.Find(WebConfigSettings.AppSettings(document), reference.Key) is { } setting
-            ? (setting, false)
-            : null;
+        return WebConfigSettings.Find(
+            Settings(document, WebConfigSection.AppSettings), reference.Key) is { } setting
+                ? (setting, false)
+                : null;
     }
 
-    private static LspLocation SettingLocation(WebConfigSetting setting)
+    private static LspLocation SettingLocation(WebConfigEntry setting)
     {
         if (setting.NameSpan == default || ReadText(setting.FilePath) is not { } text)
             return FileStart(setting.FilePath);

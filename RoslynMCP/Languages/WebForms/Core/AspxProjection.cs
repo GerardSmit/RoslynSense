@@ -474,13 +474,13 @@ internal static class AspxProjectionService
         foreach (var script in root.ScriptBlocks)
             Copy(script.Range);
 
-        AppendInlineMethod(sb, Copy, root, index: 0);
+        AppendInlineMethod(sb, Copy, root, index: 0, document.Compilation);
 
         // Every template is its own method: `<% if (…) { %>` and its closing `<% } %>` have to
         // stay in one body to balance, and a template's blocks never pair with the page's.
         int templateIndex = 1;
         foreach (var template in root.Templates)
-            AppendInlineMethod(sb, Copy, template, templateIndex++);
+            AppendInlineMethod(sb, Copy, template, templateIndex++, document.Compilation);
 
         sb.AppendLine("}");
         if (ns is not null)
@@ -500,6 +500,11 @@ internal static class AspxProjectionService
         root.Directives.Any(directive => directive.Attributes.Keys.Any(
             key => key.Value.Equals("Inherits", StringComparison.OrdinalIgnoreCase)));
 
+    /// <summary>The type <c>Container</c> has in a template that declares nothing better.</summary>
+    private static INamedTypeSymbol? ControlBaseType(Compilation compilation) =>
+        compilation.GetTypeByMetadataName("System.Web.UI.Control")
+        ?? compilation.GetTypeByMetadataName("WebFormsCore.UI.Control");
+
     /// <summary>The base class a page with no code-behind implicitly derives from.</summary>
     private static INamedTypeSymbol? PageBaseType(Compilation compilation) =>
         compilation.GetTypeByMetadataName("System.Web.UI.Page")
@@ -517,7 +522,8 @@ internal static class AspxProjectionService
         + (uint)StringComparer.OrdinalIgnoreCase.GetHashCode(filePath);
 
     private static void AppendInlineMethod(
-        StringBuilder sb, Action<TokenRange> copy, ContainerNode container, int index)
+        StringBuilder sb, Action<TokenRange> copy, ContainerNode container, int index,
+        Compilation compilation)
     {
         sb.Append("private void ").Append(InlineMethodPrefix).Append(index).AppendLine("() {");
 
@@ -531,8 +537,11 @@ internal static class AspxProjectionService
                   .AppendLine(")!;");
             }
 
-            // `Container`, typed by [TemplateContainer] on the template property.
-            if (template.ContainerType is { } containerType)
+            // `Container`, typed by [TemplateContainer] on the template property, and by
+            // `Control` when nothing says otherwise — which is the type ASP.NET itself gives it.
+            // Leaving it undeclared made `Container.ID` in a template of a control that carries no
+            // attribute bind to nothing, when the markup is perfectly valid.
+            if ((template.ContainerType ?? ControlBaseType(compilation)) is { } containerType)
             {
                 sb.Append("var Container = default(")
                   .Append(containerType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))

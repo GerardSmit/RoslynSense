@@ -4,18 +4,30 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+/// <remarks>
+/// In the serialized collection because the home directory the personal layers live under is an
+/// environment variable, and it is pointed at an empty directory here so the machine's real
+/// settings never reach a test.
+/// </remarks>
+[Collection(SharedState.Name)]
 public class RoslynSenseConfigLoaderTests : IDisposable
 {
     private readonly string _root;
+    private readonly string? _previousHome;
 
     public RoslynSenseConfigLoaderTests()
     {
         _root = Path.Combine(Path.GetTempPath(), "rsense-cfg-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_root);
+
+        _previousHome = Environment.GetEnvironmentVariable(ConfigPaths.HomeOverrideVariable);
+        Environment.SetEnvironmentVariable(
+            ConfigPaths.HomeOverrideVariable, Directory.CreateDirectory(Path.Combine(_root, ".home")).FullName);
     }
 
     public void Dispose()
     {
+        Environment.SetEnvironmentVariable(ConfigPaths.HomeOverrideVariable, _previousHome);
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
     }
 
@@ -61,8 +73,9 @@ public class RoslynSenseConfigLoaderTests : IDisposable
         Assert.Null(err);
     }
 
+    /// <summary>The nearer file wins the fields it names; see ConfigLayerTests for the merge.</summary>
     [Fact]
-    public void Load_StopsAtFirstFound()
+    public void Load_PrefersTheNearestFile()
     {
         var child = MakeDir("a", "b");
         WriteCfg(_root, """{"tableFormat":"parent"}""");

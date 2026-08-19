@@ -45,6 +45,7 @@ internal sealed class DaemonServer
 
         var (config, _, _) = RoslynSenseConfigLoader.Load(workingDir);
         var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out _);
+        DebuggerViewOptions.Current = settings.DebugView;
 
         // Acquire the single-owner lock BEFORE any expensive setup (MSBuild registration, DI
         // build). This is what guarantees exactly one live host per solution: a daemon that
@@ -62,6 +63,11 @@ internal sealed class DaemonServer
             lifecycle.Dispose();
             return 0;
         }
+
+        DebuggerViewOptions.Current = settings.DebugView;
+        // A session that is stopped right now picks the new policy up on its next expansion,
+        // which is the whole point of making these switchable rather than start-up only.
+        Services.DebugSessionManager.GetSession()?.ApplyViewOptions(settings.DebugView);
 
         WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
         WorkspaceService.EnsureRegistered();

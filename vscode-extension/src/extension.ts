@@ -15,12 +15,14 @@ import {
     TransportKind,
 } from 'vscode-languageclient/node';
 import { DEBUG_TYPE, registerDebugLaunch } from './debugLaunch';
+import { additionalConfigGlobs, homeDirectory, loadLayers } from './roslynsenseConfig';
 import { registerTestController, runTestById } from './testController';
 import { registerImpactedTests } from './impactedTests';
 import { registerCoverageMapProgress } from './coverageMapProgress';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerSearchEverywhere } from './search';
+import { registerSettingsPanel } from './settings';
 import { registerVirtualDocuments } from './virtualDocuments';
 import { registerEmbeddedLanguages } from './embeddedLanguages';
 import { registerNuGetPanel } from './nuget';
@@ -78,9 +80,9 @@ export interface ExtraLanguage {
     /** Whether the gutter offers breakpoints in these documents. */
     readonly breakpoints: boolean;
     /**
-     * Extensions already covered by a watcher outside this table, and so left out of this
-     * language's own glob. Two watchers over one pattern means two `didChangeWatchedFiles` for
-     * every save, and the server does its reload work per event.
+     * Extensions and name globs already covered by a watcher outside this table, and so left out
+     * of this language's own glob. Two watchers over one pattern means two
+     * `didChangeWatchedFiles` for every save, and the server does its reload work per event.
      */
     readonly watchedElsewhere?: readonly string[];
     /**
@@ -114,9 +116,44 @@ function watchGlobs(language: ExtraLanguage): string[] {
         );
     }
 
-    globs.push(...(language.patterns ?? []));
+    globs.push(
+        ...(language.patterns ?? []).filter(
+            (pattern) => !(language.watchedElsewhere ?? []).includes(pattern),
+        ),
+    );
 
     return globs;
+}
+
+/**
+ * The two framework config files, in the casings that occur on disk.
+ *
+ * Named here rather than only inside the `webconfig` row because they are claimed twice: by that
+ * pack, for its `<appSettings>` reference counts, and unconditionally by the selector, for the
+ * binding redirects the server answers about whether or not the pack is on.
+ */
+const CONFIG_FILE_PATTERNS = ['**/[wW]eb.config', '**/[aA]pp.config'] as const;
+
+/**
+ * The extra names `webConfig.additionalFiles` claims, as globs — DotNetNuke's `release.config` and
+ * `development.config`, and anything else a framework keeps beside its `web.config`.
+ *
+ * Read from the file here rather than asked of the server: a document selector is fixed when the
+ * client is constructed, which is before there is a server to ask. A name that is a path or a glob
+ * is dropped silently — the server warns about it once, and warning twice for the same line in the
+ * same file is noise.
+ */
+function additionalConfigPatterns(folder?: vscode.WorkspaceFolder): string[] {
+    const directory = folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!directory) {
+        return [];
+    }
+
+    try {
+        return additionalConfigGlobs(loadLayers(directory).merged);
+    } catch {
+        return [];
+    }
 }
 
 /**
@@ -186,11 +223,34 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         // Application configuration. Not a language of its own: the files are JSON and stay
         // JSON — the selector matches them by name shape so the server hears about exactly the
         // ones that feed IConfiguration, and package.json beside them stays untouched.
+        //
+        // package.json maps the same name shape to `jsonc`, because the configuration host
+        // parses these with comments and trailing commas allowed and the plain `json` service
+        // marks both as errors. `json` stays in the list: a `files.associations` entry, or a
+        // user who picks the language by hand, puts the buffer back under it, and the server
+        // should still hear about the file.
         id: 'appsettings',
         extensions: [],
         patterns: ['**/appsettings*.json', '**/secrets.json'],
         patternLanguages: ['json', 'jsonc'],
         breakpoints: false,
+    },
+    {
+        // Framework configuration. Not a language of its own either: the files are XML and stay
+        // XML, and the selector matches them by name so that `packages.config` and `nuget.config`
+        // beside them stay the project-file pack's.
+        //
+        // Only `web.config` and `app.config` themselves. A `Web.Release.config` is an XDT
+        // transform — its `<add>` elements are edits to apply at publish, not settings that
+        // exist — and matching it would put reference counts on entries nothing ever reads.
+        id: 'webconfig',
+        extensions: [],
+        patterns: [...CONFIG_FILE_PATTERNS],
+        patternLanguages: ['xml'],
+        breakpoints: false,
+        // web.config already has a watcher below, ungated on purpose because the tag prefixes it
+        // registers re-bind every control whether or not this pack is on.
+        watchedElsewhere: ['**/[wW]eb.config'],
     },
 ];
 
@@ -386,6 +446,16 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
         symbolServer: config.get('symbolServer'),
         referenceSource: config.get('referenceSource'),
         fileNesting: { rules: config.get('fileNesting.rules') },
+        // Which System.Diagnostics debugger attributes the engines honour. Sent as a section so
+        // an older server, which reads none of it, ignores one property instead of six.
+        debugger: {
+            debuggerDisplay: config.get('debugger.debuggerDisplay'),
+            typeProxy: config.get('debugger.typeProxy'),
+            browsable: config.get('debugger.browsable'),
+            justMyCode: config.get('debugger.justMyCode'),
+            rawView: config.get('debugger.rawView'),
+            maxChildren: config.get('debugger.maxChildren'),
+        },
         // Which language packs this connection wants. Per connection on the server too: the
         // daemon is shared, so another window — or an AI session on the same daemon — keeps
         // whatever it asked for.
@@ -422,6 +492,70 @@ function registerConfigurationSync(context: vscode.ExtensionContext): void {
             }
         })
     );
+}
+
+/**
+ * Watches the `roslynsense.json` layers for the one thing in them the editor cannot apply live.
+ *
+ * The server reloads the file itself and applies most of it to a running host. What it cannot
+ * reach from there is this window's document selector, which was fixed when the client was
+ * constructed — so a name added to `webConfig.additionalFiles` leaves the file opening as plain
+ * XML until the window reconnects. Everything else about the edit has already taken effect by the
+ * time this asks.
+ */
+function registerConfigFileWatch(context: vscode.ExtensionContext): void {
+    let current = additionalConfigPatterns().join('|');
+
+    const onChanged = () => {
+        const next = additionalConfigPatterns().join('|');
+        if (next === current) {
+            return;
+        }
+        current = next;
+        void promptReloadForConfigFiles();
+    };
+
+    // Two watchers, because two of the four layers live outside the workspace entirely: a glob
+    // with no base only ever matches inside the open folders, so a global or personal file — the
+    // ones the settings page writes for the "Global" and "Personal" tabs — would change without
+    // this window ever hearing about it.
+    for (const pattern of [
+        '**/roslynsense*.json',
+        homePattern(),
+    ]) {
+        if (!pattern) {
+            continue;
+        }
+
+        const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+        watcher.onDidChange(onChanged, undefined, context.subscriptions);
+        watcher.onDidCreate(onChanged, undefined, context.subscriptions);
+        watcher.onDidDelete(onChanged, undefined, context.subscriptions);
+        context.subscriptions.push(watcher);
+    }
+}
+
+/** Both home layers under one recursive pattern, or undefined when there is no home directory. */
+function homePattern(): vscode.RelativePattern | undefined {
+    try {
+        const home = homeDirectory();
+        return home
+            ? new vscode.RelativePattern(vscode.Uri.file(home), '**/roslynsense*.json')
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function promptReloadForConfigFiles(): Promise<void> {
+    const reload = 'Reload Window';
+    const choice = await vscode.window.showInformationMessage(
+        'RoslynSense: the configuration files it treats as web.config changed. Reload the window to apply it.',
+        reload
+    );
+    if (choice === reload) {
+        await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
 }
 
 /**
@@ -573,6 +707,7 @@ async function startClient(
             // project file, and the tag prefixes it registers re-bind every control for the
             // other sessions sharing this daemon.
             '**/[wW]eb.config',
+            ...additionalConfigPatterns(binding?.folder),
             ...enabledFileLanguages().flatMap(watchGlobs),
         ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
     }
@@ -603,6 +738,21 @@ async function startClient(
                       )
                     : [fileFilter(language.id, binding?.folder)],
             ),
+            // Not gated on the `webconfig` pack, for the same reason the watcher below is not:
+            // what these files also carry is binding redirects, which the server answers about
+            // whether or not any pack is on — a lens above the file, the shipped version on
+            // hover, and a fix on each stale redirect. Turning off `<appSettings>` reference
+            // counts must not take those with it. A duplicate filter is harmless: a selector is
+            // a match test, so a file matching twice is still one document.
+            ...CONFIG_FILE_PATTERNS.map((pattern) => patternFilter('xml', pattern, binding?.folder)),
+            // The names `webConfig.additionalFiles` added. Gated on the pack, unlike the two
+            // above: what makes those unconditional is the binding redirects they carry, and a
+            // framework's own configuration file is claimed for its settings or not at all.
+            ...(enabledLanguages().some((language) => language.id === 'webconfig')
+                ? additionalConfigPatterns(binding?.folder).map((pattern) =>
+                      patternFilter('xml', pattern, binding?.folder),
+                  )
+                : []),
         ],
         uriConverters: { code2Protocol, protocol2Code },
         middleware: {
@@ -977,6 +1127,32 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
                                 )
                             )
                     )
+                );
+            }
+        ),
+        // CodeLens "N external references": the reads live in compiled assemblies, so the
+        // server decompiles them on demand and the peek opens on the decompiled source.
+        vscode.commands.registerCommand(
+            'roslynSense.showExternalConfigReads',
+            async (uri: string, line: number, character: number) => {
+                if (!client) {
+                    return;
+                }
+                let locations: LspLocation[];
+                try {
+                    locations = await client.sendRequest<LspLocation[]>(
+                        'roslynSense/externalConfigReads',
+                        { textDocument: { uri }, line, character }
+                    );
+                } catch {
+                    return;
+                }
+                void vscode.commands.executeCommand(
+                    'roslynSense.showReferences',
+                    uri,
+                    line,
+                    character,
+                    locations ?? []
                 );
             }
         ),
@@ -2854,6 +3030,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         })
     );
     registerConfigurationSync(context);
+    registerConfigFileWatch(context);
     registerLensCommands(context);
     registerOnAutoInsert(context);
     registerProcessStatusBar(context);
@@ -2869,6 +3046,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerVirtualDocuments(context, () => client);
     registerEmbeddedLanguages(context);
     registerSearchEverywhere(context, () => client);
+    registerSettingsPanel(context);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
     registerHotReload(context, () => client);

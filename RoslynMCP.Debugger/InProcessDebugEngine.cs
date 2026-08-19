@@ -34,6 +34,11 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
 
     public Task<List<DebugVariable>> VariablesAsync(uint frameIndex) => _session.VariablesAsync(frameIndex);
 
+    public Task<List<DebugVariable>> ExpandAsync(uint frameIndex, string path) =>
+        _session.ExpandAsync(frameIndex, path);
+
+    public void SetDisplayOptions(DebugDisplayOptions options) => _session.DisplayOptions = options;
+
     public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
         _session.EvaluateAsync(frameIndex, expression);
 
@@ -72,6 +77,9 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
 
     public void SetExceptionPolicy(bool breakOnFirstChance) =>
         _session.SetExceptionPolicy(breakOnFirstChance);
+
+    public Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout) =>
+        _session.ShutdownAsync(timeout);
 
     public void Terminate() => _session.Terminate();
 

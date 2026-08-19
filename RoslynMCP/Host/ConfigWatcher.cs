@@ -16,17 +16,18 @@ internal sealed record ConfigReload(
 /// not choose.
 /// </summary>
 /// <remarks>
-/// Two directories are watched: the one holding the config file the startup walk found, and the
-/// working directory itself — so a config newly created closer to the solution than the one in
-/// effect is noticed too. A config appearing in some other ancestor directory is not; that costs
-/// a watcher per path segment and moves in practice are between "next to the solution" and
-/// "nowhere".
+/// Every directory a layer could occupy is watched: every ancestor of the working directory that
+/// could hold a <c>roslynsense.json</c> or a <c>roslynsense.local.json</c>, one watcher each, plus
+/// one recursive watcher over the home directory for the global and personal layers. That is one
+/// watcher per path segment, which the old two-directory version avoided; it is affordable now
+/// because it is also necessary, since a repository-root file two levels up now contributes to the
+/// answer instead of being shadowed.
 ///
-/// Every event re-runs the same startup walk (<see cref="RoslynSenseConfigLoader.Load"/>) rather
-/// than trusting the event's path, so create, delete and rename all resolve to whichever file
-/// now governs. A file whose text did not change (editors touch without writing) is dropped, and
-/// a file that no longer parses keeps the current settings — half a config must never win over a
-/// whole one.
+/// Every event re-runs the same startup walk (<see cref="RoslynSenseConfigLoader.LoadLayers"/>)
+/// rather than trusting the event's path, so create, delete and rename all resolve to whatever now
+/// governs. The comparison is against every layer's text at once: a file whose text did not change
+/// (editors touch without writing) is dropped, and a file that no longer parses keeps the current
+/// settings — half a config must never win over a whole one.
 /// </remarks>
 internal sealed class ConfigWatcher : IDisposable
 {
@@ -60,35 +61,29 @@ internal sealed class ConfigWatcher : IDisposable
     public static ConfigWatcher? Start(
         string workingDir, string[] args, EffectiveSettings current, Action<ConfigReload> apply)
     {
-        var (_, configPath, _) = RoslynSenseConfigLoader.Load(workingDir);
-        string? initialText = configPath is not null ? TryRead(configPath) : null;
+        var layered = RoslynSenseConfigLoader.LoadLayers(workingDir);
 
-        var watcher = new ConfigWatcher(workingDir, args, current, initialText, apply);
+        var watcher = new ConfigWatcher(workingDir, args, current, Fingerprint(layered), apply);
+
+        string home = ConfigPaths.HomeDirectory;
 
         var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { workingDir };
-        if (configPath is not null && Path.GetDirectoryName(configPath) is { } configDir)
-            dirs.Add(configDir);
+        foreach (var layer in layered.Layers)
+        {
+            if (Path.GetDirectoryName(layer.FilePath) is not { Length: > 0 } layerDir)
+                continue;
+
+            // The two home layers are covered by one recursive watcher below, and have to be:
+            // the personal layer's own directory usually does not exist yet, and a watcher
+            // cannot be opened on a directory that is not there.
+            if (!IsUnder(layerDir, home))
+                dirs.Add(layerDir);
+        }
 
         foreach (string dir in dirs)
-        {
-            try
-            {
-                var fsw = new FileSystemWatcher(dir, RoslynSenseConfigLoader.FileName)
-                {
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
-                };
-                fsw.Changed += (_, _) => watcher.OnEvent();
-                fsw.Created += (_, _) => watcher.OnEvent();
-                fsw.Deleted += (_, _) => watcher.OnEvent();
-                fsw.Renamed += (_, _) => watcher.OnEvent();
-                fsw.EnableRaisingEvents = true;
-                watcher._watchers.Add(fsw);
-            }
-            catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
-            {
-                Console.Error.WriteLine($"[Config] Cannot watch '{dir}' for {RoslynSenseConfigLoader.FileName}: {ex.Message}");
-            }
-        }
+            watcher.Watch(dir, recursive: false);
+
+        watcher.WatchHome(home);
 
         if (watcher._watchers.Count == 0)
         {
@@ -97,6 +92,78 @@ internal sealed class ConfigWatcher : IDisposable
         }
 
         return watcher;
+    }
+
+    /// <summary>
+    /// Watches the home directory, creating it if it is not there.
+    /// </summary>
+    /// <remarks>
+    /// Recursive, and the one place this class creates anything. Both home layers live under it —
+    /// the global file directly, the personal one inside <c>projects/&lt;mangled-path&gt;/</c> —
+    /// and neither directory need exist yet: the first personal setting a person ever saves
+    /// creates its directory, and a watcher opened per layer directory would have missed exactly
+    /// that save. One directory that this program owns anyway is a smaller price than a reload
+    /// that works only for people who already had the folder.
+    /// </remarks>
+    private void WatchHome(string home)
+    {
+        if (home.Length == 0)
+            return;
+
+        try
+        {
+            Directory.CreateDirectory(home);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // No home to watch, so no global or personal layer to reload from either.
+            return;
+        }
+
+        Watch(home, recursive: true);
+    }
+
+    /// <summary>One watcher over one directory, or nothing if it cannot be opened.</summary>
+    /// <remarks>
+    /// Filtered by name pattern rather than one watcher per file name: the two names differ only
+    /// by an infix, and a filter that matches both also matches a <c>roslynsense.local.json</c>
+    /// created after the watcher was set up.
+    /// </remarks>
+    private void Watch(string dir, bool recursive)
+    {
+        try
+        {
+            var fsw = new FileSystemWatcher(dir, "roslynsense*.json")
+            {
+                IncludeSubdirectories = recursive,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
+            };
+            fsw.Changed += (_, _) => OnEvent();
+            fsw.Created += (_, _) => OnEvent();
+            fsw.Deleted += (_, _) => OnEvent();
+            fsw.Renamed += (_, _) => OnEvent();
+            fsw.EnableRaisingEvents = true;
+            _watchers.Add(fsw);
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            // A directory that is simply not there is the ordinary case, not a fault.
+            if (Directory.Exists(dir))
+                Console.Error.WriteLine($"[Config] Cannot watch '{dir}' for {RoslynSenseConfigLoader.FileName}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Whether <paramref name="path"/> is <paramref name="root"/> or sits inside it.</summary>
+    private static bool IsUnder(string path, string root)
+    {
+        if (root.Length == 0)
+            return false;
+
+        string normalizedRoot = Path.TrimEndingDirectorySeparator(root);
+        string normalizedPath = Path.TrimEndingDirectorySeparator(path);
+
+        return normalizedPath.Equals(normalizedRoot, StringComparison.OrdinalIgnoreCase)
+            || normalizedPath.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     private void OnEvent()
@@ -126,17 +193,19 @@ internal sealed class ConfigWatcher : IDisposable
     /// <summary>The debounced body — the unit under test.</summary>
     internal void Reload()
     {
-        var (config, configPath, loadError) = RoslynSenseConfigLoader.Load(_workingDir);
-        if (loadError is not null)
+        var layered = RoslynSenseConfigLoader.LoadLayers(_workingDir);
+        if (layered.LoadError is { } loadError)
         {
             // A save mid-edit, or genuinely broken JSON. Either way the current settings stand:
             // reverting a running host to defaults because a file was briefly invalid would be
             // strictly worse than staying stale for one more save.
-            Console.Error.WriteLine($"[Config] {RoslynSenseConfigLoader.FileName} ({configPath}): {loadError}; keeping current settings.");
+            Console.Error.WriteLine($"[Config] {loadError}; keeping current settings.");
             return;
         }
 
-        string? text = configPath is not null ? TryRead(configPath) : null;
+        var config = layered.Config;
+        string? configPath = layered.PrimaryPath;
+        string? text = Fingerprint(layered);
 
         ConfigReload reload;
         lock (_gate)
@@ -155,6 +224,26 @@ internal sealed class ConfigWatcher : IDisposable
         }
 
         _apply(reload);
+    }
+
+    /// <summary>
+    /// Every layer's path and text, in precedence order — what "the configuration" is, as one
+    /// string to compare against the last one.
+    /// </summary>
+    /// <remarks>
+    /// The paths are part of it, not only the contents: deleting the nearest file and leaving a
+    /// parent one whose text happens to match would otherwise read as no change at all, when what
+    /// actually changed is which file governs.
+    /// </remarks>
+    private static string? Fingerprint(LayeredConfig layered)
+    {
+        var present = layered.Present.ToList();
+        if (present.Count == 0)
+            return null;
+
+        return string.Join(
+            " | ",
+            present.Select(layer => layer.FilePath + " = " + (TryRead(layer.FilePath) ?? string.Empty)));
     }
 
     private static string? TryRead(string path)

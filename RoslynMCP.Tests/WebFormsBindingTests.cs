@@ -592,6 +592,179 @@ public class WebFormsBindingTests
             scenario.Document, scenario.Caret, default));
     }
 
+    // ---- DataBinder.Eval, and where a path is not a path ---------------------------------------
+
+    /// <summary>
+    /// The shape real markup is written in: an untyped <c>Container.DataItem</c> handed to
+    /// <c>DataBinder.Eval</c>, with the item type coming from the repeater rather than the call.
+    /// </summary>
+    private const string BinderRepeater = """
+        <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+        <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+            <ItemTemplate>
+                <span>{0}</span>
+            </ItemTemplate>
+        </asp:Repeater>
+        """;
+
+    [Fact]
+    public async Task DataBinderEvalResolvesItsSecondArgumentAsAPath()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(
+                BinderRepeater, """<%# DataBinder.Eval(Container.DataItem, "Cust|omer") %>"""),
+            ItemCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        // The long-hand of `Eval("Customer")`, and it has to answer the same property.
+        Assert.NotNull(member);
+        Assert.Equal("Customer", member!.Name);
+        Assert.Equal("Order", member.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task DataBinderEvalOffersTheItemsFields()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(BinderRepeater, """<%# DataBinder.Eval(Container.DataItem, "|") %>"""),
+            ItemCodeBehind);
+
+        var labels = (await scenario.CompleteAsync()).Items.Select(i => i.Label).ToList();
+
+        Assert.Contains("Customer", labels);
+        Assert.Contains("Buyer", labels);
+    }
+
+    [Fact]
+    public async Task GetPropertyValueIsAPathToo()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(
+                BinderRepeater,
+                """<%# DataBinder.GetPropertyValue(Container.DataItem, "Buyer.Na|me") %>"""),
+            ItemCodeBehind);
+
+        var member = await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default);
+
+        Assert.NotNull(member);
+        Assert.Equal("Name", member!.Name);
+        Assert.Equal("Client", member.ContainingType.Name);
+    }
+
+    [Fact]
+    public async Task TheFormatArgumentOfDataBinderEvalIsNotAPath()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(
+                BinderRepeater,
+                """<%# DataBinder.Eval(Container.DataItem, "Amount", "{0:c|}") %>"""),
+            ItemCodeBehind);
+
+        // A format string is not a field name. Offering `Amount` inside it would insert something
+        // that renders as itself.
+        Assert.Empty((await scenario.CompleteAsync()).Items);
+    }
+
+    [Fact]
+    public async Task TheFormatArgumentOfEvalIsNotAPath()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(BinderRepeater, """<%# Eval("Amount", "{0:c|}") %>"""),
+            ItemCodeBehind);
+
+        Assert.Empty((await scenario.CompleteAsync()).Items);
+    }
+
+    [Fact]
+    public async Task AnUnqualifiedTwoArgumentCallIsNotABinder()
+    {
+        using var scenario = Scenario.Create(
+            string.Format(BinderRepeater, """<%# Describe(Container.DataItem, "Cust|omer") %>"""),
+            ItemCodeBehind);
+
+        // `Eval` and `Bind` read their *first* argument as a path. A page method that happens to
+        // take a string second argument is nobody's binder, and its argument is nobody's field.
+        Assert.Null(await AspxLanguageHandler.DataBoundMemberAsync(
+            scenario.Document, scenario.Caret, default));
+    }
+
+    [Fact]
+    public void ABinderCallNestedInsideAnotherCallIsStillFound()
+    {
+        // Straight out of a real page: the path is the second argument of the inner call, and the
+        // format string wrapping it is a string that must not be mistaken for one.
+        const string text =
+            """<img src='<%# ResolveUrl(string.Format("~/icons/{0}", DataBinder.Eval(Container.DataItem, "Icon"))) %>' />""";
+
+        var found = DataBindingService.AllArguments(text)
+            .Select(span => text.Substring(span.Start, span.Length))
+            .ToList();
+
+        Assert.Equal(["Icon"], found);
+    }
+
+    // ---- Container ------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task ContainerIsTypedEvenWhenTheTemplateDeclaresNothing()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server">
+                <AlternatingItemTemplate>
+                    <span><%# Container.I|D %></span>
+                </AlternatingItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var projection = AspxProjectionService.Get(scenario.Document);
+        Assert.NotNull(projection);
+
+        int? projected = projection!.ToProjected(scenario.Caret);
+        Assert.NotNull(projected);
+
+        var symbol = await SymbolFinder.FindSymbolAtPositionAsync(
+            projection.Document, projected!.Value, default);
+
+        // `AlternatingItemTemplate` carries no [TemplateContainer], so the type is the one ASP.NET
+        // falls back to rather than nothing at all.
+        Assert.Equal("ID", symbol?.Name);
+        Assert.Equal("Control", symbol?.ContainingType.Name);
+    }
+
+    // ---- A path is a reference ------------------------------------------------------------------
+
+    [Fact]
+    public async Task FindReferencesOfAPropertyIncludesThePathsThatReadIt()
+    {
+        // The caret is only there because the harness wants one; this asks about the whole file.
+        using var scenario = Scenario.Create(
+            string.Format(
+                BinderRepeater, """<%# DataBinder.Eval(Container.DataItem, "Cust|omer") %>"""),
+            ItemCodeBehind);
+
+        var property = scenario.Document.Compilation
+            .GetTypeByMetadataName("Fixture.Order")!
+            .GetMembers("Customer")
+            .Single();
+
+        var references = await AspxReferenceService.FindInDocumentAsync(
+            scenario.Document, property, default);
+
+        var reference = Assert.Single(references);
+        Assert.Equal("Customer", scenario.Document.Text.Substring(
+            reference.Span.Start, reference.Span.Length));
+
+        // What rename would write there — the whole segment, since a path segment carries no
+        // prefix to preserve.
+        Assert.Equal("Client", AspxReferenceService.RenamedText(reference, "Client"));
+    }
+
     // ---- What the colouring pass sees ----------------------------------------------------------
 
     [Fact]

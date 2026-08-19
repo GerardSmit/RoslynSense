@@ -28,10 +28,12 @@ internal sealed partial class WebFormsLanguage : IConfiguredStringLanguage, IEmb
 
     public ImmutableArray<string> StringSyntaxIdentifiers { get; } = [ControlIdSyntaxIdentifier];
 
-    public string? Detect(SyntaxToken token, SemanticModel semanticModel, CancellationToken ct) =>
-        FindControlNavigationService.IsFindControlIdLiteral(token, semanticModel, ct)
-            ? ControlIdSyntaxIdentifier
-            : null;
+    public Task<string?> DetectAsync(
+        Document document, SyntaxToken token, SemanticModel semanticModel, CancellationToken ct) =>
+        Task.FromResult(
+            FindControlNavigationService.IsFindControlIdLiteral(token, semanticModel, ct)
+                ? ControlIdSyntaxIdentifier
+                : null);
 
     public Task<LspLocation[]> DefinitionAsync(
         EmbeddedStringContext context, bool typeDefinition, CancellationToken ct) =>

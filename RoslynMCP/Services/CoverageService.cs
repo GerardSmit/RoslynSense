@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
+using RoslynMCP.Languages.DotSettings.Core;
 using RoslynMCP.Tools;
 
 namespace RoslynMCP.Services;
@@ -106,6 +107,17 @@ public static class CoverageService
                 // Include test assembly in coverage (for projects with code and tests together);
                 // the dynamic collector includes it on its own.
                 args.Append(" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeTestAssembly=true");
+
+                // What the team already excludes in ReSharper, excluded here too — otherwise a
+                // number measured in the IDE and the same number measured here disagree, and the
+                // generated-code the exclusions exist to hide drags the second one down.
+                // coverlet only; the dynamic collector takes its filters from a runsettings file.
+                if (ReSharperSettings.ForProject(csprojPath).CoverletExcludeFilters is { IsEmpty: false } excludes)
+                {
+                    args.Append(" DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude=\"")
+                        .Append(string.Join(',', excludes))
+                        .Append('"');
+                }
             }
 
             using var process = new Process

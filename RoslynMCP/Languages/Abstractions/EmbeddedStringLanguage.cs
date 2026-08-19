@@ -67,8 +67,14 @@ internal interface IConfiguredStringLanguage : IEmbeddedStringLanguage
     /// <remarks>
     /// Runs against every string literal in the document on the diagnostics pass, so an
     /// implementation rejects on syntax before it binds anything.
+    /// <para>
+    /// The document comes along because a literal's meaning can depend on a declaration in another
+    /// project — the method a configuration key is passed to, whose body says whether it is one —
+    /// and reaching that needs the solution the model alone does not carry.
+    /// </para>
     /// </remarks>
-    string? Detect(SyntaxToken token, SemanticModel semanticModel, CancellationToken ct);
+    Task<string?> DetectAsync(
+        Document document, SyntaxToken token, SemanticModel semanticModel, CancellationToken ct);
 }
 
 /// <summary>

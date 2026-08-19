@@ -132,7 +132,7 @@ internal sealed class DebugCommandPipeServer : IDisposable
                 "locals" => await session.GetLocalsAsync(ct),
                 "stacktrace" => await session.GetStackTraceAsync(ct),
                 "status" => session.GetStatus(),
-                "stop" => StopSession(),
+                "stop" => await StopSessionAsync(),
                 "set_breakpoint" when request.File is not null =>
                     (await session.SetBreakpointAsync(
                         request.File, request.Line, request.Condition,
@@ -196,21 +196,25 @@ internal sealed class DebugCommandPipeServer : IDisposable
     private static string Json<T>(T value) =>
         System.Text.Json.JsonSerializer.Serialize(value, DebugJson.Options);
 
-    private string StopSession()
+    private async Task<string> StopSessionAsync()
     {
+        var timeout = Tools.DebugControlTool.DebugStopTimeout;
         var managed = DebugSessionManager.GetSession();
         if (managed is null)
         {
             // A DAP-hosted session owns its backend directly and was never registered with the
             // manager, so the manager path would report success while stopping nothing.
-            return _sessionProvider()?.Stop() ?? "No active debug session.";
+            var hosted = _sessionProvider();
+            return hosted is null
+                ? "No active debug session."
+                : (await hosted.ShutdownAsync(timeout)).Message;
         }
 
         // Route through the manager so the pipe server + published state are torn down with
         // the session, exactly as the DebugStop tool does.
-        var result = managed.Stop();
+        var (_, message) = await managed.ShutdownAsync(timeout);
         DebugSessionManager.DisposeSession();
-        return result;
+        return message;
     }
 
     /// <summary>Connects to the command pipe of the debug session owned by

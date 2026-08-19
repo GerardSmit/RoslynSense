@@ -170,6 +170,10 @@ internal static class SymbolHandlers
         if (string.IsNullOrWhiteSpace(p.Query))
             return Array.Empty<SymbolInformation>();
 
+        // Same reason as roslynSense/searchEverywhere: answering out of a half-loaded solution
+        // looks like a missing symbol rather than an unfinished load. See SolutionWarmup.
+        await SolutionWarmup.WaitAsync(ct);
+
         var solution = WorkspaceService.TryGetMostRecentSolution();
         if (solution is null)
             return Array.Empty<SymbolInformation>();

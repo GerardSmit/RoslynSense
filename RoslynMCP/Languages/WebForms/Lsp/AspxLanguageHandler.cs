@@ -688,27 +688,67 @@ internal static class AspxLanguageHandler
         // instead, keeping only what is located in this file.
         graph ??= AspxIncludeService.GetGraph(document.Project);
         var rootIncluders = graph.RootIncluders(document.FilePath);
-        if (rootIncluders.Length > 0)
-            return await IncludeScopedDiagnosticsAsync(document, rootIncluders, ct);
 
-        var parse = document.Parse.RawDiagnostics
-            // The parse inlines what this file includes, so diagnostics raised inside included
-            // content carry the include's path — and its offsets, which mean nothing in this
-            // buffer. They are reported on the include file itself, above.
-            .Where(d => OwnedByDocument(d, document.FilePath))
-            .Select(d => (Microsoft.CodeAnalysis.Diagnostic)d)
-            .Where(d => d.Severity != DiagnosticSeverity.Hidden)
-            .Select(d => new Protocol.Diagnostic(
-                ToRange(document, d.Location.SourceSpan),
-                LspConverters.ToLspSeverity(d.Severity),
-                d.Id,
-                "roslyn-sense",
-                d.GetMessage()))
-            .ToArray();
+        // Only the *parse* needs the includers' context. What a resource key in this file names is
+        // this file's own question, so a fragment gets the same key diagnostics a page does.
+        var parse = rootIncluders.Length > 0
+            ? await IncludeScopedDiagnosticsAsync(document, rootIncluders, ct)
+            : document.Parse.RawDiagnostics
+                // The parse inlines what this file includes, so diagnostics raised inside included
+                // content carry the include's path — and its offsets, which mean nothing in this
+                // buffer. They are reported on the include file itself, above.
+                .Where(d => OwnedByDocument(d, document.FilePath))
+                .Select(d => (Microsoft.CodeAnalysis.Diagnostic)d)
+                .Where(d => d.Severity != DiagnosticSeverity.Hidden)
+                .Select(d => new Protocol.Diagnostic(
+                    ToRange(document, d.Location.SourceSpan),
+                    LspConverters.ToLspSeverity(d.Severity),
+                    d.Id,
+                    "roslyn-sense",
+                    d.GetMessage()))
+                .ToArray();
 
         var resources = await AspxResourceHandler.DiagnosticsAsync(document, ct);
+        var embedded = await EmbeddedDiagnosticsAsync(document, ct);
 
-        return resources.Length == 0 ? parse : [.. parse, .. resources];
+        return resources.Length == 0 && embedded.Length == 0
+            ? parse
+            : [.. parse, .. resources, .. embedded];
+    }
+
+    /// <summary>
+    /// What the embedded-string languages have to say about the literals in this page's inline
+    /// code — a resource key naming an entry no <c>.resx</c> declares, above all.
+    /// </summary>
+    /// <remarks>
+    /// The same pass the C# diagnostics run, over the projection, with the spans brought back. The
+    /// builders and <c>resourcekey</c> attributes are already covered by
+    /// <see cref="AspxResourceHandler.DiagnosticsAsync"/>, which reads them out of the parse tree;
+    /// a key inside <c>&lt;%= LocalizeString("…") %&gt;</c> is a C# literal and reachable no other
+    /// way. Anything the projection cannot map back is dropped rather than reported at a guessed
+    /// position: scaffolding this server wrote is not something the user can fix.
+    /// </remarks>
+    private static async Task<Protocol.Diagnostic[]> EmbeddedDiagnosticsAsync(
+        AspxDocument document, CancellationToken ct)
+    {
+        if (AspxProjectionService.Get(document) is not { } projection)
+            return [];
+
+        var found = await DiagnosticsHandler.EmbeddedDiagnosticsAsync(projection.Document, ct);
+        if (found.Count == 0)
+            return [];
+
+        var mapped = new List<Protocol.Diagnostic>(found.Count);
+
+        foreach (var diagnostic in found)
+        {
+            var projected = LspConverters.ToTextSpan(projection.Text, diagnostic.Range);
+
+            if (projection.ToAspx(projected) is { } span)
+                mapped.Add(diagnostic with { Range = ToRange(document, span) });
+        }
+
+        return [.. mapped];
     }
 
     /// <summary>A diagnostic with no file belongs to the parse that raised it; one with a file

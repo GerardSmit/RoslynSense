@@ -25,7 +25,8 @@ namespace RoslynMCP.Languages.WebForms.Core;
 /// <see cref="AspxSymbolResolver"/> resolves them.
 /// </para>
 /// <para>
-/// Conservative in exactly one direction. Every branch of <c>CollectMarkup</c> matches a name that
+/// Conservative in exactly one direction. Every branch of <c>CollectMarkup</c> — and the binding
+/// paths collected beside it, whose segments are tokens too — matches a name that
 /// appears in the file as one of these tokens, so a file the filter rejects cannot have produced a
 /// result — but anything the filter cannot describe (a symbol whose name is not an identifier, a
 /// file that will not read, an open buffer) is admitted and parsed as before. A false positive

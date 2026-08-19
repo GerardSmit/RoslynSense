@@ -92,6 +92,13 @@
       <EmbeddedResource Include="Languages\MsBuild\Help\*.json" />
     </ItemGroup>
 
+    <!-- NuGet's and MSBuild's documented diagnostic codes, read by the diagnostic-code catalog.
+         Embedded for the same reason as the corpus above. Provenance, licence and how to
+         regenerate it are in Services/DiagnosticCodes/README.md. -->
+    <ItemGroup>
+      <EmbeddedResource Include="Services\DiagnosticCodes\*.json" />
+    </ItemGroup>
+
     <!--
       ICorDebug cannot attach across x86/x64, so a target whose bitness differs from this host is
       debugged through a worker of the target's bitness. The RID's apphost is what fixes a

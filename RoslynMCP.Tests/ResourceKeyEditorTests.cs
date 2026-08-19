@@ -3,6 +3,7 @@ using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.Resources;
 using RoslynMCP.Languages.Resources.Core;
+using RoslynMCP.Languages.WebForms.Core;
 using RoslynMCP.Languages.WebForms.Lsp;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
@@ -356,6 +357,419 @@ public class ResourceKeyEditorTests
 
         Assert.NotNull(framework);
         Assert.Equal("Greeting.Text", framework!.Key);
+    }
+
+    // ---- A key inside markup inline code -----------------------------------------------------
+
+    /// <summary>The offset of the <c>"Greeting"</c> literal inside <c>Default.aspx</c>'s
+    /// <c>&lt;%= … %&gt;</c> block.</summary>
+    private static int InlineKeyOffset() =>
+        OffsetOf(FixturePaths.DefaultAspxFile, "GetString(\"Greeting\"", "GetString(\"".Length);
+
+    [Fact]
+    public async Task AKeyInsideAnInlineCodeBlockLocatesAgainstTheMarkupFile()
+    {
+        var pack = Publish();
+
+        var target = await ResourceKeySearch.LocateAsync(
+            pack.Settings, FixturePaths.DefaultAspxFile, InlineKeyOffset(), project: null, default);
+
+        Assert.NotNull(target);
+
+        // The key the runtime probes for, and the abbreviation the page wrote — DNN appends `.Text`
+        // when the key carries no dot of its own.
+        Assert.Equal("Greeting.Text", target!.Key);
+        Assert.Equal("Greeting", target.Written);
+        Assert.Equal(".Text", target.KeySuffix);
+        Assert.Equal(RootConfidence.Exact, target.Confidence);
+        Assert.Equal("Default.aspx", Assert.Single(target.Families).BaseName);
+
+        // The markup file and a span inside it, not the projection: every span on a target is
+        // going to reach an editor as a location or an edit.
+        Assert.Equal(FixturePaths.DefaultAspxFile, target.FilePath);
+        Assert.False(target.Group);
+    }
+
+    [Fact]
+    public async Task AStringInInlineCodeThatIsNotAKeyLocatesNothing()
+    {
+        var pack = Publish();
+
+        int offset = OffsetOf(
+            FixturePaths.DefaultAspxFile, "HtmlEncode(\"test\"", "HtmlEncode(\"".Length);
+
+        // The page's other inline literal. Claiming every string in a page would put rename and
+        // find-references on text that has nothing to do with resources.
+        Assert.Null(await ResourceKeySearch.LocateAsync(
+            pack.Settings, FixturePaths.DefaultAspxFile, offset, project: null, default));
+    }
+
+    [Fact]
+    public async Task FindReferencesFromInlineCodeReachesTheDeclarationAndBack()
+    {
+        var pack = Publish();
+
+        var results = await pack.ReferencesAsync(
+            FixturePaths.DefaultAspxFile, InlineKeyOffset(), project: null, default);
+
+        Assert.NotNull(results);
+        var files = results!.Select(r => FileNameOf(r.Uri)).Order(StringComparer.Ordinal).ToList();
+
+        // The declaration, the site the search started from — a reference list that omits the
+        // caret's own site is one a rename would apply incompletely — and the code-behind of
+        // another page, which reads the same entry through an explicit `"~/Default.aspx"` root.
+        Assert.Equal(["Default.aspx", "Default.aspx.resx", "Localized.aspx.cs"], files);
+    }
+
+    [Fact]
+    public async Task FindReferencesFromTheResxReachesIntoMarkupInlineCode()
+    {
+        var pack = Publish();
+
+        var results = await pack.ReferencesAsync(
+            FixturePaths.DefaultAspxResxFile,
+            OffsetOf(FixturePaths.DefaultAspxResxFile, "name=\"Greeting.Text\"", "name=\"".Length),
+            project: null,
+            default);
+
+        Assert.NotNull(results);
+
+        // The other direction, which is the one a rename runs in: the declaration has to know that
+        // a page reads it from inside a code block.
+        var markup = Assert.Single(
+            results!, r => FileNameOf(r.Uri).Equals("Default.aspx", StringComparison.Ordinal));
+
+        var text = SourceText.From(File.ReadAllText(FixturePaths.DefaultAspxFile));
+        var span = LspConverters.ToTextSpan(text, markup.Range);
+
+        Assert.Equal("Greeting", text.ToString(span));
+    }
+
+    [Fact]
+    public async Task RenamingFromTheResxRewritesTheMarkupInlineCodeInItsOwnForm()
+    {
+        var pack = Publish();
+
+        var edit = await pack.RenameAsync(
+            new RenameParams(
+                Doc(FixturePaths.DefaultAspxResxFile),
+                PositionOf(FixturePaths.DefaultAspxResxFile, "name=\"Greeting.Text\"", "name=\"".Length),
+                "Salutation.Text"),
+            default);
+
+        Assert.NotNull(edit);
+
+        Assert.Equal(
+            ["Default.aspx", "Default.aspx.resx", "Localized.aspx.cs"],
+            edit!.Changes.Keys.Select(FileNameOf).Order(StringComparer.Ordinal));
+
+        // The declaration takes the whole key; the call site takes the form it wrote, because the
+        // `.Text` is the lookup's and not the page's to spell.
+        Assert.Equal(
+            "Salutation.Text",
+            Assert.Single(edit.Changes[LspConverters.PathToUri(FixturePaths.DefaultAspxResxFile)]).NewText);
+
+        Assert.Equal(
+            "Salutation",
+            Assert.Single(edit.Changes[LspConverters.PathToUri(FixturePaths.DefaultAspxFile)]).NewText);
+    }
+
+    [Fact]
+    public async Task RenamingFromMarkupInlineCodeRewritesTheDeclaration()
+    {
+        Publish();
+
+        // Through the markup handler, which is what the editor calls for an .aspx buffer: the pack
+        // is reached as a contributor ahead of the symbol resolve, because a key binds to nothing.
+        var edit = await AspxLanguageHandler.RenameAsync(
+            new RenameParams(
+                Doc(FixturePaths.DefaultAspxFile),
+                PositionOf(FixturePaths.DefaultAspxFile, "GetString(\"Greeting\"", "GetString(\"".Length),
+                "Salutation"),
+            default);
+
+        Assert.NotNull(edit);
+
+        Assert.Equal(
+            ["Default.aspx", "Default.aspx.resx", "Localized.aspx.cs"],
+            edit!.Changes.Keys.Select(FileNameOf).Order(StringComparer.Ordinal));
+
+        // The name was typed in the call site's form, so the entry it renames is the suffixed one.
+        Assert.Equal(
+            "Salutation.Text",
+            Assert.Single(edit.Changes[LspConverters.PathToUri(FixturePaths.DefaultAspxResxFile)]).NewText);
+    }
+
+    [Fact]
+    public async Task PrepareRenameFromMarkupInlineCodeOffersTheWrittenKey()
+    {
+        Publish();
+
+        var prepared = await AspxLanguageHandler.PrepareRenameAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.DefaultAspxFile),
+                PositionOf(FixturePaths.DefaultAspxFile, "GetString(\"Greeting\"", "GetString(\"".Length)),
+            default);
+
+        Assert.NotNull(prepared);
+
+        // The abbreviation, not the entry: the box the user types into has to start from what the
+        // page says, or every rename from a DNN call site would begin by deleting a `.Text`.
+        Assert.Equal("Greeting", prepared!.Placeholder);
+
+        var text = SourceText.From(File.ReadAllText(FixturePaths.DefaultAspxFile));
+        Assert.Equal("Greeting", text.ToString(LspConverters.ToTextSpan(text, prepared.Range)));
+    }
+
+    [Fact]
+    public async Task CompletionInsideAnInlineCodeBlockOffersThePagesKeys()
+    {
+        Publish();
+
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.DefaultAspxFile),
+                PositionOf(FixturePaths.DefaultAspxFile, "GetString(\"Greeting\"", "GetString(\"".Length)),
+            new LspResolveCache(),
+            default);
+
+        // The list a caret inside the literal gets is the resx's, not C#'s: the entries of the
+        // page's own `App_LocalResources` file, written the way the call site writes them.
+        Assert.Contains("Greeting", completions.Items.Select(i => i.Label));
+    }
+
+    // ---- The find_usages tool ------------------------------------------------------------------
+
+    [Fact]
+    public async Task TheFindUsagesToolReachesTheKeysSitesFromInsideAnInlineCodeBlock()
+    {
+        Publish();
+
+        string result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.DefaultAspxFile,
+            markupSnippet: "GetString(\"[|Greeting|]\", this)",
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
+
+        // Not "No symbol found for 'Greeting' in ASPX file." — a session asking the tool about a
+        // key has to get the same answer Shift+F12 gives in the editor.
+        Assert.Contains("Default.aspx.resx", result, StringComparison.Ordinal);
+        Assert.Contains("Localized.aspx.cs", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TheFindUsagesToolFindsTheSameKeyFromCSharp()
+    {
+        Publish();
+
+        string result = await FindUsagesTool.FindUsages(
+            filePath: FixturePaths.LocalizedCodeBehindFile,
+            markupSnippet: "GetString(\"[|Greeting|]\", \"~/Default.aspx\")",
+            fmt: new MarkdownFormatter(),
+            handlers: TestHandlers.FindUsages);
+
+        // The other side of the same search. A key is symbol-free in C# too, so the tool's own
+        // path needs the pack consulted just as the markup handler's does — and the markup site
+        // is in the answer, which is the whole point of indexing inline code.
+        Assert.Contains("Default.aspx.resx", result, StringComparison.Ordinal);
+        Assert.Contains("Default.aspx", result, StringComparison.Ordinal);
+    }
+
+    // ---- The missing-key diagnostic in markup inline code -------------------------------------
+
+    [Fact]
+    public async Task AnUndeclaredKeyInInlineCodeIsReportedInTheMarkup()
+    {
+        using var page = TemporaryPage.Beside(
+            FixturePaths.DefaultAspxFile,
+            "<%@ Page Language=\"C#\" CodeBehind=\"Default.aspx.cs\" Inherits=\"AspxProject.DefaultPage\" %>\n"
+            + "<div><%= DotNetNuke.Services.Localization.Localization.GetString(\"Nope\", this) %></div>\n");
+
+        PublishWithMissingKeyDiagnostic();
+
+        var diagnostics = await AspxLanguageHandler.DiagnosticsAsync(page.Path, default);
+
+        var reported = Assert.Single(diagnostics, d => d.Code == "RSX0003");
+
+        // The squiggle is on the key in the page, not on the projection this server wrote to bind
+        // it — and it names the entry the runtime would have looked for.
+        var text = SourceText.From(File.ReadAllText(page.Path));
+        Assert.Equal("Nope", text.ToString(LspConverters.ToTextSpan(text, reported.Range)));
+        Assert.Contains("Nope.Text", reported.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ADeclaredKeyInInlineCodeIsNotReported()
+    {
+        PublishWithMissingKeyDiagnostic();
+
+        var diagnostics = await AspxLanguageHandler.DiagnosticsAsync(
+            FixturePaths.DefaultAspxFile, default);
+
+        // `Greeting.Text` is in the page's own file, and the other inline literal is not a key at
+        // all. A rule that fires on either is a rule a solution switches off.
+        Assert.DoesNotContain(diagnostics, d => d.Code == "RSX0003");
+    }
+
+    [Fact]
+    public async Task AnUndeclaredKeyIsReportedInAnIncludedFragmentToo()
+    {
+        using var fragment = TemporaryPage.Included(
+            FixturePaths.DefaultAspxFile,
+            "<%@ Page Language=\"C#\" CodeBehind=\"Default.aspx.cs\" Inherits=\"AspxProject.DefaultPage\" %>\n"
+            + "<div><%= DotNetNuke.Services.Localization.Localization.GetString(\"Nope\", this) %></div>\n");
+
+        PublishWithMissingKeyDiagnostic();
+
+        // The premises of the test, asserted rather than assumed: something includes this file, so
+        // it takes the include-scoped path — and its inline code projects, which is the only way a
+        // literal in it is ever bound. Stated here so a run where the project failed to load says
+        // so, instead of reporting an empty list as a missing diagnostic.
+        var document = await AspxDocumentService.GetAsync(fragment.Path, default);
+        Assert.NotEmpty(
+            AspxIncludeService.GetGraph(document!.Project).RootIncluders(document.FilePath));
+        Assert.NotNull(AspxProjectionService.Get(document));
+
+        var diagnostics = await AspxLanguageHandler.DiagnosticsAsync(fragment.Path, default);
+
+        // A file someone includes answers its *parse* out of the includers', because its tags and
+        // prefixes are theirs. What a key names is not: it is this file's own question, and a
+        // fragment that stopped reporting missing keys the moment a page included it would go
+        // quiet exactly where a DNN skin keeps its markup.
+        var reported = Assert.Single(diagnostics, d => d.Code == "RSX0003");
+        Assert.Contains("Nope.Text", reported.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The registry with the missing-key rule on, which ships off.</summary>
+    private static void PublishWithMissingKeyDiagnostic()
+    {
+        var settings = EffectiveSettings.Resolve(
+            [],
+            new RoslynSenseConfig { Resources = new ResourcesConfig { MissingKeyDiagnostic = true } },
+            out _);
+
+        new LanguageRegistry(
+            LanguagePackRegistration.Create(settings, new MarkdownFormatter())).Publish();
+    }
+
+    /// <summary>
+    /// Markup written into the fixture project for one test and deleted after it, for the cases
+    /// that need a page the shared fixtures deliberately do not have.
+    /// </summary>
+    private sealed class TemporaryPage : IDisposable
+    {
+        private readonly List<string> _written = [];
+
+        /// <summary>The file the test asks about.</summary>
+        public required string Path { get; init; }
+
+        public static TemporaryPage Beside(string sibling, string text)
+        {
+            var page = new TemporaryPage { Path = NameBeside(sibling) };
+            page.Write(page.Path, text);
+
+            AspxReferenceService.ResetFileListCache();
+            return page;
+        }
+
+        /// <summary>
+        /// The same page, plus a second one that server-side-includes it — which is what makes the
+        /// first a fragment rather than a page, and sends its diagnostics down the include-scoped
+        /// path.
+        /// </summary>
+        public static TemporaryPage Included(string sibling, string text)
+        {
+            var fragment = new TemporaryPage { Path = NameBeside(sibling) };
+            fragment.Write(fragment.Path, text);
+            fragment.Write(
+                NameBeside(sibling),
+                $"<!--#include file=\"{System.IO.Path.GetFileName(fragment.Path)}\" -->\n");
+
+            AspxReferenceService.ResetFileListCache();
+            return fragment;
+        }
+
+        private static string NameBeside(string sibling) =>
+            System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(sibling)!,
+                "TemporaryKey" + Guid.NewGuid().ToString("N")[..8] + ".aspx");
+
+        private void Write(string path, string text)
+        {
+            File.WriteAllText(path, text);
+            _written.Add(path);
+        }
+
+        public void Dispose()
+        {
+            foreach (string path in _written)
+            {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch (IOException)
+                {
+                }
+            }
+
+            AspxReferenceService.ResetFileListCache();
+        }
+    }
+
+    // ---- The root a call in markup is measured from ------------------------------------------
+
+    [Fact]
+    public async Task AContainingFileRootInMarkupIsTheMarkupFile()
+    {
+        Publish();
+
+        // `containingFile` is the one root source whose answer differs between a page and its
+        // code-behind, and inline code is where it is written: the file the call sits in *is* the
+        // page. Measured from the projection instead, it would look for a resx named after a
+        // generated file — `App_LocalResources/Default.aspx.aspx-inline.g.cs.resx` — and find none.
+        var target = await ResourceKeySearch.LocateAsync(
+            ContainingFileGetString(), FixturePaths.DefaultAspxFile, InlineKeyOffset(),
+            project: null, default);
+
+        Assert.NotNull(target);
+        Assert.Equal("Greeting.Text", target!.Key);
+        Assert.Equal(RootConfidence.Exact, target.Confidence);
+        Assert.Equal("Default.aspx", Assert.Single(target.Families).BaseName);
+    }
+
+    /// <summary>A <c>GetString(key, *)</c> lookup that reads the file the call is written in.</summary>
+    private static ResourceSettings ContainingFileGetString()
+    {
+        var warnings = new List<string>();
+
+        var settings = ResourceSettings.Resolve(
+            enabled: true,
+            new ResourcesConfig
+            {
+                Preset = "none",
+                Conventions =
+                [
+                    new ResourceConventionConfig { Id = "local", SiblingFolder = "App_LocalResources" },
+                ],
+                Lookups =
+                [
+                    new ResourceLookupConfig
+                    {
+                        ContainingType = "DotNetNuke.Services.Localization.Localization",
+                        MethodName = "GetString",
+                        ParameterTypes = ["string", "*"],
+                        KeyIndex = 0,
+                        RootSource = "containingFile",
+                        RootInterpretation = "virtualPath",
+                        DefaultKeySuffix = ".Text",
+                    },
+                ],
+            },
+            warnings);
+
+        Assert.Empty(warnings);
+        return settings;
     }
 
     /// <summary>A <c>GetString(key)</c> lookup that names no declaring type, with its one

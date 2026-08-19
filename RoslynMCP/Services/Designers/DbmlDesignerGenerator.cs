@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Xml;
 using Microsoft.CodeAnalysis;
+using RoslynMCP.Languages.DotSettings.Core;
 
 namespace RoslynMCP.Services.Designers;
 
@@ -185,8 +186,10 @@ internal sealed class DbmlDesignerGenerator : IDesignerGenerator
         if (relative is "." || relative.StartsWith("..", StringComparison.Ordinal))
             return rootNamespace;
 
-        var segments = relative
-            .Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries)
+        // The project's .DotSettings has the last word on which of these folders is a namespace:
+        // a model under a folder marked "do not create a namespace" belongs to the folder's parent.
+        var segments = ReSharperSettings.ForProject(project.FilePath ?? dbmlPath)
+            .NamespaceSegments(relative)
             .Select(SanitizeNamespaceSegment)
             .Where(s => s.Length > 0);
 

@@ -1,4 +1,6 @@
+using System.Collections.Immutable;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Services.Database;
 
 namespace RoslynMCP.Config;
@@ -41,6 +43,34 @@ public sealed record EffectiveSettings(
     /// <see cref="Resources"/>.</summary>
     internal bool AppSettings { get; init; } = true;
 
+    /// <summary>The <c>web.config</c> pack's gate. Init-only for the same reason as
+    /// <see cref="Resources"/>.</summary>
+    internal bool WebConfig { get; init; } = true;
+
+    /// <summary>
+    /// File names the <c>web.config</c> pack claims beyond the two built-in ones, already
+    /// validated and de-duplicated. Empty is the normal case.
+    /// </summary>
+    internal ImmutableArray<string> WebConfigFiles { get; init; } = [];
+
+    /// <summary>
+    /// The ReSharper-settings pack's gate. Init-only for the same reason as <see cref="Resources"/>.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the other gates this one does not only decide whether requests about a file type are
+    /// answered — the pack answers none. It decides whether a committed <c>.DotSettings</c> is
+    /// allowed to change the namespace inferred for a new file, the files a search returns, and the
+    /// types a coverage run counts. Turning it off is how a team that has stale layers in the
+    /// repository gets RoslynSense's own defaults back.
+    /// </remarks>
+    internal bool DotSettings { get; init; } = true;
+
+    /// <summary>
+    /// Which <c>System.Diagnostics</c> debugger attributes the debug engines honour. Init-only for
+    /// the same reason as <see cref="Resources"/>.
+    /// </summary>
+    public Debugger.DebugDisplayOptions DebugView { get; init; } = new();
+
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
         warnings = new List<string>();
@@ -72,6 +102,9 @@ public sealed record EffectiveSettings(
         bool msBuild = !HasFlag("--no-msbuild") && tools.MsBuild;
         bool dbml = !HasFlag("--no-dbml") && tools.Dbml;
         bool appSettings = !HasFlag("--no-appsettings") && tools.AppSettings;
+        bool webConfig = !HasFlag("--no-webconfig") && tools.WebConfig;
+        var webConfigFiles = ResolveWebConfigFiles(config?.WebConfig, webConfig, warnings);
+        bool dotSettings = !HasFlag("--no-dotsettings") && tools.DotSettings;
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -125,12 +158,72 @@ public sealed record EffectiveSettings(
             autoDiscover, tableFormat, explicitProviders,
             preload, sharedHost, hostIdleMinutes, maxWorkspaces)
         {
+            DebugView = DebuggerViewOptions.Resolve(config?.Debugger, args),
             Resources = resources,
             MsBuild = msBuild,
             Dbml = dbml,
             AppSettings = appSettings,
+            WebConfig = webConfig,
+            WebConfigFiles = webConfigFiles,
+            DotSettings = dotSettings,
         };
     }
+
+    /// <summary>
+    /// The additional <c>web.config</c>-shaped file names, minus the ones that would take a file
+    /// belonging to something else. Every rejection is a warning rather than a silent drop: a name
+    /// in the file that does nothing is a question the user will otherwise ask twice.
+    /// </summary>
+    private static ImmutableArray<string> ResolveWebConfigFiles(
+        WebConfigConfig? config, bool packEnabled, List<string> warnings)
+    {
+        if (config?.AdditionalFiles is not { Count: > 0 } declared)
+            return [];
+
+        if (!packEnabled)
+        {
+            warnings.Add(
+                "webConfig.additionalFiles is set but the web.config pack is off; the names do nothing.");
+            return [];
+        }
+
+        var names = ImmutableArray.CreateBuilder<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string? raw in declared)
+        {
+            string name = raw?.Trim() ?? string.Empty;
+            if (name.Length == 0)
+                continue;
+
+            if (name.IndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]) >= 0
+                || name.Contains('*') || name.Contains('?'))
+            {
+                warnings.Add(
+                    $"webConfig.additionalFiles '{name}': a file name, not a path or a glob; skipped.");
+                continue;
+            }
+
+            // NuGet's two are why the pack claims names instead of the .config extension in the
+            // first place; letting a config file hand them over would undo that from the outside.
+            if (s_reservedConfigNames.Contains(name))
+            {
+                warnings.Add($"webConfig.additionalFiles '{name}': belongs to NuGet; skipped.");
+                continue;
+            }
+
+            if (WebConfigFile.BuiltInNames.Contains(name, StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            if (seen.Add(name))
+                names.Add(name);
+        }
+
+        return names.ToImmutable();
+    }
+
+    private static readonly HashSet<string> s_reservedConfigNames =
+        new(StringComparer.OrdinalIgnoreCase) { "packages.config", "nuget.config" };
 
     public bool ShouldRunAutoDiscovery()
     {

@@ -1,4 +1,4 @@
-using RoslynMCP.Lsp;
+﻿using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
@@ -548,6 +548,58 @@ public class SolutionExplorerTests
         Assert.Contains(children, n =>
             n.Kind == SolutionNodeKind.File &&
             n.Label.Equals("Calculator.cs", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// The two rows that are the project's own furniture come first, in that order. Left to the
+    /// alphabet Properties sits between the source folders — LegacyProject has a Models folder,
+    /// which sorts ahead of it — and launchSettings.json is then somewhere in the middle of the
+    /// tree rather than where Visual Studio and Rider both pin it.
+    /// </summary>
+    [Fact]
+    public async Task DependenciesAndPropertiesLeadTheProject()
+    {
+        var children = await SolutionTreeHandler.ChildrenAsync(
+            new SolutionTreeParams($"project:{FixturePaths.LegacyProjectFile}"), default);
+
+        Assert.Equal(SolutionNodeKind.Dependencies, children[0].Kind);
+        Assert.Equal(SolutionNodeKind.Folder, children[1].Kind);
+        Assert.Equal("Properties", children[1].Label);
+
+        // And the rest keeps the order it had: pinning two rows must not shuffle the folders
+        // behind them.
+        var folders = children
+            .Skip(2)
+            .Where(n => n.Kind == SolutionNodeKind.Folder)
+            .Select(n => n.Label)
+            .ToList();
+        Assert.Equal(folders.OrderBy(label => label, StringComparer.OrdinalIgnoreCase), folders);
+    }
+
+    /// <summary>
+    /// A project reference points at the project it names instead of growing a second copy of it.
+    /// </summary>
+    /// <remarks>
+    /// The id is the part that matters beyond the leaf-ness: it used to be exactly the id of the
+    /// real project row, and the tree keys its items by id — so a referenced project that was also
+    /// visible under the solution was one id claimed by two rows, which is a row that fails to
+    /// render rather than one that merely looks odd.
+    /// </remarks>
+    [Fact]
+    public async Task AProjectReferenceIsAPointerNotASubtree()
+    {
+        var references = await SolutionTreeHandler.ChildrenAsync(
+            new SolutionTreeParams($"group:projects|{FixturePaths.MultiProjectBFile}"), default);
+
+        var reference = Assert.Single(references);
+        Assert.Equal(SolutionNodeKind.ProjectRef, reference.Kind);
+        Assert.Equal("ProjectA", reference.Label);
+        Assert.False(reference.HasChildren);
+        Assert.NotEqual($"project:{FixturePaths.MultiProjectAFile}", reference.Id);
+
+        // And it still says which project it points at, which is what going to it needs.
+        Assert.Equal(
+            LspConverters.PathToUri(FixturePaths.MultiProjectAFile), reference.ResourceUri);
     }
 
     [Fact]

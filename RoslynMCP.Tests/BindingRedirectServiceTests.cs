@@ -62,6 +62,27 @@ public class BindingRedirectServiceTests
     }
 
     /// <summary>
+    /// Reading from text is what the hover does, because the buffer it is answering about may
+    /// never have been saved. It has to see exactly what reading the file sees.
+    /// </summary>
+    [Fact]
+    public void TextAndFileAreReadTheSameWay()
+    {
+        var fromFile = Assert.Single(BindingRedirectService.Read(Write(Config)));
+        var fromText = Assert.Single(BindingRedirectService.ReadText(Config));
+
+        Assert.Equal(fromFile, fromText);
+    }
+
+    /// <summary>
+    /// A config being typed into does not parse for as long as the tag is half-written, and a
+    /// hover there answers nothing rather than throwing on the way past.
+    /// </summary>
+    [Fact]
+    public void TextThatDoesNotParseReadsAsNoRedirects() =>
+        Assert.Empty(BindingRedirectService.ReadText("<configuration><runtime>"));
+
+    /// <summary>
     /// A config writes an unsigned assembly's token as the literal <c>null</c>, which has to read
     /// back as "no token" rather than as a token spelled n-u-l-l.
     /// </summary>
@@ -187,6 +208,39 @@ public class BindingRedirectServiceTests
         Assert.Equal("System.Private.CoreLib", info!.Identity.Name);
         Assert.Equal("7cec85d7bea7798e", info.Identity.PublicKeyToken);
         Assert.Equal("neutral", info.Identity.Culture);
+    }
+
+    /// <summary>
+    /// Identities are memoized per file so a <c>packages</c> folder is not re-parsed on every
+    /// request. The one way that can go wrong is an assembly that changed and was not re-read —
+    /// which is the case right after a build, and the case this whole feature exists to catch.
+    /// </summary>
+    [Fact]
+    public void AnAssemblyRebuiltUnderTheSamePathIsReadAgain()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"binding-{Guid.NewGuid():N}.dll");
+
+        File.Copy(typeof(BindingRedirectServiceTests).Assembly.Location, path);
+        string? first = BindingRedirectService.Identity(path)?.Identity.Name;
+
+        // A different assembly at the same path, which is what a rebuild looks like from here.
+        File.Copy(typeof(BindingRedirectService).Assembly.Location, path, overwrite: true);
+        string? second = BindingRedirectService.Identity(path)?.Identity.Name;
+
+        Assert.Equal("RoslynMCP.Tests", first);
+        Assert.Equal("RoslynMCP", second);
+    }
+
+    /// <summary>The same file, unchanged, reads back the same identity rather than a stale
+    /// null.</summary>
+    [Fact]
+    public void AnUnchangedAssemblyReadsTheSameIdentityTwice()
+    {
+        string path = typeof(BindingRedirectService).Assembly.Location;
+
+        Assert.Equal(
+            BindingRedirectService.Identity(path)?.Identity,
+            BindingRedirectService.Identity(path)?.Identity);
     }
 
     [Fact]

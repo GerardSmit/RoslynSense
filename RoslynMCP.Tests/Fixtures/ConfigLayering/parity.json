@@ -1,0 +1,176 @@
+{
+    "$comment": [
+        "The one description of the layering that both implementations answer to.",
+        "",
+        "RoslynMCP/Config/RoslynSenseConfigLoader.cs and vscode-extension/src/roslynsenseConfig.ts",
+        "resolve the same files in the same order for different reasons, and the C# half is the",
+        "authority. This file is what keeps the other half honest: ConfigLayeringParityTests.cs and",
+        "vscode-extension/src/test/parity.test.ts both read it, and a change to the rule that lands",
+        "in only one language fails in the other.",
+        "",
+        "The mangled names are split by platform because both implementations resolve the path",
+        "first, and an absolute path is not the same thing on both. Each suite runs the list its",
+        "own platform names."
+    ],
+
+    "mangledDirectories": {
+        "windows": [
+            {
+                "why": "The readable half is the path with every non-alphanumeric run flattened.",
+                "directory": "D:\\Sources\\RoslynSense",
+                "expected": "D--Sources-RoslynSense-0db6e0f7"
+            },
+            {
+                "why": "A trailing separator is not part of the path.",
+                "directory": "D:\\Sources\\RoslynSense\\",
+                "expected": "D--Sources-RoslynSense-0db6e0f7"
+            },
+            {
+                "why": "Neither is the direction of the slashes.",
+                "directory": "D:/Sources/RoslynSense",
+                "expected": "D--Sources-RoslynSense-0db6e0f7"
+            },
+            {
+                "why": "Spaces flatten like anything else.",
+                "directory": "C:\\Program Files\\App",
+                "expected": "C--Program-Files-App-abc17140"
+            },
+            {
+                "why": "These two flatten to the same text; only the hash separates them.",
+                "directory": "C:\\Users\\dev\\code\\a\\b-c",
+                "expected": "C--Users-dev-code-a-b-c-00c6037f"
+            },
+            {
+                "why": "The other half of that pair.",
+                "directory": "C:\\Users\\dev\\code\\a-b\\c",
+                "expected": "C--Users-dev-code-a-b-c-210f0182"
+            }
+        ],
+        "posix": [
+            {
+                "why": "The leading separator flattens too, so every name starts with a dash.",
+                "directory": "/home/dev/code/app",
+                "expected": "-home-dev-code-app-2292478a"
+            },
+            {
+                "why": "The colliding pair, posix-shaped.",
+                "directory": "/home/dev/code/a/b-c",
+                "expected": "-home-dev-code-a-b-c-31579be9"
+            },
+            {
+                "why": "The other half of it.",
+                "directory": "/home/dev/code/a-b/c",
+                "expected": "-home-dev-code-a-b-c-11469438"
+            }
+        ]
+    },
+
+    "$mergeComment": [
+        "Each case writes the files it names and expects the merge to be exactly `expected`.",
+        "The file keys are scopes: `global` and `personal` live in the home directory, `parent` and",
+        "`parentLocal` are the roslynsense.json / roslynsense.local.json one directory above the",
+        "working directory, and `repo` and `repoLocal` are the pair inside it.",
+        "The comparison is on the merged JSON rather than on resolved settings, because that is the",
+        "only view where 'no layer mentioned this' is still distinguishable from the default."
+    ],
+
+    "mergeCases": [
+        {
+            "name": "a nearer file overrides only the fields it names",
+            "files": {
+                "parent": { "tools": { "webForms": false }, "tableFormat": "toon" },
+                "repo": { "tableFormat": "markdown" }
+            },
+            "expected": { "tools": { "webForms": false }, "tableFormat": "markdown" }
+        },
+        {
+            "name": "the global file is the weakest layer",
+            "files": {
+                "global": { "tableFormat": "toon", "maxWorkspaces": 8 },
+                "repo": { "tableFormat": "markdown" }
+            },
+            "expected": { "tableFormat": "markdown", "maxWorkspaces": 8 }
+        },
+        {
+            "name": "the local file beats the committed one beside it",
+            "files": {
+                "repo": { "tools": { "webForms": true, "razor": true } },
+                "repoLocal": { "tools": { "razor": false } }
+            },
+            "expected": { "tools": { "webForms": true, "razor": false } }
+        },
+        {
+            "name": "the personal file beats every file in the checkout",
+            "files": {
+                "global": { "tableFormat": "json" },
+                "repo": { "tableFormat": "markdown" },
+                "repoLocal": { "tableFormat": "markdown" },
+                "personal": { "tableFormat": "toon" }
+            },
+            "expected": { "tableFormat": "toon" }
+        },
+        {
+            "name": "a local file in the parent still loses to the committed file below it",
+            "files": {
+                "parentLocal": { "tableFormat": "json" },
+                "repo": { "tableFormat": "markdown" }
+            },
+            "expected": { "tableFormat": "markdown" }
+        },
+        {
+            "name": "arrays replace rather than append",
+            "files": {
+                "global": { "preload": ["global.sln"] },
+                "repo": { "preload": ["repo.sln"] }
+            },
+            "expected": { "preload": ["repo.sln"] }
+        },
+        {
+            "name": "objects keyed by name merge entry by entry",
+            "files": {
+                "global": { "database": { "connections": { "shared": "psql:Host=localhost;Database=a" } } },
+                "repoLocal": { "database": { "connections": { "mine": "psql:Host=localhost;Database=b" } } }
+            },
+            "expected": {
+                "database": {
+                    "connections": {
+                        "shared": "psql:Host=localhost;Database=a",
+                        "mine": "psql:Host=localhost;Database=b"
+                    }
+                }
+            }
+        },
+        {
+            "name": "an explicit null replaces, which is how a nearer layer unsets a value",
+            "files": {
+                "global": { "webConfig": { "additionalFiles": ["release.config"] } },
+                "repo": { "webConfig": { "additionalFiles": null } }
+            },
+            "expected": { "webConfig": { "additionalFiles": null } }
+        },
+        {
+            "name": "a broken layer is skipped and the others still apply",
+            "files": {
+                "global": { "tableFormat": "toon" },
+                "repo": "{ not json"
+            },
+            "expected": { "tableFormat": "toon" },
+            "expectLoadError": true
+        },
+        {
+            "name": "a file with comments and trailing commas is a file",
+            "files": {
+                "repo": "{\n    // the team's default\n    \"tableFormat\": \"markdown\",\n}"
+            },
+            "expected": { "tableFormat": "markdown" }
+        },
+        {
+            "name": "an empty file says nothing rather than resetting everything",
+            "files": {
+                "global": { "tableFormat": "toon" },
+                "repo": ""
+            },
+            "expected": { "tableFormat": "toon" }
+        }
+    ]
+}

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 
+using RoslynMCP.Languages.DotSettings.Core;
 namespace RoslynMCP.Lsp.Search;
 
 /// <summary>
@@ -124,8 +125,11 @@ public static class SolutionFileIndex
 
         foreach (string child in Directory.EnumerateDirectories(directory))
         {
-            if (SearchFileRules.IsExcluded(Path.GetFileName(child)))
+            if (SearchFileRules.IsExcluded(Path.GetFileName(child))
+                || DotSettingsExclusions.IsExcluded(child))
+            {
                 continue;
+            }
 
             try
             {

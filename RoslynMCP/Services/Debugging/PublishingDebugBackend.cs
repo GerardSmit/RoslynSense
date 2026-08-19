@@ -79,6 +79,9 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     /// <inheritdoc />
     public int? DebuggeePid => _inner.DebuggeePid;
 
+    public void ApplyViewOptions(RoslynMCP.Debugger.DebugDisplayOptions options) =>
+        _inner.ApplyViewOptions(options);
+
     public async Task<string> StartTestSessionAsync(
         string csprojPath, string? filter,
         IEnumerable<(string file, int line)>? initialBreakpoints = null,
@@ -268,13 +271,30 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
 
     public string GetStatus() => _inner.GetStatus();
 
+    public async Task<(bool Graceful, string Message)> ShutdownAsync(
+        TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        var result = await PublishAfter(_inner.ShutdownAsync(timeout, cancellationToken));
+
+        // The same teardown Stop does: a session that ended gracefully is just as over as one
+        // that was killed, and leaving the watcher and the shared state behind would advertise a
+        // live session to every other surface.
+        ClearSessionState();
+        return result;
+    }
+
     public string Stop()
     {
         var result = _inner.Stop();
+        ClearSessionState();
+        return result;
+    }
+
+    private void ClearSessionState()
+    {
         _watcher.Clear();
         DebugStateStore.Clear(Environment.ProcessId);
         _started = false;
-        return result;
     }
 
     public void Dispose()
@@ -486,7 +506,7 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
         };
     }
 
-    private async Task<string> PublishAfter(Task<string> operation)
+    private async Task<T> PublishAfter<T>(Task<T> operation)
     {
         try
         {

@@ -668,7 +668,34 @@ internal sealed partial class DebuggerService : IDebugBackend
             return $"Error: netcoredbg exited immediately. {error}";
         }
 
+        await ApplyViewSettingsAsync(cancellationToken);
+
         return null;
+    }
+
+    /// <summary>
+    /// Tells netcoredbg what it can be told about the debugger attributes.
+    /// </summary>
+    /// <remarks>
+    /// Only Just My Code: netcoredbg implements <c>DebuggerDisplay</c>, <c>DebuggerTypeProxy</c>
+    /// and <c>DebuggerBrowsable</c> itself with no switch to turn them off, so those settings
+    /// govern the ICorDebug engine (.NET Framework targets) alone. Sent only when it differs from
+    /// the default, and failures are ignored — an older build answers <c>^error</c> and keeps its
+    /// own default, which is the behaviour we would fall back to anyway.
+    /// </remarks>
+    private async Task ApplyViewSettingsAsync(CancellationToken cancellationToken)
+    {
+        if (Config.DebuggerViewOptions.Current.JustMyCode)
+            return;
+
+        try
+        {
+            await SendCommandAsync("-gdb-set just-my-code 0", cancellationToken);
+        }
+        catch
+        {
+            // Best effort: the session is usable either way.
+        }
     }
 
     private async Task ReadOutputLoop(CancellationToken cancellationToken)

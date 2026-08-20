@@ -172,7 +172,11 @@ internal static class DbmlReferences
             ("Association", "ThisKey") => DbmlReferenceKind.ThisKeyColumn,
             ("Association", "OtherKey") => DbmlReferenceKind.OtherKeyColumn,
 
-            (_, "Type") when element is "Column" or "Parameter" or "Return" or "ElementType"
+            // Not ElementType: it names a type this file declares, and it carries that name in
+            // IdRef or Name rather than in Type. Listing it here read as coverage it never had,
+            // and now that an unresolved CLR type is an error, a wrong classification would be a
+            // red squiggle on a name that is perfectly well declared two elements up.
+            (_, "Type") when element is "Column" or "Parameter" or "Return"
                 => DbmlReferenceKind.ClrType,
 
             _ => null,

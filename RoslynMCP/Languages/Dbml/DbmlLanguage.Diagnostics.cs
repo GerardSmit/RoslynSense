@@ -9,6 +9,7 @@ internal sealed partial class DbmlLanguage : ILanguageDiagnosticProvider
 {
     private const string Source = "dbml";
 
+    private const int Error = 1;
     private const int Warning = 2;
     private const int Information = 3;
 
@@ -28,6 +29,13 @@ internal sealed partial class DbmlLanguage : ILanguageDiagnosticProvider
     /// project has never been built is not broken, it is unbuilt, and the message exists so the
     /// missing reference counts read as "not yet" rather than as "none".
     /// </para>
+    /// <para>
+    /// The one exception to the narrowness is a <c>Type=</c> that names nothing. That is not a
+    /// question about the database — the compilation answers it outright — and it is the failure
+    /// that ends in a build error naming a type nobody typed, in a generated file nobody edits. It
+    /// is reported as an error because that is what it becomes; the rest of the pack stays at
+    /// warning because the rest of the pack is describing a model, not a compilation.
+    /// </para>
     /// </remarks>
     public async Task<Diagnostic[]> DiagnosticsAsync(string filePath, CancellationToken ct)
     {
@@ -39,6 +47,7 @@ internal sealed partial class DbmlLanguage : ILanguageDiagnosticProvider
 
         AddBindingDiagnostics(view, lines, diagnostics);
         AddModelDiagnostics(view, lines, diagnostics, ct);
+        AddClrTypeDiagnostics(view, lines, diagnostics, ct);
 
         return [.. diagnostics];
     }
@@ -80,6 +89,59 @@ internal sealed partial class DbmlLanguage : ILanguageDiagnosticProvider
                 range, Information, "DBML0003", Source,
                 $"{designer} is not part of the project's compilation, or was generated from "
                 + "something other than this model, so nothing here binds to it."));
+        }
+    }
+
+    /// <summary>A <c>Type=</c> that names no type the project can see.</summary>
+    /// <remarks>
+    /// <para>
+    /// Gated on the same compilation <see cref="ClrTokenType"/> is, so the colour and the squiggle
+    /// are driven by one predicate and cannot disagree: a model whose project has never been built
+    /// has no compilation, and reporting against one that does not exist would paint every column
+    /// red on a checkout. The <c>DataContext</c> probe is the second half of that — a project whose
+    /// references failed to resolve can produce a compilation in which nothing resolves, and this
+    /// pass has to stay quiet there rather than report the whole file.
+    /// </para>
+    /// <para>
+    /// Driven from <see cref="DbmlReferences.All"/> rather than from the model, because the model
+    /// records a column's type and not a function's: <c>DbmlReader</c> never descends into
+    /// <c>&lt;Parameter&gt;</c> or <c>&lt;Return&gt;</c>, so a model-driven pass would skip every
+    /// stored-procedure signature — which is where a hand-edited type name is likeliest to be.
+    /// </para>
+    /// </remarks>
+    internal static void AddClrTypeDiagnostics(
+        DbmlView view, TextLineCollection lines, List<Diagnostic> diagnostics, CancellationToken ct)
+    {
+        if (view.Index.Compilation is not { } compilation
+            || compilation.GetTypeByMetadataName("System.Data.Linq.DataContext") is null)
+        {
+            return;
+        }
+
+        // Per call, not per reference: a model repeats a handful of type names across hundreds of
+        // columns, and a miss costs one metadata lookup per dot in the name.
+        var resolved = new Dictionary<string, bool>(StringComparer.Ordinal);
+
+        foreach (var reference in DbmlReferences.All(view.Document))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (reference.Kind != DbmlReferenceKind.ClrType)
+                continue;
+
+            if (!resolved.TryGetValue(reference.Name, out bool exists))
+            {
+                exists = ResolveClrType(compilation, reference.Name) is not null;
+                resolved[reference.Name] = exists;
+            }
+
+            if (exists)
+                continue;
+
+            diagnostics.Add(new Diagnostic(
+                LspConverters.ToRange(lines, reference.Span), Error, "DBML0006", Source,
+                $"'{reference.Name}' names no type this project can see. The generated designer "
+                + "will not compile."));
         }
     }
 

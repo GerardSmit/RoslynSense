@@ -123,6 +123,18 @@ internal sealed partial class DbmlLanguage :
     /// and metadata spells with a plus. Trying the rightmost dot first and walking left resolves
     /// <c>Ns.Outer.Inner</c> without knowing where the namespace stops.
     /// </para>
+    /// <para>
+    /// The rest is about spellings a person writes and a generator does not. SqlMetal emits
+    /// <c>System.Int32</c>, but a hand-edited model reasonably says <c>int</c>, <c>int?</c>,
+    /// <c>System.Byte[]</c> or an assembly-qualified name, and none of those is a metadata name.
+    /// Every one of them is a type that exists, so failing to resolve it is a wrong answer — which
+    /// used to cost only a missing colour and now costs a red squiggle.
+    /// </para>
+    /// <para>
+    /// The plural lookup at the end is for a name two referenced assemblies both define: the
+    /// singular overload answers <c>null</c> for an ambiguity, which reads as "no such type" and is
+    /// the one false negative here that has nothing to do with how the name was written.
+    /// </para>
     /// </remarks>
     internal static INamedTypeSymbol? ResolveClrType(Compilation compilation, string typeName)
     {
@@ -131,8 +143,25 @@ internal sealed partial class DbmlLanguage :
         if (name.StartsWith("global::", StringComparison.Ordinal))
             name = name["global::".Length..];
 
+        // "Ns.T, MyAssembly, Version=..." — the assembly is the runtime's business, not the
+        // compilation's, and the name in front of the comma is the whole question.
+        int qualifier = name.IndexOf(',');
+        if (qualifier >= 0)
+            name = name[..qualifier].TrimEnd();
+
+        // A .dbml carries nullability in CanBeNull, so a "?" here is someone writing C#.
+        name = name.TrimEnd('?').TrimEnd();
+
+        // An array of a type that exists is a type that exists, and the element is what every
+        // caller wants anyway: the TypeKind to colour by, and the declaration to open.
+        while (name.EndsWith("[]", StringComparison.Ordinal))
+            name = name[..^2].TrimEnd();
+
         if (name.Length == 0)
             return null;
+
+        if (s_keywordTypes.TryGetValue(name, out var special))
+            return compilation.GetSpecialType(special);
 
         if (compilation.GetTypeByMetadataName(name) is { } direct)
             return direct;
@@ -147,8 +176,28 @@ internal sealed partial class DbmlLanguage :
                 return nested;
         }
 
-        return null;
+        return compilation.GetTypesByMetadataName(name) is [var ambiguous, ..] ? ambiguous : null;
     }
+
+    /// <summary>The C# names for the special types, which are not metadata names.</summary>
+    private static readonly Dictionary<string, SpecialType> s_keywordTypes = new(StringComparer.Ordinal)
+    {
+        ["bool"] = SpecialType.System_Boolean,
+        ["byte"] = SpecialType.System_Byte,
+        ["sbyte"] = SpecialType.System_SByte,
+        ["char"] = SpecialType.System_Char,
+        ["decimal"] = SpecialType.System_Decimal,
+        ["double"] = SpecialType.System_Double,
+        ["float"] = SpecialType.System_Single,
+        ["int"] = SpecialType.System_Int32,
+        ["uint"] = SpecialType.System_UInt32,
+        ["long"] = SpecialType.System_Int64,
+        ["ulong"] = SpecialType.System_UInt64,
+        ["short"] = SpecialType.System_Int16,
+        ["ushort"] = SpecialType.System_UInt16,
+        ["object"] = SpecialType.System_Object,
+        ["string"] = SpecialType.System_String,
+    };
 
     /// <summary>
     /// Every use of the element's generated member across the solution, with the designer's own

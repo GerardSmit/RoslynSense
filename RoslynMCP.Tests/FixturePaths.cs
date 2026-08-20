@@ -61,6 +61,9 @@ internal static class FixturePaths
 
     /// <summary>Two repeaters whose templates declare the same <c>ID</c>, for the FindControl
     /// naming-container ladder: handler-scoped, page-wide, computed.</summary>
+    public static string NestedControlsAspxFile => Path.Combine(AspxProjectDir, "NestedControls.aspx");
+    public static string OuterPanelAscxFile => Path.Combine(AspxProjectDir, "Controls", "OuterPanel.ascx");
+    public static string InnerPanelAscxFile => Path.Combine(AspxProjectDir, "Controls", "InnerPanel.ascx");
     public static string NamingScopeAspxFile => Path.Combine(AspxProjectDir, "NamingScope.aspx");
     public static string NamingScopeCodeBehindFile => Path.Combine(AspxProjectDir, "NamingScope.aspx.cs");
 

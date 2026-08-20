@@ -203,6 +203,55 @@ public class WebFormsClientIdSearchTests
         Assert.Equal(FixturePaths.NamingScopeAspxFile, hit.FilePath);
     }
 
+    /// <summary>
+    /// The containers an id names are spread across files, and the match follows them out.
+    /// </summary>
+    /// <remarks>
+    /// This is the ordinary shape of a real page rather than an exotic one: a module writes a user
+    /// control, that control writes another, and the button in front of the user is three files
+    /// from the page whose id it carries. A match confined to one file sees only the innermost run
+    /// of segments, finds a leftover it cannot explain, and rejects the one right answer.
+    /// <para>
+    /// <c>lnkDeep</c> is the awkward half of it: the id names <c>ucInner</c>, and the file that
+    /// declares the button is the one <em>writing</em> that tag rather than the one behind it.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task AControlUnderTwoUserControlsResolvesThroughBoth()
+    {
+        var hits = await ResolveAsync("dnn_ctr7_pageForm_ucOuter_ucInner_lnkDeep");
+
+        var hit = Assert.Single(hits);
+        Assert.Equal("lnkDeep", hit.Name);
+        Assert.Equal(FixturePaths.OuterPanelAscxFile, hit.FilePath);
+    }
+
+    /// <summary>And the same id continues into the control's own markup.</summary>
+    [Fact]
+    public async Task AControlInsideTheInnerFileResolvesThroughItsHosts()
+    {
+        var hits = await ResolveAsync("dnn_ctr7_pageForm_ucOuter_ucInner_lblInner");
+
+        var hit = Assert.Single(hits);
+        Assert.Equal("lblInner", hit.Name);
+        Assert.Equal(FixturePaths.InnerPanelAscxFile, hit.FilePath);
+    }
+
+    /// <summary>
+    /// The hosts are matched, not merely walked past.
+    /// </summary>
+    /// <remarks>
+    /// Walking out of a file is what makes the leftover segments explainable, so it is also the
+    /// thing that could explain anything if it did not check. A container the markup never wrote
+    /// still has to fail.
+    /// </remarks>
+    [Fact]
+    public async Task AnIdNamingAHostThatWroteNoSuchTagResolvesToNothing()
+    {
+        Assert.Empty(await ResolveAsync("dnn_ctr7_pageForm_ucNotHere_ucInner_lblInner"));
+        Assert.Empty(await ResolveAsync("dnn_ctr7_pageForm_ucOuter_ucNotHere_lblInner"));
+    }
+
     /// <summary>An ordinary query is not this pack's business and it says so without looking.</summary>
     [Fact]
     public async Task AnOrdinaryQueryIsDeclined() =>

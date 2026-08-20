@@ -37,6 +37,15 @@ internal static class ClientIdSearch
     private const int MaxIdSegments = 4;
 
     /// <summary>
+    /// How many user controls deep the walk out of a file will go.
+    /// </summary>
+    /// <remarks>
+    /// A bound rather than a budget: markup that registers itself, directly or round a ring, would
+    /// otherwise recurse forever, and nothing is reached honestly at this depth anyway.
+    /// </remarks>
+    private const int MaxHostDepth = 16;
+
+    /// <summary>
     /// Scores are pack-local and only ever compared with each other. Contributor hits replace the
     /// ordinary search rather than mixing into it, so there is no scale to line up with — and
     /// borrowing the generic search's tier arithmetic would tie this to constants it keeps private
@@ -44,12 +53,21 @@ internal static class ClientIdSearch
     /// </summary>
     private const int Base = -1_000_000;
 
+    /// <summary>A file's summary, with the project directory its <c>~/</c> paths are relative to.</summary>
+    private readonly record struct IndexedFile(WebFormsFileIndex Index, string ProjectDir)
+    {
+        public string FilePath => Index.FilePath;
+    }
+
+    /// <summary>A place some other file writes a tag for this one.</summary>
+    private readonly record struct HostSite(IndexedFile File, WebFormsControlId Control);
+
     /// <summary>Every control the segments could name, best first, or empty when they name none.</summary>
     public static async Task<IReadOnlyList<SearchHit>> ResolveAsync(
         Solution solution, ClientIdSegments segments, CancellationToken ct)
     {
         var seenProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var files = new List<WebFormsFileIndex>();
+        var files = new List<IndexedFile>();
 
         foreach (var project in solution.Projects)
         {
@@ -60,7 +78,10 @@ internal static class ClientIdSearch
             if (project.FilePath is not { } path || !seenProjects.Add(path))
                 continue;
 
-            files.AddRange(await WebFormsIndex.ForProjectAsync(project, ct));
+            string dir = Path.GetDirectoryName(path) ?? string.Empty;
+
+            foreach (var index in await WebFormsIndex.ForProjectAsync(project, ct))
+                files.Add(new IndexedFile(index, dir));
         }
 
         if (files.Count == 0)
@@ -74,10 +95,11 @@ internal static class ClientIdSearch
     }
 
     private static List<SearchHit> Controls(
-        List<WebFormsFileIndex> files, ClientIdSegments segments, CancellationToken ct)
+        List<IndexedFile> files, ClientIdSegments segments, CancellationToken ct)
     {
         var kept = segments.Kept;
         var found = new List<(int Consumed, bool Named, SearchHit Hit)>();
+        var hosts = Hosts(files, ct);
 
         // Anchored on the right, because that is the end of the id the user actually cares about
         // and the only segment guaranteed to be a control's own name. The `$` form knows exactly
@@ -93,15 +115,15 @@ internal static class ClientIdSearch
             {
                 ct.ThrowIfCancellationRequested();
 
-                foreach (var control in file.Controls)
+                foreach (var control in file.Index.Controls)
                 {
                     if (!control.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    if (Verify(file, control, left) is not { } verdict)
+                    if (Verify(file, control, left, hosts, depth: 0) is not { } verdict)
                         continue;
 
-                    found.Add((verdict.Consumed, verdict.Named, Hit(file, control)));
+                    found.Add((verdict.Consumed, verdict.Named, Hit(file.Index, control)));
                 }
             }
 
@@ -124,16 +146,128 @@ internal static class ClientIdSearch
     }
 
     /// <summary>
+    /// For each markup file, the tags other files write for it.
+    /// </summary>
+    /// <remarks>
+    /// This is the edge that makes the containers of a real id resolvable at all. A page nests user
+    /// controls several files deep — a module's <c>.ascx</c> writes a <c>&lt;uc:Filter&gt;</c> and
+    /// that file writes a <c>&lt;uc:GenericFilter&gt;</c> — so the ancestors an id names are spread
+    /// across the files, and a match confined to one of them sees only the innermost run.
+    /// <para>
+    /// A <c>Src</c> is resolved against the index rather than against the disk: every markup file
+    /// worth reaching is already in this list, so the answer is a dictionary lookup instead of a
+    /// <c>File.Exists</c> per registration per file — which on a site with a thousand pages is the
+    /// difference between a keystroke and a pause.
+    /// </para>
+    /// </remarks>
+    private static Dictionary<string, List<HostSite>> Hosts(
+        List<IndexedFile> files, CancellationToken ct)
+    {
+        var known = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in files)
+            known.TryAdd(Full(file.FilePath), file.FilePath);
+
+        var hosts = new Dictionary<string, List<HostSite>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in files)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (file.Index.Registrations.IsDefaultOrEmpty || file.Index.Controls.IsDefaultOrEmpty)
+                continue;
+
+            // Resolved once per directive rather than once per tag written under it: a page that
+            // repeats a user control twenty times registers it once.
+            Dictionary<string, string>? targets = null;
+
+            foreach (var registration in file.Index.Registrations)
+            {
+                if (registration.SourcePath is not { Length: > 0 } src)
+                    continue;
+
+                if (Resolve(file, src) is { } full && known.TryGetValue(full, out string? target))
+                {
+                    targets ??= new(StringComparer.OrdinalIgnoreCase);
+                    targets[Tag(registration.Prefix, registration.TagName)] = target;
+                }
+            }
+
+            if (targets is null)
+                continue;
+
+            foreach (var control in file.Index.Controls)
+            {
+                if (control.Prefix is not { Length: > 0 } prefix || control.Id.Length == 0)
+                    continue;
+
+                if (!targets.TryGetValue(Tag(prefix, control.TagName), out string? target))
+                    continue;
+
+                if (!hosts.TryGetValue(target, out var sites))
+                    hosts[target] = sites = [];
+
+                sites.Add(new HostSite(file, control));
+            }
+        }
+
+        return hosts;
+    }
+
+    private static string Tag(string prefix, string tagName) => $"{prefix}:{tagName}";
+
+    private static string Full(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch (ArgumentException)
+        {
+            return path;
+        }
+    }
+
+    /// <summary>A <c>Src</c> as a full path — <c>~/</c> against the project, anything else against
+    /// the file's own directory — without asking whether it exists.</summary>
+    private static string? Resolve(IndexedFile file, string src)
+    {
+        string relative = src.Replace('/', Path.DirectorySeparatorChar).Trim();
+        bool rooted = relative.StartsWith("~" + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+
+        string baseDir = rooted
+            ? file.ProjectDir
+            : Path.GetDirectoryName(file.FilePath) ?? string.Empty;
+
+        if (rooted)
+            relative = relative[2..];
+
+        if (baseDir.Length == 0 || relative.Length == 0)
+            return null;
+
+        try
+        {
+            return Path.GetFullPath(Path.Combine(baseDir, relative));
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Whether the segments to the left of the control's own id describe where it sits.
     /// </summary>
     /// <remarks>
     /// They are consumed right to left against the markup ancestors as an ordered subsequence.
-    /// Whatever is left over ran past the file's own root, and can then only be the file itself —
-    /// a module control DNN loaded by name, or a page class. Left over and matching neither, the
-    /// candidate is somebody else's control that happens to share a name.
+    /// Whatever is left over ran past the file's own root, and from there the id can only be
+    /// continuing in whoever writes this file's tag — walked recursively, since a page nests user
+    /// controls several deep — or naming the file itself, which is where a module control DNN
+    /// loaded by name ends. Left over and matching neither, the candidate is somebody else's
+    /// control that happens to share a name.
     /// </remarks>
     private static (int Consumed, bool Named)? Verify(
-        WebFormsFileIndex file, WebFormsControlId control, ReadOnlySpan<string> left)
+        IndexedFile file, WebFormsControlId control, ReadOnlySpan<string> left,
+        Dictionary<string, List<HostSite>> hosts, int depth)
     {
         ImmutableArray<string> ancestors = control.Ancestors.IsDefault ? [] : control.Ancestors;
 
@@ -155,12 +289,60 @@ internal static class ClientIdSearch
         if (l < 0)
             return (consumed, Named: false);
 
-        // What is left has to name the file. DNN's ModuleControlFactory calls a dynamically loaded
+        // What is left may name the file. DNN's ModuleControlFactory calls a dynamically loaded
         // module control after its `.ascx`, which is where a segment run like `OrderIntake_View`
         // in the middle of an id comes from.
-        string run = string.Join('_', left[..(l + 1)].ToArray());
+        var rest = left[..(l + 1)];
 
-        return Names(file, run) ? (consumed + l + 1, Named: true) : null;
+        if (Names(file.Index, string.Join('_', rest.ToArray())))
+            return (consumed + rest.Length, Named: true);
+
+        return Outward(file, rest, hosts, depth) is { } outer
+            ? (consumed + outer.Consumed, outer.Named)
+            : null;
+    }
+
+    /// <summary>
+    /// The same question asked of whoever writes this file's tag.
+    /// </summary>
+    /// <remarks>
+    /// A file may be written in several places and they do not agree: the same user control under
+    /// two different pages makes the leftover segments resolvable through one and not the other.
+    /// The best answer wins rather than the first found, on the rule the hits themselves are ranked
+    /// by — most segments explained, and an id that reached a file it can name over one that merely
+    /// ran out of containers.
+    /// </remarks>
+    private static (int Consumed, bool Named)? Outward(
+        IndexedFile file, ReadOnlySpan<string> left,
+        Dictionary<string, List<HostSite>> hosts, int depth)
+    {
+        if (depth >= MaxHostDepth || left.Length == 0)
+            return null;
+
+        if (!hosts.TryGetValue(Full(file.FilePath), out var sites))
+            return null;
+
+        (int Consumed, bool Named)? best = null;
+
+        foreach (var site in sites)
+        {
+            if (!site.Control.Id.Equals(left[^1], StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (Verify(site.File, site.Control, left[..^1], hosts, depth + 1) is not { } verdict)
+                continue;
+
+            var candidate = (Consumed: verdict.Consumed + 1, verdict.Named);
+
+            if (best is not { } incumbent
+                || candidate.Consumed > incumbent.Consumed
+                || (candidate.Consumed == incumbent.Consumed && candidate.Named && !incumbent.Named))
+            {
+                best = candidate;
+            }
+        }
+
+        return best;
     }
 
     /// <summary>Whether a run of segments is this file's own name.</summary>
@@ -176,7 +358,7 @@ internal static class ClientIdSearch
     /// Suffix runs, longest first: the leading segments of such an id are the containers above the
     /// module, which have no markup of their own to match.
     /// </remarks>
-    private static List<SearchHit> Files(List<WebFormsFileIndex> files, ClientIdSegments segments)
+    private static List<SearchHit> Files(List<IndexedFile> files, ClientIdSegments segments)
     {
         var kept = segments.Kept;
 
@@ -185,7 +367,7 @@ internal static class ClientIdSearch
             string run = string.Join('_', kept.TakeLast(width));
 
             var hits = files
-                .Where(file => Names(file, run))
+                .Where(file => Names(file.Index, run))
                 .OrderBy(file => file.FilePath, StringComparer.OrdinalIgnoreCase)
                 .Take(MaxHits)
                 .Select((file, rank) => new SearchHit(

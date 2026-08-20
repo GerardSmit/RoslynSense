@@ -87,19 +87,46 @@ internal static class ClientIdSearch
         if (files.Count == 0)
             return [];
 
-        var controls = Controls(files, segments, ct);
+        // Built once and shared by both readings: it is a pass over every registration in the
+        // solution, and the reading only decides which segments are matched against it.
+        var hosts = Hosts(files, ct);
+        var readings = Readings(segments);
+
+        foreach (var reading in readings)
+        {
+            if (Controls(files, reading, hosts, ct) is { Count: > 0 } controls)
+                return controls;
+        }
 
         // The paste ended at a container rather than at a control — `dnn_ctr1848_OrderIntake_View`
         // names a module, not something inside it. Saying so beats saying nothing.
-        return controls.Count > 0 ? controls : Files(files, segments);
+        foreach (var reading in readings)
+        {
+            if (Files(files, reading) is { Count: > 0 } named)
+                return named;
+        }
+
+        return [];
     }
 
+    /// <summary>
+    /// The segmentations to try, in the order they deserve to win.
+    /// </summary>
+    /// <remarks>
+    /// The id as written first. A control really called <c>btnSave_2</c> is far rarer than a
+    /// repeater row, but where the markup declares one it is the right answer and the row-number
+    /// reading would walk straight past it — so the markup decides which reading was meant, the
+    /// same way it decides where an underscored id begins.
+    /// </remarks>
+    private static List<ClientIdSegments> Readings(ClientIdSegments segments) =>
+        segments.WithoutRowNumbers() is { } trimmed ? [segments, trimmed] : [segments];
+
     private static List<SearchHit> Controls(
-        List<IndexedFile> files, ClientIdSegments segments, CancellationToken ct)
+        List<IndexedFile> files, ClientIdSegments segments,
+        Dictionary<string, List<HostSite>> hosts, CancellationToken ct)
     {
         var kept = segments.Kept;
         var found = new List<(int Consumed, bool Named, SearchHit Hit)>();
-        var hosts = Hosts(files, ct);
 
         // Anchored on the right, because that is the end of the id the user actually cares about
         // and the only segment guaranteed to be a control's own name. The `$` form knows exactly

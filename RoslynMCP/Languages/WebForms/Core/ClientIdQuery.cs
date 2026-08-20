@@ -10,7 +10,43 @@ namespace RoslynMCP.Languages.WebForms.Core;
 /// an <c>ID</c> may itself contain, so <c>OrderPortal_Intake_View</c> is one segment or three and
 /// only the markup can say which.
 /// </param>
-internal sealed record ClientIdSegments(ImmutableArray<string> Kept, bool Exact);
+internal sealed record ClientIdSegments(ImmutableArray<string> Kept, bool Exact)
+{
+    /// <summary>
+    /// The same id read with the runtime's row numbers taken out, or null when it has none.
+    /// </summary>
+    /// <remarks>
+    /// <c>ClientIDMode="Predictable"</c> — what a data-bound control uses by default — numbers the
+    /// rows of a repeated template by appending the index to the id it just generated, so the save
+    /// button in the third row of <c>rptBackorder</c> is <c>…_rptBackorder_btnSave_2</c> and no
+    /// markup anywhere declares a <c>btnSave_2</c>. Nested templates leave one in the middle as
+    /// well, since the inner repeater's own id was numbered before the button's was:
+    /// <c>…_rptOuter_rptInner_0_btnSave_1</c>.
+    /// <para>
+    /// A second reading rather than a correction, because an <c>ID</c> may legally contain
+    /// <c>_2</c> — <c>Step_1_Detail</c> is somebody's control — and nothing in the id says which of
+    /// the two this is. The markup decides, the same way it decides where an underscored id begins.
+    /// </para>
+    /// </remarks>
+    public ClientIdSegments? WithoutRowNumbers()
+    {
+        if (!Kept.Any(RowNumber))
+            return null;
+
+        var kept = Kept.Where(segment => !RowNumber(segment)).ToImmutableArray();
+
+        return kept.IsEmpty ? null : new ClientIdSegments(kept, Exact);
+    }
+
+    /// <summary>
+    /// A segment that is nothing but digits, which no hand-written <c>ID</c> can be.
+    /// </summary>
+    /// <remarks>
+    /// An <c>ID</c> has to begin with a letter or an underscore, so digits alone were written by
+    /// the runtime — even where the underscore in front of them was not.
+    /// </remarks>
+    private static bool RowNumber(string segment) => segment.All(char.IsAsciiDigit);
+}
 
 /// <summary>
 /// Whether a query is a runtime control id, and what it is made of.

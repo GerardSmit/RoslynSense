@@ -34,6 +34,9 @@ public class WebFormsClientIdQueryTests
     [InlineData("MAX_BUFFER_SIZE")]
     [InlineData("snake_case_helper_name")]
     [InlineData("Order_Item_Total")]
+    // A number is not a generated segment. The runtime writes one for every repeated row, but so
+    // does everybody who ever numbered a phase, and this gate decides who walks control trees.
+    [InlineData("Order_Item_2")]
     // Two segments is not a nesting.
     [InlineData("form1_lblName")]
     // `ctl` without digits is somebody's own control.
@@ -74,6 +77,34 @@ public class WebFormsClientIdQueryTests
         Assert.True(segments!.Exact);
         Assert.Equal(["OrderIntake_View", "list", "Amount"], segments.Kept.ToArray());
     }
+
+    /// <summary>
+    /// A row number is dropped from the second reading and kept in the first.
+    /// </summary>
+    /// <remarks>
+    /// <c>ClientIDMode="Predictable"</c> appends the row index to the id it generated, so the save
+    /// button in the third row of a repeater ends <c>_btnSave_2</c> and nothing in the markup is
+    /// called that. Nested templates leave one in the middle too, since the inner repeater's own
+    /// id was numbered before the button's was.
+    /// </remarks>
+    [Fact]
+    public void ARowNumberIsDroppedFromTheSecondReading()
+    {
+        var segments = ClientIdQuery.Parse("dnn_ctr455_Edit_rptOuter_rptInner_0_btnSave_1");
+
+        Assert.Equal(
+            ["Edit", "rptOuter", "rptInner", "0", "btnSave", "1"], segments!.Kept.ToArray());
+
+        var trimmed = segments.WithoutRowNumbers();
+
+        Assert.NotNull(trimmed);
+        Assert.Equal(["Edit", "rptOuter", "rptInner", "btnSave"], trimmed!.Kept.ToArray());
+    }
+
+    /// <summary>An id with no number in it has one reading, and is not walked twice.</summary>
+    [Fact]
+    public void AnIdWithNoRowNumberHasOnlyOneReading() =>
+        Assert.Null(ClientIdQuery.Parse("dnn_ctr455_Edit_rptOuter_btnSave")!.WithoutRowNumbers());
 
     /// <summary>A control someone called <c>dnn</c> is theirs; only the leading one is DNN's.</summary>
     [Fact]
@@ -250,6 +281,63 @@ public class WebFormsClientIdSearchTests
     {
         Assert.Empty(await ResolveAsync("dnn_ctr7_pageForm_ucNotHere_ucInner_lblInner"));
         Assert.Empty(await ResolveAsync("dnn_ctr7_pageForm_ucOuter_ucNotHere_lblInner"));
+    }
+
+    /// <summary>
+    /// A control in a repeated template resolves past the row number the runtime put on it.
+    /// </summary>
+    /// <remarks>
+    /// The default for a data-bound control since 4.0, and the shape of every id anyone pastes
+    /// off a rendered grid: <c>ClientIDMode="Predictable"</c> appends the row index to the id it
+    /// generated, so a button in the third row arrives as <c>btnAction_2</c> — which is a control
+    /// no markup declares, on a page where <c>btnAction</c> is right there.
+    /// </remarks>
+    [Fact]
+    public async Task AControlInARepeatedRowResolvesPastItsRowNumber()
+    {
+        var hits = await ResolveAsync("dnn_ctr455_Repeater_rptItems_btnAction_2");
+
+        var hit = Assert.Single(hits);
+        Assert.Equal("btnAction", hit.Name);
+        Assert.Equal(FixturePaths.RepeaterAspxFile, hit.FilePath);
+    }
+
+    /// <summary>
+    /// And past one in the middle, which is what a repeater inside a repeater produces.
+    /// </summary>
+    /// <remarks>
+    /// The inner repeater's own id was numbered before the button's was, so the id carries two
+    /// numbers in different places rather than one at the end. Dropping only a trailing number
+    /// would leave the middle one to be matched against a container that does not exist.
+    /// </remarks>
+    [Fact]
+    public async Task ARowNumberInTheMiddleIsReadPastToo()
+    {
+        var hits = await ResolveAsync(
+            "dnn_ctr9_NestedRepeater_rptBaskets_rptBasketRows_0_btnRemoveRow_1");
+
+        var hit = Assert.Single(hits);
+        Assert.Equal("btnRemoveRow", hit.Name);
+        Assert.Equal(FixturePaths.NestedRepeaterAspxFile, hit.FilePath);
+    }
+
+    /// <summary>
+    /// An <c>ID</c> that really ends in a number is still that control.
+    /// </summary>
+    /// <remarks>
+    /// Which is why the number is a second reading rather than a correction: <c>lblRow_2</c> is a
+    /// legal <c>ID</c> and nothing in a pasted id says whether the <c>_2</c> came from the markup
+    /// or from the runtime. The id as written is tried first, so the markup decides — the same way
+    /// it decides where an underscored id begins.
+    /// </remarks>
+    [Fact]
+    public async Task AnIdThatReallyEndsInANumberResolvesToItself()
+    {
+        var hits = await ResolveAsync("dnn_ctr9_NestedRepeater_rptBaskets_lblRow_2");
+
+        var hit = Assert.Single(hits);
+        Assert.Equal("lblRow_2", hit.Name);
+        Assert.Equal(FixturePaths.NestedRepeaterAspxFile, hit.FilePath);
     }
 
     /// <summary>An ordinary query is not this pack's business and it says so without looking.</summary>

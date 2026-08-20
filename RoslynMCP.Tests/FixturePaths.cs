@@ -67,6 +67,12 @@ internal static class FixturePaths
     public static string NamingScopeAspxFile => Path.Combine(AspxProjectDir, "NamingScope.aspx");
     public static string NamingScopeCodeBehindFile => Path.Combine(AspxProjectDir, "NamingScope.aspx.cs");
 
+    /// <summary>A repeater inside a repeater, for the row numbers a Predictable ClientID
+    /// carries — one in the middle and one at the end — beside an ID that ends in a number by
+    /// hand.</summary>
+    public static string NestedRepeaterAspxFile =>
+        Path.Combine(AspxProjectDir, "NestedRepeater.aspx");
+
     /// <summary>The cross-project FindControl fixture: the wrappers (and the Control stubs they
     /// extend) live in ControlLib, and WebApp reaches its template control only through them.</summary>
     public static string ControlLibAppDir => Path.Combine(s_fixturesRoot, "ControlLibApp");

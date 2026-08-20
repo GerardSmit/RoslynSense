@@ -180,7 +180,10 @@ The language features are the same ones C# gets, resolved against the markup's o
   misbehaves, and it is the one thing the ordinary search cannot answer: its generated segments
   match no declaration, and a control inside an `<ItemTemplate>` has no code-behind field to match
   in the first place. The containers are matched as well as the ID, so a `lblTotal` declared under
-  three different repeaters resolves to the right one. An ID whose containers match nothing
+  three different repeaters resolves to the right one, and the row numbers a repeated template
+  adds — `…_rptOrders_btnSave_2`, plus one in the middle for a repeater inside a repeater — are
+  read past. A control someone really called `lblRow_2` still wins where the markup declares one,
+  because the ID as written is tried first. An ID whose containers match nothing
   resolves to nothing rather than to the nearest same-named control, and an ID that stops at a
   container names the file.
 - **Linked editing** ties an open tag to its closing tag — renaming `<asp:Panel>` retypes

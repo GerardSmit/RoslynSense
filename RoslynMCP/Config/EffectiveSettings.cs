@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Resources;
 using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Services.Database;
@@ -30,6 +31,10 @@ public sealed record EffectiveSettings(
     /// every other caller of this type ignores.
     /// </remarks>
     internal ResourceSettings Resources { get; init; } = ResourceSettings.Disabled;
+
+    /// <summary>The logging-template pack's gate and which of its rules run. Init-only for the
+    /// same reason as <see cref="Resources"/>.</summary>
+    internal LoggingSettings Logging { get; init; } = LoggingSettings.Disabled;
 
     /// <summary>The project-file pack's gate. Init-only for the same reason as
     /// <see cref="Resources"/>.</summary>
@@ -105,6 +110,8 @@ public sealed record EffectiveSettings(
         bool webConfig = !HasFlag("--no-webconfig") && tools.WebConfig;
         var webConfigFiles = ResolveWebConfigFiles(config?.WebConfig, webConfig, warnings);
         bool dotSettings = !HasFlag("--no-dotsettings") && tools.DotSettings;
+        var logging = LoggingSettings.Resolve(
+            !HasFlag("--no-logging") && tools.Logging, config?.Logging);
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -166,6 +173,7 @@ public sealed record EffectiveSettings(
             WebConfig = webConfig,
             WebConfigFiles = webConfigFiles,
             DotSettings = dotSettings,
+            Logging = logging,
         };
     }
 

@@ -4,6 +4,7 @@ using RoslynMCP.Languages.AppSettings;
 using RoslynMCP.Languages.Dbml;
 using RoslynMCP.Languages.DotSettings;
 using RoslynMCP.Languages.DotSettings.Core;
+using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Mediator;
 using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
@@ -41,6 +42,8 @@ internal static class LanguagePackRegistration
             packs.Add(new MediatorLanguage());
         if (settings.Resources.Enabled)
             packs.Add(new ResourcesLanguage(settings));
+        if (settings.Logging.Enabled)
+            packs.Add(new LoggingLanguage(settings));
         if (settings.MsBuild)
             packs.Add(new MsBuildLanguage());
         if (settings.Dbml)
@@ -73,6 +76,8 @@ internal static class LanguagePackRegistration
             AddPack<MediatorLanguage>(services);
         if (settings.Resources.Enabled)
             AddPack<ResourcesLanguage>(services);
+        if (settings.Logging.Enabled)
+            AddPack<LoggingLanguage>(services);
         if (settings.MsBuild)
             AddPack<MsBuildLanguage>(services);
         if (settings.Dbml)

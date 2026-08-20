@@ -61,6 +61,11 @@
           "title": "ReSharper settings",
           "description": "Whether a committed `.DotSettings` narrows inferred namespaces, search results and coverage."
         },
+        "logging": {
+          "type": "boolean",
+          "title": "Logging templates",
+          "description": "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."
+        },
         "debugger": {
           "type": "boolean",
           "title": "Debugger",
@@ -426,6 +431,53 @@
       },
       "title": "web.config files",
       "description": "Which files the web.config pack treats as Framework configuration."
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "templateSyntax": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Malformed template",
+          "description": "LOG0001 — an unclosed brace or a placeholder naming nothing. Microsoft.Extensions.Logging throws on the first of those rather than rendering it oddly."
+        },
+        "unknownPlaceholder": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Placeholder names no parameter",
+          "description": "LOG0002 — a placeholder in a `[LoggerMessage]` message that matches no parameter, so it prints as literal text. SYSLIB1014's claim, reported on the placeholder."
+        },
+        "valueCount": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Wrong number of values",
+          "description": "LOG0003 — the placeholders and the values disagree in count. Placeholders bind by position, so this shifts every placeholder after the mistake onto the wrong value."
+        },
+        "unusedValue": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Value never printed",
+          "description": "LOG0004 — a parameter or argument no placeholder renders. SYSLIB1015's claim for a generated method, reported on the parameter."
+        },
+        "exceptionPosition": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Exception in the wrong place",
+          "description": "LOG0005 — an exception passed as a rendered value rather than as the first argument, which loses the stack trace and the sink's exception handling."
+        }
+      },
+      "title": "Logging templates",
+      "description": "Which of the message-template rules report. Two of them restate what the `[LoggerMessage]` source generator says as SYSLIB1014 and SYSLIB1015, at a better location — turn those off where the generator runs."
     },
     "debugger": {
       "type": "object",

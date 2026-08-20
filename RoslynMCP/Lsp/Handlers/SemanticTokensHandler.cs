@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Classification;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 
 namespace RoslynMCP.Lsp.Handlers;
@@ -242,7 +244,7 @@ internal static class SemanticTokensHandler
                 modifiersBySpan[span.TextSpan] = modifiersBySpan.GetValueOrDefault(span.TextSpan) | bit;
         }
 
-        var tokens = new List<(int Line, int Char, int Length, int Type, int Modifiers)>();
+        var primary = new List<Coloured>();
         int lastEnd = -1;
         foreach (var span in spans
                      .Where(s => s_classificationMap.ContainsKey(s.ClassificationType))
@@ -253,18 +255,25 @@ internal static class SemanticTokensHandler
                 continue;
             lastEnd = span.TextSpan.End;
 
-            int type = s_typeIndex[s_classificationMap[span.ClassificationType]];
-            int modifiers = modifiersBySpan.GetValueOrDefault(span.TextSpan);
-            var linePositions = text.Lines.GetLinePositionSpan(span.TextSpan);
+            primary.Add(new Coloured(
+                span.TextSpan,
+                s_typeIndex[s_classificationMap[span.ClassificationType]],
+                modifiersBySpan.GetValueOrDefault(span.TextSpan)));
+        }
+
+        var merged = Carve(primary, await EmbeddedTokensAsync(document, classified, ct));
+
+        var tokens = new List<(int Line, int Char, int Length, int Type, int Modifiers)>();
+        foreach (var (span, type, modifiers) in merged)
+        {
+            var linePositions = text.Lines.GetLinePositionSpan(span);
 
             // Split multi-line spans (block comments, verbatim strings) into per-line tokens.
             for (int line = linePositions.Start.Line; line <= linePositions.End.Line; line++)
             {
                 var textLine = text.Lines[line];
-                int start = line == linePositions.Start.Line
-                    ? span.TextSpan.Start : textLine.Start;
-                int end = line == linePositions.End.Line
-                    ? span.TextSpan.End : textLine.End;
+                int start = line == linePositions.Start.Line ? span.Start : textLine.Start;
+                int end = line == linePositions.End.Line ? span.End : textLine.End;
                 if (end > start)
                     tokens.Add((line, start - textLine.Start, end - start, type, modifiers));
             }
@@ -285,5 +294,87 @@ internal static class SemanticTokensHandler
             prevChar = ch;
         }
         return data;
+    }
+
+
+    /// <summary>One span of one colour, before it is split at line boundaries.</summary>
+    private readonly record struct Coloured(TextSpan Span, int Type, int Modifiers);
+
+    /// <summary>
+    /// The spans an embedded language claims inside the string literals of this document.
+    /// </summary>
+    /// <remarks>
+    /// Gated twice, because this runs on every keystroke: nothing happens unless some registered
+    /// language colours literals at all, and the walk is confined to the window the request asked
+    /// about, so a range request over the visible screen costs a scan of the visible screen.
+    /// </remarks>
+    private static async Task<List<Coloured>> EmbeddedTokensAsync(
+        Document document, TextSpan window, CancellationToken ct)
+    {
+        var languages = RoslynEmbeddedLanguages.Current;
+        if (languages.IsEmpty || !languages.Languages.OfType<IEmbeddedSemanticTokensProvider>().Any())
+            return [];
+
+        var found = new List<Coloured>();
+
+        foreach (var context in await languages.DetectAllAsync(document, ct, window))
+        {
+            if (context.Language is not IEmbeddedSemanticTokensProvider provider)
+                continue;
+
+            foreach (var token in await provider.SemanticTokensAsync(context, ct))
+            {
+                // A name outside the C# legend is dropped rather than renumbered into whatever
+                // sits at that index: a wrong colour is harder to explain than none.
+                if (token.Span.Length > 0 && s_typeIndex.TryGetValue(token.TokenType, out int type))
+                    found.Add(new Coloured(token.Span, type, token.Modifiers));
+            }
+        }
+
+        found.Sort((left, right) => left.Span.Start.CompareTo(right.Span.Start));
+        return found;
+    }
+
+    /// <summary>
+    /// Cuts the embedded spans out of the C# tokens that contain them and puts them in the gaps.
+    /// </summary>
+    /// <remarks>
+    /// The protocol says tokens must not overlap, and every embedded span is inside a string
+    /// literal that Roslyn already classified as one <c>string</c> token. So the literal is
+    /// replaced by the pieces between the holes — which is also what makes the result look right:
+    /// the quotes and the prose stay string-coloured, and only the holes change.
+    /// </remarks>
+    private static List<Coloured> Carve(List<Coloured> primary, List<Coloured> embedded)
+    {
+        if (embedded.Count == 0)
+            return primary;
+
+        var result = new List<Coloured>(primary.Count + embedded.Count * 2);
+
+        foreach (var token in primary)
+        {
+            int at = token.Span.Start;
+
+            foreach (var hole in embedded)
+            {
+                if (hole.Span.Start >= token.Span.End)
+                    break;
+                if (hole.Span.End <= at)
+                    continue;
+
+                int start = Math.Max(hole.Span.Start, at);
+                if (start > at)
+                    result.Add(token with { Span = TextSpan.FromBounds(at, start) });
+
+                at = Math.Min(hole.Span.End, token.Span.End);
+            }
+
+            if (at < token.Span.End)
+                result.Add(token with { Span = TextSpan.FromBounds(at, token.Span.End) });
+        }
+
+        result.AddRange(embedded);
+        result.Sort((left, right) => left.Span.Start.CompareTo(right.Span.Start));
+        return result;
     }
 }

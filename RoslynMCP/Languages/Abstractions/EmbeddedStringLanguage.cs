@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using LspDiagnostic = RoslynMCP.Lsp.Protocol.Diagnostic;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
@@ -147,5 +148,37 @@ internal interface IEmbeddedHoverProvider
 internal interface IEmbeddedDiagnosticProvider
 {
     Task<IReadOnlyList<LspDiagnostic>> DiagnosticsAsync(
+        EmbeddedStringContext context, CancellationToken ct);
+}
+
+/// <summary>
+/// One coloured span inside the literal.
+/// </summary>
+/// <param name="TokenType">A name from the C# legend — <c>parameter</c>, <c>operator</c>,
+/// <c>keyword</c>. A name the legend does not carry is dropped.</param>
+/// <param name="Modifiers">The C# modifier bitmask, usually 0.</param>
+internal readonly record struct EmbeddedToken(TextSpan Span, string TokenType, int Modifiers = 0);
+
+/// <summary>
+/// Colour inside the literal: the <c>{Id}</c> of a route template, the placeholders of a logging
+/// message, the field names of a query.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Deliberately restricted to the token types C# already declares, rather than letting a language
+/// add its own to the legend as a <see cref="ILanguagePack"/> can. A pack that owns a file type
+/// is colouring a document nothing else has an opinion about; this is colouring a few characters
+/// inside a C# string, next to real C# tokens, and a theme that has never heard of the name would
+/// leave them uncoloured — which is worse than the plain string they already were.
+/// </para>
+/// <para>
+/// The handler carves these out of the string token that encloses them, because the protocol
+/// forbids overlapping tokens: the literal stops being one <c>string</c> span and becomes the
+/// pieces between the holes.
+/// </para>
+/// </remarks>
+internal interface IEmbeddedSemanticTokensProvider
+{
+    Task<IReadOnlyList<EmbeddedToken>> SemanticTokensAsync(
         EmbeddedStringContext context, CancellationToken ct);
 }

@@ -12,6 +12,9 @@ public sealed class RoslynSenseConfig
     /// claims beyond <c>web.config</c> and <c>app.config</c>.</summary>
     public WebConfigConfig WebConfig { get; init; } = new();
 
+    /// <summary>The <c>logging</c> section: which of the message-template rules run.</summary>
+    public LoggingConfig Logging { get; init; } = new();
+
     /// <summary>Which debugger attributes the debug engines honour while inspecting and stepping.</summary>
     public DebuggerConfig Debugger { get; init; } = new();
     public string? TableFormat { get; init; }
@@ -46,6 +49,7 @@ public sealed class ToolsConfig
     public bool AppSettings { get; init; } = true;
     public bool WebConfig { get; init; } = true;
     public bool DotSettings { get; init; } = true;
+    public bool Logging { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;
     public bool Database { get; init; } = true;
@@ -74,6 +78,37 @@ public sealed class WebConfigConfig
     /// what claiming the extension outright already fails to do.
     /// </remarks>
     public IReadOnlyList<string>? AdditionalFiles { get; init; }
+}
+
+/// <summary>
+/// The <c>logging</c> section of <c>roslynsense.json</c>: which of the message-template rules
+/// report.
+/// </summary>
+/// <remarks>
+/// One switch per rule, because two of them restate what the <c>[LoggerMessage]</c> source
+/// generator already says as SYSLIB1014 and SYSLIB1015. A solution where the generator runs turns
+/// those two off and keeps the three it has no equivalent for.
+/// </remarks>
+public sealed class LoggingConfig
+{
+    /// <summary>LOG0001 — malformed template text: an unclosed brace, a hole naming nothing.</summary>
+    public bool? TemplateSyntax { get; init; }
+
+    /// <summary>LOG0002 — a placeholder that matches no parameter of a generated logging
+    /// method, so it prints as literal text. SYSLIB1014's claim, reported on the placeholder.</summary>
+    public bool? UnknownPlaceholder { get; init; }
+
+    /// <summary>LOG0003 — the template's placeholder count and the call's value count
+    /// disagree.</summary>
+    public bool? ValueCount { get; init; }
+
+    /// <summary>LOG0004 — a value no placeholder renders. SYSLIB1015's claim for a generated
+    /// method, reported on the parameter.</summary>
+    public bool? UnusedValue { get; init; }
+
+    /// <summary>LOG0005 — an exception passed as a rendered value instead of as the call's
+    /// first argument, which loses the stack trace.</summary>
+    public bool? ExceptionPosition { get; init; }
 }
 
 public sealed class DatabaseConfig

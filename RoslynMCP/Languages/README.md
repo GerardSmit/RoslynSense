@@ -33,6 +33,10 @@ Languages/
   Resources/           .resx, and the resource keys C# and markup name
     Core/              the engine: discover, group, read, and resolve a key to a family
     ResourcesLanguage.*.cs
+  Logging/             structured logging message templates — no files of its own, only the edge
+                       between a template's {Placeholders} and the values beside them
+    Core/              the engine: parse a template, resolve what binds it, match the two up
+    LoggingLanguage.*.cs
   DotSettings/         ReSharper and Rider settings layers — answers no request about its own
                        files, and narrows the answers to requests about other files instead
     Core/              the engine: unescape, parse, stack the layers, resolve the four keys
@@ -47,6 +51,15 @@ return, which types a coverage run counts — so the work happens at those three
 reaches the settings through `ReSharperSettings.ForProject`. The pack exists to be the gate: it is
 what a reader looks for when they want to know whether a committed settings file is allowed to move
 those answers, and what they switch off when it should not.
+
+`Logging/` is the third kind, and the one to copy when a language turns out to live inside a
+string. It owns no extension either, but unlike `Mediator/` what it answers about is a *span*: the
+`{OrderId}` in `logger.LogWarning("Stopped {OrderId}", id)` is a hole in a small language embedded
+in a C# literal, reached through [`IConfiguredStringLanguage`](Abstractions/EmbeddedStringLanguage.cs)
+rather than through the file map. That seam is orthogonal to pack identity — `Resources/`,
+`WebConfig/`, `AppSettings/` and `WebForms/` all implement it beside owning files, and this
+implements only it — so the choice is not "pack or embedded language" but "does this own documents,
+and does it own spans inside someone else's".
 
 Not every pack is a file type. `Mediator/` owns no extension at all: a request, its handler and the
 call joining them are ordinary C#, and what is missing is the *edge* between them, which Roslyn

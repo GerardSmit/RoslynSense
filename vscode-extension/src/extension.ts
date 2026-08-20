@@ -192,6 +192,14 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         breakpoints: false,
     },
     {
+        // No files of its own either. A message template lives inside a C# string literal, so the
+        // selector already covers it; this row exists only to carry the id into
+        // `serverSettings().languages`.
+        id: 'logging',
+        extensions: [],
+        breakpoints: false,
+    },
+    {
         // Project files. Contributed as their own language for the same reason as resx: without
         // the id in `contributes.languages` VS Code opens a .csproj as `xml`, the selector below
         // never matches it, and the server is never told the buffer was opened.

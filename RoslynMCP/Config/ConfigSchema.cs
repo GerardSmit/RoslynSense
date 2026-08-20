@@ -1,4 +1,4 @@
-﻿using System.Text.Encodings.Web;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Schema;
@@ -59,12 +59,20 @@ public static class ConfigSchema
             ["tools.appSettings"] = ("appsettings.json", "`appsettings*.json` keys joined to the configuration reads that name them."),
             ["tools.webConfig"] = ("web.config", "`<appSettings>` and `<connectionStrings>` joined to the C# and markup that read them."),
             ["tools.dotSettings"] = ("ReSharper settings", "Whether a committed `.DotSettings` narrows inferred namespaces, search results and coverage."),
+            ["tools.logging"] = ("Logging templates", "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."),
             ["tools.debugger"] = ("Debugger", "Launch, breakpoints, stepping and evaluation."),
             ["tools.profiling"] = ("Profiling", "CPU sampling, memory snapshots and coverage."),
             ["tools.database"] = ("Database", "Querying and describing the databases the solution connects to."),
 
             ["webConfig"] = ("web.config files", "Which files the web.config pack treats as Framework configuration."),
             ["webConfig.additionalFiles"] = ("Additional files", "File names claimed alongside `web.config` and `app.config` — for frameworks that keep their own, such as DotNetNuke's `release.config` and `development.config`. Names only, not paths or globs."),
+
+            ["logging"] = ("Logging templates", "Which of the message-template rules report. Two of them restate what the `[LoggerMessage]` source generator says as SYSLIB1014 and SYSLIB1015, at a better location — turn those off where the generator runs."),
+            ["logging.templateSyntax"] = ("Malformed template", "LOG0001 — an unclosed brace or a placeholder naming nothing. Microsoft.Extensions.Logging throws on the first of those rather than rendering it oddly."),
+            ["logging.unknownPlaceholder"] = ("Placeholder names no parameter", "LOG0002 — a placeholder in a `[LoggerMessage]` message that matches no parameter, so it prints as literal text. SYSLIB1014's claim, reported on the placeholder."),
+            ["logging.valueCount"] = ("Wrong number of values", "LOG0003 — the placeholders and the values disagree in count. Placeholders bind by position, so this shifts every placeholder after the mistake onto the wrong value."),
+            ["logging.unusedValue"] = ("Value never printed", "LOG0004 — a parameter or argument no placeholder renders. SYSLIB1015's claim for a generated method, reported on the parameter."),
+            ["logging.exceptionPosition"] = ("Exception in the wrong place", "LOG0005 — an exception passed as a rendered value rather than as the first argument, which loses the stack trace and the sink's exception handling."),
 
             ["resources"] = ("Resource lookups", "How `.resx` files are found and which call shapes carry a resource key."),
             ["resources.preset"] = ("Preset", "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting."),

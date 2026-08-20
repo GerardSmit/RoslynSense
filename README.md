@@ -179,6 +179,7 @@ Use the following server configuration:
 | `--no-dbml` | Disable LINQ to SQL (`.dbml`) support: no navigation between a model and the C# SqlMetal generated from it, no reference counts, no table refresh. |
 | `--no-appsettings` | Disable `appsettings*.json` support: no reference counts, override or external-reference lenses, no navigation between a key and the code reading it. |
 | `--no-webconfig` | Disable `web.config` / `app.config` settings support: the same for `<appSettings>` and `<connectionStrings>`. Binding-redirect checking — warnings, fixes, the lens and the hover — is unaffected. |
+| `--no-logging` | Disable logging message templates: no placeholder colouring, completion, hover or template diagnostics. |
 | `--no-debugger` | Disable all debugger tools (see [Debugging](#debugging)). |
 | `--no-debugger-display` | Show values as their type name rather than through `[DebuggerDisplay]`. See [Debugging](#debugging). |
 | `--no-type-proxy` | Expand values as their own fields rather than through `[DebuggerTypeProxy]`. |
@@ -272,6 +273,12 @@ In VS Code, **RoslynSense: Settings** — from the command palette, or the `⋯`
 | `tools.appSettings` | bool | `true` | `--no-appsettings` forces `false` |
 | `tools.webConfig` | bool | `true` | `--no-webconfig` forces `false` |
 | `webConfig.additionalFiles` | string[]? | `null` | — (extra file names the `web.config` pack claims) |
+| `tools.logging` | bool | `true` | `--no-logging` forces `false` |
+| `logging.templateSyntax` | bool | `true` | — (LOG0001, a malformed template) |
+| `logging.unknownPlaceholder` | bool | `true` | — (LOG0002, a `[LoggerMessage]` placeholder matching no parameter; SYSLIB1014's claim) |
+| `logging.valueCount` | bool | `true` | — (LOG0003, placeholders and values disagreeing in count) |
+| `logging.unusedValue` | bool | `true` | — (LOG0004, a value no placeholder prints; SYSLIB1015's claim) |
+| `logging.exceptionPosition` | bool | `true` | — (LOG0005, an exception passed as a value rather than first) |
 | `tools.debugger` | bool | `true` | `--no-debugger` forces `false` |
 | `tools.profiling` | bool | `true` | `--no-profiling` forces `false` |
 | `tools.database` | bool | `true` | `--no-db` forces `false` |

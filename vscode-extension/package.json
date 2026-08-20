@@ -1309,6 +1309,11 @@
           "default": true,
           "markdownDescription": "Resolve `Send`, `Publish` and the generated mediator extension methods to the handler that runs, and count those calls as usages of the handler. Supports MediatR and Zapto.Mediator. Off leaves them resolving to the mediator interface in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
+        "roslynSense.languages.logging": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for structured logging message templates \u2014 Microsoft.Extensions.Logging, Serilog and NLog. Colours each `{Placeholder}`, completes it from the values the call passes, explains on hover which value it actually prints, and warns when the template and the values disagree or an exception is passed as a value instead of as the first argument. Off leaves the template as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
         "roslynSense.languages.msbuild": {
           "type": "boolean",
           "default": true,

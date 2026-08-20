@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Text;
 using Microsoft.CodeAnalysis.CSharp.EmbeddedLanguages.LanguageServices;
 using Microsoft.CodeAnalysis.EmbeddedLanguages;
 
@@ -127,15 +128,22 @@ internal sealed class RoslynEmbeddedLanguages
     /// </summary>
     /// <remarks>
     /// This walks every token, which the caret path deliberately does not. Keep it off interactive
-    /// requests.
+    /// requests, or give it a <paramref name="window"/>.
     /// </remarks>
+    /// <param name="window">The part of the document to look in, or null for all of it. What the
+    /// semantic-tokens range request passes, since colouring what is on screen should not cost a
+    /// walk over what is not.</param>
     public async Task<IReadOnlyList<EmbeddedStringContext>> DetectAllAsync(
-        Document document, CancellationToken ct)
+        Document document, CancellationToken ct, TextSpan? window = null)
     {
         if (IsEmpty || await document.GetSyntaxRootAsync(ct) is not { } root)
             return [];
 
-        var candidates = root.DescendantTokens().Where(IsCandidate).ToList();
+        var candidates = (window is { } span
+                ? root.DescendantTokens(span)
+                : root.DescendantTokens())
+            .Where(IsCandidate)
+            .ToList();
         if (candidates.Count == 0)
             return [];
 

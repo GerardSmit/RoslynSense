@@ -5,6 +5,7 @@ using RoslynMCP.Languages;
 using RoslynMCP.Languages.AppSettings;
 using RoslynMCP.Languages.Dbml;
 using RoslynMCP.Languages.DotSettings;
+using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Mediator;
 using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
@@ -139,6 +140,7 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ProtoLanguage>(pack),
             pack => Assert.IsType<MediatorLanguage>(pack),
             pack => Assert.IsType<ResourcesLanguage>(pack),
+            pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),
@@ -213,6 +215,7 @@ public class LanguageRegistryTests
             pack => Assert.IsType<RazorLanguage>(pack),
             pack => Assert.IsType<ProtoLanguage>(pack),
             pack => Assert.IsType<ResourcesLanguage>(pack),
+            pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),
@@ -257,6 +260,7 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ProtoLanguage>(pack),
             pack => Assert.IsType<MediatorLanguage>(pack),
             pack => Assert.IsType<ResourcesLanguage>(pack),
+            pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),

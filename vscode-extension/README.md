@@ -279,6 +279,59 @@ from a code action is not implemented, so a missing key is a navigation target y
 terms as WebForms; `--no-resources` (or `"tools": { "resources": false }`) turns it off for the
 daemon, AI sessions included.
 
+## Logging templates
+
+A structured logging message is a small language living in a C# string, and nothing in C# connects
+its `{Placeholders}` to the values beside them. Microsoft.Extensions.Logging, Serilog and NLog all
+implement [messagetemplates.org](https://messagetemplates.org), and this reads all three.
+
+The thing worth knowing before anything else: **at a call site the holes bind by position, not by
+name.**
+
+```csharp
+Log.Warning("{User} left {Room}", room, user);   // logs the room as User and the user as Room
+```
+
+That compiles, runs, and quietly logs the wrong thing forever. Only the `[LoggerMessage]` source
+generator binds by name.
+
+- **Colour.** Each hole is painted — braces as punctuation, the name as the value it stands for. A
+  hole that reaches no value is left the colour of the string around it, because that is what it
+  prints as.
+- **Hover** on a hole names the value it actually prints — `2nd value passed to _logger.LogWarning
+  — matched by position, not by name` — with its type, plus what a `@`/`$` capture operator, an
+  alignment or a format specifier does to it.
+- **Completion** inside `{` offers what the call passes, in the PascalCase a log property is
+  written in whatever the parameter is called, with the one this position actually renders
+  preselected.
+- **Diagnostics**, all warnings, each switchable in `roslynsense.json`:
+
+  | | |
+  |---|---|
+  | `LOG0001` | A malformed template — an unclosed brace, a hole naming nothing. Microsoft.Extensions.Logging throws `FormatException` on the first of those. |
+  | `LOG0002` | A `[LoggerMessage]` placeholder matching no parameter, so it prints as literal text. |
+  | `LOG0003` | The placeholders and the values disagree in count. Because binding is positional, this shifts every hole after the mistake onto the wrong value. |
+  | `LOG0004` | A value no placeholder prints. Reported on the parameter or the argument, not on the call. |
+  | `LOG0005` | An exception passed as a rendered value instead of as the first argument. It compiles and logs something, and the stack trace, the error grouping and the sink's own exception rendering are all gone. |
+
+`LOG0002` and `LOG0004` over a `[LoggerMessage]` restate what the source generator reports as
+SYSLIB1014 and SYSLIB1015 — more precisely placed, on the hole and on the parameter rather than on
+the method, but the same claim. Where the generator runs, turn those two off:
+
+```json
+{ "logging": { "unknownPlaceholder": false, "unusedValue": false } }
+```
+
+Where it does not — an older target framework, a project with the generator disabled, or a codebase
+that calls the logger directly — they are the only report there is. Serilog and NLog have no
+generator and no equivalent analyzer at all.
+
+log4net is deliberately absent: `ILog.WarnFormat` is `string.Format` with a logger attached, so
+there are no properties to name and nothing to explain.
+
+`roslynSense.languages.logging` turns it off for one window; `--no-logging` (or
+`"tools": { "logging": false }`) turns it off for the daemon, AI sessions included.
+
 ## Editor context for AI chats
 
 With `roslynSense.shareEditorContext` on (the default), the extension tells connected AI chats

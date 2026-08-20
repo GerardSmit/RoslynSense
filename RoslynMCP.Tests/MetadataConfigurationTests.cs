@@ -215,6 +215,124 @@ public class MetadataConfigurationTests : IDisposable
         Assert.DoesNotContain("NotASetting", index.Names(MetadataConfigurationKind.AppSetting));
     }
 
+    // ---- Read through a wrapper the package declares --------------------------------------------
+
+    /// <summary>
+    /// The shape every framework of the Framework generation settles on: the read is wrapped once,
+    /// in the framework's own assembly, and every caller from then on names the wrapper.
+    /// </summary>
+    private const string WrapperSource = """
+        using System.Collections.Specialized;
+        using System.Configuration;
+
+        namespace Contoso.Platform
+        {
+            public static class Config
+            {
+                public static string? GetSetting(string setting) =>
+                    ConfigurationManager.AppSettings[setting];
+
+                public static string? GetConnection(string name) =>
+                    ConfigurationManager.ConnectionStrings[name]?.ConnectionString;
+
+                // The same shape down to the receiver being a static AppSettings property — and
+                // the property belongs to something that is not a configuration manager.
+                public static string? GetOwn(string name) => Impostor.AppSettings[name];
+            }
+
+            public static class Impostor
+            {
+                public static NameValueCollection AppSettings { get; } = new NameValueCollection();
+            }
+
+            public static class Startup
+            {
+                // The caller, in the same assembly that declares the wrapper — which is where a
+                // framework does most of its own reading.
+                public static string? Installed() => Config.GetSetting("InstallationDate");
+
+                public static string? Main() => Config.GetConnection("SiteSqlServer");
+
+                public static string? Decoy() => Config.GetOwn("NotASetting");
+            }
+        }
+        """;
+
+    [Fact]
+    public async Task AKeyHandedToAWrapperInTheSameAssemblyIsFound()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var managersReference = MetadataReference.CreateFromFile(managers);
+        string platform = Emit("Contoso.Platform", WrapperSource, managersReference);
+
+        var index = await IndexAsync(platform, managersReference);
+
+        // Nothing in Startup names a configuration API, and nothing in Config names a key. The
+        // read only exists as the pair.
+        Assert.Contains("InstallationDate", index.Names(MetadataConfigurationKind.AppSetting));
+        Assert.Contains("SiteSqlServer", index.Names(MetadataConfigurationKind.ConnectionString));
+    }
+
+    [Fact]
+    public async Task AWrapperOverACollectionOfItsOwnForwardsNothing()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var managersReference = MetadataReference.CreateFromFile(managers);
+        string platform = Emit("Contoso.Platform", WrapperSource, managersReference);
+
+        var index = await IndexAsync(platform, managersReference);
+
+        // GetOwn is the wrapper shape down to the last opcode — a parameter handed to a get_Item
+        // on the collection a static AppSettings property returned. The one thing that differs is
+        // who declares that property, which is a question only the type system can answer.
+        Assert.DoesNotContain("NotASetting", index.Names(MetadataConfigurationKind.AppSetting));
+        Assert.DoesNotContain(index.Wrappers, w => w.MethodName == "GetOwn");
+    }
+
+    [Fact]
+    public async Task AKeyHandedToAnotherAssemblysWrapperIsFoundToo()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var managersReference = MetadataReference.CreateFromFile(managers);
+        string platform = Emit("Contoso.Platform", WrapperSource, managersReference);
+
+        string module = Emit("Contoso.Module", """
+            namespace Contoso.Modules
+            {
+                public static class Widget
+                {
+                    // Names no configuration type at all: the only clue is the callee.
+                    public static string? Skin() => Contoso.Platform.Config.GetSetting("DefaultSkin");
+                }
+            }
+            """, MetadataReference.CreateFromFile(platform));
+
+        var index = await IndexAsync(
+            module, [managersReference, MetadataReference.CreateFromFile(platform)],
+            siblingAssemblyName: null);
+
+        // The reason the wrapper pass has to run over every reference rather than over the one
+        // that declared the wrapper.
+        Assert.Contains("DefaultSkin", index.Names(MetadataConfigurationKind.AppSetting));
+    }
+
+    [Fact]
+    public async Task TheWrapperIsPublishedSoTheSolutionsOwnCallsCanBeFound()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var managersReference = MetadataReference.CreateFromFile(managers);
+        string platform = Emit("Contoso.Platform", WrapperSource, managersReference);
+
+        var index = await IndexAsync(platform, managersReference);
+
+        var wrapper = Assert.Single(index.Wrappers, w => w.MethodName == "GetSetting");
+
+        // Spelled as C# spells it, because the workspace side matches a bound call against it.
+        Assert.Equal("Contoso.Platform.Config", wrapper.TypeName);
+        Assert.Equal(0, wrapper.ParameterIndex);
+        Assert.Equal(MetadataConfigurationKind.AppSetting, wrapper.Kind);
+    }
+
     [Fact]
     public async Task AnAssemblyBuiltByAProjectInTheSolutionIsLeftToItsSource()
     {

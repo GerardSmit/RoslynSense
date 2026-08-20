@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 
@@ -34,6 +34,17 @@ internal readonly record struct MetadataConfigurationRead(
     string MethodName);
 
 /// <summary>
+/// A method with no source in the solution that reads whatever key it is handed, and the keyspace
+/// it reads from.
+/// </summary>
+/// <param name="TypeName">The declaring type as C# spells it, not as metadata does, so a call site
+/// bound in the workspace can be matched against it by name.</param>
+/// <param name="ParameterIndex">Which parameter carries the key, counted as the declaration counts
+/// them.</param>
+internal readonly record struct MetadataConfigurationWrapper(
+    MetadataConfigurationKind Kind, string TypeName, string MethodName, int ParameterIndex);
+
+/// <summary>
 /// The configuration a project's referenced assemblies read, confirmed against the type system.
 /// </summary>
 /// <remarks>
@@ -54,16 +65,31 @@ internal readonly record struct MetadataConfigurationRead(
 /// </remarks>
 internal sealed class MetadataConfigurationIndex
 {
-    public static readonly MetadataConfigurationIndex Empty = new([]);
+    public static readonly MetadataConfigurationIndex Empty = new([], []);
 
     private readonly ImmutableArray<MetadataConfigurationRead> _reads;
 
-    private MetadataConfigurationIndex(ImmutableArray<MetadataConfigurationRead> reads) =>
+    private MetadataConfigurationIndex(
+        ImmutableArray<MetadataConfigurationRead> reads,
+        ImmutableArray<MetadataConfigurationWrapper> wrappers)
+    {
         _reads = reads;
+        Wrappers = wrappers;
+    }
 
-    public bool IsEmpty => _reads.IsEmpty;
+    public bool IsEmpty => _reads.IsEmpty && Wrappers.IsEmpty;
 
     public ImmutableArray<MetadataConfigurationRead> Reads => _reads;
+
+    /// <summary>
+    /// The reading methods the referenced assemblies declare, whose callers are reads too.
+    /// </summary>
+    /// <remarks>
+    /// Published rather than kept private because the solution's own source calls these as well,
+    /// and the source-side index has no other way to learn about them: it discovers wrappers by
+    /// reading their bodies, and a wrapper compiled into a package has no body to read.
+    /// </remarks>
+    public ImmutableArray<MetadataConfigurationWrapper> Wrappers { get; }
 
     /// <summary>Every external read of one name.</summary>
     public IEnumerable<MetadataConfigurationRead> ReadsFor(MetadataConfigurationKind kind, string name) =>
@@ -173,42 +199,109 @@ internal sealed class MetadataConfigurationIndex
             "Microsoft.Extensions.Configuration.IConfiguration");
 
         var reads = ImmutableArray.CreateBuilder<MetadataConfigurationRead>();
-        var resolved = new Dictionary<(string Type, string Member, string? Receiver), MetadataConfigurationKind?>();
+        var resolved =
+            new Dictionary<MetadataConfigurationCandidate, MetadataConfigurationKind?>();
+        var wrappers = new Dictionary<MetadataForwarderKey, MetadataConfigurationWrapper>();
+
+        MetadataConfigurationKind? KindOf(MetadataConfigurationCandidate candidate)
+        {
+            // Memoised on the whole shape of the call rather than on part of it. The receiver's
+            // type is the only thing separating ConfigurationManager.AppSettings[key] from some
+            // other class's AppSettings[key], and leaving it out of the key let the first of the
+            // two answer for both.
+            var shape = candidate with { Literal = "", ContainingTypeName = "", ContainingMethodName = "" };
+
+            if (!resolved.TryGetValue(shape, out var kind))
+            {
+                kind = Classify(compilation, configuration, candidate);
+                resolved[shape] = kind;
+            }
+
+            return kind;
+        }
+
+        void Record(MetadataConfigurationKind kind, MetadataConfigurationCandidate candidate,
+            string assembly, string path)
+        {
+            if (Name(kind, candidate.MemberName, candidate.Literal) is { Length: > 0 } name)
+            {
+                reads.Add(new MetadataConfigurationRead(
+                    kind, name, candidate.Literal, assembly, path,
+                    candidate.ContainingTypeName, candidate.ContainingMethodName));
+            }
+        }
 
         foreach (var (path, _) in references)
         {
             ct.ThrowIfCancellationRequested();
 
-            var candidates = MetadataConfigurationScanner.Candidates(path);
+            var scan = MetadataConfigurationScanner.Scan(path);
 
-            if (candidates.IsEmpty)
+            if (scan.IsEmpty)
                 continue;
 
             string assembly = Path.GetFileNameWithoutExtension(path);
 
-            foreach (var candidate in candidates)
+            foreach (var candidate in scan.Candidates)
             {
-                var lookup = (candidate.DeclaringTypeName, candidate.MemberName, candidate.ReceiverMemberName);
+                if (KindOf(candidate) is { } confirmed)
+                    Record(confirmed, candidate, assembly, path);
+            }
 
-                if (!resolved.TryGetValue(lookup, out var kind))
+            foreach (var forwarder in scan.Forwarders)
+            {
+                // Classified by what its parameter reaches, which is the same question asked of a
+                // direct read and answered by the same rules — a wrapper over a collection of its
+                // own is rejected here exactly as a decoy read is.
+                //
+                // Framework keyspaces only. The IConfiguration surface is enumerated deliberately,
+                // with Bind and Configure left out on purpose, and inferring wrappers over it would
+                // reopen that decision from the wrong end while double-counting the framework's own
+                // extension methods — GetConnectionString is itself a parameter handed to a
+                // GetSection, and every call to it is already a read in its own right.
+                if (KindOf(forwarder.Read) is { } confirmed
+                    and not MetadataConfigurationKind.Path)
                 {
-                    kind = Classify(compilation, configuration, candidate);
-                    resolved[lookup] = kind;
-                }
+                    // Through the type system rather than by rewriting the metadata name, because
+                    // the workspace side matches on what C# calls the type: a nested one is
+                    // Outer+Inner here and Outer.Inner there, and a generic one is neither.
+                    string spelling =
+                        compilation.GetTypeByMetadataName(forwarder.Key.TypeName)?.ToDisplayString()
+                        ?? forwarder.Key.TypeName;
 
-                if (kind is not { } confirmed)
-                    continue;
-
-                if (Name(confirmed, candidate.MemberName, candidate.Literal) is { Length: > 0 } name)
-                {
-                    reads.Add(new MetadataConfigurationRead(
-                        confirmed, name, candidate.Literal, assembly, path,
-                        candidate.ContainingTypeName, candidate.ContainingMethodName));
+                    wrappers.TryAdd(forwarder.Key, new MetadataConfigurationWrapper(
+                        confirmed, spelling, forwarder.Key.MethodName, forwarder.ParameterIndex));
                 }
             }
         }
 
-        return reads.Count == 0 ? Empty : new MetadataConfigurationIndex(reads.ToImmutable());
+        // Second pass, once every wrapper is known: the assemblies that call them. Skipped
+        // entirely when nothing wraps anything, which is every modern solution.
+        if (wrappers.Count > 0)
+        {
+            var keys = wrappers.Keys.ToImmutableArray();
+
+            foreach (var (path, _) in references)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                string assembly = Path.GetFileNameWithoutExtension(path);
+
+                foreach (var candidate in MetadataConfigurationScanner.ForwardedCandidates(path, keys))
+                {
+                    if (wrappers.TryGetValue(
+                        new MetadataForwarderKey(candidate.DeclaringTypeName, candidate.MemberName),
+                        out var wrapper))
+                    {
+                        Record(wrapper.Kind, candidate, assembly, path);
+                    }
+                }
+            }
+        }
+
+        return reads.Count == 0 && wrappers.Count == 0
+            ? Empty
+            : new MetadataConfigurationIndex(reads.ToImmutable(), [.. wrappers.Values]);
     }
 
     /// <summary>

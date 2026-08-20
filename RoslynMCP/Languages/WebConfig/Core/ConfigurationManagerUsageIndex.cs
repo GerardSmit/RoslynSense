@@ -6,6 +6,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Services;
+using RoslynMCP.Services.MetadataConfiguration;
 
 namespace RoslynMCP.Languages.WebConfig.Core;
 
@@ -109,6 +110,21 @@ internal sealed class ConfigurationManagerUsageIndex
 
             foreach (var forwarder in index.Forwarders)
                 forwarders.TryAdd(forwarder.Id, forwarder);
+        }
+
+        // The wrappers the referenced assemblies declare, which the source scan cannot find: it
+        // recognises a wrapper by reading its body, and a wrapper compiled into a package has no
+        // body in the workspace. Seeding them here is what lets Config.GetSetting("Key") in the
+        // solution's own code count as a read of Key — the framework's wrapper is the only shape a
+        // site built on it ever writes.
+        foreach (var wrapper in (await MetadataConfigurationIndex.GetAsync(project, ct)).Wrappers)
+        {
+            if (Section(wrapper.Kind) is not { } section)
+                continue;
+
+            string id = Id(wrapper.TypeName + "." + wrapper.MethodName, wrapper.ParameterIndex);
+            forwarders.TryAdd(
+                id, new ConfigSettingForwarder(id, wrapper.MethodName, wrapper.ParameterIndex, section));
         }
 
         var scanned = new HashSet<string>(StringComparer.Ordinal);
@@ -388,6 +404,18 @@ internal sealed class ConfigurationManagerUsageIndex
     }
 
     private static string Id(string key, int parameterIndex) => key + "#" + parameterIndex;
+
+    /// <summary>
+    /// The <c>.config</c> section a metadata wrapper reads, or null for the ones that belong to
+    /// the other keyspace — an <c>IConfiguration</c> path is the appsettings pack's business.
+    /// </summary>
+    private static WebConfigSection? Section(MetadataConfigurationKind kind) =>
+        kind switch
+        {
+            MetadataConfigurationKind.AppSetting => WebConfigSection.AppSettings,
+            MetadataConfigurationKind.ConnectionString => WebConfigSection.ConnectionStrings,
+            _ => null,
+        };
 
     /// <summary>
     /// The section a receiver reads, or null when it is not one of the configuration collections.

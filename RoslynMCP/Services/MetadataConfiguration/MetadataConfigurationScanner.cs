@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
+using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
@@ -28,6 +29,42 @@ internal readonly record struct MetadataConfigurationCandidate(
     string? ReceiverTypeName,
     string ContainingTypeName,
     string ContainingMethodName);
+
+/// <summary>A type and a method, which is all a call site says about what it is calling.</summary>
+internal readonly record struct MetadataForwarderKey(string TypeName, string MethodName);
+
+/// <summary>
+/// A method in a compiled assembly that reads whatever setting it is handed —
+/// <c>Config.GetSetting(name)</c> over <c>ConfigurationManager.AppSettings</c>.
+/// </summary>
+/// <remarks>
+/// The shape that made the external-reference count read zero on a DNN site. Every framework of
+/// that generation wraps the read once, in its own assembly, and from then on nothing anywhere
+/// names a configuration API at the call site: the site says <c>Config.GetSetting("Key")</c> and
+/// the read is a compilation unit away, behind a parameter. A scan that only recognises the
+/// framework's own shapes sees the wrapper's body — with no literal in it — and every one of its
+/// hundreds of callers as ordinary calls to an ordinary method.
+/// </remarks>
+/// <param name="ParameterIndex">Which of the method's own parameters reaches the read, counted as
+/// the declaration counts them: <c>this</c> is not one.</param>
+/// <param name="Read">The read the parameter reaches, carried whole and with an empty literal, so
+/// that a wrapper is classified by exactly the rules a direct read is.</param>
+internal readonly record struct MetadataConfigurationForwarder(
+    int ParameterIndex, MetadataConfigurationCandidate Read)
+{
+    public MetadataForwarderKey Key =>
+        new(Read.ContainingTypeName, Read.ContainingMethodName);
+}
+
+/// <summary>One assembly's worth of reads, and the wrappers that read on someone else's behalf.</summary>
+internal readonly record struct MetadataConfigurationScan(
+    ImmutableArray<MetadataConfigurationCandidate> Candidates,
+    ImmutableArray<MetadataConfigurationForwarder> Forwarders)
+{
+    public static MetadataConfigurationScan Empty { get; } = new([], []);
+
+    public bool IsEmpty => Candidates.IsEmpty && Forwarders.IsEmpty;
+}
 
 /// <summary>
 /// Reads the configuration keys a compiled assembly names inside itself.
@@ -83,34 +120,121 @@ internal static class MetadataConfigurationScanner
     private static readonly ConcurrentDictionary<string, Entry> s_cache =
         new(StringComparer.OrdinalIgnoreCase);
 
-    private sealed record Entry(
+    private static readonly ConcurrentDictionary<(string Path, string Wrappers), ForwardedEntry>
+        s_forwardedCache = new();
+
+    private sealed record Entry(DateTime WrittenUtc, MetadataConfigurationScan Scan);
+
+    private sealed record ForwardedEntry(
         DateTime WrittenUtc, ImmutableArray<MetadataConfigurationCandidate> Candidates);
 
-    public static void Clear() => s_cache.Clear();
-
-    /// <summary>Every candidate in one assembly, re-read only when the file changes.</summary>
-    public static ImmutableArray<MetadataConfigurationCandidate> Candidates(string assemblyPath)
+    public static void Clear()
     {
-        DateTime writtenUtc;
+        s_cache.Clear();
+        s_forwardedCache.Clear();
+    }
 
-        try
-        {
-            writtenUtc = File.GetLastWriteTimeUtc(assemblyPath);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return [];
-        }
+    /// <summary>Everything one assembly says on its own, re-read only when the file changes.</summary>
+    public static MetadataConfigurationScan Scan(string assemblyPath)
+    {
+        if (WrittenUtc(assemblyPath) is not { } writtenUtc)
+            return MetadataConfigurationScan.Empty;
 
         if (s_cache.TryGetValue(assemblyPath, out var cached) && cached.WrittenUtc == writtenUtc)
-            return cached.Candidates;
+            return cached.Scan;
 
-        var candidates = Read(assemblyPath);
-        s_cache[assemblyPath] = new Entry(writtenUtc, candidates);
+        var scan = Read(assemblyPath);
+        s_cache[assemblyPath] = new Entry(writtenUtc, scan);
+        return scan;
+    }
+
+    /// <summary>
+    /// The literals one assembly hands to a known set of wrappers.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A second pass, because a wrapper is not known until the first one has finished: the
+    /// assembly declaring <c>Config.GetSetting</c> and the assemblies calling it are different
+    /// files, and the calling ones say nothing about configuration at all. Same shape as the
+    /// source side, which also needs a round to find the wrapper before a round can find its
+    /// callers.
+    /// </para>
+    /// <para>
+    /// The type-reference gate is what keeps a second pass from doubling the cost. An assembly
+    /// that never names the wrapper's declaring type cannot be calling it, and that is decided
+    /// from the metadata tables without a method body being read — the same filter, on a different
+    /// set of names, that made the first pass affordable.
+    /// </para>
+    /// </remarks>
+    public static ImmutableArray<MetadataConfigurationCandidate> ForwardedCandidates(
+        string assemblyPath, ImmutableArray<MetadataForwarderKey> wrappers)
+    {
+        if (wrappers.IsDefaultOrEmpty || WrittenUtc(assemblyPath) is not { } writtenUtc)
+            return [];
+
+        string key = string.Join(
+            "|", wrappers.Select(w => w.TypeName + "." + w.MethodName).OrderBy(n => n, StringComparer.Ordinal));
+
+        if (s_forwardedCache.TryGetValue((assemblyPath, key), out var cached)
+            && cached.WrittenUtc == writtenUtc)
+        {
+            return cached.Candidates;
+        }
+
+        var candidates = ReadForwarded(assemblyPath, wrappers);
+        s_forwardedCache[(assemblyPath, key)] = new ForwardedEntry(writtenUtc, candidates);
         return candidates;
     }
 
-    private static ImmutableArray<MetadataConfigurationCandidate> Read(string assemblyPath)
+    private static DateTime? WrittenUtc(string assemblyPath)
+    {
+        try
+        {
+            return File.GetLastWriteTimeUtc(assemblyPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static MetadataConfigurationScan Read(string assemblyPath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(assemblyPath);
+            using var pe = new PEReader(stream);
+
+            if (!pe.HasMetadata)
+                return MetadataConfigurationScan.Empty;
+
+            var md = pe.GetMetadataReader();
+
+            if (!ReferencesConfiguration(md))
+                return MetadataConfigurationScan.Empty;
+
+            var candidates = ImmutableArray.CreateBuilder<MetadataConfigurationCandidate>();
+            var forwarders = ImmutableArray.CreateBuilder<MetadataConfigurationForwarder>();
+
+            foreach (var (method, il) in Bodies(pe, md))
+            {
+                ReadBody(
+                    md, il, TypeName(md, method.GetDeclaringType()), md.GetString(method.Name),
+                    (method.Attributes & MethodAttributes.Static) != 0, candidates, forwarders);
+            }
+
+            return new MetadataConfigurationScan(candidates.ToImmutable(), forwarders.ToImmutable());
+        }
+        catch (Exception ex)
+            when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
+        {
+            // An unreadable or unmanaged reference contributes nothing; it is not an error.
+            return MetadataConfigurationScan.Empty;
+        }
+    }
+
+    private static ImmutableArray<MetadataConfigurationCandidate> ReadForwarded(
+        string assemblyPath, ImmutableArray<MetadataForwarderKey> wrappers)
     {
         try
         {
@@ -122,35 +246,19 @@ internal static class MetadataConfigurationScanner
 
             var md = pe.GetMetadataReader();
 
-            if (!ReferencesConfiguration(md))
+            var wanted = wrappers.ToLookup(w => w.MethodName, StringComparer.Ordinal);
+            var types = new HashSet<string>(wrappers.Select(w => w.TypeName), StringComparer.Ordinal);
+
+            if (!NamesAnyType(md, types))
                 return [];
 
             var candidates = ImmutableArray.CreateBuilder<MetadataConfigurationCandidate>();
 
-            foreach (var handle in md.MethodDefinitions)
+            foreach (var (method, il) in Bodies(pe, md))
             {
-                var method = md.GetMethodDefinition(handle);
-
-                if (method.RelativeVirtualAddress == 0)
-                    continue;
-
-                byte[] il;
-
-                try
-                {
-                    il = pe.GetMethodBody(method.RelativeVirtualAddress).GetILBytes() ?? [];
-                }
-                catch (BadImageFormatException)
-                {
-                    continue;
-                }
-
-                if (il.Length > 0)
-                {
-                    ReadBody(
-                        md, il, TypeName(md, method.GetDeclaringType()), md.GetString(method.Name),
-                        candidates);
-                }
+                ReadForwardedBody(
+                    md, il, TypeName(md, method.GetDeclaringType()), md.GetString(method.Name),
+                    wanted, candidates);
             }
 
             return candidates.ToImmutable();
@@ -158,9 +266,61 @@ internal static class MetadataConfigurationScanner
         catch (Exception ex)
             when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
         {
-            // An unreadable or unmanaged reference contributes nothing; it is not an error.
             return [];
         }
+    }
+
+    /// <summary>Every method in the assembly that has IL to read.</summary>
+    private static IEnumerable<(MethodDefinition Method, byte[] Il)> Bodies(
+        PEReader pe, MetadataReader md)
+    {
+        foreach (var handle in md.MethodDefinitions)
+        {
+            var method = md.GetMethodDefinition(handle);
+
+            if (method.RelativeVirtualAddress == 0)
+                continue;
+
+            byte[] il;
+
+            try
+            {
+                il = pe.GetMethodBody(method.RelativeVirtualAddress).GetILBytes() ?? [];
+            }
+            catch (BadImageFormatException)
+            {
+                continue;
+            }
+
+            if (il.Length > 0)
+                yield return (method, il);
+        }
+    }
+
+    /// <summary>
+    /// Whether the assembly names any of these types, whether it declares them or refers to them.
+    /// </summary>
+    /// <remarks>
+    /// Both tables, because the assembly that declares a wrapper also tends to be its heaviest
+    /// caller — DNN's own <c>Config.GetSetting</c> is read from all over DNN.
+    /// </remarks>
+    private static bool NamesAnyType(MetadataReader md, HashSet<string> types)
+    {
+        foreach (var handle in md.TypeReferences)
+        {
+            var reference = md.GetTypeReference(handle);
+
+            if (types.Contains(Join(md.GetString(reference.Namespace), md.GetString(reference.Name))))
+                return true;
+        }
+
+        foreach (var handle in md.TypeDefinitions)
+        {
+            if (types.Contains(TypeName(md, handle)))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -206,9 +366,12 @@ internal static class MetadataConfigurationScanner
     /// </summary>
     private static void ReadBody(
         MetadataReader md, byte[] il, string containingType, string containingMethod,
-        ImmutableArray<MetadataConfigurationCandidate>.Builder candidates)
+        bool isStatic,
+        ImmutableArray<MetadataConfigurationCandidate>.Builder candidates,
+        ImmutableArray<MetadataConfigurationForwarder>.Builder forwarders)
     {
         string? pending = null;
+        int? pendingArgument = null;
         string? receiverMember = null;
         string? receiverType = null;
 
@@ -230,17 +393,93 @@ internal static class MetadataConfigurationScanner
                 {
                     var (member, declaring) = Member(md, BitConverter.ToInt32(il, i));
 
-                    if (pending is not null && member is { Length: > 0 }
-                        && declaring is { Length: > 0 } && IsCandidate(member, receiverMember))
+                    if (member is { Length: > 0 } && declaring is { Length: > 0 }
+                        && IsCandidate(member, receiverMember))
                     {
-                        candidates.Add(new MetadataConfigurationCandidate(
-                            pending, member, declaring, receiverMember, receiverType,
-                            containingType, containingMethod));
+                        var read = new MetadataConfigurationCandidate(
+                            pending ?? "", member, declaring, receiverMember, receiverType,
+                            containingType, containingMethod);
+
+                        // A literal decides on its own; the parameter is only consulted when
+                        // there is no literal to be the key. A method that both names a key and
+                        // passes one of its parameters along is read as naming the key, which
+                        // costs a wrapper nobody could have told apart from a decoy anyway.
+                        if (pending is not null)
+                            candidates.Add(read);
+                        else if (pendingArgument is { } index)
+                            forwarders.Add(new MetadataConfigurationForwarder(index, read));
                     }
 
                     pending = null;
+                    pendingArgument = null;
                     receiverMember = member;
                     receiverType = declaring;
+                    break;
+                }
+
+                default:
+                    if (Argument(opcode, il, i, isStatic) is { } argument)
+                    {
+                        pendingArgument = argument;
+                    }
+                    else if (!IsPush(opcode))
+                    {
+                        pending = null;
+                        pendingArgument = null;
+                    }
+
+                    break;
+            }
+
+            i += operand;
+        }
+    }
+
+    /// <summary>
+    /// One method body, looking only for literals handed to a wrapper someone else declared.
+    /// </summary>
+    /// <remarks>
+    /// The literal is taken to be the key with the same looseness the direct pass allows, and for
+    /// the same reason: deciding which argument it fills would mean decoding the callee's
+    /// signature at every call site. A wrapper whose other parameters are also strings can
+    /// therefore be credited with the wrong one — which is why what a wrapper reads is still
+    /// settled by the type system rather than here.
+    /// </remarks>
+    private static void ReadForwardedBody(
+        MetadataReader md, byte[] il, string containingType, string containingMethod,
+        ILookup<string, MetadataForwarderKey> wrappers,
+        ImmutableArray<MetadataConfigurationCandidate>.Builder candidates)
+    {
+        string? pending = null;
+
+        for (int i = 0; i < il.Length;)
+        {
+            int opcode = il[i];
+            int operand = OperandSize(ref opcode, il, ref i);
+
+            if (operand < 0 || i + operand > il.Length)
+                return;
+
+            switch (opcode)
+            {
+                case Ldstr:
+                    pending = UserString(md, BitConverter.ToInt32(il, i));
+                    break;
+
+                case Call or Callvirt:
+                {
+                    var (member, declaring) = Member(md, BitConverter.ToInt32(il, i));
+
+                    if (pending is { Length: > 0 } literal && member is { Length: > 0 }
+                        && declaring is { Length: > 0 }
+                        && wrappers[member].Any(w => w.TypeName == declaring))
+                    {
+                        candidates.Add(new MetadataConfigurationCandidate(
+                            literal, member, declaring, ReceiverMemberName: null,
+                            ReceiverTypeName: null, containingType, containingMethod));
+                    }
+
+                    pending = null;
                     break;
                 }
 
@@ -253,6 +492,27 @@ internal static class MetadataConfigurationScanner
 
             i += operand;
         }
+    }
+
+    /// <summary>
+    /// The declaration-order parameter an <c>ldarg</c> loads, or null when the opcode is not one
+    /// or loads an instance method's <c>this</c>.
+    /// </summary>
+    private static int? Argument(int opcode, byte[] il, int i, bool isStatic)
+    {
+        int slot = opcode switch
+        {
+            >= 0x02 and <= 0x05 => opcode - 0x02,           // ldarg.0 .. ldarg.3
+            0x0E => i < il.Length ? il[i] : -1,             // ldarg.s
+            0xFE09 => i + 1 < il.Length ? BitConverter.ToUInt16(il, i) : -1, // ldarg
+            _ => -1,
+        };
+
+        if (slot < 0)
+            return null;
+
+        int index = isStatic ? slot : slot - 1;
+        return index >= 0 ? index : null;
     }
 
     private static bool IsCandidate(string member, string? receiverMember) =>

@@ -1,6 +1,8 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using RoslynMCP.Languages.AppSettings.Core;
 using RoslynMCP.Languages.WebConfig.Core;
+using RoslynMCP.Services.MetadataConfiguration;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -14,12 +16,36 @@ namespace RoslynMCP.Tests;
 /// actually lives: a shared library owns the read and every application in the solution calls it.
 /// A scan that answers per project, and stops at the framework's own shapes, sees neither half.
 /// </remarks>
-public class ConfigForwardingTests
+public class ConfigForwardingTests : IDisposable
 {
+    private readonly string _directory = Path.Combine(
+        Path.GetTempPath(), "roslynsense-forwarding-" + Guid.NewGuid().ToString("N"));
+
     public ConfigForwardingTests()
     {
         ConfigurationUsageIndex.Clear();
         ConfigurationManagerUsageIndex.Clear();
+        MetadataConfigurationScanner.Clear();
+        MetadataConfigurationIndex.Clear();
+    }
+
+    public void Dispose()
+    {
+        MetadataConfigurationScanner.Clear();
+        MetadataConfigurationIndex.Clear();
+
+        if (Directory.Exists(_directory))
+        {
+            try
+            {
+                Directory.Delete(_directory, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+        }
+
+        GC.SuppressFinalize(this);
     }
 
     // ---- Microsoft.Extensions.Configuration ------------------------------------------------------
@@ -276,6 +302,71 @@ public class ConfigForwardingTests
         Assert.True(index.IsEmpty);
     }
 
+    // ---- A wrapper the solution has no source for ------------------------------------------------
+
+    /// <summary>
+    /// The same wrapper, only compiled. Every Framework-generation platform ships one — a single
+    /// method in the platform assembly that hands its parameter to
+    /// <c>ConfigurationManager.AppSettings</c> — and a site built on it names nothing else.
+    /// </summary>
+    private const string CompiledPlatform = """
+        using System.Collections.Specialized;
+        using System.Configuration;
+
+        namespace Contoso.Platform
+        {
+            public static class Config
+            {
+                public static string? GetSetting(string setting) =>
+                    System.Configuration.ConfigurationManager.AppSettings[setting];
+
+                // A parameter handed somewhere else entirely.
+                public static string? GetOwn(string name) => Cache.Entries[name];
+            }
+
+            public static class Cache
+            {
+                public static NameValueCollection Entries { get; } = new NameValueCollection();
+            }
+        }
+        """;
+
+    [Fact]
+    public async Task AKeyHandedToACompiledWrapperIsARead()
+    {
+        var index = await CompiledAsync("""
+            namespace App
+            {
+                public class Caller
+                {
+                    // Names no configuration type, and the method it calls has no body here.
+                    public string? Read() => Contoso.Platform.Config.GetSetting("InstallationDate");
+                }
+            }
+            """);
+
+        var usage = Assert.Single(index.UsagesFor(WebConfigSection.AppSettings, "InstallationDate"));
+
+        // The lens belongs on the call the solution wrote, not on the wrapper it cannot show.
+        Assert.Equal(@"C:\src\App\Caller.cs", usage.FilePath);
+    }
+
+    [Fact]
+    public async Task AKeyHandedToACompiledMethodThatReadsSomethingElseIsNotARead()
+    {
+        var index = await CompiledAsync("""
+            namespace App
+            {
+                public class Caller
+                {
+                    public string? Read() => Contoso.Platform.Config.GetOwn("NotASetting");
+                }
+            }
+            """);
+
+        Assert.Empty(index.UsagesFor(WebConfigSection.AppSettings, "NotASetting"));
+    }
+
     // ---- Building the pieces ----------------------------------------------------------------------
 
     private static Task<ConfigurationUsageIndex> ModernAsync(string caller) =>
@@ -284,6 +375,56 @@ public class ConfigForwardingTests
     private static Task<ConfigurationManagerUsageIndex> FrameworkAsync(string caller) =>
         ConfigurationManagerUsageIndex.GetAsync(
             Application(ConfigurationManagerStubs, FrameworkReader, caller), default);
+
+    /// <summary>
+    /// One project, and a platform assembly on disk beside it — the shape of a site that installs
+    /// its framework rather than building it.
+    /// </summary>
+    private async Task<ConfigurationManagerUsageIndex> CompiledAsync(string caller)
+    {
+        Directory.CreateDirectory(_directory);
+
+        // Two assemblies, because that is the shape a platform has: its own code compiled against
+        // the Framework's configuration assembly rather than declaring it.
+        var managers = MetadataReference.CreateFromFile(
+            Compile("System.Configuration.Stub", ConfigurationManagerStubs));
+        var platform = MetadataReference.CreateFromFile(
+            Compile("Contoso.Platform", CompiledPlatform, managers));
+
+        var workspace = new AdhocWorkspace();
+        var applicationId = ProjectId.CreateNewId();
+
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                applicationId, VersionStamp.Default, "Application", "Application",
+                LanguageNames.CSharp,
+                metadataReferences: [.. Runtime, managers, platform]))
+            .AddDocument(
+                DocumentId.CreateNewId(applicationId), "Caller.cs", caller,
+                filePath: @"C:\src\App\Caller.cs");
+
+        return await ConfigurationManagerUsageIndex.GetAsync(
+            solution.GetProject(applicationId)!, default);
+    }
+
+    /// <summary>Compiles a library to disk, the way a platform arrives.</summary>
+    private string Compile(string assemblyName, string source, params MetadataReference[] references)
+    {
+        var compilation = CSharpCompilation.Create(
+            assemblyName,
+            [CSharpSyntaxTree.ParseText(source)],
+            [.. Runtime, .. references],
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+
+        string path = Path.Combine(_directory, assemblyName + ".dll");
+        var emitted = compilation.Emit(path);
+
+        Assert.True(emitted.Success, string.Join(
+            Environment.NewLine,
+            emitted.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error)));
+
+        return path;
+    }
 
     /// <summary>
     /// Two projects: a library owning the read, and the application calling it. Referenced the way

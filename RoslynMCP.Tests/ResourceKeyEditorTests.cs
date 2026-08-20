@@ -799,8 +799,31 @@ public class ResourceKeyEditorTests
     /// Markup written into the fixture project for one test and deleted after it, for the cases
     /// that need a page the shared fixtures deliberately do not have.
     /// </summary>
+    /// <remarks>
+    /// Every page gets the <c>App_LocalResources</c> file the local convention names for it, and
+    /// that is what keeps these tests from being a coin flip rather than a decoration. A page
+    /// directive is the only way to give inline code a class to bind against, so these pages copy
+    /// <c>Default.aspx</c>'s — which leaves two or three files in the project claiming
+    /// <c>AspxProject.DefaultPage</c>, and the root resolves to whichever of them the project index
+    /// lists first. Landing on a page with no resource file of its own, the root finds nothing and
+    /// falls through to proximity, and proximity is <c>Ambiguous</c>, which switches the
+    /// missing-key rule off; with one, every claimant answers the same.
+    /// </remarks>
     private sealed class TemporaryPage : IDisposable
     {
+        /// <summary>A resource file that parses and declares one key, which is not the key any of
+        /// these tests asks about.</summary>
+        private const string EmptyResources =
+            """
+            <?xml version="1.0" encoding="utf-8"?>
+            <root>
+              <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+              <resheader name="version"><value>2.0</value></resheader>
+              <data name="Placeholder.Text" xml:space="preserve"><value>Placeholder</value></data>
+            </root>
+
+            """;
+
         private readonly List<string> _written = [];
 
         /// <summary>The file the test asks about.</summary>
@@ -809,10 +832,9 @@ public class ResourceKeyEditorTests
         public static TemporaryPage Beside(string sibling, string text)
         {
             var page = new TemporaryPage { Path = NameBeside(sibling) };
-            page.Write(page.Path, text);
+            page.WritePage(page.Path, text);
 
-            AspxReferenceService.ResetFileListCache();
-            return page;
+            return page.Settled();
         }
 
         /// <summary>
@@ -823,13 +845,12 @@ public class ResourceKeyEditorTests
         public static TemporaryPage Included(string sibling, string text)
         {
             var fragment = new TemporaryPage { Path = NameBeside(sibling) };
-            fragment.Write(fragment.Path, text);
-            fragment.Write(
+            fragment.WritePage(fragment.Path, text);
+            fragment.WritePage(
                 NameBeside(sibling),
                 $"<!--#include file=\"{System.IO.Path.GetFileName(fragment.Path)}\" -->\n");
 
-            AspxReferenceService.ResetFileListCache();
-            return fragment;
+            return fragment.Settled();
         }
 
         private static string NameBeside(string sibling) =>
@@ -837,10 +858,36 @@ public class ResourceKeyEditorTests
                 System.IO.Path.GetDirectoryName(sibling)!,
                 "TemporaryKey" + Guid.NewGuid().ToString("N")[..8] + ".aspx");
 
+        /// <summary>The page, and the file its own keys would be declared in.</summary>
+        private void WritePage(string path, string text)
+        {
+            Write(path, text);
+            Write(ResourcesFor(path), EmptyResources);
+        }
+
+        private static string ResourcesFor(string page) =>
+            System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(page)!,
+                "App_LocalResources",
+                System.IO.Path.GetFileName(page) + ".resx");
+
         private void Write(string path, string text)
         {
             File.WriteAllText(path, text);
             _written.Add(path);
+            Announce(path);
+        }
+
+        /// <summary>What an editor's watcher would have said: a file entered or left the project,
+        /// so the markup index and the resource catalog both have to be regrouped.</summary>
+        private static void Announce(string path) =>
+            ProjectIndexCacheService.NotifyFileChangedForTests(
+                FixturePaths.AspxProjectFile, path, movedFiles: true);
+
+        private TemporaryPage Settled()
+        {
+            AspxReferenceService.ResetFileListCache();
+            return this;
         }
 
         public void Dispose()
@@ -854,6 +901,8 @@ public class ResourceKeyEditorTests
                 catch (IOException)
                 {
                 }
+
+                Announce(path);
             }
 
             AspxReferenceService.ResetFileListCache();

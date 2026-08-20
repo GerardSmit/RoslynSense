@@ -942,7 +942,22 @@ internal enum AspxExpressionKind { Output, Encoded, DataBinding }
 internal enum AspxCodeLocationType { Expression, CodeBlock, FindControlCall }
 
 /// <summary>All parsed ASPX files in a project.</summary>
-internal record AspxProjectIndex(List<AspxParseResult> Files);
+/// <remarks>
+/// Ordered by path, and that is load-bearing rather than tidy. Both builders parse in parallel and
+/// collect into a <see cref="System.Collections.Concurrent.ConcurrentBag{T}"/>, so left as they
+/// come out the order is whichever thread finished first. Consumers answer with the first match —
+/// <c>ResourceKeySearch.MarkupOfAsync</c>, resolving a code-behind class back to the markup that
+/// names it, above all — and two files naming the same class is ordinary rather than exotic: a page
+/// and a copy of it, or a fragment that carries the page directive of whoever includes it. An
+/// arbitrary winner there is the same question answered differently between two runs.
+/// </remarks>
+internal record AspxProjectIndex
+{
+    public AspxProjectIndex(List<AspxParseResult> files) =>
+        Files = [.. files.OrderBy(file => file.FilePath, StringComparer.OrdinalIgnoreCase)];
+
+    public List<AspxParseResult> Files { get; }
+}
 
 /// <summary>A reference to a symbol found in an ASPX file.</summary>
 /// <param name="LiteralSpan">For a <see cref="AspxCodeLocationType.FindControlCall"/>, the span of

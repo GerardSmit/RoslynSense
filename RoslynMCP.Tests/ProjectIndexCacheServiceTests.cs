@@ -62,6 +62,27 @@ public class ProjectIndexCacheServiceTests
         Assert.Contains(".ashx", extensions);
     }
 
+    /// <summary>
+    /// The index orders its files however they arrived.
+    /// </summary>
+    /// <remarks>
+    /// Both builders parse in parallel into a <see cref="System.Collections.Concurrent.ConcurrentBag{T}"/>,
+    /// so unordered the index comes out in whichever order the thread pool finished. Consumers
+    /// answer with the first match — resolving a code-behind class back to the markup naming it,
+    /// above all — and that is invisible until two files name the same class, at which point the
+    /// same question gets a different answer between two runs of it.
+    /// </remarks>
+    [Fact]
+    public void TheIndexOrdersItsFilesHoweverTheyArrive()
+    {
+        var arrived = BuildTestIndex().Files.ToList();
+        arrived.Reverse();
+
+        var files = new AspxProjectIndex(arrived).Files.Select(f => f.FilePath).ToList();
+
+        Assert.Equal([.. files.OrderBy(path => path, StringComparer.OrdinalIgnoreCase)], files);
+    }
+
     // --- Markup reference search ------------------------------------------------------------
     //
     // These replace the AspxSourceMappingService.FindSymbolReferences tests. That search matched

@@ -32,20 +32,33 @@ public class LspProgressAndRefreshTests
             capabilities = new { },
         });
 
+        // Opened first, and deliberately: the stream a session reads is not its own, so an audit
+        // or a restore another test started is in it too, ahead of anything this one does. Written
+        // out rather than waited for, because a hazard only another test can supply is a hazard
+        // that stops being tested the day that test is deleted.
+        await using (var other = await ProgressReporter.BeginAsync("Some Other Operation"))
+            other.Report("Not this one", 90);
+
         await using (var scope = await ProgressReporter.BeginAsync("Loading Sandbox"))
             scope.Report("Restoring packages", 40);
 
-        var created = await session.Client.WaitForAsync("create");
-        Assert.StartsWith("roslyn-sense/", created.GetProperty("token").GetString());
+        await session.Client.WaitForAsync("begin", p => Title(p) == "Some Other Operation");
 
-        var begin = await session.Client.WaitForAsync("begin");
-        Assert.Equal("Loading Sandbox", begin.GetProperty("value").GetProperty("title").GetString());
+        // Found by its title and then followed by its token, rather than taken as the first event
+        // of each kind — which would be the operation above every time.
+        var begin = await session.Client.WaitForAsync(
+            "begin", p => Title(p) == "Loading Sandbox");
 
-        var report = await session.Client.WaitForAsync("report");
+        string token = begin.GetProperty("token").GetString()!;
+        Assert.StartsWith("roslyn-sense/", token);
+
+        await session.Client.WaitForAsync("create", Carrying(token));
+
+        var report = await session.Client.WaitForAsync("report", Carrying(token));
         Assert.Equal("Restoring packages", report.GetProperty("value").GetProperty("message").GetString());
         Assert.Equal(40, report.GetProperty("value").GetProperty("percentage").GetInt32());
 
-        await session.Client.WaitForAsync("end");
+        await session.Client.WaitForAsync("end", Carrying(token));
     }
 
     [Fact]
@@ -247,6 +260,14 @@ public class LspProgressAndRefreshTests
         }
     }
 
+    /// <summary>The one operation this token names — the same shape for the create request and
+    /// for every <c>$/progress</c> that follows it.</summary>
+    private static Func<JsonElement, bool> Carrying(string token) =>
+        p => p.GetProperty("token").GetString() == token;
+
+    private static string? Title(JsonElement progress) =>
+        progress.GetProperty("value").GetProperty("title").GetString();
+
     private sealed class RecordingClient
     {
         private readonly ConcurrentQueue<(string Key, JsonElement Payload)> _events = new();
@@ -285,14 +306,29 @@ public class LspProgressAndRefreshTests
             return null;
         }
 
-        public async Task<JsonElement> WaitForAsync(string key, int timeoutMs = 10_000)
+        public Task<JsonElement> WaitForAsync(string key, int timeoutMs = 10_000) =>
+            WaitForAsync(key, static _ => true, timeoutMs);
+
+        /// <summary>The first recorded <paramref name="key"/> event <paramref name="matches"/>
+        /// accepts.</summary>
+        /// <remarks>
+        /// The predicate is how a test says <em>which</em> event it means. A session's stream is
+        /// not its own: progress is broadcast to every attached session, so an audit or a restore
+        /// another test opened is recorded here too, and asking for the first event of a kind gets
+        /// whichever operation the scheduler started first.
+        /// </remarks>
+        public async Task<JsonElement> WaitForAsync(
+            string key, Func<JsonElement, bool> matches, int timeoutMs = 10_000)
         {
             var deadline = Environment.TickCount64 + timeoutMs;
             while (Environment.TickCount64 < deadline)
             {
-                var match = _events.FirstOrDefault(e => e.Key == key);
-                if (match.Key is not null)
-                    return match.Payload;
+                foreach (var (recorded, payload) in _events)
+                {
+                    if (recorded == key && matches(payload))
+                        return payload;
+                }
+
                 await Task.Delay(25);
             }
             throw new TimeoutException($"No '{key}' arrived. Seen: {string.Join(", ", Seen)}");

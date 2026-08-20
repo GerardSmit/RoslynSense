@@ -31,8 +31,8 @@ public sealed record SearchHit(
 
 /// <summary>
 /// Search Everywhere: one query box over types, members and files, ranked the way ReSharper's
-/// Go to Everything ranks — an exact type beats an exact member beats a fuzzy type, and the
-/// tiering is arithmetic rather than a sort of sorts.
+/// Go to Everything ranks — kind before name quality, and the tiering is arithmetic rather than a
+/// sort of sorts.
 /// </summary>
 /// <remarks>
 /// Two things carry the design. First, tier arithmetic: a match score is turned into
@@ -46,11 +46,36 @@ public static class SearchEverywhere
     /// <summary>Bigger than any <see cref="MatcherScore"/>, so a tier can never be out-scored.</summary>
     private const int TierUnit = 0x1000;
 
-    private const int TierExactType = 3;
-    private const int TierExactMember = 2;
-    private const int TierExactFile = 2;
-    private const int TierType = 1;
-    private const int TierFile = 1;
+    private const int TierExactType = 6;
+
+    /// <summary>
+    /// A type the query named by a whole run of its words — "ShopController" against
+    /// <c>SomePrefixShopController</c>.
+    /// </summary>
+    /// <remarks>
+    /// Above an exact member on purpose, and it is the one ordering here that is not obvious.
+    /// Exactness used to win outright, so a property called <c>ShopController</c> came back ahead
+    /// of the type whose name merely ends in it — and someone typing a type's name in a codebase
+    /// whose types all carry a house prefix could not reach the type at all. Naming most of a type
+    /// is a stronger thing to have said than naming all of a property.
+    /// </remarks>
+    private const int TierWholeWordType = 5;
+
+    /// <summary>
+    /// Methods above the members that are not methods, at both levels of exactness.
+    /// </summary>
+    /// <remarks>
+    /// A method is a place code lives; a property or a field is usually a place it is stored. When
+    /// both match a query equally well the one worth opening is the method — and a single member
+    /// tier meant a type's backing fields sat among the methods that share their name.
+    /// </remarks>
+    private const int TierExactMethod = 4;
+
+    private const int TierExactMember = 3;
+    private const int TierExactFile = 3;
+    private const int TierType = 2;
+    private const int TierFile = 2;
+    private const int TierMethod = 1;
     private const int TierMember = 0;
 
     /// <summary>
@@ -169,13 +194,7 @@ public static class SearchEverywhere
             if (isType ? !request.IncludesTypes : !request.IncludesMembers)
                 continue;
 
-            int tier = (isType, match.Score.IsExactMatch()) switch
-            {
-                (true, true) => TierExactType,
-                (true, false) => TierType,
-                (false, true) => TierExactMember,
-                (false, false) => TierMember,
-            };
+            int tier = Tier(symbol, isType, match.Score);
 
             var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
             if (location is null || location.SourceTree?.FilePath is not { Length: > 0 } path)
@@ -304,6 +323,32 @@ public static class SearchEverywhere
         }
 
         return hits;
+    }
+
+    /// <summary>What kind of answer this is, ranked — see the tier constants for why.</summary>
+    private static int Tier(ISymbol symbol, bool isType, MatcherScore score)
+    {
+        if (isType)
+        {
+            if (score.IsExactMatch())
+                return TierExactType;
+
+            return score.IsWholeWordMatch() ? TierWholeWordType : TierType;
+        }
+
+        // Constructors are reached by their type's name, which is the better answer anyway, and an
+        // accessor is not a place anyone navigates to — the property it belongs to is.
+        bool isMethod = symbol is IMethodSymbol
+        {
+            MethodKind: MethodKind.Ordinary
+                or MethodKind.LocalFunction
+                or MethodKind.UserDefinedOperator,
+        };
+
+        if (score.IsExactMatch())
+            return isMethod ? TierExactMethod : TierExactMember;
+
+        return isMethod ? TierMethod : TierMember;
     }
 
     /// <summary>

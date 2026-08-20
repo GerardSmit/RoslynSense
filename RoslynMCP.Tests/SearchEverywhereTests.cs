@@ -1,4 +1,6 @@
 using Microsoft.CodeAnalysis;
+using RoslynMCP.Lsp.Completion;
+using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Lsp.Search;
 using RoslynMCP.Services;
 using Xunit;
@@ -7,8 +9,8 @@ namespace RoslynMCP.Tests;
 
 /// <summary>
 /// Search Everywhere: the ranked one-box search behind the extension's Ctrl+T. Covers the tier
-/// arithmetic (an exact type outranks an exact member outranks a fuzzy type), the container words
-/// that narrow a query, the kind filters, and files as first-class results.
+/// arithmetic (types over methods over the rest, each kind's exact matches over its fuzzy ones),
+/// the container words that narrow a query, the kind filters, and files as first-class results.
 /// </summary>
 public class SearchEverywhereTests
 {
@@ -38,6 +40,48 @@ public class SearchEverywhereTests
 
         Assert.Equal(SearchItemKind.Member, hits[0].Kind);
         Assert.Equal("Add", hits[0].Name);
+    }
+
+    [Fact]
+    public async Task ATypeWearingAHousePrefixOutranksAMemberSpelledExactly()
+    {
+        // Typing the part of a type name you remember is how people search for types whose prefix
+        // is a team convention: "CatalogGateway" is meant to land on VendorCatalogGateway, not on
+        // the property that happens to be spelled that way.
+        var hits = await SearchAsync("CatalogGateway", includeFiles: false);
+
+        Assert.Equal(SearchItemKind.Type, hits[0].Kind);
+        Assert.Equal("VendorCatalogGateway", hits[0].Name);
+        Assert.Contains(hits, h => h.Kind == SearchItemKind.Member && h.Name == "CatalogGateway");
+    }
+
+    [Fact]
+    public async Task AMethodOutranksAPropertyOfTheSameName()
+    {
+        // Both match exactly, so only the kind separates them — and Ctrl+T is how people open
+        // methods.
+        var hits = await SearchAsync("SweepCatalog", includeFiles: false);
+
+        var kinds = hits.Where(h => h.Name == "SweepCatalog").Select(h => h.SymbolKind).ToList();
+        Assert.Equal([LspSymbolKind.Method, LspSymbolKind.Property], kinds);
+    }
+
+    [Theory]
+    [InlineData("CatalogGateway", "VendorCatalogGateway", true)]
+    [InlineData("ShopController", "SomePrefixShopController", true)]
+    [InlineData("CatalogGateway", "CatalogGateway", true)]
+    [InlineData("CatGate", "VendorCatalogGateway", false)]
+    [InlineData("catalogGateway", "VendorCatalogGateway", false)]
+    [InlineData("Gateway", "VendorCatalogGatewayFactory", true)]
+    public void AWholeWordMatchIsAContiguousRunOfWholeWords(
+        string pattern, string candidate, bool wholeWord)
+    {
+        // The tier above a plain camel-hump hit: every character landed on one unbroken run, and
+        // every word that run touched was consumed entirely.
+        var match = new IdentifierMatcher(pattern).Match(candidate);
+
+        Assert.NotNull(match);
+        Assert.Equal(wholeWord, match.Value.Score.IsWholeWordMatch());
     }
 
     [Fact]

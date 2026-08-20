@@ -53,6 +53,21 @@ public static class MatcherScoreExtensions
         (score & (MatcherScore.NoTypos | MatcherScore.NoCaseTypos | MatcherScore.ExactMatch))
         == (MatcherScore.NoTypos | MatcherScore.NoCaseTypos | MatcherScore.ExactMatch);
 
+    /// <summary>
+    /// The pattern landed on one unbroken run of the candidate, and consumed every word it touched.
+    /// </summary>
+    /// <remarks>
+    /// Weaker than an exact match and much stronger than an alignment: typing "ShopController"
+    /// against <c>SomePrefixShopController</c> is someone naming a type by the part of it they
+    /// remember, which is how people search for types whose prefix is a house convention. Without a
+    /// way to say that, such a match was indistinguishable from any scattered camel-hump hit.
+    /// </remarks>
+    public static bool IsWholeWordMatch(this MatcherScore score) =>
+        (score & (MatcherScore.NoTypos | MatcherScore.NoCaseTypos
+                  | MatcherScore.ExactMiddleMatch | MatcherScore.WholeWordsMatch))
+        == (MatcherScore.NoTypos | MatcherScore.NoCaseTypos
+            | MatcherScore.ExactMiddleMatch | MatcherScore.WholeWordsMatch);
+
     public static bool IsExactPrefixMatch(this MatcherScore score) =>
         (score & (MatcherScore.NoTypos | MatcherScore.NoCaseTypos | MatcherScore.ExactPrefixMatch))
         == (MatcherScore.NoTypos | MatcherScore.NoCaseTypos | MatcherScore.ExactPrefixMatch);

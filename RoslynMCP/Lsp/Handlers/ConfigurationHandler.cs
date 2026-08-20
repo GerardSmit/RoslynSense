@@ -152,6 +152,7 @@ internal static class ConfigurationHandler
         // Severity changes are invisible until the cached results are gone: every entry was
         // computed under the old configuration and its key does not include it.
         AnalyzerDiagnosticCache.Clear();
+        ProjectWideDiagnosticCache.Clear();
         await LspSessionRegistry.RequestRefreshAsync(RefreshKind.Diagnostics, ct);
     }
 

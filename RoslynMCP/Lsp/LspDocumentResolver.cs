@@ -19,15 +19,11 @@ internal static class LspDocumentResolver
         if (filePath.StartsWith(Handlers.VirtualDocumentHandler.GeneratedScheme + ":", StringComparison.Ordinal))
             return await ResolveGeneratedAsync(filePath, ct);
 
-        string path = PathHelper.NormalizePath(filePath);
-        string? projectPath = await WorkspaceService.FindContainingProjectAsync(path, ct);
-        if (string.IsNullOrEmpty(projectPath))
-            return null;
-
-        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-            projectPath, targetFilePath: path, cancellationToken: ct);
-
-        return WorkspaceService.FindDocumentInProject(project, path);
+        // One call, where this used to make two: find the owning project, then open that same
+        // project again to take the document out of it. Every language feature starts here — hover,
+        // completion, signature help, semantic tokens, folding, inlay hints, code lens, formatting,
+        // rename, every navigation — so the duplicate was paid several times per keystroke.
+        return await WorkspaceService.FindDocumentAsync(filePath, ct);
     }
 
     private static async Task<Document?> ResolveGeneratedAsync(string uri, CancellationToken ct)

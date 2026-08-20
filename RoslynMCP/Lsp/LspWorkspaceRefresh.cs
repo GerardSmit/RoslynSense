@@ -47,6 +47,57 @@ internal static class LspWorkspaceRefresh
         // Not part of the debounced refresh above: that one carries LSP refresh kinds, and the
         // Solution Explorer is a custom view the protocol has no kind for. It draws which projects
         // are loaded, so it is stale the moment this fires.
-        LspSessionRegistry.NotifyProjectSetChanged();
+        //
+        // Debounced on its own timer, because this is raised once per (file, project) pair a
+        // watched-file batch applies — a branch switch or a build dropping its output produces
+        // thousands — and the extension answers each notification with a whole-tree refresh. The
+        // signal carries no payload, so collapsing a burst into one loses nothing: the tree is
+        // redrawn from what is loaded when it finally arrives.
+        ScheduleProjectSetNotification();
+    }
+
+    /// <summary>Quiet period before the tree is told. Shorter than the refresh debounce beside it:
+    /// this only redraws one view, and a stale tree is visible in a way a stale lens is not.</summary>
+    private static readonly TimeSpan NotifyQuiet = TimeSpan.FromMilliseconds(300);
+
+    private static readonly Lock s_notifyGate = new();
+    private static CancellationTokenSource? s_pendingNotify;
+
+    private static void ScheduleProjectSetNotification()
+    {
+        CancellationTokenSource cts;
+        lock (s_notifyGate)
+        {
+            // Guarded the same way ScheduleRefresh guards its own: the source is disposed by the
+            // task that owns it, and cancelling a disposed one throws — which would escape here and
+            // leave the notification unscheduled entirely.
+            try { s_pendingNotify?.Cancel(); }
+            catch (ObjectDisposedException) { }
+
+            cts = s_pendingNotify = new CancellationTokenSource();
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(NotifyQuiet, cts.Token);
+                LspSessionRegistry.NotifyProjectSetChanged();
+            }
+            catch (OperationCanceledException)
+            {
+                // Superseded — the newer schedule carries this signal.
+            }
+            finally
+            {
+                lock (s_notifyGate)
+                {
+                    if (ReferenceEquals(s_pendingNotify, cts))
+                        s_pendingNotify = null;
+                }
+
+                cts.Dispose();
+            }
+        });
     }
 }

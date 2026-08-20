@@ -1,4 +1,5 @@
-﻿using System.Collections.Immutable;
+﻿using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -72,8 +73,64 @@ internal static class WorkspaceService
 
     private static void NotifyProjectSetChanged()
     {
+        // Before the subscriber, and unconditionally: the answers this drops were derived from the
+        // set that just moved, and a subscriber that throws must not leave them behind.
+        s_containingProject.Clear();
+
         try { ProjectSetChanged?.Invoke(); }
         catch { /* an editor that cannot be told is not a reason to fail the load */ }
+    }
+
+    /// <summary>
+    /// Normalized file path → the project that compiles it, or <see langword="null"/> for "none
+    /// does". Filled by <see cref="FindContainingProjectAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The lookup it memoizes is a directory walk: <c>GetFiles("*.csproj")</c> at every level from
+    /// the file up towards the drive root, and for each candidate found, opening that project and
+    /// searching it for the file. It sits under <c>LspDocumentResolver.ResolveAsync</c>, which is
+    /// the first line of hover, completion, signature help, code lens, semantic tokens, folding,
+    /// inlay hints, formatting, rename and every navigation request — so the walk ran several times
+    /// per keystroke, and for a file that belongs to no project it ran all the way to the root
+    /// every time.
+    /// </para>
+    /// <para>
+    /// Only the path→project mapping is kept, deliberately, and never the <see cref="Document"/>.
+    /// A document pins the whole <see cref="Solution"/> snapshot it came from, so a memo over one
+    /// would hand out yesterday's text after every keystroke; which project owns a file changes
+    /// only when the project set or its file list does, which is exactly what
+    /// <see cref="NotifyProjectSetChanged"/> announces.
+    /// </para>
+    /// <para>
+    /// Cleared whole rather than evicted per entry: every entry costs the same to rebuild, so
+    /// there is nothing for an LRU to protect, and the signal that invalidates one plausibly
+    /// invalidates all of them.
+    /// </para>
+    /// </remarks>
+    private static readonly ConcurrentDictionary<string, string> s_containingProject =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Ceiling on <see cref="s_containingProject"/>. Reached only by a caller asking about paths
+    /// that are not a solution's files — the entries are one short string each, and a solution has
+    /// as many as it has documents.
+    /// </summary>
+    private const int MaxContainingProjectEntries = 20_000;
+
+    /// <summary>
+    /// How many times the directory walk actually ran. Exposed for tests, which assert on what was
+    /// <em>not</em> walked — the resolved document is identical either way, so counting the work is
+    /// the only way to pin the memo.
+    /// </summary>
+    internal static long ProjectSearches;
+
+    /// <summary>Zeroes <see cref="ProjectSearches"/> and forgets every owner, for a test that
+    /// needs a cold measurement.</summary>
+    internal static void ResetContainingProjectMemo()
+    {
+        s_containingProject.Clear();
+        Interlocked.Exchange(ref ProjectSearches, 0);
     }
 
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
@@ -1319,6 +1376,96 @@ internal static class WorkspaceService
         if (!string.IsNullOrEmpty(generatedProjectPath))
             return generatedProjectPath;
 
+        return (await FindOwnerAsync(filePath, cancellationToken)).ProjectPath;
+    }
+
+    /// <summary>
+    /// The document a file backs, found through the project that compiles it.
+    /// </summary>
+    /// <remarks>
+    /// One project fetch, where the two callers this replaces made two: the search below already
+    /// opens each candidate project and asks it for the file, and then the caller opened the
+    /// winner again to get the same document out of it.
+    /// </remarks>
+    public static async Task<Document?> FindDocumentAsync(
+        string filePath, CancellationToken cancellationToken = default)
+    {
+        string? decompiled = DecompiledSourceService.TryGetGeneratedProjectPath(filePath);
+        if (!string.IsNullOrEmpty(decompiled))
+            return await TryFindInProjectAsync(decompiled, PathHelper.NormalizePath(filePath), cancellationToken);
+
+        return (await FindOwnerAsync(filePath, cancellationToken)).Document;
+    }
+
+    /// <summary>Both halves of the same answer, so neither caller pays for the other's.</summary>
+    private static async Task<(string? ProjectPath, Document? Document)> FindOwnerAsync(
+        string filePath, CancellationToken cancellationToken)
+    {
+        string path = PathHelper.NormalizePath(filePath);
+
+        // Verified, never trusted. A hit still opens the project and asks it for the file, so a
+        // stale entry costs one wasted lookup and can never produce a wrong answer — which is what
+        // makes this memoizable at all, given the ways ownership can move that nothing announces.
+        // What the entry saves is the walk: every ancestor directory enumerated for *.csproj, and
+        // every candidate found along the way opened and searched.
+        if (s_containingProject.TryGetValue(path, out string? remembered))
+        {
+            if (await TryFindInProjectAsync(remembered, path, cancellationToken) is { } hit)
+                return (remembered, hit);
+
+            s_containingProject.TryRemove(path, out _);
+        }
+
+        var (found, document) = await SearchForContainingProjectAsync(filePath, cancellationToken);
+
+        // Only what was found. A miss is never recorded: a file created on disk belongs to no
+        // project until the watcher syncs it in, an MCP-only session has no watcher at all, and a
+        // remembered "nothing owns this" would outlive the creation and leave the file inert with
+        // no diagnostics, no hover and no navigation for the rest of the session.
+        if (found is null)
+            return (null, null);
+
+        if (s_containingProject.Count >= MaxContainingProjectEntries)
+            s_containingProject.Clear();
+
+        s_containingProject[path] = found;
+
+        return (found, document);
+    }
+
+    /// <summary>
+    /// The document, if this project turns out to hold it. <paramref name="filePath"/> goes in as
+    /// the target so a file changed on disk since the project was cached is re-read.
+    /// </summary>
+    private static async Task<Document?> TryFindInProjectAsync(
+        string projectPath, string filePath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var (_, project) = await GetOrOpenProjectAsync(
+                projectPath, targetFilePath: filePath, cancellationToken: cancellationToken);
+
+            return FindDocumentInProject(project, filePath);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch
+        {
+            // A project that will not open holds nothing as far as this is concerned. The walk
+            // reports the failure; repeating it here would only duplicate the log entry.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The walk: every ancestor directory, every <c>.csproj</c> in it, in name order. The document
+    /// comes back with the project because finding it is how a candidate is accepted — returning
+    /// only the path is what made every caller open the winner a second time.
+    /// </summary>
+    private static async Task<(string? ProjectPath, Document? Document)> SearchForContainingProjectAsync(
+        string filePath, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref ProjectSearches);
+
         DirectoryInfo? directory = new FileInfo(filePath).Directory;
 
         while (directory != null)
@@ -1334,11 +1481,15 @@ internal static class WorkspaceService
                     string projectPath = projectFile.FullName;
                     try
                     {
+                        // The file goes in as the target so a candidate that does hold it hands
+                        // back a document already reconciled against what is on disk — the refresh
+                        // the second lookup used to be responsible for.
                         var (_, project) = await GetOrOpenProjectAsync(
-                            projectPath, diagnosticWriter: Console.Error, cancellationToken: cancellationToken);
+                            projectPath, targetFilePath: filePath, diagnosticWriter: Console.Error,
+                            cancellationToken: cancellationToken);
 
-                        if (FindDocumentInProject(project, filePath) != null)
-                            return projectPath;
+                        if (FindDocumentInProject(project, filePath) is { } document)
+                            return (projectPath, document);
                     }
                     catch (OperationCanceledException)
                     {
@@ -1359,7 +1510,7 @@ internal static class WorkspaceService
             directory = directory.Parent;
         }
 
-        return null;
+        return (null, null);
     }
 
     /// <summary>
@@ -1367,6 +1518,18 @@ internal static class WorkspaceService
     /// </summary>
     public static Document? FindDocumentInProject(Project project, string filePath)
     {
+        // The solution's path index first: this is on the resolve path of every LSP request, and a
+        // linear scan of a large project's documents is a per-request cost for an answer Roslyn
+        // already has in a dictionary.
+        foreach (var id in project.Solution.GetDocumentIdsWithFilePath(filePath))
+        {
+            if (id.ProjectId == project.Id && project.GetDocument(id) is { } indexed)
+                return indexed;
+        }
+
+        // The index keys on the raw FilePath the project was loaded with, so a caller holding a
+        // differently-spelled but equivalent path — a different case, or a different separator —
+        // misses it. That is what the scan has always tolerated, so it stays as the fallback.
         return project.Documents
             .FirstOrDefault(d => string.Equals(d.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
     }
@@ -2141,12 +2304,37 @@ internal static class WorkspaceService
             _ => false,
         };
 
-    private static List<Document> DocumentsAt(Solution solution, ProjectId projectId, string fullPath) =>
-        solution.GetProject(projectId)?.Documents
+    /// <remarks>
+    /// The index before the scan. This is called once per (file, project) pair of a watched-file
+    /// batch — a branch switch or a build output landing produces thousands of those — and each
+    /// call used to enumerate the project's whole document list, taking a
+    /// <see cref="Path.GetFullPath(string)"/> per document, all of it inside the load gate. That is
+    /// the pause the incremental-apply path exists to remove.
+    ///
+    /// The scan stays as the fallback: <c>GetDocumentIdsWithFilePath</c> keys on the raw
+    /// <c>FilePath</c> a project was loaded with, and <paramref name="fullPath"/> has been
+    /// normalized by the caller, so the two can legitimately disagree on spelling.
+    /// </remarks>
+    private static List<Document> DocumentsAt(Solution solution, ProjectId projectId, string fullPath)
+    {
+        if (solution.GetProject(projectId) is not { } project)
+            return [];
+
+        var indexed = new List<Document>();
+        foreach (var id in solution.GetDocumentIdsWithFilePath(fullPath))
+        {
+            if (id.ProjectId == projectId && project.GetDocument(id) is { } document)
+                indexed.Add(document);
+        }
+
+        if (indexed.Count > 0)
+            return indexed;
+
+        return project.Documents
             .Where(d => d.FilePath is { Length: > 0 } fp
                 && string.Equals(Path.GetFullPath(fp), fullPath, StringComparison.OrdinalIgnoreCase))
-            .ToList()
-        ?? [];
+            .ToList();
+    }
 
     private static async Task<FileSyncResult> RemoveDocumentsAsync(
         MSBuildWorkspace live, ProjectId projectId, string fullPath, bool authoritative)
@@ -2345,15 +2533,16 @@ internal static class WorkspaceService
             return false;
         }
 
-        if (project.Documents.Any(d =>
-                d.FilePath is { Length: > 0 } fp
-                && string.Equals(
-                    Path.GetDirectoryName(Path.GetFullPath(fp)), directory, StringComparison.OrdinalIgnoreCase)))
-        {
+        // The cached predicate first. It is a mtime-keyed lookup, while the sibling scan below
+        // takes a GetFullPath per document in the project — and for an ordinary SDK project the
+        // glob answers true, which makes the scan dead code. Pure reorder of an OR.
+        if (project.FilePath is { Length: > 0 } projectPath && HasPlainDefaultCompileGlob(projectPath))
             return true;
-        }
 
-        return project.FilePath is { Length: > 0 } projectPath && HasPlainDefaultCompileGlob(projectPath);
+        return project.Documents.Any(d =>
+            d.FilePath is { Length: > 0 } fp
+            && string.Equals(
+                Path.GetDirectoryName(Path.GetFullPath(fp)), directory, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>Project file path → (stamp it was read at, whether its compile glob is unqualified).</summary>

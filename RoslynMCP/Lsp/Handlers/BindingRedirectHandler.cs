@@ -347,6 +347,24 @@ internal static class BindingRedirectHandler
         return ToDiagnostics(await BindingRedirectService.AnalyzeAsync(projectPath, ct));
     }
 
+    /// <summary>
+    /// <inheritdoc cref="DiagnosticsAsync(string, CancellationToken)"/>, through the same 15-second
+    /// cache the lens over the file uses.
+    /// </summary>
+    /// <remarks>
+    /// For the pull, which fires on every keystroke in the open config file. The uncached analysis
+    /// is a directory walk over <c>bin</c> and every package's lib folder, which is not something
+    /// to do per character; the cache is invalidated by the config file's own write time, so an
+    /// edit that fixes a redirect still clears its squiggle at once.
+    /// </remarks>
+    public static async Task<Diagnostic[]> CachedDiagnosticsAsync(string configPath, CancellationToken ct)
+    {
+        if (ProjectFor(configPath) is not { } projectPath)
+            return [];
+
+        return ToDiagnostics(await BindingRedirectService.CachedAnalyzeAsync(projectPath, ct));
+    }
+
     public static Diagnostic[] ToDiagnostics(BindingRedirectReport report) =>
         report.Findings.Select(ToDiagnostic).ToArray();
 

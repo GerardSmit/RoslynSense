@@ -320,20 +320,85 @@ internal sealed class LspServer : IDisposable
             _diagnostics?.Schedule(path, immediate: true);
     }
 
+    /// <remarks>
+    /// A ranged change is a delta against the text the editor believes this server holds. When that
+    /// belief is wrong the delta lands at the wrong offsets, and nothing afterwards puts it right:
+    /// didSave declares <c>includeText: false</c>, so there is no point at which the full document
+    /// is re-sent. The mirror stays wrong until the file is closed and reopened, and every hover,
+    /// completion, rename and code action in between is computed against text that exists nowhere.
+    ///
+    /// Two ways the belief can be wrong, and the store refuses the edit for both rather than
+    /// applying it to the wrong base — the file then reads from disk, which is wrong but converges
+    /// on the next save, instead of being wrong permanently:
+    /// a version that did not advance (a duplicate or reordered notification), and a range the
+    /// buffer cannot hold (which used to throw out of this handler, where StreamJsonRpc has nobody
+    /// to report it to and drops it).
+    /// </remarks>
     [JsonRpcMethod("textDocument/didChange", UseSingleObjectParameterDeserialization = true)]
     public void DidChange(DidChangeTextDocumentParams p)
     {
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
-        var result = OpenDocumentStore.Change(path, p.TextDocument.Version, text =>
+        string? diverged = null;
+
+        var result = OpenDocumentStore.Change(path, p.TextDocument.Version, original =>
         {
+            var text = original;
             foreach (var change in p.ContentChanges)
             {
-                text = change.Range is null
-                    ? SourceText.From(change.Text)
-                    : text.WithChanges(new TextChange(LspConverters.ToTextSpan(text, change.Range), change.Text));
+                if (change.Range is null)
+                {
+                    text = SourceText.From(change.Text);
+                    continue;
+                }
+
+                if (LspConverters.TryToTextSpan(text, change.Range) is not { } span)
+                {
+                    diverged = $"range {change.Range.Start.Line}:{change.Range.Start.Character}"
+                        + $"-{change.Range.End.Line}:{change.Range.End.Character} "
+                        + $"is outside a {text.Lines.Count}-line buffer";
+
+                    // The batch as a whole, not the part of it that happened to land. The changes
+                    // in one notification are a single edit expressed in pieces — each range is
+                    // stated against the text the piece before it produced — so half of them is not
+                    // a smaller edit, it is a different document. Committing that prefix would hand
+                    // the other owner of this entry text no editor has.
+                    return original;
+                }
+
+                text = text.WithChanges(new TextChange(span, change.Text));
             }
             return text;
         });
+
+        // This session's mirror is provably wrong: a delta landed at offsets its own text cannot
+        // hold, so no further delta from this client can be trusted to land either. Ownership is
+        // released rather than the text overwritten — divergence is a property of one editor
+        // window, and if a second window has the same file open its copy is still good and stays.
+        // With no other owner the entry dies and the file reads from disk: wrong until the next
+        // save, rather than wrong until the file is closed.
+        if (diverged is not null)
+        {
+            LspLog.Warn($"Dropping '{path}' from this session's open buffers: {diverged}. "
+                + "The editor's buffer and this server's copy have diverged; the file will be read "
+                + "from disk (or from another window's buffer) until it is saved or reopened.");
+            OpenDocumentStore.Close(SessionId, path);
+            return;
+        }
+
+        // Refused instead: the version did not advance, so this delta was computed against text
+        // this server has already moved past. Nothing was applied, which is the whole point — the
+        // store still holds the newer text, and dropping the document here would throw that away
+        // to punish a notification that arrived late. Reported because a silently ignored edit is
+        // its own bug, and this is the only place that can name it.
+        if (result is null && OpenDocumentStore.IsOpen(path))
+        {
+            LspLog.Warn(
+                $"Ignored a didChange for '{path}' at version {p.TextDocument.Version}, which does "
+                + "not advance the version already held. The notifications for this document "
+                + "arrived out of order.",
+                key: $"stale-didchange:{path}");
+            return;
+        }
 
         if (result is not null && !_clientPullsDiagnostics)
             _diagnostics?.Schedule(path, immediate: false);

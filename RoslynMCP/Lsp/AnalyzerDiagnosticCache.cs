@@ -280,6 +280,20 @@ internal static class AnalyzerDiagnosticCache
             return;
 
         foreach (var stale in s_entries.OrderBy(e => e.Value.Stamp).Take(s_entries.Count - MaxEntries).ToList())
+        {
             s_entries.TryRemove(stale.Key, out _);
+
+            // The guard record goes with the entry. s_latestRequested is written on every compute
+            // request and was only ever cleared wholesale, so the closed documents the sweep queues
+            // through RecomputeInBackground accumulated in it for the daemon's lifetime while their
+            // entries were being trimmed away underneath them.
+            //
+            // Only here, and never as a general "drop any key with no entry" rule: the guard is
+            // written before the entry exists, so such a rule could delete a newer pass's guard
+            // between its TryAdd and the older pass's completion — and the older pass would then
+            // overwrite the newer, which is the squiggle flicker the Stamp/Written split exists to
+            // prevent. A key reached by this loop belongs to a cold document by construction.
+            s_latestRequested.TryRemove(stale.Key, out _);
+        }
     }
 }

@@ -19,6 +19,7 @@ internal static class NuGetHandler
         PackageMutationScope.AfterMutation = ct =>
         {
             AnalyzerDiagnosticCache.Clear();
+            ProjectWideDiagnosticCache.Clear();
             return LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, ct);
         };
 

@@ -77,6 +77,7 @@ internal static class ExecuteCommandHandler
                 await using (await ProgressReporter.BeginAsync("Reloading workspace", ct))
                 {
                     AnalyzerDiagnosticCache.Clear();
+                    ProjectWideDiagnosticCache.Clear();
                     await WorkspaceService.EvictAllAsync(ct);
                 }
                 await LspSessionRegistry.RequestRefreshAsync(RefreshKind.All, ct);

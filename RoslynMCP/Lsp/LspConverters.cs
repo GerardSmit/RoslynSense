@@ -71,6 +71,31 @@ internal static class LspConverters
         text.Lines.GetTextSpan(new LinePositionSpan(
             ToLinePosition(range.Start), ToLinePosition(range.End)));
 
+    /// <summary>
+    /// <inheritdoc cref="ToTextSpan"/> Returns <see langword="null"/> for a range the text cannot
+    /// hold instead of throwing.
+    /// </summary>
+    /// <remarks>
+    /// For the didChange path. <c>GetTextSpan</c> clamps nothing, so a range past the end of the
+    /// buffer is an <see cref="ArgumentOutOfRangeException"/> — thrown inside a JSON-RPC
+    /// notification handler, where StreamJsonRpc has nowhere to send it and swallows it. The edit
+    /// is then silently dropped and the server's mirror of the document diverges from the editor's
+    /// permanently, because didSave carries no text to resynchronize from. Answering null lets the
+    /// caller say so and drop the document rather than keep serving answers about text that exists
+    /// nowhere.
+    /// </remarks>
+    public static TextSpan? TryToTextSpan(SourceText text, Protocol.Range range)
+    {
+        try
+        {
+            return ToTextSpan(text, range);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
     public static int ToOffset(SourceText text, Position position) =>
         text.Lines.GetPosition(ToLinePosition(position));
 

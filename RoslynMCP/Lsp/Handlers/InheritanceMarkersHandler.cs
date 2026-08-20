@@ -31,6 +31,18 @@ internal static class InheritanceMarkersHandler
         if (document is null)
             return Array.Empty<InheritanceMarker>();
 
+        // Memoized against the same key codeLens/resolve versions its counts by. The down markers
+        // below run the same workspace-wide search a "3 implementations" lens runs, and arriving as
+        // a gutter arrow rather than as a lens was the only difference between paying for it once
+        // and paying for it on every editor switch, every 700 ms typing pause, and every click on
+        // a marker — the client re-requests the whole array to read one line of it.
+        var generation = await DocumentSemanticGeneration.ForAsync(document, ct);
+        return await InheritanceMarkerMemo.GetAsync(
+            p.TextDocument.Uri, generation, () => ComputeAsync(document, CancellationToken.None), ct);
+    }
+
+    private static async Task<InheritanceMarker[]> ComputeAsync(Document document, CancellationToken ct)
+    {
         var root = await document.GetSyntaxRootAsync(ct);
         var text = await document.GetTextAsync(ct);
         var model = await document.GetSemanticModelAsync(ct);

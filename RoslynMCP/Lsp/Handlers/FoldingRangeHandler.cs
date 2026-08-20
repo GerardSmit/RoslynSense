@@ -70,10 +70,23 @@ internal static class FoldingRangeHandler
 
     private static void AddUsingRuns(SyntaxNode root, TextLineCollection lines, List<LspFoldingRange> ranges)
     {
-        var usingLists = root.DescendantNodesAndSelf()
-            .OfType<CompilationUnitSyntax>().Select(c => c.Usings)
-            .Concat(root.DescendantNodesAndSelf()
-                .OfType<BaseNamespaceDeclarationSyntax>().Select(n => n.Usings));
+        // The compilation unit is the root; walking the whole file to find it was two of the five
+        // traversals this handler makes over a document it is asked about on every open and every
+        // structural edit. `as` rather than a cast: the resolver hands back any Roslyn document and
+        // nothing above here checks the language, so a non-C# root must degrade to no usings
+        // instead of throwing.
+        //
+        // The namespace walk descends only through compilation units and namespaces, which is
+        // exhaustive — a namespace can nest inside nothing else — and stops at the first type
+        // declaration rather than visiting every node in every method body.
+        var usingLists = (root as CompilationUnitSyntax)?.Usings is { } fileUsings
+            ? [fileUsings]
+            : Enumerable.Empty<SyntaxList<UsingDirectiveSyntax>>();
+
+        usingLists = usingLists.Concat(
+            root.DescendantNodes(n => n is CompilationUnitSyntax or BaseNamespaceDeclarationSyntax)
+                .OfType<BaseNamespaceDeclarationSyntax>()
+                .Select(n => n.Usings));
 
         foreach (var usings in usingLists)
         {

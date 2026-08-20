@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis.Text;
+﻿using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.Resources.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
@@ -26,7 +26,11 @@ internal sealed partial class ResourcesLanguage : ILanguageDocumentSymbolProvide
         if (ResourceCatalogService.Text(path) is not { } text)
             return Task.FromResult(Array.Empty<DocumentSymbol>());
 
-        return Task.FromResult(Outline(text, ResxReader.Read(text)));
+        // Through the catalog's checksum cache rather than ResxReader directly: the outline is
+        // re-requested on every edit, and the sibling diagnostics pass over the same file already
+        // reads through it. The path is the one from line 24 verbatim — s_files keys on the raw
+        // string, so a re-normalized copy would quietly open a second entry and share nothing.
+        return Task.FromResult(Outline(text, ResourceCatalogService.ReadContents(path, text)));
     }
 
     private static DocumentSymbol[] Outline(SourceText text, ResxContents contents)

@@ -158,7 +158,7 @@ internal static class CodeLensHandler
             // solution-wide SymbolFinder sweep per dispatch site, and a file with six handlers
             // emits about a dozen lenses, every one of them re-resolved on each scroll and each
             // edit. This branch returned before the memo was ever consulted.
-            var packGeneration = await LensGenerationAsync(packData.Uri, ct);
+            var packGeneration = await DocumentSemanticGeneration.ForAsync(packData.Uri, ct);
 
             foreach (var contributor in
                      LanguageScope.Of(languages).Contributors<ILanguageCodeLensContributor>())
@@ -198,7 +198,7 @@ internal static class CodeLensHandler
         // semantics it can see, so it is memoized against exactly that — the same key
         // AnalyzerDiagnosticCache versions by. An edit in a project that depends on this one can
         // leave a count stale until this key next moves, which is the trade every IDE's lens makes.
-        if (await LensGenerationAsync(data.Uri, ct) is { } generation)
+        if (await DocumentSemanticGeneration.ForAsync(data.Uri, ct) is { } generation)
         {
             return await CodeLensResolveMemo.ResolveAsync(data, generation, lens,
                 async l => (await ResolveCountedAsync(l, data, CancellationToken.None, languages)).Command,
@@ -207,21 +207,6 @@ internal static class CodeLensHandler
 
         return await ResolveCountedAsync(lens, data, ct, languages);
     }
-
-    /// <summary>What a counted lens's answer depends on: this file's text, and the semantics of
-    /// its project and everything that project references.</summary>
-    private static async Task<object?> LensGenerationAsync(string uri, CancellationToken ct)
-    {
-        var document = await LspDocumentResolver.ResolveAsync(LspConverters.UriToPath(uri), ct);
-        if (document is null)
-            return null;
-
-        var text = await document.GetTextVersionAsync(ct);
-        var semantics = await document.Project.GetDependentSemanticVersionAsync(ct);
-        return new CSharpLensGeneration(text, semantics);
-    }
-
-    private sealed record CSharpLensGeneration(VersionStamp Text, VersionStamp Semantics);
 
     private static Task<LspCodeLens> ResolveCountedAsync(
         LspCodeLens lens, CodeLensData data, CancellationToken ct, LanguageSession? languages) =>

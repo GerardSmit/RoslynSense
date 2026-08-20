@@ -1,3 +1,5 @@
+using System.Buffers;
+
 namespace RoslynMCP.Lsp.Completion;
 
 public enum IdentifierMatchingStyle
@@ -27,6 +29,11 @@ public sealed class IdentifierMatcher
 {
     /// <summary>Longer candidates skip the alignment search — DP cost is length × pattern.</summary>
     private const int MaxCandidateLength = 256;
+
+    /// <summary>The only start position <see cref="IdentifierMatchingStyle.BeginningOfIdentifier"/>
+    /// allows. A field rather than a collection expression at the use site, which allocated a fresh
+    /// one-element array on every candidate.</summary>
+    private static readonly int[] s_firstCharacterOnly = [0];
 
     private const int Unvisited = int.MinValue;
     private const int Impossible = int.MinValue + 1;
@@ -126,44 +133,79 @@ public sealed class IdentifierMatcher
         if (m > n)
             return false;
 
-        int[] value = new int[m * n];
-        int[] next = new int[m * n];
-        value.AsSpan().Fill(Unvisited);
+        var starts = _style == IdentifierMatchingStyle.BeginningOfIdentifier ? s_firstCharacterOnly : humps;
 
-        int bestValue = Impossible;
-        int bestStart = -1;
-
-        // The pattern may only start where a word starts — at the identifier's first character,
-        // or at any hump when middle matching is allowed.
-        foreach (int start in _style == IdentifierMatchingStyle.BeginningOfIdentifier ? [0] : humps)
+        // The start scan before the tables, because it is what rejects nearly everything and it
+        // needs none of them. Search Everywhere runs this over every declaration name in the
+        // solution and every public type of every referenced assembly, and completion over every
+        // item Roslyn proposed; in both, the overwhelming majority of candidates have no hump the
+        // pattern's first character can sit on. Those used to pay two m*n allocations and an m*n
+        // Fill before finding that out — which is exactly what the remark on Match promises they
+        // do not.
+        bool anyStart = false;
+        foreach (int start in starts)
         {
-            if (!Matches(0, candidate, start))
-                continue;
-
-            int rest = Solve(0, start);
-            if (rest == Impossible)
-                continue;
-
-            int total = rest + Bonus(0, candidate, start, prev: -1, humps);
-            if (total > bestValue)
+            if (Matches(0, candidate, start))
             {
-                bestValue = total;
-                bestStart = start;
+                anyStart = true;
+                break;
             }
         }
 
-        if (bestStart < 0 || bestValue == Impossible)
+        if (!anyStart)
             return false;
 
-        int position = bestStart;
-        for (int pi = 0; pi < m; pi++)
+        // Pooled for the survivors. Rented rather than held per instance because the XML remark
+        // above pins these matchers as immutable and shareable, and they are genuinely shared
+        // across threads: SearchQuery hands one to several concurrent Find* passes and Roslyn's
+        // own FindSourceDeclarationsAsync is internally parallel.
+        int[] value = ArrayPool<int>.Shared.Rent(m * n);
+        int[] next = ArrayPool<int>.Shared.Rent(m * n);
+        try
         {
-            positions[pi] = position;
-            if (pi + 1 < m)
-                position = next[pi * n + position];
-        }
+            // Only `value` needs clearing: every `next` slot read below was written first.
+            value.AsSpan(0, m * n).Fill(Unvisited);
 
-        return true;
+            int bestValue = Impossible;
+            int bestStart = -1;
+
+            // The pattern may only start where a word starts — at the identifier's first
+            // character, or at any hump when middle matching is allowed.
+            foreach (int start in starts)
+            {
+                if (!Matches(0, candidate, start))
+                    continue;
+
+                int rest = Solve(0, start);
+                if (rest == Impossible)
+                    continue;
+
+                int total = rest + Bonus(0, candidate, start, prev: -1, humps);
+                if (total > bestValue)
+                {
+                    bestValue = total;
+                    bestStart = start;
+                }
+            }
+
+            if (bestStart < 0 || bestValue == Impossible)
+                return false;
+
+            int position = bestStart;
+            for (int pi = 0; pi < m; pi++)
+            {
+                positions[pi] = position;
+                if (pi + 1 < m)
+                    position = next[pi * n + position];
+            }
+
+            return true;
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(value);
+            ArrayPool<int>.Shared.Return(next);
+        }
 
         // Best total bonus for pattern[pi..] given pattern[pi] sits at pos.
         int Solve(int pi, int pos)

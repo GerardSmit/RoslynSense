@@ -203,6 +203,7 @@ internal static class WatchedFilesHandler
         {
             await using var progress = await ProgressReporter.BeginAsync("Reloading workspace", ct);
             AnalyzerDiagnosticCache.Clear();
+            ProjectWideDiagnosticCache.Clear();
             await WorkspaceService.EvictAllAsync(ct);
             return new Outcome(true, []);
         }

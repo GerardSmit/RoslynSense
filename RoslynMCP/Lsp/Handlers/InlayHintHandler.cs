@@ -44,12 +44,21 @@ internal static class InlayHintHandler
 
             // Parameter-name hints render as "name:"; type hints are bare type names.
             bool isParameter = label.EndsWith(":", StringComparison.Ordinal);
+            // Roslyn already computed what accepting the hint would write — the inferred type in
+            // place of `var`, or the argument rewritten as `name: value`. Passing it through is
+            // what makes double-clicking a hint insert it, which is the behaviour it has in VS and
+            // Rider; discarding it left the hints decorative.
+            var edits = hint.ReplacementTextChange is { } change
+                ? new[] { new TextEdit(LspConverters.ToRange(text.Lines, change.Span), change.NewText ?? "") }
+                : null;
+
             result.Add(new InlayHint(
                 LspConverters.ToPosition(text.Lines.GetLinePosition(hint.Span.Start)),
                 label,
                 Kind: isParameter ? 2 : 1,
                 PaddingLeft: false, // Roslyn anchors hints directly before the identifier/argument
-                PaddingRight: true));
+                PaddingRight: true,
+                TextEdits: edits));
         }
         return result.ToArray();
     }

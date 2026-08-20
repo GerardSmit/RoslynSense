@@ -101,6 +101,28 @@ public static class OpenDocumentStore
 
     /// <summary>Applies incremental (or full) changes. Returns the resulting text, or null if
     /// the document is not open (client protocol error — didChange before didOpen).</summary>
+    /// <remarks>
+    /// <para>
+    /// The version is checked rather than merely recorded. StreamJsonRpc dispatches notification
+    /// handlers on the thread pool, so two didChange notifications that arrive in order can still
+    /// be processed out of order — and a ranged change is a delta against the version before it,
+    /// so applying v(N+1) first and then v(N) rebases both onto text neither was computed against.
+    /// LSP requires the version to advance on every change, so a version that did not advance is
+    /// exactly that case, plus the duplicate-notification case, and both are refused.
+    /// </para>
+    /// <para>
+    /// Refused rather than applied-anyway because the damage is permanent: didSave carries no
+    /// text, so nothing ever resynchronizes the mirror, and the caller can fall back to the file on
+    /// disk — wrong until the next save, rather than wrong until the file is closed.
+    /// </para>
+    /// <para>
+    /// Only while one session owns the document. Two editor windows on one solution share this
+    /// entry and count versions independently, so with more than one owner a version going backwards
+    /// says nothing about ordering — it just means the other window is further along. That case
+    /// keeps the last-write-wins behaviour it has always had, because refusing it would silently
+    /// discard the second window's edits.
+    /// </para>
+    /// </remarks>
     public static SourceText? Change(string filePath, int version, Func<SourceText, SourceText> apply)
     {
         if (!s_docs.TryGetValue(PathHelper.NormalizePath(filePath), out var doc))
@@ -108,6 +130,11 @@ public static class OpenDocumentStore
         SourceText updated;
         lock (doc)
         {
+            // Null, not an exception: this runs inside a notification handler, where a throw has
+            // nowhere to go. The caller reports it.
+            if (version <= doc.Version && doc.OwnerSessions.Count == 1)
+                return null;
+
             updated = apply(doc.Text);
             doc.Text = updated;
             doc.Version = version;

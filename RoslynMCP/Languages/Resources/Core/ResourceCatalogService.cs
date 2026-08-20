@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -59,6 +59,18 @@ internal static class ResourceCatalogService
 
     private static readonly ConcurrentDictionary<string, FileCacheEntry> s_files =
         new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// How many times <see cref="ReadContents"/> actually parsed, rather than answering from
+    /// <see cref="s_files"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exposed for tests, which assert on what was <em>reused</em>. Asserting on the returned
+    /// contents says nothing — a cache that reparsed every time returns an equal table — so the
+    /// only way to pin the sharing is to count the work. Mirrors
+    /// <see cref="MsBuild.Core.MsBuildDocumentCache.FullParses"/>.
+    /// </remarks>
+    internal static long FileParses;
 
     /// <summary>Materialized families, per directory — families never cross one, so a content edit
     /// drops exactly the directory it landed in.</summary>
@@ -136,6 +148,7 @@ internal static class ResourceCatalogService
             return new ResxContents(cached.Entries, cached.DuplicateKeys);
         }
 
+        Interlocked.Increment(ref FileParses);
         var contents = ResxReader.Read(text);
         s_files[filePath] = new FileCacheEntry(checksum, contents.Entries, contents.DuplicateKeys);
         return contents;
@@ -185,6 +198,7 @@ internal static class ResourceCatalogService
     public static void InvalidateAll()
     {
         s_files.Clear();
+        Interlocked.Exchange(ref FileParses, 0);
         s_loaded.Clear();
 
         foreach (var resources in s_byDirectory.Values)

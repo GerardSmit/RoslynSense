@@ -92,10 +92,24 @@ public static class BindingRedirectService
     /// runtime rolls forward to the highest version it finds — so reporting on a redirect there
     /// would be reporting on a section that has no effect.
     /// </remarks>
-    public static async Task<BindingRedirectReport> AnalyzeAsync(
-        string projectPath, CancellationToken ct)
+    public static Task<BindingRedirectReport> AnalyzeAsync(string projectPath, CancellationToken ct) =>
+        AnalyzeAsync(projectPath, waitForEvaluation: true, ct);
+
+    /// <param name="waitForEvaluation">
+    /// Whether it is acceptable to evaluate the project if no evaluation is cached yet.
+    /// <see langword="false"/> reports nothing rather than waiting — for the background sweep,
+    /// which must never queue an MSBuild evaluation behind a solution load. The sweep runs again
+    /// on a timer, so the findings arrive once the evaluation the rest of the server needs anyway
+    /// has landed.
+    /// </param>
+    /// <inheritdoc cref="AnalyzeAsync(string, CancellationToken)"/>
+    internal static async Task<BindingRedirectReport> AnalyzeAsync(
+        string projectPath, bool waitForEvaluation, CancellationToken ct)
     {
-        var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
+        var evaluation = waitForEvaluation
+            ? await ProjectEvaluationService.EvaluateAsync(projectPath, ct)
+            : ProjectEvaluationService.TryGetCached(projectPath);
+
         if (evaluation is null || !IsFullFramework(evaluation))
             return new BindingRedirectReport(projectPath, null, []);
 
@@ -151,7 +165,15 @@ public static class BindingRedirectService
     /// what ships without touching the config at all.
     /// </remarks>
     internal static async Task<BindingRedirectReport> CachedAnalyzeAsync(
-        string projectPath, CancellationToken ct)
+        string projectPath, CancellationToken ct) =>
+        await CachedAnalyzeAsync(projectPath, waitForEvaluation: true, ct);
+
+    /// <inheritdoc cref="CachedAnalyzeAsync(string, CancellationToken)"/>
+    /// <param name="waitForEvaluation">
+    /// <inheritdoc cref="AnalyzeAsync(string, bool, CancellationToken)" path="/param[@name='waitForEvaluation']"/>
+    /// </param>
+    internal static async Task<BindingRedirectReport> CachedAnalyzeAsync(
+        string projectPath, bool waitForEvaluation, CancellationToken ct)
     {
         var stamp = ConfigStamp(ConfigPathFor(projectPath));
 
@@ -162,8 +184,12 @@ public static class BindingRedirectService
             return cached.Report;
         }
 
-        var report = await AnalyzeAsync(projectPath, ct);
-        s_reports[projectPath] = (stamp, DateTime.UtcNow, report);
+        var report = await AnalyzeAsync(projectPath, waitForEvaluation, ct);
+
+        // An answer that only says "no evaluation yet" must not be stored: it would hold for the
+        // whole 15-second window and stop the next sweep from noticing the evaluation arriving.
+        if (waitForEvaluation || report.ConfigPath is not null)
+            s_reports[projectPath] = (stamp, DateTime.UtcNow, report);
 
         return report;
     }
@@ -239,9 +265,17 @@ public static class BindingRedirectService
     /// <summary>
     /// Hover asks this on every mouse rest, and answering means a metadata read of every assembly
     /// in <c>bin</c> and <c>packages</c>. The window is short enough that a build finishing during
-    /// it is not a case worth designing for, and the diagnostics path is deliberately left
-    /// uncached so the squiggles still answer from what is on disk right now.
+    /// it is not a case worth designing for.
     /// </summary>
+    /// <remarks>
+    /// The diagnostics path used to be exempted from this so the squiggles would answer from what
+    /// is on disk right now. That exemption applied to the <em>document pull</em>, which runs when
+    /// the user has the config file in front of them; the background sweep inherited it by
+    /// accident and re-walked <c>bin</c> and every <c>packages</c> lib folder every two seconds for
+    /// every full-framework project in the solution. It also made the two disagree — the lens over
+    /// a line read from the cache and said "3 redirects out of date" while the squiggles on the
+    /// same line were computed fresh and said nothing.
+    /// </remarks>
     private static readonly ConcurrentDictionary<string, InstalledCache> s_installed =
         new(StringComparer.OrdinalIgnoreCase);
 

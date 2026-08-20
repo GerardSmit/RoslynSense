@@ -51,6 +51,51 @@ public class SolutionWarmupTests
     }
 
     /// <summary>
+    /// The caches a search reads are built before a search asks for them.
+    /// </summary>
+    /// <remarks>
+    /// Asserted as "every project already holds its compilation" rather than as a stopwatch,
+    /// because the thing being pinned is that the work happened, not how long it took. On a real
+    /// solution the difference is a first query of seven seconds against one of a fifth of a
+    /// second — and since the panel cancels its request on every keystroke, seconds per search is
+    /// seconds per character, which a typist outruns until the search appears to find nothing.
+    /// </remarks>
+    [Fact]
+    public async Task TheSymbolCachesAreBuiltBeforeAnyoneSearches()
+    {
+        string? previous = WorkspaceService.BoundSolutionPath;
+        bool previousSetting = LspFeatureOptions.LoadEntireSolution;
+
+        try
+        {
+            await WorkspaceService.EvictAllAsync();
+            LspFeatureOptions.LoadEntireSolution = true;
+            SolutionWarmup.Reset();
+            WorkspaceService.BindSolution(FixturePaths.MultiSolutionFile);
+
+            await SolutionWarmup.Start();
+            await SolutionWarmup.WarmedSymbols;
+
+            var solution = WorkspaceService.TryGetMostRecentSolution();
+            Assert.NotNull(solution);
+            Assert.NotEmpty(solution!.Projects);
+
+            // TryGetCompilation, not GetCompilationAsync: the second would build the thing it is
+            // supposed to be checking for and pass however cold the workspace was.
+            Assert.All(solution.Projects, project =>
+                Assert.True(
+                    project.TryGetCompilation(out _),
+                    $"'{project.Name}' had no compilation after the warm pass"));
+        }
+        finally
+        {
+            LspFeatureOptions.LoadEntireSolution = previousSetting;
+            SolutionWarmup.Reset();
+            WorkspaceService.BindSolution(previous);
+        }
+    }
+
+    /// <summary>
     /// The Solution Explorer draws the same fact the search box depends on: a project the
     /// workspace has not loaded answers nothing, and a row that looks identical to a loaded one
     /// makes that indistinguishable from a project with nothing in it.

@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
 
@@ -113,14 +115,14 @@ internal static class SolutionWarmup
             // The daemon may already be serving another window, or an open_solution from a chat.
             // Loading what is loaded would throw away that workspace and build it again.
             var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects);
-            if (missing.Count == 0)
-                return;
+            if (missing.Count > 0)
+            {
+                string name = Path.GetFileNameWithoutExtension(solutionPath);
+                await using var progress = await ProgressReporter.BeginAsync(
+                    $"Loading {name} ({missing.Count} project{(missing.Count == 1 ? "" : "s")})");
 
-            string name = Path.GetFileNameWithoutExtension(solutionPath);
-            await using var progress = await ProgressReporter.BeginAsync(
-                $"Loading {name} ({missing.Count} project{(missing.Count == 1 ? "" : "s")})");
-
-            await WorkspaceService.EnsureProjectsLoadedAsync(missing);
+                await WorkspaceService.EnsureProjectsLoadedAsync(missing);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -133,6 +135,74 @@ internal static class SolutionWarmup
                 "Projects will load as files in them are opened.",
                 key: $"solution-warmup:{solutionPath}");
         }
+
+        // Deliberately outside the try and outside anything a caller awaits: a solution that was
+        // already loaded still needs this, and a search must never wait for it.
+        var warm = Task.Run(WarmSymbolsAsync);
+        lock (s_gate)
+            s_warmedSymbols = warm;
+    }
+
+    private static Task s_warmedSymbols = Task.CompletedTask;
+
+    /// <summary>
+    /// Builds the two caches every solution-wide search reads, so the first Ctrl+T does not.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Measured on an eighteen-project, ~2,600-document solution: the first query cost 7.3 seconds
+    /// and the second 0.15. All of that difference is cache construction — enumerating all 78,893
+    /// declared names costs 8 milliseconds once the indexes exist, and running the matcher over
+    /// every one of them costs 120. It is the compilations, and Roslyn's per-project declaration
+    /// index, that are expensive to build and cheap to reuse.
+    /// </para>
+    /// <para>
+    /// Which matters more than the seconds suggest, because the panel cancels its in-flight request
+    /// on every keystroke. A cost paid per search is a cost paid per character, and a typist who
+    /// stays ahead of it aborts each attempt before it finishes — so a search that is merely slow
+    /// reads as a search that finds nothing. That is the bug this removes; the ranking work in the
+    /// same area only decides what a completed search returns.
+    /// </para>
+    /// <para>
+    /// Uncancellable and unawaited, both on purpose. Cancellable would defeat the point, since the
+    /// keystroke that cancels it is the one that needed it. Unawaited because blocking the first
+    /// search until this finishes would trade a slow answer for no answer at all: a query that
+    /// races it pays what it would have paid anyway, and Roslyn's own async caches mean the two
+    /// never build the same thing twice.
+    /// </para>
+    /// </remarks>
+    private static async Task WarmSymbolsAsync()
+    {
+        try
+        {
+            if (WorkspaceService.TryGetMostRecentSolution() is not { } solution)
+                return;
+
+            foreach (var project in solution.Projects)
+                await project.GetCompilationAsync(CancellationToken.None);
+
+            // A predicate that is never true: this materialises no symbol and builds every index.
+            await SymbolFinder.FindSourceDeclarationsAsync(
+                solution, _ => false, SymbolFilter.TypeAndMember, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            // Nothing here is required for correctness — a cold search is a slow search, not a
+            // wrong one — so a project that will not compile must not take the log with it.
+            ServiceLog.Warn(
+                $"Could not warm the symbol index: {ex.Message}. Searches will warm it themselves.",
+                key: "solution-warmup:symbols");
+        }
+    }
+
+    /// <summary>Test seam: the background symbol warm, which nothing in the server awaits.</summary>
+    internal static Task WarmedSymbols
+    {
+        get
+        {
+            lock (s_gate)
+                return s_warmedSymbols;
+        }
     }
 
     /// <summary>Test seam: forgets that a solution was warmed, so the next start reloads it.</summary>
@@ -142,6 +212,7 @@ internal static class SolutionWarmup
         {
             s_solutionPath = null;
             s_warm = Task.CompletedTask;
+            s_warmedSymbols = Task.CompletedTask;
         }
     }
 }

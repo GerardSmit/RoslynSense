@@ -38,6 +38,34 @@ internal static class ResourcePresets
         return All;
     }
 
+    /// <summary>
+    /// The shapes a page-wide localizer produces, which between them cover almost every key in an
+    /// <c>App_LocalResources</c> file that no call site ever mentions.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Written out rather than parsed from the configured form, because a preset that failed to
+    /// parse would fail in a static initializer and take the process with it. The configured form
+    /// of these four is <c>[Control.ID].Text</c>, <c>[Control.ID].ToolTip</c>,
+    /// <c>Header[Control.UniqueName].Text</c> and <c>Header[Control.Name].Text</c>; a test holds
+    /// the two spellings to each other.
+    /// </para>
+    /// <para>
+    /// A control is asked for by its <c>ID</c>, so <c>litStock.Text</c> belongs to
+    /// <c>ID="litStock"</c>. A grid column is not a control and has no ID, so a heading is asked
+    /// for under a prefix and its <c>UniqueName</c> — <c>HeaderAmount.Text</c> belongs to
+    /// <c>UniqueName="Amount"</c>. <c>Name</c> is the same rule for the column kinds that carry
+    /// that attribute instead. Anything else a codebase composes is a line of configuration.
+    /// </para>
+    /// </remarks>
+    private static ImmutableArray<ResourceMarkupBinding> ControlAndColumnHeadings { get; } =
+    [
+        new ResourceMarkupBinding { Attribute = "ID", Suffix = ".Text" },
+        new ResourceMarkupBinding { Attribute = "ID", Suffix = ".ToolTip" },
+        new ResourceMarkupBinding { Prefix = "Header", Attribute = "UniqueName", Suffix = ".Text" },
+        new ResourceMarkupBinding { Prefix = "Header", Attribute = "Name", Suffix = ".Text" },
+    ];
+
     private static ResourcePreset Empty { get; } = new([], []);
 
     /// <summary>
@@ -95,7 +123,10 @@ internal static class ResourcePresets
                 RootInterpretation = RootInterpretation.VirtualPath,
                 Fallbacks = ["local"],
             },
-        ]);
+        ])
+    {
+        MarkupBindings = ControlAndColumnHeadings,
+    };
 
     /// <summary>
     /// DNN. The three <c>local</c> → <c>localShared</c> → <c>global</c> conventions are the inner
@@ -176,7 +207,10 @@ internal static class ResourcePresets
             LocalizeHelper("DotNetNuke.Entities.Modules.PortalModuleBase", "LocalizeText"),
             LocalizeHelper("DotNetNuke.Entities.Modules.PortalModuleBase", "LocalizeString"),
             LocalizeHelper("DotNetNuke.UI.Modules.ModuleUserControlBase", "LocalizeString"),
-        ]);
+        ])
+    {
+        MarkupBindings = ControlAndColumnHeadings,
+    };
 
     /// <summary>
     /// Modern .NET: <c>IStringLocalizer</c> and the <c>ResourceManager</c> a
@@ -264,7 +298,8 @@ internal static class ResourcePresets
     };
 
     /// <summary>Conventions merge by id with the later definition winning; lookups only ever
-    /// append, since a lookup is identified by nothing.</summary>
+    /// append, since a lookup is identified by nothing; markup bindings append and dedupe, since
+    /// one is identified by everything it holds.</summary>
     public static ResourcePreset Merge(ResourcePreset first, ResourcePreset second)
     {
         var conventions = new List<ResourceRootConvention>(first.Conventions);
@@ -280,11 +315,20 @@ internal static class ResourcePresets
                 conventions.Add(convention);
         }
 
-        return new ResourcePreset([.. conventions], [.. first.Lookups, .. second.Lookups]);
+        return new ResourcePreset([.. conventions], [.. first.Lookups, .. second.Lookups])
+        {
+            // Appended and then deduplicated: the presets overlap — webforms and dnn both declare
+            // the ID rule — and a duplicate would report the same attribute twice.
+            MarkupBindings = [.. first.MarkupBindings.Concat(second.MarkupBindings).Distinct()],
+        };
     }
 }
 
-/// <summary>One named set of conventions and lookups, before any user configuration.</summary>
+/// <summary>One named set of conventions, lookups and markup bindings, before any user
+/// configuration.</summary>
 internal sealed record ResourcePreset(
     ImmutableArray<ResourceRootConvention> Conventions,
-    ImmutableArray<ResourceLookup> Lookups);
+    ImmutableArray<ResourceLookup> Lookups)
+{
+    public ImmutableArray<ResourceMarkupBinding> MarkupBindings { get; init; } = [];
+}

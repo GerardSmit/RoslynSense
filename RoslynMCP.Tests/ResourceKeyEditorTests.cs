@@ -293,6 +293,109 @@ public class ResourceKeyEditorTests
         Assert.All(edit.Changes.Values.SelectMany(edits => edits), e => Assert.Equal("Caption", e.NewText));
     }
 
+    // ---- Keys nothing writes out -------------------------------------------------------------
+
+    /// <summary>The one markup site a composed key has, and the characters it covers.</summary>
+    private static async Task<string> BindingSiteAsync(string key)
+    {
+        var pack = Publish();
+
+        var locations = await pack.ReferencesAsync(
+            new ReferenceParams(
+                Doc(FixturePaths.ImplicitResxFile),
+                PositionOf(FixturePaths.ImplicitResxFile, $"name=\"{key}\"", "name=\"".Length),
+                new ReferenceContext(IncludeDeclaration: false)),
+            default);
+
+        var markup = Assert.Single(
+            locations, l => FileNameOf(l.Uri).Equals("Implicit.aspx", StringComparison.Ordinal));
+
+        var text = SourceText.From(File.ReadAllText(FixturePaths.ImplicitAspxFile));
+        return text.ToString(LspConverters.ToTextSpan(text, markup.Range));
+    }
+
+    /// <summary>
+    /// A key composed from a control's id, which is the majority of an App_LocalResources file.
+    /// </summary>
+    /// <remarks>
+    /// Nothing on the page spells <c>litStatus.Text</c>: the localizer walks the control tree and
+    /// asks for it. Before this bound, find-references on the entry answered with the entry — the
+    /// question "what is this string for" had no answer at all.
+    /// </remarks>
+    [Fact]
+    public async Task AKeyComposedFromAControlIdReportsTheControl() =>
+        Assert.Equal("litStatus", await BindingSiteAsync("litStatus.Text"));
+
+    /// <summary>
+    /// The same for a grid column, whose key is the prefix and its <c>UniqueName</c>.
+    /// </summary>
+    /// <remarks>
+    /// The case a prefix search cannot reach from either end: the page does not contain
+    /// <c>HeaderAmount</c>, and searching for the bare <c>Amount</c> instead would parse most of a
+    /// site to match a common word. Only the family knows which page to open.
+    /// </remarks>
+    [Fact]
+    public async Task AColumnHeadingReportsTheColumnItNames() =>
+        Assert.Equal("Amount", await BindingSiteAsync("HeaderAmount.Text"));
+
+    /// <summary>
+    /// A key no pattern could have composed reaches no markup, however much of it a control's id
+    /// happens to spell.
+    /// </summary>
+    /// <remarks>
+    /// <c>Heading</c> ends in neither <c>.Text</c> nor <c>.ToolTip</c>, so no shipped pattern
+    /// produces it — and the page does hold a <c>Header</c>-prefixed column, so a rule that matched
+    /// on the prefix alone would have reported one here.
+    /// </remarks>
+    [Fact]
+    public async Task AKeyNoPatternComposesStaysOutOfTheMarkup()
+    {
+        var pack = Publish();
+
+        var locations = await pack.ReferencesAsync(
+            new ReferenceParams(
+                Doc(FixturePaths.ImplicitResxFile),
+                PositionOf(FixturePaths.ImplicitResxFile, "name=\"Heading\"", "name=\"".Length),
+                new ReferenceContext(IncludeDeclaration: true)),
+            default);
+
+        Assert.Equal(
+            ["Implicit.aspx.resx"], locations.Select(l => FileNameOf(l.Uri)).Distinct());
+    }
+
+    /// <summary>
+    /// Renaming a composed key moves every file of the family and leaves the control alone.
+    /// </summary>
+    /// <remarks>
+    /// The half of the feature that is a refusal. The characters at the binding site are the
+    /// control's name: writing <c>litReady</c> over <c>ID="litStatus"</c> would rename the control,
+    /// orphan the field its designer declares and break every line of code-behind that touches it.
+    /// So the site is reported and not edited, and the markup goes on naming a key that has moved —
+    /// the same trade the pack already makes for <c>meta:resourcekey</c>.
+    /// </remarks>
+    [Fact]
+    public async Task RenamingAComposedKeyLeavesTheControlItWasComposedFromAlone()
+    {
+        var pack = Publish();
+
+        var edit = await pack.RenameAsync(
+            new RenameParams(
+                Doc(FixturePaths.ImplicitResxFile),
+                PositionOf(FixturePaths.ImplicitResxFile, "name=\"litStatus.Text\"", "name=\"".Length),
+                "litReady.Text"),
+            default);
+
+        Assert.NotNull(edit);
+
+        Assert.Equal(
+            ["Implicit.aspx.nl-NL.resx", "Implicit.aspx.resx"],
+            edit!.Changes.Keys.Select(FileNameOf).Order(StringComparer.Ordinal));
+
+        Assert.All(
+            edit.Changes.Values.SelectMany(edits => edits),
+            e => Assert.Equal("litReady.Text", e.NewText));
+    }
+
     [Fact]
     public async Task PrepareRenameDeclinesAKeyWhoseFilesWereOnlyGuessed()
     {

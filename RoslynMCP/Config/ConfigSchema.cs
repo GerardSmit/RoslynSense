@@ -73,6 +73,7 @@ public static class ConfigSchema
             ["resources.overrides"] = ("Overrides", "Customization segments beside a base file, such as DNN's `Portal-*`. Replaces the preset's set rather than adding to it."),
             ["resources.conventions"] = ("Conventions", "Named ways of turning a call-site file into a resx base name. Merged into the preset's by id."),
             ["resources.lookups"] = ("Lookups", "Call shapes that carry a resource key. Appended to the preset's."),
+            ["resources.markupBindings"] = ("Markup bindings", "Key shapes an application composes from a markup attribute rather than any call site writing them out, each written as the key it produces: `[Control.ID].Text`, `Header[Control.UniqueName].Text`, `[Control.ID].Header`. Appended to the preset's."),
             ["resources.missingKeyDiagnostic"] = ("Report missing keys", "Report a key that no file of its family declares. Off by default: a false report on a key that resolves fine at runtime is what gets the feature switched off wholesale."),
 
             ["database"] = ("Databases", "Which databases the solution can be queried against."),

@@ -10,12 +10,37 @@ using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.Resources.Core;
 
+/// <summary>What a site is, for the consumers that treat them differently.</summary>
+internal enum ResourceSiteKind
+{
+    /// <summary>A place that reads the key.</summary>
+    Usage,
+
+    /// <summary>The <c>name=</c> attribute of a <c>.resx</c> entry.</summary>
+    Declaration,
+
+    /// <summary>
+    /// A markup attribute the key is composed from — an <c>ID</c> or a <c>UniqueName</c>.
+    /// </summary>
+    /// <remarks>
+    /// A reference, and never an edit. The characters at the site are the control's name, not the
+    /// key: rewriting them to a new key would rename the control, orphan its designer field and
+    /// break every line of code-behind that touches it. So a rename reports these and leaves them
+    /// alone, which is the trade the pack already makes for <c>meta:resourcekey</c>.
+    /// </remarks>
+    ImplicitBinding,
+}
+
 /// <summary>One place a key is written, and the exact characters that change when it is renamed.</summary>
 /// <param name="KeySuffix">The suffix the lookup at this site appends when the key carries no dot
 /// of its own — DNN's <c>.Text</c>. Null where the site writes the key out in full, which is every
 /// <c>.resx</c> and every markup mention.</param>
 internal readonly record struct ResourceKeySite(
-    string FilePath, SourceText Text, TextSpan Span, string? KeySuffix);
+    string FilePath,
+    SourceText Text,
+    TextSpan Span,
+    string? KeySuffix,
+    ResourceSiteKind Kind = ResourceSiteKind.Usage);
 
 /// <summary>The key a caret is on, and the families it was resolved against.</summary>
 /// <remarks>
@@ -1052,6 +1077,10 @@ internal static class ResourceKeySearch
 
         bool complete = Declarations(target, Add, declarations);
 
+        // Outside the project loop: this one is driven from the key's own families, so running it
+        // per project would report the same attribute once per project that happens to be open.
+        await ImplicitBindingSitesAsync(settings, target, Add, ct);
+
         foreach (var project in Scope(target))
         {
             ct.ThrowIfCancellationRequested();
@@ -1060,6 +1089,124 @@ internal static class ResourceKeySearch
         }
 
         return ([.. sites], complete);
+    }
+
+    /// <summary>
+    /// The markup attribute a key was composed from, for keys nothing writes out.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Most keys in an <c>App_LocalResources</c> file have no call site at all. A page-wide
+    /// localizer walks the control tree once and asks for <c>{control.ID}</c> — with DNN's default
+    /// suffix, <c>litStock.Text</c> — and asks for a grid's headings under a prefix and each
+    /// column's <c>UniqueName</c>, because a column is not a control and has no ID to be found by.
+    /// Nothing in the solution ever spells those keys, so find-references answered with the
+    /// declaration and nothing else, and the question "what is this string for" had no answer.
+    /// </para>
+    /// <para>
+    /// Driven backwards, from the family to the one markup file it belongs to, rather than by
+    /// scanning markup for the key. That is not an optimisation, it is the only correct direction:
+    /// the text gate every other producer uses looks for the key, and a page that writes
+    /// <c>UniqueName="Amount"</c> does not contain <c>HeaderAmount</c> anywhere — so a scan would
+    /// have to search for the bare column name instead, which is a common word, and parse most of a
+    /// large site on every request. It is also what keeps the binding local: a resx family names
+    /// exactly one markup file, and an id matched across the project would report every page that
+    /// happens to reuse it.
+    /// </para>
+    /// <para>
+    /// Fixed-name families are excluded by the same inversion. <c>SharedResources.resx</c> takes
+    /// its name from the convention rather than from a page, so inverting it yields a markup path
+    /// that does not exist and the family drops out — which is right, because a key in a shared
+    /// file could otherwise bind to every same-named control on the site.
+    /// </para>
+    /// </remarks>
+    private static async Task ImplicitBindingSitesAsync(
+        ResourceSettings settings, ResourceKeyTarget target,
+        Action<ResourceKeySite> add, CancellationToken ct)
+    {
+        // A group target already reports the meta:resourcekey attribute that reaches its entries,
+        // and its key is a prefix — matching an id against it would bind whatever merely starts
+        // with it.
+        if (settings.MarkupBindings.IsDefaultOrEmpty || target.Group)
+            return;
+
+        // What each pattern would have had to read for this key to be the one it composed, decided
+        // before a page is opened. A key no pattern could have produced — every key a call site
+        // does write out — leaves here having cost a few string comparisons.
+        var wanted = new List<(string Attribute, string Value)>();
+
+        foreach (var binding in settings.MarkupBindings)
+        {
+            if (binding.Middle(target.Key) is { Length: > 0 } value)
+                wanted.Add((binding.Attribute, value));
+        }
+
+        if (wanted.Count == 0)
+            return;
+
+        foreach (var family in target.Families)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (MarkupFileOf(settings, family) is not { } markup)
+                continue;
+
+            var document = await AspxDocumentService.GetAsync(markup, ct);
+            if (document?.Tree is not { } root)
+                continue;
+
+            foreach (var element in AspxSymbolResolver.EnumerateElements(root))
+            {
+                foreach (var (name, value) in element.RawAttributes)
+                {
+                    foreach (var (attribute, expected) in wanted)
+                    {
+                        if (!name.Value.Equals(attribute, StringComparison.OrdinalIgnoreCase)
+                            || !value.Value.Equals(expected, StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+
+                        add(new ResourceKeySite(
+                            document.FilePath, document.SourceText,
+                            AspxSymbolResolver.Span(value.Range),
+                            KeySuffix: null,
+                            ResourceSiteKind.ImplicitBinding));
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The page or control a family's resources belong to, by inverting the convention that placed
+    /// them.
+    /// </summary>
+    /// <remarks>
+    /// Exact rather than a guess: the family's directory <em>is</em> the sibling folder the
+    /// convention named, and its base name <em>is</em> the markup file's name, because that is how
+    /// the catalog grouped them. Inverting the configured conventions rather than testing for
+    /// <c>App_LocalResources</c> by name is what makes a solution that renamed the folder work.
+    /// </remarks>
+    private static string? MarkupFileOf(ResourceSettings settings, ResourceFamily family)
+    {
+        string folder = Path.GetFileName(family.Directory.TrimEnd('/', '\\'));
+
+        foreach (var convention in settings.Conventions)
+        {
+            if (convention is not { FixedName: null, SiblingFolder: { Length: > 0 } sibling }
+                || !folder.Equals(sibling, StringComparison.OrdinalIgnoreCase)
+                || Path.GetDirectoryName(family.Directory) is not { Length: > 0 } parent)
+            {
+                continue;
+            }
+
+            string candidate = Path.Combine(parent, family.BaseName);
+            if (AspxDocumentService.IsAspxFile(candidate) && File.Exists(candidate))
+                return candidate;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1127,7 +1274,8 @@ internal static class ResourceKeySearch
                     add(new ResourceKeySite(
                         file.FilePath, text,
                         new TextSpan(entry.KeySpan.Start, target.Key.Length),
-                        KeySuffix: null));
+                        KeySuffix: null,
+                        ResourceSiteKind.Declaration));
                 }
             }
         }

@@ -68,6 +68,15 @@ internal sealed partial class ResourcesLanguage : ISymbolFreeRenameProvider, ILa
 
         foreach (var site in sites)
         {
+            // A binding site holds a control's name, not the key. Writing the new key over
+            // ID="litStock" would rename the control, orphan the field its designer declares and
+            // break every line of code-behind that touches it — so the rename reports it (through
+            // find-references, which shares this collection) and leaves it where it is. The same
+            // choice the pack already makes for meta:resourcekey, with the same consequence: the
+            // markup goes on naming a key that has moved.
+            if (site.Kind is ResourceSiteKind.ImplicitBinding)
+                continue;
+
             Add(
                 LspConverters.PathToUri(site.FilePath),
                 new TextEdit(

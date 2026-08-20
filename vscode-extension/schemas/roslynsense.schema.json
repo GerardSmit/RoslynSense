@@ -311,6 +311,20 @@
           "title": "Lookups",
           "description": "Call shapes that carry a resource key. Appended to the preset's."
         },
+        "markupBindings": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Markup bindings",
+          "description": "Key shapes an application composes from a markup attribute rather than any call site writing them out, each written as the key it produces: `[Control.ID].Text`, `Header[Control.UniqueName].Text`, `[Control.ID].Header`. Appended to the preset's."
+        },
         "missingKeyDiagnostic": {
           "type": "boolean",
           "title": "Report missing keys",

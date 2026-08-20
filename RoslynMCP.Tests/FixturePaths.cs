@@ -104,6 +104,15 @@ internal static class FixturePaths
     public static string DnnLocalizedResxFile =>
         Path.Combine(AspxProjectDir, "Controls", "App_LocalResources", "DnnLocalized.ascx.resx");
 
+    /// <summary>
+    /// The implicit-binding fixture: a page whose markup writes no key at all, and a family whose
+    /// entries are composed from a control's <c>ID</c> and a column's <c>UniqueName</c>.
+    /// </summary>
+    public static string ImplicitAspxFile => Path.Combine(AspxProjectDir, "Implicit.aspx");
+    public static string ImplicitResxFile => Path.Combine(LocalResourcesDir, "Implicit.aspx.resx");
+    public static string ImplicitDutchResxFile =>
+        Path.Combine(LocalResourcesDir, "Implicit.aspx.nl-NL.resx");
+
     public static string BlazorProjectDir => Path.Combine(s_fixturesRoot, "BlazorProject");
     public static string BlazorProjectFile => Path.Combine(BlazorProjectDir, "BlazorProject.csproj");
     public static string BlazorAppHelperFile => Path.Combine(BlazorProjectDir, "AppHelper.cs");

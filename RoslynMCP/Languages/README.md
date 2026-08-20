@@ -557,8 +557,56 @@ deliberately not the default: a bare name binds every method so called in the so
 ones that have nothing to do with resources. Give it a `parameterTypes`, which is then the only thing
 telling the intended call apart from the rest.
 
-Three different merge rules, each following from what the thing is: **lookups append** (a lookup is
+Four different merge rules, each following from what the thing is: **lookups append** (a lookup is
 identified by nothing, so there is nothing to replace); **conventions merge by `id`**, so redeclaring
-`local` replaces that one and leaves `localShared` and `global` alone; **overrides replace the
-preset's set wholesale**, because a rank scheme only means anything as a whole. A malformed entry
-warns and is dropped — a typo in one lookup must not leave the solution with no navigation at all.
+`local` replaces that one and leaves `localShared` and `global` alone; **markup bindings append and
+then dedupe**, since one is identified by everything it holds and the presets overlap; **overrides
+replace the preset's set wholesale**, because a rank scheme only means anything as a whole. A
+malformed entry warns and is dropped — a typo in one lookup must not leave the solution with no
+navigation at all.
+
+### Keys nothing writes out
+
+Most keys in an `App_LocalResources` file have no call site anywhere. A page-wide localizer walks the
+control tree once and asks for each control under its own `ID` — with DNN's default property,
+`litStock.Text` — and a grid asks for one heading per column under a prefix and the column's
+`UniqueName`, because a column is not a control and has no ID to be found by. Nothing in the solution
+spells those keys, so find-references answered with the declaration and nothing else, and "what is
+this string for" had no answer at all.
+
+A binding is written as the key it produces, with the attribute in the middle:
+
+```jsonc
+"resources": {
+    "markupBindings": ["Header[Control.UniqueName].Text", "[Control.ID].Header"]
+}
+```
+
+Naming the whole key rather than a prefix is what makes it a setting rather than two hard-coded
+shapes. A codebase that puts its fixed part on the other side writes `[Control.ID].Header`; one that
+composes on both sides writes both. The `Control.` in front of the attribute name is optional and
+ignored — it is there because that is how the shape reads to someone who has one of these, and
+dropping it silently beats rejecting a pattern over punctuation. The `webforms` and `dnn` presets
+ship `[Control.ID].Text`, `[Control.ID].ToolTip`, `Header[Control.UniqueName].Text` and
+`Header[Control.Name].Text`.
+
+The search runs **backwards, from the family to the one markup file it belongs to**, and that is not
+an optimisation — it is the only correct direction. Every other producer gates on a text search for
+the key, and a page that writes `UniqueName="Amount"` does not contain `HeaderAmount` anywhere, so a
+forward scan would have to search for the bare column name instead: a common word, parsed across most
+of a large site on every request. Inverting the convention that placed the family is exact, not a
+guess — the family's directory *is* the sibling folder and its base name *is* the markup file's name,
+because that is how the catalog grouped them. It also keeps the binding local, where an id matched
+across the project would report every page that happens to reuse it. Fixed-name families such as
+`SharedResources.resx` drop out of the same inversion, which is right: a key in a shared file would
+otherwise bind to every same-named control on the site.
+
+Before any of that, each pattern is asked what the attribute would have had to read for this key to
+be the one it composed. A key no pattern could have produced — every key a call site does write out —
+leaves having cost a few string comparisons rather than a parse.
+
+A binding site is **a reference and never an edit**. The characters there are the control's name, not
+the key: rewriting them to a new key would rename the control, orphan the field its designer declares
+and break every line of code-behind that touches it. So a rename reports the site through
+find-references and leaves it alone — the same trade the pack already makes for `meta:resourcekey`,
+with the same consequence, that the markup goes on naming a key that has moved.

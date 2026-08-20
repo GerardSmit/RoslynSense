@@ -40,6 +40,14 @@ public sealed class ResourcesConfig
     public IReadOnlyList<ResourceLookupConfig>? Lookups { get; init; }
 
     /// <summary>
+    /// Key shapes an application composes from a markup attribute rather than any call site writing
+    /// them out, each written as the key it produces with the attribute in the middle:
+    /// <c>[Control.ID].Text</c>, <c>Header[Control.UniqueName].Text</c>,
+    /// <c>[Control.ID].Header</c>. Appended to the preset's, then deduplicated.
+    /// </summary>
+    public IReadOnlyList<string>? MarkupBindings { get; init; }
+
+    /// <summary>
     /// Whether a key that no file of its family declares is reported. Off by default.
     /// </summary>
     /// <remarks>

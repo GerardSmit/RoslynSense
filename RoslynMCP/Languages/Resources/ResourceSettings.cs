@@ -21,6 +21,9 @@ internal sealed record ResourceSettings
 
     public ImmutableArray<ResourceLookup> Lookups { get; init; } = [];
 
+    /// <summary>Keys a markup attribute names rather than any call site writing them out.</summary>
+    public ImmutableArray<ResourceMarkupBinding> MarkupBindings { get; init; } = [];
+
     /// <summary>Whether a key no file of its family declares is reported. Opt-in: see
     /// <see cref="ResourcesConfig.MissingKeyDiagnostic"/>.</summary>
     public bool MissingKeyDiagnostic { get; init; }
@@ -57,12 +60,16 @@ internal sealed record ResourceSettings
                 Enabled = true,
                 Conventions = preset.Conventions,
                 Lookups = preset.Lookups,
+                MarkupBindings = preset.MarkupBindings,
             };
         }
 
         var declared = new ResourcePreset(
             ReadConventions(config.Conventions, warnings),
-            ReadLookups(config.Lookups, warnings));
+            ReadLookups(config.Lookups, warnings))
+        {
+            MarkupBindings = ReadMarkupBindings(config.MarkupBindings, warnings),
+        };
 
         var merged = ResourcePresets.Merge(preset, declared);
 
@@ -72,6 +79,7 @@ internal sealed record ResourceSettings
             Discovery = ReadDiscovery(config, warnings),
             Conventions = merged.Conventions,
             Lookups = merged.Lookups,
+            MarkupBindings = merged.MarkupBindings,
             MissingKeyDiagnostic = config.MissingKeyDiagnostic,
         };
     }
@@ -101,6 +109,25 @@ internal sealed record ResourceSettings
         }
 
         return options with { Overrides = rules.ToImmutable() };
+    }
+
+    private static ImmutableArray<ResourceMarkupBinding> ReadMarkupBindings(
+        IReadOnlyList<string>? configured, List<string> warnings)
+    {
+        if (configured is not { Count: > 0 })
+            return [];
+
+        var bindings = ImmutableArray.CreateBuilder<ResourceMarkupBinding>(configured.Count);
+
+        foreach (string pattern in configured)
+        {
+            if (ResourceMarkupBinding.Parse(pattern ?? "", out string? problem) is { } binding)
+                bindings.Add(binding);
+            else
+                warnings.Add($"resources.markupBindings: '{pattern}' is skipped, because {problem}.");
+        }
+
+        return bindings.ToImmutable();
     }
 
     private static ImmutableArray<ResourceRootConvention> ReadConventions(

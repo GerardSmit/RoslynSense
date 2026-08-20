@@ -278,6 +278,7 @@ In VS Code, **RoslynSense: Settings** — from the command palette, or the `⋯`
 | `resources.preset` | string? | `null` | — (`webforms`, `dnn`, `dotnet`, `none`; omitted merges all three) |
 | `resources.include` / `.exclude` | string[] | `[]` | — (globs, discovery only) |
 | `resources.overrides` / `.conventions` / `.lookups` | object[] | preset | — (raw escape hatch; prefer `preset`) |
+| `resources.markupBindings` | string[] | preset | — (key shapes composed from a markup attribute, such as `Header[Control.UniqueName].Text`) |
 | `resources.missingKeyDiagnostic` | bool | `false` | — (reports a key no file of its family declares; only where the resource file is known for certain) |
 | `database.autoDiscovery` | bool? | `null` | `--no-auto-db` forces `false` |
 | `database.connections` | object | `{}` | `--db` overrides matching alias |
@@ -335,7 +336,7 @@ Some frameworks invent their own name for the same thing. DotNetNuke keeps a `re
 
 `overrides` is not part of a preset: the `.Portal-{id}` and `.Host` customization files DNN puts beside a base `.resx` are recognised whichever preset is in force, because grouping a directory's file names happens before any lookup does. The defaults are `Portal-*` at rank 2 and `Host` at rank 1 — explicit ranks, because sorting those two patterns alphabetically gets the precedence backwards.
 
-`conventions`, `lookups` and `overrides` layer on top of the preset, each with its own merge rule: lookups append, conventions merge by `id`, and overrides replace the preset's set wholesale (a rank scheme only means anything as a whole). A malformed entry is warned about and dropped rather than failing the load. The field shapes and the design behind them are in [`RoslynMCP/Languages/README.md`](RoslynMCP/Languages/README.md#resources-the-one-pack-whose-model-needs-explaining).
+`conventions`, `lookups`, `markupBindings` and `overrides` layer on top of the preset, each with its own merge rule: lookups append, conventions merge by `id`, markup bindings append and dedupe, and overrides replace the preset's set wholesale (a rank scheme only means anything as a whole). A malformed entry is warned about and dropped rather than failing the load. The field shapes and the design behind them are in [`RoslynMCP/Languages/README.md`](RoslynMCP/Languages/README.md#resources-the-one-pack-whose-model-needs-explaining).
 
 `--no-resources` (or `"tools": { "resources": false }`) removes the whole feature from the daemon: the pack is never registered, no catalog is built, and every resource-key feature on both the MCP and LSP surfaces stops answering. Editors can also switch it off per window with `roslynSense.languages.resx`, which leaves the daemon — and any AI session attached to it — untouched.
 

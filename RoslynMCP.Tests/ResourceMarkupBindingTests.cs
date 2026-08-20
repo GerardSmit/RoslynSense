@@ -1,4 +1,4 @@
-using RoslynMCP.Config;
+﻿using RoslynMCP.Config;
 using RoslynMCP.Languages.Resources;
 using Xunit;
 
@@ -92,6 +92,42 @@ public class ResourceMarkupBindingTests
         }.Select(p => ResourceMarkupBinding.Parse(p, out _));
 
         Assert.Equal(written, shipped);
+    }
+
+    /// <summary>
+    /// DNN's own two, on top of the four. Both were found by counting keys in a DNN site: 2160
+    /// <c>.Help</c> and 486 <c>.Header</c> that no call site in the solution mentions.
+    /// </summary>
+    [Fact]
+    public void TheDnnPresetAddsTheTwoShapesItsOwnControlsCompose()
+    {
+        var warnings = new List<string>();
+
+        var shipped = ResourceSettings.Resolve(
+            enabled: true, new ResourcesConfig { Preset = "dnn" }, warnings).MarkupBindings;
+
+        Assert.Empty(warnings);
+
+        // A dnn:label asks for its caption and its help text under the same ID.
+        Assert.Contains(ResourceMarkupBinding.Parse("[Control.ID].Help", out _), shipped);
+
+        // A bound column has no UniqueName to be found by, so the field it binds is the id.
+        Assert.Contains(ResourceMarkupBinding.Parse("[Control.DataField].Header", out _), shipped);
+
+        // And the four every WebForms page has are still there.
+        Assert.Contains(ResourceMarkupBinding.Parse("[Control.ID].Text", out _), shipped);
+    }
+
+    /// <summary>Stock WebForms has neither convention, and inventing them would report a control
+    /// for a key its framework never composes.</summary>
+    [Fact]
+    public void TheWebFormsPresetDoesNotClaimDnnSShapes()
+    {
+        var shipped = ResourceSettings.Resolve(
+            enabled: true, new ResourcesConfig { Preset = "webforms" }, new List<string>())
+            .MarkupBindings;
+
+        Assert.DoesNotContain(ResourceMarkupBinding.Parse("[Control.ID].Help", out _), shipped);
     }
 
     [Fact]

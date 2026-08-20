@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 
 namespace RoslynMCP.Languages.Resources;
 
@@ -64,6 +64,23 @@ internal static class ResourcePresets
         new ResourceMarkupBinding { Attribute = "ID", Suffix = ".ToolTip" },
         new ResourceMarkupBinding { Prefix = "Header", Attribute = "UniqueName", Suffix = ".Text" },
         new ResourceMarkupBinding { Prefix = "Header", Attribute = "Name", Suffix = ".Text" },
+    ];
+
+    /// <summary>
+    /// The two more DNN's own controls compose, on top of <see cref="ControlAndColumnHeadings"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>&lt;dnn:label&gt;</c> asks for two keys under its own <c>ID</c> — the caption and the
+    /// tooltip body beside it — so a settings page with thirty labels has thirty <c>.Help</c> keys
+    /// no call site mentions. <c>&lt;dnn:textcolumn&gt;</c> and its siblings have no
+    /// <c>UniqueName</c>: a bound column is asked for under the field it binds, which is why this
+    /// one reads a <c>DataField</c> and ends in <c>.Header</c> rather than starting with it.
+    /// Configured form: <c>[Control.ID].Help</c> and <c>[Control.DataField].Header</c>.
+    /// </remarks>
+    private static ImmutableArray<ResourceMarkupBinding> DnnLabelsAndBoundColumns { get; } =
+    [
+        new ResourceMarkupBinding { Attribute = "ID", Suffix = ".Help" },
+        new ResourceMarkupBinding { Attribute = "DataField", Suffix = ".Header" },
     ];
 
     private static ResourcePreset Empty { get; } = new([], []);
@@ -209,7 +226,7 @@ internal static class ResourcePresets
             LocalizeHelper("DotNetNuke.UI.Modules.ModuleUserControlBase", "LocalizeString"),
         ])
     {
-        MarkupBindings = ControlAndColumnHeadings,
+        MarkupBindings = [.. ControlAndColumnHeadings, .. DnnLabelsAndBoundColumns],
     };
 
     /// <summary>

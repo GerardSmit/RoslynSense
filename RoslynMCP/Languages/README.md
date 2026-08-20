@@ -1,4 +1,4 @@
-# Language packs
+﻿# Language packs
 
 Everything RoslynSense understands that is not C# lives here, one folder per language. A pack owns
 its files across **both** front-ends at once: the LSP features an editor asks for, and the MCP tools
@@ -588,7 +588,10 @@ composes on both sides writes both. The `Control.` in front of the attribute nam
 ignored — it is there because that is how the shape reads to someone who has one of these, and
 dropping it silently beats rejecting a pattern over punctuation. The `webforms` and `dnn` presets
 ship `[Control.ID].Text`, `[Control.ID].ToolTip`, `Header[Control.UniqueName].Text` and
-`Header[Control.Name].Text`.
+`Header[Control.Name].Text`; `dnn` adds `[Control.ID].Help` and `[Control.DataField].Header` for the
+two its own controls compose — a `<dnn:label>` asks for a caption and a help body under one `ID`, and
+a bound grid column has no `UniqueName`, so it is asked for under the field it binds. Counted on one
+DNN site those two account for 2160 and 486 keys that nothing in the solution names.
 
 The search runs **backwards, from the family to the one markup file it belongs to**, and that is not
 an optimisation — it is the only correct direction. Every other producer gates on a text search for

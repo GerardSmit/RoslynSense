@@ -317,6 +317,125 @@ public class WebFormsBindingTests
         """;
 
     /// <summary>
+    /// Sets the configured attributes for one test and puts them back afterwards.
+    /// </summary>
+    /// <remarks>
+    /// The settings are process-wide because the markup handlers are static, so a test that left
+    /// them set would decide what every later test in the collection sees.
+    /// </remarks>
+    private sealed class Configured : IDisposable
+    {
+        private readonly MarkupBindingSettings _previous = MarkupBindingSettings.Current;
+
+        public Configured(params MarkupBinding[] attributes) =>
+            MarkupBindingSettings.Current =
+                new MarkupBindingSettings { Attributes = [.. attributes] };
+
+        public void Dispose() => MarkupBindingSettings.Current = _previous;
+    }
+
+    private static MarkupBinding Member(string tag, string attribute) =>
+        new(tag, attribute, MarkupBindingKind.Member, Source: null);
+
+    /// <summary>
+    /// A configured attribute reads exactly as an <c>Eval</c> argument does.
+    /// </summary>
+    /// <remarks>
+    /// Which is the point of routing it through the same three calls rather than teaching the
+    /// attribute its own parser: the dotted path, the case-insensitive lookup and the item type
+    /// traced from an ancestor all come along, because they are not the attribute's behaviour —
+    /// they are the binding's.
+    /// </remarks>
+    [Fact]
+    public async Task AConfiguredAttributeResolvesLikeAnEvalArgument()
+    {
+        using var configured = new Configured(Member("grid:Column", "SortExpression"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <grid:Column runat="server" ID="col" SortExpression="Buyer.Na|me" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        string? hover = await scenario.HoverBindingAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Name", hover);
+        Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>And a misspelling in one is reported the same way.</summary>
+    [Fact]
+    public async Task AMisspelledMemberInAConfiguredAttributeIsReported()
+    {
+        using var configured = new Configured(Member("grid:Column", "SortExpression"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <grid:Column runat="server" ID="c|ol" SortExpression="Amont" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var diagnostic = Assert.Single(await scenario.BindingDiagnosticsAsync());
+
+        Assert.Equal("WFB0001", diagnostic.Code);
+        Assert.Contains("Amont", diagnostic.Message);
+    }
+
+    /// <summary>
+    /// An attribute nobody configured is left alone.
+    /// </summary>
+    /// <remarks>
+    /// The whole reason the registry ships empty. <c>SortExpression</c> holds a member path on one
+    /// vendor's grid and a SQL fragment on another's, and an attribute wrongly claimed turns every
+    /// use of it into a warning.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnconfiguredAttributeIsNotReadAsABinding()
+    {
+        using var configured = new Configured(Member("grid:Column", "SortExpression"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <grid:Column runat="server" ID="c|ol" DataField="Amont" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>A tag of <c>*</c> claims the attribute wherever it is written.</summary>
+    [Fact]
+    public async Task AnEntryForAnyTagClaimsTheAttributeEverywhere()
+    {
+        using var configured = new Configured(Member("*", "DataField"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <telerik:GridBoundColumn runat="server" ID="c|ol" DataField="Amont" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        Assert.Single(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>
     /// A misspelled member is reported, because nothing else will report it.
     /// </summary>
     /// <remarks>

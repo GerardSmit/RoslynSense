@@ -653,6 +653,89 @@
       "title": "Value sets",
       "description": "Sets of allowed string values that live outside the compilation — the rows of a lookup table — and the members in C# that have to be one of them."
     },
+    "webForms": {
+      "type": "object",
+      "properties": {
+        "dataExpressions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "tag": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Tag",
+                "description": "The tag it is written on — `telerik:GridBoundColumn` — or `*` for any. Matched on the tag as written rather than on the control's type, so it keeps working in a site whose vendor assembly does not resolve."
+              },
+              "attribute": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Attribute",
+                "description": "The attribute name. Matched without regard to casing, as markup attributes are."
+              },
+              "kind": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Value is",
+                "description": "A member path from the bound item, or a composite format string.",
+                "enum": [
+                  "member",
+                  "format"
+                ]
+              },
+              "source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Formats the value of",
+                "description": "For a format string, which sibling attribute names the value being formatted — `[ItemType].[Control.DataField]` reads this tag's `DataField` and resolves it against the bound item. That is what tells a `{0:dd-MM-yyyy}` it is formatting a date."
+              }
+            },
+            "title": "Attribute",
+            "description": "One attribute, and how its value reads."
+          },
+          "title": "Data expressions",
+          "description": "The attributes to read as a path from the bound item. A grid's `SortExpression` and `DataField` are the usual ones."
+        },
+        "unknownMemberDiagnostic": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Report unknown members",
+          "description": "WFB0001 — a name the bound item type does not have. Only ever reported when that type is known: a container with no `ItemType` whose `DataSource` cannot be traced says nothing rather than something wrong."
+        },
+        "severity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Report them as",
+          "description": "How loudly WFB0001 is reported. A warning by default, because a path is resolved case-insensitively through `TypeDescriptor` and can be satisfied at runtime by a type this tool never sees.",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hidden"
+          ]
+        }
+      },
+      "title": "WebForms markup",
+      "description": "Attributes whose value names a member of the bound item, the way `Eval(\"...\")` does. Nothing is read this way until it is listed here, because which attributes behave so comes from the control library rather than from the framework."
+    },
     "debugger": {
       "type": "object",
       "properties": {

@@ -1016,8 +1016,14 @@ internal static class AspxLanguageHandler
     internal static async Task<(DataBindingSegment Segment, INamedTypeSymbol? ItemType)?>
         DataBoundSegmentAsync(AspxDocument document, int offset, CancellationToken ct)
     {
-        if (DataBindingService.ArgumentAt(document.Text, offset) is not { } argument)
+        // An Eval argument, or an attribute the configuration reads the same way — a grid's
+        // SortExpression or DataField, which name a member of the bound item exactly as Eval does
+        // and are just as invisible to the compiler.
+        if ((DataBindingService.ArgumentAt(document.Text, offset)
+                ?? MarkupBindingSites.At(document, offset)?.Value) is not { } argument)
+        {
             return null;
+        }
 
         var itemType = await DataBindingService.ItemTypeAsync(document, offset, ct);
         var segments = DataBindingService.Segments(document.Text, argument, itemType);

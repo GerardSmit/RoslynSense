@@ -33,6 +33,10 @@ internal static class LanguagePackRegistration
     {
         var packs = new List<ILanguagePack>();
 
+        // Published rather than handed to the pack: the markup handlers are static and reached
+        // from the LSP dispatch without a session to carry settings on.
+        MarkupBindingSettings.Current = settings.MarkupBindings;
+
         if (settings.WebForms)
             packs.Add(new WebFormsLanguage(formatter));
         if (settings.Razor)

@@ -229,6 +229,21 @@ internal static class DataBindingService
             string name = text[start..nameEnd];
             bool indexed = nameEnd < end;
 
+            // `['manual_version']` with nothing before it indexes the item itself, which is how a
+            // row-shaped item — a DataRow, a dictionary, a dynamic bag — is read when its columns
+            // are not members at all. The segment has no name to colour or navigate to, but the
+            // type it yields is what the rest of the path continues from.
+            if (name.Length == 0 && indexed && current is not null)
+            {
+                current = Indexer(current, "Item") is { } self ? Indexed(self) : null;
+
+                if (end == argument.End)
+                    break;
+
+                start = end + 1;
+                continue;
+            }
+
             var member = current is null || name.Length == 0
                 ? null
                 : indexed ? Field(current, name) ?? Indexer(current, name) : Field(current, name);

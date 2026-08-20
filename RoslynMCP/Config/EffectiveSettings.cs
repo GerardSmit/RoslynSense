@@ -3,6 +3,7 @@ using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Resources;
 using RoslynMCP.Languages.Values;
 using RoslynMCP.Languages.WebConfig.Core;
+using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Services.Database;
 
 namespace RoslynMCP.Config;
@@ -40,6 +41,10 @@ public sealed record EffectiveSettings(
     /// <summary>The value-set pack's gate, its sets and where they are bound. Init-only for the
     /// same reason as <see cref="Resources"/>.</summary>
     internal ValueSettings ValueSets { get; init; } = ValueSettings.Disabled;
+
+    /// <summary>Which markup attributes are read as data expressions. Init-only for the same
+    /// reason as <see cref="Resources"/>.</summary>
+    internal MarkupBindingSettings MarkupBindings { get; init; } = MarkupBindingSettings.None;
 
     /// <summary>The project-file pack's gate. Init-only for the same reason as
     /// <see cref="Resources"/>.</summary>
@@ -104,6 +109,9 @@ public sealed record EffectiveSettings(
         var tools = config?.Tools ?? new ToolsConfig();
 
         bool webForms = !HasFlag("--no-webforms") && tools.WebForms;
+        var markupBindings = webForms
+            ? MarkupBindingSettings.Resolve(config?.WebForms, warnings)
+            : MarkupBindingSettings.None;
         bool razor = !HasFlag("--no-razor") && tools.Razor;
         bool proto = !HasFlag("--no-proto") && tools.Proto;
         bool mediator = !HasFlag("--no-mediator") && tools.Mediator;
@@ -182,6 +190,7 @@ public sealed record EffectiveSettings(
             DotSettings = dotSettings,
             Logging = logging,
             ValueSets = valueSets,
+            MarkupBindings = markupBindings,
         };
     }
 

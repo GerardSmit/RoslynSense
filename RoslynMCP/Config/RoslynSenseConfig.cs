@@ -19,6 +19,9 @@ public sealed class RoslynSenseConfig
     /// compiler cannot see.</summary>
     public ValueSetsConfig ValueSets { get; init; } = new();
 
+    /// <summary>The <c>webForms</c> section: which markup attributes carry data expressions.</summary>
+    public WebFormsConfig WebForms { get; init; } = new();
+
     /// <summary>Which debugger attributes the debug engines honour while inspecting and stepping.</summary>
     public DebuggerConfig Debugger { get; init; } = new();
     public string? TableFormat { get; init; }
@@ -207,6 +210,68 @@ public sealed class ValueBindingEntry
 
     /// <summary>Which parameter carries the value, counted from 0. Methods only.</summary>
     public int? ValueIndex { get; init; }
+}
+
+/// <summary>
+/// The <c>webForms</c> section: markup attributes whose value names a member of the bound item.
+/// </summary>
+/// <remarks>
+/// Configured rather than built in, because the attributes that behave this way come from the
+/// control library rather than from the framework — <c>SortExpression</c> and <c>DataField</c> are
+/// a grid vendor's names, and the next site uses a different vendor. Nothing ships enabled: an
+/// attribute wrongly declared to hold a member path turns every use of it into a warning.
+/// </remarks>
+public sealed class WebFormsConfig
+{
+    /// <summary>The attributes to read as data expressions.</summary>
+    public IReadOnlyList<MarkupBindingEntry>? DataExpressions { get; init; }
+
+    /// <summary>Whether a name that binds to nothing is reported at all. Default true.</summary>
+    public bool? UnknownMemberDiagnostic { get; init; }
+
+    /// <summary>
+    /// How loudly: <c>error</c>, <c>warning</c>, <c>info</c> or <c>hidden</c>. Default
+    /// <c>warning</c>.
+    /// </summary>
+    /// <remarks>
+    /// A warning rather than an error by default, unlike the value sets: a data-binding path is
+    /// resolved case-insensitively through <c>TypeDescriptor</c> and can be satisfied at runtime by
+    /// a type this tool never sees — a <c>DataTable</c> column, a dynamic row — so a name that
+    /// binds to nothing here is very likely wrong rather than certainly wrong.
+    /// </remarks>
+    public string? Severity { get; init; }
+}
+
+/// <summary>One attribute that carries a data expression.</summary>
+public sealed class MarkupBindingEntry
+{
+    /// <summary>
+    /// The tag it is written on — <c>telerik:GridBoundColumn</c>, or <c>*</c> for any.
+    /// </summary>
+    /// <remarks>
+    /// Matched on the tag as written rather than on the control's type, because the type behind a
+    /// vendor prefix is often not resolvable in a site that references the assembly loosely, and an
+    /// attribute registry that stopped working when the reference did would be worse than one that
+    /// reads names.
+    /// </remarks>
+    public string? Tag { get; init; }
+
+    /// <summary>The attribute name, matched case-insensitively as markup attributes are.</summary>
+    public string? Attribute { get; init; }
+
+    /// <summary>
+    /// How the value reads: <c>member</c> — a path from the bound item — or <c>format</c>, a
+    /// composite format string.
+    /// </summary>
+    public string? Kind { get; init; }
+
+    /// <summary>
+    /// For <c>format</c>, where the value being formatted comes from:
+    /// <c>[ItemType].[Control.DataField]</c> reads this tag's <c>DataField</c> attribute and
+    /// resolves it against the bound item, which is what tells a <c>{0:dd-MM-yyyy}</c> that it is
+    /// formatting a date.
+    /// </summary>
+    public string? Source { get; init; }
 }
 
 public sealed class DatabaseConfig

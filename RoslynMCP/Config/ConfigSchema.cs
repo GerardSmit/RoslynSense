@@ -75,6 +75,15 @@ public static class ConfigSchema
             ["logging.unusedValue"] = ("Value never printed", "LOG0004 — a parameter or argument no placeholder renders. SYSLIB1015's claim for a generated method, reported on the parameter."),
             ["logging.exceptionPosition"] = ("Exception in the wrong place", "LOG0005 — an exception passed as a rendered value rather than as the first argument, which loses the stack trace and the sink's exception handling."),
 
+            ["webForms"] = ("WebForms markup", "Attributes whose value names a member of the bound item, the way `Eval(\"...\")` does. Nothing is read this way until it is listed here, because which attributes behave so comes from the control library rather than from the framework."),
+            ["webForms.dataExpressions"] = ("Data expressions", "The attributes to read as a path from the bound item. A grid's `SortExpression` and `DataField` are the usual ones."),
+            ["webForms.dataExpressions[]"] = ("Attribute", "One attribute, and how its value reads."),
+            ["webForms.dataExpressions[].tag"] = ("Tag", "The tag it is written on — `telerik:GridBoundColumn` — or `*` for any. Matched on the tag as written rather than on the control's type, so it keeps working in a site whose vendor assembly does not resolve."),
+            ["webForms.dataExpressions[].attribute"] = ("Attribute", "The attribute name. Matched without regard to casing, as markup attributes are."),
+            ["webForms.dataExpressions[].kind"] = ("Value is", "A member path from the bound item, or a composite format string."),
+            ["webForms.dataExpressions[].source"] = ("Formats the value of", "For a format string, which sibling attribute names the value being formatted — `[ItemType].[Control.DataField]` reads this tag's `DataField` and resolves it against the bound item. That is what tells a `{0:dd-MM-yyyy}` it is formatting a date."),
+            ["webForms.unknownMemberDiagnostic"] = ("Report unknown members", "WFB0001 — a name the bound item type does not have. Only ever reported when that type is known: a container with no `ItemType` whose `DataSource` cannot be traced says nothing rather than something wrong."),
+            ["webForms.severity"] = ("Report them as", "How loudly WFB0001 is reported. A warning by default, because a path is resolved case-insensitively through `TypeDescriptor` and can be satisfied at runtime by a type this tool never sees."),
             ["valueSets"] = ("Value sets", "Sets of allowed string values that live outside the compilation — the rows of a lookup table — and the members in C# that have to be one of them."),
             ["valueSets.unknownValueDiagnostic"] = ("Report unknown values", "VAL0001 — a string that is not one of its set's values. Only ever reported for a set that loaded completely: an unreachable database says nothing rather than something wrong."),
             ["valueSets.severity"] = ("Report them as", "How loudly VAL0001 is reported. An error by default, because a code the table does not have is a branch that can never be taken. Soften it while a codebase catches up."),
@@ -219,6 +228,8 @@ public static class ConfigSchema
                 ["virtualPath", "globalClassName", "typeName", "relativePath", "baseName"],
             ["tableFormat"] = ["markdown", "toon"],
             ["valueSets.severity"] = ["error", "warning", "information"],
+            ["webForms.severity"] = ["error", "warning", "information", "hidden"],
+            ["webForms.dataExpressions[].kind"] = ["member", "format"],
         };
 
     /// <summary>

@@ -28,9 +28,16 @@ internal static class AspxBindingDiagnostics
     public static async Task<Protocol.Diagnostic[]> DiagnosticsAsync(
         AspxDocument document, CancellationToken ct)
     {
+        var settings = MarkupBindingSettings.Current;
+        if (!settings.UnknownMemberDiagnostic)
+            return [];
+
         List<Protocol.Diagnostic>? found = null;
 
-        foreach (var argument in DataBindingService.AllArguments(document.Text))
+        var arguments = DataBindingService.AllArguments(document.Text)
+            .Concat(MarkupBindingSites.Enumerate(document).Select(site => site.Value));
+
+        foreach (var argument in arguments)
         {
             ct.ThrowIfCancellationRequested();
 
@@ -48,7 +55,7 @@ internal static class AspxBindingDiagnostics
 
                 (found ??= []).Add(new Protocol.Diagnostic(
                     AspxLanguageHandler.ToRange(document, segment.Span),
-                    LspConverters.ToLspSeverity(DiagnosticSeverity.Warning),
+                    LspConverters.ToLspSeverity(settings.Severity),
                     UnknownMember,
                     DiagnosticSource,
                     $"'{itemType.ToDisplayString()}' has no member named '{segment.Name}'."));

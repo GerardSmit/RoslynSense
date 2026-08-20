@@ -480,6 +480,18 @@ internal static class AspxLanguageHandler
         if (hit is not null && AspxResourceHandler.Handles(hit.Kind))
             return await AspxResourceHandler.HoverAsync(document, hit, ct);
 
+        // `Eval("Entity.Images")`, in the same place the definition path takes it and for the same
+        // reason: the argument is a string the runtime reflects over, so the projection binds it to
+        // System.String and hovering it described the string rather than the property. Reached
+        // before the symbol branch because that is what the projection would answer with.
+        if (await DataBoundSegmentAsync(document, offset, ct) is { } binding
+            && DescribeBinding(binding.Segment, binding.ItemType, document, ct) is { } bound)
+        {
+            return new Hover(
+                new MarkupContent("markdown", bound),
+                ToRange(document, binding.Segment.Span));
+        }
+
         if (hit is { Symbol: { } symbol })
         {
             string markdown = HoverHandler.Describe(symbol, ct, document.Compilation);
@@ -710,10 +722,11 @@ internal static class AspxLanguageHandler
 
         var resources = await AspxResourceHandler.DiagnosticsAsync(document, ct);
         var embedded = await EmbeddedDiagnosticsAsync(document, ct);
+        var bindings = await AspxBindingDiagnostics.DiagnosticsAsync(document, ct);
 
-        return resources.Length == 0 && embedded.Length == 0
+        return resources.Length == 0 && embedded.Length == 0 && bindings.Length == 0
             ? parse
-            : [.. parse, .. resources, .. embedded];
+            : [.. parse, .. resources, .. embedded, .. bindings];
     }
 
     /// <summary>
@@ -954,8 +967,54 @@ internal static class AspxLanguageHandler
     /// The member a data-binding path names at the caret — the <c>Images</c> of
     /// <c>Eval("Entity.Images")</c>, or the <c>Entity</c> when the caret is on that half.
     /// </summary>
+    /// <summary>
+    /// What a data-binding path segment is worth saying, or null when there is nothing.
+    /// </summary>
+    /// <remarks>
+    /// A segment that bound is described the way the same member is described in C#, plus what
+    /// System.Web keeps in metadata rather than in XML documentation. A segment that did not bind
+    /// is worth a line only when the item type is known — otherwise the answer would be
+    /// "not found on nothing", which is noise over a page whose container declares no
+    /// <c>ItemType</c> and whose <c>DataSource</c> could not be traced.
+    /// </remarks>
+    internal static string? DescribeBinding(
+        DataBindingSegment segment, INamedTypeSymbol? itemType,
+        AspxDocument document, CancellationToken ct)
+    {
+        if (segment.Symbol is { } member)
+        {
+            string markdown = HoverHandler.Describe(member, ct, document.Compilation);
+
+            if (string.IsNullOrWhiteSpace(member.GetDocumentationCommentXml(cancellationToken: ct))
+                && FrameworkDocumentation.Describe(member, document.Compilation) is { } framework)
+            {
+                markdown += "\n\n" + framework;
+            }
+
+            return markdown;
+        }
+
+        if (itemType is null || segment.Name.Length == 0)
+            return null;
+
+        return $"`{itemType.ToDisplayString()}` has no member named `{segment.Name}`.";
+    }
+
     internal static async Task<ISymbol?> DataBoundMemberAsync(
-        AspxDocument document, int offset, CancellationToken ct)
+        AspxDocument document, int offset, CancellationToken ct) =>
+        (await DataBoundSegmentAsync(document, offset, ct))?.Segment.Symbol;
+
+    /// <summary>
+    /// The path segment under the caret, and the type the path started from.
+    /// </summary>
+    /// <remarks>
+    /// The item type comes back alongside the segment because an unresolved segment is worth
+    /// saying something about, and what there is to say is which type it was looked for on. A
+    /// segment resolving to nothing is the ordinary case while the name is still being typed, and
+    /// the ordinary case for a misspelling too.
+    /// </remarks>
+    internal static async Task<(DataBindingSegment Segment, INamedTypeSymbol? ItemType)?>
+        DataBoundSegmentAsync(AspxDocument document, int offset, CancellationToken ct)
     {
         if (DataBindingService.ArgumentAt(document.Text, offset) is not { } argument)
             return null;
@@ -963,7 +1022,9 @@ internal static class AspxLanguageHandler
         var itemType = await DataBindingService.ItemTypeAsync(document, offset, ct);
         var segments = DataBindingService.Segments(document.Text, argument, itemType);
 
-        return DataBindingService.SegmentAt(segments, offset)?.Symbol;
+        return DataBindingService.SegmentAt(segments, offset) is { } segment
+            ? (segment, itemType)
+            : null;
     }
 
     /// <summary>

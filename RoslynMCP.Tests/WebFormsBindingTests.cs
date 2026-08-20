@@ -316,6 +316,211 @@ public class WebFormsBindingTests
         }
         """;
 
+    /// <summary>
+    /// A misspelled member is reported, because nothing else will report it.
+    /// </summary>
+    /// <remarks>
+    /// <c>Eval</c> takes a string and reflects over it, so this is not a build error, not a test
+    /// failure and not anything at all until the page renders — at which point it throws at the
+    /// user rather than at whoever wrote it.
+    /// </remarks>
+    [Fact]
+    public async Task AMisspelledBoundMemberIsReported()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <asp:Label ID="lbl|Amount" runat="server" Text='<%# Eval("Amont") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var diagnostic = Assert.Single(await scenario.BindingDiagnosticsAsync());
+
+        Assert.Equal("WFB0001", diagnostic.Code);
+        Assert.Contains("Amont", diagnostic.Message);
+        Assert.Contains("Fixture.Order", diagnostic.Message);
+    }
+
+    /// <summary>One mistake is reported once, not once per dot after it.</summary>
+    [Fact]
+    public async Task OnlyTheSegmentThatBrokeThePathIsReported()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <asp:Label ID="lbl|Name" runat="server" Text='<%# Eval("Byer.Name") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var diagnostic = Assert.Single(await scenario.BindingDiagnosticsAsync());
+
+        Assert.Contains("Byer", diagnostic.Message);
+        Assert.DoesNotContain("Name", diagnostic.Message);
+    }
+
+    [Fact]
+    public async Task AMemberThatBindsIsNotReported()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <asp:Label ID="lbl|Name" runat="server" Text='<%# Eval("Buyer.Name") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>
+    /// With no item type, nothing is claimed.
+    /// </summary>
+    /// <remarks>
+    /// A container declaring no <c>ItemType</c> whose <c>DataSource</c> cannot be traced is
+    /// ordinary, and every path under it would light up — which teaches the reader to ignore the
+    /// rule everywhere, including where it is right.
+    /// </remarks>
+    [Fact]
+    public async Task NothingIsReportedWhenTheItemTypeIsUnknown()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server">
+                <ItemTemplate>
+                    <asp:Label ID="lbl|Amount" runat="server" Text='<%# Eval("Amont") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>
+    /// Hovering a bound member says what the member is.
+    /// </summary>
+    /// <remarks>
+    /// The projection binds the argument to <c>System.String</c>, because that is what it is — so
+    /// before this the hover over a bound property described the string literal holding its name,
+    /// which is true and useless. The property is reachable only from the item type.
+    /// </remarks>
+    [Fact]
+    public async Task HoveringABoundMemberDescribesTheMemberRatherThanTheString()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <asp:Label ID="lblAmount" runat="server" Text='<%# Eval("Am|ount") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        string? hover = await scenario.HoverBindingAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Amount", hover);
+        Assert.Contains("decimal", hover);
+        Assert.DoesNotContain("System.String", hover);
+    }
+
+    /// <summary>Each half of a path is described on its own terms.</summary>
+    [Fact]
+    public async Task HoveringEitherHalfOfAPathDescribesThatHalf()
+    {
+        const string Markup = """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <asp:Label ID="lblName" runat="server" Text='<%# Eval("{0}") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """;
+
+        using (var outer = Scenario.Create(string.Format(Markup, "Bu|yer.Name"), ItemCodeBehind))
+        {
+            string? hover = await outer.HoverBindingAsync();
+            Assert.NotNull(hover);
+            Assert.Contains("Buyer", hover);
+            Assert.Contains("Client", hover);
+        }
+
+        using var inner = Scenario.Create(string.Format(Markup, "Buyer.Na|me"), ItemCodeBehind);
+
+        string? nested = await inner.HoverBindingAsync();
+        Assert.NotNull(nested);
+        Assert.Contains("Name", nested);
+        Assert.Contains("string", nested);
+    }
+
+    /// <summary>
+    /// A name that binds to nothing says which type it was looked for on.
+    /// </summary>
+    /// <remarks>
+    /// The one thing the user needs and cannot get from the markup: the item type is declared on an
+    /// ancestor, or on no ancestor and inferred from a <c>DataSource</c> assignment in the
+    /// code-behind, so "what am I even reading this off" is a question the file does not answer.
+    /// </remarks>
+    [Fact]
+    public async Task HoveringAMisspelledMemberNamesTheTypeItWasLookedForOn()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <asp:Label ID="lblAmount" runat="server" Text='<%# Eval("Amo|nt") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        string? hover = await scenario.HoverBindingAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Fixture.Order", hover);
+        Assert.Contains("Amont", hover);
+    }
+
+    /// <summary>
+    /// With no item type there is nothing to say, so nothing is said.
+    /// </summary>
+    /// <remarks>
+    /// "Not found on nothing" is worse than silence: a container declaring no <c>ItemType</c> whose
+    /// <c>DataSource</c> could not be traced is ordinary, and a hover claiming the name is wrong
+    /// would be asserting something the tool does not know.
+    /// </remarks>
+    [Fact]
+    public async Task HoveringWithNoItemTypeSaysNothing()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server">
+                <ItemTemplate>
+                    <asp:Label ID="lblAmount" runat="server" Text='<%# Eval("Amo|unt") %>' />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        Assert.Null(await scenario.HoverBindingAsync());
+    }
+
     [Fact]
     public async Task EvalOffersTheFieldsOfTheContainersItemType()
     {
@@ -869,6 +1074,29 @@ public class WebFormsBindingTests
         public Task<CompletionList> CompleteAsync() =>
             AspxCompletionHandler.CompleteAsync(
                 Document, Caret, trigger: null, new LspResolveCache(), default);
+
+        public Task<RoslynMCP.Lsp.Protocol.Diagnostic[]> BindingDiagnosticsAsync() =>
+            AspxBindingDiagnostics.DiagnosticsAsync(Document, default);
+
+        /// <summary>
+        /// What hover says about the binding segment under the caret, or null for no hover.
+        /// </summary>
+        /// <remarks>
+        /// The two halves of the hover path rather than <c>HoverAsync</c> itself, which starts by
+        /// resolving a URI through the document service against the real workspace — this scenario
+        /// builds its document in an <c>AdhocWorkspace</c> that the service has never heard of.
+        /// </remarks>
+        public async Task<string?> HoverBindingAsync()
+        {
+            if (await AspxLanguageHandler.DataBoundSegmentAsync(Document, Caret, default)
+                is not { } binding)
+            {
+                return null;
+            }
+
+            return AspxLanguageHandler.DescribeBinding(
+                binding.Segment, binding.ItemType, Document, default);
+        }
 
         public void Dispose()
         {

@@ -3,5 +3,6 @@
     <ItemTemplate>
         <li><%# Item.Length %></li>
         <li><%# Container.DataItem %></li>
+        <li><%# Eval("Length") %></li>
     </ItemTemplate>
 </asp:Repeater>

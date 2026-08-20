@@ -254,6 +254,29 @@ public class WebFormsLspTests
         Assert.Contains("Repeater", hover!.Contents.Value);
     }
 
+    /// <summary>
+    /// Hover reaches the bound member through the whole request, not only through its describer.
+    /// </summary>
+    /// <remarks>
+    /// The ordering is the load-bearing part: the projection binds an <c>Eval</c> argument to
+    /// <c>System.String</c>, so a branch reached after the symbol lookup would describe the literal
+    /// and never get here. Pinned end to end because that ordering is what a later edit would
+    /// quietly undo.
+    /// </remarks>
+    [Fact]
+    public async Task HoverInsideAnEvalDescribesTheBoundMember()
+    {
+        var hover = await AspxLanguageHandler.HoverAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.TypedRepeaterAscxFile),
+                PositionOf(FixturePaths.TypedRepeaterAscxFile, "Eval(\"Length\")", 7)),
+            default);
+
+        Assert.NotNull(hover);
+        Assert.Contains("Length", hover!.Contents.Value);
+        Assert.Contains("int", hover.Contents.Value);
+    }
+
     [Fact]
     public async Task TheOutlineListsControlsUnderTheirId()
     {

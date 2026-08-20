@@ -7,8 +7,8 @@ using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 namespace RoslynMCP.Languages.Resources;
 
 /// <summary>
-/// Find-references on a resource key: its declaration in every file of the family, and every call
-/// site that reads it in C# or in markup.
+/// Find-references on a resource key: every call site that reads it in C# or in markup, and the
+/// original declaration — not the translations of it.
 /// </summary>
 /// <remarks>
 /// Answerable where <see cref="ISymbolFreeRenameProvider"/> refuses. A call site whose root only
@@ -17,8 +17,12 @@ namespace RoslynMCP.Languages.Resources;
 /// </remarks>
 internal sealed partial class ResourcesLanguage : ISymbolFreeReferenceProvider, ILanguageReferencesProvider
 {
-    public async Task<IReadOnlyList<LspLocation>?> ReferencesAsync(
-        string filePath, int offset, Project? project, CancellationToken ct)
+    public Task<IReadOnlyList<LspLocation>?> ReferencesAsync(
+        string filePath, int offset, Project? project, CancellationToken ct) =>
+        ReferencesAsync(filePath, offset, project, includeDeclaration: true, ct);
+
+    private async Task<IReadOnlyList<LspLocation>?> ReferencesAsync(
+        string filePath, int offset, Project? project, bool includeDeclaration, CancellationToken ct)
     {
         project ??= await ProjectOfAsync(filePath, ct);
 
@@ -28,7 +32,16 @@ internal sealed partial class ResourcesLanguage : ISymbolFreeReferenceProvider, 
             return null;
         }
 
-        var (sites, _) = await ResourceKeySearch.CollectAsync(Settings, target, ct);
+        // The neutral entry at most, never the translations. A key is declared once per culture and
+        // once per portal override, so a family answering for a shipped product listed a dozen
+        // spellings of the same string ahead of the two or three places that actually read it.
+        var (sites, _) = await ResourceKeySearch.CollectAsync(
+            Settings,
+            target,
+            ct,
+            includeDeclaration
+                ? ResourceKeySearch.DeclarationScope.NeutralOnly
+                : ResourceKeySearch.DeclarationScope.None);
         var results = new List<LspLocation>(sites.Length);
 
         foreach (var site in sites)
@@ -43,7 +56,8 @@ internal sealed partial class ResourcesLanguage : ISymbolFreeReferenceProvider, 
 
     public async Task<LspLocation[]> ReferencesAsync(ReferenceParams p, CancellationToken ct) =>
         Caret(p.TextDocument, p.Position) is { } at
-            && await ReferencesAsync(at.Path, at.Offset, project: null, ct) is { } found
+            && await ReferencesAsync(
+                at.Path, at.Offset, project: null, p.Context.IncludeDeclaration, ct) is { } found
                 ? [.. found]
                 : [];
 }

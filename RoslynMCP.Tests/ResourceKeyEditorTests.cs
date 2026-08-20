@@ -216,6 +216,46 @@ public class ResourceKeyEditorTests
 
     // ---- Rename ------------------------------------------------------------------------------
 
+    /// <summary>
+    /// Find-references on a key lists what reads it, not what translates it.
+    /// </summary>
+    /// <remarks>
+    /// The fixture family has five files — neutral, a culture, two portal overrides and a host
+    /// override — which is a modest version of what a shipped product has. Listing all of them
+    /// buried the two or three real call sites under a list of every language the product ships in,
+    /// and none of those entries is a place the key is used: they are other spellings of the same
+    /// string. The rename test above is the other half of this one, and has to keep passing: a
+    /// rename still has to rewrite every one of them.
+    /// </remarks>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ReferencesToAKeyLeaveTheTranslationsOut(bool includeDeclaration)
+    {
+        var pack = Publish();
+
+        var locations = await pack.ReferencesAsync(
+            new ReferenceParams(
+                Doc(FixturePaths.LocalizedResxFile),
+                PositionOf(FixturePaths.LocalizedResxFile, "name=\"Heading\"", "name=\"".Length),
+                new ReferenceContext(includeDeclaration)),
+            default);
+
+        var files = locations.Select(l => FileNameOf(l.Uri)).ToList();
+
+        Assert.NotEmpty(files);
+        Assert.Contains("Localized.aspx", files);
+
+        // The neutral file is the definition, so it follows the flag the editor sent. The rest of
+        // the family never appears either way.
+        Assert.Equal(includeDeclaration, files.Contains("Localized.aspx.resx"));
+
+        Assert.DoesNotContain("Localized.aspx.nl-NL.resx", files);
+        Assert.DoesNotContain("Localized.aspx.Host.resx", files);
+        Assert.DoesNotContain("Localized.aspx.Portal-3.resx", files);
+        Assert.DoesNotContain("Localized.aspx.nl-NL.Portal-3.resx", files);
+    }
+
     [Fact]
     public async Task RenamingAKeyRewritesTheWholeFamilyAndEveryCallSiteAtOnce()
     {

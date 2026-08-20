@@ -1036,7 +1036,10 @@ internal static class ResourceKeySearch
     /// exists, which is worse than declining the gesture.
     /// </remarks>
     public static async Task<(ImmutableArray<ResourceKeySite> Sites, bool Complete)> CollectAsync(
-        ResourceSettings settings, ResourceKeyTarget target, CancellationToken ct)
+        ResourceSettings settings,
+        ResourceKeyTarget target,
+        CancellationToken ct,
+        DeclarationScope declarations = DeclarationScope.EveryFile)
     {
         var sites = new List<ResourceKeySite>();
         var seen = new HashSet<(string, int, int)>();
@@ -1047,7 +1050,7 @@ internal static class ResourceKeySearch
                 sites.Add(site);
         }
 
-        bool complete = Declarations(target, Add);
+        bool complete = Declarations(target, Add, declarations);
 
         foreach (var project in Scope(target))
         {
@@ -1059,14 +1062,50 @@ internal static class ResourceKeySearch
         return ([.. sites], complete);
     }
 
-    /// <summary>The <c>name=</c> attribute in every file of every family that declares the key.</summary>
-    private static bool Declarations(ResourceKeyTarget target, Action<ResourceKeySite> add)
+    /// <summary>
+    /// Which of a family's files count as declaring the key, for the request being served.
+    /// </summary>
+    /// <remarks>
+    /// A key is declared once per culture and once per portal override, and the difference between
+    /// a rename and a find-references is exactly which of those the caller means. A rename means
+    /// all of them: leaving a translation naming an entry that no longer exists is corruption. A
+    /// find-references means none of them but the original — the translations are other spellings
+    /// of the same string, not places that use it, and listing them buried the handful of real call
+    /// sites under a list of every language the product ships in.
+    /// </remarks>
+    internal enum DeclarationScope
+    {
+        /// <summary>Every culture and every override — what a rename has to rewrite.</summary>
+        EveryFile,
+
+        /// <summary>The neutral file alone: the one entry a reader would call the definition.</summary>
+        NeutralOnly,
+
+        /// <summary>Call sites only.</summary>
+        None,
+    }
+
+    private static IEnumerable<ResourceFileIndex> DeclaringFiles(
+        ResourceFamily family, DeclarationScope scope) => scope switch
+    {
+        DeclarationScope.None => [],
+
+        // Nothing when the original is not on disk: a family of translations with no neutral file
+        // has no definition to point at, and any one of them standing in for it would be a guess.
+        DeclarationScope.NeutralOnly => family.Neutral is { } neutral ? [neutral] : [],
+
+        _ => family.Files,
+    };
+
+    /// <summary>The <c>name=</c> attribute in the files of every family that declare the key.</summary>
+    private static bool Declarations(
+        ResourceKeyTarget target, Action<ResourceKeySite> add, DeclarationScope scope)
     {
         bool complete = true;
 
         foreach (var family in target.Families)
         {
-            foreach (var file in family.Files)
+            foreach (var file in DeclaringFiles(family, scope))
             {
                 if (ResourceCatalogService.Text(file.FilePath) is not { } text)
                 {

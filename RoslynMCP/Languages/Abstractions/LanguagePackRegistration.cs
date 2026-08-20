@@ -4,6 +4,7 @@ using RoslynMCP.Languages.AppSettings;
 using RoslynMCP.Languages.Dbml;
 using RoslynMCP.Languages.DotSettings;
 using RoslynMCP.Languages.DotSettings.Core;
+using RoslynMCP.Languages.Formatting;
 using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Mediator;
 using RoslynMCP.Languages.MsBuild;
@@ -49,6 +50,14 @@ internal static class LanguagePackRegistration
             packs.Add(new ResourcesLanguage(settings));
         if (settings.Logging.Enabled)
             packs.Add(new LoggingLanguage(settings));
+
+        // After the logging pack, and it has to stay there. Both claim string literals from the
+        // call around them, the first claim wins, and NLog spells its template parameter `format`
+        // — which is also what makes a string composite. A logging template read as a composite
+        // string would lose the binding to the values, which is the only thing worth saying about
+        // one.
+        if (settings.Formatting)
+            packs.Add(new FormattingLanguage());
         if (settings.ValueSets.Enabled)
             packs.Add(new ValuesLanguage(settings));
         if (settings.MsBuild)
@@ -85,6 +94,10 @@ internal static class LanguagePackRegistration
             AddPack<ResourcesLanguage>(services);
         if (settings.Logging.Enabled)
             AddPack<LoggingLanguage>(services);
+
+        // After the logging pack — see Create for why the order is load-bearing.
+        if (settings.Formatting)
+            AddPack<FormattingLanguage>(services);
         if (settings.ValueSets.Enabled)
             AddPack<ValuesLanguage>(services);
         if (settings.MsBuild)

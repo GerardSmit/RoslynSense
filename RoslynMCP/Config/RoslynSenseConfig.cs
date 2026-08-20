@@ -57,6 +57,7 @@ public sealed class ToolsConfig
     public bool WebConfig { get; init; } = true;
     public bool DotSettings { get; init; } = true;
     public bool Logging { get; init; } = true;
+    public bool Formatting { get; init; } = true;
     public bool ValueSets { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;

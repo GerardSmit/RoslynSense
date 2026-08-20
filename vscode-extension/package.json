@@ -1318,6 +1318,11 @@
           "default": true,
           "markdownDescription": "Language features for structured logging message templates \u2014 Microsoft.Extensions.Logging, Serilog and NLog. Colours each `{Placeholder}`, completes it from the values the call passes, explains on hover which value it actually prints, and warns when the template and the values disagree or an exception is passed as a value instead of as the first argument. Off leaves the template as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
+        "roslynSense.languages.formatting": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for composite format strings — `string.Format(\"{0:dd-MM-yyyy}\", …)`, an interpolation's `$\"{value:yyyyMMdd}\"`, and the markup attributes listed under `webForms.dataExpressions`. Colours each component of a specifier a different colour, so `dd-MM-yyyy` and `dd-mm-yyyy` no longer look alike, explains on hover what a component prints with a worked example, and completes the components from the type of the value being formatted. Off leaves the specifier as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
         "roslynSense.languages.valuesets": {
           "type": "boolean",
           "default": true,

@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Languages.Formatting;
 using RoslynMCP.Languages.WebForms.Core;
 using WebFormsCore;
 using WebFormsCore.Nodes;
@@ -54,7 +55,7 @@ internal static class AspxCompletionHandler
             AspxContextKind.Code => await CodeAsync(document, offset, trigger, cache, ct),
             AspxContextKind.TagName => TagNames(document, context),
             AspxContextKind.AttributeName => AttributeNames(document, context),
-            AspxContextKind.AttributeValue => await AttributeValuesAsync(document, context, ct),
+            AspxContextKind.AttributeValue => await AttributeValuesAsync(document, context, offset, ct),
             AspxContextKind.Directive => DirectiveAttributes(document, context),
             _ => Empty,
         };
@@ -271,8 +272,14 @@ internal static class AspxCompletionHandler
     /// control's own type is consulted — nothing on the control binds it.
     /// </summary>
     private static async Task<CompletionList> AttributeValuesAsync(
-        AspxDocument document, AspxCompletionContext context, CancellationToken ct)
+        AspxDocument document, AspxCompletionContext context, int offset, CancellationToken ct)
     {
+        // Ahead of everything else: a configured format attribute is an ordinary string property
+        // on the control, so the branch below would resolve it, find no enum behind it and offer
+        // nothing — which is exactly the caret where the components are worth having.
+        if (await FormatComponentsAsync(document, offset, ct) is { } components)
+            return components;
+
         if (context.AttributeName is { Length: > 0 } name
             && AspxSymbolResolver.IsImplicitKeyAttribute(name))
         {
@@ -335,6 +342,63 @@ internal static class AspxCompletionHandler
             .ToArray();
 
         return items.Length == 0 ? Empty : new CompletionList(false, items);
+    }
+
+    /// <summary>
+    /// The specifier components, for a caret inside a configured format attribute.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Null rather than empty when the caret is somewhere else, so the ordinary attribute-value
+    /// list still answers. Inside the specifier and nowhere else: a caret on the index of
+    /// <c>{0:…}</c> is choosing which value to print, and the components would be the wrong list.
+    /// </para>
+    /// <para>
+    /// The replace span is the component run under the caret rather than the whole value, which is
+    /// what makes retyping half of one work — <c>dd-M|M</c> replaces the <c>MM</c> and leaves the
+    /// rest of the date alone. The attribute-wide span the scanner computes would delete it.
+    /// </para>
+    /// </remarks>
+    private static async Task<CompletionList?> FormatComponentsAsync(
+        AspxDocument document, int offset, CancellationToken ct)
+    {
+        if (await MarkupFormatSites.AtAsync(document, offset, ct) is not { } format)
+            return null;
+
+        int inside = offset - format.Value.Start;
+
+        if (FormatString.HoleAt(FormatString.Holes(format.Text), inside) is not { } hole
+            || inside < hole.Specifier.Start || inside > hole.Specifier.End)
+        {
+            return null;
+        }
+
+        string specifier = format.Text[hole.Specifier.Start..hole.Specifier.End];
+        var parts = FormatString.Parts(specifier, format.Family);
+
+        var replaced = FormatString.PartAt(parts, inside - hole.Specifier.Start) is
+            { Kind: not (FormatPartKind.Literal or FormatPartKind.Escape) } run
+            ? new TextSpan(
+                format.Value.Start + hole.Specifier.Start + run.Span.Start, run.Span.Length)
+            : new TextSpan(offset, 0);
+
+        var range = AspxLanguageHandler.ToRange(document, replaced);
+        var items = new List<CompletionItem>();
+        int order = 0;
+
+        foreach (var component in FormatString.Components(format.Family))
+        {
+            string detail = FormatString.Example(component.Text, format.Family) is { } example
+                ? $"{component.Description} — {example}"
+                : component.Description;
+
+            items.Add(new CompletionItem(
+                component.Text, LspCompletionItemKind.EnumMember, detail,
+                order++.ToString("D2"), component.Text,
+                new TextEdit(range, component.Text)));
+        }
+
+        return new CompletionList(false, [.. items]);
     }
 
     private static CompletionItem Value(string text, Protocol.Range range) =>

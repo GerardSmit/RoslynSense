@@ -37,7 +37,7 @@ internal static class MarkupBindingSites
                     continue;
 
                 if (settings.For(element.Namespace?.Value, element.Name.Value, key.Value)
-                    is not { Kind: MarkupBindingKind.Member } binding)
+                    is not { } binding)
                 {
                     continue;
                 }
@@ -48,13 +48,35 @@ internal static class MarkupBindingSites
         }
     }
 
-    /// <summary>The site a caret sits in, or null when it sits in none.</summary>
-    public static MarkupBindingSite? At(AspxDocument document, int offset)
+    /// <summary>The site of the given kind a caret sits in, or null when it sits in none.</summary>
+    public static MarkupBindingSite? At(AspxDocument document, int offset, MarkupBindingKind kind)
     {
         foreach (var site in Enumerate(document))
         {
-            if (offset >= site.Value.Start && offset <= site.Value.End)
+            if (site.Binding.Kind == kind
+                && offset >= site.Value.Start && offset <= site.Value.End)
+            {
                 return site;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The span of a named attribute's value on an element, or null when it has none.
+    /// </summary>
+    /// <remarks>
+    /// Case-insensitively, as markup attributes are matched everywhere else, and by the name as
+    /// written rather than through the control's type — a format entry names its source attribute
+    /// the way the page spells it, and the vendor assembly a tag comes from may not resolve.
+    /// </remarks>
+    public static TextSpan? Attribute(AspxDocument document, ElementNode element, string name)
+    {
+        foreach (var (key, value) in element.RawAttributes)
+        {
+            if (key.Value.Equals(name, StringComparison.OrdinalIgnoreCase) && value.Value.Length > 0)
+                return ToSpan(document, value.Range);
         }
 
         return null;

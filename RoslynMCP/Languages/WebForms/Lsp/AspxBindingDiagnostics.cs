@@ -35,7 +35,9 @@ internal static class AspxBindingDiagnostics
         List<Protocol.Diagnostic>? found = null;
 
         var arguments = DataBindingService.AllArguments(document.Text)
-            .Concat(MarkupBindingSites.Enumerate(document).Select(site => site.Value));
+            .Concat(MarkupBindingSites.Enumerate(document)
+                .Where(site => site.Binding.Kind == MarkupBindingKind.Member)
+                .Select(site => site.Value));
 
         foreach (var argument in arguments)
         {

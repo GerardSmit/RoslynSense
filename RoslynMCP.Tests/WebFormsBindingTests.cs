@@ -304,6 +304,7 @@ public class WebFormsBindingTests
                 public string Customer { get; set; } = "";
                 public decimal Amount { get; set; }
                 public int Id;
+                public System.DateTime CompletedDate { get; set; }
 
                 public Client Buyer { get; set; } = new Client();
 
@@ -336,6 +337,9 @@ public class WebFormsBindingTests
 
     private static MarkupBinding Member(string tag, string attribute) =>
         new(tag, attribute, MarkupBindingKind.Member, Source: null);
+
+    private static MarkupBinding Format(string tag, string attribute, string? source = null) =>
+        new(tag, attribute, MarkupBindingKind.Format, source);
 
     /// <summary>
     /// A configured attribute reads exactly as an <c>Eval</c> argument does.
@@ -414,6 +418,187 @@ public class WebFormsBindingTests
             ItemCodeBehind);
 
         Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    // ---- Format strings --------------------------------------------------------------------
+
+    /// <summary>
+    /// The page holding a grid column that writes both halves: which member it shows, and how.
+    /// </summary>
+    private const string Column = """
+        <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+        <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+            <ItemTemplate>
+                <grid:Column runat="server" ID="col" DataField="{0}" DataFormatString="{1}" />
+            </ItemTemplate>
+        </asp:Repeater>
+        """;
+
+    /// <summary>
+    /// Hovering a component says what it prints, worked out rather than described.
+    /// </summary>
+    /// <remarks>
+    /// The question a specifier raises has always been the same one — what does this actually
+    /// produce? — and until now the only way to answer it was to request the page.
+    /// </remarks>
+    [Fact]
+    public async Task HoveringAFormatComponentWorksAnExample()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{0:dd-M|M-yyyy}"), ItemCodeBehind);
+
+        string? hover = await scenario.FormatHoverAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Month, two digits", hover, StringComparison.Ordinal);
+        Assert.Contains("`dd-MM-yyyy` → `27-03-2026`", hover, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The sibling attribute the entry names is what says which grammar the specifier is in.
+    /// </summary>
+    /// <remarks>
+    /// The whole reason <c>source</c> exists. <c>MM</c> is a two-digit month on a date and two
+    /// literal Ms on a decimal, and <c>N2</c> is a number pattern on a decimal and the letter N
+    /// followed by a 2 on a date — so without the sibling, half of every description would be
+    /// about a value the column does not hold.
+    /// </remarks>
+    [Fact]
+    public async Task TheSourceAttributeDecidesHowTheSpecifierReads()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "Amount", "{0:N|2}"), ItemCodeBehind);
+
+        string? hover = await scenario.FormatHoverAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Number, with thousands separators, 2 decimal places", hover, StringComparison.Ordinal);
+        Assert.Contains("`1,234.57`", hover, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An entry that named no source still reads the specifier, from what it contains.
+    /// </summary>
+    /// <remarks>
+    /// Standing down entirely would be the wrong trade: the components are the same characters
+    /// whatever the value is, and a date reading of a specifier holding date letters is right far
+    /// more often than it is not.
+    /// </remarks>
+    [Fact]
+    public async Task AFormatWithNoSourceIsStillRead()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{0:M|M-yyyy}"), ItemCodeBehind);
+
+        string? hover = await scenario.FormatHoverAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Month, two digits", hover, StringComparison.Ordinal);
+    }
+
+    /// <summary>Hovering the hole itself names the value the column formats.</summary>
+    [Fact]
+    public async Task HoveringTheHoleNamesWhatIsBeingFormatted()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{|0:dd-MM-yyyy}"), ItemCodeBehind);
+
+        string? hover = await scenario.FormatHoverAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("System.DateTime", hover, StringComparison.Ordinal);
+    }
+
+    /// <summary>An attribute nobody configured as a format string is not read as one.</summary>
+    [Fact]
+    public async Task AnUnconfiguredAttributeIsNotReadAsAFormat()
+    {
+        using var configured = new Configured(Format("grid:Column", "SomethingElse"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{0:dd-M|M-yyyy}"), ItemCodeBehind);
+
+        Assert.Null(await scenario.FormatHoverAsync());
+    }
+
+    /// <summary>
+    /// The components are coloured apart from one another.
+    /// </summary>
+    /// <remarks>
+    /// <c>dd-MM-yyyy</c> and <c>dd-mm-yyyy</c> are one keystroke apart, both look like a date, and
+    /// only one of them prints a month. Three different colours are what makes the pair visibly
+    /// different before anyone reads the letters.
+    /// </remarks>
+    [Fact]
+    public async Task AFormatStringIsColouredComponentByComponent()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{0:dd-MM-yyyy}") + "|", ItemCodeBehind);
+
+        var coloured = await scenario.FormatColoursAsync();
+
+        var used = new[] { "dd", "MM", "yyyy" }.Select(part => coloured[part]);
+        Assert.Equal(3, new HashSet<int>(used).Count);
+
+        // The literal text between them prints as itself, and the string colour already says so.
+        Assert.False(coloured.ContainsKey("-"));
+    }
+
+    /// <summary>
+    /// Completion inside the specifier offers the components, each with what it prints.
+    /// </summary>
+    /// <remarks>
+    /// The list is the documentation. Nobody remembers whether the month is <c>MM</c> or
+    /// <c>mm</c>, and the usual way that gets settled is by writing one and requesting the page.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionInsideASpecifierOffersTheComponents()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{0:dd-|}"), ItemCodeBehind);
+
+        var items = (await scenario.CompleteAsync()).Items;
+
+        Assert.Contains(items, item => item.Label == "MM" && item.Detail!.Contains("03"));
+        Assert.Contains(items, item => item.Label == "yyyy" && item.Detail!.Contains("2026"));
+    }
+
+    /// <summary>
+    /// A decimal column is offered digit placeholders rather than date components.
+    /// </summary>
+    /// <remarks>
+    /// Offering <c>dd</c> for a <c>decimal</c> would insert a specifier that prints its own
+    /// letters, which is the mistake the colouring exists to make visible.
+    /// </remarks>
+    [Fact]
+    public async Task CompletionFollowsTheSourcesType()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "Amount", "{0:|}"), ItemCodeBehind);
+
+        var labels = (await scenario.CompleteAsync()).Items.Select(item => item.Label).ToList();
+
+        Assert.Contains("N2", labels);
+        Assert.DoesNotContain("yyyy", labels);
+    }
+
+    /// <summary>A caret on the index is choosing a value, not a component.</summary>
+    [Fact]
+    public async Task CompletionOnTheIndexOffersNoComponents()
+    {
+        using var configured = new Configured(Format("grid:Column", "DataFormatString", "DataField"));
+        using var scenario = Scenario.Create(
+            string.Format(Column, "CompletedDate", "{|0:dd}"), ItemCodeBehind);
+
+        var labels = (await scenario.CompleteAsync()).Items.Select(item => item.Label).ToList();
+
+        Assert.DoesNotContain("MM", labels);
     }
 
     /// <summary>A tag of <c>*</c> claims the attribute wherever it is written.</summary>
@@ -1196,6 +1381,30 @@ public class WebFormsBindingTests
 
         public Task<RoslynMCP.Lsp.Protocol.Diagnostic[]> BindingDiagnosticsAsync() =>
             AspxBindingDiagnostics.DiagnosticsAsync(Document, default);
+
+        /// <summary>What hover says about the format string under the caret.</summary>
+        public async Task<string?> FormatHoverAsync() =>
+            (await AspxLanguageHandler.FormatHoverAsync(Document, Caret, default))?.Contents.Value;
+
+        /// <summary>
+        /// The coloured runs of the page's format strings, by the text each one covers.
+        /// </summary>
+        /// <remarks>
+        /// The colouring pass directly rather than through <c>SemanticTokensFullAsync</c>, which
+        /// starts by resolving a URI through the document service against the real workspace —
+        /// this scenario's document lives in an <c>AdhocWorkspace</c> the service never saw.
+        /// </remarks>
+        public async Task<Dictionary<string, int>> FormatColoursAsync()
+        {
+            var found = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            await WebFormsLanguage.ColourFormatStringsAsync(
+                Document,
+                (span, type) => found[Document.Text[span.Start..span.End]] = type,
+                default);
+
+            return found;
+        }
 
         /// <summary>
         /// What hover says about the binding segment under the caret, or null for no hover.

@@ -5,6 +5,7 @@ using Microsoft.CodeAnalysis.Rename;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Languages;
+using RoslynMCP.Languages.Formatting;
 using RoslynMCP.Languages.WebForms.Core;
 using WebFormsCore;
 using WebFormsCore.Models;
@@ -491,6 +492,12 @@ internal static class AspxLanguageHandler
                 new MarkupContent("markdown", bound),
                 ToRange(document, binding.Segment.Span));
         }
+
+        // `DataFormatString="{0:dd-MM-yyyy}"`. Not a symbol either, and for a sharper reason than
+        // the path above: the question a specifier raises is what it prints, which no amount of
+        // binding answers and which the reader currently has to request the page to find out.
+        if (await FormatHoverAsync(document, offset, ct) is { } formatted)
+            return formatted;
 
         if (hit is { Symbol: { } symbol })
         {
@@ -1000,6 +1007,48 @@ internal static class AspxLanguageHandler
         return $"`{itemType.ToDisplayString()}` has no member named `{segment.Name}`.";
     }
 
+    /// <summary>
+    /// Hover inside a configured format attribute: the component under the caret, or the whole
+    /// hole when the caret is on its literal text.
+    /// </summary>
+    /// <remarks>
+    /// The component is preferred because that is where the mistake lives. <c>dd-mm-yyyy</c> prints
+    /// the minute where the month belongs, and the caret is on the two characters that are wrong;
+    /// answering about the whole string would describe the specifier the reader believes they
+    /// wrote.
+    /// </remarks>
+    internal static async Task<Hover?> FormatHoverAsync(
+        AspxDocument document, int offset, CancellationToken ct)
+    {
+        if (await MarkupFormatSites.AtAsync(document, offset, ct) is not { } format)
+            return null;
+
+        int inside = offset - format.Value.Start;
+
+        if (FormatString.HoleAt(FormatString.Holes(format.Text), inside) is not { } hole)
+            return null;
+
+        string specifier = format.Text[hole.Specifier.Start..hole.Specifier.End];
+        var parts = FormatString.Parts(specifier, format.Family);
+
+        if (FormatString.PartAt(parts, inside - hole.Specifier.Start) is
+            { Kind: not (FormatPartKind.Literal or FormatPartKind.Escape) } part)
+        {
+            return new Hover(
+                new MarkupContent("markdown", FormatMarkdown.Component(part, specifier, format.Family)),
+                ToRange(document, new TextSpan(
+                    format.Value.Start + hole.Specifier.Start + part.Span.Start, part.Span.Length)));
+        }
+
+        string? source = format.Source is { } type
+            ? $"Formats a `{type.ToDisplayString()}`."
+            : null;
+
+        return new Hover(
+            new MarkupContent("markdown", FormatMarkdown.Hole(format.Text, hole, format.Family, source)),
+            ToRange(document, new TextSpan(format.Value.Start + hole.Span.Start, hole.Span.Length)));
+    }
+
     internal static async Task<ISymbol?> DataBoundMemberAsync(
         AspxDocument document, int offset, CancellationToken ct) =>
         (await DataBoundSegmentAsync(document, offset, ct))?.Segment.Symbol;
@@ -1020,7 +1069,7 @@ internal static class AspxLanguageHandler
         // SortExpression or DataField, which name a member of the bound item exactly as Eval does
         // and are just as invisible to the compiler.
         if ((DataBindingService.ArgumentAt(document.Text, offset)
-                ?? MarkupBindingSites.At(document, offset)?.Value) is not { } argument)
+                ?? MarkupBindingSites.At(document, offset, MarkupBindingKind.Member)?.Value) is not { } argument)
         {
             return null;
         }

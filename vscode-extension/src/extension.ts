@@ -1,4 +1,4 @@
-﻿import * as vscode from 'vscode';
+import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -196,6 +196,13 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         // selector already covers it; this row exists only to carry the id into
         // `serverSettings().languages`.
         id: 'logging',
+        extensions: [],
+        breakpoints: false,
+    },
+    {
+        // Nor this one. A composite format string and an interpolation's format clause are both
+        // inside C#, and the markup half rides the WebForms selector.
+        id: 'formatting',
         extensions: [],
         breakpoints: false,
     },

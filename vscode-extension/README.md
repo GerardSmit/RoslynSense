@@ -196,6 +196,51 @@ The language features are the same ones C# gets, resolved against the markup's o
   like, so a control whose type does not resolve reads differently from one that does, and a
   recognised property reads differently from an attribute nobody claims.
 
+### Data expressions in markup
+
+`Eval("Buyer.Name")` is a string the runtime reflects over, so a misspelling in it is not a build
+error, not a test failure, and not anything at all until the page renders — where it throws at the
+visitor rather than at whoever wrote it. RoslynSense resolves the path against the bound item, which
+comes from an ancestor's `ItemType` or from a `DataSource` traced through the code-behind:
+
+- **Hover** on a segment describes the property it names, not the string it sits in.
+- **F12** goes to that property.
+- **Colour** marks the segments that resolve, so the one that does not stands out.
+- **`WFB0001`**, a warning, names the member the item type does not have. Silent when the item type
+  is unknown, and only the segment that broke the path is reported.
+
+Control libraries carry the same idea in attributes — a grid column's `SortExpression` and
+`DataField` hold a member path, and its `DataFormatString` holds a composite format string. Which
+attributes those are comes from the library rather than from the framework, so **nothing is read
+this way until it is listed**:
+
+```json
+{
+  "webForms": {
+    "dataExpressions": [
+      { "tag": "grid:GridBoundColumn", "attribute": "DataField" },
+      { "tag": "grid:GridBoundColumn", "attribute": "SortExpression" },
+      {
+        "tag": "grid:GridBoundColumn",
+        "attribute": "DataFormatString",
+        "kind": "format",
+        "source": "DataField"
+      }
+    ]
+  }
+}
+```
+
+`tag` is the tag as written — or `*` for any — matched on the spelling rather than on the control's
+type, so it keeps working in a site whose vendor assembly does not resolve. `kind` is `member` (the
+default) or `format`. A `format` entry's `source` names the **sibling attribute** holding the value
+being formatted: the column's `DataField` is resolved against the bound item, and its type is what
+tells `{0:MM}` whether `MM` is a two-digit month or two literal Ms. See
+[Format strings](#format-strings) for what that buys.
+
+The registry ships empty on purpose. `SortExpression` holds a member path on one vendor's grid and a
+SQL fragment on another's, so a guess would turn every use of it into a warning.
+
 ### Generating event handlers
 
 Typing `OnClick="` offers the name the designer would have used (`btnSave_Click`) at the top of
@@ -339,6 +384,61 @@ there are no properties to name and nothing to explain.
 
 `roslynSense.languages.logging` turns it off for one window; `--no-logging` (or
 `"tools": { "logging": false }`) turns it off for the daemon, AI sessions included.
+
+## Format strings
+
+`dd-MM-yyyy` and `dd-mm-yyyy` are one keystroke apart. Both are valid, both look like a date, and the
+second prints the minute where the month belongs — every month, until someone notices. The specifier
+is handed to the value's own `ToString` at run time, so no compiler has ever had an opinion about it.
+
+- **Colour.** Every component of a specifier gets its own colour, using C#'s existing token names so
+  the theme you already have distinguishes them. A day, a month and a year are three colours; so are
+  an hour, a minute and a second. The literal text between them keeps the string's colour, because
+  that is what it prints as.
+- **Hover** on a component says what it produces and works an example:
+
+  > **MM** — Month, two digits
+  >
+  > Prints `03`.
+  >
+  > `dd-MM-yyyy` → `27-03-2026`
+  >
+  > | | |
+  > |---|---|
+  > | `dd` | Day of the month, two digits |
+  > | `MM` | Month, two digits |
+  > | `yyyy` | Year, four digits |
+
+  Hovering the hole instead names the value it prints — `The 2nd value passed to String.Format —
+  matched by position, not by name` — which is the arithmetic nobody does, and the reason
+  `string.Format("{0:dd-MM-yyyy}", name, date)` compiles, runs and prints a name.
+- **Completion** inside a specifier offers the components with their rendered output beside them, so
+  "is the month `MM` or `mm`" is answered where it is asked rather than by requesting the page.
+
+Everything reads the same grammar in every place a format string is written:
+
+```csharp
+string.Format("Completed {0:dd-MM-yyyy} by {1}", order.CompletedDate, user)
+$"{DateTime.Now:yyyyMMdd}"
+order.CompletedDate.ToString("HH:mm:ss")
+DateTime.ParseExact(text, "yyyyMMdd", CultureInfo.InvariantCulture)
+```
+
+```xml
+<grid:GridBoundColumn DataField="CompletedDate" DataFormatString="{0:dd-MM-yyyy HH:mm}" />
+```
+
+The **type of the value decides how the specifier reads**, because the same characters mean
+different things: `MM` is a two-digit month on a `DateTime` and two literal Ms on a `decimal`, and
+`N2` is a thousands-separated number on a `decimal` and the letter N followed by a 2 on a date. In
+C# the value is beside the specifier and costs nothing to find. In markup it is named by a sibling
+attribute, which is what `source` in [`webForms.dataExpressions`](#data-expressions-in-markup) is
+for — a `decimal` column is then offered `#,##0.00` and `N2` where a `DateTime` column is offered
+`dd` and `yyyy`. Where nothing said, the specifier is read from what it contains and the components
+are still coloured.
+
+`roslynSense.languages.formatting` turns it off for one window; `--no-formatting` (or
+`"tools": { "formatting": false }`) turns it off for the daemon, AI sessions included.
 
 ## Value sets
 

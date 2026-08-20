@@ -42,6 +42,10 @@ public sealed record EffectiveSettings(
     /// same reason as <see cref="Resources"/>.</summary>
     internal ValueSettings ValueSets { get; init; } = ValueSettings.Disabled;
 
+    /// <summary>The format-string pack's gate. Init-only for the same reason as
+    /// <see cref="Resources"/>.</summary>
+    internal bool Formatting { get; init; } = true;
+
     /// <summary>Which markup attributes are read as data expressions. Init-only for the same
     /// reason as <see cref="Resources"/>.</summary>
     internal MarkupBindingSettings MarkupBindings { get; init; } = MarkupBindingSettings.None;
@@ -127,6 +131,7 @@ public sealed record EffectiveSettings(
             !HasFlag("--no-logging") && tools.Logging, config?.Logging);
         var valueSets = ValueSettings.Resolve(
             !HasFlag("--no-valuesets") && tools.ValueSets, config?.ValueSets, warnings);
+        bool formatting = !HasFlag("--no-formatting") && tools.Formatting;
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -190,6 +195,7 @@ public sealed record EffectiveSettings(
             DotSettings = dotSettings,
             Logging = logging,
             ValueSets = valueSets,
+            Formatting = formatting,
             MarkupBindings = markupBindings,
         };
     }

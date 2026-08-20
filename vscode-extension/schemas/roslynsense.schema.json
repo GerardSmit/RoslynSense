@@ -66,6 +66,11 @@
           "title": "Logging templates",
           "description": "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."
         },
+        "formatting": {
+          "type": "boolean",
+          "title": "Format strings",
+          "description": "The `{0:dd-MM-yyyy}` of a composite format string and the `yyyyMMdd` of an interpolation, coloured a component at a time and hovered with a worked example."
+        },
         "valueSets": {
           "type": "boolean",
           "title": "Value sets",

@@ -60,6 +60,7 @@ public static class ConfigSchema
             ["tools.webConfig"] = ("web.config", "`<appSettings>` and `<connectionStrings>` joined to the C# and markup that read them."),
             ["tools.dotSettings"] = ("ReSharper settings", "Whether a committed `.DotSettings` narrows inferred namespaces, search results and coverage."),
             ["tools.logging"] = ("Logging templates", "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."),
+            ["tools.formatting"] = ("Format strings", "The `{0:dd-MM-yyyy}` of a composite format string and the `yyyyMMdd` of an interpolation, coloured a component at a time and hovered with a worked example."),
             ["tools.valueSets"] = ("Value sets", "Strings that have to be one of a known set of values — a status code from a lookup table, most often. Completion, hover and a diagnostic wherever one is written."),
             ["tools.debugger"] = ("Debugger", "Launch, breakpoints, stepping and evaluation."),
             ["tools.profiling"] = ("Profiling", "CPU sampling, memory snapshots and coverage."),

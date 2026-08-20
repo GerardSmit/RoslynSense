@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Languages.Formatting;
 using RoslynMCP.Languages.WebForms.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
@@ -104,6 +105,7 @@ internal sealed partial class WebFormsLanguage : ILanguageSemanticTokensProvider
         }
 
         await ColourBindingPathsAsync(document, Add, property, unknownControl, ct);
+        await ColourFormatStringsAsync(document, Add, ct);
 
         return Encode(tokens);
 
@@ -163,6 +165,42 @@ internal sealed partial class WebFormsLanguage : ILanguageSemanticTokensProvider
                     continue;
 
                 add(segment.Span, segment.Symbol is null ? unknown : property);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Colours the components of every configured format attribute: the day, the month and the
+    /// year each their own colour.
+    /// </summary>
+    /// <remarks>
+    /// The markup half of <see cref="FormatColours"/>, reading the same table the C# side reads so
+    /// that <c>DataFormatString="{0:dd-MM-yyyy}"</c> in a page and <c>$"{value:dd-MM-yyyy}"</c> in
+    /// the code behind it look the same. Nothing happens until an attribute is configured as a
+    /// format string, so a solution that has listed none pays a dictionary lookup per page.
+    /// </remarks>
+    internal static async Task ColourFormatStringsAsync(
+        AspxDocument document, Action<TextSpan, int> add, CancellationToken ct)
+    {
+        foreach (var format in await MarkupFormatSites.EnumerateAsync(document, ct))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            foreach (var hole in FormatString.Holes(format.Text))
+            {
+                string specifier = format.Text[hole.Specifier.Start..hole.Specifier.End];
+
+                foreach (var part in FormatString.Parts(specifier, format.Family))
+                {
+                    if (FormatColours.For(part.Kind) is not { } colour)
+                        continue;
+
+                    add(
+                        new TextSpan(
+                            format.Value.Start + hole.Specifier.Start + part.Span.Start,
+                            part.Span.Length),
+                        LanguageSession.SharedTokenType(colour));
+                }
             }
         }
     }

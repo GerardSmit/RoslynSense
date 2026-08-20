@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using RoslynMCP.Config;
 using Xunit;
 
@@ -35,9 +35,9 @@ public class ConfigSchemaTests
     }
 
     /// <summary>
-    /// Every setting a person can reach from the settings page needs a label and a sentence.
-    /// Properties of the objects inside an array are exempt: those are the raw resource-lookup
-    /// escape hatch, which the settings page sends to the JSON file rather than rendering.
+    /// Every field a person can reach from the settings page needs a label and a sentence — the
+    /// fields inside a list item included, since those are the ones the page used to render as bare
+    /// property names with nothing to explain them.
     /// </summary>
     [Fact]
     public void EverySettingHasATitleAndADescription()
@@ -61,6 +61,9 @@ public class ConfigSchemaTests
 
     private static void Walk(JsonObject node, string path, List<string> missing)
     {
+        if (node["items"] is JsonObject item)
+            Walk(item, path + "[]", missing);
+
         if (node["properties"] is not JsonObject properties)
             return;
 
@@ -71,6 +74,8 @@ public class ConfigSchemaTests
 
             string childPath = path.Length == 0 ? name : $"{path}.{name}";
 
+            // A list of plain strings has an element with nothing on it to describe; the list
+            // itself carries the sentence.
             if (childObject["title"] is null || childObject["description"] is null)
                 missing.Add(childPath);
 
@@ -80,6 +85,12 @@ public class ConfigSchemaTests
 
     private static void Collect(JsonObject node, string path, HashSet<string> into)
     {
+        if (node["items"] is JsonObject item)
+        {
+            into.Add(path + "[]");
+            Collect(item, path + "[]", into);
+        }
+
         if (node["properties"] is not JsonObject properties)
             return;
 

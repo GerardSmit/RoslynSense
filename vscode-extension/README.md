@@ -1,4 +1,4 @@
-# RoslynSense for VSCode
+﻿# RoslynSense for VSCode
 
 C# language support (go to definition, references, hover, rename, diagnostics, completion,
 code actions, formatting) served by the **RoslynSense shared daemon** — the same process and
@@ -350,6 +350,17 @@ The form is generated from the schema the server emits, so new settings appear w
 being taught about them, and the same schema is registered for `roslynsense.json` and
 `roslynsense.local.json` — hand-editing gets completion and validation too. Writes are surgical:
 comments, key order and indentation survive being touched from a form.
+
+A setting that names a method in your code — a resource lookup's class, member and signature — is
+one editor over all of it rather than a text box each. It asks the solution as you type: the class
+and member names complete from the compilation, the overloads the signature selects are listed
+against the ones it merely shares a name with, and the parameter carrying the key is a click rather
+than a comma count. That is worth the machinery because a wrong class, a misspelled member and a
+signature matching no overload all look exactly like a correct entry — they bind nothing, quietly,
+and the only symptom is a feature that does not work. Settings whose valid values depend on the
+solution, such as a lookup's fallback conventions, are a checklist of what this solution actually
+defines. Both are declared in the schema (`x-shape`, `x-choices`), so the next setting naming a
+method gets the same editor without the panel learning anything new.
 
 ## Building the extension
 

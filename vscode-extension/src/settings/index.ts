@@ -1,4 +1,5 @@
-import * as vscode from 'vscode';
+﻿import * as vscode from 'vscode';
+import type { LanguageClient } from 'vscode-languageclient/node';
 import { wire } from './host';
 
 /**
@@ -15,7 +16,10 @@ import { wire } from './host';
 
 const VIEW_TYPE = 'roslynSense.settings';
 
-export function registerSettingsPanel(context: vscode.ExtensionContext): void {
+export function registerSettingsPanel(
+    context: vscode.ExtensionContext,
+    getClient: () => LanguageClient | undefined = () => undefined
+): void {
     let panel: vscode.WebviewPanel | undefined;
 
     context.subscriptions.push(
@@ -24,12 +28,12 @@ export function registerSettingsPanel(context: vscode.ExtensionContext): void {
                 panel.reveal();
                 return;
             }
-            panel = createPanel(context, () => (panel = undefined));
+            panel = createPanel(context, () => (panel = undefined), getClient);
         }),
         vscode.window.registerWebviewPanelSerializer(VIEW_TYPE, {
             async deserializeWebviewPanel(restored) {
                 panel = restored;
-                wire(context, restored, () => (panel = undefined));
+                wire(context, restored, () => (panel = undefined), getClient);
             },
         })
     );
@@ -37,7 +41,8 @@ export function registerSettingsPanel(context: vscode.ExtensionContext): void {
 
 function createPanel(
     context: vscode.ExtensionContext,
-    onDispose: () => void
+    onDispose: () => void,
+    getClient: () => LanguageClient | undefined
 ): vscode.WebviewPanel {
     const panel = vscode.window.createWebviewPanel(
         VIEW_TYPE,
@@ -51,6 +56,6 @@ function createPanel(
             ],
         }
     );
-    wire(context, panel, onDispose);
+    wire(context, panel, onDispose, getClient);
     return panel;
 }

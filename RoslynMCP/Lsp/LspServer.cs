@@ -640,6 +640,16 @@ internal sealed class LspServer : IDisposable
     public Task<ResolveMetadataResult?> ResolveMetadataTarget(ResolveMetadataParams p, CancellationToken ct) =>
         Handlers.SearchEverywhereHandler.ResolveMetadataAsync(p, ct);
 
+    // ---- Settings page ------------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/settingChoices", UseSingleObjectParameterDeserialization = true)]
+    public SettingChoicesResult SettingChoices(SettingChoicesParams p) =>
+        Handlers.SettingsAssistHandler.Choices(p);
+
+    [JsonRpcMethod("roslynSense/memberShape", UseSingleObjectParameterDeserialization = true)]
+    public Task<MemberShapeResult> MemberShape(MemberShapeParams p, CancellationToken ct) =>
+        Handlers.SettingsAssistHandler.MemberShapeAsync(p, ct);
+
     [JsonRpcMethod("roslynSense/editorContext", UseSingleObjectParameterDeserialization = true)]
     public void EditorContext(Handlers.EditorContextParams p) =>
         Handlers.EditorContextHandler.Report(p);

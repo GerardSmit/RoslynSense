@@ -109,7 +109,13 @@
             "null"
           ],
           "title": "Preset",
-          "description": "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting."
+          "description": "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting.",
+          "enum": [
+            "webforms",
+            "dnn",
+            "dotnet",
+            "none"
+          ]
         },
         "include": {
           "type": [
@@ -151,20 +157,26 @@
             ],
             "properties": {
               "pattern": {
-                "type": "string"
+                "type": "string",
+                "title": "Segment",
+                "description": "The segment as it appears in the file name, `*` allowed — DNN's `Host` and `Portal-*`."
               },
               "rank": {
                 "type": [
                   "string",
                   "integer"
                 ],
-                "pattern": "^-?(?:0|[1-9]\\d*)$"
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Wins over",
+                "description": "Higher wins. The uncustomized file is 0, so `Host` is 1 and `Portal-*` is 2. Explicit because sorting `Portal-*` and `Host` alphabetically gets the precedence backwards."
               }
             },
             "required": [
               "pattern",
               "rank"
-            ]
+            ],
+            "title": "Override",
+            "description": "One customization segment and how strongly it wins."
           },
           "title": "Overrides",
           "description": "Customization segments beside a base file, such as DNN's `Portal-*`. Replaces the preset's set rather than adding to it."
@@ -184,25 +196,33 @@
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Name",
+                "description": "What a lookup's Fallbacks refers to this by. Reusing the name of a built-in convention replaces it and leaves the rest alone."
               },
               "siblingFolder": {
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Folder beside the file",
+                "description": "Looked for next to the calling file — `App_LocalResources`. Use this or Folder at the project root, not both."
               },
               "rootFolder": {
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Folder at the project root",
+                "description": "Looked for from the project root down — `App_GlobalResources`."
               },
               "fixedName": {
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Always this file",
+                "description": "One file name every call site shares, such as `SharedResources`. Leave empty to name the file after the calling file."
               },
               "suffix": {
                 "type": [
@@ -214,9 +234,13 @@
                     "string",
                     "null"
                   ]
-                }
+                },
+                "title": "File endings",
+                "description": "What the resx name ends with. `.ascx.resx` for a user control's local file; defaults to `.resx`."
               }
-            }
+            },
+            "title": "Convention",
+            "description": "One way of getting from a call site to the resx file it reads."
           },
           "title": "Conventions",
           "description": "Named ways of turning a call-site file into a resx base name. Merged into the preset's by id."
@@ -236,13 +260,17 @@
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the method — `DotNetNuke.Services.Localization.Localization`. Leave empty to match the method on any class, which is the escape hatch for a codebase where each module wraps localization in its own helper."
               },
               "methodName": {
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Method",
+                "description": "The method name, or `Item` for an indexer."
               },
               "parameterTypes": {
                 "type": [
@@ -254,25 +282,48 @@
                     "string",
                     "null"
                   ]
-                }
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload — which is wrong wherever overloads disagree about where the file name sits."
               },
               "keyIndex": {
                 "type": [
                   "string",
                   "integer"
                 ],
-                "pattern": "^-?(?:0|[1-9]\\d*)$"
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Key is parameter",
+                "description": "Which parameter carries the resource key, counted from 0."
               },
               "rootSource": {
                 "type": [
                   "string",
                   "null"
+                ],
+                "title": "File name comes from",
+                "description": "Where the call site says which resx file to read.",
+                "enum": [
+                  "argument",
+                  "typeArgument",
+                  "containingType",
+                  "containingFile",
+                  "constant",
+                  "none"
                 ]
               },
               "rootInterpretation": {
                 "type": [
                   "string",
                   "null"
+                ],
+                "title": "Read that as",
+                "description": "What kind of name that value is, which decides how it becomes a resx file.",
+                "enum": [
+                  "virtualPath",
+                  "globalClassName",
+                  "typeName",
+                  "relativePath",
+                  "baseName"
                 ]
               },
               "rootIndex": {
@@ -280,19 +331,25 @@
                   "string",
                   "integer"
                 ],
-                "pattern": "^-?(?:0|[1-9]\\d*)$"
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "File name is parameter",
+                "description": "Which parameter carries it, counted from 0. Only used when the file name comes from an argument."
               },
               "rootConstant": {
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Fixed name",
+                "description": "The file name itself, for a helper that always reads one file. Only used when the file name is fixed."
               },
               "defaultKeySuffix": {
                 "type": [
                   "string",
                   "null"
-                ]
+                ],
+                "title": "Add to keys without a dot",
+                "description": "Appended to a key that contains no `.` — DNN's `.Text`, so `GetString(\"Submit\")` reads `Submit.Text`."
               },
               "fallbacks": {
                 "type": [
@@ -304,7 +361,22 @@
                     "string",
                     "null"
                   ]
-                }
+                },
+                "title": "Then also look in",
+                "description": "Tried in order when the key is not in the first file. The list is what the preset defines plus any convention this file adds.",
+                "x-choices": "server"
+              }
+            },
+            "title": "Lookup",
+            "description": "One method that takes a resource key, and where the file it reads comes from.",
+            "x-shape": {
+              "kind": "member",
+              "type": "containingType",
+              "member": "methodName",
+              "parameters": "parameterTypes",
+              "positions": {
+                "keyIndex": "key",
+                "rootIndex": "file name"
               }
             }
           },
@@ -418,7 +490,11 @@
         "null"
       ],
       "title": "Table format",
-      "description": "How tabular tool output is rendered: `markdown` (default) or `toon`."
+      "description": "How tabular tool output is rendered: `markdown` (default) or `toon`.",
+      "enum": [
+        "markdown",
+        "toon"
+      ]
     },
     "preload": {
       "type": [

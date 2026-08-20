@@ -1,4 +1,4 @@
-/*
+﻿/*
  * The settings panel. Every colour is a VS Code theme variable, so the page follows the editor
  * into whatever theme it is wearing rather than approximating one.
  */
@@ -287,9 +287,116 @@ main {
     box-sizing: border-box;
 }
 
+/* The sentence under a field, same relationship as .setting-description to its row. */
+.item-help {
+    grid-column: 2;
+    margin: 0 0 2px;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.item legend {
+    padding: 0 4px;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
 .item-actions {
     margin-top: 4px;
     text-align: right;
+}
+
+/* ---------------------------------------------------------------------------
+ * Choosing several of what the solution offers
+ * ------------------------------------------------------------------------- */
+
+.choice-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.choice {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    font-family: var(--vscode-font-family);
+    font-size: 1em;
+    color: var(--vscode-foreground);
+}
+
+.choice input[type='checkbox'] {
+    margin: 0;
+}
+
+.choice-detail {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+/* ---------------------------------------------------------------------------
+ * Naming a call shape
+ * ------------------------------------------------------------------------- */
+
+.shape {
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/* What the entry currently selects — the one thing five text boxes could never say. */
+.shape-status {
+    grid-column: 2;
+    margin: 2px 0 4px 150px;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.shape-status.warn {
+    color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
+}
+
+.shape-overloads {
+    margin: 0 0 6px 150px;
+}
+
+.overload {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+    overflow-wrap: anywhere;
+}
+
+/* The ones the signature selects, against the ones it merely shares a name with. */
+.overload.matched {
+    color: var(--vscode-foreground);
+}
+
+.chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.chip {
+    padding: 2px 8px;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.chip:hover {
+    background: color-mix(in srgb, var(--vscode-foreground) 8%, var(--vscode-input-background));
+}
+
+.chip.picked {
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    border-color: var(--vscode-button-background);
 }
 
 .linklike.remove {
@@ -379,5 +486,19 @@ textarea::placeholder {
     .setting-control {
         justify-self: start;
         margin-top: 4px;
+    }
+
+    .item-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .item-help,
+    .shape-status {
+        grid-column: 1;
+        margin-left: 0;
+    }
+
+    .shape-overloads {
+        margin-left: 0;
     }
 }

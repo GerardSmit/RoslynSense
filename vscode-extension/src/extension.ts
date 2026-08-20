@@ -1,4 +1,4 @@
-import * as vscode from 'vscode';
+﻿import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -3136,7 +3136,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerVirtualDocuments(context, () => client);
     registerEmbeddedLanguages(context);
     registerSearchEverywhere(context, () => client);
-    registerSettingsPanel(context);
+    registerSettingsPanel(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
     registerHotReload(context, () => client);

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * The settings panel's message contract. Shared by the extension host and the webview script,
  * which are compiled separately and can only agree through this file.
  */
@@ -56,7 +56,50 @@ declare namespace SettingsMsg {
         readonly results: Readonly<Record<string, ConnectionPreview>>;
     }
 
-    type ToView = State | ConnectionCompletions | ConnectionsResolved;
+    /** One value a setting can take here, with a short note on what it means. */
+    interface Choice {
+        readonly value: string;
+        readonly detail?: string;
+    }
+
+    /**
+     * The values a setting can currently take. Answered by the server, because the list is a fact
+     * about the solution rather than about the schema.
+     */
+    interface SettingChoices {
+        readonly type: 'settingChoices';
+        /** Echoed back so an answer that arrives after the form re-rendered is dropped. */
+        readonly token: number;
+        readonly items: readonly Choice[];
+    }
+
+    interface ShapeParameter {
+        readonly name: string;
+        readonly type: string;
+    }
+
+    /** One overload the configured class and member select. */
+    interface ShapeMatch {
+        readonly declaredBy: string;
+        readonly name: string;
+        readonly signature: string;
+        readonly parameters: readonly ShapeParameter[];
+        /** Whether the configured parameter list selects this one. */
+        readonly matched: boolean;
+    }
+
+    /** What a class/member/signature triple resolves to in the loaded solution. */
+    interface MemberShape {
+        readonly type: 'memberShape';
+        readonly token: number;
+        readonly typeSuggestions: readonly string[];
+        readonly memberSuggestions: readonly string[];
+        readonly matches: readonly ShapeMatch[];
+        readonly resolvedType?: string;
+        readonly problem?: string;
+    }
+
+    type ToView = State | ConnectionCompletions | ConnectionsResolved | SettingChoices | MemberShape;
 
     /** Write one setting into the selected scope. `value: null` unsets it. */
     interface SetSetting {
@@ -90,5 +133,29 @@ declare namespace SettingsMsg {
         readonly values: readonly string[];
     }
 
-    type ToHost = SetSetting | SelectScope | OpenFile | CompleteConnection | ResolveConnections;
+    /** Ask what values a setting can take, for the solution as the page currently has it. */
+    interface AskChoices {
+        readonly type: 'askChoices';
+        readonly token: number;
+        /** The dotted path with item markers — `resources.lookups[].fallbacks`. */
+        readonly path: string;
+    }
+
+    /** Ask what a class/member/signature triple selects. */
+    interface AskMemberShape {
+        readonly type: 'askMemberShape';
+        readonly token: number;
+        readonly containingType?: string;
+        readonly memberName?: string;
+        readonly parameterTypes?: readonly string[];
+    }
+
+    type ToHost =
+        | SetSetting
+        | SelectScope
+        | OpenFile
+        | CompleteConnection
+        | ResolveConnections
+        | AskChoices
+        | AskMemberShape;
 }

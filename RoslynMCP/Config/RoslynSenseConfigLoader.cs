@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -20,6 +20,13 @@ public static class RoslynSenseConfigLoader
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
+
+    /// <summary>
+    /// The reader a layer is parsed with. Public so that anything reading a fragment of the same
+    /// file — the settings page asking what a half-written section would resolve to — reads it
+    /// under the same rules rather than a stricter set of its own.
+    /// </summary>
+    public static JsonSerializerOptions SerializerOptions => s_options;
 
     private static readonly JsonDocumentOptions s_documentOptions = new()
     {

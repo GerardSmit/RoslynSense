@@ -1,4 +1,4 @@
-/// <reference path="../../settings/protocol.d.ts" />
+﻿/// <reference path="../../settings/protocol.d.ts" />
 
 /**
  * The settings panel's browser half: it turns the JSON Schema into a form, and turns edits back
@@ -27,8 +27,36 @@ window.addEventListener('message', (event: MessageEvent<SettingsMsg.ToView>) => 
         case 'connectionsResolved':
             applyConnectionPreviews(message);
             break;
+        case 'settingChoices':
+        case 'memberShape':
+            answer(message.token, message);
+            break;
     }
 });
+
+/**
+ * Questions to the host are answered out of band, and several controls have one outstanding at
+ * once. A token per question, and an answer for a token nobody is waiting for any more — because
+ * the form re-rendered, or the field was typed in again — is dropped rather than applied to
+ * whatever is on screen now.
+ */
+const waiting = new Map<number, (message: SettingsMsg.ToView) => void>();
+let nextToken = 0;
+
+function askHost<T extends SettingsMsg.ToView>(
+    build: (token: number) => SettingsMsg.ToHost,
+    onAnswer: (message: T) => void
+): void {
+    const token = ++nextToken;
+    waiting.set(token, (message) => onAnswer(message as T));
+    vscode.postMessage(build(token));
+}
+
+function answer(token: number, message: SettingsMsg.ToView): void {
+    const handler = waiting.get(token);
+    waiting.delete(token);
+    handler?.(message);
+}
 
 const searchBox = document.getElementById('search') as HTMLInputElement;
 searchBox.addEventListener('input', applyFilter);
@@ -177,6 +205,28 @@ interface SchemaNode {
     properties?: Record<string, SchemaNode>;
     items?: SchemaNode;
     enum?: unknown[];
+    /** `"server"` — the values are a fact about the solution, so the host is asked for them. */
+    'x-choices'?: string;
+    /** Several fields that together name a call shape; see {@link MemberShapeSpec}. */
+    'x-shape'?: MemberShapeSpec;
+}
+
+/**
+ * Which of an item's fields name a class, a member on it, and a position in its parameter list.
+ *
+ * Declared by the schema rather than recognised by name here, so the next setting that names a
+ * call shape gets the same editor by saying so rather than by being special-cased in this file.
+ */
+interface MemberShapeSpec {
+    kind: string;
+    /** The field holding the declaring type's full name. */
+    type: string;
+    /** The field holding the member name. */
+    member: string;
+    /** The field holding the positional parameter types. */
+    parameters: string;
+    /** Field name → what that parameter carries, in words: `{ keyIndex: "key" }`. */
+    positions: Record<string, string>;
 }
 
 function properties(node: SchemaNode): [string, SchemaNode][] {
@@ -604,18 +654,29 @@ function objectListControl(itemSchema: SchemaNode, path: string[]): HTMLElement 
     const list = document.createElement('div');
     box.append(list);
 
+    const shape = itemSchema['x-shape'];
+    const owned = shape ? shapeFields(shape) : new Set<string>();
+
     const addItem = (value: Record<string, unknown>) => {
         const item = document.createElement('fieldset');
         item.className = 'item';
 
-        for (const [name, child] of properties(itemSchema)) {
-            const row = document.createElement('div');
-            row.className = 'item-row';
+        if (itemSchema.title) {
+            const caption = document.createElement('legend');
+            caption.textContent = itemSchema.title;
+            item.append(caption);
+        }
 
-            const label = document.createElement('label');
-            label.textContent = name;
-            row.append(label, itemField(name, child, value[name]));
-            item.append(row);
+        // The fields a shape editor owns are drawn by it, together and in its own order, rather
+        // than as five text boxes that only mean something read as a group.
+        for (const [name, child] of properties(itemSchema)) {
+            if (!owned.has(name)) {
+                item.append(itemRow(name, child, value[name], path));
+            }
+        }
+
+        if (shape) {
+            item.prepend(memberShapeEditor(shape, itemSchema, value, path));
         }
 
         const actions = document.createElement('div');
@@ -663,8 +724,45 @@ function objectListControl(itemSchema: SchemaNode, path: string[]): HTMLElement 
     return box;
 }
 
+/**
+ * One labelled field of one list item, with the sentence the schema gives it.
+ *
+ * The label used to be the raw property name and there was no sentence at all, which is what made
+ * the page unreadable to anyone who had not written the code behind it: `rootInterpretation` is
+ * not a question anybody can answer from the word alone.
+ */
+function itemRow(
+    name: string,
+    schema: SchemaNode,
+    value: unknown,
+    listPath: readonly string[]
+): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'item-row';
+
+    const label = document.createElement('label');
+    label.textContent = schema.title ?? name;
+    // The key as the file spells it, for whoever edits the JSON by hand.
+    label.title = name;
+    row.append(label, itemField(name, schema, value, listPath));
+
+    if (schema.description) {
+        const blurb = document.createElement('p');
+        blurb.className = 'item-help';
+        blurb.textContent = schema.description;
+        row.append(blurb);
+    }
+
+    return row;
+}
+
 /** One field of one list item. `data-field` carries the property name for readItemField. */
-function itemField(name: string, schema: SchemaNode, value: unknown): HTMLElement {
+function itemField(
+    name: string,
+    schema: SchemaNode,
+    value: unknown,
+    listPath: readonly string[]
+): HTMLElement {
     const type = typeOf(schema);
 
     if (type === 'boolean') {
@@ -676,6 +774,31 @@ function itemField(name: string, schema: SchemaNode, value: unknown): HTMLElemen
         addOption(select, 'false', 'Off');
         select.value = typeof value === 'boolean' ? String(value) : '';
         return select;
+    }
+
+    // A closed list is a closed list wherever it appears. Inside an item it used to be a text box,
+    // so the six spellings of `rootSource` were something you had to already know.
+    if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+        const select = document.createElement('select');
+        select.dataset.field = name;
+        select.dataset.kind = 'text';
+        addOption(select, '', 'Default');
+        for (const choice of schema.enum) {
+            addOption(select, String(choice), String(choice));
+        }
+
+        const current = value === undefined || value === null ? '' : String(value);
+        // A value the schema does not list is still what the file says; showing it beats
+        // silently rewriting it to the first option the moment the item is committed.
+        if (current !== '' && !schema.enum.some((choice) => String(choice) === current)) {
+            addOption(select, current, `${current} (not a known value)`);
+        }
+        select.value = current;
+        return select;
+    }
+
+    if (type === 'array' && schema['x-choices'] === 'server') {
+        return choiceListField(name, `${listPath.join('.')}[].${name}`, value);
     }
 
     const input = document.createElement('input');
@@ -694,12 +817,99 @@ function itemField(name: string, schema: SchemaNode, value: unknown): HTMLElemen
     return input;
 }
 
+/**
+ * A list of strings chosen from what the solution actually offers — a lookup's fallbacks, whose
+ * valid values are the root conventions the preset and the file between them define.
+ *
+ * Order is kept rather than taken from the offered list, because "tried in order" is the whole
+ * meaning of the field: an unchecked-then-rechecked convention goes to the end, where it now is.
+ */
+function choiceListField(name: string, path: string, value: unknown): HTMLElement {
+    const box = document.createElement('div');
+    box.className = 'choice-list';
+    box.dataset.field = name;
+    box.dataset.kind = 'chips';
+
+    let chosen: string[] = Array.isArray(value) ? value.map(String) : [];
+    box.dataset.value = JSON.stringify(chosen);
+
+    const draw = (offered: readonly SettingsMsg.Choice[]) => {
+        box.textContent = '';
+
+        // Anything the file already names goes in the list even when the solution no longer
+        // defines it, marked as such — silently dropping it on the next save is data loss.
+        const known = new Set(offered.map((choice) => choice.value));
+        const rows: SettingsMsg.Choice[] = [
+            ...offered,
+            ...chosen
+                .filter((id) => !known.has(id))
+                .map((id) => ({ value: id, detail: 'not defined in this solution' })),
+        ];
+
+        if (rows.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'item-help';
+            empty.textContent = 'No conventions are defined yet.';
+            box.append(empty);
+            return;
+        }
+
+        for (const choice of rows) {
+            const line = document.createElement('label');
+            line.className = 'choice';
+
+            const tick = document.createElement('input');
+            tick.type = 'checkbox';
+            tick.checked = chosen.includes(choice.value);
+            tick.addEventListener('change', () => {
+                chosen = tick.checked
+                    ? [...chosen.filter((id) => id !== choice.value), choice.value]
+                    : chosen.filter((id) => id !== choice.value);
+                box.dataset.value = JSON.stringify(chosen);
+            });
+
+            const text = document.createElement('span');
+            text.textContent = choice.value;
+
+            line.append(tick, text);
+
+            if (choice.detail) {
+                const detail = document.createElement('span');
+                detail.className = 'choice-detail';
+                detail.textContent = choice.detail;
+                line.append(detail);
+            }
+
+            box.append(line);
+        }
+    };
+
+    draw([]);
+    askHost<SettingsMsg.SettingChoices>(
+        (token) => ({ type: 'askChoices', token, path }),
+        (message) => draw(message.items)
+    );
+
+    return box;
+}
+
 /** The field's value for the file, or undefined when it should be omitted from the item. */
 function readItemField(field: HTMLElement): unknown {
     const kind = field.dataset.kind;
 
+    if (kind === 'chips') {
+        const chosen = JSON.parse(field.dataset.value ?? '[]') as string[];
+        return chosen.length > 0 ? chosen : undefined;
+    }
+
     if (field instanceof HTMLSelectElement) {
-        return field.value === '' ? undefined : field.value === 'true';
+        return kind === 'boolean'
+            ? field.value === ''
+                ? undefined
+                : field.value === 'true'
+            : field.value === ''
+                ? undefined
+                : field.value;
     }
     if (!(field instanceof HTMLInputElement)) {
         return undefined;
@@ -717,6 +927,265 @@ function readItemField(field: HTMLElement): unknown {
         return parts.length > 0 ? parts : undefined;
     }
     return text;
+}
+
+// ---------------------------------------------------------------------------
+// Naming a call shape
+// ---------------------------------------------------------------------------
+
+/** Every field the shape editor draws itself. */
+function shapeFields(shape: MemberShapeSpec): Set<string> {
+    return new Set([
+        shape.type,
+        shape.member,
+        shape.parameters,
+        ...Object.keys(shape.positions),
+    ]);
+}
+
+/**
+ * One editor over the fields that together name a method: the class, the member, the signature
+ * that picks an overload apart from its siblings, and which parameter carries what.
+ *
+ * Five text boxes could not say whether any of it resolved. The whole difficulty of writing one of
+ * these is that a wrong containing type, a misspelled member and a signature that matches nothing
+ * all look exactly like a correct entry — they simply bind nothing, silently, forever. So the
+ * editor asks the solution after every edit and shows the overloads the entry currently selects;
+ * "2 of 3 match" is the fact the person needed, and clicking the parameter that carries the key is
+ * the correction they would otherwise have had to make by counting.
+ */
+function memberShapeEditor(
+    shape: MemberShapeSpec,
+    itemSchema: SchemaNode,
+    value: Record<string, unknown>,
+    listPath: readonly string[]
+): HTMLElement {
+    const box = document.createElement('div');
+    box.className = 'shape';
+
+    const fieldSchema = (name: string) => itemSchema.properties?.[name] ?? {};
+
+    const typeInput = shapeInput(shape.type, fieldSchema(shape.type), value[shape.type]);
+    const memberInput = shapeInput(shape.member, fieldSchema(shape.member), value[shape.member]);
+    const parametersInput = shapeInput(
+        shape.parameters,
+        fieldSchema(shape.parameters),
+        value[shape.parameters]
+    );
+    parametersInput.dataset.kind = 'list';
+    parametersInput.placeholder = 'Any overload';
+
+    const types = suggestionList(`shape-types-${++nextToken}`);
+    const members = suggestionList(`shape-members-${++nextToken}`);
+    typeInput.setAttribute('list', types.id);
+    memberInput.setAttribute('list', members.id);
+
+    box.append(
+        shapeRow(fieldSchema(shape.type).title ?? shape.type, typeInput, fieldSchema(shape.type)),
+        shapeRow(
+            fieldSchema(shape.member).title ?? shape.member,
+            memberInput,
+            fieldSchema(shape.member)
+        ),
+        shapeRow(
+            fieldSchema(shape.parameters).title ?? shape.parameters,
+            parametersInput,
+            fieldSchema(shape.parameters)
+        )
+    );
+
+    const status = document.createElement('p');
+    status.className = 'shape-status';
+    box.append(status);
+
+    const overloads = document.createElement('div');
+    overloads.className = 'shape-overloads';
+    box.append(overloads);
+
+    // The positions are stored on hidden fields so `commit` reads them like any other, and set by
+    // clicking a parameter rather than by counting one.
+    const positions = new Map<string, HTMLInputElement>();
+    const positionRows = document.createElement('div');
+    positionRows.className = 'shape-positions';
+    box.append(positionRows);
+
+    for (const [field, what] of Object.entries(shape.positions)) {
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.dataset.field = field;
+        hidden.dataset.kind = 'text';
+        const current = value[field];
+        hidden.value = current === undefined || current === null ? '' : String(current);
+        positions.set(field, hidden);
+        box.append(hidden);
+        void what;
+    }
+
+    let timer: number | undefined;
+    const refresh = () => {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(ask, 200);
+    };
+
+    typeInput.addEventListener('input', refresh);
+    memberInput.addEventListener('input', refresh);
+    parametersInput.addEventListener('input', refresh);
+
+    function ask(): void {
+        const parameterTypes = parametersInput.value
+            .split(',')
+            .map((part) => part.trim())
+            .filter((part) => part.length > 0);
+
+        askHost<SettingsMsg.MemberShape>(
+            (token) => ({
+                type: 'askMemberShape',
+                token,
+                containingType: typeInput.value.trim(),
+                memberName: memberInput.value.trim(),
+                parameterTypes,
+            }),
+            show
+        );
+    }
+
+    function show(answerMessage: SettingsMsg.MemberShape): void {
+        fill(types, answerMessage.typeSuggestions);
+        fill(members, answerMessage.memberSuggestions);
+
+        overloads.textContent = '';
+        positionRows.textContent = '';
+
+        const matched = answerMessage.matches.filter((match) => match.matched);
+
+        status.classList.toggle('warn', answerMessage.matches.length > 0 && matched.length === 0);
+        status.textContent = answerMessage.problem
+            ? answerMessage.problem
+            : answerMessage.matches.length === 0
+                ? ''
+                : matched.length === answerMessage.matches.length
+                    ? `${count(matched.length, 'overload')} — all of them.`
+                    : `${matched.length} of ${count(answerMessage.matches.length, 'overload')} match.`;
+
+        for (const match of answerMessage.matches) {
+            const line = document.createElement('div');
+            line.className = match.matched ? 'overload matched' : 'overload';
+            line.textContent = match.signature;
+            overloads.append(line);
+        }
+
+        // Parameters to choose from come from an overload the entry actually selects: naming the
+        // key's position against an overload this shape does not bind would be arithmetic about
+        // nothing.
+        const example = matched[0];
+        if (!example) {
+            return;
+        }
+
+        for (const [field, what] of Object.entries(shape.positions)) {
+            const hidden = positions.get(field);
+            if (!hidden) {
+                continue;
+            }
+
+            const row = document.createElement('div');
+            row.className = 'item-row';
+
+            const label = document.createElement('label');
+            label.textContent = itemSchema.properties?.[field]?.title ?? field;
+            label.title = field;
+            row.append(label);
+
+            const chips = document.createElement('div');
+            chips.className = 'chips';
+
+            example.parameters.forEach((parameter, index) => {
+                const chip = document.createElement('button');
+                chip.type = 'button';
+                chip.className = 'chip';
+                chip.textContent = `${index}  ${parameter.name}`;
+                chip.title = parameter.type;
+                chip.setAttribute('aria-pressed', String(hidden.value === String(index)));
+
+                if (hidden.value === String(index)) {
+                    chip.classList.add('picked');
+                }
+
+                chip.addEventListener('click', () => {
+                    hidden.value = String(index);
+                    for (const sibling of chips.querySelectorAll<HTMLElement>('.chip')) {
+                        sibling.classList.remove('picked');
+                        sibling.setAttribute('aria-pressed', 'false');
+                    }
+                    chip.classList.add('picked');
+                    chip.setAttribute('aria-pressed', 'true');
+                });
+
+                chips.append(chip);
+            });
+
+            row.append(chips);
+
+            const blurb = document.createElement('p');
+            blurb.className = 'item-help';
+            blurb.textContent = `Which parameter carries the ${what}.`;
+            row.append(blurb);
+
+            positionRows.append(row);
+        }
+    }
+
+    ask();
+    return box;
+}
+
+function shapeInput(name: string, schema: SchemaNode, value: unknown): HTMLInputElement {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.dataset.field = name;
+    input.dataset.kind = 'text';
+    input.spellcheck = false;
+    input.value = value === undefined || value === null ? '' : String(value);
+    void schema;
+    return input;
+}
+
+function shapeRow(title: string, control: HTMLElement, schema: SchemaNode): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'item-row';
+
+    const label = document.createElement('label');
+    label.textContent = title;
+    row.append(label, control);
+
+    if (schema.description) {
+        const blurb = document.createElement('p');
+        blurb.className = 'item-help';
+        blurb.textContent = schema.description;
+        row.append(blurb);
+    }
+
+    return row;
+}
+
+function suggestionList(id: string): HTMLDataListElement {
+    const list = document.createElement('datalist');
+    list.id = id;
+    document.body.append(list);
+    return list;
+}
+
+function fill(list: HTMLDataListElement, items: readonly string[]): void {
+    list.textContent = '';
+    for (const item of items) {
+        const option = document.createElement('option');
+        option.value = item;
+        list.append(option);
+    }
+}
+
+function count(n: number, noun: string): string {
+    return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
 
 function removeButton(row: HTMLElement, commit: () => void): HTMLButtonElement {

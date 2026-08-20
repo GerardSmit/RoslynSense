@@ -1,6 +1,7 @@
-import * as fs from 'fs';
+﻿import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { LanguageClient } from 'vscode-languageclient/node';
 import { html } from './html';
 import {
     listReferenceNames,
@@ -26,7 +27,8 @@ import {
 export function wire(
     context: vscode.ExtensionContext,
     panel: vscode.WebviewPanel,
-    onDispose: () => void
+    onDispose: () => void,
+    getClient: () => LanguageClient | undefined = () => undefined
 ): void {
     panel.webview.html = html(panel.webview, context.extensionUri);
 
@@ -90,6 +92,42 @@ export function wire(
                 return;
             }
 
+            case 'askChoices': {
+                // Answered against the merge the page is showing rather than the config the
+                // server booted with: a convention someone just added has to be offerable as a
+                // fallback before the file is saved and reloaded.
+                const items = await ask<{ items: SettingsMsg.Choice[] }>(
+                    'roslynSense/settingChoices',
+                    { path: message.path, config: loadLayers(workingDirectory()).merged }
+                );
+                post({ type: 'settingChoices', token: message.token, items: items?.items ?? [] });
+                return;
+            }
+
+            case 'askMemberShape': {
+                const shape = await ask<Omit<SettingsMsg.MemberShape, 'type' | 'token'>>(
+                    'roslynSense/memberShape',
+                    {
+                        containingType: message.containingType,
+                        memberName: message.memberName,
+                        parameterTypes: message.parameterTypes,
+                    }
+                );
+
+                post({
+                    type: 'memberShape',
+                    token: message.token,
+                    typeSuggestions: shape?.typeSuggestions ?? [],
+                    memberSuggestions: shape?.memberSuggestions ?? [],
+                    matches: shape?.matches ?? [],
+                    resolvedType: shape?.resolvedType,
+                    problem: shape
+                        ? shape.problem
+                        : 'The language server is not running, so nothing can be resolved yet.',
+                });
+                return;
+            }
+
             case 'set': {
                 try {
                     // `null` over the wire is the panel's "unset"; `undefined` does not survive
@@ -111,6 +149,24 @@ export function wire(
     });
 
     post(buildState(scope));
+
+    /**
+     * One request to the server, or undefined when there is nobody to ask. A settings page is
+     * usable without a loaded solution — every control except the two that resolve symbols — so a
+     * missing client is a quieter answer rather than an error.
+     */
+    async function ask<T>(method: string, parameters: unknown): Promise<T | undefined> {
+        const client = getClient();
+        if (!client) {
+            return undefined;
+        }
+
+        try {
+            return await client.sendRequest<T>(method, parameters);
+        } catch {
+            return undefined;
+        }
+    }
 
     function buildState(current: ConfigScope, notice?: string): SettingsMsg.State {
         const directory = workingDirectory();

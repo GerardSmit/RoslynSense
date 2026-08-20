@@ -1,4 +1,4 @@
-using System.Text.Encodings.Web;
+﻿using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Schema;
@@ -76,6 +76,29 @@ public static class ConfigSchema
             ["resources.markupBindings"] = ("Markup bindings", "Key shapes an application composes from a markup attribute rather than any call site writing them out, each written as the key it produces: `[Control.ID].Text`, `Header[Control.UniqueName].Text`, `[Control.ID].Header`. Appended to the preset's."),
             ["resources.missingKeyDiagnostic"] = ("Report missing keys", "Report a key that no file of its family declares. Off by default: a false report on a key that resolves fine at runtime is what gets the feature switched off wholesale."),
 
+            ["resources.overrides[]"] = ("Override", "One customization segment and how strongly it wins."),
+            ["resources.overrides[].pattern"] = ("Segment", "The segment as it appears in the file name, `*` allowed — DNN's `Host` and `Portal-*`."),
+            ["resources.overrides[].rank"] = ("Wins over", "Higher wins. The uncustomized file is 0, so `Host` is 1 and `Portal-*` is 2. Explicit because sorting `Portal-*` and `Host` alphabetically gets the precedence backwards."),
+
+            ["resources.conventions[]"] = ("Convention", "One way of getting from a call site to the resx file it reads."),
+            ["resources.conventions[].id"] = ("Name", "What a lookup's Fallbacks refers to this by. Reusing the name of a built-in convention replaces it and leaves the rest alone."),
+            ["resources.conventions[].siblingFolder"] = ("Folder beside the file", "Looked for next to the calling file — `App_LocalResources`. Use this or Folder at the project root, not both."),
+            ["resources.conventions[].rootFolder"] = ("Folder at the project root", "Looked for from the project root down — `App_GlobalResources`."),
+            ["resources.conventions[].fixedName"] = ("Always this file", "One file name every call site shares, such as `SharedResources`. Leave empty to name the file after the calling file."),
+            ["resources.conventions[].suffix"] = ("File endings", "What the resx name ends with. `.ascx.resx` for a user control's local file; defaults to `.resx`."),
+
+            ["resources.lookups[]"] = ("Lookup", "One method that takes a resource key, and where the file it reads comes from."),
+            ["resources.lookups[].containingType"] = ("Class", "The full name of the class or interface declaring the method — `DotNetNuke.Services.Localization.Localization`. Leave empty to match the method on any class, which is the escape hatch for a codebase where each module wraps localization in its own helper."),
+            ["resources.lookups[].methodName"] = ("Method", "The method name, or `Item` for an indexer."),
+            ["resources.lookups[].parameterTypes"] = ("Parameters", "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload — which is wrong wherever overloads disagree about where the file name sits."),
+            ["resources.lookups[].keyIndex"] = ("Key is parameter", "Which parameter carries the resource key, counted from 0."),
+            ["resources.lookups[].rootSource"] = ("File name comes from", "Where the call site says which resx file to read."),
+            ["resources.lookups[].rootInterpretation"] = ("Read that as", "What kind of name that value is, which decides how it becomes a resx file."),
+            ["resources.lookups[].rootIndex"] = ("File name is parameter", "Which parameter carries it, counted from 0. Only used when the file name comes from an argument."),
+            ["resources.lookups[].rootConstant"] = ("Fixed name", "The file name itself, for a helper that always reads one file. Only used when the file name is fixed."),
+            ["resources.lookups[].defaultKeySuffix"] = ("Add to keys without a dot", "Appended to a key that contains no `.` — DNN's `.Text`, so `GetString(\"Submit\")` reads `Submit.Text`."),
+            ["resources.lookups[].fallbacks"] = ("Then also look in", "Tried in order when the key is not in the first file. The list is what the preset defines plus any convention this file adds."),
+
             ["database"] = ("Databases", "Which databases the solution can be queried against."),
             ["database.autoDiscovery"] = ("Auto-discovery", "Scan the tree for connection strings. Omitted runs the scan only when nothing is registered explicitly. Production-flavoured environment names are never loaded."),
             ["database.connections"] = ("Connections", "Explicit connections by alias. Either `provider:connectionString` or an object with `provider` and `connectionString`."),
@@ -150,6 +173,68 @@ public static class ConfigSchema
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
+    /// <summary>
+    /// The values a setting accepts, where the type behind it is a string rather than an enum.
+    /// </summary>
+    /// <remarks>
+    /// The parser takes these as strings so that an unknown one warns and falls back rather than
+    /// failing the load, which is right for a config file and useless for a form: a text box for a
+    /// six-value choice is a text box you have to already know the answer to. Spelled here so the
+    /// settings page draws a dropdown and the JSON editor completes them.
+    /// </remarks>
+    private static readonly Dictionary<string, string[]> s_choices =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["resources.preset"] = ["webforms", "dnn", "dotnet", "none"],
+            ["resources.lookups[].rootSource"] =
+                ["argument", "typeArgument", "containingType", "containingFile", "constant", "none"],
+            ["resources.lookups[].rootInterpretation"] =
+                ["virtualPath", "globalClassName", "typeName", "relativePath", "baseName"],
+            ["tableFormat"] = ["markdown", "toon"],
+        };
+
+    /// <summary>
+    /// Settings whose values only the running solution knows, so the page asks the server for them
+    /// rather than reading a list from here.
+    /// </summary>
+    /// <remarks>
+    /// A lookup's fallbacks name root conventions, and which conventions exist is the preset plus
+    /// whatever the file declared — an answer per solution. Marked rather than probed so the page
+    /// knows to draw a multiple-choice control before the answer arrives.
+    /// </remarks>
+    private static readonly HashSet<string> s_askTheServer =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "resources.lookups[].fallbacks",
+        };
+
+    /// <summary>
+    /// Groups of fields that together name a call shape, so the page can offer one editor over all
+    /// of them instead of five text boxes.
+    /// </summary>
+    /// <remarks>
+    /// Declared here rather than hard-coded in the page because the shape is not specific to
+    /// resource lookups. "A class, a member on it, and which parameter carries what" is what every
+    /// setting naming a call shape needs, and the next one should get the same editor by adding a
+    /// line here.
+    /// </remarks>
+    private static readonly Dictionary<string, JsonObject> s_shapes =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["resources.lookups[]"] = new JsonObject
+            {
+                ["kind"] = "member",
+                ["type"] = "containingType",
+                ["member"] = "methodName",
+                ["parameters"] = "parameterTypes",
+                ["positions"] = new JsonObject
+                {
+                    ["keyIndex"] = "key",
+                    ["rootIndex"] = "file name",
+                },
+            },
+        };
+
     /// <summary>Every path the descriptions table knows about, for the test that checks it is complete.</summary>
     internal static IReadOnlyCollection<string> DescribedPaths => s_descriptions.Keys;
 
@@ -164,6 +249,17 @@ public static class ConfigSchema
             obj["description"] = text.Description;
         }
 
+        if (s_askTheServer.Contains(path))
+            obj["x-choices"] = "server";
+
+        if (s_choices.TryGetValue(path, out var choices))
+            obj["enum"] = new JsonArray([.. choices.Select(choice => (JsonNode)JsonValue.Create(choice))]);
+
+        // Not a JSON Schema keyword: a validator ignores it and the settings page reads it. The
+        // alternative was a second document to keep in step with this one.
+        if (s_shapes.TryGetValue(path, out var shape))
+            obj["x-shape"] = shape.DeepClone();
+
         return obj;
     }
 
@@ -173,7 +269,10 @@ public static class ConfigSchema
     /// </summary>
     /// <remarks>
     /// The exporter reports the path as JSON Pointer segments that include the <c>properties</c>
-    /// keyword between levels; dropping those leaves the path a person would write.
+    /// keyword between levels; dropping those leaves the path a person would write. An array
+    /// element keeps its property's path with <c>[]</c> on the end, so the list and one item's
+    /// fields can be described separately — <c>resources.lookups</c> is a list of call shapes, and
+    /// <c>resources.lookups[].keyIndex</c> is which parameter carries the key.
     /// </remarks>
     private static string PathOf(JsonSchemaExporterContext context)
     {
@@ -182,11 +281,18 @@ public static class ConfigSchema
         // A span, so no LINQ: the exporter hands the path out without allocating it.
         foreach (string segment in context.Path)
         {
-            // Inside a collection or dictionary value. The element carries the same path as the
-            // property holding it, and annotating both puts the property's sentence on every item
-            // of the array as well — so the element is left alone and only the property is named.
-            if (segment is "items" or "additionalProperties")
+            // A dictionary's value. The keys are the person's own, so there is nothing to name.
+            if (segment is "additionalProperties")
                 return string.Empty;
+
+            if (segment is "items")
+            {
+                if (segments.Count == 0)
+                    return string.Empty;
+
+                segments[^1] += "[]";
+                continue;
+            }
 
             if (segment is "$" or "properties" or "anyOf" or "oneOf" or "$defs")
                 continue;

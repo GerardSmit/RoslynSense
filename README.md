@@ -180,6 +180,7 @@ Use the following server configuration:
 | `--no-appsettings` | Disable `appsettings*.json` support: no reference counts, override or external-reference lenses, no navigation between a key and the code reading it. |
 | `--no-webconfig` | Disable `web.config` / `app.config` settings support: the same for `<appSettings>` and `<connectionStrings>`. Binding-redirect checking — warnings, fixes, the lens and the hover — is unaffected. |
 | `--no-logging` | Disable logging message templates: no placeholder colouring, completion, hover or template diagnostics. |
+| `--no-valuesets` | Disable value sets: no completion, hover or diagnostic for strings bound to a set of allowed values. |
 | `--no-debugger` | Disable all debugger tools (see [Debugging](#debugging)). |
 | `--no-debugger-display` | Show values as their type name rather than through `[DebuggerDisplay]`. See [Debugging](#debugging). |
 | `--no-type-proxy` | Expand values as their own fields rather than through `[DebuggerTypeProxy]`. |
@@ -279,6 +280,11 @@ In VS Code, **RoslynSense: Settings** — from the command palette, or the `⋯`
 | `logging.valueCount` | bool | `true` | — (LOG0003, placeholders and values disagreeing in count) |
 | `logging.unusedValue` | bool | `true` | — (LOG0004, a value no placeholder prints; SYSLIB1015's claim) |
 | `logging.exceptionPosition` | bool | `true` | — (LOG0005, an exception passed as a value rather than first) |
+| `tools.valueSets` | bool | `true` | `--no-valuesets` forces `false` |
+| `valueSets.sets` | list | — | Named sets: an `id`, and either a `query` against a `connection` or a list of `values` |
+| `valueSets.bindings` | list | — | Where each set is written: a `containingType`, a `memberName`, optional `parameterTypes`, and a `valueIndex` for a method parameter |
+| `valueSets.unknownValueDiagnostic` | bool | `true` | — (VAL0001, a string the set does not contain) |
+| `valueSets.severity` | string | `error` | `error`, `warning` or `information` |
 | `tools.debugger` | bool | `true` | `--no-debugger` forces `false` |
 | `tools.profiling` | bool | `true` | `--no-profiling` forces `false` |
 | `tools.database` | bool | `true` | `--no-db` forces `false` |

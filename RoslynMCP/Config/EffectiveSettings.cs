@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.Values;
 using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Services.Database;
 
@@ -35,6 +36,10 @@ public sealed record EffectiveSettings(
     /// <summary>The logging-template pack's gate and which of its rules run. Init-only for the
     /// same reason as <see cref="Resources"/>.</summary>
     internal LoggingSettings Logging { get; init; } = LoggingSettings.Disabled;
+
+    /// <summary>The value-set pack's gate, its sets and where they are bound. Init-only for the
+    /// same reason as <see cref="Resources"/>.</summary>
+    internal ValueSettings ValueSets { get; init; } = ValueSettings.Disabled;
 
     /// <summary>The project-file pack's gate. Init-only for the same reason as
     /// <see cref="Resources"/>.</summary>
@@ -112,6 +117,8 @@ public sealed record EffectiveSettings(
         bool dotSettings = !HasFlag("--no-dotsettings") && tools.DotSettings;
         var logging = LoggingSettings.Resolve(
             !HasFlag("--no-logging") && tools.Logging, config?.Logging);
+        var valueSets = ValueSettings.Resolve(
+            !HasFlag("--no-valuesets") && tools.ValueSets, config?.ValueSets, warnings);
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -174,6 +181,7 @@ public sealed record EffectiveSettings(
             WebConfigFiles = webConfigFiles,
             DotSettings = dotSettings,
             Logging = logging,
+            ValueSets = valueSets,
         };
     }
 

@@ -37,6 +37,9 @@ Languages/
                        between a template's {Placeholders} and the values beside them
     Core/              the engine: parse a template, resolve what binds it, match the two up
     LoggingLanguage.*.cs
+  Values/              strings whose allowed values live in a database — also no files of its own
+    Core/              the engine: the sets and their cache, and which literals a binding claims
+    ValuesLanguage.*.cs
   DotSettings/         ReSharper and Rider settings layers — answers no request about its own
                        files, and narrows the answers to requests about other files instead
     Core/              the engine: unescape, parse, stack the layers, resolve the four keys
@@ -60,6 +63,10 @@ rather than through the file map. That seam is orthogonal to pack identity — `
 `WebConfig/`, `AppSettings/` and `WebForms/` all implement it beside owning files, and this
 implements only it — so the choice is not "pack or embedded language" but "does this own documents,
 and does it own spans inside someone else's".
+
+`Values/` is the same kind again, and the one that shows what the kind is for. Its definition is
+not even in the repository — it is rows in a lookup table — so what the pack contributes is a way
+of reaching something the compilation cannot see at all, hung off the same seam.
 
 Not every pack is a file type. `Mediator/` owns no extension at all: a request, its handler and the
 call joining them are ordinary C#, and what is missing is the *edge* between them, which Roslyn

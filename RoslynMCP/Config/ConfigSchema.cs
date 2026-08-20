@@ -60,6 +60,7 @@ public static class ConfigSchema
             ["tools.webConfig"] = ("web.config", "`<appSettings>` and `<connectionStrings>` joined to the C# and markup that read them."),
             ["tools.dotSettings"] = ("ReSharper settings", "Whether a committed `.DotSettings` narrows inferred namespaces, search results and coverage."),
             ["tools.logging"] = ("Logging templates", "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."),
+            ["tools.valueSets"] = ("Value sets", "Strings that have to be one of a known set of values — a status code from a lookup table, most often. Completion, hover and a diagnostic wherever one is written."),
             ["tools.debugger"] = ("Debugger", "Launch, breakpoints, stepping and evaluation."),
             ["tools.profiling"] = ("Profiling", "CPU sampling, memory snapshots and coverage."),
             ["tools.database"] = ("Database", "Querying and describing the databases the solution connects to."),
@@ -73,6 +74,24 @@ public static class ConfigSchema
             ["logging.valueCount"] = ("Wrong number of values", "LOG0003 — the placeholders and the values disagree in count. Placeholders bind by position, so this shifts every placeholder after the mistake onto the wrong value."),
             ["logging.unusedValue"] = ("Value never printed", "LOG0004 — a parameter or argument no placeholder renders. SYSLIB1015's claim for a generated method, reported on the parameter."),
             ["logging.exceptionPosition"] = ("Exception in the wrong place", "LOG0005 — an exception passed as a rendered value rather than as the first argument, which loses the stack trace and the sink's exception handling."),
+
+            ["valueSets"] = ("Value sets", "Sets of allowed string values that live outside the compilation — the rows of a lookup table — and the members in C# that have to be one of them."),
+            ["valueSets.unknownValueDiagnostic"] = ("Report unknown values", "VAL0001 — a string that is not one of its set's values. Only ever reported for a set that loaded completely: an unreachable database says nothing rather than something wrong."),
+            ["valueSets.severity"] = ("Report them as", "How loudly VAL0001 is reported. An error by default, because a code the table does not have is a branch that can never be taken. Soften it while a codebase catches up."),
+            ["valueSets.sets"] = ("Sets", "The named sets of values. Each is a query against a configured connection, or a list written out here."),
+            ["valueSets.sets[]"] = ("Set", "One set of allowed values, and where they come from."),
+            ["valueSets.sets[].id"] = ("Name", "What a binding refers to this set by."),
+            ["valueSets.sets[].connection"] = ("Connection", "Which configured database connection to run the query against. Leave empty when only one is configured."),
+            ["valueSets.sets[].query"] = ("Query", "The query producing the values — `SELECT [Code] FROM Shop_OrderStatus ORDER BY [Code]`. The first column is the value; a second column, if there is one, is shown beside it as a label."),
+            ["valueSets.sets[].values"] = ("Values", "The values written out, for a set with no database behind it. Ignored when a query is set."),
+            ["valueSets.sets[].caseSensitive"] = ("Match casing exactly", "Off by default, because the comparison the code does usually is case-insensitive too."),
+            ["valueSets.bindings"] = ("Where they are written", "The members in C# whose strings come from a set."),
+            ["valueSets.bindings[]"] = ("Binding", "One member, and the set its values come from. A method with a parameter position takes the value as that argument; a method without one returns it; a property or field holds it, and every literal compared or assigned to it is checked."),
+            ["valueSets.bindings[].set"] = ("Set", "Which set this member's values come from."),
+            ["valueSets.bindings[].containingType"] = ("Class", "The full name of the class or interface declaring the member. Leave empty to match the member on any class."),
+            ["valueSets.bindings[].memberName"] = ("Member", "The method, property or field name, or `Item` for an indexer."),
+            ["valueSets.bindings[].parameterTypes"] = ("Parameters", "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."),
+            ["valueSets.bindings[].valueIndex"] = ("Value is parameter", "Which parameter carries the value, counted from 0. Leave empty for a property, a field, or a method whose return value is one of the set."),
 
             ["resources"] = ("Resource lookups", "How `.resx` files are found and which call shapes carry a resource key."),
             ["resources.preset"] = ("Preset", "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting."),
@@ -199,6 +218,7 @@ public static class ConfigSchema
             ["resources.lookups[].rootInterpretation"] =
                 ["virtualPath", "globalClassName", "typeName", "relativePath", "baseName"],
             ["tableFormat"] = ["markdown", "toon"],
+            ["valueSets.severity"] = ["error", "warning", "information"],
         };
 
     /// <summary>
@@ -214,6 +234,8 @@ public static class ConfigSchema
         new(StringComparer.OrdinalIgnoreCase)
         {
             "resources.lookups[].fallbacks",
+            "valueSets.bindings[].set",
+            "valueSets.sets[].connection",
         };
 
     /// <summary>
@@ -239,6 +261,20 @@ public static class ConfigSchema
                 {
                     ["keyIndex"] = "key",
                     ["rootIndex"] = "file name",
+                },
+            },
+
+            // The second one, which is what the note above was written in anticipation of: a value
+            // binding is the same class-member-signature triple, with one position instead of two.
+            ["valueSets.bindings[]"] = new JsonObject
+            {
+                ["kind"] = "member",
+                ["type"] = "containingType",
+                ["member"] = "memberName",
+                ["parameters"] = "parameterTypes",
+                ["positions"] = new JsonObject
+                {
+                    ["valueIndex"] = "value",
                 },
             },
         };

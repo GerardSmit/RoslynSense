@@ -332,6 +332,93 @@ there are no properties to name and nothing to explain.
 `roslynSense.languages.logging` turns it off for one window; `--no-logging` (or
 `"tools": { "logging": false }`) turns it off for the daemon, AI sessions included.
 
+## Value sets
+
+Some strings are not really strings. A status code is one of a fixed list, that list is rows in a
+lookup table, and the C# holding it is a bare `string` — so nothing between the two checks anything:
+
+```csharp
+if (status?.Code is "order_rejected" or "order_wait_for_logn")   // never true, forever
+```
+
+That compiles, the tests pass, and the branch is simply never taken. A row renamed by a migration
+does the same thing in reverse to code that used to work. An `enum` would fix it and usually is not
+available, because the table is the product's data and rows get added without a deployment.
+
+So name the query once and say where its values are written:
+
+```json
+{
+  "valueSets": {
+    "sets": [
+      {
+        "id": "orderStatus",
+        "connection": "shop",
+        "query": "SELECT [Code], [Description] FROM Shop_OrderStatus ORDER BY [SortOrder]"
+      }
+    ],
+    "bindings": [
+      {
+        "set": "orderStatus",
+        "containingType": "Contoso.Shop.OrderController",
+        "memberName": "OrderStatus_Get",
+        "parameterTypes": ["string"],
+        "valueIndex": 0
+      },
+      {
+        "set": "orderStatus",
+        "containingType": "Contoso.Shop.Data.OrderStatus",
+        "memberName": "Code"
+      }
+    ]
+  }
+}
+```
+
+The two bindings are the two halves, and which is which comes from the member rather than from a
+flag. A **method with a parameter position** takes the value as that argument. A **property or
+field holds** one, so what is checked is every literal it is compared or assigned — and that means
+all of these, wherever they are written:
+
+```csharp
+status.Code == "order_shipped"                                   // and !=
+status?.Code is "order_rejected" or "order_wait_for_login"       // including or-patterns
+status is { Code: "order_shipped" }
+status.Code.Equals(code, StringComparison.OrdinalIgnoreCase)
+switch (status.Code) { case "order_shipped": … }
+status.Code switch { "order_shipped" => … }
+status.Code = "order_shipped"
+```
+
+A **method with no parameter position** is read as returning one, so literals compared against its
+result are checked too.
+
+You get completion from the column itself — with the second column, if the query selects one, shown
+beside each value as a label — hover saying what a code means and where the list comes from, and
+`VAL0001` on a string the set does not contain, with the nearest value offered:
+
+> `'order_wait_for_logn'` is not one of the 7 values of `'orderStatus'`, from shop: SELECT [Code], [Description] FROM Shop_OrderStatus ORDER BY [SortOrder]. Did you mean `'order_wait_for_login'`?
+
+An error rather than a warning, because that is what it is — the same class of mistake as a
+misspelled member name. `"severity": "warning"` while a codebase catches up.
+
+**It never guesses.** The values are loaded once per session and cached, and `VAL0001` is reported
+only for a set that loaded *completely* — a database that is unreachable, a query that failed and a
+result too large to be a value set all report nothing at all, because "that is not a valid code" is
+a claim about every code there is. Completion still offers whatever arrived, and hover says why the
+rest did not.
+
+Because the values are cached, **RoslynSense: Reload Value Sets** is how a migration that added a
+row reaches the editor.
+
+Sets with no database behind them work too — `"values": ["draft", "sent"]` instead of a query —
+which is worth having for a list that lives in a spreadsheet, another team's documentation, or a
+config file nothing in the solution reads.
+
+`roslynSense.languages.valuesets` turns it off for one window; `--no-valuesets` (or
+`"tools": { "valueSets": false }`) turns it off for the daemon, AI sessions included. With no
+`valueSets` section there is nothing to do and the pack is not loaded at all.
+
 ## Editor context for AI chats
 
 With `roslynSense.shareEditorContext` on (the default), the extension tells connected AI chats

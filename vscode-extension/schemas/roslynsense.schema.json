@@ -66,6 +66,11 @@
           "title": "Logging templates",
           "description": "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."
         },
+        "valueSets": {
+          "type": "boolean",
+          "title": "Value sets",
+          "description": "Strings that have to be one of a known set of values — a status code from a lookup table, most often. Completion, hover and a diagnostic wherever one is written."
+        },
         "debugger": {
           "type": "boolean",
           "title": "Debugger",
@@ -478,6 +483,175 @@
       },
       "title": "Logging templates",
       "description": "Which of the message-template rules report. Two of them restate what the `[LoggerMessage]` source generator says as SYSLIB1014 and SYSLIB1015, at a better location — turn those off where the generator runs."
+    },
+    "valueSets": {
+      "type": "object",
+      "properties": {
+        "sets": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Name",
+                "description": "What a binding refers to this set by."
+              },
+              "connection": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Connection",
+                "description": "Which configured database connection to run the query against. Leave empty when only one is configured.",
+                "x-choices": "server"
+              },
+              "query": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Query",
+                "description": "The query producing the values — `SELECT [Code] FROM Shop_OrderStatus ORDER BY [Code]`. The first column is the value; a second column, if there is one, is shown beside it as a label."
+              },
+              "values": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Values",
+                "description": "The values written out, for a set with no database behind it. Ignored when a query is set."
+              },
+              "caseSensitive": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "title": "Match casing exactly",
+                "description": "Off by default, because the comparison the code does usually is case-insensitive too."
+              }
+            },
+            "title": "Set",
+            "description": "One set of allowed values, and where they come from."
+          },
+          "title": "Sets",
+          "description": "The named sets of values. Each is a query against a configured connection, or a list written out here."
+        },
+        "bindings": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "set": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Set",
+                "description": "Which set this member's values come from.",
+                "x-choices": "server"
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the member. Leave empty to match the member on any class."
+              },
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Member",
+                "description": "The method, property or field name, or `Item` for an indexer."
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."
+              },
+              "valueIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Value is parameter",
+                "description": "Which parameter carries the value, counted from 0. Leave empty for a property, a field, or a method whose return value is one of the set."
+              }
+            },
+            "title": "Binding",
+            "description": "One member, and the set its values come from. A method with a parameter position takes the value as that argument; a method without one returns it; a property or field holds it, and every literal compared or assigned to it is checked.",
+            "x-shape": {
+              "kind": "member",
+              "type": "containingType",
+              "member": "memberName",
+              "parameters": "parameterTypes",
+              "positions": {
+                "valueIndex": "value"
+              }
+            }
+          },
+          "title": "Where they are written",
+          "description": "The members in C# whose strings come from a set."
+        },
+        "unknownValueDiagnostic": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Report unknown values",
+          "description": "VAL0001 — a string that is not one of its set's values. Only ever reported for a set that loaded completely: an unreachable database says nothing rather than something wrong."
+        },
+        "severity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Report them as",
+          "description": "How loudly VAL0001 is reported. An error by default, because a code the table does not have is a branch that can never be taken. Soften it while a codebase catches up.",
+          "enum": [
+            "error",
+            "warning",
+            "information"
+          ]
+        }
+      },
+      "title": "Value sets",
+      "description": "Sets of allowed string values that live outside the compilation — the rows of a lookup table — and the members in C# that have to be one of them."
     },
     "debugger": {
       "type": "object",

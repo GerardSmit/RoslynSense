@@ -797,8 +797,11 @@ function itemField(
         return select;
     }
 
-    if (type === 'array' && schema['x-choices'] === 'server') {
-        return choiceListField(name, `${listPath.join('.')}[].${name}`, value);
+    if (schema['x-choices'] === 'server') {
+        const path = `${listPath.join('.')}[].${name}`;
+        return type === 'array'
+            ? choiceListField(name, path, value)
+            : choiceSelectField(name, path, value);
     }
 
     const input = document.createElement('input');
@@ -849,7 +852,7 @@ function choiceListField(name: string, path: string, value: unknown): HTMLElemen
         if (rows.length === 0) {
             const empty = document.createElement('p');
             empty.className = 'item-help';
-            empty.textContent = 'No conventions are defined yet.';
+            empty.textContent = 'Nothing to choose from yet.';
             box.append(empty);
             return;
         }
@@ -891,6 +894,50 @@ function choiceListField(name: string, path: string, value: unknown): HTMLElemen
     );
 
     return box;
+}
+
+/**
+ * One string chosen from what the rest of the file offers — which value set a binding names, which
+ * connection a set queries.
+ *
+ * The list arrives after the control does, so it is drawn twice: once with whatever the file
+ * already says, and again once the answer comes back. A value the answer does not contain stays in
+ * the list, marked — a binding naming a set that was renamed is wrong and should look wrong, not
+ * quietly become the first option in the dropdown.
+ */
+function choiceSelectField(name: string, path: string, value: unknown): HTMLElement {
+    const select = document.createElement('select');
+    select.dataset.field = name;
+    select.dataset.kind = 'text';
+
+    const current = value === undefined || value === null ? '' : String(value);
+
+    const draw = (offered: readonly SettingsMsg.Choice[]) => {
+        select.textContent = '';
+        addOption(select, '', 'Default');
+
+        for (const choice of offered) {
+            addOption(
+                select,
+                choice.value,
+                choice.detail ? `${choice.value} — ${choice.detail}` : choice.value
+            );
+        }
+
+        if (current !== '' && !offered.some((choice) => choice.value === current)) {
+            addOption(select, current, `${current} (not defined in this file)`);
+        }
+
+        select.value = current;
+    };
+
+    draw([]);
+    askHost<SettingsMsg.SettingChoices>(
+        (token) => ({ type: 'askChoices', token, path }),
+        (message) => draw(message.items)
+    );
+
+    return select;
 }
 
 /** The field's value for the file, or undefined when it should be omitted from the item. */

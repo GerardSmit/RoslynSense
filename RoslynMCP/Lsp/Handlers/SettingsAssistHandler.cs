@@ -38,6 +38,8 @@ internal static class SettingsAssistHandler
         new(p.Path switch
         {
             "resources.lookups[].fallbacks" => ConventionIds(p.Config),
+            "valueSets.bindings[].set" => ValueSetIds(p.Config),
+            "valueSets.sets[].connection" => ConnectionAliases(p.Config),
             _ => [],
         });
 
@@ -71,6 +73,90 @@ internal static class SettingsAssistHandler
 
         return convention.FixedName is { Length: > 0 } name ? $"{where}, {name}" : where;
     }
+
+    /// <summary>
+    /// The value sets declared in the file being edited.
+    /// </summary>
+    /// <remarks>
+    /// Read from the raw JSON rather than through <see cref="ValueSetsConfig"/> for the same reason
+    /// the conventions are: a set someone just typed has to be bindable before the file is saved,
+    /// and half-typed JSON does not deserialize. The one field needed is the id.
+    /// </remarks>
+    private static SettingChoice[] ValueSetIds(JsonElement? config)
+    {
+        if (Section(config, "valueSets") is not { } valueSets
+            || !valueSets.TryGetProperty("sets", out var sets)
+            || sets.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        var found = new List<SettingChoice>();
+
+        foreach (var set in sets.EnumerateArray())
+        {
+            if (Text(set, "id") is { Length: > 0 } id)
+                found.Add(new SettingChoice(id, DescribeSet(set)));
+        }
+
+        return [.. found];
+    }
+
+    /// <summary>Where the set's values come from, short enough to sit beside its name.</summary>
+    private static string DescribeSet(JsonElement set)
+    {
+        if (Text(set, "query") is { Length: > 0 } query)
+        {
+            string connection = Text(set, "connection") is { Length: > 0 } alias ? $"{alias}: " : "";
+            return connection + query;
+        }
+
+        return set.TryGetProperty("values", out var values) && values.ValueKind == JsonValueKind.Array
+            ? $"{values.GetArrayLength()} values listed here"
+            : "no query and no values";
+    }
+
+    /// <summary>
+    /// The database connections the file configures, so a set can be pointed at one by name.
+    /// </summary>
+    /// <remarks>
+    /// The file's rather than the server's registered ones, which are a superset: a connection
+    /// added over the wire for one chat is not something a checked-in value set should be resolved
+    /// against, and would not resolve on anyone else's machine.
+    /// </remarks>
+    private static SettingChoice[] ConnectionAliases(JsonElement? config)
+    {
+        if (Section(config, "database") is not { } database
+            || !database.TryGetProperty("connections", out var connections)
+            || connections.ValueKind != JsonValueKind.Object)
+        {
+            return [];
+        }
+
+        var found = new List<SettingChoice>();
+
+        foreach (var connection in connections.EnumerateObject())
+        {
+            if (connection.Name.Length > 0)
+                found.Add(new SettingChoice(connection.Name, Text(connection.Value, "provider")));
+        }
+
+        return [.. found];
+    }
+
+    private static JsonElement? Section(JsonElement? config, string name) =>
+        config is { ValueKind: JsonValueKind.Object } root
+        && root.TryGetProperty(name, out var section)
+        && section.ValueKind == JsonValueKind.Object
+            ? section
+            : null;
+
+    private static string? Text(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object
+        && element.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     private static ResourcesConfig? ResourcesOf(JsonElement? config)
     {

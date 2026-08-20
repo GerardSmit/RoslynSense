@@ -251,6 +251,10 @@
         "title": "RoslynSense: Restart Server"
       },
       {
+        "command": "roslynSense.reloadValueSets",
+        "title": "RoslynSense: Reload Value Sets"
+      },
+      {
         "command": "roslynSense.showEmbeddedProjection",
         "title": "RoslynSense: Show Embedded HTML Projection"
       },
@@ -1313,6 +1317,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Language features for structured logging message templates \u2014 Microsoft.Extensions.Logging, Serilog and NLog. Colours each `{Placeholder}`, completes it from the values the call passes, explains on hover which value it actually prints, and warns when the template and the values disagree or an exception is passed as a value instead of as the first argument. Off leaves the template as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.valuesets": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for strings whose allowed values live outside the code \u2014 the rows of a lookup table, most often. Completes a bound literal from the values themselves, explains on hover what a code means and where it is defined, and reports a string the set does not contain. Needs `valueSets` in `roslynsense.json` to have anything to do. Off leaves those literals as plain strings in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.msbuild": {
           "type": "boolean",

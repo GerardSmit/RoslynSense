@@ -200,6 +200,13 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         breakpoints: false,
     },
     {
+        // Nor this one: a value set is a fact about a string literal, so the C# selector already
+        // covers every file it has anything to say about.
+        id: 'valuesets',
+        extensions: [],
+        breakpoints: false,
+    },
+    {
         // Project files. Contributed as their own language for the same reason as resx: without
         // the id in `contributes.languages` VS Code opens a .csproj as `xml`, the selector below
         // never matches it, and the server is never told the buffer was opened.
@@ -1339,7 +1346,47 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand(
             'roslynSense.dbmlRefreshTable',
             (uri: string, tableName: string) => refreshDbmlTable(uri, tableName)
-        )
+        ),
+        // Value sets are read once and kept, so this is how a migration that added a row reaches
+        // the editor. The id differs from the server command for the reason above.
+        vscode.commands.registerCommand('roslynSense.reloadValueSets', () => reloadValueSets())
+    );
+}
+
+interface ValueSetRefreshResult {
+    ok: boolean;
+    problem?: string;
+    sets: string[];
+}
+
+/**
+ * Re-reads every value set from its database.
+ *
+ * No question to ask first: the sets are declared in `roslynsense.json`, the queries are read-only,
+ * and reloading all of them is both what someone wants after a migration and cheaper than making
+ * them pick one. The server re-pulls diagnostics on its own once the values are back.
+ */
+async function reloadValueSets(): Promise<void> {
+    if (!client) {
+        return;
+    }
+
+    const result = await client.sendRequest<ValueSetRefreshResult>('workspace/executeCommand', {
+        command: 'roslynSense.refreshValueSets',
+        arguments: [],
+    });
+
+    if (!result.ok) {
+        void vscode.window.showWarningMessage(
+            `RoslynSense: ${result.problem ?? 'the value sets could not be reloaded.'}`
+        );
+        return;
+    }
+
+    void vscode.window.showInformationMessage(
+        result.sets.length === 0
+            ? 'RoslynSense: no value sets are configured.'
+            : `RoslynSense: reloaded ${result.sets.length} value set${result.sets.length === 1 ? '' : 's'}.`
     );
 }
 

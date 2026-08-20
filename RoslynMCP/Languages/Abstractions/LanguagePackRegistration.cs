@@ -10,6 +10,7 @@ using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.Values;
 using RoslynMCP.Languages.WebConfig;
 using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Languages.WebForms;
@@ -44,6 +45,8 @@ internal static class LanguagePackRegistration
             packs.Add(new ResourcesLanguage(settings));
         if (settings.Logging.Enabled)
             packs.Add(new LoggingLanguage(settings));
+        if (settings.ValueSets.Enabled)
+            packs.Add(new ValuesLanguage(settings));
         if (settings.MsBuild)
             packs.Add(new MsBuildLanguage());
         if (settings.Dbml)
@@ -78,6 +81,8 @@ internal static class LanguagePackRegistration
             AddPack<ResourcesLanguage>(services);
         if (settings.Logging.Enabled)
             AddPack<LoggingLanguage>(services);
+        if (settings.ValueSets.Enabled)
+            AddPack<ValuesLanguage>(services);
         if (settings.MsBuild)
             AddPack<MsBuildLanguage>(services);
         if (settings.Dbml)

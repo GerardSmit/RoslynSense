@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { State } from 'vscode-languageclient/node';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { onClientReady } from './clientReady';
+import { isUnder, normalisePath } from './paths';
 import { composite, restore, snapshot, UndoStack } from './solutionUndo';
 import type { Snapshot, UndoStep } from './solutionUndo';
 
@@ -1903,15 +1904,6 @@ function draggableOf(nodes: readonly SolutionTreeNode[]): DragItem[] {
 /** Compares two file-system paths the way Windows does. */
 function samePath(a: string, b: string): boolean {
     return normalisePath(a) === normalisePath(b);
-}
-
-function normalisePath(value: string): string {
-    return value.split('\\').join('/').toLowerCase();
-}
-
-function isUnder(path: string, directory: string): boolean {
-    const parent = normalisePath(directory).replace(/\/$/, '');
-    return normalisePath(path).startsWith(parent + '/');
 }
 
 /**

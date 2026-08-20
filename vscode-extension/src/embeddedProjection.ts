@@ -40,25 +40,16 @@ export interface Region {
  * it still parses.
  */
 export function project(text: string): string {
-    const out = text.split('');
-
-    const blank = (start: number, end: number) => {
-        for (let i = Math.max(0, start); i < Math.min(end, out.length); i++) {
-            if (out[i] !== '\n' && out[i] !== '\r') {
-                out[i] = ' ';
-            }
-        }
-    };
-
     // `<%@ %>` directives, `<% %>` blocks, `<%= %>` and `<%# %>` expressions, `<%$ %>` builders and
     // `<%-- --%>` comments are all one shape once the terminator is picked.
+    const islands: Span[] = [];
     for (let i = text.indexOf('<%'); i >= 0; i = text.indexOf('<%', i)) {
         const comment = text.startsWith('<%--', i);
         const terminator = comment ? '--%>' : '%>';
         const found = text.indexOf(terminator, i + (comment ? 4 : 2));
         const end = found < 0 ? text.length : found + terminator.length;
 
-        blank(i, end);
+        islands.push({ start: i, end });
         i = end;
     }
 
@@ -66,15 +57,124 @@ export function project(text: string): string {
     // original. A `<script runat="server">` written inside a `<%-- --%>` comment, or quoted in a
     // code block, is not an element — and pairing that phantom open tag with the next real
     // `</script>` blanks the live JavaScript between them and takes the whole region with it.
-    const withoutIslands = out.join('');
+    const withoutIslands = blanked(text, islands);
 
     // The tags around a server script are what say it is C#, so the whole element goes; leaving
     // them would have the HTML service read the class inside as JavaScript.
-    for (const element of serverScripts(withoutIslands)) {
-        blank(element.start, element.end);
+    return blanked(withoutIslands, serverScripts(withoutIslands));
+}
+
+/** A stretch of the page, as the blanking passes hand it around. */
+interface Span {
+    start: number;
+    end: number;
+}
+
+/** `\n` and `\r` as the codes the blanking scan compares against. */
+const LF = 10;
+const CR = 13;
+
+/**
+ * `text` with every span in `spans` turned to spaces, copied a run at a time.
+ *
+ * What this used to be was `text.split('')`, a write per character and a `join('')` — one string
+ * object for every character of the page, twice over, on a projection that is rebuilt on every
+ * keystroke of a document that may be half a megabyte. Emitted here instead is the untouched
+ * stretch before each span verbatim, then the span as spaces, then the tail: the same bytes the
+ * character walk produced, out of a handful of slices rather than a million of them.
+ *
+ * Line breaks survive blanking at the offset they were at, which is the contract the whole
+ * projection rests on. A run of spaces that swallowed a `\n` would pull every line after the span
+ * up by one, and a completion asked for at line 40 of the page would be answered for line 39 of
+ * the projection.
+ *
+ * Two things about `spans` are relied on rather than repaired, because both callers already
+ * produce them and repairing them would cost a sort the projection does not need:
+ *
+ * Spans arrive in ascending order of `start`. Nothing here re-orders them, so a caller that broke
+ * that would have the page emitted out of sequence rather than merely mis-blanked. Both current
+ * callers produce them in order; a future one that did not has its offending span dropped rather
+ * than throwing, because this runs inside completion, hover and signature help, and an exception
+ * there costs the user the feature outright while one unblanked span costs them one wrong
+ * suggestion.
+ *
+ * A later span may still begin inside an earlier one. `openTags` resumes its scan at the body of
+ * the tag it just found, so a `<script runat="server">` nested in another one is reported a second
+ * time over ground already covered. Writing a space over a space cost the character walk nothing;
+ * copying runs it would emit that ground twice and lengthen the projection, so the overlap is
+ * clamped off the front of the span and a span that ends at or before what has been emitted is
+ * dropped outright.
+ */
+function blanked(text: string, spans: readonly Span[]): string {
+    if (spans.length === 0) {
+        return text;
     }
 
-    return out.join('');
+    const parts: string[] = [];
+    let cursor = 0;
+    let previous = -1;
+
+    for (const span of spans) {
+        if (span.start < previous) {
+            continue;
+        }
+        previous = span.start;
+
+        const end = Math.min(span.end, text.length);
+        const start = Math.max(cursor, span.start);
+        if (end <= start) {
+            continue;
+        }
+
+        parts.push(text.slice(cursor, start));
+        blankInto(parts, text, start, end);
+        cursor = end;
+    }
+
+    parts.push(text.slice(cursor));
+
+    return parts.join('');
+}
+
+/** The spaces one span becomes, with the line breaks inside it left standing where they were. */
+function blankInto(parts: string[], text: string, start: number, end: number): void {
+    let at = start;
+
+    while (at < end) {
+        // Walked a character at a time rather than found with `indexOf`, which searches to the end
+        // of the string and so would run the length of the page for every span that holds no break
+        // at all — on a minified single-line file with a hundred islands in it, the whole file a
+        // hundred times over. This walk never leaves the span, and the spans together are the page.
+        let plain = at;
+        while (plain < end) {
+            const code = text.charCodeAt(plain);
+            if (code === LF || code === CR) {
+                break;
+            }
+            plain++;
+        }
+
+        if (plain > at) {
+            parts.push(' '.repeat(plain - at));
+        }
+
+        // A CRLF, or a run of blank lines, comes over in one slice rather than one push per
+        // character.
+        let breaks = plain;
+        while (breaks < end) {
+            const code = text.charCodeAt(breaks);
+            if (code !== LF && code !== CR) {
+                break;
+            }
+            breaks++;
+        }
+
+        if (breaks > plain) {
+            parts.push(text.slice(plain, breaks));
+        }
+
+        at = breaks;
+    }
 }
 
 /**

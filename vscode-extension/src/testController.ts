@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { onClientReady } from './clientReady';
 import { DEBUG_TYPE } from './debugLaunch';
+import { isUnder } from './paths';
 
 /**
  * Test Explorer backed by the shared solution: discovery is a Roslyn walk in the daemon (not a
@@ -278,27 +279,66 @@ export function registerTestController(
 
     // Saving a test file can add or remove tests; rediscovering the owning project is cheap
     // because the daemon already holds the compilation.
+    //
+    // The saved files pile up in a set that the timer drains, rather than the timer closing over
+    // one document. The timer exists to coalesce a "Save All" into a single pass, and a captured
+    // document is whichever file VS Code happened to fire last — so every other project in that
+    // save kept its stale test list, with nothing to say so.
+    const savedPaths = new Set<string>();
     let rediscoverTimer: NodeJS.Timeout | undefined;
     context.subscriptions.push(
         vscode.workspace.onDidSaveTextDocument((document) => {
             if (document.languageId !== 'csharp') {
                 return;
             }
+            savedPaths.add(document.uri.fsPath);
             clearTimeout(rediscoverTimer);
             rediscoverTimer = setTimeout(() => {
+                // Drained whether or not there is a client: with no server nothing has been
+                // discovered yet, so there is no stale list for these saves to correct, and
+                // holding on to them would only grow the set for the rest of the session.
+                const saved = [...savedPaths];
+                savedPaths.clear();
                 const client = getClient();
-                if (!client) {
-                    return;
-                }
-                for (const [projectPath, item] of projectItems) {
-                    if (!document.uri.fsPath.startsWith(dirname(projectPath))) {
-                        continue;
-                    }
-                    void discoverTests(client, controller, item, projectPath, testData).catch(() => undefined);
+                if (client) {
+                    void rediscoverSaved(client, controller, projectItems, saved, testData);
                 }
             }, 500);
         })
     );
+}
+
+/**
+ * Rediscovers each test project that owns at least one of the saved files, once per project
+ * rather than once per file.
+ *
+ * Sequential, the way discoverAll is, and deliberately not a fan-out of `void discoverTests(...)`:
+ * every discovery pulls its project through the single load gate on the server, so starting them
+ * together does not finish them any sooner and does park every unrelated request behind the whole
+ * batch.
+ *
+ * The ownership test is `isUnder` and not a prefix test on the raw strings, for two reasons that
+ * both cost more than they look. `document.uri.fsPath` comes back from VS Code with a lower-cased
+ * drive letter while `projectPath` carries MSBuild's casing, so a case-sensitive comparison
+ * matches nothing at all and on-save rediscovery quietly never runs. And without a separator
+ * boundary `Foo.Tests` claims every save inside its sibling `Foo.Tests.Integration` — which is not
+ * merely a wasted redraw, because discovering an unexpanded project drags it through that same
+ * load gate and a cold `dotnet restore` for a file it does not contain.
+ */
+async function rediscoverSaved(
+    client: LanguageClient,
+    controller: vscode.TestController,
+    projectItems: Map<string, vscode.TestItem>,
+    savedPaths: string[],
+    testData: Map<string, DiscoveredTest>
+): Promise<void> {
+    for (const [projectPath, item] of projectItems) {
+        const projectDirectory = dirname(projectPath);
+        if (!savedPaths.some((saved) => isUnder(saved, projectDirectory))) {
+            continue;
+        }
+        await discoverTests(client, controller, item, projectPath, testData).catch(() => undefined);
+    }
 }
 
 async function discoverProjects(

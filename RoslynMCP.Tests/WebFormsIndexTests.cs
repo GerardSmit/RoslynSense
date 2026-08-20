@@ -54,6 +54,32 @@ public class WebFormsIndexTests
         Assert.Equal("Label", heading.TagName);
     }
 
+    /// <summary>
+    /// Every ID-bearing ancestor is recorded, outermost first.
+    /// </summary>
+    /// <remarks>
+    /// Every one, not only the naming containers among them: whether a control is one is a
+    /// question about its type, and this index holds names on purpose. The <c>&lt;form&gt;</c> is
+    /// therefore in the chain even though it contributes nothing to a rendered <c>ClientID</c>,
+    /// which is why the consumer matches the chain as an ordered subsequence rather than exactly.
+    /// </remarks>
+    [Fact]
+    public async Task AControlRecordsTheControlsItSitsInside()
+    {
+        var index = await WebFormsIndex.GetAsync(FixturePaths.RepeaterAspxFile, default);
+
+        // Inside an <ItemTemplate>, which sits outside the child hierarchy — the nesting a plain
+        // walk of it loses, and the only nesting a pasted ClientID is ever about.
+        var nested = index!.Controls.Single(c => c.Id == "lblName");
+        Assert.Equal(["form1", "rptItems"], nested.Ancestors.ToArray());
+
+        var repeater = index.Controls.Single(c => c.Id == "rptItems");
+        Assert.Equal(["form1"], repeater.Ancestors.ToArray());
+
+        var form = index.Controls.Single(c => c.Id == "form1");
+        Assert.Empty(form.Ancestors);
+    }
+
     [Fact]
     public async Task TheSpanOfAnIdIsWhereTheIdIsWritten()
     {

@@ -181,6 +181,31 @@ public class LanguageSessionTests : IDisposable
         Assert.DoesNotContain(disabled, s => IsMarkup(s.Location.Uri));
     }
 
+    /// <summary>
+    /// A disabled pack does not claim a query either.
+    /// </summary>
+    /// <remarks>
+    /// Search Everywhere is the one place a pack's answer <em>replaces</em> the ordinary one
+    /// rather than joining it, so a pack that answered a connection that had switched it off would
+    /// not merely add a row — it would take the whole result over.
+    /// </remarks>
+    [Fact]
+    public async Task ADisabledPackClaimsNoSearchQuery()
+    {
+        var registry = Published();
+        await RoslynTestHelpers.OpenProjectAsync(FixturePaths.AspxProjectFile);
+
+        // A pasted ClientID, which means nothing to the ordinary search: any hit for it is the
+        // WebForms pack's and nobody else's.
+        var query = new SearchEverywhereParams("form1_rptItems_ctl00_lblName");
+
+        var enabled = await SearchEverywhereHandler.SearchAsync(query, default, With(registry, true));
+        Assert.Contains(enabled.Items, i => IsMarkup(i.Uri));
+
+        var disabled = await SearchEverywhereHandler.SearchAsync(query, default, With(registry, false));
+        Assert.DoesNotContain(disabled.Items, i => IsMarkup(i.Uri));
+    }
+
     [Fact]
     public async Task ADisabledPackIsLeftOutOfTheWorkspaceSweep()
     {

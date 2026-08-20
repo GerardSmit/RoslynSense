@@ -175,6 +175,14 @@ The language features are the same ones C# gets, resolved against the markup's o
   itself rather than at the generated projection, so the result is a file you can open.
 - **Go to symbol in workspace (Ctrl+T)** sees markup: control IDs, the page and control classes
   named by `Inherits`, and user controls registered with `<%@ Register %>`.
+- **A pasted runtime ID** resolves to the control that declares it. `dnn_ctr1848_Orders_View_btnGo`
+  — or the `$`-separated `UniqueID` form — is what you have in front of you when a rendered page
+  misbehaves, and it is the one thing the ordinary search cannot answer: its generated segments
+  match no declaration, and a control inside an `<ItemTemplate>` has no code-behind field to match
+  in the first place. The containers are matched as well as the ID, so a `lblTotal` declared under
+  three different repeaters resolves to the right one. An ID whose containers match nothing
+  resolves to nothing rather than to the nearest same-named control, and an ID that stops at a
+  container names the file.
 - **Linked editing** ties an open tag to its closing tag — renaming `<asp:Panel>` retypes
   `</asp:Panel>` as you go. Typing the `>` that finishes an open tag writes the closing tag for
   you in the first place, and `<%--` finishes its own comment.

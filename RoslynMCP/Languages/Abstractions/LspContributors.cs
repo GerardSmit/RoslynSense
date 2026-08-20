@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Lsp.Search;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
 namespace RoslynMCP.Languages;
@@ -274,6 +275,26 @@ internal interface ISymbolFreeReferenceProvider
 internal interface ILanguageWorkspaceSymbolProvider
 {
     Task<IReadOnlyList<SymbolInformation>> WorkspaceSymbolsAsync(
+        string query, Solution solution, CancellationToken ct);
+}
+
+/// <summary>
+/// A query the pack recognises as one of its own, for the Search Everywhere panel.
+/// </summary>
+/// <remarks>
+/// Separate from <see cref="ILanguageWorkspaceSymbolProvider"/>, which adds the pack's declarations
+/// to whatever the generic search found. This one is for a query that means nothing to the generic
+/// matcher at all — a pasted runtime control id, say — where adding rows underneath a list of
+/// typo-corrected guesses would bury the only real answer. A non-empty return therefore
+/// <em>replaces</em> the generic result rather than joining it.
+/// <para>
+/// Returning <c>[]</c> is the normal case and must stay cheap: this is asked on every keystroke in
+/// the picker, so a pack decides from the query text before it looks at a single file.
+/// </para>
+/// </remarks>
+internal interface ILanguageSearchContributor
+{
+    Task<IReadOnlyList<SearchHit>> SearchAsync(
         string query, Solution solution, CancellationToken ct);
 }
 

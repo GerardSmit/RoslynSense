@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis;
+using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Lsp.Search;
 using RoslynMCP.Services;
@@ -11,7 +13,7 @@ internal static class SearchEverywhereHandler
     private const int MaxResults = 200;
 
     public static async Task<SearchEverywhereResult> SearchAsync(
-        SearchEverywhereParams p, CancellationToken ct)
+        SearchEverywhereParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         // A search that ran while the solution was still loading used to answer out of whatever
         // subset happened to be loaded, which reads as "Ctrl+T does not find my type" rather than
@@ -35,9 +37,10 @@ internal static class SearchEverywhereHandler
 
         // One extra result is asked for so the client can say "there are more" without the server
         // having to count everything it threw away.
-        var hits = await SearchEverywhere.SearchAsync(
-            solution, p.Query, limit + 1, ct,
-            only: only, includeMetadata: p.IncludeMetadata);
+        var hits = await ClaimedAsync(p.Query, solution, only, languages, ct)
+            ?? await SearchEverywhere.SearchAsync(
+                solution, p.Query, limit + 1, ct,
+                only: only, includeMetadata: p.IncludeMetadata);
 
         bool truncated = hits.Count > limit;
         var items = hits
@@ -54,6 +57,50 @@ internal static class SearchEverywhereHandler
             .ToArray();
 
         return new SearchEverywhereResult(items, truncated);
+    }
+
+    /// <summary>
+    /// The packs' answer when one of them recognises the query as its own, or null when none does.
+    /// </summary>
+    /// <remarks>
+    /// Replaces the ordinary search rather than joining it, which is the contract on
+    /// <see cref="ILanguageSearchContributor"/>: a query a pack claims — a pasted runtime control
+    /// id — means nothing to the generic matcher, so what it would contribute underneath is a list
+    /// of typo-corrected guesses with the real answer buried in it.
+    /// <para>
+    /// The kind filter is applied here rather than in the packs, so that a pack answers what it
+    /// knows and the tab decides what it wants. A claim that survives the filter with nothing left
+    /// is no claim: the Classes tab falls through to the ordinary search rather than going blank.
+    /// </para>
+    /// </remarks>
+    private static async Task<IReadOnlyList<SearchHit>?> ClaimedAsync(
+        string query, Solution solution, SearchItemKind? only,
+        LanguageSession? languages, CancellationToken ct)
+    {
+        List<SearchHit>? claimed = null;
+
+        foreach (var contributor in
+                 LanguageScope.Of(languages).Contributors<ILanguageSearchContributor>())
+        {
+            var hits = await contributor.SearchAsync(query, solution, ct);
+            if (hits.Count == 0)
+                continue;
+
+            (claimed ??= []).AddRange(hits);
+        }
+
+        if (claimed is null)
+            return null;
+
+        var kept = only is { } kind
+            ? claimed.Where(hit => hit.Kind == kind).ToList()
+            : claimed;
+
+        if (kept.Count == 0)
+            return null;
+
+        kept.Sort((a, b) => a.Score.CompareTo(b.Score));
+        return kept;
     }
 
     public static async Task<ResolveMetadataResult?> ResolveMetadataAsync(

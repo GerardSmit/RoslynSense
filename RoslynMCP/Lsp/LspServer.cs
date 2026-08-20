@@ -630,7 +630,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/searchEverywhere", UseSingleObjectParameterDeserialization = true)]
     public Task<SearchEverywhereResult> SearchEverywhere(SearchEverywhereParams p, CancellationToken ct) =>
-        Handlers.SearchEverywhereHandler.SearchAsync(p, ct);
+        Handlers.SearchEverywhereHandler.SearchAsync(p, ct, _languages);
 
     [JsonRpcMethod("roslynSense/searchText", UseSingleObjectParameterDeserialization = true)]
     public Task<SearchTextResult> SearchText(SearchTextParams p, CancellationToken ct) =>

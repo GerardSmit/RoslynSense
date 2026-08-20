@@ -10,8 +10,21 @@ using WebFormsCore.Nodes;
 namespace RoslynMCP.Languages.WebForms.Core;
 
 /// <summary>A control the markup declares, and where its <c>ID</c> attribute value is written.</summary>
+/// <param name="Ancestors">
+/// The <c>ID</c>s of the server controls it sits inside, outermost first.
+/// </param>
+/// <remarks>
+/// <paramref name="Ancestors"/> records every ID-bearing ancestor rather than only the naming
+/// containers, and deliberately. Which ancestors a runtime <c>ClientID</c> actually names is a
+/// question about types — whether each implements <c>INamingContainer</c> — and this index holds
+/// names rather than symbols on purpose. Matching a ClientID against the chain as an ordered
+/// subsequence is the rule that survives either way: an ancestor that is not a naming container
+/// simply never appears in the ClientID, and the item containers a data-bound control creates at
+/// runtime appear in the ClientID with no markup counterpart at all.
+/// </remarks>
 internal readonly record struct WebFormsControlId(
-    string Id, string? Prefix, string TagName, LinePositionSpan Span);
+    string Id, string? Prefix, string TagName, LinePositionSpan Span,
+    ImmutableArray<string> Ancestors);
 
 /// <summary>An <c>On…</c> attribute and the method name it names.</summary>
 /// <remarks>
@@ -216,7 +229,7 @@ internal static class WebFormsIndex
                     {
                         controls.Add(new WebFormsControlId(
                             value.Value, element.Namespace?.Value, element.Name.Value,
-                            value.Range));
+                            value.Range, Ancestors(element)));
                     }
 
                     continue;
@@ -240,6 +253,33 @@ internal static class WebFormsIndex
             Handlers = handlers.ToImmutable(),
             Registrations = registrations.ToImmutable(),
         };
+    }
+
+    /// <summary>The <c>ID</c>s of the server controls an element sits inside, outermost first.</summary>
+    /// <remarks>
+    /// <c>Node.Parent</c> is set for the contents of a template too, so a <c>&lt;asp:Label&gt;</c>
+    /// inside an <c>&lt;ItemTemplate&gt;</c> correctly reports the repeater around it — which is
+    /// the whole nesting a pasted <c>ClientID</c> is made of.
+    /// </remarks>
+    private static ImmutableArray<string> Ancestors(ElementNode element)
+    {
+        List<string>? ids = null;
+
+        for (var parent = element.Parent; parent is not null; parent = parent.Parent)
+        {
+            if (IsServerControl(parent)
+                && parent.RawAttributes.TryGetValue("ID", out var id)
+                && id.Value.Length > 0)
+            {
+                (ids ??= []).Add(id.Value);
+            }
+        }
+
+        if (ids is null)
+            return [];
+
+        ids.Reverse();
+        return [.. ids];
     }
 
     /// <summary>

@@ -31,6 +31,7 @@ import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
 import { bindNestedCodeActions, registerNestedCodeActions } from './nestedCodeActions';
+import { lensesToPreResolve } from './codeLensPrewarm';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -765,6 +766,14 @@ async function startClient(
                 bindNestedCodeActions(actions, clientKey);
                 return actions;
             },
+            // A refreshed lens list kills the previous list's command keys while the editor is
+            // still drawing the previous list's anchors, so an unresolved lens is clickable and
+            // dead for as long as its resolve takes. Resolving the ones on screen before handing
+            // the list over closes that window. See codeLensPrewarm.ts.
+            provideCodeLenses: async (document, token, next) => {
+                const lenses = await next(document, token);
+                return lenses ? preResolveVisibleLenses(document, lenses, token) : lenses;
+            },
         },
         // Sent at initialize so the very first analyzer pass already runs under the user's
         // settings; changes afterwards go through workspace/didChangeConfiguration.
@@ -1091,6 +1100,87 @@ async function runTestFromLens(
     terminal.show();
     const project = projectPath ? ` "${projectPath}"` : '';
     terminal.sendText(`dotnet test${project} --filter "FullyQualifiedName~${fullyQualifiedName}"`);
+}
+
+/**
+ * How long the lens list waits for the pre-resolve before going out unresolved.
+ *
+ * The failure this guards is worse than the one it fixes: a resolve that blocks on the project
+ * load gate would hold back every lens in the document, so a file that showed stale-but-visible
+ * lenses would show none at all. Past the deadline the list goes out as it came, the editor
+ * resolves it the usual way, and the requests already in flight are not wasted — the server
+ * memoizes a resolve, so the editor's own round trip finds the answer waiting.
+ */
+const LENS_PRE_RESOLVE_TIMEOUT_MS = 400;
+
+/**
+ * Resolve the lenses on screen before the editor is handed the list they belong to.
+ *
+ * See codeLensPrewarm.ts for why this exists and what it costs. The one rule that matters here is
+ * that nothing in it may reject: a middleware that throws loses every lens in the document, which
+ * is a far louder bug than the one being fixed.
+ */
+async function preResolveVisibleLenses(
+    document: vscode.TextDocument,
+    lenses: vscode.CodeLens[],
+    token: vscode.CancellationToken,
+): Promise<vscode.CodeLens[]> {
+    const active = client;
+
+    if (!active) {
+        return lenses;
+    }
+
+    const visible = vscode.window.visibleTextEditors
+        .filter((editor) => editor.document === document)
+        .flatMap((editor) => editor.visibleRanges);
+
+    const chosen = lensesToPreResolve(lenses, visible);
+
+    if (chosen.length === 0) {
+        return lenses;
+    }
+
+    const resolving = Promise.allSettled(
+        chosen.map(async (index) => {
+            // asCodeLens carries `data` across only for the client's own ProtocolCodeLens, which is
+            // what `next` returned; anything else round-trips as a bare range and comes back
+            // uncommanded, which the merge below then declines to take.
+            const sent = active.code2ProtocolConverter.asCodeLens(lenses[index]);
+            const answer = (await active.sendRequest('codeLens/resolve', sent, token)) as typeof sent;
+
+            return [index, active.protocol2CodeConverter.asCodeLens(answer)] as const;
+        }),
+    );
+
+    let expire: ReturnType<typeof setTimeout> | undefined;
+
+    const outcomes = await Promise.race([
+        resolving,
+        new Promise<undefined>((resolve) => {
+            expire = setTimeout(() => resolve(undefined), LENS_PRE_RESOLVE_TIMEOUT_MS);
+        }),
+    ]);
+
+    if (expire !== undefined) {
+        clearTimeout(expire);
+    }
+
+    if (outcomes === undefined) {
+        return lenses;
+    }
+
+    const merged = lenses.slice();
+
+    for (const outcome of outcomes) {
+        // A lens that came back without a command is no better than the one already in the list,
+        // and swapping it in would only discard the `data` the editor still needs to resolve it.
+        if (outcome.status === 'fulfilled' && outcome.value[1]?.command) {
+            merged[outcome.value[0]] = outcome.value[1];
+        }
+    }
+
+    return merged;
 }
 
 function registerLensCommands(context: vscode.ExtensionContext): void {

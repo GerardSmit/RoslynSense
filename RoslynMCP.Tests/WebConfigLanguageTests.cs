@@ -351,6 +351,36 @@ public class WebConfigLanguageTests
         Assert.Equal("1 reference", await LensTitleAsync("WrappedConnection"));
     }
 
+    /// <summary>
+    /// The count arrives with the lens, not one resolve later.
+    /// </summary>
+    /// <remarks>
+    /// Not an optimisation — the lens is unclickable until it is commanded, in a way that is
+    /// invisible. VS Code keeps drawing the previous list's anchors while a refreshed list is being
+    /// resolved, and the key behind those anchors dies with the list they came in; a click in that
+    /// window reports a command that does not exist. During a solution load, when a refresh goes
+    /// out every few seconds and each resolve waits on the project gate, that window is most of the
+    /// time the file is open. The tests above still go through <c>ResolveCodeLensAsync</c>, which
+    /// is what holds the two paths to the same answer for a client that resolves anyway.
+    /// </remarks>
+    [Fact]
+    public async Task AConfigLensIsClickableBeforeAnyoneResolvesIt()
+    {
+        var pack = new WebConfigLanguage();
+        string uri = LspConverters.PathToUri(FixturePaths.AspxWebConfigFile);
+
+        var lenses = await pack.CodeLensAsync(new CodeLensParams(new TextDocumentIdentifier(uri)), default);
+        var lens = lenses.Single(l => l.Data is { } d && LensName(d) == "CdnRoot");
+
+        Assert.Equal("3 references", lens.Command?.Title);
+        Assert.Equal("roslynSense.showReferences", lens.Command?.Name);
+
+        // The peek's own payload, which is the part VS Code drops when the list it came in is
+        // replaced — its presence here is what a commanded lens buys.
+        var locations = Assert.IsType<LspLocation[]>(lens.Command!.Arguments![3]);
+        Assert.Equal(3, locations.Length);
+    }
+
     private static async Task<string?> LensTitleAsync(string name)
     {
         var pack = new WebConfigLanguage();

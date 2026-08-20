@@ -38,10 +38,23 @@ internal sealed partial class WebConfigLanguage : ILanguageCodeLensProvider, ILa
     /// A count over every <c>&lt;add&gt;</c> in both sections.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Emitted even when nothing reads the file, for the same reason the appsettings pack does:
     /// "0 references" over a setting nothing reads is the finding, not noise. A config file that
     /// has outlived three rewrites of the application it configures is exactly where the zeros
     /// are worth having.
+    /// </para>
+    /// <para>
+    /// Counted here rather than at resolve, which is the same choice the override-chain lens beside
+    /// it already makes and for the same reason: the answer is a bucketing of an index this call
+    /// has already built, not a search. It is also what makes the lens survive a refresh. VS Code
+    /// hands any command carrying arguments to an internal delegate keyed to the lens list it came
+    /// in, and drops the key the moment a new list arrives — but the widget keeps drawing the old
+    /// anchor until the new list is resolved. A lens that arrives already commanded re-renders a
+    /// live key in the same message that killed the old one; one that arrives bare leaves a
+    /// clickable anchor wired to a dead key for as long as its resolve takes, which during a
+    /// solution load is seconds, and a click in that window reports a command that does not exist.
+    /// </para>
     /// </remarks>
     public async Task<LspCodeLens[]> CodeLensAsync(CodeLensParams p, CancellationToken ct)
     {
@@ -56,6 +69,7 @@ internal sealed partial class WebConfigLanguage : ILanguageCodeLensProvider, ILa
         var lines = view.Text.Lines;
         var lenses = new List<LspCodeLens>();
         var external = await MetadataConfigurationIndex.GetAsync(view.Project, ct);
+        var usages = WebConfigReferenceService.UsagesByName(view);
 
         foreach (var entry in view.Document.Entries)
         {
@@ -67,8 +81,16 @@ internal sealed partial class WebConfigLanguage : ILanguageCodeLensProvider, ILa
             var start = lines.GetLinePosition(entry.NameSpan.Start);
             var range = LspConverters.ToRange(lines, entry.NameSpan);
 
-            lenses.Add(new LspCodeLens(range, Command: null)
+            lenses.Add(new LspCodeLens(
+                range,
+                ReferenceCommand(
+                    uri,
+                    start.Line,
+                    start.Character,
+                    usages.GetValueOrDefault(new SettingKey(entry.Section, entry.Name), [])))
             {
+                // Kept even though the command is already here: an LSP client is free to resolve
+                // anyway, and the answer it gets back has to be the same one.
                 Data = new CodeLensData(uri, start.Line, start.Character, ReferencesKind),
             });
 
@@ -94,16 +116,21 @@ internal sealed partial class WebConfigLanguage : ILanguageCodeLensProvider, ILa
 
         var locations = await LensLocationsAsync(data, ct);
 
-        // A zero-count lens still carries the command with an empty location list: LSP requires a
-        // non-empty command id, and an empty peek is a sane result for a click.
         return lens with
         {
-            Command = new Command(
-                $"{locations.Length} {(locations.Length == 1 ? "reference" : "references")}",
-                "roslynSense.showReferences",
-                [data.Uri, data.Line, data.Character, locations.Take(MaxLensLocations).ToArray()]),
+            Command = ReferenceCommand(data.Uri, data.Line, data.Character, locations),
         };
     }
+
+    /// <summary>The click, wherever the count was taken.</summary>
+    /// <remarks>A zero-count lens still carries the command with an empty location list: LSP
+    /// requires a non-empty command id, and an empty peek is a sane result for a click.</remarks>
+    private static Command ReferenceCommand(
+        string uri, int line, int character, LspLocation[] locations) =>
+        new(
+            $"{locations.Length} {(locations.Length == 1 ? "reference" : "references")}",
+            "roslynSense.showReferences",
+            [uri, line, character, locations.Take(MaxLensLocations).ToArray()]);
 
     private static async Task<LspLocation[]> LensLocationsAsync(CodeLensData data, CancellationToken ct)
     {

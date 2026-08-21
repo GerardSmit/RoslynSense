@@ -19,6 +19,7 @@ import { additionalConfigGlobs, homeDirectory, loadLayers } from './roslynsenseC
 import { registerTestController, runTestById } from './testController';
 import { registerImpactedTests } from './impactedTests';
 import { registerCoverageMapProgress } from './coverageMapProgress';
+import { registerProjectSet } from './projectSet';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerSearchEverywhere } from './search';
@@ -3192,6 +3193,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerDebugLaunch(context, () => client);
     registerTestController(context, () => client);
     registerCoverageMapProgress(context, () => client);
+    registerProjectSet(context, () => client);
     registerImpactedTests(context, () => client);
     registerCoverageExplorer(context, () => client);
     registerSolutionExplorer(context, () => client);

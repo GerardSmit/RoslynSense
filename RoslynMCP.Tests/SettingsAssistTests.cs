@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
@@ -35,6 +35,18 @@ public class SettingsAssistTests
 
             public class ProductModule : ModuleBase
             {
+            }
+
+            public interface ILocalizedControl
+            {
+            }
+
+            public static class LocalizedControlExtensions
+            {
+                public static string GetString(this ILocalizedControl control, string key) => key;
+
+                public static string GetString(
+                    this ILocalizedControl control, string key, string suffix) => key;
             }
         }
         """;
@@ -86,6 +98,42 @@ public class SettingsAssistTests
         Assert.Equal(["bool", "string"], matched.Parameters.Select(p => p.Type));
     }
 
+    /// <summary>
+    /// An extension method is matched the way it is called, without the receiver.
+    /// </summary>
+    /// <remarks>
+    /// A signature is written by looking at a call — <c>control.GetString(key)</c> names one
+    /// argument — and this page lists members declared on the static class, which name two. The
+    /// two lists disagreeing meant a correct entry reported "0 of 2 match", which is the page
+    /// saying the opposite of the truth about the only thing it is for.
+    /// </remarks>
+    [Fact]
+    public async Task AnExtensionMethodIsMatchedTheWayItIsCalled()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.LocalizedControlExtensions", "GetString", ["System.String"]));
+
+        Assert.Equal(2, result.Matches.Length);
+
+        var matched = Assert.Single(result.Matches, match => match.Matched);
+        Assert.Equal("GetString(string key)", matched.Signature);
+    }
+
+    /// <summary>
+    /// And its parameters start at the first argument, so the key's position is the one the call
+    /// site counts.
+    /// </summary>
+    [Fact]
+    public async Task AnExtensionMethodSParametersStartAtTheFirstArgument()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.LocalizedControlExtensions", "GetString", ["System.String", "*"]));
+
+        var matched = result.Matches.Single(match => match.Matched);
+
+        Assert.Equal(["key", "suffix"], matched.Parameters.Select(p => p.Name));
+    }
+
     /// <summary>Both spellings of a built-in, the same as the binding rules accept.</summary>
     [Theory]
     [InlineData("string")]
@@ -130,7 +178,7 @@ public class SettingsAssistTests
     {
         var result = await ShapeAsync(new MemberShapeParams("Contoso.Web.ModuleBse", "GetString"));
 
-        Assert.Empty(result.Matches);
+        Assert.Null(result.ResolvedType);
         Assert.NotNull(result.Problem);
 
         // And the near miss is offered, because the failure is almost always a typo or a namespace.
@@ -162,14 +210,70 @@ public class SettingsAssistTests
 
     /// <summary>
     /// Leaving the class empty is the documented escape hatch, not a mistake, so it is explained
-    /// rather than reported.
+    /// rather than reported — and the methods of that name are offered, because the ordinary
+    /// reason for the field being empty is not knowing the namespace.
     /// </summary>
     [Fact]
-    public async Task NoClassAtAllIsExplainedRatherThanTreatedAsAnError()
+    public async Task NoClassAtAllIsExplainedAndAnsweredWithTheMethodsOfThatName()
     {
         var result = await ShapeAsync(new MemberShapeParams(ContainingType: "", MemberName: "GetString"));
 
+        Assert.Contains("any class", result.Problem!, StringComparison.OrdinalIgnoreCase);
+
+        // Every class declaring one, so the namespace is something to be chosen rather than known.
+        Assert.Contains(result.Matches, m => m.DeclaredBy == "Contoso.Web.ModuleBase");
+        Assert.Contains(result.Matches, m => m.DeclaredBy == "Contoso.Web.LocalizedControlExtensions");
+
+        // No class was settled on, which is how the page knows these are candidates rather than
+        // the overloads of one method.
+        Assert.Null(result.ResolvedType);
+    }
+
+    /// <summary>
+    /// A class that does not resolve is still a container word: the search grammar is the one
+    /// Ctrl+T uses, so what was typed narrows the answer instead of voiding it.
+    /// </summary>
+    [Fact]
+    public async Task AClassThatDoesNotResolveNarrowsTheSearchRatherThanEndingIt()
+    {
+        var result = await ShapeAsync(new MemberShapeParams("Contoso", "GetString"));
+
+        Assert.NotEmpty(result.Matches);
+        Assert.All(result.Matches, m => Assert.StartsWith("Contoso.", m.DeclaredBy, StringComparison.Ordinal));
+
+        // A container nothing lives under keeps its own answer, rather than falling back to every
+        // method of that name in the solution.
+        var elsewhere = await ShapeAsync(new MemberShapeParams("Fabrikam", "GetString"));
+        Assert.Empty(elsewhere.Matches);
+    }
+
+    /// <summary>
+    /// The search walks every declaration in the solution and runs on a keystroke. One or two
+    /// characters name nothing anyone was looking for.
+    /// </summary>
+    [Fact]
+    public async Task TwoCharactersDoNotSearchTheSolution()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(ContainingType: "", MemberName: "Ge"));
+
+        Assert.Empty(result.Matches);
         Assert.Contains("any type", result.Problem!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A searched method is written down the way it is called, which for an extension method is
+    /// not the way it is declared.
+    /// </summary>
+    [Fact]
+    public async Task ASearchedExtensionMethodDropsItsReceiverToo()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(ContainingType: "", MemberName: "GetString"));
+
+        var extension = result.Matches.Single(
+            m => m.DeclaredBy == "Contoso.Web.LocalizedControlExtensions" && m.Parameters.Length == 1);
+
+        Assert.Equal("key", extension.Parameters[0].Name);
+        Assert.Equal("GetString(string key)", extension.Signature);
     }
 
     // ---- The values a setting can take -------------------------------------------------------

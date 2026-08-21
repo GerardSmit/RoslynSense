@@ -67,10 +67,34 @@ internal static class MemberSignature
         type.ToDisplayString(TypeName).Equals(expected, StringComparison.Ordinal)
         || type.ToDisplayString(FrameworkTypeName).Equals(expected, StringComparison.Ordinal);
 
+    /// <summary>
+    /// The parameters a call site writes, which for an extension method is not all of them.
+    /// </summary>
+    /// <remarks>
+    /// <c>control.GetString(key)</c> and <c>Extensions.GetString(control, key)</c> are the same
+    /// method and are bound to two different symbols: Roslyn hands the first a reduced one whose
+    /// parameters start at <c>key</c>, and the second the static one whose parameters start at the
+    /// receiver. A configured signature is written by looking at a call, so it names what the call
+    /// names — and the settings page, which lists members declared on the static class, was showing
+    /// the other list. Both are normalised to the reduced form here so the two agree, which is the
+    /// entire reason this file is shared.
+    /// </remarks>
+    public static ImmutableArray<IParameterSymbol> CallParameters(ISymbol member)
+    {
+        var parameters = Parameters(member);
+
+        // `MethodKind.ReducedExtension` has already dropped it; an extension method still in its
+        // declared form has not.
+        return member is IMethodSymbol { IsExtensionMethod: true, MethodKind: MethodKind.Ordinary }
+            && parameters.Length > 0
+                ? parameters.RemoveAt(0)
+                : parameters;
+    }
+
     /// <summary>Whether a member's parameters are positionally what the signature named.</summary>
     public static bool Matches(ISymbol member, ImmutableArray<string> expected)
     {
-        var parameters = Parameters(member);
+        var parameters = CallParameters(member);
 
         if (parameters.Length != expected.Length)
             return false;

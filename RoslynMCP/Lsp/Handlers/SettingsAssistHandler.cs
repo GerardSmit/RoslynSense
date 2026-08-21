@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
@@ -26,6 +26,16 @@ internal static class SettingsAssistHandler
 {
     /// <summary>Enough to choose from; more than a dropdown should ever show.</summary>
     private const int MaxSuggestions = 30;
+
+    /// <summary>
+    /// How much of a method name has to be typed before the solution is searched for it.
+    /// </summary>
+    /// <remarks>
+    /// The search walks every declaration in the solution, and this runs on a keystroke rather
+    /// than on a keypress the way Ctrl+T does. One or two characters name nothing anyone was
+    /// looking for and would find several thousand things.
+    /// </remarks>
+    private const int MinimumSearch = 3;
 
     // ---- Choices ---------------------------------------------------------------------------------
 
@@ -200,27 +210,47 @@ internal static class SettingsAssistHandler
         string type = (p.ContainingType ?? "").Trim();
         string member = (p.MemberName ?? "").Trim();
 
+        int max = p.MaxResults is > 0 and <= 50 ? p.MaxResults : 20;
+
         // A shape with no type is the deliberate escape hatch — it matches any type declaring a
         // member of that name — so it is a state to be helped through, not an error.
         if (type.Length == 0)
         {
+            if (member.Length == 0)
+            {
+                return new MemberShapeResult(
+                    [], [], [],
+                    Problem: "Name a class and a method, or a method on its own to match it on "
+                        + "any class.");
+            }
+
+            var anywhere = await SearchAsync(solution, member, max, ct);
+
             return new MemberShapeResult(
-                [], [], [],
-                Problem: member.Length == 0
-                    ? "Name a type, or leave it empty to match any type declaring this member."
-                    : "Matching any type that declares this member.");
+                [], [], anywhere,
+                Problem: anywhere.Length == 0
+                    ? "Matching any type that declares this member."
+                    : "Matching any class that declares this method. Choose one below to name "
+                        + "its class.");
         }
 
         var resolved = await ResolveAsync(solution, type, ct);
 
         if (resolved is null)
         {
-            // Said even when there are near names to offer. The suggestions are the remedy, not a
-            // reason to keep quiet about the miss: an entry naming a type that is not there is
-            // exactly the silent failure this whole answer exists to break.
+            // The whole line handed to the search box's own grammar: `DotNetNuke.GetString` means
+            // a method called GetString somewhere under DotNetNuke, and somebody writing a lookup
+            // knows the method they saw at a call site and not the namespace it was declared in.
+            var anywhere = await SearchAsync(solution, $"{type}.{member}", max, ct);
+
+            // The miss is said even when there are near names to offer. The suggestions are the
+            // remedy, not a reason to keep quiet about it: an entry naming a type that is not
+            // there is exactly the silent failure this whole answer exists to break.
             return new MemberShapeResult(
-                await TypeSuggestionsAsync(solution, type, ct), [], [],
-                Problem: $"No type named '{type}' in this solution or its references.");
+                await TypeSuggestionsAsync(solution, type, ct), [], anywhere,
+                Problem: anywhere.Length > 0
+                    ? $"No class named '{type}'. Choose a method below to name its class."
+                    : $"No type named '{type}' in this solution or its references.");
         }
 
         var declared = Members(resolved).ToList();
@@ -246,13 +276,13 @@ internal static class SettingsAssistHandler
                 (m.ContainingType?.ToDisplayString(MemberSignature.DeclarationName)) ?? "",
                 Spelling(m),
                 Signature(m),
-                [.. MemberSignature.Parameters(m).Select(
+                [.. MemberSignature.CallParameters(m).Select(
                     parameter => new MemberShapeParameter(
                         parameter.Name, parameter.Type.ToDisplayString(MemberSignature.TypeName)))],
                 expected is not { } wanted || MemberSignature.Matches(m, wanted)))
             .OrderByDescending(m => m.Matched)
             .ThenBy(m => m.Parameters.Length)
-            .Take(p.MaxResults is > 0 and <= 50 ? p.MaxResults : 20)
+            .Take(max)
             .ToArray();
 
         return new MemberShapeResult(
@@ -265,13 +295,54 @@ internal static class SettingsAssistHandler
                 : null);
     }
 
+    /// <summary>
+    /// Methods of that name anywhere in the solution, as the shapes that would name them.
+    /// </summary>
+    /// <remarks>
+    /// The answer to "I know the method and not the namespace it lives in", which is the ordinary
+    /// state of someone writing one of these: they are looking at a call site, where the namespace
+    /// is a <c>using</c> at the top of some other file. Ranked by
+    /// <see cref="SearchEverywhere.FindMethodsAsync"/> so the query grammar is the one Ctrl+T
+    /// already taught them — a leading word narrows by container.
+    /// </remarks>
+    private static async Task<MemberShapeMatch[]> SearchAsync(
+        Solution solution, string query, int max, CancellationToken ct)
+    {
+        if (Named(query).Length < MinimumSearch)
+            return [];
+
+        var found = await SearchEverywhere.FindMethodsAsync(solution, query, max, ct);
+
+        return [.. found.Select(method => new MemberShapeMatch(
+            method.ContainingType.ToDisplayString(MemberSignature.DeclarationName),
+            Spelling(method),
+            Signature(method),
+            [.. MemberSignature.CallParameters(method).Select(
+                parameter => new MemberShapeParameter(
+                    parameter.Name, parameter.Type.ToDisplayString(MemberSignature.TypeName)))],
+            // Every one of them is a method that could be named here; which overload a signature
+            // then selects is the question asked once a class is settled on.
+            Matched: true))];
+    }
+
+    /// <summary>The part of a query that names the thing rather than where it lives.</summary>
+    private static string Named(string query)
+    {
+        int dot = query.LastIndexOf('.');
+        return dot < 0 ? query : query[(dot + 1)..];
+    }
+
     /// <summary>The name a configured shape writes: an indexer is <c>Item</c>, as the CLR has it.</summary>
     private static string Spelling(ISymbol member) =>
         member is IPropertySymbol { IsIndexer: true } ? "Item" : member.Name;
 
+    /// <summary>
+    /// The member as a call site writes it, which is the form a configured signature is written
+    /// against — so an extension method loses the receiver it is invoked on.
+    /// </summary>
     private static string Signature(ISymbol member)
     {
-        var parameters = MemberSignature.Parameters(member).Select(
+        var parameters = MemberSignature.CallParameters(member).Select(
             parameter => $"{parameter.Type.ToDisplayString(s_shortType)} {parameter.Name}");
 
         return member is IPropertySymbol { IsIndexer: true }

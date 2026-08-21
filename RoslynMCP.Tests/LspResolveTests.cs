@@ -110,8 +110,13 @@ public class LspResolveTests
         finally
         {
             RoslynMCP.Services.OpenDocumentStore.Close(session, path);
-            // Close's reconcile runs on a background task; settle it here so the next test's
-            // disk-computed positions meet a workspace already restored to the disk text.
+
+            // Closing announces the revert; it does not wait for it. A didClose notification has
+            // nowhere to return a Task to, so the workspace is put back on a background thread —
+            // and until it is, the process-wide workspace still holds the line this test typed.
+            // Awaiting the reconcile is the one thing the notification handler cannot do and a
+            // test can; without it the next test in this collection completes against text that
+            // moved every line below it, and asks Roslyn about a position off the end of one.
             await RoslynMCP.Services.WorkspaceService.ReconcileOpenBufferAsync(path);
         }
     }

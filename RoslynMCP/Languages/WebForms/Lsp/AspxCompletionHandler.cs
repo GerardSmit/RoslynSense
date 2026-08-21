@@ -102,7 +102,8 @@ internal static class AspxCompletionHandler
         AspxDocument document, int offset, AspxProjection projection, int projected,
         LspCompletionContext? trigger, CancellationToken ct)
     {
-        if (await RoslynEmbeddedLanguages.Current.DetectAsync(projection.Document, projected, ct) is not
+        if (await RoslynEmbeddedLanguages.Current.DetectForCompletionAsync(
+                projection.Document, projected, ct) is not
             { Language: IEmbeddedCompletionProvider embedded } context)
         {
             return null;

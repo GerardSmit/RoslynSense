@@ -62,13 +62,16 @@ internal sealed partial class FormattingLanguage : IConfiguredStringLanguage
     /// value and two in the file.</param>
     /// <param name="Declared">The family the annotation named, for the literals Roslyn claimed and
     /// whose value this pack never saw.</param>
+    /// <param name="DeclaredKind">Likewise the annotation's answer to which of that family's
+    /// components apply — <c>DateOnlyFormat</c> names a value with no time of day on it.</param>
     private readonly record struct FormatAt(
         FormatSite Site,
         string Text,
         SyntaxToken Token,
         int Offset,
         bool Exact,
-        FormatFamily Declared)
+        FormatFamily Declared,
+        FormatValueKind DeclaredKind)
     {
         /// <summary>A span inside the format text, as a span in the document.</summary>
         /// <remarks>
@@ -87,8 +90,15 @@ internal sealed partial class FormattingLanguage : IConfiguredStringLanguage
         public FormatFamily Family(int index) =>
             Value(index) is { } value ? Or(FormatFamilies.Of(value.Type)) : Declared;
 
+        /// <summary>Which of that grammar's components the hole's value can be printed with.</summary>
+        public FormatValueKind Kind(int index) =>
+            Value(index) is { } value ? Or(FormatFamilies.KindOf(value.Type)) : DeclaredKind;
+
         private FormatFamily Or(FormatFamily found) =>
             found == FormatFamily.Unknown ? Declared : found;
+
+        private FormatValueKind Or(FormatValueKind found) =>
+            found == FormatValueKind.Any ? DeclaredKind : found;
     }
 
     private static FormatAt? Resolve(EmbeddedStringContext context, CancellationToken ct)
@@ -120,7 +130,8 @@ internal sealed partial class FormattingLanguage : IConfiguredStringLanguage
 
         return new FormatAt(
             site, token.ValueText, token, token.SpanStart + prefix, exact,
-            Declared(context.Identifier));
+            Declared(context.Identifier),
+            DeclaredKind(context.Identifier));
     }
 
     /// <summary>The family an annotation named, when one did.</summary>
@@ -129,6 +140,18 @@ internal sealed partial class FormattingLanguage : IConfiguredStringLanguage
         "NumericFormat" => FormatFamily.Number,
         SpecifierSyntax or "DateOnlyFormat" or "TimeOnlyFormat" => FormatFamily.Date,
         _ => FormatFamily.Unknown,
+    };
+
+    /// <summary>Which of that family's components the annotation left available.</summary>
+    /// <remarks>
+    /// The two narrow annotations are the whole of it: <c>DateTimeFormat</c> sits on parameters
+    /// that take a <c>DateTime</c> and a <c>DateOnly</c> alike, so it rules nothing out.
+    /// </remarks>
+    private static FormatValueKind DeclaredKind(string identifier) => identifier switch
+    {
+        "DateOnlyFormat" => FormatValueKind.WithoutTime,
+        "TimeOnlyFormat" => FormatValueKind.WithoutDate,
+        _ => FormatValueKind.Any,
     };
 
     /// <summary>

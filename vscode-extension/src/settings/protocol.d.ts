@@ -99,14 +99,67 @@ declare namespace SettingsMsg {
         readonly problem?: string;
     }
 
-    type ToView = State | ConnectionCompletions | ConnectionsResolved | SettingChoices | MemberShape;
+    /**
+     * The server can answer things it could not a moment ago — it connected, or it finished
+     * loading a solution. Every control that was told "nothing yet" asks again.
+     */
+    interface Resolvable {
+        readonly type: 'resolvable';
+    }
 
-    /** Write one setting into the selected scope. `value: null` unsets it. */
-    interface SetSetting {
-        readonly type: 'set';
+    /**
+     * The pending edits reached the file, so the page can stop holding them.
+     *
+     * Its own message rather than a flag on the state that follows it: a state also arrives when
+     * somebody else edits the file, and clearing on that one would throw away edits nobody had
+     * saved yet.
+     */
+    interface Saved {
+        readonly type: 'saved';
+    }
+
+    type ToView =
+        | State
+        | ConnectionCompletions
+        | ConnectionsResolved
+        | SettingChoices
+        | MemberShape
+        | Resolvable
+        | Saved;
+
+    /**
+     * The webview has loaded and holds nothing yet.
+     *
+     * A handshake rather than a post at wire time, because the page is built by a script that may
+     * not have run when the panel is created — and because VS Code reloads it whenever it likes,
+     * which used to leave an empty form behind.
+     */
+    interface Ready {
+        readonly type: 'ready';
+    }
+
+    /**
+     * One setting changed, not yet written. `value: null` unsets it.
+     *
+     * Reported to the host as it happens even though nothing is written until a save, because the
+     * host is the half that outlives the page: closing the tab is what asks whether to keep these,
+     * and by then the webview is gone.
+     */
+    interface EditSetting {
+        readonly type: 'edit';
         readonly scope: Scope;
         readonly path: readonly string[];
         readonly value: unknown;
+    }
+
+    /** Write every pending edit. */
+    interface SaveSettings {
+        readonly type: 'save';
+    }
+
+    /** Drop every pending edit and show what is on disk again. */
+    interface DiscardEdits {
+        readonly type: 'discard';
     }
 
     /** Switch which scope the form edits. */
@@ -151,7 +204,10 @@ declare namespace SettingsMsg {
     }
 
     type ToHost =
-        | SetSetting
+        | Ready
+        | EditSetting
+        | SaveSettings
+        | DiscardEdits
         | SelectScope
         | OpenFile
         | CompleteConnection

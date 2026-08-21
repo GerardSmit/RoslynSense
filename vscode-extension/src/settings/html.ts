@@ -32,13 +32,15 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 <body>
 
 <header class="chrome">
-  <div class="scope-row">
-    <span class="scope-label">Editing</span>
-    <nav id="scopes" role="tablist" aria-label="Settings scope"></nav>
-  </div>
-  <p id="scope-file" class="scope-file"></p>
-  <div class="search-row">
+  <div class="toolbar">
     <input id="search" type="search" placeholder="Search settings" aria-label="Search settings">
+    <span id="pending" class="pending" role="status"></span>
+    <button id="discard" class="linklike" type="button" hidden>Discard</button>
+    <button id="save" class="save" type="button" disabled>Save</button>
+  </div>
+  <div class="scope-row">
+    <nav id="scopes" role="tablist" aria-label="Settings scope"></nav>
+    <p id="scope-file" class="scope-file"></p>
   </div>
   <p id="notice" class="notice" role="status" hidden></p>
 </header>
@@ -48,7 +50,8 @@ export function html(webview: vscode.Webview, extensionUri: vscode.Uri): string 
 
 <footer class="status">
   <span class="hint">Values shown are the ones in effect. Later scopes override earlier ones,
-  field by field — a note under a setting says when its value comes from another scope.</span>
+  field by field — a note under a setting says when its value comes from another scope. Changes
+  are written when you save.</span>
 </footer>
 
 <script nonce="${nonce}" src="${script}"></script>

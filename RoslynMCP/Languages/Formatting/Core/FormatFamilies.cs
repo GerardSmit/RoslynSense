@@ -31,23 +31,15 @@ internal static class FormatFamilies
 
     public static FormatFamily Of(ITypeSymbol? type)
     {
-        if (type is null)
+        if (Unwrapped(type) is not { } value)
             return FormatFamily.Unknown;
-
-        // `DateTime?` formats exactly as `DateTime` does — the hole renders the value, and a null
-        // one renders as empty rather than as a different grammar.
-        if (type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } nullable
-            && nullable.TypeArguments.Length == 1)
-        {
-            type = nullable.TypeArguments[0];
-        }
 
         // An enum's specifiers are its own small set (G, D, X, F) and none of them is a date or a
         // number pattern, so neither grammar describes it.
-        if (type.TypeKind == TypeKind.Enum)
+        if (value.TypeKind == TypeKind.Enum)
             return FormatFamily.Unknown;
 
-        switch (type.SpecialType)
+        switch (value.SpecialType)
         {
             case SpecialType.System_DateTime:
                 return FormatFamily.Date;
@@ -66,8 +58,55 @@ internal static class FormatFamilies
                 return FormatFamily.Number;
         }
 
-        return s_dateTypes.Contains(type.ToDisplayString(MemberSignature.DeclarationName))
+        return s_dateTypes.Contains(value.ToDisplayString(MemberSignature.DeclarationName))
             ? FormatFamily.Date
             : FormatFamily.Unknown;
     }
+
+    /// <summary>
+    /// What the value can be printed with, within its grammar.
+    /// </summary>
+    /// <remarks>
+    /// The family says which language the specifier is written in; this says which of its words the
+    /// value knows. Both distinctions are about the same failure: a specifier the value rejects
+    /// does not print oddly, it throws — <c>D5</c> on a <c>double</c> and <c>HH</c> on a
+    /// <c>DateOnly</c> are both a <c>FormatException</c> at run time, from a line that compiled.
+    /// </remarks>
+    public static FormatValueKind KindOf(ITypeSymbol? type)
+    {
+        if (Unwrapped(type) is not { } value)
+            return FormatValueKind.Any;
+
+        if (value.SpecialType is SpecialType.System_SByte
+            or SpecialType.System_Byte
+            or SpecialType.System_Int16
+            or SpecialType.System_UInt16
+            or SpecialType.System_Int32
+            or SpecialType.System_UInt32
+            or SpecialType.System_Int64
+            or SpecialType.System_UInt64)
+        {
+            return FormatValueKind.WholeNumber;
+        }
+
+        return value.ToDisplayString(MemberSignature.DeclarationName) switch
+        {
+            "System.DateOnly" => FormatValueKind.WithoutTime,
+            "System.TimeOnly" => FormatValueKind.WithoutDate,
+            _ => FormatValueKind.Any,
+        };
+    }
+
+    /// <summary>
+    /// The type behind a <c>Nullable&lt;T&gt;</c>, which formats exactly as its <c>T</c> does: the
+    /// hole renders the value, and a null one renders as empty rather than as another grammar.
+    /// </summary>
+    private static ITypeSymbol? Unwrapped(ITypeSymbol? type) =>
+        type is INamedTypeSymbol
+        {
+            OriginalDefinition.SpecialType: SpecialType.System_Nullable_T,
+            TypeArguments.Length: 1,
+        } nullable
+            ? nullable.TypeArguments[0]
+            : type;
 }

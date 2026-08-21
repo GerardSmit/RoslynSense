@@ -43,6 +43,10 @@ internal static class InheritanceMarkersHandler
 
     private static async Task<InheritanceMarker[]> ComputeAsync(Document document, CancellationToken ct)
     {
+        // Frozen, as Roslyn's inheritance margin binds: markers re-compute on every typing pause,
+        // and the real solution would pay a full rebind plus a generator run each time.
+        document = await document.FreezeAsync(ct);
+
         var root = await document.GetSyntaxRootAsync(ct);
         var text = await document.GetTextAsync(ct);
         var model = await document.GetSemanticModelAsync(ct);

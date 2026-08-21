@@ -28,10 +28,18 @@ public sealed record TextDocumentClientCapabilities(
     [property: JsonPropertyName("completion")] CompletionClientCapabilities? Completion = null);
 
 public sealed record CompletionClientCapabilities(
-    [property: JsonPropertyName("completionItem")] CompletionItemClientCapabilities? CompletionItem);
+    [property: JsonPropertyName("completionItem")] CompletionItemClientCapabilities? CompletionItem,
+    [property: JsonPropertyName("completionList")] CompletionListClientCapabilities? CompletionList = null);
 
 public sealed record CompletionItemClientCapabilities(
     [property: JsonPropertyName("snippetSupport")] bool SnippetSupport);
+
+/// <summary>The names of the fields this client will read off
+/// <c>CompletionList.itemDefaults</c> — "editRange", "data", "commitCharacters",
+/// "insertTextFormat", "insertTextMode". A field not named here must still be sent per item:
+/// hoisting it would leave the client with no value at all.</summary>
+public sealed record CompletionListClientCapabilities(
+    [property: JsonPropertyName("itemDefaults")] string[]? ItemDefaults);
 
 /// <summary>Workspace-side capabilities. The refresh flags say whether the client will honor
 /// a server-initiated "re-request everything" nudge; sending one to a client that doesn't

@@ -10,9 +10,10 @@ using RoslynDiagnostic = Microsoft.CodeAnalysis.Diagnostic;
 namespace RoslynMCP.Lsp.Handlers;
 
 /// <summary>Diagnostics for one document — shared by push (<see cref="DiagnosticsPublisher"/>)
-/// and pull (textDocument/diagnostic). Compiler diagnostics are cheap and always computed;
-/// analyzer diagnostics ride the <see cref="AnalyzerDiagnosticCache"/> so they never block a
-/// keystroke or a pull.</summary>
+/// and pull (textDocument/diagnostic). Compiler diagnostics ride the
+/// <see cref="CompilerDiagnosticCache"/> so the several requesters of one typing pause bind the
+/// file once between them; analyzer diagnostics ride the <see cref="AnalyzerDiagnosticCache"/> so
+/// they never block a keystroke or a pull.</summary>
 internal static class DiagnosticsHandler
 {
     /// <summary>Compiler diagnostics only — the fast pass.</summary>
@@ -39,9 +40,8 @@ internal static class DiagnosticsHandler
         if (document is null)
             return Array.Empty<Protocol.Diagnostic>();
 
-        return WithEmbedded(
-            ToProtocol(await CompilerDiagnosticsAsync(document, ct)),
-            await EmbeddedDiagnosticsAsync(document, ct));
+        var compiler = await CompilerDiagnosticCache.GetOrComputeAsync(document, ct);
+        return WithEmbedded(ToProtocol(compiler.Compiler), compiler.Embedded);
     }
 
     /// <summary>Compiler plus analyzer diagnostics, computing the analyzer pass if it is not
@@ -69,11 +69,11 @@ internal static class DiagnosticsHandler
         if (document is null)
             return Array.Empty<Protocol.Diagnostic>();
 
-        var compiler = await CompilerDiagnosticsAsync(document, ct);
+        // Phase 2 of the push runs over the same text phase 1 just bound, ~1500ms later; the cache
+        // is what stops the second phase paying for the bind again.
+        var compiler = await CompilerDiagnosticCache.GetOrComputeAsync(document, ct);
         var analyzer = await AnalyzerDiagnosticCache.GetOrComputeAsync(document, ct);
-        return WithEmbedded(
-            ToProtocol(Merge(compiler, analyzer)),
-            await EmbeddedDiagnosticsAsync(document, ct));
+        return WithEmbedded(ToProtocol(Merge(compiler.Compiler, analyzer)), compiler.Embedded);
     }
 
     /// <summary>
@@ -107,15 +107,6 @@ internal static class DiagnosticsHandler
     private static Protocol.Diagnostic[] WithEmbedded(
         Protocol.Diagnostic[] diagnostics, IReadOnlyList<Protocol.Diagnostic> embedded) =>
         embedded.Count == 0 ? diagnostics : [.. diagnostics, .. embedded];
-
-    private static async Task<ImmutableArray<RoslynDiagnostic>> CompilerDiagnosticsAsync(
-        Document document, CancellationToken ct)
-    {
-        var model = await document.GetSemanticModelAsync(ct);
-        return model is null
-            ? ImmutableArray<RoslynDiagnostic>.Empty
-            : model.GetDiagnostics(cancellationToken: ct);
-    }
 
     /// <summary>Union of both sources, deduplicated on id + span: an analyzer reporting what the
     /// compiler already reported must not draw two squiggles.</summary>
@@ -299,7 +290,10 @@ internal static class DiagnosticsHandler
         if (resultId is not null && p.PreviousResultId == resultId)
             return new UnchangedDocumentDiagnosticReport("unchanged", resultId);
 
-        var compiler = await CompilerDiagnosticsAsync(document, ct);
+        // Keyed on the version already derived above — the same key the resultId is built from, so
+        // the re-pull the background analyzer pass asks for, where only the marker moved from "c"
+        // to "a", is answered without binding the file a second time.
+        var compiler = await CompilerDiagnosticCache.GetOrComputeAsync(document, ct, version);
 
         // Only when there is a version to cache against. A null-version pass bypasses the cache
         // entirely, so it can never satisfy the next request — it would recompute, ask for a
@@ -309,9 +303,7 @@ internal static class DiagnosticsHandler
 
         return new FullDocumentDiagnosticReport(
             "full",
-            WithEmbedded(
-                ToProtocol(Merge(compiler, analyzer)),
-                await EmbeddedDiagnosticsAsync(document, ct)))
+            WithEmbedded(ToProtocol(Merge(compiler.Compiler, analyzer)), compiler.Embedded))
         {
             ResultId = resultId,
         };

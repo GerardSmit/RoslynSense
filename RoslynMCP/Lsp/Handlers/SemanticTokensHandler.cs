@@ -226,6 +226,10 @@ internal static class SemanticTokensHandler
         if (document is null)
             return Array.Empty<int>();
 
+        // Frozen, as Roslyn's LSP classifies: tokens re-compute per keystroke and only need this
+        // document's tree bound against whatever compilation state already exists.
+        document = await document.FreezeAsync(ct);
+
         var text = await document.GetTextAsync(ct);
         var classified = window is null
             ? new TextSpan(0, text.Length)

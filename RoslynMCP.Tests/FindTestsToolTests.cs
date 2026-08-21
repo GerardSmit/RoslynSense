@@ -5,8 +5,14 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 [Collection(SharedState.Name)]
-public class FindTestsToolTests
+public class FindTestsToolTests : IAsyncLifetime
 {
+    // These tests anchor markup against the file as it is on disk. A preceding test's buffer
+    // close reconciles on a background task, so wait for the mirror to quiesce first.
+    public Task InitializeAsync() => WorkspaceService.ReconcileOpenBufferAsync(FixturePaths.CalculatorFile);
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
     [Fact]
     public async Task WhenSymbolHasNoTestReferencesThenReturnsNoTestsMessage()
     {

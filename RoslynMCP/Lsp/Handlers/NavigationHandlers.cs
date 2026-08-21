@@ -257,13 +257,81 @@ internal static class NavigationHandlers
 
         var locations = new List<Microsoft.CodeAnalysis.Location>();
 
-        foreach (var referenced in await SymbolFinder.FindReferencesAsync(symbol, solution, ct))
+        // The options Visual Studio's Find All References runs under. The default forwarded by the
+        // public overload cascades the inheritance hierarchy in both directions, so a search
+        // started on one interface implementation also searches every sibling implementation —
+        // members that can never reach the one that was asked about.
+        foreach (var referenced in await SymbolFinder.FindReferencesAsync(
+                     symbol, solution,
+                     FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol), ct))
         {
             if (includeDeclaration)
                 locations.AddRange(referenced.Definition.Locations.Where(l => l.IsInSource));
             locations.AddRange(referenced.Locations.Select(r => r.Location));
         }
 
+        return await MergeContributedAsync(locations, symbol, project, ct, languages, waitForCompleteScope);
+    }
+
+    /// <summary>
+    /// The reference count behind a code lens, and the locations its click peeks at.
+    /// </summary>
+    /// <remarks>
+    /// A lens renders a number and peeks at most <paramref name="cap"/> locations, and every
+    /// visible lens re-resolves on every scroll and every edit, so this is deliberately not
+    /// <see cref="AllReferencesAsync"/>: the search runs implicitly (serial scheduler,
+    /// unidirectional cascade) and stops as soon as the cap is exceeded. Contributors are asked
+    /// unchanged — a pack's count is the whole reason a mediator handler's lens is not "0".
+    /// </remarks>
+    /// <returns>
+    /// The locations found, and whether the search was stopped by the cap — in which case the
+    /// count is a lower bound and must be rendered as such.
+    /// </returns>
+    public static async Task<(LspLocation[] Locations, bool Capped)> CountedReferencesAsync(
+        ISymbol symbol, Project project, int cap, CancellationToken ct,
+        LanguageSession? languages = null)
+    {
+        var locations = new List<Microsoft.CodeAnalysis.Location>();
+        bool capped = false;
+
+        using (var collector = new CappedReferenceCollector(cap, ct))
+        {
+            try
+            {
+                await SymbolFinder.FindReferencesAsync(
+                    symbol, project.Solution, collector, documents: null,
+                    s_countingSearch, collector.CancellationToken);
+            }
+            catch (OperationCanceledException) when (collector.CapReached && !ct.IsCancellationRequested)
+            {
+                capped = true;
+            }
+
+            locations.AddRange(collector.Locations);
+        }
+
+        var results = await MergeContributedAsync(
+            locations, symbol, project, ct, languages, waitForCompleteScope: false);
+
+        return (results, capped);
+    }
+
+    /// <summary>
+    /// Implicit, unidirectional: a count in the gutter is nobody's gesture, so it must not run in
+    /// parallel against the typing loop, and it wants the references that could actually reach
+    /// this member rather than everything related to it.
+    /// </summary>
+    private static readonly FindReferencesSearchOptions s_countingSearch =
+        FindReferencesSearchOptions.Default with
+        {
+            Explicit = false,
+            UnidirectionalHierarchyCascade = true,
+        };
+
+    private static async Task<LspLocation[]> MergeContributedAsync(
+        List<Microsoft.CodeAnalysis.Location> locations, ISymbol symbol, Project project,
+        CancellationToken ct, LanguageSession? languages, bool waitForCompleteScope)
+    {
         var results = new List<LspLocation>(await HandlerHelpers.ToLocationsAsync(locations, project, ct));
 
         var contributed = new List<LspLocation>();
@@ -386,16 +454,28 @@ internal static class NavigationHandlers
         if (symbol is null)
             return Array.Empty<DocumentHighlight>();
 
-        // Same-file scope only: pass just this document to the reference search.
-        var references = await SymbolFinder.FindReferencesAsync(
-            symbol, document.Project.Solution, ImmutableHashSet.Create(document), ct);
+        // Same-file scope only, and not by handing the solution-wide engine a document filter:
+        // that filter narrows which documents are read, not which symbols are cascaded to, so one
+        // caret move can still force cross-project compilations. This is the search Roslyn's own
+        // highlighter runs — the dedicated in-documents entry point, and Explicit=false to put it
+        // on the exclusive serial scheduler so it never competes with typing. The entry point
+        // asserts UnidirectionalHierarchyCascade, which the feature options already set.
+        var collector = new StreamingProgressCollector();
+        await SymbolFinder.FindReferencesInDocumentsInCurrentProcessAsync(
+            symbol, document.Project.Solution, collector, ImmutableHashSet.Create(document),
+            FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol) with
+            {
+                Explicit = false,
+            },
+            ct);
 
+        var tree = await document.GetSyntaxTreeAsync(ct);
         var highlights = new List<DocumentHighlight>();
-        foreach (var referenced in references)
+        foreach (var referenced in collector.GetReferencedSymbols())
         {
             foreach (var loc in referenced.Definition.Locations)
             {
-                if (loc.IsInSource && loc.SourceTree == await document.GetSyntaxTreeAsync(ct))
+                if (loc.IsInSource && loc.SourceTree == tree)
                     highlights.Add(new DocumentHighlight(LspConverters.ToRange(loc.GetLineSpan().Span), 1));
             }
             foreach (var refLoc in referenced.Locations)

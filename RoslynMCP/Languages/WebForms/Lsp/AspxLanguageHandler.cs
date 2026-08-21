@@ -423,7 +423,11 @@ internal static class AspxLanguageHandler
     {
         var locations = new List<Microsoft.CodeAnalysis.Location>();
 
-        foreach (var referenced in await SymbolFinder.FindReferencesAsync(symbol, project.Solution, ct))
+        // The options the C# side searches under, so a find-references started in markup and one
+        // started in the code-behind cascade the hierarchy the same way.
+        foreach (var referenced in await SymbolFinder.FindReferencesAsync(
+                     symbol, project.Solution,
+                     FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol), ct))
         {
             if (includeDeclaration)
                 locations.AddRange(referenced.Definition.Locations.Where(l => l.IsInSource));

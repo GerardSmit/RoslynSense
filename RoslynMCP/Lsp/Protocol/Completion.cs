@@ -13,7 +13,35 @@ public sealed record LspCompletionContext(
 
 public sealed record CompletionList(
     [property: JsonPropertyName("isIncomplete")] bool IsIncomplete,
-    [property: JsonPropertyName("items")] CompletionItem[] Items);
+    [property: JsonPropertyName("items")] CompletionItem[] Items)
+{
+    /// <summary>Fields every item in <see cref="Items"/> would otherwise repeat, sent once
+    /// (LSP 3.17). Only filled when the client asked for it in
+    /// <c>textDocument.completion.completionList.itemDefaults</c> — see
+    /// <see cref="RoslynMCP.Lsp.LspClientState.CompletionEditRangeDefault"/>. A client that did
+    /// not ask never sees this member and keeps getting a per-item <c>textEdit</c>.</summary>
+    [JsonPropertyName("itemDefaults")] public CompletionItemDefaults? ItemDefaults { get; init; }
+}
+
+/// <summary>
+/// The per-list defaults an item may leave out. An item that sets the same field itself wins;
+/// the default only applies where the item is silent.
+/// </summary>
+public sealed record CompletionItemDefaults
+{
+    /// <summary>The span a committed item replaces. With this set, an item needs no
+    /// <c>textEdit</c> at all: the client pairs this range with the item's
+    /// <see cref="CompletionItem.TextEditText"/>, or with its label when that is absent too.</summary>
+    [JsonPropertyName("editRange")] public Range? EditRange { get; init; }
+
+    [JsonPropertyName("commitCharacters")] public string[]? CommitCharacters { get; init; }
+
+    [JsonPropertyName("insertTextFormat")] public int? InsertTextFormat { get; init; }
+
+    /// <summary>Resolve payload shared by every item in the list. Left null here: the resolve
+    /// key is a per-item index into the cached Roslyn list, so there is nothing to share.</summary>
+    [JsonPropertyName("data")] public CompletionItemData? Data { get; init; }
+}
 
 public sealed record CompletionItem(
     [property: JsonPropertyName("label")] string Label,
@@ -26,6 +54,13 @@ public sealed record CompletionItem(
     /// <summary>Server-defined resolve payload: round-tripped by the client into
     /// completionItem/resolve. Holds a cache generation + item index.</summary>
     [JsonPropertyName("data")] public CompletionItemData? Data { get; init; }
+
+    /// <summary>What to insert over <see cref="CompletionItemDefaults.EditRange"/> when this item
+    /// has no <see cref="TextEdit"/> of its own — the label is used when this is null too. Only
+    /// worth sending for the items whose commit text differs from what they display (a generic
+    /// type shows <c>List&lt;&gt;</c> and commits <c>List</c>), which is what makes dropping the
+    /// per-item edit safe.</summary>
+    [JsonPropertyName("textEditText")] public string? TextEditText { get; init; }
 
     [JsonPropertyName("documentation")] public MarkupContent? Documentation { get; init; }
 

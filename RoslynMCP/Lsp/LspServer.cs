@@ -135,6 +135,12 @@ internal sealed class LspServer : IDisposable
         _clientRefreshesInlayHints = p.Capabilities?.Workspace?.InlayHint?.RefreshSupport ?? false;
         LspClientState.SnippetSupport =
             p.Capabilities?.TextDocument?.Completion?.CompletionItem?.SnippetSupport ?? false;
+        // Opt-in per field: a client lists the itemDefaults members it honors, and hoisting one it
+        // did not list would drop it on the floor. Only editRange is hoisted today, so only
+        // editRange is asked about.
+        LspClientState.CompletionEditRangeDefault =
+            p.Capabilities?.TextDocument?.Completion?.CompletionList?.ItemDefaults is { } itemDefaults
+            && Array.IndexOf(itemDefaults, "editRange") >= 0;
 
         // Before the capabilities are built: workspaceDiagnostics decides one of them.
         Handlers.ConfigurationHandler.Apply(p.InitializationOptions);
@@ -318,6 +324,11 @@ internal sealed class LspServer : IDisposable
             SourceText.From(p.TextDocument.Text), p.TextDocument.Version);
         if (!_clientPullsDiagnostics)
             _diagnostics?.Schedule(path, immediate: true);
+
+        // A project opened cold has no import-completion index, and completion no longer builds
+        // one on its own thread (see CompletionHandler.s_options) — start it now, before the
+        // first Ctrl+Space needs it.
+        ImportCompletionWarmer.Schedule(path, immediate: true);
     }
 
     /// <remarks>
@@ -403,14 +414,41 @@ internal sealed class LspServer : IDisposable
         if (result is not null && !_clientPullsDiagnostics)
             _diagnostics?.Schedule(path, immediate: false);
         if (result is not null)
+        {
+            // The edit just invalidated this project's import-completion index; rebuild it once
+            // the typing pauses, so the next completion is not served a list that predates it.
+            ImportCompletionWarmer.Schedule(path);
             ScheduleClientRefresh();
+        }
     }
 
     [JsonRpcMethod("textDocument/didSave", UseSingleObjectParameterDeserialization = true)]
     public void DidSave(DidSaveTextDocumentParams p)
     {
+        string savedPath = LspConverters.UriToPath(p.TextDocument.Uri);
         if (!_clientPullsDiagnostics)
-            _diagnostics?.Schedule(LspConverters.UriToPath(p.TextDocument.Uri), immediate: true);
+            _diagnostics?.Schedule(savedPath, immediate: true);
+
+        // Saves are when source-generator output is allowed to move: under the default Automatic
+        // execution this enqueue is a batched no-op, but it is the signal a Balanced-mode host
+        // needs, and wiring it here (with dependent projects bumped by Roslyn) is what makes
+        // switching SourceGeneratorExecutionPreference safe at all. Off the dispatch thread —
+        // resolving the document can trigger a project load.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var document = await LspDocumentResolver.ResolveAsync(savedPath, CancellationToken.None);
+                document?.Project.Solution.Workspace
+                    .EnqueueUpdateSourceGeneratorVersion(document.Project.Id, forceRegeneration: false);
+            }
+            catch (Exception ex)
+            {
+                LspLog.Warn($"Source-generator version bump for '{savedPath}' failed: {ex.Message}",
+                    key: $"sg-bump:{savedPath}");
+            }
+        });
+
         ScheduleClientRefresh();
     }
 

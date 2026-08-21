@@ -260,10 +260,17 @@ internal static class AnalyzerDiagnosticCache
         return run.Diagnostics;
     }
 
+    // Both of these forward to CompilerDiagnosticCache, which holds the other half of the same
+    // document's diagnostics under the same key. Every caller that drops one wants both dropped —
+    // a removed document, a reloaded project, an .editorconfig edit that re-severities compiler
+    // ids as readily as analyzer ones — and forwarding here is what keeps the two from drifting as
+    // call sites are added.
+
     public static void Evict(DocumentId documentId)
     {
         s_entries.TryRemove(documentId, out _);
         s_latestRequested.TryRemove(documentId, out _);
+        CompilerDiagnosticCache.Evict(documentId);
     }
 
     /// <summary>Drops everything — used when analyzer configuration changes (.editorconfig edits).</summary>
@@ -272,6 +279,7 @@ internal static class AnalyzerDiagnosticCache
         s_entries.Clear();
         s_inFlight.Clear();
         s_latestRequested.Clear();
+        CompilerDiagnosticCache.Clear();
     }
 
     private static void Trim()

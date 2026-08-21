@@ -215,4 +215,69 @@ public class WorkspaceServiceTests
             await WorkspaceService.EvictAllAsync();
         }
     }
+
+    /// <summary>
+    /// A file that changed on disk is refreshed into a fork once, not once per request.
+    /// </summary>
+    /// <remarks>
+    /// The refresh forks the solution, and the fork used to be discarded with the request that
+    /// made it — so the next request replayed the tree replace and re-bound the project, and did so
+    /// forever after, for a file that had long since stopped changing. Identity of the
+    /// <see cref="Solution"/> is the whole assertion: every downstream cache that survives —
+    /// semantic models, the frozen-partial memo — hangs off that instance and nothing weaker.
+    /// </remarks>
+    [Fact]
+    public async Task WhenSourceFileUnchangedSinceLastRefreshThenTheSameSolutionIsReturned()
+    {
+        await WorkspaceService.EvictAllAsync();
+
+        string originalContent = await File.ReadAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile);
+
+        try
+        {
+            await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+
+            await File.WriteAllTextAsync(
+                FixturePaths.WorkspaceRefreshTargetFile, originalContent + "\n// first edit");
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
+
+            var first = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+            var second = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+
+            // Guard: the fork really happened, so identity below is not identity with the base.
+            Assert.Contains("first edit", (await TargetTextAsync(first.Project)));
+            Assert.Same(first.Project.Solution, second.Project.Solution);
+
+            // And the memo is keyed on the bytes, not on having refreshed once.
+            await File.WriteAllTextAsync(
+                FixturePaths.WorkspaceRefreshTargetFile, originalContent + "\n// second edit");
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
+
+            var third = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+
+            Assert.NotSame(second.Project.Solution, third.Project.Solution);
+            Assert.Contains("second edit", (await TargetTextAsync(third.Project)));
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    private static async Task<string> TargetTextAsync(Microsoft.CodeAnalysis.Project project)
+    {
+        var document = WorkspaceService.FindDocumentInProject(
+            project, FixturePaths.WorkspaceRefreshTargetFile);
+        Assert.NotNull(document);
+        return (await document!.GetTextAsync()).ToString();
+    }
 }

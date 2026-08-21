@@ -179,7 +179,14 @@ internal static class SolutionWarmup
                 return;
 
             foreach (var project in solution.Projects)
+            {
                 await project.GetCompilationAsync(CancellationToken.None);
+
+                // With the compilation in hand this is just the type walk — build each project's
+                // import-completion index now, so the first Ctrl+Space anywhere in the solution
+                // gets unimported types without having to wait for (or miss) them.
+                ImportCompletionWarmer.Queue(project);
+            }
 
             // A predicate that is never true: this materialises no symbol and builds every index.
             await SymbolFinder.FindSourceDeclarationsAsync(

@@ -10,7 +10,8 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>Analyzer diagnostics on the editor path: the per-document pass, .editorconfig
-/// severity handling, and the version-keyed cache that keeps it off the typing loop.</summary>
+/// severity handling, and the version-keyed caches — analyzer and compiler alike — that keep both
+/// off the typing loop.</summary>
 [Collection(SharedState.Name)]
 public class AnalyzerDiagnosticsTests
 {
@@ -139,6 +140,45 @@ public class AnalyzerDiagnosticsTests
         // The slow pass must be a superset: publishDiagnostics replaces the whole set per URI,
         // so dropping compiler diagnostics here would erase squiggles the fast pass drew.
         Assert.All(compilerOnly, c => Assert.Contains(merged, m => m.Code == c.Code && m.Range == c.Range));
+    }
+
+    /// <summary>
+    /// One typing pause binds a document once, however many requesters ask about it.
+    /// </summary>
+    /// <remarks>
+    /// <c>SemanticModel.GetDiagnostics()</c> re-binds every method body per call and memoizes
+    /// nothing, and three paths ask for the same text: the fast push phase, the analyzer push phase
+    /// ~1500ms behind it, and the pull — plus the re-pull the background analyzer pass requests,
+    /// where only the result-id marker moved and the compiler could not possibly disagree with
+    /// itself. Counted rather than asserted on the reports, because a hit and a miss report
+    /// identically by construction; the count is the only outward difference a cache keyed on the
+    /// invalidation condition can have.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnchangedDocumentIsBoundOnceAcrossPushPhasesAndThePull()
+    {
+        AnalyzerDiagnosticCache.Clear();
+        await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+
+        string uri = LspConverters.PathToUri(FixturePaths.WarningsFile);
+
+        // The bind this test is entitled to. Everything after it asks about the same text.
+        var first = await DiagnosticsHandler.ComputeAsync(FixturePaths.WarningsFile, default);
+        Assert.NotEmpty(first);
+
+        CompilerDiagnosticCache.ResetComputationCounter();
+
+        var fastAgain = await DiagnosticsHandler.ComputeAsync(FixturePaths.WarningsFile, default);
+        var withAnalyzers = await DiagnosticsHandler.ComputeWithAnalyzersAsync(
+            FixturePaths.WarningsFile, default);
+        var pulled = Assert.IsType<FullDocumentDiagnosticReport>(await DiagnosticsHandler.PullAsync(
+            new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)), default));
+
+        Assert.Equal(0L, CompilerDiagnosticCache.Computations);
+
+        // And served from the cache means served in full, not served empty.
+        foreach (var served in new[] { fastAgain, withAnalyzers, pulled.Items })
+            Assert.All(first, d => Assert.Contains(served, s => s.Code == d.Code && s.Range == d.Range));
     }
 
     [Fact]

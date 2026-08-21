@@ -16,9 +16,10 @@ namespace RoslynMCP.Lsp.Handlers;
 /// - the internal GetCompletionsAsync overload taking <see cref="RoslynCompletionOptions"/>,
 ///   with ShowItemsFromUnimportedNamespaces enabled (import completion — types you haven't
 ///   'using'-imported yet, with the using added on commit via resolve)
-/// - Document.WithFrozenPartialSemantics: completion binds against whatever compilation
-///   state exists instead of forcing a full bind; slow binds starve Roslyn's per-provider
-///   time budgets and collapse the list to locals/keywords.
+/// - FrozenSemantics.Freeze: completion binds against whatever compilation state exists
+///   instead of forcing a full bind; slow binds starve Roslyn's per-provider time budgets
+///   and collapse the list to locals/keywords. (The public WithFrozenPartialSemantics is a
+///   no-op outside editor hosts — see FrozenSemantics.)
 ///
 /// Roslyn decides <em>what</em> is in scope; ordering is ours (see
 /// <see cref="RoslynMCP.Lsp.Completion.CompletionRanker"/>): a CamelHumps match feeds a 64-bit
@@ -33,11 +34,24 @@ internal static class CompletionHandler
     {
         ShowItemsFromUnimportedNamespaces = true,
         TriggerOnTypingLetters = true,
-        // The unimported-type index is normally populated lazily in the background, so the
-        // first requests silently miss all import-completion items. Force it instead: one-time
-        // cost per project, then cached.
-        ForceExpandedCompletionIndexCreation = true,
+        // NOT forced (ForceExpandedCompletionIndexCreation stays false): the import-completion
+        // indexes are cached per project keyed by content checksum, so forcing made every
+        // completion after an edit rebuild the edited project's index — a full background-thread
+        // compilation plus a walk of every top-level type, paid on the request. Unforced, Roslyn
+        // serves the cached entry (stale is fine; one keystroke behind) and re-queues a refresh
+        // after every request. The cold-start gap forcing used to cover — a freshly loaded
+        // project has no entry at all, and unforced completion silently omits every
+        // import-completion item — is covered by ImportCompletionWarmer instead, which builds
+        // the entry off the request path (didOpen, post-edit quiet, solution warm-up).
         UpdateImportCompletionCacheInBackground = true,
+        // The list is re-ranked wholesale by CompletionRanker (ties break on each item's own
+        // SortText, not list position), so Roslyn sorting it first is pure waste.
+        PerformSort = false,
+        // The "new snippet experience" defaults on via feature flag and runs its providers per
+        // request — for a commit path this server never wired: resolve does not read
+        // LSPSnippetKey, so a committed snippet loses its placeholders anyway. Off, the same
+        // choice Roslyn's LSP makes for non-VS clients.
+        SnippetsBehavior = SnippetsRule.NeverInclude,
     };
 
     public static async Task<CompletionList> CompletionAsync(
@@ -78,7 +92,7 @@ internal static class CompletionHandler
         Func<TextSpan, Protocol.Range?> toRange,
         CancellationToken ct)
     {
-        document = document.WithFrozenPartialSemantics(ct);
+        document = await document.FreezeAsync(ct);
 
         var service = CompletionService.GetService(document);
         if (service is null)
@@ -89,9 +103,14 @@ internal static class CompletionHandler
             : CompletionTrigger.Invoke;
 
         // Let Roslyn's per-provider heuristics veto character triggers (e.g. "<" that is a
-        // less-than operator) instead of answering every trigger with a full list.
+        // less-than operator) instead of answering every trigger with a full list. The internal
+        // overload (publicized), because the public one looks the document up in an open-document
+        // registry this server does not populate and then substitutes its own option set — the
+        // veto must be decided under the same provider filtering as the request that follows.
         if (trigger.Kind == CompletionTriggerKind.Insertion
-            && !service.ShouldTriggerCompletion(text, offset, trigger))
+            && !service.ShouldTriggerCompletion(
+                document.Project, document.Project.Services, text, offset, trigger,
+                s_options, document.Project.Solution.Options, roles: null))
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
         // Every "(" opens an expression position, but Roslyn's providers answer a typed one only
@@ -100,6 +119,13 @@ internal static class CompletionHandler
         // so ask for it the way Ctrl+Space would. In an argument list the two agree anyway.
         if (trigger is { Kind: CompletionTriggerKind.Insertion, Character: '(' })
             trigger = CompletionTrigger.Invoke;
+
+        // Declaring types and the nearest local — the two ranking inputs a completion item does
+        // not carry — need only the span start, which is computable from text alone. Started
+        // before the provider pass so the walk overlaps it instead of serializing after it; the
+        // recompute below covers the contexts where Roslyn widens the span past the default.
+        int predictedStart = service.GetDefaultCompletionListSpan(text, offset).Start;
+        var semanticsTask = CompletionSemanticContext.CreateAsync(document, predictedStart, ct);
 
         var completions = await service.GetCompletionsAsync(
             document, offset, s_options, document.Project.Solution.Options, trigger,
@@ -116,9 +142,9 @@ internal static class CompletionHandler
             : "";
         string contextId = CompletionRanker.ContextId(text, completions.Span);
 
-        // Declaring types and the nearest local — the two ranking inputs a completion item does
-        // not carry. One pass over the type being completed on, not a symbol resolve per item.
-        var semantics = await CompletionSemanticContext.CreateAsync(document, completions.Span.Start, ct);
+        var semantics = completions.Span.Start == predictedStart
+            ? await semanticsTask
+            : await CompletionSemanticContext.CreateAsync(document, completions.Span.Start, ct);
 
         var ranked = CompletionRanker.Rank(completions.ItemsList, prefix, contextId, MaxItems, semantics);
         if (ranked.Items.Count == 0)
@@ -127,25 +153,41 @@ internal static class CompletionHandler
         var cachedItems = ranked.Items.Select(r => r.Item).ToList();
         long cacheId = cache.StoreCompletions(document, cachedItems);
 
+        // Every item in this list replaces the same span, so the range is the list's, not the
+        // item's. A client that reads itemDefaults gets it once; the rest still get a full
+        // textEdit each, which is the same bytes as before.
+        bool hoistEditRange = LspClientState.CompletionEditRangeDefault;
+
         var items = ranked.Items
             .Select((entry, index) =>
             {
                 var item = entry.Item;
+                // Symbol items store their real commit text in Properties (e.g. generic
+                // types commit "List" while displaying "List<>").
+                string insertion = item.Properties.TryGetValue("InsertionText", out string? text)
+                    ? text
+                    : item.DisplayText;
+
                 return new CompletionItem(
                     item.DisplayText,
                     ToLspKind(item),
                     Detail(item),
                     entry.SortText(index),
                     FilterText(item, prefix),
-                    // Symbol items store their real commit text in Properties (e.g. generic
-                    // types commit "List" while displaying "List<>").
-                    new TextEdit(defaultRange,
-                        item.Properties.TryGetValue("InsertionText", out string? insertion)
-                            ? insertion
-                            : item.DisplayText))
+                    hoistEditRange ? null : new TextEdit(defaultRange, insertion))
                 {
+                    // Silence is "insert the label", which is what all but a handful of items
+                    // want; the exceptions say so and cost one string each.
+                    TextEditText = hoistEditRange && !string.Equals(insertion, item.DisplayText, StringComparison.Ordinal)
+                        ? insertion
+                        : null,
                     Data = new CompletionItemData(cacheId, index),
                     Preselect = item.Rules.MatchPriority == MatchPriority.Preselect ? true : null,
+                    // Kept per item, and not hoisted into itemDefaults.data: the arguments are the
+                    // accept signal CompletionStatistics ranks on, and the client sends back only
+                    // what a command carries. itemDefaults has no member for a command, and data
+                    // is not it — data reaches the server through resolve, which fires on
+                    // selection rather than on commit.
                     Command = new Command(
                         "",
                         ExecuteCommandHandler.CompletionAcceptedCommand,
@@ -156,7 +198,12 @@ internal static class CompletionHandler
 
         // Ranking (and the typo tier) depends on the typed prefix, so a narrowed list is not a
         // subset the client can compute on its own — ask for a fresh request per keystroke.
-        return new CompletionList(ranked.Truncated || prefix.Length > 0, items);
+        return new CompletionList(ranked.Truncated || prefix.Length > 0, items)
+        {
+            // data stays per item: the resolve key is an index into the cached Roslyn list, so
+            // there is no value the whole list could share.
+            ItemDefaults = hoistEditRange ? new CompletionItemDefaults { EditRange = defaultRange } : null,
+        };
     }
 
     /// <summary>

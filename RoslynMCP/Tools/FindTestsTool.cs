@@ -181,7 +181,13 @@ public static class FindTestsTool
         HashSet<string> seen,
         CancellationToken cancellationToken)
     {
-        var references = await SymbolFinder.FindReferencesAsync(symbol, solution, cancellationToken);
+        // The same options find-references runs under: a test reaches this member through the
+        // hierarchy above it, never through a sibling implementation that overrides the same
+        // interface member.
+        var references = await SymbolFinder.FindReferencesAsync(
+            symbol, solution,
+            FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol),
+            cancellationToken);
 
         foreach (var reference in references)
         {

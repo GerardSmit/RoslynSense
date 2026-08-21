@@ -295,6 +295,13 @@ internal static class WatchedFilesHandler
         // for again and ages out of the cap on its own. Clearing would also drop every other
         // solution's still-valid results.
 
+        // A document updated in place invalidated its project's import-completion index exactly
+        // like a keystroke would — a regenerated designer file (.dbml, .aspx) is the common case
+        // — and completion no longer rebuilds that index on its own thread. Immediate, because
+        // these arrive post-save behind the coalesce window; nobody is mid-keystroke.
+        foreach (string path in applied)
+            ImportCompletionWarmer.Schedule(path, immediate: true);
+
         return new Outcome(reloadedProjects, [.. evicted, .. projectFiles], invalidatedMarkup, applied);
     }
 

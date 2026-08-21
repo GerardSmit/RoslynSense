@@ -103,6 +103,10 @@ internal static class HoverHandler
             return await embedded.HoverAsync(embeddedContext, ct);
         }
 
+        // Frozen: hover after an edit only needs this document bound against the compilation
+        // state that already exists — the real solution would rebind the project first.
+        document = await document.FreezeAsync(ct);
+
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
         if (symbol is null)
             return null;

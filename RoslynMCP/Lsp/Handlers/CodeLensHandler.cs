@@ -232,13 +232,17 @@ internal static class CodeLensHandler
         if (symbol is null)
             return lens with { Command = noReferences };
 
-        // The search Shift+F12 runs, contributors included, rather than Roslyn's alone. A method
-        // a dozen mediator sends dispatch to has no C# references at all, and a gutter reading
-        // "0 references" above the peek that lists twelve is worse than no gutter.
-        var locations = await NavigationHandlers.AllReferencesAsync(
-            symbol, document.Project, includeDeclaration: false, ct, languages);
+        // Contributors included, rather than Roslyn's answer alone. A method a dozen mediator
+        // sends dispatch to has no C# references at all, and a gutter reading "0 references"
+        // above the peek that lists twelve is worse than no gutter. Counted rather than
+        // enumerated: the peek below shows MaxReferenceLocations at most, so a symbol referenced
+        // ten thousand times must not be searched to the end on every scroll.
+        var (locations, capped) = await NavigationHandlers.CountedReferencesAsync(
+            symbol, document.Project, MaxReferenceLocations, ct, languages);
 
-        string title = locations.Length == 1 ? "1 reference" : $"{locations.Length} references";
+        string title = capped
+            ? $"{MaxReferenceLocations}+ references"
+            : locations.Length == 1 ? "1 reference" : $"{locations.Length} references";
         return lens with
         {
             Command = new Command(title, "roslynSense.showReferences",

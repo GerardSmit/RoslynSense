@@ -9,6 +9,7 @@ using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using Xunit;
 using CompletionItem = RoslynMCP.Lsp.Protocol.CompletionItem;
+using CompletionList = RoslynMCP.Lsp.Protocol.CompletionList;
 using RoslynItem = Microsoft.CodeAnalysis.Completion.CompletionItem;
 
 namespace RoslynMCP.Tests;
@@ -410,6 +411,138 @@ public class CompletionRankingTests
         Assert.Contains(resolved.AdditionalTextEdits!, e => e.NewText.Contains("using SampleProject.Ranking", StringComparison.Ordinal));
     }
 
+    // --- response shape: completionList.itemDefaults ---
+
+    private const string ShapeSource = """
+        using System.Collections.Generic;
+
+        namespace SampleProject;
+
+        public class RankingSampleShape
+        {
+            public int Compute(string value)
+            {
+                return value.Le
+            }
+        }
+        """;
+
+    private const string ShapeAnchor = "return value.Le";
+
+    [Fact]
+    public async Task ItemDefaultsCarriesTheEditRangeAndItemsDropTheirOwn()
+    {
+        var (list, _) = await WithEditRangeDefaultAsync(true, () => CompleteListAsync(ShapeSource, ShapeAnchor));
+
+        Assert.NotNull(list.ItemDefaults);
+        var range = list.ItemDefaults!.EditRange;
+        Assert.NotNull(range);
+
+        // The span a commit replaces is the partial word "Le" on one line — the same span every
+        // item used to repeat.
+        Assert.Equal(range!.Start.Line, range.End.Line);
+        Assert.Equal(2, range.End.Character - range.Start.Character);
+
+        Assert.All(list.Items, i => Assert.Null(i.TextEdit));
+
+        // An item whose commit text is its label says nothing at all; the client falls back to
+        // the label. At this position that is every item, which is the point of the exercise.
+        Assert.Contains(list.Items, i => i.TextEditText is null);
+        Assert.All(list.Items, i => Assert.NotEqual(i.Label, i.TextEditText));
+    }
+
+    [Fact]
+    public async Task WithoutTheCapabilityEveryItemKeepsItsOwnRange()
+    {
+        var (list, _) = await WithEditRangeDefaultAsync(false, () => CompleteListAsync(ShapeSource, ShapeAnchor));
+
+        Assert.Null(list.ItemDefaults);
+        Assert.All(list.Items, i =>
+        {
+            Assert.NotNull(i.TextEdit);
+            Assert.Null(i.TextEditText);
+        });
+
+        // One range, repeated — which is what hoisting it removes.
+        var first = list.Items[0].TextEdit!.Range;
+        Assert.All(list.Items, i => Assert.Equal(first, i.TextEdit!.Range));
+    }
+
+    [Fact]
+    public async Task HoistingTheRangeChangesNoItemsCommitText()
+    {
+        var (hoisted, _) = await WithEditRangeDefaultAsync(true, () => CompleteListAsync(ShapeSource, ShapeAnchor));
+        var (perItem, _) = await WithEditRangeDefaultAsync(false, () => CompleteListAsync(ShapeSource, ShapeAnchor));
+
+        var expected = perItem.Items.ToDictionary(i => i.SortText!, i => i.TextEdit!.NewText);
+        Assert.All(hoisted.Items, i =>
+        {
+            // What the client will insert: textEditText when the item overrides, the label
+            // otherwise. It has to equal the edit the fallback path spells out.
+            Assert.Equal(expected[i.SortText!], i.TextEditText ?? i.Label);
+            Assert.Equal(hoisted.ItemDefaults!.EditRange, perItem.Items[0].TextEdit!.Range);
+        });
+    }
+
+    [Fact]
+    public async Task ResolveStillFindsItsItemWhenTheRangeWasHoisted()
+    {
+        string source = """
+            namespace SampleProject;
+
+            public class RankingSampleShapeResolve
+            {
+                public string Compute(string value)
+                {
+                    return value.Shout
+                }
+            }
+            """;
+
+        var (list, cache) = await WithEditRangeDefaultAsync(
+            true, () => CompleteListAsync(source, "return value.Shout"));
+
+        var shout = Array.Find(list.Items, i => i.Label == "ShoutRanking");
+        Assert.True(shout is not null,
+            $"import completion missed the extension; got: {string.Join(", ", list.Items.Take(10).Select(i => i.Label))}");
+        Assert.Null(shout!.TextEdit);
+
+        // The resolve key rides in per-item data, which no default replaced.
+        var resolved = await CompletionHandler.ResolveAsync(shout, cache, default);
+        Assert.NotNull(resolved.AdditionalTextEdits);
+        Assert.Contains(resolved.AdditionalTextEdits!, e => e.NewText.Contains("using SampleProject.Ranking", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void TheItemDefaultsCapabilityIsReadOffTheClientsInitializeParams()
+    {
+        var capabilities = System.Text.Json.JsonSerializer.Deserialize<ClientCapabilities>(
+            """
+            {"textDocument":{"completion":{"completionItem":{"snippetSupport":true},
+             "completionList":{"itemDefaults":["commitCharacters","editRange","data"]}}}}
+            """);
+
+        Assert.Equal(
+            new[] { "commitCharacters", "editRange", "data" },
+            capabilities?.TextDocument?.Completion?.CompletionList?.ItemDefaults);
+    }
+
+    /// <summary>Runs <paramref name="body"/> with the client capability forced either way, and
+    /// puts the process-wide flag back however it ends.</summary>
+    private static async Task<T> WithEditRangeDefaultAsync<T>(bool supported, Func<Task<T>> body)
+    {
+        bool previous = LspClientState.CompletionEditRangeDefault;
+        LspClientState.CompletionEditRangeDefault = supported;
+        try
+        {
+            return await body();
+        }
+        finally
+        {
+            LspClientState.CompletionEditRangeDefault = previous;
+        }
+    }
+
     [Fact]
     public async Task InstanceMethodsOutrankRealExtensionMethods()
     {
@@ -520,9 +653,27 @@ public class CompletionRankingTests
     private static async Task<(CompletionItem[] Items, LspResolveCache Cache)> CompleteWithCacheAsync(
         string source, string anchor)
     {
+        var (list, cache) = await CompleteListAsync(source, anchor);
+        return (list.Items, cache);
+    }
+
+    private static async Task<(CompletionList List, LspResolveCache Cache)> CompleteListAsync(
+        string source, string anchor)
+    {
         string path = FixturePaths.CalculatorFile;
         string sessionId = $"ranking-{Guid.NewGuid():N}";
         var text = SourceText.From(source);
+
+        // Import completion serves only what a background build has already cached; this is the
+        // deterministic, awaitable form of what ImportCompletionWarmer queues in production.
+        var warmDocument = await LspDocumentResolver.ResolveAsync(path, default);
+        Assert.NotNull(warmDocument);
+        await Microsoft.CodeAnalysis.Completion.Providers.AbstractTypeImportCompletionService
+            .BatchUpdateCacheAsync(
+                Microsoft.CodeAnalysis.Collections.ImmutableSegmentedList.Create(warmDocument!.Project),
+                default);
+        await Microsoft.CodeAnalysis.Completion.Providers.ExtensionMemberImportCompletionHelper
+            .SymbolComputer.UpdateCacheAsync(warmDocument.Project, default);
 
         OpenDocumentStore.Open(sessionId, path, text, version: 1);
         try
@@ -539,11 +690,14 @@ public class CompletionRankingTests
                 default);
 
             Assert.NotEmpty(list.Items);
-            return (list.Items, cache);
+            return (list, cache);
         }
         finally
         {
             OpenDocumentStore.Close(sessionId, path);
+            // The close-reconcile runs on a background task; a later test resolving this file
+            // against its on-disk text must not race the overlay still being peeled off.
+            await WorkspaceService.ReconcileOpenBufferAsync(path);
         }
     }
 }

@@ -87,6 +87,16 @@ public class LspResolveTests
             RoslynMCP.Services.OpenDocumentStore.Open(session, path,
                 Microsoft.CodeAnalysis.Text.SourceText.From(modified), 1);
 
+            // Completion serves the import-completion index but never builds it on the request
+            // thread (that was the post-edit stall); build it here the deterministic way, standing
+            // in for ImportCompletionWarmer's background queue.
+            var document = await LspDocumentResolver.ResolveAsync(path, default);
+            Assert.NotNull(document);
+            await Microsoft.CodeAnalysis.Completion.Providers.AbstractTypeImportCompletionService
+                .BatchUpdateCacheAsync(
+                    Microsoft.CodeAnalysis.Collections.ImmutableSegmentedList.Create(document!.Project),
+                    default);
+
             var (line, character) = PositionOf(modified, "StringB");
             var cache = new LspResolveCache();
             var list = await CompletionHandler.CompletionAsync(
@@ -100,6 +110,9 @@ public class LspResolveTests
         finally
         {
             RoslynMCP.Services.OpenDocumentStore.Close(session, path);
+            // Close's reconcile runs on a background task; settle it here so the next test's
+            // disk-computed positions meet a workspace already restored to the disk text.
+            await RoslynMCP.Services.WorkspaceService.ReconcileOpenBufferAsync(path);
         }
     }
 

@@ -132,12 +132,13 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
         // returns a declaration — a lens that counted itself would read "1 reference" on a
         // control nothing uses.
         var (project, target) = await AspxDocumentService.AnchorAsync(document, field, ct);
-        var locations = (await NavigationHandlers.AllReferencesAsync(
-                target, project, includeDeclaration: false, ct))
-            .Where(location => !IsSelf(location, data))
-            .ToArray();
+        var (found, capped) = await NavigationHandlers.CountedReferencesAsync(
+            target, project, MaxReferenceLocations, ct);
+        var locations = found.Where(location => !IsSelf(location, data)).ToArray();
 
-        string title = locations.Length == 1 ? "1 reference" : $"{locations.Length} references";
+        string title = capped
+            ? $"{MaxReferenceLocations}+ references"
+            : locations.Length == 1 ? "1 reference" : $"{locations.Length} references";
         return lens with
         {
             Command = new Command(title, "roslynSense.showReferences",

@@ -36,7 +36,7 @@ internal static class SignatureHelpHandler
         if (service is null)
             return null;
 
-        document = document.WithFrozenPartialSemantics(ct);
+        document = await document.FreezeAsync(ct);
 
         var triggerInfo = triggerContext is { TriggerKind: 2, TriggerCharacter.Length: > 0 } typed
             ? new SignatureHelpTriggerInfo(

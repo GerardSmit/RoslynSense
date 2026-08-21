@@ -75,8 +75,14 @@ public static class FindUsagesTool
 
             var symbol = ctx.Symbol!;
 
+            // Visual Studio's Find All References options. The default the public overload
+            // forwards cascades the inheritance hierarchy in both directions, which searches
+            // every sibling implementation of every interface member involved — members that can
+            // never reach the one that was asked about.
             var references = await SymbolFinder.FindReferencesAsync(
-                symbol, ctx.Workspace.CurrentSolution, cancellationToken);
+                symbol, ctx.Workspace.CurrentSolution,
+                FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol),
+                cancellationToken);
 
             // Build Razor source map for mapping generated references
             var razorSourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(ctx.Project, cancellationToken);
@@ -125,7 +131,10 @@ public static class FindUsagesTool
 
                         if (refSymbol is null) continue;
 
-                        var refResults = await SymbolFinder.FindReferencesAsync(refSymbol, refSolution, cancellationToken);
+                        var refResults = await SymbolFinder.FindReferencesAsync(
+                            refSymbol, refSolution,
+                            FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(refSymbol),
+                            cancellationToken);
                         var locations = refResults.SelectMany(r => r.Locations).ToList();
                         if (locations.Count > 0)
                         {

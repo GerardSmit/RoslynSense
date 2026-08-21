@@ -2681,7 +2681,7 @@ internal static class WorkspaceService
     /// the bytes moving — which is what a rebuild produces — must cost nothing.
     /// </remarks>
     private static Project RefreshDocumentIfStale(
-        Project project, string filePath, DateTime cacheTime)
+        CachedWorkspaceEntry entry, Project project, string filePath, DateTime cacheTime)
     {
         var document = FindDocumentInProject(project, filePath);
         if (document is null)
@@ -2711,9 +2711,64 @@ internal static class WorkspaceService
         if (document.TryGetText(out var current) && current.ContentEquals(text))
             return project;
 
-        var updatedSolution = project.Solution.WithDocumentText(document.Id, text);
+        var updatedSolution = MemoizedRefresh(entry, project.Solution, document.Id, text);
         return updatedSolution.GetProject(project.Id) ?? project;
     }
+
+    /// <summary>
+    /// The forked solution for one refreshed document, memoized per (base solution, document,
+    /// disk content) so the same disk text refreshed again returns the <em>same</em>
+    /// <see cref="Solution"/> instance rather than an equivalent one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The fork was discarded with the request that made it, so every semantic question asked of
+    /// the next one replayed the tree replace and re-bound the project: a document's semantic-model
+    /// weak reference and the solution's frozen-partial memo both hang off the instance, and both
+    /// died with it. Nothing about the answer changes here — only whether the work behind it is
+    /// done once or once per request, forever, for a file that stopped changing.
+    /// </para>
+    /// <para>
+    /// Keyed on the base solution by reference, as the buffer overlay is: any move of
+    /// <c>CurrentSolution</c> (an incremental project add, a reconciled buffer) makes every fork
+    /// taken from the old one an answer about a solution that no longer exists. The content
+    /// checksum rather than the <see cref="SourceText"/> instance, because the text is read fresh
+    /// from disk on each call and is never the same object twice.
+    /// </para>
+    /// <para>
+    /// Bounded, and cleared wholesale when it overflows: each retained fork pins a compilation, and
+    /// a session that walks a large project would otherwise accumulate one per file it touched.
+    /// </para>
+    /// </remarks>
+    private static Solution MemoizedRefresh(
+        CachedWorkspaceEntry entry, Solution baseSolution, DocumentId documentId, SourceText text)
+    {
+        var checksum = text.GetChecksum();
+
+        lock (entry.RefreshLock)
+        {
+            if (!ReferenceEquals(entry.RefreshBase, baseSolution))
+            {
+                entry.RefreshBase = baseSolution;
+                entry.RefreshedDocuments.Clear();
+            }
+            else if (entry.RefreshedDocuments.TryGetValue(documentId, out var memo)
+                && memo.Checksum.SequenceEqual(checksum))
+            {
+                return memo.Solution;
+            }
+
+            if (entry.RefreshedDocuments.Count >= MaxMemoizedRefreshes)
+                entry.RefreshedDocuments.Clear();
+
+            var refreshed = baseSolution.WithDocumentText(documentId, text);
+            entry.RefreshedDocuments[documentId] = (refreshed, checksum);
+            return refreshed;
+        }
+    }
+
+    /// <summary>How many refreshed-from-disk forks one entry keeps alive at once.</summary>
+    private const int MaxMemoizedRefreshes = 16;
 
     private static bool TryGetValidCachedEntryLocked(string normalizedProjectPath, out CachedWorkspaceEntry? entry)
     {
@@ -3004,7 +3059,7 @@ internal static class WorkspaceService
         project = ApplyOpenDocumentOverlay(entry, project);
 
         if (targetFilePath != null)
-            project = RefreshDocumentIfStale(project, targetFilePath, entry.CachedAtUtc);
+            project = RefreshDocumentIfStale(entry, project, targetFilePath, entry.CachedAtUtc);
 
         return (entry.Workspace, project);
     }
@@ -3696,6 +3751,15 @@ internal static class WorkspaceService
         /// <summary>The text each document in <see cref="OverlaySolution"/> was overlaid with, so
         /// the next rebuild can re-apply only the buffers that moved instead of all of them.</summary>
         public Dictionary<DocumentId, SourceText> OverlayTexts { get; set; } = new();
+
+        /// <summary>Memoized refreshed-from-disk forks (see MemoizedRefresh): the solution each
+        /// stale document was last refreshed into, and the disk checksum it was refreshed from.
+        /// Valid only against <see cref="RefreshBase"/>.</summary>
+        public object RefreshLock { get; } = new();
+        public Solution? RefreshBase { get; set; }
+
+        public Dictionary<DocumentId, (Solution Solution, ImmutableArray<byte> Checksum)> RefreshedDocuments { get; }
+            = new();
 
         public CachedWorkspaceEntry(
             string cacheKey,

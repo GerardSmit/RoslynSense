@@ -96,6 +96,9 @@ public class LspSignatureAndPullTests
         finally
         {
             OpenDocumentStore.Close(session, path);
+            // The close-reconcile runs on a background task; a later test resolving this file
+            // against its on-disk text must not race the overlay still being peeled off.
+            await WorkspaceService.ReconcileOpenBufferAsync(path);
         }
     }
 

@@ -165,6 +165,14 @@
             "expected": { "tableFormat": "markdown" }
         },
         {
+            "name": "a byte-order mark is not part of the file",
+            "files": {
+                "global": { "tableFormat": "toon" },
+                "repo": "\uFEFF{ \"tableFormat\": \"markdown\" }"
+            },
+            "expected": { "tableFormat": "markdown" }
+        },
+        {
             "name": "an empty file says nothing rather than resetting everything",
             "files": {
                 "global": { "tableFormat": "toon" },

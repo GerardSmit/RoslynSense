@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
+import { withoutByteOrderMark } from '../jsonText';
+
 /**
  * The active colour theme's token colours, for the README code blocks.
  *
@@ -119,7 +121,9 @@ function readThemeFile(file: string, depth = 0): Rule[] {
         return [];
     }
 
-    const theme = JSON.parse(stripJsonComments(fs.readFileSync(file, 'utf8')));
+    const theme = JSON.parse(
+        stripJsonComments(withoutByteOrderMark(fs.readFileSync(file, 'utf8')))
+    );
     const rules: Rule[] = [];
 
     if (typeof theme.include === 'string') {

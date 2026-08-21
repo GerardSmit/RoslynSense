@@ -4,6 +4,8 @@ import * as vscode from 'vscode';
 import * as oniguruma from 'vscode-oniguruma';
 import * as vsctm from 'vscode-textmate';
 
+import { withoutByteOrderMark } from '../jsonText';
+
 /**
  * Real syntax highlighting for the preview pane: the same TextMate engine and the same theme
  * rules the editor uses, run in the extension host.
@@ -132,7 +134,9 @@ async function createRegistry(): Promise<vsctm.Registry | null> {
                 if (!source) {
                     return null;
                 }
-                const content = await fs.readFile(source.grammarPath, 'utf8');
+                const content = withoutByteOrderMark(
+                    await fs.readFile(source.grammarPath, 'utf8')
+                );
                 return vsctm.parseRawGrammar(content, source.grammarPath);
             },
             getInjections: (scopeName) =>
@@ -231,7 +235,9 @@ async function readThemeChain(themePath: string, depth = 0): Promise<ThemeSettin
         return [];
     }
 
-    const theme = parseJsonWithComments(await fs.readFile(themePath, 'utf8')) as ThemeFile | null;
+    const theme = parseJsonWithComments(
+        withoutByteOrderMark(await fs.readFile(themePath, 'utf8'))
+    ) as ThemeFile | null;
     if (theme === null) {
         return [];
     }

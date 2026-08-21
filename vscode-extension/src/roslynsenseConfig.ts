@@ -2,7 +2,16 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { applyEdits, modify, parse as parseJsonc, ParseError, printParseErrorCode } from 'jsonc-parser';
+import {
+    applyEdits,
+    modify,
+    parse as parseJsonc,
+    ParseError,
+    ParseErrorCode,
+    printParseErrorCode,
+} from 'jsonc-parser';
+
+import { splitByteOrderMark, withoutByteOrderMark } from './jsonText';
 
 /**
  * Reading and writing `roslynsense.json`, in the same layers the server resolves it in.
@@ -153,21 +162,23 @@ export async function writeSetting(
     const filePath = configFilePath(scope, workingDirectory);
     await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
 
-    let text = '';
+    let existing = '';
     try {
-        text = await fs.promises.readFile(filePath, 'utf8');
+        existing = await fs.promises.readFile(filePath, 'utf8');
     } catch {
-        text = '{}\n';
+        existing = '{}\n';
     }
-    if (text.trim().length === 0) {
-        text = '{}\n';
-    }
+
+    // Split off and put back rather than dropped: the file is the team's, and moving a toggle on
+    // the settings page is no reason for it to change encoding.
+    const { mark, body } = splitByteOrderMark(existing);
+    const text = body.trim().length === 0 ? '{}\n' : body;
 
     const edits = modify(text, [...settingPath], value, {
         formattingOptions: { insertSpaces: true, tabSize: 4 },
     });
 
-    await fs.promises.writeFile(filePath, applyEdits(text, edits), 'utf8');
+    await fs.promises.writeFile(filePath, mark + applyEdits(text, edits), 'utf8');
     return filePath;
 }
 
@@ -213,7 +224,7 @@ export function anyCasing(fileName: string): string {
 function readLayer(scope: ConfigScope, filePath: string): ConfigLayer {
     let text: string;
     try {
-        text = fs.readFileSync(filePath, 'utf8');
+        text = withoutByteOrderMark(fs.readFileSync(filePath, 'utf8'));
     } catch {
         return { scope, filePath };
     }
@@ -229,7 +240,7 @@ function readLayer(scope: ConfigScope, filePath: string): ConfigLayer {
         return {
             scope,
             filePath,
-            parseError: printParseErrorCode(errors[0].error),
+            parseError: describeParseError(text, errors[0]),
         };
     }
 
@@ -237,6 +248,42 @@ function readLayer(scope: ConfigScope, filePath: string): ConfigLayer {
         ? { scope, filePath, json: parsed as Record<string, unknown> }
         : { scope, filePath, parseError: 'Expected an object.' };
 }
+
+/**
+ * What `jsonc-parser` found, in the words of somebody who has to go and fix the file.
+ *
+ * `printParseErrorCode` answers with the name of the branch the parser took — `InvalidSymbol`,
+ * `ColonExpected` — which is a fact about the parser rather than about the file, and it says
+ * nothing at all about where. The position is the half that matters: a configuration file is long
+ * enough that "line 41" is most of the answer, and the code alone leaves a person re-reading all
+ * of it.
+ */
+function describeParseError(text: string, error: ParseError): string {
+    const before = text.slice(0, error.offset);
+    const line = before.split('\n').length;
+    const column = error.offset - before.lastIndexOf('\n');
+
+    return `${PARSE_ERRORS[error.error] ?? printParseErrorCode(error.error)}, line ${line}, column ${column}`;
+}
+
+const PARSE_ERRORS: Readonly<Record<number, string>> = {
+    [ParseErrorCode.InvalidSymbol]: 'Unexpected character',
+    [ParseErrorCode.InvalidNumberFormat]: 'Not a number',
+    [ParseErrorCode.PropertyNameExpected]: 'Expected a property name',
+    [ParseErrorCode.ValueExpected]: 'Expected a value',
+    [ParseErrorCode.ColonExpected]: 'Expected a colon',
+    [ParseErrorCode.CommaExpected]: 'Expected a comma',
+    [ParseErrorCode.CloseBraceExpected]: 'Expected a closing brace',
+    [ParseErrorCode.CloseBracketExpected]: 'Expected a closing bracket',
+    [ParseErrorCode.EndOfFileExpected]: 'Expected the end of the file',
+    [ParseErrorCode.InvalidCommentToken]: 'Not a comment',
+    [ParseErrorCode.UnexpectedEndOfComment]: 'Unterminated comment',
+    [ParseErrorCode.UnexpectedEndOfString]: 'Unterminated string',
+    [ParseErrorCode.UnexpectedEndOfNumber]: 'Unterminated number',
+    [ParseErrorCode.InvalidUnicode]: 'Invalid unicode escape',
+    [ParseErrorCode.InvalidEscapeCharacter]: 'Invalid escape character',
+    [ParseErrorCode.InvalidCharacter]: 'A control character inside a string',
+};
 
 /** The filesystem root down to the working directory — outermost first, so nearer files win. */
 function repositoryDirectories(workingDirectory: string): string[] {

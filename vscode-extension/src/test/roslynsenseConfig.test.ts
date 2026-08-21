@@ -140,6 +140,41 @@ describe('loadLayers', () => {
         assert.strictEqual(broken?.filePath, configFilePath('repo', app));
     });
 
+    it('says where a file stopped parsing, not which branch the parser took', () => {
+        write(configFilePath('repo', app), '{\n    "tableFormat": "markdown"\n    "preload": []\n}');
+
+        const broken = loadLayers(app).layers.find((layer) => layer.parseError);
+
+        // `printParseErrorCode` would answer `CommaExpected` and leave the line to be hunted for.
+        assert.match(broken?.parseError ?? '', /line 3, column 5/);
+    });
+
+    it('reads a file that a Windows editor left a byte-order mark on', () => {
+        // Visual Studio, Notepad and `Set-Content` all write one, and .NET strips it on the way
+        // in — so a file the server was happily reading used to be reported here as broken.
+        write(configFilePath('repo', app), '\uFEFF{ "tableFormat": "markdown" }');
+
+        const layered = loadLayers(app);
+
+        assert.strictEqual(layered.merged.tableFormat, 'markdown');
+        assert.strictEqual(
+            layered.layers.some((layer) => layer.parseError !== undefined),
+            false
+        );
+    });
+
+    it('leaves the byte-order mark where it found it', async () => {
+        const filePath = configFilePath('repo', app);
+        write(filePath, '\uFEFF{\n    "tableFormat": "markdown"\n}\n');
+
+        await writeSetting('repo', app, ['tableFormat'], 'json');
+
+        const written = fs.readFileSync(filePath, 'utf8');
+
+        assert.strictEqual(written.startsWith('\uFEFF'), true);
+        assert.strictEqual(loadLayers(app).merged.tableFormat, 'json');
+    });
+
     it('reads comments and trailing commas, because people write them', () => {
         write(configFilePath('repo', app), '{\n  // ours\n  "tableFormat": "markdown",\n}');
 

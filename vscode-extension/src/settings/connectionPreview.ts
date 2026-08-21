@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parse as parseJsonc, ParseError } from 'jsonc-parser';
 
+import { withoutByteOrderMark } from '../jsonText';
+
 /**
  * The panel's mirror of the server's ConnectionStringResolver: enough of its semantics to show
  * what a `json:`/`xml:` connection reference will resolve to, without asking the server.
@@ -162,7 +164,8 @@ export function listReferenceNames(filePath: string, kind: 'json' | 'xml'): stri
 
 function parseJsonFile(filePath: string): unknown {
     const errors: ParseError[] = [];
-    const root: unknown = parseJsonc(fs.readFileSync(filePath, 'utf8'), errors, {
+    const text = withoutByteOrderMark(fs.readFileSync(filePath, 'utf8'));
+    const root: unknown = parseJsonc(text, errors, {
         allowTrailingComma: true,
     });
     if (errors.length > 0) {

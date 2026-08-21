@@ -72,6 +72,11 @@ internal static class CliRunner
             return 0;
         }
 
+        // The MEF composition every workspace needs, started while the flags are still being
+        // parsed. A one-shot invocation has no earlier moment to hide it in, and paying it inline
+        // puts it squarely in front of whatever the tool was asked to do.
+        WorkspaceService.WarmHostServicesInBackground();
+
         var toolName = args[0];
 
         // --cli find_usages --help  →  show tool usage

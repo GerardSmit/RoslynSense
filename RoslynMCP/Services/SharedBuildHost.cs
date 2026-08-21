@@ -68,7 +68,8 @@ internal static partial class SharedBuildHost
         ImmutableDictionary<string, string> properties,
         IReadOnlyList<string> projectPaths,
         Func<ProjectMap> projectMapFactory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>>? sharedEvaluations = null)
     {
         if (projectPaths.Count == 0)
             return [];
@@ -88,12 +89,34 @@ internal static partial class SharedBuildHost
         // of a recycle. A warm host holding a stale evaluation used to be retired so the next load
         // read from disk; now the load simply goes to a host that never saw the project, which is
         // just as correct and costs nothing. Recycling is left for when every host has it.
+        // One map for every shard of this call: the shard closures overlap heavily, and this is
+        // what stops them evaluating each other's dependencies over again. A caller that already
+        // has evaluations running — a solution open whose prewarm is still in flight — passes its
+        // own map, and each shard here consumes those results the moment they complete. Scoped to
+        // the call or to one open — never static — because a reload exists to re-read disk.
+        var inFlight = sharedEvaluations ?? NewEvaluationMap();
+
         if (projectPaths.Count == 1)
         {
-            shards[ChooseShardFor(projectPaths[0], properties)].Add(projectPaths[0]);
+            int chosen = ChooseShardFor(projectPaths[0], properties);
+
+            // An interactive load must not queue behind a whole-solution evaluation. When the
+            // chosen shard's gate is held — a prewarm or a batch is running — the load takes a
+            // host of its own instead of waiting minutes for someone else's work. The solo host
+            // stays warm and keyed like any other, so the next contended single load reuses it.
+            if (s_gates.TryGetValue($"{chosen} {KeyFor(properties)}", out var chosenGate)
+                && chosenGate.CurrentCount == 0)
+            {
+                return Reconcile(
+                    [await LoadShardAsync(
+                        workspace, properties, [projectPaths[0]], SoloShard,
+                        projectMapFactory, inFlight, cancellationToken)]);
+            }
+
+            shards[chosen].Add(projectPaths[0]);
 
             var single = await Task.WhenAll(shards.Select((shard, index) =>
-                LoadShardAsync(workspace, properties, shard, index, projectMapFactory, cancellationToken)));
+                LoadShardAsync(workspace, properties, shard, index, projectMapFactory, inFlight, cancellationToken)));
 
             return Reconcile(single);
         }
@@ -111,16 +134,205 @@ internal static partial class SharedBuildHost
             shards[(start + i) % PoolSize].Add(projectPaths[i]);
 
         var results = await Task.WhenAll(shards.Select((shard, index) =>
-            LoadShardAsync(workspace, properties, shard, index, projectMapFactory, cancellationToken)));
+            LoadShardAsync(workspace, properties, shard, index, projectMapFactory, inFlight, cancellationToken)));
 
         return Reconcile(results);
+    }
+
+    /// <summary>Sentinel shard index for a host outside the round-robin pool.</summary>
+    private const int SoloShard = -1;
+
+    /// <summary>
+    /// An empty evaluation map, for a caller that wants a prewarm and a load to share their
+    /// in-flight evaluations. See <see cref="PrewarmEvaluationsAsync"/>.
+    /// </summary>
+    public static ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>> NewEvaluationMap() =>
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Evaluates <paramref name="projectPaths"/> across the pool and stores the results in the
+    /// evaluation cache, producing no project models at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is how a solution open stops being sequential. The open's shape is seed first, batch
+    /// second, and the seed's own evaluation used to stand in front of everything else the pool
+    /// could have been doing. Started before the seed, this pass runs the whole solution's MSBuild
+    /// evaluation — the actual wall-clock cost of a cold open — concurrently with it; by the time
+    /// the batch runs, every project is a cache hit and the batch is conversion work only.
+    /// </para>
+    /// <para>
+    /// It deliberately skips <c>MSBuildProjectLoader.LoadInfosAsync</c> and drives the providers
+    /// directly: the loader's output is <c>ProjectInfo</c>s bound to a <c>ProjectMap</c> of some
+    /// particular workspace, which is exactly the part that cannot be decided yet while the seed
+    /// is still creating that workspace. Evaluation has no such binding, so only evaluation runs
+    /// here. <paramref name="workspace"/> is a scratch workspace the caller owns, used for the
+    /// loader services a provider needs; it must outlive this call and gains no projects.
+    /// </para>
+    /// </remarks>
+    public static async Task PrewarmEvaluationsAsync(
+        Workspace workspace,
+        ImmutableDictionary<string, string> properties,
+        IReadOnlyList<string> projectPaths,
+        ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>> evaluations,
+        CancellationToken cancellationToken)
+    {
+        if (projectPaths.Count == 0)
+            return;
+
+        var shards = new List<string>[PoolSize];
+        for (int i = 0; i < PoolSize; i++)
+            shards[i] = [];
+
+        int start = ShardFor(projectPaths[0]);
+        for (int i = 0; i < projectPaths.Count; i++)
+            shards[(start + i) % PoolSize].Add(projectPaths[i]);
+
+        await Task.WhenAll(shards.Select((shard, index) =>
+            PrewarmShardAsync(workspace, properties, shard, index, evaluations, cancellationToken)));
+    }
+
+    private static async Task PrewarmShardAsync(
+        Workspace workspace,
+        ImmutableDictionary<string, string> properties,
+        List<string> shard,
+        int shardIndex,
+        ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>> inFlight,
+        CancellationToken cancellationToken)
+    {
+        if (shard.Count == 0)
+            return;
+
+        string key = $"{shardIndex} {KeyFor(properties)}";
+        var gate = s_gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        var watch = Stopwatch.StartNew();
+
+        Interlocked.Increment(ref s_inFlightLoads);
+        try
+        {
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                var loader = new MSBuildProjectLoader(workspace, properties);
+                var provider = new CachingProjectFileInfoProvider(properties,
+                    new Lazy<IProjectFileInfoProvider>(() => new BuildHostProjectFileInfoProvider(
+                        ManagerFor(key, properties), loader.ProjectFileExtensionRegistry, loader.Reporter,
+                        progress: null)),
+                    inFlight);
+
+                var misses = provider.Probe(shard);
+                if (misses.Count == 0)
+                    return;
+
+                await RecycleIfAlreadyEvaluatedAsync(key, misses);
+
+                var reporting = new DiagnosticReportingOptions(
+                    DiagnosticReportingMode.Log, DiagnosticReportingMode.Log);
+
+                // A queue rather than a foreach: each evaluation names its ProjectReferences, and
+                // a reference outside the solution's own list — a legacy project only reachable
+                // through another project — would otherwise be met for the first time by the
+                // batch, on its critical path. The in-flight map keeps a reference two shards
+                // discover from being evaluated twice.
+                var pending = new Queue<string>(misses);
+                var chased = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                while (pending.Count > 0)
+                {
+                    string path = pending.Dequeue();
+                    string fullPath = Path.GetFullPath(path);
+                    if (!chased.Add(fullPath))
+                        continue;
+
+                    // Claimed by another shard since it was enqueued: awaiting it would idle this
+                    // host on someone else's work — the stall the prewarm exists to avoid. Only a
+                    // path nobody owns is this shard's business.
+                    if (inFlight.ContainsKey(fullPath))
+                        continue;
+
+                    try
+                    {
+                        var infos = await provider.LoadProjectFileInfosAsync(path, reporting, cancellationToken);
+
+                        string dir = Path.GetDirectoryName(Path.GetFullPath(path)) ?? "";
+                        foreach (var info in infos)
+                        {
+                            if (info.ProjectReferences.IsDefault)
+                                continue;
+
+                            foreach (var reference in info.ProjectReferences)
+                            {
+                                string referencePath = Path.GetFullPath(Path.Combine(dir, reference.Path));
+                                if (!chased.Contains(referencePath)
+                                    && !inFlight.ContainsKey(referencePath)
+                                    && File.Exists(referencePath))
+                                {
+                                    pending.Enqueue(referencePath);
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // The load that follows will evaluate this one itself and report properly;
+                        // said out loud because every one of these is a project the prewarm failed
+                        // to take off the batch's critical path.
+                        Console.Error.WriteLine(
+                            $"[BuildHost] Prewarm could not evaluate '{Path.GetFileName(path)}': {ex.Message}");
+                    }
+                }
+
+                Console.Error.WriteLine(
+                    $"[BuildHost] Prewarm shard {shardIndex}: {chased.Count} evaluation(s) in "
+                    + $"{watch.ElapsedMilliseconds} ms.");
+
+                // Same bookkeeping as a real load: these evaluations live in the host's
+                // ProjectCollection now, and a future reload has to know to retire it.
+                lock (provider.HostEvaluated)
+                {
+                    if (provider.HostEvaluated.Count > 0)
+                    {
+                        var seen = s_evaluated.GetOrAdd(key,
+                            _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                        lock (seen)
+                        {
+                            foreach (string path in provider.HostEvaluated)
+                                seen.Add(path);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref s_inFlightLoads);
+        }
     }
 
     /// <summary>
     /// How many warm hosts to keep. Each is a <c>dotnet</c> process holding a parsed copy of the
     /// SDK, so this trades memory for the ability to evaluate projects concurrently.
+    /// <c>ROSLYNMCP_BUILDHOST_POOL</c> overrides the computed size (bounded 1–16), for machines
+    /// where the computed size does not fit.
     /// </summary>
-    private static readonly int PoolSize = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+    /// <remarks>
+    /// The cap is 6 because that is where an 80-project cold open measured fastest, and the curve
+    /// is not subtle: on a 32-core machine, per-shard evaluation of the same solution took ~10.5s
+    /// with 6 hosts, ~13s with 8, and 16 hosts were three times slower than 4 — MSBuild
+    /// evaluation contends on something machine-wide (the evaluations per second barely move from
+    /// 4 hosts up), so extra hosts past 6 only add spawn cost and contention.
+    /// </remarks>
+    private static readonly int PoolSize =
+        int.TryParse(Environment.GetEnvironmentVariable("ROSLYNMCP_BUILDHOST_POOL"), out int configured)
+            ? Math.Clamp(configured, 1, 16)
+            : Math.Clamp(Environment.ProcessorCount / 2, 1, 6);
 
     /// <summary>
     /// The shard a project starts at — stable for a given path within the process, so the same
@@ -176,6 +388,7 @@ internal static partial class SharedBuildHost
         List<string> shard,
         int shardIndex,
         Func<ProjectMap> projectMapFactory,
+        ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>> inFlight,
         CancellationToken cancellationToken)
     {
         if (shard.Count == 0)
@@ -195,17 +408,31 @@ internal static partial class SharedBuildHost
         await gate.WaitAsync(cancellationToken);
         try
         {
-            // Before anything else: a host that has already evaluated one of these would answer
-            // from its cache rather than from disk. See RecycleIfAlreadyEvaluatedAsync.
-            await RecycleIfAlreadyEvaluatedAsync(key, shard);
-
-            var manager = ManagerFor(key, properties);
-
             // A loader per call, which is cheap — it holds a diagnostic reporter and a file-extension
-            // registry, not a process. The manager is what has to survive, and it does.
+            // registry, not a process. The manager is what has to survive, and it does — but only
+            // when something actually needs evaluating: behind the Lazy, so a shard answered
+            // entirely from the evaluation cache never claims a host at all.
             var loader = new MSBuildProjectLoader(workspace, properties);
-            var provider = new BuildHostProjectFileInfoProvider(
-                manager, loader.ProjectFileExtensionRegistry, loader.Reporter, progress: null);
+            var provider = new CachingProjectFileInfoProvider(properties,
+                new Lazy<IProjectFileInfoProvider>(() => new BuildHostProjectFileInfoProvider(
+                    ManagerFor(key, properties), loader.ProjectFileExtensionRegistry, loader.Reporter,
+                    progress: null)),
+                inFlight);
+
+            // Only the projects the cache cannot answer are the host's business. Among those, a
+            // host that has already evaluated one would answer from its ProjectCollection rather
+            // than from disk — see RecycleIfAlreadyEvaluatedAsync. A cache hit must not trigger
+            // that recycle: it never touches the host, so the host's copy stays irrelevant.
+            var misses = provider.Probe(shard);
+            if (misses.Count > 0)
+            {
+                await RecycleIfAlreadyEvaluatedAsync(key, misses);
+
+                // Saturate the host from the start instead of letting the loader feed it one
+                // dependency-ordered project at a time. See Prefetch for why this is the
+                // difference between pool size mattering and not.
+                provider.Prefetch(misses, cancellationToken);
+            }
 
             // Built inside the shard, so no two concurrent loads ever touch the same map.
             var infos = await loader.LoadInfosAsync(
@@ -213,18 +440,38 @@ internal static partial class SharedBuildHost
 
             // Recorded after the fact: every project this host has now evaluated, including the
             // transitive ones it pulled in, because those are cached in its ProjectCollection just
-            // as firmly as the ones that were asked for.
-            var seen = s_evaluated.GetOrAdd(key, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-            lock (seen)
+            // as firmly as the ones that were asked for. Only genuine host evaluations count —
+            // recording a cache hit here would make the next reload retire a host that never saw
+            // the project.
+            lock (provider.HostEvaluated)
             {
-                foreach (string path in shard)
-                    seen.Add(Path.GetFullPath(path));
-
-                foreach (var info in infos)
+                if (provider.HostEvaluated.Count > 0)
                 {
-                    if (info.FilePath is { Length: > 0 } p)
-                        seen.Add(Path.GetFullPath(p));
+                    var seen = s_evaluated.GetOrAdd(key,
+                        _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                    lock (seen)
+                    {
+                        foreach (string path in provider.HostEvaluated)
+                            seen.Add(path);
+                    }
                 }
+            }
+
+            if (provider.Hits > 0)
+            {
+                string hostWork;
+                lock (provider.HostEvaluated)
+                {
+                    // Named when few, because on a warm load each of these is a surprise worth
+                    // being able to read off the log.
+                    hostWork = provider.HostEvaluated.Count is > 0 and <= 8
+                        ? $"{provider.HostEvaluated.Count} from the host " +
+                          $"({string.Join(", ", provider.HostEvaluated.Select(Path.GetFileName))})"
+                        : $"{provider.HostEvaluated.Count} from the host";
+                }
+
+                Console.Error.WriteLine(
+                    $"[BuildHost] Shard {shardIndex}: {provider.Hits} evaluation(s) from cache, {hostWork}");
             }
 
             return infos;

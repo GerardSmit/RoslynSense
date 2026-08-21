@@ -705,7 +705,13 @@ internal static class WorkspaceService
                 // daemon start. Must happen before the first project lands in the workspace, and
                 // only for the bound solution's own workspace: SQLite holds the DB exclusively,
                 // so a second workspace given the same path would silently degrade to NoOp.
-                if (BoundSolutionPath is { Length: > 0 } boundSolution
+                //
+                // Opt-in while it earns trust: setting the FilePath switches every index read and
+                // write in the process onto the SQLite storage service and its native library —
+                // a crash or wedge there takes the whole load down, which is a daemon that never
+                // answers and an editor that says the workspace is still loading.
+                if (Environment.GetEnvironmentVariable("ROSLYN_SENSE_PERSISTENT_INDEX") == "1"
+                    && BoundSolutionPath is { Length: > 0 } boundSolution
                     && string.Equals(cacheKey, Path.GetFullPath(boundSolution),
                         StringComparison.OrdinalIgnoreCase))
                 {
@@ -1154,41 +1160,90 @@ internal static class WorkspaceService
         foreach (string batchProjectPath in normalized)
             await GeneratorBuildService.EnsureGeneratorsBuiltAsync(batchProjectPath, cancellationToken);
 
-        // The first project both establishes the solution workspace (via the ordinary cached path,
-        // including all its fallback behaviour) and tells us which entry the rest belong in.
-        await GetOrOpenProjectAsync(normalized[0], cancellationToken: cancellationToken);
+        // Every project's MSBuild evaluation, started before the seed instead of after it. The
+        // seed takes seconds and the batch's evaluation took tens of them, strictly in sequence;
+        // this runs the expensive half of the batch concurrently with the seed (which takes a solo
+        // BuildHost rather than queueing behind these shards), and the batch below then finds
+        // every project already in the evaluation cache. Failure here costs nothing: the batch
+        // evaluates whatever the cache cannot answer, exactly as it always did.
+        Task? prewarm = null;
+        MSBuildWorkspace? scratch = null;
+        var evaluations = SharedBuildHost.NewEvaluationMap();
+        if (normalized.Count > 1)
+        {
+            try
+            {
+                scratch = CreateWorkspace(isLegacy: PathHelper.RequiresMsBuild(normalized[0]));
 
-        CachedWorkspaceEntry? entry = null;
-        await s_cacheLock.WaitAsync(cancellationToken);
+                // Everything except the seed itself: the seed's own load is about to evaluate
+                // that one anyway, and evaluating it here too would only race the stores.
+                prewarm = SharedBuildHost.PrewarmEvaluationsAsync(
+                    scratch, scratch.Properties, normalized.Skip(1).ToList(), evaluations,
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WorkspaceService] Evaluation prewarm failed to start: {ex.Message}");
+            }
+        }
+
         try
         {
-            if (s_projectToCacheKey.TryGetValue(normalized[0], out var keys)
-                && keys.FirstOrDefault(k => s_cache.ContainsKey(k)) is { } key
-                && s_cache.TryGetValue(key, out var found)
-                && found.Workspace is MSBuildWorkspace
-                && PathHelper.IsSolutionFile(found.CacheKey))
+            // The first project both establishes the solution workspace (via the ordinary cached
+            // path, including all its fallback behaviour) and tells us which entry the rest belong
+            // in.
+            await GetOrOpenProjectAsync(normalized[0], cancellationToken: cancellationToken);
+
+            CachedWorkspaceEntry? entry = null;
+            await s_cacheLock.WaitAsync(cancellationToken);
+            try
             {
-                entry = found;
+                if (s_projectToCacheKey.TryGetValue(normalized[0], out var keys)
+                    && keys.FirstOrDefault(k => s_cache.ContainsKey(k)) is { } key
+                    && s_cache.TryGetValue(key, out var found)
+                    && found.Workspace is MSBuildWorkspace
+                    && PathHelper.IsSolutionFile(found.CacheKey))
+                {
+                    entry = found;
+                }
+            }
+            finally
+            {
+                s_cacheLock.Release();
+            }
+
+            if (entry is null)
+            {
+                // Loose projects, decompiled entries, or a solution whose workspace failed to
+                // become the owner: nothing to batch into.
+                foreach (string path in normalized.Skip(1))
+                    await LoadOneIgnoringFailureAsync(path, cancellationToken);
+                return;
+            }
+
+            // Deliberately not awaiting the prewarm first. The batch's shards queue on the same
+            // host gates the prewarm holds, so each one starts converting the moment that shard's
+            // evaluations drain — staggered, while the slowest shards are still working — instead
+            // of the whole conversion waiting for the last one. The shared evaluation map is what
+            // makes this safe: every prewarm result, including a reference outside the solution
+            // list (the chase) and a failed evaluation the disk cache never records, reaches the
+            // batch as an in-flight task rather than as a cache miss that would claim a host.
+            if (!await TryBatchLoadAsync(entry, normalized, evaluations, cancellationToken))
+            {
+                foreach (string path in normalized)
+                    await LoadOneIgnoringFailureAsync(path, cancellationToken);
             }
         }
         finally
         {
-            s_cacheLock.Release();
-        }
+            if (prewarm is not null)
+            {
+                // Whether the batch consumed it or the seed threw halfway: let the prewarm drain
+                // before the scratch workspace it borrows services from is disposed under it.
+                try { await prewarm; } catch { }
+            }
 
-        if (entry is null)
-        {
-            // Loose projects, decompiled entries, or a solution whose workspace failed to become
-            // the owner: nothing to batch into.
-            foreach (string path in normalized.Skip(1))
-                await LoadOneIgnoringFailureAsync(path, cancellationToken);
-            return;
-        }
-
-        if (!await TryBatchLoadAsync(entry, normalized, cancellationToken))
-        {
-            foreach (string path in normalized)
-                await LoadOneIgnoringFailureAsync(path, cancellationToken);
+            scratch?.Dispose();
         }
     }
 
@@ -1235,7 +1290,10 @@ internal static class WorkspaceService
     /// </para>
     /// </remarks>
     private static async Task<bool> TryBatchLoadAsync(
-        CachedWorkspaceEntry entry, IReadOnlyList<string> wanted, CancellationToken cancellationToken)
+        CachedWorkspaceEntry entry,
+        IReadOnlyList<string> wanted,
+        ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>>? sharedEvaluations,
+        CancellationToken cancellationToken)
     {
         if (entry.Workspace is not MSBuildWorkspace live)
             return false;
@@ -1280,7 +1338,8 @@ internal static class WorkspaceService
                 live.Properties,
                 missing,
                 () => ProjectMap.Create(solutionForMaps),
-                cancellationToken);
+                cancellationToken,
+                sharedEvaluations);
         }
         catch (OperationCanceledException)
         {
@@ -2741,38 +2800,135 @@ internal static class WorkspaceService
     /// the bytes moving — which is what a rebuild produces — must cost nothing.
     /// </remarks>
     private static Project RefreshDocumentIfStale(
-        CachedWorkspaceEntry entry, Project project, string filePath, DateTime cacheTime)
+        CachedWorkspaceEntry entry, Project project, string? filePath, DateTime cacheTime)
     {
-        var document = FindDocumentInProject(project, filePath);
-        if (document is null)
+        var solution = project.Solution;
+        List<(DocumentId Id, SourceText Text)>? stale = null;
+        var watcher = entry.DirtyWatcher;
+        bool watching = watcher is not null && !watcher.TakeOverflow();
+
+        if (watching)
+        {
+            // The watcher recorded every disk change since load, so refresh is exactly the dirty
+            // set — no stats over files nobody touched, and edits in *other* projects of this
+            // workspace are picked up too, which the old target-only refresh never did. Events
+            // arrive with no mtime promise (a copy that preserves timestamps still raises one),
+            // so the event itself is the trigger and content is the judge.
+            foreach (var evt in watcher!.Snapshot())
+            {
+                bool retry = false;
+                foreach (var documentId in solution.GetDocumentIdsWithFilePath(evt.Key))
+                {
+                    if (solution.GetDocument(documentId) is not { } document)
+                        continue;
+
+                    switch (TryReadChanged(document, evt.Key, cacheTime, requireNewerMtime: false, out var text))
+                    {
+                        case ReadOutcome.Changed:
+                            (stale ??= []).Add((documentId, text!));
+                            break;
+                        case ReadOutcome.Unreadable:
+                            // Mid-write. Leave the event marked so the next request retries.
+                            retry = true;
+                            break;
+                    }
+                }
+
+                if (!retry)
+                    watcher.Clear(evt);
+            }
+        }
+        else
+        {
+            // No watcher (unwatchable root) or it overflowed: fall back to statting every
+            // document of the requested project, throttled per workspace. A request with no
+            // named file is asking about the project as a whole and always sweeps — there is
+            // no precise fallback that could cover for it.
+            bool sweepDue = filePath is null;
+            long now = Environment.TickCount64;
+            long last = Interlocked.Read(ref entry.LastStaleSweepTicks);
+            if (now - last >= StaleSweepInterval
+                && Interlocked.CompareExchange(ref entry.LastStaleSweepTicks, now, last) == last)
+            {
+                sweepDue = true;
+            }
+
+            if (sweepDue)
+            {
+                foreach (var document in project.Documents)
+                {
+                    if (document.FilePath is not { Length: > 0 } path)
+                        continue;
+                    if (TryReadChanged(document, path, cacheTime, requireNewerMtime: true, out var text)
+                        == ReadOutcome.Changed)
+                    {
+                        (stale ??= []).Add((document.Id, text!));
+                    }
+                }
+            }
+        }
+
+        // The named file is always checked precisely, watcher or not: a watcher event is
+        // delivered asynchronously, and the write this request is about may have beaten it here.
+        if (filePath is not null
+            && (stale is null || !stale.Any(s => solution.GetDocument(s.Id)?.FilePath?.Equals(
+                filePath, StringComparison.OrdinalIgnoreCase) == true))
+            && FindDocumentInProject(project, filePath) is { } target
+            && TryReadChanged(target, filePath, cacheTime, requireNewerMtime: true, out var targetText)
+                == ReadOutcome.Changed)
+        {
+            (stale ??= []).Add((target.Id, targetText!));
+        }
+
+        if (stale is null)
             return project;
 
-        // An open editor buffer (LSP) is authoritative over disk — it was already applied by
-        // the overlay pass, and disk mtime says nothing about unsaved edits.
+        var updatedSolution = MemoizedRefresh(entry, solution, stale);
+        return updatedSolution.GetProject(project.Id) ?? project;
+    }
+
+    /// <summary>How long a workspace coasts between whole-project staleness sweeps when no
+    /// watcher covers it. Long enough that the LSP request stream never pays the per-document
+    /// stats twice for one burst, short enough that an edit-then-ask MCP exchange always lands
+    /// after a fresh sweep.</summary>
+    private const long StaleSweepInterval = 2_000;
+
+    private enum ReadOutcome { Unchanged, Changed, Unreadable }
+
+    /// <summary>Reads the file's disk text when it genuinely differs from what the workspace
+    /// holds. <see cref="ReadOutcome.Unchanged"/> also covers a file an editor buffer owns
+    /// (the overlay already applied it, and disk says nothing about unsaved edits) and one whose
+    /// mtime gate says nothing moved; <see cref="ReadOutcome.Unreadable"/> is a file mid-write,
+    /// where what the workspace holds is the better answer than no answer.</summary>
+    private static ReadOutcome TryReadChanged(
+        Document document, string filePath, DateTime cacheTime, bool requireNewerMtime,
+        out SourceText? text)
+    {
+        text = null;
+
         if (OpenDocumentStore.IsOpen(filePath))
-            return project;
+            return ReadOutcome.Unchanged;
 
         var fileInfo = new FileInfo(filePath);
-        if (!fileInfo.Exists || fileInfo.LastWriteTimeUtc <= cacheTime)
-            return project;
+        if (!fileInfo.Exists || (requireNewerMtime && fileInfo.LastWriteTimeUtc <= cacheTime))
+            return ReadOutcome.Unchanged;
 
-        SourceText text;
+        SourceText disk;
         try
         {
             using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            text = SourceText.From(stream);
+            disk = SourceText.From(stream);
         }
         catch (IOException)
         {
-            // Mid-write on disk. What the workspace holds is the better answer than no answer.
-            return project;
+            return ReadOutcome.Unreadable;
         }
 
-        if (document.TryGetText(out var current) && current.ContentEquals(text))
-            return project;
+        if (document.TryGetText(out var current) && current.ContentEquals(disk))
+            return ReadOutcome.Unchanged;
 
-        var updatedSolution = MemoizedRefresh(entry, project.Solution, document.Id, text);
-        return updatedSolution.GetProject(project.Id) ?? project;
+        text = disk;
+        return ReadOutcome.Changed;
     }
 
     /// <summary>
@@ -2801,29 +2957,49 @@ internal static class WorkspaceService
     /// </para>
     /// </remarks>
     private static Solution MemoizedRefresh(
-        CachedWorkspaceEntry entry, Solution baseSolution, DocumentId documentId, SourceText text)
+        CachedWorkspaceEntry entry, Solution baseSolution,
+        IReadOnlyList<(DocumentId Id, SourceText Text)> staleDocuments)
     {
-        var checksum = text.GetChecksum();
-
         lock (entry.RefreshLock)
         {
             if (!ReferenceEquals(entry.RefreshBase, baseSolution))
             {
                 entry.RefreshBase = baseSolution;
+                entry.RefreshResult = baseSolution;
                 entry.RefreshedDocuments.Clear();
             }
-            else if (entry.RefreshedDocuments.TryGetValue(documentId, out var memo)
-                && memo.Checksum.SequenceEqual(checksum))
+
+            // One chain rather than a fork per document: each stale document's text is applied on
+            // top of what is already there, so a request that names file A and one that names
+            // file B converge on the same Solution instance — and its semantic models — instead
+            // of building rival forks that each miss the other's refresh.
+            // Overflow restarts the chain with just this batch, checked up front so a reset can
+            // never throw away part of the batch it is applying. The chain holds one Solution
+            // however many documents it carries, so the bound is about not letting a session that
+            // walks the whole tree keep every replaced syntax tree alive forever.
+            int newDocuments = staleDocuments.Count(d => !entry.RefreshedDocuments.ContainsKey(d.Id));
+            if (entry.RefreshedDocuments.Count + newDocuments > MaxMemoizedRefreshes)
             {
-                return memo.Solution;
+                entry.RefreshResult = baseSolution;
+                entry.RefreshedDocuments.Clear();
             }
 
-            if (entry.RefreshedDocuments.Count >= MaxMemoizedRefreshes)
-                entry.RefreshedDocuments.Clear();
+            var result = entry.RefreshResult ?? baseSolution;
+            foreach (var (documentId, text) in staleDocuments)
+            {
+                var checksum = text.GetChecksum();
+                if (entry.RefreshedDocuments.TryGetValue(documentId, out var applied)
+                    && applied.SequenceEqual(checksum))
+                {
+                    continue;
+                }
 
-            var refreshed = baseSolution.WithDocumentText(documentId, text);
-            entry.RefreshedDocuments[documentId] = (refreshed, checksum);
-            return refreshed;
+                result = result.WithDocumentText(documentId, text);
+                entry.RefreshedDocuments[documentId] = checksum;
+            }
+
+            entry.RefreshResult = result;
+            return result;
         }
     }
 
@@ -3812,14 +3988,24 @@ internal static class WorkspaceService
         /// the next rebuild can re-apply only the buffers that moved instead of all of them.</summary>
         public Dictionary<DocumentId, SourceText> OverlayTexts { get; set; } = new();
 
-        /// <summary>Memoized refreshed-from-disk forks (see MemoizedRefresh): the solution each
-        /// stale document was last refreshed into, and the disk checksum it was refreshed from.
+        /// <summary>Memoized refreshed-from-disk fork (see MemoizedRefresh): one chained solution
+        /// carrying every stale document's disk text, with the checksum each was refreshed from.
         /// Valid only against <see cref="RefreshBase"/>.</summary>
         public object RefreshLock { get; } = new();
         public Solution? RefreshBase { get; set; }
+        public Solution? RefreshResult { get; set; }
 
-        public Dictionary<DocumentId, (Solution Solution, ImmutableArray<byte> Checksum)> RefreshedDocuments { get; }
-            = new();
+        public Dictionary<DocumentId, ImmutableArray<byte>> RefreshedDocuments { get; } = new();
+
+        /// <summary>When the last whole-project staleness sweep ran (Environment.TickCount64).
+        /// The sweep is the fallback when <see cref="DirtyWatcher"/> is unavailable or lost
+        /// events; with a live watcher the dirty set replaces it entirely.</summary>
+        public long LastStaleSweepTicks;
+
+        /// <summary>Disk changes under this workspace's root since load, recorded by a file
+        /// watcher so refresh consumes exactly what changed. Null when the root cannot be
+        /// watched, in which case the throttled stat sweep covers.</summary>
+        public WorkspaceDirtyWatcher? DirtyWatcher { get; }
 
         public CachedWorkspaceEntry(
             string cacheKey,
@@ -3841,6 +4027,8 @@ internal static class WorkspaceService
             ProjectIds = new System.Collections.Concurrent.ConcurrentDictionary<string, ProjectId>(
                 StringComparer.OrdinalIgnoreCase);
             RefreshProjectIds();
+
+            DirtyWatcher = WorkspaceDirtyWatcher.TryCreate(Path.GetDirectoryName(cacheKey));
         }
 
         /// <summary>Re-syncs <see cref="ProjectIds"/> from the workspace's current solution after
@@ -3899,6 +4087,7 @@ internal static class WorkspaceService
             // First, so a load parked on the gate sees it the moment it gets in, rather than
             // walking into a workspace that is already being torn down.
             IsDisposed = true;
+            DirtyWatcher?.Dispose();
             Workspace.Dispose();
             ShadowLoader?.Dispose();
             if (TempDirs is not null)

@@ -770,7 +770,7 @@ internal static class WorkspaceService
                         var seedInfos = await SharedBuildHost.LoadAsync(
                             msbuildWorkspace, msbuildWorkspace.Properties, [normalizedPath],
                             () => ProjectMap.Create(solutionForMap), openLinked.Token);
-                        AddProjectsAndRewireReferences(msbuildWorkspace, seedInfos);
+                        await AddProjectsRewireAndHealAsync(msbuildWorkspace, seedInfos, openLinked.Token);
                         openedProject = msbuildWorkspace.CurrentSolution.Projects.First(p =>
                             p.FilePath is { Length: > 0 } fp
                             && string.Equals(Path.GetFullPath(fp), normalizedPath, StringComparison.OrdinalIgnoreCase));
@@ -1084,6 +1084,64 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// <see cref="AddProjectsAndRewireReferences"/>, then heals the references evaluation
+    /// dropped over unbuilt outputs — loading the dropped targets when the workspace does not
+    /// hold them, which is the usual case: a dropped reference is precisely one the loader
+    /// never chased.
+    /// </summary>
+    /// <remarks>
+    /// Bounded rounds, not a fixpoint: each round can only discover targets through projects
+    /// the previous round loaded, and reference chains of dropped-over-unbuilt-output projects
+    /// run shallow. A chain deeper than the bound stays partially healed and says so in the
+    /// load log, which beats an unbounded loop over a pathological project graph.
+    /// </remarks>
+    private static async Task AddProjectsRewireAndHealAsync(
+        MSBuildWorkspace workspace,
+        ImmutableArray<ProjectInfo> infos,
+        CancellationToken cancellationToken)
+    {
+        AddProjectsAndRewireReferences(workspace, infos);
+
+        for (int round = 0; round < 3; round++)
+        {
+            var missing = ProjectReferenceHealer.Heal(workspace);
+            if (missing.Count == 0)
+                return;
+
+            ImmutableArray<ProjectInfo> extra;
+            try
+            {
+                var solutionForMap = workspace.CurrentSolution;
+                extra = await SharedBuildHost.LoadAsync(
+                    workspace, workspace.Properties, missing,
+                    () => ProjectMap.Create(solutionForMap), cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[WorkspaceService] Could not load {missing.Count} project(s) referenced " +
+                    $"through unbuilt outputs ({ex.Message}); their references stay dropped.");
+                return;
+            }
+
+            if (extra.IsDefaultOrEmpty)
+                return;
+
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Loaded {extra.Length} project(s) reachable only through " +
+                $"references evaluation had dropped: " +
+                $"{string.Join(", ", missing.Select(Path.GetFileName).Take(4))}" +
+                (missing.Count > 4 ? ", …" : "") + ".");
+
+            AddProjectsAndRewireReferences(workspace, extra);
+        }
+    }
+
+    /// <summary>
     /// Which of <paramref name="projectPaths"/> are not served by any live cached workspace yet.
     /// </summary>
     /// <remarks>
@@ -1383,7 +1441,7 @@ internal static class WorkspaceService
             // project's own id; AddProjectsAndRewireReferences skips those, so this counts what
             // genuinely arrived.
             added = loaded.Count(i => !live.CurrentSolution.ContainsProject(i.Id));
-            AddProjectsAndRewireReferences(live, loaded);
+            await AddProjectsRewireAndHealAsync(live, loaded, cancellationToken);
 
             if (added == 0)
             {

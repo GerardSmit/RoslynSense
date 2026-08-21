@@ -252,6 +252,13 @@ public static class GoToDefinitionSnippetTool
     /// carry how the source was obtained, because a checksum-verified file and a decompilation are
     /// not equally strong evidence of what the assembly actually does.
     /// </remarks>
+    /// <summary>
+    /// Below this size an external file is shown whole. A window around a type's declaration
+    /// line cuts off the body — the part the reader usually came for — which then has to be
+    /// paged in by hand from the temp file.
+    /// </summary>
+    private const int WholeExternalFileLineLimit = 200;
+
     private static async Task AppendExternalSourceAsync(
         StringBuilder sb,
         ExternalSourceResult external,
@@ -265,6 +272,12 @@ public static class GoToDefinitionSnippetTool
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            return;
+        }
+
+        if (lines.Length <= WholeExternalFileLineLimit)
+        {
+            AppendWholeExternalFile(sb, external, lines);
             return;
         }
 
@@ -282,6 +295,7 @@ public static class GoToDefinitionSnippetTool
 
             int targetLine = external.Positions[i].Line;
             sb.AppendLine($"**File**: {external.FilePath}");
+            sb.AppendLine($"**Length**: {lines.Length} lines");
             sb.AppendLine($"**Line**: {targetLine + 1}");
             sb.AppendLine();
 
@@ -299,6 +313,37 @@ public static class GoToDefinitionSnippetTool
             sb.AppendLine("```");
             sb.AppendLine();
         }
+    }
+
+    private static void AppendWholeExternalFile(
+        StringBuilder sb, ExternalSourceResult external, string[] lines)
+    {
+        sb.AppendLine($"## {external.Title}");
+        sb.AppendLine();
+
+        sb.AppendLine(
+            $"**Provenance**: {external.Provenance} from "
+            + $"`{Path.GetFileNameWithoutExtension(external.AssemblyPath)}`");
+        sb.AppendLine($"**Assembly Path**: {external.AssemblyPath}");
+        sb.AppendLine($"**File**: {external.FilePath}");
+        sb.AppendLine($"**Length**: {lines.Length} lines (shown in full)");
+
+        var targetLines = external.Positions.Select(p => p.Line).ToHashSet();
+        sb.AppendLine(targetLines.Count > 1
+            ? $"**Lines**: {string.Join(", ", targetLines.Order().Select(l => l + 1))}"
+            : $"**Line**: {targetLines.First() + 1}");
+        sb.AppendLine();
+
+        sb.AppendLine("```csharp");
+        for (int line = 0; line < lines.Length; line++)
+        {
+            sb.AppendLine(targetLines.Contains(line)
+                ? $"{line + 1}: > {lines[line]}"
+                : $"{line + 1}:   {lines[line]}");
+        }
+
+        sb.AppendLine("```");
+        sb.AppendLine();
     }
 
     private static async Task AppendLocationsAsync(

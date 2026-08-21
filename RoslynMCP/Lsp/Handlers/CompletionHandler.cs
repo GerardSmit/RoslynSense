@@ -51,7 +51,7 @@ internal static class CompletionHandler
         // template, a GraphQL document — belongs to that language, not to C#: the C# pass has
         // nothing to offer inside a literal anyway. Costs one syntax lookup when no embedded
         // language is registered, and nothing at all when the caret is not in a literal.
-        if (await RoslynEmbeddedLanguages.Current.DetectAsync(document, offset, ct) is
+        if (await RoslynEmbeddedLanguages.Current.DetectForCompletionAsync(document, offset, ct) is
             { Language: IEmbeddedCompletionProvider embedded } embeddedContext)
         {
             return await embedded.CompletionAsync(embeddedContext, p, ct);

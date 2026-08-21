@@ -123,6 +123,57 @@ internal sealed class RoslynEmbeddedLanguages
     }
 
     /// <summary>
+    /// The embedded language a caret is completing in, which is not quite the one it is standing
+    /// in.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A caret is a gap between characters, and what is being typed is the token to its left. That
+    /// makes <c>$"{total:yyyy|}"</c> — where every specifier is finished, and the place anybody
+    /// would ask for a list — a position the token does not contain, which is why nothing was ever
+    /// offered inside one.
+    /// </para>
+    /// <para>
+    /// An empty specifier has no token to find at all: <c>$"{total:|}"</c> leaves the format text
+    /// zero-width and <see cref="SyntaxNode.FindToken"/> steps straight over it. Having typed a
+    /// colon and stopped is the strongest signal there is that somebody does not know what goes
+    /// after it, so that is the one position the list has to answer.
+    /// </para>
+    /// </remarks>
+    public async Task<EmbeddedStringContext?> DetectForCompletionAsync(
+        Document document, int position, CancellationToken ct)
+    {
+        if (IsEmpty || await document.GetSyntaxRootAsync(ct) is not { } root)
+            return null;
+
+        return CompletingIn(root, position) is { } token
+            ? await DetectAtAsync(document, token, position, ct)
+            : null;
+    }
+
+    /// <summary>The token a caret is typing into; see <see cref="DetectForCompletionAsync"/>.</summary>
+    private static SyntaxToken? CompletingIn(SyntaxNode root, int position)
+    {
+        var here = root.FindToken(position);
+        if (IsCandidate(here) && here.Span.Contains(position))
+            return here;
+
+        if (position == 0)
+            return null;
+
+        var before = root.FindToken(position - 1);
+        if (IsCandidate(before) && before.Span.End == position)
+            return before;
+
+        // What is on the left of an empty specifier is its colon, so the token nobody can find by
+        // position is reached as the one after it.
+        var empty = before.GetNextToken(includeZeroWidth: true);
+        return IsCandidate(empty) && empty.Span.IsEmpty && empty.SpanStart == position
+            ? empty
+            : null;
+    }
+
+    /// <summary>
     /// Every embedded literal in the document, for the passes that are about a file rather than a
     /// caret — diagnostics above all.
     /// </summary>

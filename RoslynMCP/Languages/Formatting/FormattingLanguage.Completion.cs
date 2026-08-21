@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Languages.Formatting.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
 
@@ -37,7 +38,8 @@ internal sealed partial class FormattingLanguage : IEmbeddedCompletionProvider
         // value to print, and the components would be the wrong list for it.
         if (FormatString.HoleAt(Holes(at), offset) is not { } hole
             || offset < hole.Specifier.Start
-            || offset > hole.Specifier.End)
+            || offset > hole.Specifier.End
+            || !HasSpecifier(at, hole))
         {
             return Empty;
         }
@@ -59,7 +61,7 @@ internal sealed partial class FormattingLanguage : IEmbeddedCompletionProvider
         var items = new List<CompletionItem>();
         int order = 0;
 
-        foreach (var component in FormatString.Components(family))
+        foreach (var component in FormatString.Components(family, at.Kind(hole.Index)))
         {
             string detail = FormatString.Example(component.Text, family) is { } example
                 ? $"{component.Description} — {example}"
@@ -76,4 +78,17 @@ internal sealed partial class FormattingLanguage : IEmbeddedCompletionProvider
 
         return new CompletionList(false, [.. items]);
     }
+
+    /// <summary>
+    /// Whether the hole has a specifier at all, rather than a place one would go.
+    /// </summary>
+    /// <remarks>
+    /// A hole with no colon is given a zero-width specifier at its closing brace, which is the same
+    /// position as a caret that has just finished typing the index — so <c>{0|}</c> would be
+    /// offered a list of date components on the strength of punctuation nobody has typed. A lone
+    /// specifier has no colon of its own: the whole text is one.
+    /// </remarks>
+    private static bool HasSpecifier(FormatAt at, FormatHole hole) =>
+        at.Site.Kind != FormatTextKind.Composite
+        || (hole.Specifier.Start > 0 && at.Text[hole.Specifier.Start - 1] == ':');
 }

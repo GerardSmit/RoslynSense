@@ -5,6 +5,31 @@ using Microsoft.CodeAnalysis.Text;
 namespace RoslynMCP.Languages.Formatting;
 
 /// <summary>
+/// Which components of its family a value can actually be printed with.
+/// </summary>
+/// <remarks>
+/// Not a second family: a <c>DateOnly</c> and a <c>DateTime</c> read the same grammar and colour
+/// the same way, and they differ only in which of its words they accept. The distinction earns its
+/// place because a rejected specifier does not print oddly — <c>D5</c> on a <c>double</c> and
+/// <c>HH</c> on a <c>DateOnly</c> are each a <c>FormatException</c> at run time, thrown from a line
+/// that compiled, so offering one is offering a crash.
+/// </remarks>
+internal enum FormatValueKind
+{
+    /// <summary>Anything the family offers — or nothing said what the value is.</summary>
+    Any,
+
+    /// <summary>An integral type, which alone accepts <c>D</c> and <c>X</c>.</summary>
+    WholeNumber,
+
+    /// <summary>A <c>DateOnly</c>, which has no time of day to print.</summary>
+    WithoutTime,
+
+    /// <summary>A <c>TimeOnly</c>, which has no date to print.</summary>
+    WithoutDate,
+}
+
+/// <summary>
 /// Which grammar a specifier is read with — the same characters mean different things.
 /// </summary>
 /// <remarks>
@@ -468,11 +493,24 @@ internal static class FormatString
     /// annotated is a date far more often than it is anything else — offering the numeric
     /// placeholders instead would put <c>#,##0.00</c> in front of someone formatting a timestamp.
     /// </para>
+    /// <para>
+    /// <paramref name="kind"/> takes back out what the value cannot print. A <c>double</c> compiles
+    /// with <c>D5</c> and throws on it, and so does a <c>DateOnly</c> with <c>HH</c> — a list that
+    /// offered them would be handing over the one specifier the reader cannot use.
+    /// </para>
     /// </remarks>
-    public static ImmutableArray<FormatComponent> Components(FormatFamily family) =>
-        family == FormatFamily.Number ? s_numberComponents : s_dateComponents;
+    public static ImmutableArray<FormatComponent> Components(
+        FormatFamily family, FormatValueKind kind = FormatValueKind.Any) =>
+        family == FormatFamily.Number
+            ? kind == FormatValueKind.WholeNumber ? s_wholeNumberComponents : s_numberComponents
+            : kind switch
+            {
+                FormatValueKind.WithoutTime => s_calendarComponents,
+                FormatValueKind.WithoutDate => s_clockComponents,
+                _ => s_dateComponents,
+            };
 
-    private static readonly ImmutableArray<FormatComponent> s_dateComponents =
+    private static readonly ImmutableArray<FormatComponent> s_calendarComponents =
     [
         new("dd", "Day of the month, two digits"),
         new("ddd", "Day of the week, short name"),
@@ -482,12 +520,25 @@ internal static class FormatString
         new("MMMM", "Month, full name"),
         new("yy", "Year, two digits"),
         new("yyyy", "Year, four digits"),
+    ];
+
+    private static readonly ImmutableArray<FormatComponent> s_clockComponents =
+    [
         new("HH", "Hour, 24-hour clock, two digits"),
         new("hh", "Hour, 12-hour clock, two digits"),
         new("mm", "Minute, two digits"),
         new("ss", "Second, two digits"),
         new("fff", "Fractional second, three digits"),
         new("tt", "AM or PM"),
+    ];
+
+    private static readonly ImmutableArray<FormatComponent> s_dateComponents =
+    [
+        .. s_calendarComponents,
+        .. s_clockComponents,
+
+        // A zone belongs to neither half: it is the one component a `DateOnly` and a `TimeOnly`
+        // both reject, because neither of them carries an offset.
         new("zzz", "Time zone offset"),
     ];
 
@@ -502,8 +553,14 @@ internal static class FormatString
         new("C2", "Currency, two decimals"),
         new("P1", "Per cent, one decimal"),
         new("F2", "Fixed-point, two decimals"),
-        new("D5", "Integer, padded to five digits"),
         new("E3", "Scientific, three decimals"),
+    ];
+
+    private static readonly ImmutableArray<FormatComponent> s_wholeNumberComponents =
+    [
+        .. s_numberComponents,
+        new("D5", "Whole number, padded to five digits"),
+        new("X4", "Hexadecimal, padded to four digits"),
     ];
 
     /// <summary>

@@ -184,20 +184,46 @@ internal static partial class SharedBuildHost
         for (int i = 0; i < PoolSize; i++)
             shards[i] = [];
 
+        // Legacy projects get one lane of their own rather than a round-robin slot. Their cost
+        // is not evaluation — warm, a legacy design-time build measured ~150-200 ms — it is the
+        // .NET Framework BuildHost behind it: a VS MSBuild initialisation that measured ~10 s
+        // when six shards each spawned their own while six SDK hosts were initialising beside
+        // them. Concentrated here, that price is paid once per open, concurrently with the SDK
+        // shards, and an 80-project cold open on the same loaded machine dropped from 52.8 s to
+        // under 20 s. Legacy projects a chase discovers mid-shard still evaluate where they are
+        // found — rare, and correctness beats purity there.
+        var legacy = new List<string>();
         int start = ShardFor(projectPaths[0]);
+        int next = 0;
         for (int i = 0; i < projectPaths.Count; i++)
-            shards[(start + i) % PoolSize].Add(projectPaths[i]);
+        {
+            if (PathHelper.RequiresMsBuild(projectPaths[i]))
+                legacy.Add(projectPaths[i]);
+            else
+                shards[(start + next++) % PoolSize].Add(projectPaths[i]);
+        }
 
         // The prewarm is the one place the whole pool runs flat out over one solution, which
         // makes it the machine's pool-size benchmark: hot loads never get here with enough
         // misses to record, so only genuine cold loads teach the calibration anything.
         var watch = Stopwatch.StartNew();
-        int[] evaluated = await Task.WhenAll(shards.Select((shard, index) =>
-            PrewarmShardAsync(workspace, properties, shard, index, evaluations, cancellationToken)));
+        var lanes = shards.Select((shard, index) =>
+            PrewarmShardAsync(workspace, properties, shard, index, evaluations, cancellationToken));
+        if (legacy.Count > 0)
+        {
+            lanes = lanes.Append(PrewarmShardAsync(
+                workspace, properties, legacy, LegacyShard, evaluations, cancellationToken));
+        }
+
+        int[] evaluated = await Task.WhenAll(lanes);
 
         BuildHostPoolCalibration.Record(
             PoolSize, evaluated.Sum(), watch.Elapsed.TotalSeconds);
     }
+
+    /// <summary>Sentinel shard index for the one host that serves every legacy project of an
+    /// open. See the routing in <see cref="PrewarmEvaluationsAsync"/>.</summary>
+    private const int LegacyShard = -2;
 
     private static async Task<int> PrewarmShardAsync(
         Workspace workspace,
@@ -236,6 +262,16 @@ internal static partial class SharedBuildHost
                 var reporting = new DiagnosticReportingOptions(
                     DiagnosticReportingMode.Log, DiagnosticReportingMode.Log);
 
+                // Claim every miss in the shared map before evaluating any of them. The batch
+                // conversion runs concurrently with this prewarm and does not share its shard
+                // assignment (legacy projects live on their own lane here), so an unclaimed
+                // path would be evaluated by whichever batch shard reached it first — on a
+                // host of the wrong kind, which for a legacy project means the very VS MSBuild
+                // spawn this lane exists to pay only once. A claimed path is awaited instead.
+                provider.Prefetch(misses, cancellationToken);
+                var claimed = new HashSet<string>(
+                    misses.Select(Path.GetFullPath), StringComparer.OrdinalIgnoreCase);
+
                 // A queue rather than a foreach: each evaluation names its ProjectReferences, and
                 // a reference outside the solution's own list — a legacy project only reachable
                 // through another project — would otherwise be met for the first time by the
@@ -251,9 +287,10 @@ internal static partial class SharedBuildHost
                         continue;
 
                     // Claimed by another shard since it was enqueued: awaiting it would idle this
-                    // host on someone else's work — the stall the prewarm exists to avoid. Only a
-                    // path nobody owns is this shard's business.
-                    if (inFlight.ContainsKey(fullPath))
+                    // host on someone else's work — the stall the prewarm exists to avoid. Only
+                    // paths this shard claimed itself, and unowned chase discoveries, are its
+                    // business.
+                    if (!claimed.Contains(fullPath) && inFlight.ContainsKey(fullPath))
                         continue;
 
                     try

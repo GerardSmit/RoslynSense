@@ -152,8 +152,12 @@ internal sealed class CachingProjectFileInfoProvider(
         await _hostGate.WaitAsync(cancellationToken);
         try
         {
+            var evalWatch = System.Diagnostics.Stopwatch.StartNew();
             infos = await inner.Value.LoadProjectFileInfosAsync(
                 projectPath, reportingOptions, cancellationToken);
+            if (Environment.GetEnvironmentVariable("ROSLYNMCP_EVAL_TIMING") == "1")
+                Console.Error.WriteLine(
+                    $"[EvalTiming] {evalWatch.ElapsedMilliseconds} ms {Path.GetFileName(projectPath)}");
         }
         finally
         {

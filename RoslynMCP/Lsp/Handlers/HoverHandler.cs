@@ -1,5 +1,6 @@
 using System.Text;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
@@ -327,10 +328,12 @@ internal static class HoverHandler
                 ? attributeClass.Name[..^"Attribute".Length]
                 : attributeClass.Name;
 
+            // TypedConstant does not override ToString(); ToCSharpString renders the value
+            // the way it was written: quoted strings, qualified enum members, typeof(...).
             var arguments = attribute.ConstructorArguments
-                .Select(a => a.ToString())
+                .Select(a => a.ToCSharpString())
                 .Concat(attribute.NamedArguments
-                    .Select(a => $"{a.Key} = {a.Value.ToString()}"))
+                    .Select(a => $"{a.Key} = {a.Value.ToCSharpString()}"))
                 .ToArray();
 
             yield return arguments.Length == 0

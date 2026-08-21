@@ -26,6 +26,7 @@ public static class SolutionSessionTool
     {
         try
         {
+            RunwayTrace.Mark("OpenSolution entry");
             var resolved = ResolveSolution(solutionPath);
             if (resolved is null)
             {
@@ -35,6 +36,7 @@ public static class SolutionSessionTool
             }
 
             var projects = PathHelper.GetProjectsFromSolution(resolved);
+            RunwayTrace.Mark("solution parsed");
             if (projects.Count == 0)
                 return $"Error: '{Path.GetFileName(resolved)}' contains no projects.";
 
@@ -47,16 +49,31 @@ public static class SolutionSessionTool
             session.Open(resolved, directories, watch);
 
             var classifications = projects.Select(ProjectClassifier.Classify).ToList();
+            RunwayTrace.Mark("projects classified");
+
+            // The toolchain probe walks VS installations and disk state — a quarter second the
+            // report at the end of the open otherwise pays serially, after the workspace is
+            // already warm. Touched here, it resolves while the projects load, and
+            // AppendToolchain reads a memo.
+            if (classifications.Any(p =>
+                    p.BuildTool == BuildTool.VisualStudioMsBuild || p.Kind == AppKind.AspNetClassic))
+            {
+                _ = Task.Run(() => NetFxToolchain.Info);
+            }
 
             // The editor and MCP clients share one daemon, so by the time a chat calls
             // open_solution the editor has usually loaded some or all of it. Warming only the
             // projects that are actually missing is what keeps this call from reloading a
             // solution that is already being served.
             var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects, cancellationToken);
+            RunwayTrace.Mark("load state checked");
             if (missing.Count > 0)
                 await WarmWorkspaceAsync(missing, cancellationToken);
 
-            return Format(resolved, classifications, session, watch, fmt, alreadyLoaded: missing.Count == 0);
+            RunwayTrace.Mark("workspace warmed");
+            var report = Format(resolved, classifications, session, watch, fmt, alreadyLoaded: missing.Count == 0);
+            RunwayTrace.Mark("report formatted");
+            return report;
         }
         catch (OperationCanceledException)
         {

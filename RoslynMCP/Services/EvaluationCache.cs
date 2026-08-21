@@ -90,6 +90,26 @@ internal static class EvaluationCache
     private static readonly JsonSerializerOptions s_json = new() { WriteIndented = false };
 
     /// <summary>
+    /// Whether an entry for this project exists on disk at all — no deserialization, no
+    /// fingerprint check. A cheap advance signal for "will this load need BuildHosts": a present
+    /// entry usually validates, an absent one certainly won't.
+    /// </summary>
+    public static bool HasEntry(string projectPath, ImmutableDictionary<string, string> properties)
+    {
+        if (!Enabled)
+            return false;
+
+        try
+        {
+            return File.Exists(EntryPath(projectPath, properties));
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// The cached evaluation of <paramref name="projectPath"/>, when every input it was computed
     /// from is unchanged. False on any doubt: a miss costs one ordinary evaluation.
     /// </summary>

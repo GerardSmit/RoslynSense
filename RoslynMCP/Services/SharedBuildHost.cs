@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
@@ -203,6 +203,7 @@ internal static partial class SharedBuildHost
                 shards[(start + next++) % PoolSize].Add(projectPaths[i]);
         }
 
+
         // The prewarm is the one place the whole pool runs flat out over one solution, which
         // makes it the machine's pool-size benchmark: hot loads never get here with enough
         // misses to record, so only genuine cold loads teach the calibration anything.
@@ -222,8 +223,96 @@ internal static partial class SharedBuildHost
     }
 
     /// <summary>Sentinel shard index for the one host that serves every legacy project of an
-    /// open. See the routing in <see cref="PrewarmEvaluationsAsync"/>.</summary>
+    /// open. One lane, one host, on purpose: a second .NET Framework host — split statically,
+    /// stealing from a shared queue, and (with its handshake prepaid by ignition) engaged as an
+    /// extra evaluation slot both immediately and after the first evaluation — was measured a
+    /// net loss every way, because each host pays its own VS MSBuild initialisation per project
+    /// language, the parallel initialisations slow each other and every SDK shard beside them,
+    /// and the serial evaluation left to split never covers that. See the routing in
+    /// <see cref="PrewarmEvaluationsAsync"/>.</summary>
     private const int LegacyShard = -2;
+
+    /// <summary>
+    /// Starts every BuildHost process a cold solution open is about to need — immediately,
+    /// concurrently, spawn-and-handshake only, and only for host kinds the evaluation cache
+    /// cannot already serve.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On a cold open, each lane of the prewarm pays its host's process spawn inside its own
+    /// wall, because the spawn happens lazily on the lane's first evaluation. The open has a
+    /// runway before that — MSBuild registration, the restore probe, workspace creation — so
+    /// the spawns are fired here, at the top of the open, and each lane's first evaluation
+    /// meets a live process. The handshake is roughly half a second; what remains inside each
+    /// lane's first evaluation is MSBuild's own initialisation, which was measured not to be
+    /// movable onto the runway: evaluating a synthetic project here warmed ~1 s of it and made
+    /// the open slower overall, so this deliberately spawns and nothing more.
+    /// </para>
+    /// <para>
+    /// A host kind whose projects all have cache entries is not touched at all — a hot open
+    /// needs zero BuildHosts, and spawning eight of them to idle would be a pure regression.
+    /// On any failure the lane concerned spawns its own host exactly as before; ignition can
+    /// only ever move cost earlier, never add it.
+    /// </para>
+    /// </remarks>
+    public static void IgniteInBackground(
+        ImmutableDictionary<string, string> properties, IReadOnlyList<string> projectPaths)
+    {
+        // One sample path per host kind — the manager picks the .NET Core or .NET Framework
+        // host process by the project it is asked about — and only from projects the cache has
+        // no entry for: a kind that is fully cached gets no host at all.
+        string? sdkSample = null, legacySample = null;
+        foreach (string path in projectPaths)
+        {
+            if (PathHelper.RequiresMsBuild(path))
+            {
+                if (legacySample is null && !EvaluationCache.HasEntry(path, properties))
+                    legacySample = path;
+            }
+            else if (sdkSample is null && !EvaluationCache.HasEntry(path, properties))
+            {
+                sdkSample = path;
+            }
+
+            if (sdkSample is not null && legacySample is not null)
+                break;
+        }
+
+        if (sdkSample is null && legacySample is null)
+            return;
+
+        var watch = Stopwatch.StartNew();
+
+        void Spawn(int shardIndex, string samplePath) => _ = Task.Run(async () =>
+        {
+            try
+            {
+                string key = $"{shardIndex} {KeyFor(properties)}";
+                await ManagerFor(key, properties)
+                    .GetBuildHostWithFallbackAsync(samplePath, CancellationToken.None);
+                Console.Error.WriteLine(
+                    $"[BuildHost] Ignited host {shardIndex} at {watch.ElapsedMilliseconds} ms.");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[BuildHost] Ignition of host {shardIndex} failed: {ex.Message}");
+            }
+        });
+
+        if (sdkSample is not null)
+        {
+            for (int index = 0; index < PoolSize; index++)
+                Spawn(index, sdkSample);
+
+            // The seed load goes solo when the prewarm already holds its chosen shard's gate —
+            // which on a cold open it always does.
+            Spawn(SoloShard, sdkSample);
+        }
+
+        if (legacySample is not null)
+            Spawn(LegacyShard, legacySample);
+    }
 
     private static async Task<int> PrewarmShardAsync(
         Workspace workspace,

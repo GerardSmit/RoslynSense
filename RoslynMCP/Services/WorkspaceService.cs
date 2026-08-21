@@ -279,63 +279,16 @@ internal static class WorkspaceService
     public static void EnsureRegistered() { }
 
     /// <summary>
-    /// The MEF composition every workspace runs on, built once for the process.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// This used to be built inside <see cref="CreateWorkspace"/>, so every workspace composed the
-    /// whole of Roslyn's feature catalogue from scratch — several hundred milliseconds of assembly
-    /// loading and export discovery, paid again for the second solution a window opened, and again
-    /// for each short-lived workspace the batch loader creates.
-    /// </para>
-    /// <para>
-    /// Sharing one is the intended use: a <c>MefHostServices</c> is a stateless container of
-    /// exports, Roslyn's own <c>MefHostServices.DefaultHost</c> is a process-wide singleton for
-    /// exactly this reason, and the per-workspace state that does exist lives on the
-    /// <see cref="Workspace"/> rather than on the host.
-    /// </para>
-    /// <para>
-    /// The own-assembly addition is what makes this a custom host rather than the default one: it
-    /// exports no-op implementations of the VS-only Pythia contracts that the C# feature providers
-    /// import, and without them composition fails at the first completion request
-    /// (see <c>PythiaStubExports</c>).
-    /// </para>
-    /// </remarks>
-    private static readonly Lazy<Microsoft.CodeAnalysis.Host.Mef.MefHostServices> s_hostServices =
-        new(() => Microsoft.CodeAnalysis.Host.Mef.MefHostServices.Create(
-                Microsoft.CodeAnalysis.Host.Mef.MefHostServices.DefaultAssemblies
-                    .Add(typeof(NullPythiaSignatureHelpImplementation).Assembly)),
-            LazyThreadSafetyMode.ExecutionAndPublication);
-
-    /// <summary>
     /// The shared MEF composition, for the few places that need a workspace of their own rather
-    /// than one from the cache.
+    /// than one from the cache. Lives on <see cref="HostComposition"/> so warming it does not run
+    /// this class's static initializer — and with it the MSBuild registration the composition
+    /// never needed.
     /// </summary>
-    internal static Microsoft.CodeAnalysis.Host.HostServices HostServices => s_hostServices.Value;
+    internal static Microsoft.CodeAnalysis.Host.HostServices HostServices =>
+        HostComposition.HostServices;
 
-    /// <summary>
-    /// Builds the MEF composition ahead of the first request that needs it, on a background thread.
-    /// </summary>
-    /// <remarks>
-    /// Pure warm-up: it loads no project, reads no solution and allocates nothing that is not going
-    /// to be allocated anyway the moment the editor asks for anything semantic. It exists because
-    /// the composition is unavoidable, fixed, and otherwise lands squarely inside the first request
-    /// the user waits on.
-    /// </remarks>
-    public static void WarmHostServicesInBackground() =>
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                _ = s_hostServices.Value;
-            }
-            catch (Exception ex)
-            {
-                // Nothing awaits this. Left to the real caller to fail properly, with its own
-                // error handling and its own message.
-                Console.Error.WriteLine($"[WorkspaceService] MEF warm-up failed: {ex.Message}");
-            }
-        });
+    /// <inheritdoc cref="HostComposition.WarmInBackground"/>
+    public static void WarmHostServicesInBackground() => HostComposition.WarmInBackground();
 
     private static Dictionary<string, string> CreateDefaultProperties() => new()
     {
@@ -355,12 +308,19 @@ internal static class WorkspaceService
     /// </summary>
     static WorkspaceService()
     {
+        RunwayTrace.Mark("cctor start");
         PatchBuildHostBindingRedirects();
+        RunwayTrace.Mark("binding redirects patched");
         TryRegisterVisualStudioMSBuild();
-        RuntimeHelpers.RunClassConstructor(typeof(CSharpSyntaxTree).TypeHandle);
+        RunwayTrace.Mark("locator registered");
+        // Warmed, not required: nothing in this initializer consumes the C# syntax factories,
+        // and the callers gated on registration shouldn't wait out a Roslyn static init they
+        // may never touch. Fired after the locator so this can't pull in an MSBuild type early.
+        _ = Task.Run(() => RuntimeHelpers.RunClassConstructor(typeof(CSharpSyntaxTree).TypeHandle));
         s_evictionTimer = new Timer(EvictExpiredEntries, null, EvictionInterval, EvictionInterval);
         ShadowCopyService.Instance.AnalyzerDirectoryChanged += OnAnalyzerDirectoryChanged;
         DecompiledSourceService.CleanupOrphanedTempDirs();
+        RunwayTrace.Mark("cctor end");
     }
 
     /// <summary>
@@ -524,14 +484,19 @@ internal static class WorkspaceService
     /// </summary>
     public static MSBuildWorkspace CreateWorkspace(
         TextWriter? diagnosticWriter = null, bool isLegacy = false,
-        IReadOnlyDictionary<string, string>? extraProperties = null)
+        IReadOnlyDictionary<string, string>? extraProperties = null,
+        bool lite = false)
     {
         var properties = isLegacy ? CreateLegacyProperties() : CreateDefaultProperties();
         if (extraProperties is not null)
             foreach (var (key, value) in extraProperties)
                 properties[key] = value;
 
-        var workspace = MSBuildWorkspace.Create(properties, s_hostServices.Value);
+        // A lite workspace runs on the workspaces-only composition: enough to drive BuildHost
+        // evaluations, ready long before the full feature composition, and only ever asked for
+        // by callers that dispose the workspace without serving a semantic request from it.
+        var workspace = MSBuildWorkspace.Create(properties,
+            lite ? HostComposition.LiteHostServices : HostComposition.HostServices);
 
         workspace.RegisterWorkspaceFailedHandler(args =>
         {
@@ -1208,22 +1173,11 @@ internal static class WorkspaceService
         if (normalized.Count == 0)
             return;
 
-        // Restore first, once, for everything: it is per solution and outside every gate, so doing
-        // it here rather than inside the loop below means one subprocess for the whole batch.
-        await RestoreService.EnsureRestoredAsync(normalized[0], cancellationToken);
-
-        // Per batch member rather than only the first: the members can sit in disjoint corners of
-        // the reference graph, each with its own generator. The scan is cached project XML, so the
-        // repeats cost nothing when there is nothing to build.
-        foreach (string batchProjectPath in normalized)
-            await GeneratorBuildService.EnsureGeneratorsBuiltAsync(batchProjectPath, cancellationToken);
-
-        // Every project's MSBuild evaluation, started before the seed instead of after it. The
-        // seed takes seconds and the batch's evaluation took tens of them, strictly in sequence;
-        // this runs the expensive half of the batch concurrently with the seed (which takes a solo
-        // BuildHost rather than queueing behind these shards), and the batch below then finds
-        // every project already in the evaluation cache. Failure here costs nothing: the batch
-        // evaluates whatever the cache cannot answer, exactly as it always did.
+        // Before anything else — the restore probe, the generator scan, the seed — start the
+        // BuildHost processes this open is about to need. Spawns are pure overlap: nothing here
+        // waits on them, and each prewarm lane's first evaluation then meets a live process
+        // instead of paying the spawn inside its own wall. The scratch workspace exists this
+        // early only because its properties are the pool key.
         Task? prewarm = null;
         MSBuildWorkspace? scratch = null;
         var evaluations = SharedBuildHost.NewEvaluationMap();
@@ -1231,8 +1185,47 @@ internal static class WorkspaceService
         {
             try
             {
-                scratch = CreateWorkspace(isLegacy: PathHelper.RequiresMsBuild(normalized[0]));
+                // Ignition takes the raw property map rather than the workspace's own: the two
+                // hold the same pairs (MSBuildWorkspace.Create stores what it is given, and the
+                // pool key sorts them), but the workspace blocks on the MEF composition for most
+                // of a second — a wait the host spawns have no reason to sit behind. Fired first,
+                // the handshakes run under the composition instead of after it, and each lane's
+                // first evaluation meets a process that is already live.
+                bool legacySeed = PathHelper.RequiresMsBuild(normalized[0]);
+                SharedBuildHost.IgniteInBackground(
+                    ImmutableDictionary.CreateRange(
+                        legacySeed ? CreateLegacyProperties() : CreateDefaultProperties()),
+                    normalized);
+                RunwayTrace.Mark("ignition fired");
+                scratch = CreateWorkspace(isLegacy: legacySeed, lite: true);
+                RunwayTrace.Mark("scratch workspace created");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WorkspaceService] Host ignition failed to start: {ex.Message}");
+            }
+        }
 
+        // Restore first, once, for everything: it is per solution and outside every gate, so doing
+        // it here rather than inside the loop below means one subprocess for the whole batch.
+        await RestoreService.EnsureRestoredAsync(normalized[0], cancellationToken);
+        RunwayTrace.Mark("restore ensured");
+
+        // Every project's MSBuild evaluation, started before the seed instead of after it. The
+        // seed takes seconds and the batch's evaluation took tens of them, strictly in sequence;
+        // this runs the expensive half of the batch concurrently with the seed (which takes a solo
+        // BuildHost rather than queueing behind these shards), and the batch below then finds
+        // every project already in the evaluation cache. Failure here costs nothing: the batch
+        // evaluates whatever the cache cannot answer, exactly as it always did.
+        //
+        // Started before the generator scan below, not after: evaluation reads project XML and
+        // targets, and what a generator project has or hasn't built changes nothing it records —
+        // while the scan over a large solution costs most of a second that the prewarm lanes
+        // would otherwise spend idle.
+        if (scratch is not null)
+        {
+            try
+            {
                 // Everything except the seed itself: the seed's own load is about to evaluate
                 // that one anyway, and evaluating it here too would only race the stores.
                 prewarm = SharedBuildHost.PrewarmEvaluationsAsync(
@@ -1244,6 +1237,13 @@ internal static class WorkspaceService
                 Console.Error.WriteLine($"[WorkspaceService] Evaluation prewarm failed to start: {ex.Message}");
             }
         }
+
+        // Per batch member rather than only the first: the members can sit in disjoint corners of
+        // the reference graph, each with its own generator. The scan is cached project XML, so the
+        // repeats cost nothing when there is nothing to build. It stays ahead of the seed because
+        // the seed's compilation is what consumes generator output.
+        foreach (string batchProjectPath in normalized)
+            await GeneratorBuildService.EnsureGeneratorsBuiltAsync(batchProjectPath, cancellationToken);
 
         try
         {

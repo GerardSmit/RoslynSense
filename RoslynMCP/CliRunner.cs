@@ -74,15 +74,36 @@ internal static class CliRunner
 
         // The MEF composition every workspace needs, started while the flags are still being
         // parsed. A one-shot invocation has no earlier moment to hide it in, and paying it inline
-        // puts it squarely in front of whatever the tool was asked to do.
-        WorkspaceService.WarmHostServicesInBackground();
+        // puts it squarely in front of whatever the tool was asked to do. MSBuild registration —
+        // WorkspaceService's static initializer — goes to a second thread of its own: the
+        // composition doesn't need it, the flag parsing doesn't either, and the barrier before
+        // the tool invocation below is what everything that does need it waits behind.
+        HostComposition.WarmInBackground();
+        var msbuildRegistration = Task.Run(WorkspaceService.EnsureRegistered);
+        RunwayTrace.Mark("CLI entry");
 
         var toolName = args[0];
 
         // --cli find_usages --help  →  show tool usage
         bool wantHelp = args.Any(a => a is "-h" or "--help");
 
-        var method = FindToolMethod(toolName);
+        // The reflection scan over the tool classes costs real time on a one-shot start, and
+        // nothing the config/settings plumbing does depends on which tool was named — so the
+        // lookup runs beside it.
+        var methodTask = Task.Run(() => FindToolMethod(toolName));
+
+        var parsed = ParseFlags(args[1..]);
+
+        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
+        if (configError is not null)
+            Console.Error.WriteLine($"Warning: {configError}");
+
+        RunwayTrace.Mark("config loaded");
+        var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
+        RunwayTrace.Mark("settings resolved");
+
+        var method = await methodTask;
+        RunwayTrace.Mark("tool resolved");
         if (method is null)
         {
             Console.Error.WriteLine($"Unknown tool '{toolName}'. Run 'roslyn-sense --cli --help' to list available tools.");
@@ -94,14 +115,6 @@ internal static class CliRunner
             PrintToolHelp(method);
             return 0;
         }
-
-        var parsed = ParseFlags(args[1..]);
-
-        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
-        if (configError is not null)
-            Console.Error.WriteLine($"Warning: {configError}");
-
-        var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
         foreach (var w in settingsWarnings)
             Console.Error.WriteLine($"Warning: {w}");
         DebuggerViewOptions.Current = settings.DebugView;
@@ -110,7 +123,9 @@ internal static class CliRunner
         var fmt = useToon ? (IOutputFormatter)new ToonFormatter() : new MarkdownFormatter();
 
         var dbProviders = settings.ExplicitDbProviders;
-        if (settings.Database && settings.ShouldRunAutoDiscovery())
+        bool wantsDb = method.GetParameters()
+            .Any(p => p.ParameterType == typeof(DbConnectionRegistry));
+        if (wantsDb && settings.Database && settings.ShouldRunAutoDiscovery())
         {
             var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out _);
             var existing = new HashSet<string>(dbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
@@ -127,6 +142,12 @@ internal static class CliRunner
 
         try
         {
+            // The barrier for the registration started at entry: no tool may touch an MSBuild
+            // type before the locator hook is in place, so the plumbing above ran alongside it
+            // and the invocation waits for it.
+            await msbuildRegistration;
+            RunwayTrace.Mark("MSBuild registered");
+
             var result = await InvokeAsync(method, parsed, fmt, dbRegistry, settings, cts.Token);
             Console.WriteLine(result);
             return 0;
@@ -155,8 +176,11 @@ internal static class CliRunner
     private static IReadOnlyList<MethodInfo>? s_allTools;
 
     private static IReadOnlyList<MethodInfo> AllTools =>
+        // Exported types only: every tool class is public by construction (the MCP server finds
+        // them the same way), while GetTypes() would also load the far larger internal half of
+        // the assembly — measurable time on a one-shot CLI start that resolves exactly one tool.
         s_allTools ??= typeof(FindUsagesTool).Assembly
-            .GetTypes()
+            .GetExportedTypes()
             .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
             .Where(m => m.GetCustomAttribute<McpServerToolAttribute>() is not null)
             .OrderBy(m => ToolCommandName(m))

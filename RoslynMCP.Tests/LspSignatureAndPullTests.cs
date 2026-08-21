@@ -96,6 +96,11 @@ public class LspSignatureAndPullTests
         finally
         {
             OpenDocumentStore.Close(session, path);
+
+            // Closing announces the revert; it does not wait for it. Until the workspace is put
+            // back, it still holds the line this test added — and the next test in the collection
+            // reads the same file at a position it worked out from disk.
+            await WorkspaceService.ReconcileOpenBufferAsync(path);
         }
     }
 

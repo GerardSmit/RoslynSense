@@ -38,7 +38,8 @@ body {
 .scope-row {
     display: flex;
     align-items: baseline;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 4px 8px;
     min-width: 0;
     margin-top: 8px;
 }
@@ -46,8 +47,10 @@ body {
 #scopes {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 2px;
-    flex: none;
+    /* Shrinkable, so the tabs wrap among themselves in a panel too narrow for the row. */
+    flex: 0 1 auto;
 }
 
 /* The separator makes the tab row read as what it is: the merge, weakest to strongest. The glyph
@@ -86,9 +89,13 @@ body {
     color: var(--vscode-descriptionForeground);
 }
 
-/* Trails the tabs on the same line: the tabs say which scope, this says which file it is. */
+/*
+ * Trails the tabs on the same line: the tabs say which scope, this says which file it is. Given a
+ * width it would rather have than none, so a narrow panel drops it to its own line instead of
+ * squeezing it down to an ellipsis and nothing else.
+ */
 .scope-file {
-    flex: 1;
+    flex: 1 1 220px;
     min-width: 0;
     margin: 0;
     overflow: hidden;

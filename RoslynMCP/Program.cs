@@ -17,6 +17,13 @@ class Program
 {
     static async Task<int> Main(string[] args)
     {
+        // When this process runs under `dotnet-trace collect -- ...`, the tracer starts it with
+        // DOTNET_DiagnosticPorts=...,suspend. Our own runtime consumed that at startup, but every
+        // helper this process spawns — BuildHosts, restores, test hosts — would inherit it and
+        // freeze at CLR start waiting for a profiler connection that is only ever coming for us.
+        // Scrubbed here, before anything can spawn, so profiling the tool doesn't hang it.
+        Environment.SetEnvironmentVariable("DOTNET_DiagnosticPorts", null);
+
         // Before anything else, including mode selection: a redirect hands the whole session over
         // as it is, whatever mode the host asked for.
         if (await RoslynMCP.DevBuildRedirect.TryRunAsync(args) is { } redirected)

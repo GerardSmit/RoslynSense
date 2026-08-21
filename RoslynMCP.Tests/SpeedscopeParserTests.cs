@@ -230,7 +230,62 @@ public class SpeedscopeParserTests : IDisposable
     }
 
     [Fact]
-    public void HandlesNoSampledProfile()
+    public void ConvertsAnEventedProfileToStacks()
+    {
+        // What dotnet-trace actually exports: one evented profile per thread, open/close frame
+        // events with timestamps. Timeline here:
+        //   0–10   [A]        → A self 10
+        //   10–14  [A, B]     → B self 4, A total grows
+        //   14–20  [A]        → A self 6
+        // A: self 16, total 20. B: self 4, total 4.
+        var speedscope = new
+        {
+            version = "0.0.1",
+            shared = new
+            {
+                frames = new object[]
+                {
+                    new { name = "Ns.ClassA.MethodA()" },
+                    new { name = "Ns.ClassB.MethodB()" }
+                }
+            },
+            profiles = new object[]
+            {
+                new
+                {
+                    type = "evented",
+                    name = "Thread (1)",
+                    unit = "milliseconds",
+                    startValue = 0,
+                    endValue = 20,
+                    events = new object[]
+                    {
+                        new { type = "O", frame = 0, at = 0.0 },
+                        new { type = "O", frame = 1, at = 10.0 },
+                        new { type = "C", frame = 1, at = 14.0 },
+                        new { type = "C", frame = 0, at = 20.0 }
+                    }
+                }
+            }
+        };
+
+        var path = WriteTempSpeedscope(speedscope);
+        var result = SpeedscopeParser.Parse(path, maxResults: 10);
+
+        Assert.Null(result.Error);
+        Assert.Equal(20.0, result.TotalDurationMs);
+
+        var a = result.HotMethods.Single(m => m.Name == "ClassA.MethodA()");
+        Assert.Equal(16.0, a.SelfTimeMs);
+        Assert.Equal(20.0, a.TotalTimeMs);
+
+        var b = result.HotMethods.Single(m => m.Name == "ClassB.MethodB()");
+        Assert.Equal(4.0, b.SelfTimeMs);
+        Assert.Equal(4.0, b.TotalTimeMs);
+    }
+
+    [Fact]
+    public void HandlesAnEmptyEventedProfile()
     {
         var speedscope = new
         {
@@ -241,13 +296,30 @@ public class SpeedscopeParserTests : IDisposable
                 new
                 {
                     type = "evented",
-                    name = "GC",
-                    unit = "bytes",
+                    name = "Thread (1)",
+                    unit = "milliseconds",
                     startValue = 0,
                     endValue = 0,
                     events = Array.Empty<object>()
                 }
             }
+        };
+
+        var path = WriteTempSpeedscope(speedscope);
+        var result = SpeedscopeParser.Parse(path, maxResults: 10);
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("no samples", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void HandlesNoProfilesAtAll()
+    {
+        var speedscope = new
+        {
+            version = "0.0.1",
+            shared = new { frames = new object[] { new { name = "A" } } },
+            profiles = Array.Empty<object>()
         };
 
         var path = WriteTempSpeedscope(speedscope);

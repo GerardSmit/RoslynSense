@@ -284,7 +284,7 @@ public sealed class EventPipeRecording : ProfileRecording
     {
         var client = new DiagnosticsClient(pid);
         var session = client.StartEventPipeSession(
-            new EventPipeProvider("Microsoft-DotNET-SampleProfiler", System.Diagnostics.Tracing.EventLevel.Informational),
+            new EventPipeProvider("Microsoft-DotNETCore-SampleProfiler", System.Diagnostics.Tracing.EventLevel.Informational),
             requestRundown: true);
 
         var nettracePath = Path.Combine(tempDir, "recording.nettrace");

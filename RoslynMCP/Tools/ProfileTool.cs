@@ -143,21 +143,26 @@ public static class ProfileTool
                     fmt, store, runner, sessions, cancellationToken);
             }
 
-            var runArgs = new StringBuilder();
-            runArgs.Append("run --project \"");
-            runArgs.Append(csprojPath);
-            runArgs.Append("\" --no-build");
+            // The built output, not `dotnet run`: dotnet-trace samples its direct child, and
+            // under `dotnet run` that child is the CLI launcher — the app itself runs as an
+            // untraced grandchild, and the profile comes back as the launcher blocking on it.
+            var targetPath = MsBuildLocator.GetTargetPath(csprojPath);
+            if (targetPath is null || !File.Exists(targetPath))
+                return $"Error: No build output found for '{Path.GetFileName(csprojPath)}'. " +
+                       "Build the project first — profiling runs the existing build output.";
+
+            var launch = new StringBuilder();
+            if (targetPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                launch.Append("dotnet exec ");
+            launch.Append('"').Append(targetPath).Append('"');
 
             if (!string.IsNullOrWhiteSpace(appArgs))
-            {
-                runArgs.Append(" -- ");
-                runArgs.Append(appArgs);
-            }
+                launch.Append(' ').Append(appArgs);
 
-            var description = $"dotnet run {Path.GetFileNameWithoutExtension(csprojPath)}";
+            var description = $"profile {Path.GetFileNameWithoutExtension(csprojPath)}";
 
             return await RunDotnetTraceAsync(
-                $"-- dotnet {runArgs}",
+                $"-- {launch}",
                 Path.GetDirectoryName(csprojPath)!,
                 maxDurationSeconds, maxResults, description, hitUrls, ownPrefixes,
                 fmt, store, cancellationToken);
@@ -657,11 +662,13 @@ public static class ProfileTool
         {
             // Build the dotnet-trace command
             // --format speedscope produces parseable JSON
-            // --providers Microsoft-DotNET-SampleProfiler for CPU sampling
+            // --providers Microsoft-DotNETCore-SampleProfiler for CPU sampling — the exact
+            // provider name matters: a misspelt one is accepted silently and produces a trace
+            // with rundown metadata but zero samples.
             var traceArgs = new StringBuilder();
             traceArgs.Append("collect --format speedscope");
             traceArgs.Append($" --output \"{outputPath}\"");
-            traceArgs.Append(" --providers Microsoft-DotNET-SampleProfiler");
+            traceArgs.Append(" --providers Microsoft-DotNETCore-SampleProfiler");
             if (maxDurationSeconds > 0)
             {
                 var duration = TimeSpan.FromSeconds(maxDurationSeconds);

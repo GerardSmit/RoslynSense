@@ -246,7 +246,7 @@ internal static class SettingsAssistHandler
                 (m.ContainingType?.ToDisplayString(MemberSignature.DeclarationName)) ?? "",
                 Spelling(m),
                 Signature(m),
-                [.. MemberSignature.Parameters(m).Select(
+                [.. MemberSignature.CallParameters(m).Select(
                     parameter => new MemberShapeParameter(
                         parameter.Name, parameter.Type.ToDisplayString(MemberSignature.TypeName)))],
                 expected is not { } wanted || MemberSignature.Matches(m, wanted)))
@@ -269,9 +269,13 @@ internal static class SettingsAssistHandler
     private static string Spelling(ISymbol member) =>
         member is IPropertySymbol { IsIndexer: true } ? "Item" : member.Name;
 
+    /// <summary>
+    /// The member as a call site writes it, which is the form a configured signature is written
+    /// against — so an extension method loses the receiver it is invoked on.
+    /// </summary>
     private static string Signature(ISymbol member)
     {
-        var parameters = MemberSignature.Parameters(member).Select(
+        var parameters = MemberSignature.CallParameters(member).Select(
             parameter => $"{parameter.Type.ToDisplayString(s_shortType)} {parameter.Name}");
 
         return member is IPropertySymbol { IsIndexer: true }

@@ -6,6 +6,7 @@ import { onClientReady } from './clientReady';
 import { isUnder, normalisePath } from './paths';
 import { composite, restore, snapshot, UndoStack } from './solutionUndo';
 import type { Snapshot, UndoStep } from './solutionUndo';
+import { onProjectSetChanged } from './projectSet';
 
 /**
  * Solution Explorer: the solution's *logical* structure, the way Visual Studio and Rider show
@@ -326,10 +327,10 @@ export function registerSolutionExplorer(
 
         // Which projects are loaded is drawn on the rows, and the server loads them in the
         // background — so without this the tree keeps saying "loading…" over a solution that
-        // finished loading a minute ago, until somebody presses refresh.
-        context.subscriptions.push(
-            client.onNotification('roslynSense/projectSetChanged', () => refresh())
-        );
+        // finished loading a minute ago, until somebody presses refresh. Through the shared
+        // signal rather than the notification, because the settings panel needs it too and
+        // `onNotification` would hand it to whichever of them subscribed last.
+        context.subscriptions.push(onProjectSetChanged(() => refresh()));
 
         // And again on every transition into Running. Binding to another solution, or a restart,
         // puts the client through Starting — during which fetchChildren has nothing to ask and

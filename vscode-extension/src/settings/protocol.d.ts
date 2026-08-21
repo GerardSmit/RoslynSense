@@ -99,7 +99,32 @@ declare namespace SettingsMsg {
         readonly problem?: string;
     }
 
-    type ToView = State | ConnectionCompletions | ConnectionsResolved | SettingChoices | MemberShape;
+    /**
+     * The server can answer things it could not a moment ago — it connected, or it finished
+     * loading a solution. Every control that was told "nothing yet" asks again.
+     */
+    interface Resolvable {
+        readonly type: 'resolvable';
+    }
+
+    type ToView =
+        | State
+        | ConnectionCompletions
+        | ConnectionsResolved
+        | SettingChoices
+        | MemberShape
+        | Resolvable;
+
+    /**
+     * The webview has loaded and holds nothing yet.
+     *
+     * A handshake rather than a post at wire time, because the page is built by a script that may
+     * not have run when the panel is created — and because VS Code reloads it whenever it likes,
+     * which used to leave an empty form behind.
+     */
+    interface Ready {
+        readonly type: 'ready';
+    }
 
     /** Write one setting into the selected scope. `value: null` unsets it. */
     interface SetSetting {
@@ -151,6 +176,7 @@ declare namespace SettingsMsg {
     }
 
     type ToHost =
+        | Ready
         | SetSetting
         | SelectScope
         | OpenFile

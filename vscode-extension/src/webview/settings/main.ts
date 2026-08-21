@@ -31,8 +31,22 @@ window.addEventListener('message', (event: MessageEvent<SettingsMsg.ToView>) => 
         case 'memberShape':
             answer(message.token, message);
             break;
+        case 'resolvable':
+            for (const again of [...askAgain]) {
+                again();
+            }
+            break;
     }
 });
+
+/**
+ * Controls whose answer came from the solution rather than from the schema.
+ *
+ * Every one of them asks once, when it is built, and a panel opened while the solution was still
+ * loading gets "nothing yet" from all of them — which then stood until the panel was closed and
+ * reopened. They ask again when the host says there is something new to ask.
+ */
+const askAgain = new Set<() => void>();
 
 /**
  * Questions to the host are answered out of band, and several controls have one outstanding at
@@ -78,6 +92,7 @@ function render(): void {
 
     const form = document.getElementById('form')!;
     form.textContent = '';
+    askAgain.clear();
 
     const schema = state.schema as SchemaNode;
     for (const [name, child] of properties(schema)) {
@@ -821,77 +836,209 @@ function itemField(
 }
 
 /**
- * A list of strings chosen from what the solution actually offers — a lookup's fallbacks, whose
- * valid values are the root conventions the preset and the file between them define.
+ * Several of what the solution offers, in the order they are tried — a lookup's fallbacks.
  *
- * Order is kept rather than taken from the offered list, because "tried in order" is the whole
- * meaning of the field: an unchecked-then-rechecked convention goes to the end, where it now is.
+ * A dropdown with the chosen values in front of it rather than a column of checkboxes, because
+ * order is the whole meaning of this field and a checkbox column cannot show it: "custom, then
+ * globalCustom, then globalLocal" is a sentence, and six ticks in a list are not. What is chosen
+ * reads left to right; what is available is behind the caret, where a list of things you are not
+ * using belongs.
+ *
+ * Choosing something already chosen moves it to the end, which is also how it is reordered.
  */
 function choiceListField(name: string, path: string, value: unknown): HTMLElement {
     const box = document.createElement('div');
-    box.className = 'choice-list';
+    box.className = 'picker';
     box.dataset.field = name;
     box.dataset.kind = 'chips';
 
     let chosen: string[] = Array.isArray(value) ? value.map(String) : [];
+    let offered: readonly SettingsMsg.Choice[] = [];
     box.dataset.value = JSON.stringify(chosen);
 
-    const draw = (offered: readonly SettingsMsg.Choice[]) => {
-        box.textContent = '';
+    const face = document.createElement('button');
+    face.type = 'button';
+    face.className = 'picker-face';
+    face.setAttribute('aria-haspopup', 'listbox');
+    face.setAttribute('aria-expanded', 'false');
 
-        // Anything the file already names goes in the list even when the solution no longer
-        // defines it, marked as such — silently dropping it on the next save is data loss.
+    const pills = document.createElement('span');
+    pills.className = 'pills';
+
+    const caret = document.createElement('span');
+    caret.className = 'picker-caret';
+    caret.setAttribute('aria-hidden', 'true');
+    caret.textContent = '⌄';
+
+    face.append(pills, caret);
+
+    const menu = document.createElement('div');
+    menu.className = 'picker-menu';
+    menu.setAttribute('role', 'listbox');
+    menu.hidden = true;
+
+    box.append(face, menu);
+
+    const commit = () => {
+        box.dataset.value = JSON.stringify(chosen);
+        drawPills();
+        drawMenu();
+    };
+
+    /** Everything to offer: what the solution defines, plus what the file already named. */
+    const rows = (): SettingsMsg.Choice[] => {
         const known = new Set(offered.map((choice) => choice.value));
-        const rows: SettingsMsg.Choice[] = [
+        return [
             ...offered,
+            // A value the solution no longer defines stays offerable and stays marked. Dropping
+            // it on the next save is data loss dressed up as tidying.
             ...chosen
                 .filter((id) => !known.has(id))
                 .map((id) => ({ value: id, detail: 'not defined in this solution' })),
         ];
+    };
 
-        if (rows.length === 0) {
-            const empty = document.createElement('p');
-            empty.className = 'item-help';
-            empty.textContent = 'Nothing to choose from yet.';
-            box.append(empty);
+    function drawPills(): void {
+        pills.textContent = '';
+
+        if (chosen.length === 0) {
+            const empty = document.createElement('span');
+            empty.className = 'picker-empty';
+            empty.textContent = 'Choose where else to look';
+            pills.append(empty);
             return;
         }
 
-        for (const choice of rows) {
-            const line = document.createElement('label');
-            line.className = 'choice';
-
-            const tick = document.createElement('input');
-            tick.type = 'checkbox';
-            tick.checked = chosen.includes(choice.value);
-            tick.addEventListener('change', () => {
-                chosen = tick.checked
-                    ? [...chosen.filter((id) => id !== choice.value), choice.value]
-                    : chosen.filter((id) => id !== choice.value);
-                box.dataset.value = JSON.stringify(chosen);
-            });
+        for (const id of chosen) {
+            const pill = document.createElement('span');
+            pill.className = 'pill';
 
             const text = document.createElement('span');
-            text.textContent = choice.value;
+            text.textContent = id;
 
-            line.append(tick, text);
+            const drop = document.createElement('span');
+            drop.className = 'pill-remove';
+            drop.setAttribute('role', 'button');
+            drop.setAttribute('aria-label', `Remove ${id}`);
+            drop.textContent = '×';
+            drop.addEventListener('click', (event) => {
+                // The pill sits on the button that opens the menu; removing one is not opening it.
+                event.stopPropagation();
+                chosen = chosen.filter((candidate) => candidate !== id);
+                commit();
+            });
+
+            pill.append(text, drop);
+            pills.append(pill);
+        }
+    }
+
+    function drawMenu(): void {
+        menu.textContent = '';
+        const all = rows();
+
+        if (all.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'picker-note';
+            empty.textContent = 'Nothing to choose from yet.';
+            menu.append(empty);
+            return;
+        }
+
+        for (const choice of all) {
+            const picked = chosen.includes(choice.value);
+
+            const option = document.createElement('div');
+            option.className = 'picker-option';
+            option.tabIndex = -1;
+            option.setAttribute('role', 'option');
+            option.setAttribute('aria-selected', String(picked));
+
+            const tick = document.createElement('span');
+            tick.className = 'picker-tick';
+            tick.setAttribute('aria-hidden', 'true');
+            tick.textContent = picked ? '✓' : '';
+
+            const label = document.createElement('span');
+            label.className = 'picker-name';
+            label.textContent = choice.value;
+
+            option.append(tick, label);
 
             if (choice.detail) {
                 const detail = document.createElement('span');
-                detail.className = 'choice-detail';
+                detail.className = 'picker-detail';
                 detail.textContent = choice.detail;
-                line.append(detail);
+                option.append(detail);
             }
 
-            box.append(line);
+            option.addEventListener('click', () => {
+                chosen = picked
+                    ? chosen.filter((id) => id !== choice.value)
+                    : [...chosen.filter((id) => id !== choice.value), choice.value];
+                commit();
+            });
+
+            menu.append(option);
         }
+    }
+
+    const open = (wanted: boolean) => {
+        menu.hidden = !wanted;
+        face.setAttribute('aria-expanded', String(wanted));
     };
 
-    draw([]);
-    askHost<SettingsMsg.SettingChoices>(
-        (token) => ({ type: 'askChoices', token, path }),
-        (message) => draw(message.items)
-    );
+    face.addEventListener('click', () => open(menu.hidden));
+
+    box.addEventListener('keydown', (event) => {
+        const key = (event as KeyboardEvent).key;
+
+        if (key === 'Escape' && !menu.hidden) {
+            open(false);
+            face.focus();
+            event.stopPropagation();
+            return;
+        }
+
+        if (key === 'ArrowDown' || key === 'ArrowUp') {
+            const options = [...menu.querySelectorAll<HTMLElement>('.picker-option')];
+            if (options.length === 0) {
+                return;
+            }
+            open(true);
+            const at = options.indexOf(document.activeElement as HTMLElement);
+            const next = key === 'ArrowDown' ? at + 1 : at - 1;
+            options[Math.max(0, Math.min(options.length - 1, next))].focus();
+            event.preventDefault();
+        }
+
+        if ((key === 'Enter' || key === ' ') && document.activeElement?.matches('.picker-option')) {
+            (document.activeElement as HTMLElement).click();
+            event.preventDefault();
+        }
+    });
+
+    // Anywhere else in the page closes it, the way every dropdown does.
+    box.addEventListener('focusout', (event) => {
+        const next = (event as FocusEvent).relatedTarget;
+        if (!(next instanceof Node) || !box.contains(next)) {
+            open(false);
+        }
+    });
+
+    const ask = () =>
+        askHost<SettingsMsg.SettingChoices>(
+            (token) => ({ type: 'askChoices', token, path }),
+            (message) => {
+                offered = message.items;
+                drawMenu();
+            }
+        );
+
+    drawPills();
+    drawMenu();
+    ask();
+    askAgain.add(ask);
 
     return box;
 }
@@ -931,11 +1078,15 @@ function choiceSelectField(name: string, path: string, value: unknown): HTMLElem
         select.value = current;
     };
 
+    const ask = () =>
+        askHost<SettingsMsg.SettingChoices>(
+            (token) => ({ type: 'askChoices', token, path }),
+            (message) => draw(message.items)
+        );
+
     draw([]);
-    askHost<SettingsMsg.SettingChoices>(
-        (token) => ({ type: 'askChoices', token, path }),
-        (message) => draw(message.items)
-    );
+    ask();
+    askAgain.add(ask);
 
     return select;
 }
@@ -991,15 +1142,19 @@ function shapeFields(shape: MemberShapeSpec): Set<string> {
 }
 
 /**
- * One editor over the fields that together name a method: the class, the member, the signature
- * that picks an overload apart from its siblings, and which parameter carries what.
+ * One editor over the fields that together name a method: the class, the member, and the signature
+ * that tells one overload from its siblings.
  *
- * Five text boxes could not say whether any of it resolved. The whole difficulty of writing one of
- * these is that a wrong containing type, a misspelled member and a signature that matches nothing
- * all look exactly like a correct entry — they simply bind nothing, silently, forever. So the
- * editor asks the solution after every edit and shows the overloads the entry currently selects;
- * "2 of 3 match" is the fact the person needed, and clicking the parameter that carries the key is
- * the correction they would otherwise have had to make by counting.
+ * Written as the call itself — `Contoso.Web.Localizer.GetString(string, *)` — because that is the
+ * form the person is copying from. They are looking at a call site; asking them to take it apart
+ * into three boxes is asking them to do the parsing, and getting it wrong in any one of the three
+ * binds nothing, silently, forever. So the line is typed the way it reads, split on the way to the
+ * file, and completed against the solution as it is typed: classes, then the members on the class
+ * that resolved, then the overloads that share the member's name.
+ *
+ * Below it, the same answer as evidence rather than as completion — which overloads this entry
+ * currently selects, and which parameter of one carries the key. "2 of 3 overloads match" is the
+ * fact three text boxes could never state.
  */
 function memberShapeEditor(
     shape: MemberShapeSpec,
@@ -1007,39 +1162,63 @@ function memberShapeEditor(
     value: Record<string, unknown>,
     listPath: readonly string[]
 ): HTMLElement {
+    void listPath;
+
     const box = document.createElement('div');
     box.className = 'shape';
 
-    const fieldSchema = (name: string) => itemSchema.properties?.[name] ?? {};
+    // The three fields the line stands for. Hidden rather than dropped: `commit` reads them like
+    // every other field in the item, so what lands in the file is unchanged by any of this.
+    const stored: readonly string[] | undefined = Array.isArray(value[shape.parameters])
+        ? (value[shape.parameters] as unknown[]).map(text)
+        : undefined;
 
-    const typeInput = shapeInput(shape.type, fieldSchema(shape.type), value[shape.type]);
-    const memberInput = shapeInput(shape.member, fieldSchema(shape.member), value[shape.member]);
-    const parametersInput = shapeInput(
-        shape.parameters,
-        fieldSchema(shape.parameters),
-        value[shape.parameters]
+    const typeField = hiddenField(shape.type, 'text', value[shape.type]);
+    const memberField = hiddenField(shape.member, 'text', value[shape.member]);
+    const parametersField = hiddenField(shape.parameters, 'list', stored?.join(', '));
+
+    const row = document.createElement('div');
+    row.className = 'item-row';
+
+    const label = document.createElement('label');
+    label.textContent = 'Method';
+    label.htmlFor = `call-${++nextToken}`;
+
+    const well = document.createElement('div');
+    well.className = 'call';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = label.htmlFor;
+    input.className = 'call-input';
+    input.spellcheck = false;
+    input.autocomplete = 'off';
+    input.placeholder = 'Namespace.Class.Method(string, *)';
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-expanded', 'false');
+    input.value = formatCall(
+        text(value[shape.type]),
+        text(value[shape.member]),
+        stored !== undefined && stored.length > 0 ? stored : undefined
     );
-    parametersInput.dataset.kind = 'list';
-    parametersInput.placeholder = 'Any overload';
 
-    const types = suggestionList(`shape-types-${++nextToken}`);
-    const members = suggestionList(`shape-members-${++nextToken}`);
-    typeInput.setAttribute('list', types.id);
-    memberInput.setAttribute('list', members.id);
+    const menu = document.createElement('div');
+    menu.className = 'call-menu';
+    menu.setAttribute('role', 'listbox');
+    menu.hidden = true;
 
-    box.append(
-        shapeRow(fieldSchema(shape.type).title ?? shape.type, typeInput, fieldSchema(shape.type)),
-        shapeRow(
-            fieldSchema(shape.member).title ?? shape.member,
-            memberInput,
-            fieldSchema(shape.member)
-        ),
-        shapeRow(
-            fieldSchema(shape.parameters).title ?? shape.parameters,
-            parametersInput,
-            fieldSchema(shape.parameters)
-        )
-    );
+    well.append(input, menu);
+    row.append(label, well);
+
+    const help = document.createElement('p');
+    help.className = 'item-help';
+    help.textContent =
+        'Leave the class off to match any class declaring the method. Add parentheses to pick one '
+        + 'overload, and * for a parameter of any type.';
+    row.append(help);
+
+    box.append(row);
 
     const status = document.createElement('p');
     status.className = 'shape-status';
@@ -1056,52 +1235,130 @@ function memberShapeEditor(
     positionRows.className = 'shape-positions';
     box.append(positionRows);
 
-    for (const [field, what] of Object.entries(shape.positions)) {
-        const hidden = document.createElement('input');
-        hidden.type = 'hidden';
-        hidden.dataset.field = field;
-        hidden.dataset.kind = 'text';
-        const current = value[field];
-        hidden.value = current === undefined || current === null ? '' : String(current);
+    for (const field of Object.keys(shape.positions)) {
+        const hidden = hiddenField(field, 'text', value[field]);
         positions.set(field, hidden);
         box.append(hidden);
-        void what;
+    }
+
+    box.append(typeField, memberField, parametersField);
+
+    // ---- what the line says ------------------------------------------------------------------
+
+    /** The line taken apart, onto the fields that are written to the file. */
+    function sync(): void {
+        const call = parseCall(input.value);
+        typeField.value = call.type;
+        memberField.value = call.member;
+        parametersField.value = (call.parameters ?? []).join(', ');
     }
 
     let timer: number | undefined;
     const refresh = () => {
+        sync();
         window.clearTimeout(timer);
         timer = window.setTimeout(ask, 200);
     };
 
-    typeInput.addEventListener('input', refresh);
-    memberInput.addEventListener('input', refresh);
-    parametersInput.addEventListener('input', refresh);
+    input.addEventListener('input', refresh);
+
+    /**
+     * Two readings of one line, because a name being typed is ambiguous until the next character
+     * arrives: `Contoso.Web.Localizer` is a class, and `Contoso.Web.Localizer.Get` is a class and
+     * the start of a method on it. Both are asked, and the one that resolved the more specific
+     * thing is the one shown — which is what makes the completion continue rather than restart
+     * every time a dot is typed.
+     */
+    let generation = 0;
 
     function ask(): void {
-        const parameterTypes = parametersInput.value
-            .split(',')
-            .map((part) => part.trim())
-            .filter((part) => part.length > 0);
+        const call = parseCall(input.value);
+        const mine = ++generation;
+
+        let asMember: SettingsMsg.MemberShape | undefined;
+        let asType: SettingsMsg.MemberShape | undefined;
+        let outstanding = call.parameters === undefined ? 2 : 1;
+
+        const arrived = () => {
+            if (mine !== generation) {
+                return;
+            }
+            if (--outstanding === 0) {
+                show(pick(call, asMember, asType));
+            }
+        };
 
         askHost<SettingsMsg.MemberShape>(
             (token) => ({
                 type: 'askMemberShape',
                 token,
-                containingType: typeInput.value.trim(),
-                memberName: memberInput.value.trim(),
-                parameterTypes,
+                containingType: call.type,
+                memberName: call.member,
+                parameterTypes: call.parameters ?? [],
             }),
-            show
+            (message) => {
+                asMember = message;
+                arrived();
+            }
         );
+
+        // A parenthesis cannot be part of a class name, so once there is one the line is no longer
+        // half-written and there is nothing to read the second way.
+        if (call.parameters === undefined) {
+            askHost<SettingsMsg.MemberShape>(
+                (token) => ({
+                    type: 'askMemberShape',
+                    token,
+                    containingType: head(input.value),
+                    memberName: '',
+                }),
+                (message) => {
+                    asType = message;
+                    arrived();
+                }
+            );
+        }
     }
 
-    function show(answerMessage: SettingsMsg.MemberShape): void {
-        fill(types, answerMessage.typeSuggestions);
-        fill(members, answerMessage.memberSuggestions);
+    /**
+     * Which reading to believe, and the half-typed member name it should be narrowed by — which is
+     * only a fragment under the reading that treated it as one; see {@link ask}.
+     */
+    function pick(
+        call: Call,
+        asMember: SettingsMsg.MemberShape | undefined,
+        asType: SettingsMsg.MemberShape | undefined
+    ): Reading {
+        if (asMember && asMember.resolvedType !== undefined && asMember.matches.length > 0) {
+            return { answer: asMember, typed: call.member };
+        }
+        if (asType && asType.resolvedType !== undefined) {
+            // The whole line is a class, so there is no member half-typed yet: the menu offers
+            // every one it declares.
+            return { answer: asType, typed: '' };
+        }
+        if (asMember && asMember.resolvedType !== undefined) {
+            return { answer: asMember, typed: call.member };
+        }
+        // Neither resolved. The whole-line reading is the one whose suggestions were matched
+        // against the last thing typed rather than against the segment before it — but only while
+        // it has any, so that a line naming no class at all is left saying so.
+        return asType && asType.typeSuggestions.length > 0
+            ? { answer: asType, typed: '' }
+            : { answer: asMember ?? asType, typed: call.member };
+    }
+
+    function show(reading: Reading): void {
+        const answerMessage = reading.answer;
 
         overloads.textContent = '';
         positionRows.textContent = '';
+        menu.textContent = '';
+
+        if (!answerMessage) {
+            open(false);
+            return;
+        }
 
         const matched = answerMessage.matches.filter((match) => match.matched);
 
@@ -1115,16 +1372,106 @@ function memberShapeEditor(
                     : `${matched.length} of ${count(answerMessage.matches.length, 'overload')} match.`;
 
         for (const match of answerMessage.matches) {
-            const line = document.createElement('div');
-            line.className = match.matched ? 'overload matched' : 'overload';
-            line.textContent = match.signature;
-            overloads.append(line);
+            overloads.append(overloadRow(match, 'overload'));
         }
 
+        drawMenu(reading);
+        drawPositions(matched[0]);
+    }
+
+    /** One overload, as a line that can be adopted by clicking it. */
+    function overloadRow(match: SettingsMsg.ShapeMatch, className: string): HTMLElement {
+        const line = document.createElement('button');
+        line.type = 'button';
+        line.className = match.matched ? `${className} matched` : className;
+        line.textContent = match.signature;
+        line.title = `${match.declaredBy}.${match.name}`;
+        line.addEventListener('click', () =>
+            adopt(
+                formatCall(
+                    match.declaredBy,
+                    match.name,
+                    match.parameters.map((parameter) => parameter.type)
+                )
+            )
+        );
+        return line;
+    }
+
+    /**
+     * What to offer next: the overloads once a method is named, the methods once a class is, and
+     * the classes until then. One rung at a time, because offering all three at once is offering a
+     * list nobody can read.
+     */
+    function drawMenu(reading: Reading): void {
+        const answerMessage = reading.answer;
+
+        if (!answerMessage || document.activeElement !== input) {
+            open(false);
+            return;
+        }
+
+        if (answerMessage.matches.length > 0) {
+            for (const match of answerMessage.matches) {
+                menu.append(overloadRow(match, 'call-option'));
+            }
+            open(true);
+            return;
+        }
+
+        const owner = answerMessage.resolvedType;
+
+        if (owner !== undefined && answerMessage.memberSuggestions.length > 0) {
+            // The server answers with every name the class declares; which of them are worth
+            // showing is whatever the person has typed of one so far.
+            const typed = reading.typed;
+            const offered = answerMessage.memberSuggestions.filter((name) =>
+                contains(name, typed)
+            );
+
+            for (const name of offered.slice(0, 40)) {
+                menu.append(
+                    option(name, typed, () => adopt(formatCall(owner, name)))
+                );
+            }
+            open(offered.length > 0);
+            return;
+        }
+
+        if (answerMessage.typeSuggestions.length > 0) {
+            const typed = segment(head(input.value));
+            for (const name of answerMessage.typeSuggestions.slice(0, 40)) {
+                menu.append(option(name, typed, () => adopt(`${name}.`)));
+            }
+            open(true);
+            return;
+        }
+
+        open(false);
+    }
+
+    function option(name: string, typed: string, choose: () => void): HTMLElement {
+        const line = document.createElement('button');
+        line.type = 'button';
+        line.className = 'call-option';
+        line.append(highlight(name, typed));
+        line.addEventListener('click', choose);
+        return line;
+    }
+
+    /** Replaces the line with a resolved one and carries on from there. */
+    function adopt(line: string): void {
+        input.value = line;
+        input.focus();
+        input.setSelectionRange(line.length, line.length);
+        sync();
+        ask();
+    }
+
+    function drawPositions(example: SettingsMsg.ShapeMatch | undefined): void {
         // Parameters to choose from come from an overload the entry actually selects: naming the
         // key's position against an overload this shape does not bind would be arithmetic about
         // nothing.
-        const example = matched[0];
         if (!example) {
             return;
         }
@@ -1135,13 +1482,13 @@ function memberShapeEditor(
                 continue;
             }
 
-            const row = document.createElement('div');
-            row.className = 'item-row';
+            const line = document.createElement('div');
+            line.className = 'item-row';
 
-            const label = document.createElement('label');
-            label.textContent = itemSchema.properties?.[field]?.title ?? field;
-            label.title = field;
-            row.append(label);
+            const name = document.createElement('label');
+            name.textContent = itemSchema.properties?.[field]?.title ?? field;
+            name.title = field;
+            line.append(name);
 
             const chips = document.createElement('div');
             chips.className = 'chips';
@@ -1171,64 +1518,177 @@ function memberShapeEditor(
                 chips.append(chip);
             });
 
-            row.append(chips);
+            line.append(chips);
 
             const blurb = document.createElement('p');
             blurb.className = 'item-help';
             blurb.textContent = `Which parameter carries the ${what}.`;
-            row.append(blurb);
+            line.append(blurb);
 
-            positionRows.append(row);
+            positionRows.append(line);
         }
     }
 
+    // ---- opening and closing -----------------------------------------------------------------
+
+    function open(wanted: boolean): void {
+        menu.hidden = !wanted || menu.childElementCount === 0;
+        input.setAttribute('aria-expanded', String(!menu.hidden));
+        if (menu.hidden) {
+            active = -1;
+        }
+    }
+
+    let active = -1;
+
+    const options = () => [...menu.querySelectorAll<HTMLElement>('.call-option')];
+
+    function highlightActive(): void {
+        options().forEach((line, index) => line.classList.toggle('active', index === active));
+        options()[active]?.scrollIntoView({ block: 'nearest' });
+    }
+
+    input.addEventListener('focus', ask);
+
+    input.addEventListener('keydown', (event) => {
+        const all = options();
+
+        if (event.key === 'Escape' && !menu.hidden) {
+            open(false);
+            event.stopPropagation();
+            return;
+        }
+
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            if (all.length === 0) {
+                return;
+            }
+            open(true);
+            active = Math.max(
+                0,
+                Math.min(all.length - 1, active + (event.key === 'ArrowDown' ? 1 : -1))
+            );
+            highlightActive();
+            event.preventDefault();
+            return;
+        }
+
+        if (event.key === 'Enter' && !menu.hidden && active >= 0) {
+            all[active]?.click();
+            event.preventDefault();
+        }
+    });
+
+    // Clicking a suggestion must not take the focus off the field it is completing — the line is
+    // still being typed, and the panel commits when focus leaves the item.
+    menu.addEventListener('mousedown', (event) => event.preventDefault());
+
+    well.addEventListener('focusout', (event) => {
+        const next = (event as FocusEvent).relatedTarget;
+        if (!(next instanceof Node) || !well.contains(next)) {
+            open(false);
+        }
+    });
+
+    sync();
     ask();
+    askAgain.add(ask);
+
     return box;
 }
 
-function shapeInput(name: string, schema: SchemaNode, value: unknown): HTMLInputElement {
+/** A field the item's `commit` reads, drawn by something other than a text box. */
+function hiddenField(name: string, kind: string, value: unknown): HTMLInputElement {
     const input = document.createElement('input');
-    input.type = 'text';
+    input.type = 'hidden';
     input.dataset.field = name;
-    input.dataset.kind = 'text';
-    input.spellcheck = false;
-    input.value = value === undefined || value === null ? '' : String(value);
-    void schema;
+    input.dataset.kind = kind;
+    input.value = text(value);
     return input;
 }
 
-function shapeRow(title: string, control: HTMLElement, schema: SchemaNode): HTMLElement {
-    const row = document.createElement('div');
-    row.className = 'item-row';
-
-    const label = document.createElement('label');
-    label.textContent = title;
-    row.append(label, control);
-
-    if (schema.description) {
-        const blurb = document.createElement('p');
-        blurb.className = 'item-help';
-        blurb.textContent = schema.description;
-        row.append(blurb);
-    }
-
-    return row;
+/** One of the two readings of a half-written line, once the server has answered it. */
+interface Reading {
+    readonly answer?: SettingsMsg.MemberShape;
+    /** The part of a member name typed so far, which the suggestions are narrowed by. */
+    readonly typed: string;
 }
 
-function suggestionList(id: string): HTMLDataListElement {
-    const list = document.createElement('datalist');
-    list.id = id;
-    document.body.append(list);
-    return list;
+/** A call taken apart, as the three fields that are stored. */
+interface Call {
+    readonly type: string;
+    readonly member: string;
+    /** The parameter list, or undefined when the line has no parentheses — any overload. */
+    readonly parameters?: readonly string[];
 }
 
-function fill(list: HTMLDataListElement, items: readonly string[]): void {
-    list.textContent = '';
-    for (const item of items) {
-        const option = document.createElement('option');
-        option.value = item;
-        list.append(option);
+/** Everything before the parameter list, with a trailing dot dropped. */
+function head(line: string): string {
+    const open = line.indexOf('(');
+    return (open < 0 ? line : line.slice(0, open)).trim().replace(/\.$/, '');
+}
+
+/** The last dotted segment — the part of a name somebody types from memory. */
+function segment(name: string): string {
+    const dot = name.lastIndexOf('.');
+    return dot < 0 ? name : name.slice(dot + 1);
+}
+
+/**
+ * `Contoso.Web.Localizer.GetString(string, *)` as the fields that hold it.
+ *
+ * The class is everything before the last dot, so a line with no dot at all names no class — which
+ * is the documented escape hatch for matching any class that declares the member, and reads as one:
+ * `GetString(string)` is a method, said without saying whose.
+ */
+function parseCall(line: string): Call {
+    const trimmed = line.trim();
+    const open = trimmed.indexOf('(');
+    const name = (open < 0 ? trimmed : trimmed.slice(0, open)).trim();
+    const inside = open < 0 ? undefined : trimmed.slice(open + 1).replace(/\)\s*$/, '');
+    const dot = name.lastIndexOf('.');
+
+    return {
+        type: dot < 0 ? '' : name.slice(0, dot).trim(),
+        member: (dot < 0 ? name : name.slice(dot + 1)).trim(),
+        parameters:
+            inside === undefined
+                ? undefined
+                : inside
+                    .split(',')
+                    .map((part) => part.trim())
+                    .filter((part) => part.length > 0),
+    };
+}
+
+function formatCall(type: string, member: string, parameters?: readonly string[]): string {
+    const name = type === '' ? member : `${type}.${member}`;
+    return parameters === undefined ? name : `${name}(${parameters.join(', ')})`;
+}
+
+/** The typed fragment picked out of a suggestion, so it is clear why it is being offered. */
+function highlight(name: string, typed: string): DocumentFragment {
+    const out = document.createDocumentFragment();
+    const at = typed === '' ? -1 : name.toLowerCase().indexOf(typed.toLowerCase());
+
+    if (at < 0) {
+        out.append(name);
+        return out;
     }
+
+    const hit = document.createElement('span');
+    hit.className = 'match';
+    hit.textContent = name.slice(at, at + typed.length);
+    out.append(name.slice(0, at), hit, name.slice(at + typed.length));
+    return out;
+}
+
+function contains(name: string, typed: string): boolean {
+    return typed === '' || name.toLowerCase().includes(typed.toLowerCase());
+}
+
+function text(value: unknown): string {
+    return value === undefined || value === null ? '' : String(value);
 }
 
 function count(n: number, noun: string): string {
@@ -1380,3 +1840,8 @@ function commitOnBlur(element: HTMLInputElement | HTMLTextAreaElement, commit: (
         }
     });
 }
+
+// The page holds nothing until the host sends it something, and the host does not know the script
+// has run until it says so. VS Code reloads a webview whenever it likes, which without this left
+// an empty form behind.
+vscode.postMessage({ type: 'ready' });

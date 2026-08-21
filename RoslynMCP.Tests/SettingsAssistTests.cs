@@ -36,6 +36,18 @@ public class SettingsAssistTests
             public class ProductModule : ModuleBase
             {
             }
+
+            public interface ILocalizedControl
+            {
+            }
+
+            public static class LocalizedControlExtensions
+            {
+                public static string GetString(this ILocalizedControl control, string key) => key;
+
+                public static string GetString(
+                    this ILocalizedControl control, string key, string suffix) => key;
+            }
         }
         """;
 
@@ -84,6 +96,42 @@ public class SettingsAssistTests
 
         Assert.Equal(["local", "key"], matched.Parameters.Select(p => p.Name));
         Assert.Equal(["bool", "string"], matched.Parameters.Select(p => p.Type));
+    }
+
+    /// <summary>
+    /// An extension method is matched the way it is called, without the receiver.
+    /// </summary>
+    /// <remarks>
+    /// A signature is written by looking at a call — <c>control.GetString(key)</c> names one
+    /// argument — and this page lists members declared on the static class, which name two. The
+    /// two lists disagreeing meant a correct entry reported "0 of 2 match", which is the page
+    /// saying the opposite of the truth about the only thing it is for.
+    /// </remarks>
+    [Fact]
+    public async Task AnExtensionMethodIsMatchedTheWayItIsCalled()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.LocalizedControlExtensions", "GetString", ["System.String"]));
+
+        Assert.Equal(2, result.Matches.Length);
+
+        var matched = Assert.Single(result.Matches, match => match.Matched);
+        Assert.Equal("GetString(string key)", matched.Signature);
+    }
+
+    /// <summary>
+    /// And its parameters start at the first argument, so the key's position is the one the call
+    /// site counts.
+    /// </summary>
+    [Fact]
+    public async Task AnExtensionMethodSParametersStartAtTheFirstArgument()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.LocalizedControlExtensions", "GetString", ["System.String", "*"]));
+
+        var matched = result.Matches.Single(match => match.Matched);
+
+        Assert.Equal(["key", "suffix"], matched.Parameters.Select(p => p.Name));
     }
 
     /// <summary>Both spellings of a built-in, the same as the binding rules accept.</summary>

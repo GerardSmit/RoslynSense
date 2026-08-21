@@ -50,6 +50,10 @@ function createPanel(
         vscode.ViewColumn.Active,
         {
             enableScripts: true,
+            // A form in the middle of being filled in is not something to throw away because
+            // somebody looked at another tab. The page holds unsaved text, an open dropdown and a
+            // scroll position, and rebuilding it loses all three.
+            retainContextWhenHidden: true,
             localResourceRoots: [
                 vscode.Uri.joinPath(context.extensionUri, 'out', 'webview'),
                 vscode.Uri.joinPath(context.extensionUri, 'media'),

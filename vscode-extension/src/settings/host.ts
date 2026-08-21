@@ -8,6 +8,7 @@ import {
     previewConnection,
     splitProvider,
 } from './connectionPreview';
+import { onProjectSetChanged } from '../projectSet';
 import {
     ConfigScope,
     SCOPE_LABELS,
@@ -58,8 +59,18 @@ export function wire(
     watcher.onDidDelete(refresh);
     panel.onDidDispose(() => watcher.dispose());
 
+    // What a control resolves against is the loaded solution, and a panel opened during load is
+    // told "nothing yet" by every one of them. Nothing asked again, so the answer stood until the
+    // panel was closed and reopened.
+    const resolvable = onProjectSetChanged(() => post({ type: 'resolvable' }));
+    panel.onDidDispose(() => resolvable.dispose());
+
     panel.webview.onDidReceiveMessage(async (message: SettingsMsg.ToHost) => {
         switch (message.type) {
+            case 'ready':
+                post(buildState(scope));
+                return;
+
             case 'selectScope':
                 scope = message.scope;
                 post(buildState(scope));
@@ -147,8 +158,6 @@ export function wire(
             }
         }
     });
-
-    post(buildState(scope));
 
     /**
      * One request to the server, or undefined when there is nobody to ask. A settings page is

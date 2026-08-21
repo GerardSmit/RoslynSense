@@ -203,6 +203,16 @@ internal static partial class SharedBuildHost
                 shards[(start + next++) % PoolSize].Add(projectPaths[i]);
         }
 
+        // Largest project file first, smallest last. The order changes nothing inside the lane —
+        // it is serial either way — but the batch converts each evaluation as it lands, so the
+        // one conversion that cannot overlap anything is the final project's, and a small last
+        // project makes that tail short.
+        legacy.Sort((a, b) =>
+        {
+            try { return new FileInfo(b).Length.CompareTo(new FileInfo(a).Length); }
+            catch (IOException) { return 0; }
+        });
+
 
         // The prewarm is the one place the whole pool runs flat out over one solution, which
         // makes it the machine's pool-size benchmark: hot loads never get here with enough

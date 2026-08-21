@@ -48,6 +48,18 @@ public static class SolutionSessionTool
 
             session.Open(resolved, directories, watch);
 
+            // The editor and MCP clients share one daemon, so by the time a chat calls
+            // open_solution the editor has usually loaded some or all of it. Warming only the
+            // projects that are actually missing is what keeps this call from reloading a
+            // solution that is already being served. The warm starts before the classification
+            // pass below, not after: everything under it (host ignition first of all) is what
+            // the caller is actually waiting on, and the classification only feeds the report.
+            var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects, cancellationToken);
+            RunwayTrace.Mark("load state checked");
+            var warm = missing.Count > 0
+                ? WarmWorkspaceAsync(missing, cancellationToken)
+                : Task.CompletedTask;
+
             var classifications = projects.Select(ProjectClassifier.Classify).ToList();
             RunwayTrace.Mark("projects classified");
 
@@ -61,14 +73,7 @@ public static class SolutionSessionTool
                 _ = Task.Run(() => NetFxToolchain.Info);
             }
 
-            // The editor and MCP clients share one daemon, so by the time a chat calls
-            // open_solution the editor has usually loaded some or all of it. Warming only the
-            // projects that are actually missing is what keeps this call from reloading a
-            // solution that is already being served.
-            var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects, cancellationToken);
-            RunwayTrace.Mark("load state checked");
-            if (missing.Count > 0)
-                await WarmWorkspaceAsync(missing, cancellationToken);
+            await warm;
 
             RunwayTrace.Mark("workspace warmed");
             var report = Format(resolved, classifications, session, watch, fmt, alreadyLoaded: missing.Count == 0);

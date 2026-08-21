@@ -1,0 +1,165 @@
+using Microsoft.CodeAnalysis.CSharp;
+using RoslynMCP.Services;
+using RoslynMCP.Services.Testing;
+using Xunit;
+
+namespace RoslynMCP.Tests;
+
+/// <summary>
+/// The Changed Members view's mapping: which member declarations own the lines a diff touched,
+/// and where inside each member a click should land. Everything here is syntax-only, so the
+/// tests parse source directly and hand the service line ranges as git would report them.
+/// </summary>
+public class ChangedMemberServiceTests
+{
+    private const string Source = """
+        using System;
+
+        namespace App.Orders
+        {
+            public class OrderService
+            {
+                private readonly int _limit = 10;
+
+                public string Name { get; set; } = "";
+
+                public OrderService(int limit)
+                {
+                    _limit = limit;
+                }
+
+                public int Total(int count)
+                {
+                    return count * _limit;
+                }
+            }
+        }
+        """;
+
+    private static IReadOnlyList<ChangedMember> Collect(params LineRange[] ranges)
+    {
+        var root = CSharpSyntaxTree.ParseText(Source).GetRoot();
+        return ChangedMemberService.CollectMembers(
+            root, new ChangedFile(@"C:\repo\OrderService.cs", ranges));
+    }
+
+    [Fact]
+    public void CollectMembers_FindsTheMethodOwningAChangedBodyLine()
+    {
+        // Line 18 is inside Total's body.
+        var member = Assert.Single(Collect(new LineRange(18, 18)));
+
+        Assert.Equal("Total", member.Name);
+        Assert.Equal("method", member.Kind);
+        Assert.Equal("OrderService", member.ContainerType);
+        Assert.Equal("App.Orders", member.Namespace);
+    }
+
+    [Fact]
+    public void CollectMembers_LandsOnTheFirstChangedLineInsideTheMember()
+    {
+        // The range runs past Total's last line (19) into the class brace; the count clips.
+        var member = Assert.Single(Collect(new LineRange(18, 20)));
+
+        Assert.Equal(18, member.FirstChangedLine);
+        Assert.Equal(2, member.ChangedLineCount);
+    }
+
+    [Fact]
+    public void CollectMembers_ClipsARangeSpanningTwoMembersToEach()
+    {
+        // Lines 13-19 run from the constructor into Total.
+        var members = Collect(new LineRange(13, 19));
+
+        Assert.Equal(["OrderService", "Total"], members.Select(m => m.Name));
+        Assert.Equal("constructor", members[0].Kind);
+        Assert.Equal(13, members[0].FirstChangedLine);
+        Assert.Equal(16, members[1].FirstChangedLine);
+    }
+
+    [Fact]
+    public void CollectMembers_ReportsFieldsAndPropertiesByName()
+    {
+        var members = Collect(new LineRange(7, 9));
+
+        Assert.Equal(["_limit", "Name"], members.Select(m => m.Name));
+        Assert.Equal(["field", "property"], members.Select(m => m.Kind));
+    }
+
+    [Fact]
+    public void CollectMembers_ListsEachChangedBlockClippedAndPreviewed()
+    {
+        // Two separate edits inside Total: its signature (16) and its body (18), with the body
+        // range running past the member's last line so the block has to clip.
+        var member = Assert.Single(Collect(new LineRange(16, 16), new LineRange(18, 20)));
+
+        Assert.Equal(2, member.Blocks.Count);
+        Assert.Equal((16, 16), (member.Blocks[0].StartLine, member.Blocks[0].EndLine));
+        Assert.Equal((18, 19), (member.Blocks[1].StartLine, member.Blocks[1].EndLine));
+        Assert.Equal("public int Total(int count)", member.Blocks[0].Preview);
+        Assert.Equal("return count * _limit;", member.Blocks[1].Preview);
+    }
+
+    [Fact]
+    public void CollectMembers_WholeFileHasNoBlocks()
+    {
+        Assert.All(Collect(), m => Assert.Empty(m.Blocks));
+    }
+
+    [Fact]
+    public void CollectMembers_IgnoresChangesOutsideAnyMember()
+    {
+        // Line 1 is a using directive; line 5 is the class header.
+        Assert.Empty(Collect(new LineRange(1, 1), new LineRange(5, 5)));
+    }
+
+    [Fact]
+    public void CollectMembers_WholeFileListsEveryMemberAtItsOwnName()
+    {
+        var members = Collect();
+
+        Assert.Equal(4, members.Count);
+        var total = members.Single(m => m.Name == "Total");
+        // The click lands on the method's name line, not the first line of the file.
+        Assert.Equal(16, total.FirstChangedLine);
+    }
+
+    [Fact]
+    public void CollectMembers_FileScopedNamespaceIsReported()
+    {
+        var root = CSharpSyntaxTree.ParseText("""
+            namespace App.Billing;
+
+            public class Invoice
+            {
+                public decimal Amount => 0m;
+            }
+            """).GetRoot();
+
+        var member = Assert.Single(ChangedMemberService.CollectMembers(
+            root, new ChangedFile(@"C:\repo\Invoice.cs", [new LineRange(5, 5)])));
+
+        Assert.Equal("App.Billing", member.Namespace);
+        Assert.Equal("Invoice", member.ContainerType);
+    }
+
+    [Fact]
+    public void CollectMembers_NestedTypesJoinTheContainerName()
+    {
+        var root = CSharpSyntaxTree.ParseText("""
+            class Outer
+            {
+                class Inner
+                {
+                    void Run() { }
+                }
+            }
+            """).GetRoot();
+
+        var member = Assert.Single(ChangedMemberService.CollectMembers(
+            root, new ChangedFile(@"C:\repo\Outer.cs", [new LineRange(5, 5)])));
+
+        Assert.Equal("Outer.Inner", member.ContainerType);
+        Assert.Equal("", member.Namespace);
+    }
+}

@@ -21,6 +21,7 @@ import { registerImpactedTests } from './impactedTests';
 import { registerCoverageMapProgress } from './coverageMapProgress';
 import { registerProjectSet } from './projectSet';
 import { registerCoverageExplorer } from './coverageExplorer';
+import { registerChangedMembers } from './changedMembers';
 import { registerSolutionExplorer } from './solutionExplorer';
 import { registerSearchEverywhere } from './search';
 import { registerSettingsPanel } from './settings';
@@ -3196,6 +3197,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerProjectSet(context, () => client);
     registerImpactedTests(context, () => client);
     registerCoverageExplorer(context, () => client);
+    registerChangedMembers(context, () => client);
     registerSolutionExplorer(context, () => client);
     registerVirtualDocuments(context, () => client);
     registerEmbeddedLanguages(context);

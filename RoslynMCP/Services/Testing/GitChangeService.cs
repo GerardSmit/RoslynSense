@@ -37,10 +37,13 @@ public sealed record ChangedFile(string FilePath, IReadOnlyList<LineRange> Range
 public readonly record struct LineRange(int Start, int End);
 
 /// <summary>What the diff said, or why it could not be taken.</summary>
+/// <param name="DiffTarget">The revision the working tree was compared against — "HEAD", a
+/// merge-base sha, or the caller's reference. What a client needs to show the same diff.</param>
 public sealed record GitChangeSet(
     IReadOnlyList<ChangedFile> Files,
     string Description,
-    string? Error = null)
+    string? Error = null,
+    string? DiffTarget = null)
 {
     public static GitChangeSet Failed(string error) => new([], "", error);
 }
@@ -129,7 +132,8 @@ public static partial class GitChangeService
 
         return new GitChangeSet(
             files.Values.OrderBy(f => f.FilePath, StringComparer.OrdinalIgnoreCase).ToList(),
-            description);
+            description,
+            DiffTarget: diffTarget);
     }
 
     /// <summary>

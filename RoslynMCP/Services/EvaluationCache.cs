@@ -38,6 +38,13 @@ namespace RoslynMCP.Services;
 /// cost a noticeable slice of what the cache saves.
 /// </para>
 /// <para>
+/// Which file names count as "source-shaped" is not one fixed list: each entry records the
+/// extensions its own evaluation consumed beyond the built-in floor (see
+/// <see cref="ExtraExtensionsOf"/>), so a project globbing something exotic invalidates on
+/// exactly that, and <c>ROSLYNMCP_EVAL_CACHE_EXTENSIONS</c> adds extensions globally for the
+/// shapes derivation cannot see.
+/// </para>
+/// <para>
 /// <c>ROSLYNMCP_NO_EVAL_CACHE=1</c> turns it off; <c>ROSLYNMCP_EVAL_CACHE_DIR</c> relocates it
 /// (the test suite points it at a sandbox so parallel testhosts and the user's live daemon never
 /// share entries).
@@ -46,12 +53,14 @@ namespace RoslynMCP.Services;
 internal static class EvaluationCache
 {
     /// <summary>Bumped when the entry shape or fingerprint recipe changes.</summary>
-    private const int FormatVersion = 1;
+    private const int FormatVersion = 2;
 
     private static bool Enabled =>
         Environment.GetEnvironmentVariable("ROSLYNMCP_NO_EVAL_CACHE") is not ("1" or "true" or "on");
 
-    private static string Root =>
+    /// <summary>Also home to <see cref="BuildHostPoolCalibration"/>'s state, so tests that
+    /// sandbox the cache directory sandbox the calibration with it.</summary>
+    internal static string Root =>
         Environment.GetEnvironmentVariable("ROSLYNMCP_EVAL_CACHE_DIR") is { Length: > 0 } custom
             ? custom
             : Path.Combine(
@@ -64,11 +73,18 @@ internal static class EvaluationCache
     /// <summary>Entries written after a genuine evaluation this process lifetime. Diagnostic only.</summary>
     internal static int StoreCount;
 
+    /// <param name="ExtraExtensions">
+    /// File extensions beyond <see cref="s_sourceExtensions"/> that this project's evaluation
+    /// actually consumed — a WPF project's <c>.xaml</c>, a content glob's <c>.json</c>. Recorded
+    /// per entry so the fingerprint's file walk watches exactly what this project globs, instead
+    /// of a fixed list guessing for every project at once.
+    /// </param>
     private sealed record Entry(
         int Version,
         string Fingerprint,
         ImmutableArray<ProjectFileInfo> Infos,
-        ImmutableArray<string> OutputPaths);
+        ImmutableArray<string> OutputPaths,
+        ImmutableArray<string> ExtraExtensions = default);
 
     private static readonly JsonSerializerOptions s_json = new() { WriteIndented = false };
 
@@ -76,18 +92,20 @@ internal static class EvaluationCache
     /// The cached evaluation of <paramref name="projectPath"/>, when every input it was computed
     /// from is unchanged. False on any doubt: a miss costs one ordinary evaluation.
     /// </summary>
-    /// <param name="fingerprint">
-    /// The current fingerprint when the caller has already computed it. Fingerprinting reads the
-    /// project file, the restore assets and a directory walk, and one load asks about the same
-    /// path up to three times (probe, post-miss re-check, store) — computed fresh each time it
-    /// was a measurable slice of the loading it exists to avoid.
+    /// <param name="fingerprintOf">
+    /// Computes the current fingerprint for a given set of extra watched extensions — the set is
+    /// the entry's own, so it is not known until the entry is read. Callers that load many
+    /// projects pass a memoizing function: fingerprinting reads the project file, the restore
+    /// assets and a directory walk, and one load asks about the same path up to three times
+    /// (probe, post-miss re-check, store) — computed fresh each time it was a measurable slice
+    /// of the loading it exists to avoid.
     /// </param>
     public static bool TryGet(
         string projectPath,
         ImmutableDictionary<string, string> properties,
         out ImmutableArray<ProjectFileInfo> infos,
         out ImmutableArray<string> outputPaths,
-        string? fingerprint = null)
+        Func<ImmutableArray<string>, string>? fingerprintOf = null)
     {
         infos = default;
         outputPaths = default;
@@ -102,13 +120,14 @@ internal static class EvaluationCache
                 return false;
 
             var entry = JsonSerializer.Deserialize<Entry>(File.ReadAllBytes(file), s_json);
-            if (entry is null
-                || entry.Version != FormatVersion
-                || entry.Infos.IsDefault
-                || entry.Fingerprint != (fingerprint ?? Fingerprint(projectPath, properties)))
-            {
+            if (entry is null || entry.Version != FormatVersion || entry.Infos.IsDefault)
                 return false;
-            }
+
+            var extras = entry.ExtraExtensions.IsDefault ? [] : entry.ExtraExtensions;
+            string current = fingerprintOf?.Invoke(extras)
+                ?? Fingerprint(projectPath, properties, extras);
+            if (entry.Fingerprint != current)
+                return false;
 
             infos = entry.Infos;
             outputPaths = entry.OutputPaths.IsDefault ? [] : entry.OutputPaths;
@@ -132,7 +151,7 @@ internal static class EvaluationCache
         ImmutableDictionary<string, string> properties,
         ImmutableArray<ProjectFileInfo> infos,
         ImmutableArray<string> outputPaths,
-        string? fingerprint = null)
+        Func<ImmutableArray<string>, string>? fingerprintOf = null)
     {
         if (!Enabled || infos.IsDefaultOrEmpty)
             return;
@@ -141,9 +160,13 @@ internal static class EvaluationCache
         {
             try
             {
+                // The extras come from what evaluation just produced, never from the previous
+                // entry, so a project that gains or loses a glob re-records the truth here.
+                var extras = ExtraExtensionsOf(infos);
                 var entry = new Entry(
-                    FormatVersion, fingerprint ?? Fingerprint(projectPath, properties),
-                    infos, outputPaths);
+                    FormatVersion,
+                    fingerprintOf?.Invoke(extras) ?? Fingerprint(projectPath, properties, extras),
+                    infos, outputPaths, extras);
 
                 string file = EntryPath(projectPath, properties);
                 Directory.CreateDirectory(Path.GetDirectoryName(file)!);
@@ -203,8 +226,11 @@ internal static class EvaluationCache
     /// next one's.
     /// </summary>
     internal static string Fingerprint(
-        string projectPath, ImmutableDictionary<string, string> properties)
+        string projectPath,
+        ImmutableDictionary<string, string> properties,
+        ImmutableArray<string> extraExtensions = default)
     {
+        var watched = WatchedExtensions(extraExtensions);
         string full = Path.GetFullPath(projectPath);
         string? projectDir = Path.GetDirectoryName(full);
 
@@ -235,6 +261,10 @@ internal static class EvaluationCache
         AddText(typeof(ProjectFileInfo).Assembly.GetName().Version?.ToString() ?? "");
         AddText(PropertiesKey(properties));
 
+        // The watched set is itself an input: two fingerprints over different sets must never
+        // compare equal by accident, even when the file lists they saw happen to coincide.
+        AddText(string.Join(";", watched.Order(StringComparer.OrdinalIgnoreCase)));
+
         AddFile("project", full);
 
         if (projectDir is not null)
@@ -250,7 +280,7 @@ internal static class EvaluationCache
             AddFile("assets", Path.Combine(projectDir, "obj", "project.assets.json"));
 
             AddText("files");
-            foreach (string relative in SourceShapedFiles(projectDir))
+            foreach (string relative in SourceShapedFiles(projectDir, watched))
                 AddText(relative);
         }
 
@@ -263,15 +293,82 @@ internal static class EvaluationCache
     /// </summary>
     private static readonly HashSet<string> s_sourceExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".cs", ".vb", ".razor", ".cshtml", ".aspx", ".ascx", ".master",
+        ".cs", ".vb", ".razor", ".cshtml", ".aspx", ".ascx", ".master", ".xaml",
         ".resx", ".editorconfig", ".globalconfig", ".props", ".targets",
     };
 
     /// <summary>
-    /// The names (not contents) of the source-shaped files under <paramref name="projectDir"/>,
-    /// as sorted relative paths, skipping the directories evaluation itself skips.
+    /// The full extension set one fingerprint watches: the built-in floor, anything the user
+    /// added via <c>ROSLYNMCP_EVAL_CACHE_EXTENSIONS</c> (semicolon- or comma-separated, with or
+    /// without the leading dot), and the extensions this particular entry recorded.
     /// </summary>
-    private static IEnumerable<string> SourceShapedFiles(string projectDir)
+    private static HashSet<string> WatchedExtensions(ImmutableArray<string> extraExtensions)
+    {
+        var watched = new HashSet<string>(s_sourceExtensions, StringComparer.OrdinalIgnoreCase);
+
+        if (Environment.GetEnvironmentVariable("ROSLYNMCP_EVAL_CACHE_EXTENSIONS")
+            is { Length: > 0 } configured)
+        {
+            foreach (string raw in configured.Split(';', ','))
+            {
+                string ext = raw.Trim();
+                if (ext.Length > 0)
+                    watched.Add(ext.StartsWith('.') ? ext : "." + ext);
+            }
+        }
+
+        if (!extraExtensions.IsDefaultOrEmpty)
+        {
+            foreach (string ext in extraExtensions)
+                watched.Add(ext);
+        }
+
+        return watched;
+    }
+
+    /// <summary>
+    /// The extensions an evaluation consumed beyond the built-in set — every document, content
+    /// file and analyzer config the project's globs actually pulled in. Stored on the entry so
+    /// its fingerprint watches them from then on: a WPF project starts missing when a
+    /// <c>.xaml</c> file appears, without every non-WPF project paying to watch <c>.xaml</c>.
+    /// </summary>
+    internal static ImmutableArray<string> ExtraExtensionsOf(ImmutableArray<ProjectFileInfo> infos)
+    {
+        var extras = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void Add(string? filePath)
+        {
+            if (Path.GetExtension(filePath) is { Length: > 1 } ext
+                && !s_sourceExtensions.Contains(ext))
+            {
+                extras.Add(ext.ToLowerInvariant());
+            }
+        }
+
+        foreach (var info in infos)
+        {
+            foreach (var document in info.Documents.EmptyIfDefault())
+                Add(document.FilePath);
+            foreach (var document in info.AdditionalDocuments.EmptyIfDefault())
+                Add(document.FilePath);
+            foreach (var document in info.AnalyzerConfigDocuments.EmptyIfDefault())
+                Add(document.FilePath);
+            foreach (string path in info.ContentFilePaths.EmptyIfDefault())
+                Add(path);
+        }
+
+        return [.. extras];
+    }
+
+    private static ImmutableArray<T> EmptyIfDefault<T>(this ImmutableArray<T> array) =>
+        array.IsDefault ? [] : array;
+
+    /// <summary>
+    /// The names (not contents) of the files matching <paramref name="watched"/> under
+    /// <paramref name="projectDir"/>, as sorted relative paths, skipping the directories
+    /// evaluation itself skips.
+    /// </summary>
+    private static IEnumerable<string> SourceShapedFiles(string projectDir, HashSet<string> watched)
     {
         var names = new List<string>();
         var pending = new Stack<string>();
@@ -299,7 +396,7 @@ internal static class EvaluationCache
                         pending.Push(entry);
                     }
                 }
-                else if (s_sourceExtensions.Contains(Path.GetExtension(name)))
+                else if (watched.Contains(Path.GetExtension(name)))
                 {
                     names.Add(entry[(projectDir.Length + 1)..]);
                 }

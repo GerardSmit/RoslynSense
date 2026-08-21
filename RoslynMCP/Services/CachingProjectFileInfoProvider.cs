@@ -47,17 +47,20 @@ internal sealed class CachingProjectFileInfoProvider(
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// One fingerprint per project per load. Computing one reads the project file, the restore
-    /// assets and a directory listing, and one load asks about the same project up to three
-    /// times; scoped to the provider so nothing survives into a later load, where the files may
-    /// have changed.
+    /// One fingerprint per (project, watched-extension-set) per load. Computing one reads the
+    /// project file, the restore assets and a directory listing, and one load asks about the
+    /// same project up to three times; scoped to the provider so nothing survives into a later
+    /// load, where the files may have changed. The extension set is part of the key because the
+    /// entry on disk and a fresh evaluation can disagree about it — when they do, both
+    /// fingerprints are real and the disagreement is exactly what forces the re-evaluation.
     /// </summary>
     private readonly ConcurrentDictionary<string, string> _fingerprint =
         new(StringComparer.OrdinalIgnoreCase);
 
-    private string FingerprintFor(string projectPath) =>
-        _fingerprint.GetOrAdd(Path.GetFullPath(projectPath),
-            _ => EvaluationCache.Fingerprint(projectPath, properties));
+    private Func<ImmutableArray<string>, string> FingerprintOf(string projectPath) =>
+        extras => _fingerprint.GetOrAdd(
+            Path.GetFullPath(projectPath) + "|" + string.Join(";", extras.IsDefault ? [] : extras),
+            _ => EvaluationCache.Fingerprint(projectPath, properties, extras));
 
     /// <summary>Paths the BuildHost genuinely evaluated during this load. Lock to read or write.</summary>
     public HashSet<string> HostEvaluated { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -105,7 +108,7 @@ internal sealed class CachingProjectFileInfoProvider(
                     .Remove(new KeyValuePair<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>>(full, pending));
             }
 
-            if (EvaluationCache.TryGet(path, properties, out var infos, out _, FingerprintFor(path)))
+            if (EvaluationCache.TryGet(path, properties, out var infos, out _, FingerprintOf(path)))
                 _served[full] = infos;
             else
                 misses.Add(path);
@@ -139,7 +142,7 @@ internal sealed class CachingProjectFileInfoProvider(
         DiagnosticReportingOptions reportingOptions,
         CancellationToken cancellationToken)
     {
-        if (EvaluationCache.TryGet(projectPath, properties, out var fromDisk, out _, FingerprintFor(projectPath)))
+        if (EvaluationCache.TryGet(projectPath, properties, out var fromDisk, out _, FingerprintOf(projectPath)))
         {
             _served[full] = fromDisk;
             return fromDisk;
@@ -160,7 +163,7 @@ internal sealed class CachingProjectFileInfoProvider(
         lock (HostEvaluated)
             HostEvaluated.Add(full);
 
-        EvaluationCache.Store(projectPath, properties, infos, OutputsOf(infos), FingerprintFor(projectPath));
+        EvaluationCache.Store(projectPath, properties, infos, OutputsOf(infos), FingerprintOf(projectPath));
         return infos;
     }
 
@@ -208,7 +211,7 @@ internal sealed class CachingProjectFileInfoProvider(
         if (inFlight.TryGetValue(full, out var evaluation))
             return OutputsOf(await evaluation.Value);
 
-        if (EvaluationCache.TryGet(projectPath, properties, out infos, out _, FingerprintFor(projectPath)))
+        if (EvaluationCache.TryGet(projectPath, properties, out infos, out _, FingerprintOf(projectPath)))
         {
             _served[full] = infos;
             return OutputsOf(infos);

@@ -39,7 +39,7 @@ public class EvaluationCacheTests : IDisposable
         try { Directory.Delete(_projectDir, recursive: true); } catch { }
     }
 
-    private ProjectFileInfo MakeInfo() => new()
+    private ProjectFileInfo MakeInfo(ImmutableArray<string> contentFilePaths = default) => new()
     {
         IsEmpty = false,
         Language = LanguageNames.CSharp,
@@ -65,7 +65,7 @@ public class EvaluationCacheTests : IDisposable
             new ProjectFileReference(@"..\Lib\Lib.csproj", aliases: ["global"], referenceOutputAssembly: true),
         ],
         ProjectCapabilities = ["CSharp", "TestContainer"],
-        ContentFilePaths = [],
+        ContentFilePaths = contentFilePaths.IsDefault ? [] : contentFilePaths,
         PackageReferences = [new PackageReferenceItem("xunit", "2.9.0")],
         MetadataReferences = [new MetadataReferenceItem(@"C:\refs\System.Runtime.dll", [])],
         CodePage = 65001,
@@ -198,5 +198,58 @@ public class EvaluationCacheTests : IDisposable
             "<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>");
 
         Assert.False(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+    }
+
+    [Fact]
+    public async Task MissesAfterAFileOfARecordedExtensionAppears()
+    {
+        // The evaluation consumed a .json content file, so the entry records .json as watched —
+        // the "exotic glob" case a fixed extension list cannot anticipate. A new .json appearing
+        // must then miss, exactly as a new .cs would.
+        File.WriteAllText(Path.Combine(_projectDir, "settings.json"), "{}");
+        EvaluationCache.Store(_projectPath, Properties,
+            [MakeInfo([Path.Combine(_projectDir, "settings.json")])], ["out1"]);
+        await EvaluationCache.WhenStoresIdleAsync();
+
+        Assert.True(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+
+        File.WriteAllText(Path.Combine(_projectDir, "other.json"), "{}");
+
+        Assert.False(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+    }
+
+    [Fact]
+    public async Task IgnoresFilesOfExtensionsTheProjectNeverEvaluated()
+    {
+        var (hit, _, _) = await StoreThenGetAsync(Properties);
+        Assert.True(hit);
+
+        // No .json ever reached this project's evaluation, so its entry does not watch them —
+        // per-entry recording is what keeps every other project from paying for one project's
+        // exotic globs.
+        File.WriteAllText(Path.Combine(_projectDir, "notes.json"), "{}");
+
+        Assert.True(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+    }
+
+    [Fact]
+    public async Task WatchesExtensionsConfiguredByEnvironment()
+    {
+        // For evaluation shapes derivation cannot see (an import reading files by convention),
+        // ROSLYNMCP_EVAL_CACHE_EXTENSIONS widens the watched set for every project.
+        Environment.SetEnvironmentVariable("ROSLYNMCP_EVAL_CACHE_EXTENSIONS", "json");
+        try
+        {
+            var (hit, _, _) = await StoreThenGetAsync(Properties);
+            Assert.True(hit);
+
+            File.WriteAllText(Path.Combine(_projectDir, "data.json"), "{}");
+
+            Assert.False(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("ROSLYNMCP_EVAL_CACHE_EXTENSIONS", null);
+        }
     }
 }

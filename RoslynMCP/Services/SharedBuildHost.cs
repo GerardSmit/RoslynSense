@@ -188,11 +188,18 @@ internal static partial class SharedBuildHost
         for (int i = 0; i < projectPaths.Count; i++)
             shards[(start + i) % PoolSize].Add(projectPaths[i]);
 
-        await Task.WhenAll(shards.Select((shard, index) =>
+        // The prewarm is the one place the whole pool runs flat out over one solution, which
+        // makes it the machine's pool-size benchmark: hot loads never get here with enough
+        // misses to record, so only genuine cold loads teach the calibration anything.
+        var watch = Stopwatch.StartNew();
+        int[] evaluated = await Task.WhenAll(shards.Select((shard, index) =>
             PrewarmShardAsync(workspace, properties, shard, index, evaluations, cancellationToken)));
+
+        BuildHostPoolCalibration.Record(
+            PoolSize, evaluated.Sum(), watch.Elapsed.TotalSeconds);
     }
 
-    private static async Task PrewarmShardAsync(
+    private static async Task<int> PrewarmShardAsync(
         Workspace workspace,
         ImmutableDictionary<string, string> properties,
         List<string> shard,
@@ -201,7 +208,7 @@ internal static partial class SharedBuildHost
         CancellationToken cancellationToken)
     {
         if (shard.Count == 0)
-            return;
+            return 0;
 
         string key = $"{shardIndex} {KeyFor(properties)}";
         var gate = s_gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
@@ -222,7 +229,7 @@ internal static partial class SharedBuildHost
 
                 var misses = provider.Probe(shard);
                 if (misses.Count == 0)
-                    return;
+                    return 0;
 
                 await RecycleIfAlreadyEvaluatedAsync(key, misses);
 
@@ -303,6 +310,8 @@ internal static partial class SharedBuildHost
                                 seen.Add(path);
                         }
                     }
+
+                    return provider.HostEvaluated.Count;
                 }
             }
             finally
@@ -323,16 +332,19 @@ internal static partial class SharedBuildHost
     /// where the computed size does not fit.
     /// </summary>
     /// <remarks>
-    /// The cap is 6 because that is where an 80-project cold open measured fastest, and the curve
-    /// is not subtle: on a 32-core machine, per-shard evaluation of the same solution took ~10.5s
-    /// with 6 hosts, ~13s with 8, and 16 hosts were three times slower than 4 — MSBuild
-    /// evaluation contends on something machine-wide (the evaluations per second barely move from
-    /// 4 hosts up), so extra hosts past 6 only add spawn cost and contention.
+    /// Without measurements the default is <c>cores/2</c> capped at 6 — the size where an
+    /// 80-project cold open measured fastest on the machine this was built on (evaluation
+    /// contends on something machine-wide, so extra hosts past the machine's ceiling only add
+    /// spawn cost). But that ceiling is the machine's, not a constant, so once
+    /// <see cref="BuildHostPoolCalibration"/> has cold-load throughput samples for <em>this</em>
+    /// machine, they decide instead. The upper bound caps how far its probing may climb.
     /// </remarks>
     private static readonly int PoolSize =
         int.TryParse(Environment.GetEnvironmentVariable("ROSLYNMCP_BUILDHOST_POOL"), out int configured)
             ? Math.Clamp(configured, 1, 16)
-            : Math.Clamp(Environment.ProcessorCount / 2, 1, 6);
+            : BuildHostPoolCalibration.ChoosePoolSize(
+                heuristic: Math.Clamp(Environment.ProcessorCount / 2, 1, 6),
+                upperBound: Math.Clamp(Environment.ProcessorCount, 1, 12));
 
     /// <summary>
     /// The shard a project starts at — stable for a given path within the process, so the same

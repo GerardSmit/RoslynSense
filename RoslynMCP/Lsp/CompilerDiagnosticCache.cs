@@ -50,6 +50,7 @@ internal static class CompilerDiagnosticCache
 
     private static long s_clock;
     private static long s_computations;
+    private static long s_spanBinds;
 
     /// <summary><paramref name="Stamp"/> orders use and is what <see cref="Trim"/> evicts by.</summary>
     /// <remarks>
@@ -81,7 +82,7 @@ internal static class CompilerDiagnosticCache
         version ??= await AnalyzerDiagnosticCache.GetVersionAsync(document, ct);
 
         if (version is null)
-            return await ComputeAsync(document, ct);
+            return await ComputeAsync(document, version: null, ct);
 
         if (s_entries.TryGetValue(document.Id, out var entry) && entry.Version == version)
         {
@@ -107,20 +108,62 @@ internal static class CompilerDiagnosticCache
     private static async Task<Result> ComputeAndStoreAsync(
         Document document, string version, CancellationToken ct)
     {
-        var result = await ComputeAsync(document, ct);
+        var result = await ComputeAsync(document, version, ct);
         s_entries[document.Id] = new Entry(version, result, Interlocked.Increment(ref s_clock));
         Trim();
         return result;
     }
 
-    private static async Task<Result> ComputeAsync(Document document, CancellationToken ct)
+    private static async Task<Result> ComputeAsync(Document document, string? version, CancellationToken ct)
     {
         Interlocked.Increment(ref s_computations);
 
         var model = await document.GetSemanticModelAsync(ct);
         return new Result(
-            model is null ? ImmutableArray<Diagnostic>.Empty : model.GetDiagnostics(cancellationToken: ct),
+            model is null ? ImmutableArray<Diagnostic>.Empty : await BindAsync(document, model, version, ct),
             await DiagnosticsHandler.EmbeddedDiagnosticsAsync(document, ct));
+    }
+
+    /// <summary>
+    /// One member's widened span when a single keystroke is all that separates this version from
+    /// the last one bound, the whole file otherwise.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is where the incremental path pays: <c>GetDiagnostics()</c> with no span binds every
+    /// method body in the file, and with one it binds the bodies that span touches. The previous
+    /// entry supplies everything outside it, mapped over the edit.
+    /// </para>
+    /// <para>
+    /// Everything the compiler reports is span-limited here, unlike the analyzer half where only
+    /// some analyzers are — hence the unconditional <c>true</c>. The exception the splice already
+    /// knows about is CS8019: a using directive is never examined under a span, so its greying can
+    /// only ever come forward from the last whole-file bind.
+    /// </para>
+    /// </remarks>
+    private static async Task<ImmutableArray<Diagnostic>> BindAsync(
+        Document document, SemanticModel model, string? version, CancellationToken ct)
+    {
+        if (version is null)
+            return model.GetDiagnostics(cancellationToken: ct);
+
+        MemberEditAnalysis.Observe(document, version);
+
+        if (await MemberEditAnalysis.TryComputeAsync(document, version, ct) is not { } edit
+            || !s_entries.TryGetValue(document.Id, out var prior)
+            || prior.Version != edit.BaseVersion)
+        {
+            return model.GetDiagnostics(cancellationToken: ct);
+        }
+
+        Interlocked.Increment(ref s_spanBinds);
+
+        return MemberEditAnalysis.Splice(
+            prior.Result.Compiler,
+            model.GetDiagnostics(edit.CompilerSpan, ct),
+            edit,
+            edit.CompilerSpan,
+            static _ => true);
     }
 
     public static void Evict(DocumentId documentId) => s_entries.TryRemove(documentId, out _);
@@ -139,7 +182,14 @@ internal static class CompilerDiagnosticCache
             return;
 
         foreach (var stale in s_entries.OrderBy(e => e.Value.Stamp).Take(s_entries.Count - MaxEntries).ToList())
+        {
             s_entries.TryRemove(stale.Key, out _);
+
+            // The member-edit record is written before either cache has an entry, and is only
+            // useful while one of them does. Dropped here as well as from the analyzer cache's
+            // trim, because with analyzer diagnostics switched off that trim never runs.
+            MemberEditAnalysis.Forget(stale.Key);
+        }
     }
 
     // ---- Test hooks (exposed via InternalsVisibleTo) ----
@@ -149,5 +199,12 @@ internal static class CompilerDiagnosticCache
     /// hit and of a miss are equal by construction.</summary>
     internal static long Computations => Interlocked.Read(ref s_computations);
 
-    internal static void ResetComputationCounter() => Interlocked.Exchange(ref s_computations, 0);
+    /// <summary>Of those binds, the ones restricted to a single edited member's span.</summary>
+    internal static long SpanBinds => Interlocked.Read(ref s_spanBinds);
+
+    internal static void ResetComputationCounter()
+    {
+        Interlocked.Exchange(ref s_computations, 0);
+        Interlocked.Exchange(ref s_spanBinds, 0);
+    }
 }

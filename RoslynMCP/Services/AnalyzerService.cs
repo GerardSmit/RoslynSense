@@ -75,12 +75,22 @@ internal static class AnalyzerService
     public static ImmutableArray<DiagnosticAnalyzer> GetAnalyzersFor(Project project)
     {
         var project0 = LoadAnalyzersForProject(project);
-        if (!LspFeatureOptions.CodeStyleDiagnostics)
-            return project0;
+        if (LspFeatureOptions.CodeStyleDiagnostics)
+        {
+            var ide = LoadIdeAnalyzers();
+            project0 = project0.IsDefaultOrEmpty ? ide : ide.IsDefaultOrEmpty ? project0 : project0.AddRange(ide);
+        }
 
-        var ide = LoadIdeAnalyzers();
-        return project0.IsDefaultOrEmpty ? ide : ide.IsDefaultOrEmpty ? project0 : project0.AddRange(ide);
+        var extra = AdditionalAnalyzersForTesting;
+        return extra.IsDefaultOrEmpty ? project0
+            : project0.IsDefaultOrEmpty ? extra
+            : project0.AddRange(extra);
     }
+
+    /// <summary>Test seam: analyzers added to every project's set, for exercising the cost
+    /// buckets without shipping a pathological analyzer in a fixture.</summary>
+    internal static ImmutableArray<DiagnosticAnalyzer> AdditionalAnalyzersForTesting { get; set; } =
+        ImmutableArray<DiagnosticAnalyzer>.Empty;
 
     /// <summary>
     /// What a run produced, and whether it actually finished.
@@ -97,7 +107,15 @@ internal static class AnalyzerService
     /// thread resumed that — so a thread-local neither reaches the reader (the timeout is cached as
     /// clean anyway) nor stays put (a stale true on a reused thread discards a later good result).
     /// </remarks>
-    public readonly record struct AnalyzerRun(ImmutableArray<Diagnostic> Diagnostics, bool Failed);
+    /// <param name="SpanLimitedIds">
+    /// The ids whose analyzers were run over one member's span rather than the whole file, so the
+    /// caller knows which of them it still owes findings for outside that span. Null after a
+    /// whole-file pass, where nothing is owed.
+    /// </param>
+    public readonly record struct AnalyzerRun(
+        ImmutableArray<Diagnostic> Diagnostics,
+        bool Failed,
+        ImmutableHashSet<string>? SpanLimitedIds = null);
 
     /// <summary>
     /// Runs analyzers for a single document using Roslyn's per-tree entry points, which analyze
@@ -112,8 +130,28 @@ internal static class AnalyzerService
         (await RunDocumentAnalyzersWithStatusAsync(document, cancellationToken)).Diagnostics;
 
     /// <summary>As above, and says whether the run finished or gave up.</summary>
-    public static async Task<AnalyzerRun> RunDocumentAnalyzersWithStatusAsync(
-        Document document, CancellationToken cancellationToken = default)
+    public static Task<AnalyzerRun> RunDocumentAnalyzersWithStatusAsync(
+        Document document, CancellationToken cancellationToken = default) =>
+        RunAsync(document, memberSpan: null, cancellationToken);
+
+    /// <summary>
+    /// The typing-loop pass: span-capable analyzers see only <paramref name="memberSpan"/>, the
+    /// rest still see the whole file.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors Roslyn's incremental member-edit analysis. Span capability is
+    /// <c>DiagnosticAnalyzerCategory.SemanticSpanAnalysis</c>, which an analyzer only claims by
+    /// implementing <see cref="IBuiltInAnalyzer"/> — an unknown third-party analyzer is assumed to
+    /// need the whole document, so restricting it would silently lose findings. The returned
+    /// <see cref="AnalyzerRun.SpanLimitedIds"/> is how the caller knows which half of the result is
+    /// partial and has to be completed from the previous whole-file one.
+    /// </remarks>
+    internal static Task<AnalyzerRun> RunMemberSpanAnalyzersAsync(
+        Document document, TextSpan memberSpan, CancellationToken cancellationToken) =>
+        RunAsync(document, memberSpan, cancellationToken);
+
+    private static async Task<AnalyzerRun> RunAsync(
+        Document document, TextSpan? memberSpan, CancellationToken cancellationToken)
     {
         var project = document.Project;
         var analyzers = GetAnalyzersFor(project);
@@ -134,48 +172,222 @@ internal static class AnalyzerService
         await s_passes.WaitAsync(cancellationToken);
         try
         {
+            var withAnalyzers = DriverFor(compilation, project, analyzers);
+            var (fast, slow) = await BucketsAsync(withAnalyzers, analyzers, cancellationToken);
+            var spanLimited = memberSpan is null ? null : SpanLimitedIdsOf(analyzers);
+
             var window = BudgetFor(text);
-            using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            budget.CancelAfter(window);
-
             var syntaxOnly = ImmutableArray<Diagnostic>.Empty;
-            try
-            {
-                var withAnalyzers = DriverFor(compilation, project, analyzers);
+            ImmutableArray<Diagnostic> cheap;
 
-                var syntax = await withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(model.SyntaxTree, budget.Token);
-                syntaxOnly = syntax;
-                var semantic = await withAnalyzers.GetAnalyzerSemanticDiagnosticsAsync(model, null, budget.Token);
+            using (var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                budget.CancelAfter(window);
+                try
+                {
+                    // The whole set, not just the fast bucket: a syntax action is by construction
+                    // not one of the shapes that puts an analyzer in the slow bucket, so splitting
+                    // this half would buy nothing and cost a second driver invocation.
+                    syntaxOnly = await withAnalyzers.GetAnalyzerSyntaxDiagnosticsAsync(
+                        model.SyntaxTree, null, analyzers, budget.Token);
+                    cheap = syntaxOnly.AddRange(
+                        await SemanticAsync(withAnalyzers, model, fast, memberSpan, budget.Token));
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    // The syntax pass is the cheap half and is usually already done when the semantic
+                    // half runs out of time. Reporting it beats reporting nothing, and Failed still
+                    // keeps the caller from caching this as a clean file.
+                    ServiceLog.Warn(
+                        $"Analyzers timed out after {window.TotalSeconds:0}s for '{document.Name}' "
+                        + $"({text.Lines.Count} lines, {fast.Length} of {analyzers.Length} analyzers); "
+                        + "showing compiler and syntax diagnostics only.",
+                        key: "analyzer-timeout");
+                    return new AnalyzerRun(ForThisTree(syntaxOnly, model), Failed: true);
+                }
+                catch (Exception ex)
+                {
+                    ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex.Message}", key: "analyzer-failure");
+                    return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
+                }
+            }
 
-                return new AnalyzerRun(ForThisTree(syntax.AddRange(semantic), model), Failed: false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            // The expensive half, on its own clock and its own token. Whatever happens to it, the
+            // cheap half above has already finished and is a real result: it used to share one
+            // budget with this, so a single analyzer registering a SymbolStart or SemanticModel
+            // action could time the whole pass out, mark it Failed, block it from being cached,
+            // and have every code-style squiggle in the file recomputed and lost again on the next
+            // request — for as long as that analyzer stayed in the project.
+            var slowFindings = ImmutableArray<Diagnostic>.Empty;
+            if (!slow.IsEmpty)
             {
-                throw;
+                var slowWindow = SlowBudgetOverrideForTesting ?? BudgetFor(text);
+                using var slowBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                slowBudget.CancelAfter(slowWindow);
+                try
+                {
+                    slowFindings = await SemanticAsync(withAnalyzers, model, slow, memberSpan, slowBudget.Token);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // A keystroke cancels both waves. The caller's token is linked into each
+                    // budget, so this is the same cancellation the cheap half would have seen.
+                    throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    ServiceLog.Warn(
+                        $"Expensive analyzers timed out after {slowWindow.TotalSeconds:0}s for "
+                        + $"'{document.Name}' ({slow.Length} of {analyzers.Length} analyzers); "
+                        + "reporting the rest.",
+                        key: "analyzer-slow-timeout");
+                }
+                catch (Exception ex)
+                {
+                    ServiceLog.Error(
+                        $"Expensive analyzers failed for '{document.Name}': {ex.Message}",
+                        key: "analyzer-slow-failure");
+                }
             }
-            catch (OperationCanceledException)
-            {
-                // The syntax pass is the cheap half and is usually already done when the semantic
-                // half runs out of time. Reporting it beats reporting nothing, and Failed still
-                // keeps the caller from caching this as a clean file.
-                ServiceLog.Warn(
-                    $"Analyzers timed out after {window.TotalSeconds:0}s for '{document.Name}' "
-                    + $"({text.Lines.Count} lines, {analyzers.Length} analyzers); "
-                    + "showing compiler and syntax diagnostics only.",
-                    key: "analyzer-timeout");
-                return new AnalyzerRun(ForThisTree(syntaxOnly, model), Failed: true);
-            }
-            catch (Exception ex)
-            {
-                ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex.Message}", key: "analyzer-failure");
-                return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
-            }
+
+            return new AnalyzerRun(
+                ForThisTree(cheap.AddRange(slowFindings), model), Failed: false, SpanLimitedIds: spanLimited);
         }
         finally
         {
             s_passes.Release();
         }
     }
+
+    private static async Task<ImmutableArray<Diagnostic>> SemanticAsync(
+        CompilationWithAnalyzers driver, SemanticModel model, ImmutableArray<DiagnosticAnalyzer> subset,
+        TextSpan? memberSpan, CancellationToken ct)
+    {
+        if (subset.IsDefaultOrEmpty)
+            return ImmutableArray<Diagnostic>.Empty;
+
+        if (memberSpan is null)
+            return await driver.GetAnalyzerSemanticDiagnosticsAsync(model, null, subset, ct);
+
+        var spanCapable = subset.Where(SupportsSpan).ToImmutableArray();
+        var wholeFile = subset.Where(static a => !SupportsSpan(a)).ToImmutableArray();
+
+        var restricted = spanCapable.IsEmpty
+            ? ImmutableArray<Diagnostic>.Empty
+            : await driver.GetAnalyzerSemanticDiagnosticsAsync(model, memberSpan, spanCapable, ct);
+        var complete = wholeFile.IsEmpty
+            ? ImmutableArray<Diagnostic>.Empty
+            : await driver.GetAnalyzerSemanticDiagnosticsAsync(model, null, wholeFile, ct);
+
+        return restricted.AddRange(complete);
+    }
+
+    private static ImmutableHashSet<string> SpanLimitedIdsOf(ImmutableArray<DiagnosticAnalyzer> analyzers)
+    {
+        var builder = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
+        foreach (var analyzer in analyzers)
+        {
+            if (!SupportsSpan(analyzer))
+                continue;
+            try
+            {
+                foreach (var descriptor in analyzer.SupportedDiagnostics)
+                    builder.Add(descriptor.Id);
+            }
+            catch { /* an analyzer that cannot describe itself is not one we can restrict */ }
+        }
+
+        return builder.ToImmutable();
+    }
+
+    /// <summary>Whether an analyzer promises that a span-restricted semantic pass is complete for
+    /// that span. Unknown analyzers do not, which is the safe answer.</summary>
+    internal static bool SupportsSpan(DiagnosticAnalyzer analyzer)
+    {
+        try { return analyzer.SupportsSpanBasedSemanticDiagnosticAnalysis(); }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Which analyzers get the ordinary budget and which get their own.
+    /// </summary>
+    /// <remarks>
+    /// The shapes Roslyn de-prioritises: a SymbolStart/End pair holds per-symbol state across the
+    /// whole compilation, and a SemanticModel action asks for the file to be fully bound. The
+    /// compiler analyzer is never de-prioritised however it registers. Classification is one
+    /// <c>GetAnalyzerTelemetryInfoAsync</c> call per analyzer — it forces the analyzer's
+    /// <c>Initialize</c>, which the driver is about to do anyway — and is cached on the analyzer
+    /// instance, which is itself cached per project by <see cref="AnalyzerHost"/>.
+    /// </remarks>
+    private static async Task<(ImmutableArray<DiagnosticAnalyzer> Fast, ImmutableArray<DiagnosticAnalyzer> Slow)>
+        BucketsAsync(
+            CompilationWithAnalyzers driver, ImmutableArray<DiagnosticAnalyzer> analyzers,
+            CancellationToken ct)
+    {
+        var fast = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
+        var slow = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
+
+        foreach (var analyzer in analyzers)
+            (await IsExpensiveAsync(driver, analyzer, ct) ? slow : fast).Add(analyzer);
+
+        return (fast.ToImmutable(), slow.ToImmutable());
+    }
+
+    private static readonly ConditionalWeakTable<DiagnosticAnalyzer, StrongBox<bool>> s_cost = new();
+
+    private static async ValueTask<bool> IsExpensiveAsync(
+        CompilationWithAnalyzers driver, DiagnosticAnalyzer analyzer, CancellationToken ct)
+    {
+        if (s_cost.TryGetValue(analyzer, out var known))
+            return known.Value;
+
+        bool expensive;
+        try
+        {
+            if (analyzer.IsCompilerAnalyzer())
+            {
+                expensive = false;
+            }
+            else
+            {
+                var telemetry = await driver.GetAnalyzerTelemetryInfoAsync(analyzer, ct);
+                expensive = telemetry.SymbolStartActionsCount > 0
+                    || telemetry.SymbolEndActionsCount > 0
+                    || telemetry.SemanticModelActionsCount > 0;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Not an answer, and caching it would fix a misclassification for the process lifetime.
+            throw;
+        }
+        catch
+        {
+            // An analyzer that cannot be interrogated keeps the behaviour it had before there were
+            // buckets: the ordinary budget.
+            expensive = false;
+        }
+
+        s_cost.AddOrUpdate(analyzer, new StrongBox<bool>(expensive));
+        return expensive;
+    }
+
+    internal static Task<(ImmutableArray<DiagnosticAnalyzer> Fast, ImmutableArray<DiagnosticAnalyzer> Slow)>
+        BucketsForTesting(
+            CompilationWithAnalyzers driver, ImmutableArray<DiagnosticAnalyzer> analyzers,
+            CancellationToken ct = default) =>
+        BucketsAsync(driver, analyzers, ct);
+
+    internal static bool IsCompilerAnalyzerForTesting(DiagnosticAnalyzer analyzer) =>
+        analyzer.IsCompilerAnalyzer();
+
+    /// <summary>Test seam: the expensive bucket's own window, so a pathological analyzer can be
+    /// timed out without waiting out the real budget.</summary>
+    internal static TimeSpan? SlowBudgetOverrideForTesting { get; set; }
 
     private static ImmutableArray<Diagnostic> ForThisTree(
         ImmutableArray<Diagnostic> diagnostics, SemanticModel model) =>

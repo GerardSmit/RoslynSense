@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Lsp.Completion;
@@ -38,8 +39,8 @@ public sealed record SearchHit(
 /// Two things carry the design. First, tier arithmetic: a match score is turned into
 /// <c>-score - TierUnit * tier</c>, where one tier step outweighs every possible match score, so
 /// "which kind of thing is this" strictly dominates "how well does the name match" without either
-/// being thrown away. Second, names are matched before symbols exist — the predicate handed to
-/// Roslyn runs on declaration names, so only the matches are ever materialised.
+/// being thrown away. Second, names are matched before symbols exist — the corpus is Roslyn's
+/// per-document declaration index, so a search costs a parse at worst and never a compilation.
 /// </remarks>
 public static class SearchEverywhere
 {
@@ -168,60 +169,183 @@ public static class SearchEverywhere
         return byName != 0 ? byName : string.CompareOrdinal(x.FilePath, y.FilePath);
     }
 
+    /// <summary>
+    /// Declarations, matched out of Roslyn's per-document index rather than out of its
+    /// compilations — the corpus NavigateTo searches.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>SymbolFinder.FindSourceDeclarationsAsync</c> read the same names, but it walked projects
+    /// one at a time and built each one's <c>Compilation</c> to do it, then bound a real
+    /// <c>ISymbol</c> for every hit. That is a solution-wide compile inside a keystroke's budget:
+    /// seven seconds cold on a mid-sized solution, and paid again on every character until the
+    /// caches were full. <see cref="TopLevelSyntaxTreeIndex"/> holds the declared names of one
+    /// document, derived from its syntax alone, persisted between sessions, and buildable for one
+    /// document without touching another — so the sweep is a parallel loop over documents that
+    /// never asks for a compilation at all.
+    /// </para>
+    /// <para>
+    /// The price is that a <see cref="DeclaredSymbolInfo"/> is what the parser saw, not what the
+    /// compiler resolved: the kind comes from the declaration's syntax, and the container is the
+    /// qualified name written around it. Nothing here needed more than that — the ranking has
+    /// always run on names.
+    /// </para>
+    /// </remarks>
     private static async Task<IEnumerable<SearchHit>> FindSymbolsAsync(
         Solution solution, SearchQuery request, CancellationToken ct)
     {
+        var documents = new List<Document>();
+        foreach (var project in solution.Projects)
+        {
+            foreach (var document in project.Documents)
+            {
+                // Build output is not a place anyone navigates to, and it is where every SDK
+                // project's generated AssemblyInfo lives. A .DotSettings layer adds whatever the
+                // team excluded on top of that. Asked once per document rather than once per hit,
+                // which is also what keeps the excluded documents from being indexed at all.
+                if (document.FilePath is not { Length: > 0 } path
+                    || SearchFileRules.IsExcluded(path)
+                    || DotSettingsExclusions.IsExcluded(path))
+                {
+                    continue;
+                }
+
+                documents.Add(document);
+            }
+        }
+
+        var perDocument = new ConcurrentBag<List<SearchHit>>();
+
+        await Parallel.ForEachAsync(
+            documents,
+            new ParallelOptions
+            {
+                CancellationToken = ct,
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+            },
+            async (document, token) =>
+            {
+                var hits = await MatchDeclarationsAsync(document, request, token);
+                if (hits.Count > 0)
+                    perDocument.Add(hits);
+            });
+
+        return perDocument.SelectMany(hits => hits);
+    }
+
+    /// <summary>One document's declarations, matched and scored.</summary>
+    private static async Task<List<SearchHit>> MatchDeclarationsAsync(
+        Document document, SearchQuery request, CancellationToken ct)
+    {
+        TopLevelSyntaxTreeIndex? index;
+        try
+        {
+            index = await TopLevelSyntaxTreeIndex.GetIndexAsync(document, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A document that will not parse — a stale generated file, a file the workspace has
+            // since lost — is one missing row, never a failed search.
+            return [];
+        }
+
+        if (index is null)
+            return [];
+
         var matcher = request.NameMatcher;
+        List<(DeclaredSymbolInfo Info, SearchItemKind Kind, MatcherScore Score, int Container)>? matched = null;
 
-        // The predicate sees declaration names, not symbols: everything that fails here costs
-        // nothing beyond the match itself.
-        var symbols = await SymbolFinder.FindSourceDeclarationsAsync(
-            solution, name => matcher.Match(name) is not null, SymbolFilter.TypeAndMember, ct);
-
-        var hits = new List<SearchHit>();
-        foreach (var symbol in symbols)
+        foreach (var info in index.DeclaredSymbolInfos)
         {
             ct.ThrowIfCancellationRequested();
 
-            if (symbol.IsImplicitlyDeclared || matcher.Match(symbol.Name) is not { } match)
+            if (KindOf(info.Kind) is not { } kind)
                 continue;
 
-            string container = ContainerOf(symbol);
-            if (!request.TryScoreContainer(container, out int containerScore))
+            if (kind == SearchItemKind.Type ? !request.IncludesTypes : !request.IncludesMembers)
                 continue;
 
-            bool isType = symbol is INamedTypeSymbol;
-            if (isType ? !request.IncludesTypes : !request.IncludesMembers)
+            if (matcher.Match(info.Name) is not { } match)
                 continue;
 
-            int tier = Tier(symbol, isType, match.Score);
-
-            var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
-            if (location is null || location.SourceTree?.FilePath is not { Length: > 0 } path)
+            if (!request.TryScoreContainer(info.FullyQualifiedContainerName, out int containerScore))
                 continue;
 
-            // Build output is not a place anyone navigates to, and it is where every SDK
-            // project's generated AssemblyInfo lives. A .DotSettings layer adds whatever the team
-            // excluded on top of that.
-            if (SearchFileRules.IsExcluded(path) || DotSettingsExclusions.IsExcluded(path))
+            (matched ??= []).Add((info, kind, match.Score, containerScore));
+        }
+
+        if (matched is null)
+            return [];
+
+        // Only a document that matched something pays for its text. The index stores spans as
+        // offsets, and a line-and-column is what a client can open.
+        var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+        string path = document.FilePath!;
+        bool isGenerated = SearchFileRules.IsGenerated(path);
+
+        var hits = new List<SearchHit>(matched.Count);
+        foreach (var (info, kind, score, containerScore) in matched)
+        {
+            // An index restored from disk can outlive the text it described by a moment; a span
+            // past the end of the file would throw rather than merely point somewhere odd.
+            if (info.Span.End > text.Length)
                 continue;
 
-            var span = location.GetLineSpan();
+            var span = text.Lines.GetLinePositionSpan(info.Span);
+            string container = info.FullyQualifiedContainerName;
+
             hits.Add(new SearchHit(
-                isType ? SearchItemKind.Type : SearchItemKind.Member,
-                symbol.Name,
+                kind,
+                info.Name,
                 container.Length == 0 ? null : container,
                 path,
-                span.StartLinePosition.Line,
-                span.StartLinePosition.Character,
-                span.EndLinePosition.Line,
-                span.EndLinePosition.Character,
-                LspConverters.ToLspSymbolKind(symbol),
-                Score(match.Score, tier, containerScore, SearchFileRules.IsGenerated(path))));
+                span.Start.Line,
+                span.Start.Character,
+                span.End.Line,
+                span.End.Character,
+                ToLspSymbolKind(info.Kind),
+                Score(score, Tier(info.Kind, kind, score), containerScore, isGenerated)));
         }
 
         return hits;
     }
+
+    /// <summary>
+    /// Which of the two symbol rows a declaration is, or null for the kinds Search Everywhere
+    /// never offers — a namespace is not something anyone navigates to by name.
+    /// </summary>
+    private static SearchItemKind? KindOf(DeclaredSymbolInfoKind kind) => kind switch
+    {
+        DeclaredSymbolInfoKind.Namespace => null,
+        DeclaredSymbolInfoKind.Class
+            or DeclaredSymbolInfoKind.Delegate
+            or DeclaredSymbolInfoKind.Enum
+            or DeclaredSymbolInfoKind.Interface
+            or DeclaredSymbolInfoKind.Module
+            or DeclaredSymbolInfoKind.Record
+            or DeclaredSymbolInfoKind.RecordStruct
+            or DeclaredSymbolInfoKind.Struct
+            or DeclaredSymbolInfoKind.Union => SearchItemKind.Type,
+        _ => SearchItemKind.Member,
+    };
+
+    private static int ToLspSymbolKind(DeclaredSymbolInfoKind kind) => kind switch
+    {
+        DeclaredSymbolInfoKind.Interface => LspSymbolKind.Interface,
+        DeclaredSymbolInfoKind.Struct or DeclaredSymbolInfoKind.RecordStruct => LspSymbolKind.Struct,
+        DeclaredSymbolInfoKind.Enum => LspSymbolKind.Enum,
+        DeclaredSymbolInfoKind.Delegate => LspSymbolKind.Function,
+        DeclaredSymbolInfoKind.Constructor => LspSymbolKind.Constructor,
+        DeclaredSymbolInfoKind.Method
+            or DeclaredSymbolInfoKind.ExtensionMethod
+            or DeclaredSymbolInfoKind.Operator => LspSymbolKind.Method,
+        DeclaredSymbolInfoKind.Property or DeclaredSymbolInfoKind.Indexer => LspSymbolKind.Property,
+        DeclaredSymbolInfoKind.EnumMember => LspSymbolKind.EnumMember,
+        DeclaredSymbolInfoKind.Constant => LspSymbolKind.Constant,
+        DeclaredSymbolInfoKind.Field => LspSymbolKind.Field,
+        DeclaredSymbolInfoKind.Event => LspSymbolKind.Event,
+        _ => LspSymbolKind.Class,
+    };
 
     /// <summary>
     /// Files come from the directory index rather than from the compilation: a <c>.proto</c>, a
@@ -326,9 +450,9 @@ public static class SearchEverywhere
     }
 
     /// <summary>What kind of answer this is, ranked — see the tier constants for why.</summary>
-    private static int Tier(ISymbol symbol, bool isType, MatcherScore score)
+    private static int Tier(DeclaredSymbolInfoKind kind, SearchItemKind item, MatcherScore score)
     {
-        if (isType)
+        if (item == SearchItemKind.Type)
         {
             if (score.IsExactMatch())
                 return TierExactType;
@@ -336,14 +460,12 @@ public static class SearchEverywhere
             return score.IsWholeWordMatch() ? TierWholeWordType : TierType;
         }
 
-        // Constructors are reached by their type's name, which is the better answer anyway, and an
-        // accessor is not a place anyone navigates to — the property it belongs to is.
-        bool isMethod = symbol is IMethodSymbol
-        {
-            MethodKind: MethodKind.Ordinary
-                or MethodKind.LocalFunction
-                or MethodKind.UserDefinedOperator,
-        };
+        // Constructors are reached by their type's name, which is the better answer anyway — they
+        // carry that name, so leaving them out of the method tier keeps the type ahead of them.
+        bool isMethod = kind
+            is DeclaredSymbolInfoKind.Method
+            or DeclaredSymbolInfoKind.ExtensionMethod
+            or DeclaredSymbolInfoKind.Operator;
 
         if (score.IsExactMatch())
             return isMethod ? TierExactMethod : TierExactMember;
@@ -358,10 +480,6 @@ public static class SearchEverywhere
     /// </summary>
     private static int Score(MatcherScore nameScore, int tier, int containerScore, bool isGenerated) =>
         -(int)nameScore - TierUnit * tier + containerScore + (isGenerated ? GeneratedPenalty : 0);
-
-    private static string ContainerOf(ISymbol symbol) =>
-        symbol.ContainingType?.ToDisplayString()
-        ?? (symbol.ContainingNamespace is { IsGlobalNamespace: false } ns ? ns.ToDisplayString() : "");
 
     /// <summary>
     /// A parsed query: an optional kind filter, the container words, and the last word — the one

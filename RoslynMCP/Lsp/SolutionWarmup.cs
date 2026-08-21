@@ -145,8 +145,19 @@ internal static class SolutionWarmup
 
     private static Task s_warmedSymbols = Task.CompletedTask;
 
+    /// <summary>How many index builds run at once. Two to three is the band the report names: high
+    /// enough that a sweep of thousands of documents is not one core's worth of work, low enough
+    /// that a keystroke arriving mid-sweep still finds a free core to be answered on.</summary>
+    private const int IndexConcurrency = 3;
+
+    /// <summary>The pause taken between two projects' compilations. Long enough that queued
+    /// request work reaches a thread before the next multi-hundred-millisecond compile starts,
+    /// short enough that eighteen of them are lost in the noise of the compiles themselves.</summary>
+    private static readonly TimeSpan Breath = TimeSpan.FromMilliseconds(10);
+
     /// <summary>
-    /// Builds the two caches every solution-wide search reads, so the first Ctrl+T does not.
+    /// Builds the caches every solution-wide gesture reads, so the first Ctrl+T, Shift+F12 and
+    /// Ctrl+F12 do not.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -164,33 +175,72 @@ internal static class SolutionWarmup
     /// same area only decides what a completed search returns.
     /// </para>
     /// <para>
-    /// Uncancellable and unawaited, both on purpose. Cancellable would defeat the point, since the
-    /// keystroke that cancels it is the one that needed it. Unawaited because blocking the first
-    /// search until this finishes would trade a slow answer for no answer at all: a query that
-    /// races it pays what it would have paid anyway, and Roslyn's own async caches mean the two
-    /// never build the same thing twice.
+    /// Three things decide the shape of the pass. <b>Order:</b> the project the user has files open
+    /// in goes first (<see cref="WarmOrder"/>), because every other project's turn is time that
+    /// project spends cold — and a cold project is worse than merely slow now that semantics are
+    /// served from frozen snapshots, since freezing a project that was never built yields a
+    /// near-empty compilation rather than a slow one. <b>Coverage:</b> the declaration sweep at the
+    /// end builds only the top-level index; find-references narrows through the *other* per-document
+    /// index and go-to-implementation builds a <see cref="SymbolTreeInfo"/> per metadata reference,
+    /// so both are swept here or the first of each gesture pays for them inside the user's wait.
+    /// <b>Position:</b> the index sweep runs before the compilations, because indexes need only
+    /// text checksums — on a session with a warm on-disk store it is nearly free, and it is the
+    /// half that the gestures block on hardest.
+    /// </para>
+    /// <para>
+    /// Throttled throughout — bounded concurrency over the sweep, a pause between compilations —
+    /// so the background pass never holds every core against the request that arrives while it
+    /// runs. That is the cost the reorder buys back: more work happens earlier, so it has to be
+    /// work the foreground can interrupt.
+    /// </para>
+    /// <para>
+    /// Unawaited on purpose: blocking the first search until this finishes would trade a slow answer
+    /// for no answer at all — a query that races it pays what it would have paid anyway, and
+    /// Roslyn's own async caches mean the two never build the same thing twice. Cancellable only by
+    /// shutdown, for the same reason: the keystroke that would cancel it is the one that needed it.
     /// </para>
     /// </remarks>
-    private static async Task WarmSymbolsAsync()
+    private static Task WarmSymbolsAsync() => WarmSymbolsAsync(CancellationToken.None);
+
+    /// <summary>Test seam: the warm pass, with a token a test can stop the sweep with.</summary>
+    internal static async Task WarmSymbolsAsync(CancellationToken ct)
     {
         try
         {
             if (WorkspaceService.TryGetMostRecentSolution() is not { } solution)
                 return;
 
-            foreach (var project in solution.Projects)
+            var order = WarmOrder(solution);
+
+            // Before the compilations: see the remarks. Cheap where storage is warm, and the
+            // gestures that block on it block on nothing else.
+            await SweepIndexesAsync(solution, order, ct);
+
+            foreach (var project in order)
             {
-                await project.GetCompilationAsync(CancellationToken.None);
+                ct.ThrowIfCancellationRequested();
+
+                await project.GetCompilationAsync(ct);
 
                 // With the compilation in hand this is just the type walk — build each project's
                 // import-completion index now, so the first Ctrl+Space anywhere in the solution
                 // gets unimported types without having to wait for (or miss) them.
                 ImportCompletionWarmer.Queue(project);
+
+                // Hand the pool back between projects, so a burst of keystrokes that arrives
+                // mid-warm is dispatched rather than queued behind the next compilation.
+                await Task.Delay(Breath, ct);
             }
 
-            // A predicate that is never true: this materialises no symbol and builds every index.
-            await SymbolFinder.FindSourceDeclarationsAsync(
-                solution, _ => false, SymbolFilter.TypeAndMember, CancellationToken.None);
+            // The never-true-predicate FindSourceDeclarationsAsync that used to sit here primed
+            // the declaration search Search Everywhere ran on. That search now reads
+            // TopLevelSyntaxTreeIndex directly — built by the index sweep above, before the
+            // compilation loop — so the call had nothing left to warm.
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown, or a test stopping the sweep. Nothing to report: a warm that did not
+            // finish leaves exactly the cold-but-correct state it started from.
         }
         catch (Exception ex)
         {
@@ -200,6 +250,129 @@ internal static class SolutionWarmup
                 $"Could not warm the symbol index: {ex.Message}. Searches will warm it themselves.",
                 key: "solution-warmup:symbols");
         }
+    }
+
+    /// <summary>
+    /// The projects of <paramref name="solution"/>, those holding a document the editor has open
+    /// first, solution order preserved within each group.
+    /// </summary>
+    /// <remarks>
+    /// Warm-up work is never wasted no matter what order it happens in — Roslyn advances tracker
+    /// state in place and shares it by reference across forks — so this is purely about who waits.
+    /// Whatever the user is looking at is what the next request will be about, and until its turn
+    /// comes that project answers from an unbuilt compilation.
+    /// </remarks>
+    internal static IReadOnlyList<Project> WarmOrder(Solution solution)
+    {
+        var open = OpenDocumentStore.OpenPaths();
+        if (open.Count == 0)
+            return solution.Projects.ToList();
+
+        var openPaths = new HashSet<string>(open, StringComparer.OrdinalIgnoreCase);
+
+        var edited = new List<Project>();
+        var rest = new List<Project>();
+
+        foreach (var project in solution.Projects)
+            (HoldsAnOpenDocument(project, openPaths) ? edited : rest).Add(project);
+
+        edited.AddRange(rest);
+        return edited;
+    }
+
+    /// <remarks>
+    /// Additional documents count: an open .aspx or .razor is edited through the project that lists
+    /// it just as much as an open .cs is, and it is the same project whose compilation the request
+    /// about it will need.
+    /// </remarks>
+    private static bool HoldsAnOpenDocument(Project project, HashSet<string> openPaths)
+    {
+        foreach (var document in project.Documents)
+        {
+            if (document.FilePath is { Length: > 0 } path
+                && openPaths.Contains(PathHelper.NormalizePath(path)))
+            {
+                return true;
+            }
+        }
+
+        foreach (var document in project.AdditionalDocuments)
+        {
+            if (document.FilePath is { Length: > 0 } path
+                && openPaths.Contains(PathHelper.NormalizePath(path)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Builds the per-document syntax indexes and the per-metadata-reference symbol trees, at
+    /// <see cref="IndexConcurrency"/> at a time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two indexes per document, not one. The declaration sweep this warm ends with populates the
+    /// top-level index only — the names a search box matches. Find-references narrows candidate
+    /// documents through the full <see cref="SyntaxTreeIndex"/> (does this file mention this
+    /// identifier at all), which is a different table over the same tree, so a first Shift+F12 on a
+    /// solution warmed without it still parses every document before it can start searching.
+    /// </para>
+    /// <para>
+    /// Metadata references are swept per distinct file, not per project: a reference to the same
+    /// assembly from thirty projects is one <see cref="SymbolTreeInfo"/>, and building it thirty
+    /// times would be the sweep's whole cost. These are what go-to-implementation builds on first
+    /// use when it looks for types outside the source it can see.
+    /// </para>
+    /// </remarks>
+    /// <param name="swept">
+    /// Test seam, called once per indexed document. A counter the caller owns rather than one this
+    /// class keeps, so that a test measuring a sweep is not also measuring whatever background warm
+    /// an earlier test left running.
+    /// </param>
+    internal static async Task SweepIndexesAsync(
+        Solution solution, IReadOnlyList<Project> order, CancellationToken ct, Action? swept = null)
+    {
+        var documents = new List<Document>();
+        var references = new List<PortableExecutableReference>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var project in order)
+        {
+            if (!project.SupportsCompilation)
+                continue;
+
+            documents.AddRange(project.Documents);
+
+            foreach (var reference in project.MetadataReferences.OfType<PortableExecutableReference>())
+            {
+                if (reference.FilePath is { Length: > 0 } path && seen.Add(path))
+                    references.Add(reference);
+            }
+        }
+
+        var options = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = IndexConcurrency,
+            CancellationToken = ct,
+        };
+
+        await Parallel.ForEachAsync(documents, options, async (document, token) =>
+        {
+            await SyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
+            await TopLevelSyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
+            swept?.Invoke();
+        });
+
+        await Parallel.ForEachAsync(references, options, async (reference, token) =>
+        {
+            var checksum = SymbolTreeInfo.GetMetadataChecksum(solution.Services, reference, token);
+            await SymbolTreeInfo
+                .GetInfoForMetadataReferenceAsync(solution, reference, checksum, token)
+                .ConfigureAwait(false);
+        });
     }
 
     /// <summary>Test seam: the background symbol warm, which nothing in the server awaits.</summary>

@@ -676,6 +676,12 @@ public class CompletionRankingTests
             .SymbolComputer.UpdateCacheAsync(warmDocument.Project, default);
 
         OpenDocumentStore.Open(sessionId, path, text, version: 1);
+
+        // Import completion is a second, background pass that a live request merges only if it
+        // lands inside the grace window. These tests are about what the list contains, not about
+        // that race, so the window is widened to "however long it takes".
+        var previousGrace = ExpandedCompletionPass.GraceWindow;
+        ExpandedCompletionPass.GraceWindow = TimeSpan.FromSeconds(30);
         try
         {
             int offset = source.IndexOf(anchor, StringComparison.Ordinal) + anchor.Length;
@@ -694,6 +700,7 @@ public class CompletionRankingTests
         }
         finally
         {
+            ExpandedCompletionPass.GraceWindow = previousGrace;
             OpenDocumentStore.Close(sessionId, path);
             // The close-reconcile runs on a background task; a later test resolving this file
             // against its on-disk text must not race the overlay still being peeled off.

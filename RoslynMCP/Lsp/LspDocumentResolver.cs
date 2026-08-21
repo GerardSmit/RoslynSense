@@ -19,6 +19,11 @@ internal static class LspDocumentResolver
         if (filePath.StartsWith(Handlers.VirtualDocumentHandler.GeneratedScheme + ":", StringComparison.Ordinal))
             return await ResolveGeneratedAsync(filePath, ct);
 
+        // A request that races the keystroke's buffer reconcile would fork an overlay off the
+        // stale base and build semantics the reconcile immediately orphans. Briefly meeting it
+        // here lets completion → signature help → tokens for one version share one snapshot.
+        await WorkspaceService.AwaitPendingReconcileAsync(filePath, ct);
+
         // One call, where this used to make two: find the owning project, then open that same
         // project again to take the document out of it. Every language feature starts here — hover,
         // completion, signature help, semantic tokens, folding, inlay hints, code lens, formatting,

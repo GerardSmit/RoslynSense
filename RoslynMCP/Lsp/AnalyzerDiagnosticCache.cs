@@ -1,10 +1,332 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.LanguageService;
+using Microsoft.CodeAnalysis.Shared.Extensions;
+using Microsoft.CodeAnalysis.SolutionCrawler;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
 
 namespace RoslynMCP.Lsp;
+
+/// <summary>
+/// The typing-loop shortcut both diagnostic caches share: when one keystroke changed the inside of
+/// exactly one method-level member, re-analyse that member's span and splice the findings into what
+/// the previous version said, instead of re-analysing the whole file.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This is Roslyn's <c>IncrementalMemberEditAnalyzer</c>. The diff comes from the same place —
+/// <see cref="IDocumentDifferenceService.GetChangedMemberAsync"/>, which returns null for anything
+/// that is not a single body-level edit, signature changes included — and the compiler's span is
+/// widened the same way, to the containing method-level declarations of both ends.
+/// </para>
+/// <para>
+/// The previous document is held weakly. A <see cref="Document"/> roots its whole
+/// <see cref="Solution"/> and every compilation hanging off it, and the point of this cache is to
+/// hold less work, not more memory; if the edit before last has already been collected the pass
+/// simply falls back to the whole file.
+/// </para>
+/// </remarks>
+internal static class MemberEditAnalysis
+{
+    /// <summary>Off switch, for tests that need the whole-file answer to compare against.</summary>
+    internal static bool Enabled { get; set; } = true;
+
+    /// <summary>Splices performed. The only outward difference between an incremental pass and a
+    /// full one is meant to be its cost, so nothing else can observe which ran.</summary>
+    internal static long Splices => Interlocked.Read(ref s_splices);
+
+    internal static void ResetCounters() => Interlocked.Exchange(ref s_splices, 0);
+
+    private static long s_splices;
+
+    private sealed record Seen(string Version, WeakReference<Document> Document);
+
+    private sealed record Slot(Seen? Previous, Seen Current);
+
+    private static readonly ConcurrentDictionary<DocumentId, Slot> s_seen = new();
+
+    /// <summary>
+    /// Records the version a pass is about to compute, rotating the one before it into the
+    /// previous slot.
+    /// </summary>
+    /// <remarks>
+    /// Two slots rather than one because two caches compute the same version one after the other:
+    /// the compiler pass arrives at V2 first and would, with a single slot, overwrite the V1
+    /// document that the analyzer pass behind it still needs to diff against. Rotation is keyed on
+    /// the version, so the second caller of a version changes nothing.
+    /// </remarks>
+    public static void Observe(Document document, string? version)
+    {
+        if (version is null)
+            return;
+
+        s_seen.AddOrUpdate(
+            document.Id,
+            static (_, state) => new Slot(null, new Seen(state.Version, new WeakReference<Document>(state.Document))),
+            static (_, slot, state) => slot.Current.Version == state.Version
+                ? slot
+                : new Slot(slot.Current, new Seen(state.Version, new WeakReference<Document>(state.Document))),
+            (Version: version, Document: document));
+    }
+
+    public static void Forget(DocumentId documentId) => s_seen.TryRemove(documentId, out _);
+
+    public static void Clear()
+    {
+        s_seen.Clear();
+        ResetCounters();
+    }
+
+    /// <summary>What one keystroke changed, when it changed one member's body and nothing else.</summary>
+    /// <param name="BaseVersion">The version the previous whole-file result was computed for — a
+    /// caller may only splice into a cache entry stamped with exactly this.</param>
+    /// <param name="MemberSpan">The changed member's full span, in the new document's coordinates.</param>
+    /// <param name="CompilerSpan">The same, widened the way Roslyn widens it for the compiler.</param>
+    /// <param name="Change">The edit, in the <em>previous</em> document's coordinates — what prior
+    /// spans have to be mapped through.</param>
+    internal sealed record MemberEdit(
+        string BaseVersion,
+        SyntaxTree Tree,
+        TextSpan MemberSpan,
+        TextSpan CompilerSpan,
+        TextChangeRange Change);
+
+    /// <summary>
+    /// The edit to analyse incrementally, or null when this pass has to look at the whole file.
+    /// </summary>
+    /// <remarks>
+    /// Every condition here is a way for the splice to be unsound rather than merely unhelpful, so
+    /// each one falls back rather than approximating:
+    /// the previous document is gone; the semantic half of the version moved, which is exactly what
+    /// a signature or any other top-level change does; the text moved in more than one place;
+    /// the differ says no single member owns the change; or the edit reaches outside the member it
+    /// was attributed to.
+    /// </remarks>
+    public static async Task<MemberEdit?> TryComputeAsync(
+        Document document, string version, CancellationToken ct)
+    {
+        if (!Enabled)
+            return null;
+
+        if (!s_seen.TryGetValue(document.Id, out var slot)
+            || slot.Current.Version != version
+            || slot.Previous is not { } previous
+            || !previous.Document.TryGetTarget(out var old))
+            return null;
+
+        // "textChecksum:dependentSemanticVersion". Requiring the semantic half to stand still is
+        // both the same-world guard and the signature-edit fallback: a changed declaration moves
+        // the project's dependent semantic version, and every other file's cached result with it.
+        if (!SameSemantics(previous.Version, version))
+            return null;
+
+        try
+        {
+            var oldText = await old.GetTextAsync(ct);
+            var newText = await document.GetTextAsync(ct);
+
+            var ranges = newText.GetChangeRanges(oldText);
+            if (ranges.Count != 1)
+                return null;
+            var change = ranges[0];
+
+            if (document.GetLanguageService<IDocumentDifferenceService>() is not { } differ)
+                return null;
+
+            var member = await differ.GetChangedMemberAsync(old, document, ct);
+            if (member is null)
+                return null;
+
+            var root = await document.GetSyntaxRootAsync(ct);
+            if (root is null || member.SyntaxTree != root.SyntaxTree)
+                return null;
+
+            var memberSpan = member.FullSpan;
+
+            // The edit has to live inside the member the differ named, or prior findings between
+            // the two would be mapped through a delta that does not describe them.
+            if (!memberSpan.Contains(new TextSpan(change.Span.Start, change.NewLength)))
+                return null;
+
+            return new MemberEdit(
+                previous.Version,
+                root.SyntaxTree,
+                memberSpan,
+                AdjustForCompiler(document, root, memberSpan),
+                change);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// The compiler reports at locations outside the span it was given — an unused parameter is
+    /// flagged at the declaration, not in the body — so its span is grown to the containing
+    /// method-level declarations of both ends, exactly as
+    /// <c>DocumentAnalysisExecutor.GetAdjustedSpanForCompilerAnalyzerAsync</c> does.
+    /// </summary>
+    private static TextSpan AdjustForCompiler(Document document, SyntaxNode root, TextSpan span)
+    {
+        if (document.GetLanguageService<ISyntaxFactsService>() is not { } facts)
+            return span;
+
+        var startNode = facts.GetContainingMemberDeclaration(root, span.Start, useFullSpan: true);
+        var endNode = facts.GetContainingMemberDeclaration(root, span.End, useFullSpan: true);
+        if (startNode is null || endNode is null)
+            return span;
+
+        if (startNode == endNode)
+            return facts.IsMethodLevelMember(startNode) ? startNode.FullSpan : span;
+
+        var startSpan = facts.IsMethodLevelMember(startNode) ? startNode.FullSpan : span;
+        var endSpan = facts.IsMethodLevelMember(endNode) ? endNode.FullSpan : span;
+        return TextSpan.FromBounds(
+            Math.Min(startSpan.Start, endSpan.Start), Math.Max(startSpan.End, endSpan.End));
+    }
+
+    private static bool SameSemantics(string a, string b)
+    {
+        int i = a.IndexOf(':');
+        int j = b.IndexOf(':');
+        return i >= 0 && j >= 0 && a.AsSpan(i).SequenceEqual(b.AsSpan(j));
+    }
+
+    /// <summary>
+    /// Where a span from the previous version lands in this one, or null when the edit went
+    /// through it and it no longer describes anything.
+    /// </summary>
+    public static TextSpan? Map(TextSpan span, TextChangeRange change)
+    {
+        if (span.End <= change.Span.Start)
+            return span;
+        if (span.Start >= change.Span.End)
+            return new TextSpan(span.Start + change.NewLength - change.Span.Length, span.Length);
+        return null;
+    }
+
+    /// <summary>
+    /// The previous whole-file result, brought forward over the edit, with everything the fresh
+    /// pass is authoritative about removed and the fresh findings put in its place.
+    /// </summary>
+    /// <param name="analyzedSpan">What the fresh pass actually looked at.</param>
+    /// <param name="spanLimited">Whether the fresh pass only speaks for <paramref name="analyzedSpan"/>
+    /// on this id. False means it examined the whole file and its answer is complete.</param>
+    public static ImmutableArray<Diagnostic> Splice(
+        ImmutableArray<Diagnostic> previous,
+        ImmutableArray<Diagnostic> fresh,
+        MemberEdit edit,
+        TextSpan analyzedSpan,
+        Func<string, bool> spanLimited)
+    {
+        Interlocked.Increment(ref s_splices);
+
+        var seen = new HashSet<(string, TextSpan)>();
+        var result = ImmutableArray.CreateBuilder<Diagnostic>(fresh.Length + previous.Length);
+
+        foreach (var diagnostic in fresh)
+        {
+            if (seen.Add((diagnostic.Id, diagnostic.Location.SourceSpan)))
+                result.Add(diagnostic);
+        }
+
+        foreach (var diagnostic in previous)
+        {
+            if (!diagnostic.Location.IsInSource)
+                continue;
+            if (Map(diagnostic.Location.SourceSpan, edit.Change) is not { } mapped)
+                continue;
+
+            // Never reported under a span at all — the compiler does not look at using directives
+            // when it is given one — so the only place these can come from is the last whole-file
+            // result. Without this the greying of an unused using blinked out on every keystroke
+            // and came back on the next full pass.
+            bool alwaysCarried = s_wholeFileOnlyIds.Contains(diagnostic.Id);
+
+            if (!alwaysCarried)
+            {
+                // The fresh pass covered the whole file for this id, so it has already said
+                // everything there is to say about it.
+                if (!spanLimited(diagnostic.Id))
+                    continue;
+
+                // Inside what was re-analysed: the fresh answer replaces this one, including by
+                // being absent, which is how a fixed warning disappears.
+                if (analyzedSpan.IntersectsWith(mapped))
+                    continue;
+            }
+
+            if (seen.Add((diagnostic.Id, mapped)))
+                result.Add(Relocate(diagnostic, mapped, edit));
+        }
+
+        return result.ToImmutable();
+    }
+
+    /// <summary>Ids no span-restricted pass can produce, whoever asked for the span.</summary>
+    private static readonly ImmutableHashSet<string> s_wholeFileOnlyIds =
+        ImmutableHashSet.Create(StringComparer.Ordinal, "CS8019", "IDE0005");
+
+    /// <summary>
+    /// The same finding, at the span the edit moved it to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Rebuilt rather than relocated: <c>Diagnostic.WithLocation</c> is internal to the
+    /// compiler layer, and the public factory that takes an already-rendered message is the only
+    /// way to carry one across trees without the arguments it was formatted from. Everything the
+    /// LSP shape reads — id, category, severity, warning level, custom tags, properties, the
+    /// message itself — is passed through; what is lost is the descriptor's identity, which
+    /// nothing downstream compares by reference.
+    /// </para>
+    /// <para>
+    /// The additional locations move with it. They are what a code fix uses to find the rest of
+    /// what it has to change — the other half of a redundant cast, the declaration behind an unused
+    /// value — so dropping them would leave the squiggle in the right place and its fix pointing
+    /// at the wrong one.
+    /// </para>
+    /// </remarks>
+    private static Diagnostic Relocate(Diagnostic diagnostic, TextSpan span, MemberEdit edit)
+    {
+        var descriptor = diagnostic.Descriptor;
+        return Diagnostic.Create(
+            diagnostic.Id,
+            descriptor.Category,
+            diagnostic.GetMessage(),
+            diagnostic.Severity,
+            diagnostic.DefaultSeverity,
+            descriptor.IsEnabledByDefault,
+            diagnostic.WarningLevel,
+            diagnostic.IsSuppressed,
+            descriptor.Title,
+            descriptor.Description,
+            descriptor.HelpLinkUri,
+            Location.Create(edit.Tree, span),
+            RelocateAll(diagnostic.AdditionalLocations, edit),
+            customTags: descriptor.CustomTags,
+            properties: diagnostic.Properties);
+    }
+
+    private static IEnumerable<Location>? RelocateAll(
+        IReadOnlyList<Location> locations, MemberEdit edit)
+    {
+        if (locations.Count == 0)
+            return null;
+
+        var moved = new List<Location>(locations.Count);
+        foreach (var location in locations)
+        {
+            if (!location.IsInSource)
+                moved.Add(location);
+            else if (Map(location.SourceSpan, edit.Change) is { } mapped)
+                moved.Add(Location.Create(edit.Tree, mapped));
+        }
+
+        return moved;
+    }
+}
 
 /// <summary>
 /// Caches analyzer diagnostics per document version so the expensive pass runs once per edit
@@ -215,7 +537,7 @@ internal static class AnalyzerDiagnosticCache
         // analysed as first and making every later pass run and be thrown away.
         long observed = s_entries.TryGetValue(document.Id, out var before) ? before.Written : long.MinValue;
 
-        var run = await AnalyzerService.RunDocumentAnalyzersWithStatusAsync(document, ct);
+        var run = await RunAsync(document, version, ct);
 
         // A run that gave up is not a result. Storing it would say "this version is analysed and
         // clean", so nothing would ever look at the file again.
@@ -260,6 +582,43 @@ internal static class AnalyzerDiagnosticCache
         return run.Diagnostics;
     }
 
+    /// <summary>
+    /// One member's span when that is all that changed, the whole file otherwise.
+    /// </summary>
+    /// <remarks>
+    /// The splice needs two things to agree: an edit the differ can attribute to a single member,
+    /// and a cached result computed for exactly the version that edit started from. The second is
+    /// checked here rather than inside <see cref="MemberEditAnalysis"/> because each cache has its
+    /// own entry and they can be a version apart — the compiler half is computed on the fast push
+    /// phase and this one ~1500ms later, and a document closed and reopened in between has one and
+    /// not the other.
+    /// </remarks>
+    private static async Task<AnalyzerService.AnalyzerRun> RunAsync(
+        Document document, string version, CancellationToken ct)
+    {
+        MemberEditAnalysis.Observe(document, version);
+
+        if (await MemberEditAnalysis.TryComputeAsync(document, version, ct) is not { } edit
+            || !s_entries.TryGetValue(document.Id, out var prior)
+            || prior.Version != edit.BaseVersion)
+        {
+            return await AnalyzerService.RunDocumentAnalyzersWithStatusAsync(document, ct);
+        }
+
+        var run = await AnalyzerService.RunMemberSpanAnalyzersAsync(document, edit.MemberSpan, ct);
+
+        // A pass that gave up has nothing to splice; a whole-file result (no restricted subset)
+        // needs no splicing. Both go back as they are.
+        if (run.Failed || run.SpanLimitedIds is not { } spanLimited)
+            return run;
+
+        return run with
+        {
+            Diagnostics = MemberEditAnalysis.Splice(
+                prior.Diagnostics, run.Diagnostics, edit, edit.MemberSpan, spanLimited.Contains),
+        };
+    }
+
     // Both of these forward to CompilerDiagnosticCache, which holds the other half of the same
     // document's diagnostics under the same key. Every caller that drops one wants both dropped —
     // a removed document, a reloaded project, an .editorconfig edit that re-severities compiler
@@ -270,6 +629,7 @@ internal static class AnalyzerDiagnosticCache
     {
         s_entries.TryRemove(documentId, out _);
         s_latestRequested.TryRemove(documentId, out _);
+        MemberEditAnalysis.Forget(documentId);
         CompilerDiagnosticCache.Evict(documentId);
     }
 
@@ -279,6 +639,7 @@ internal static class AnalyzerDiagnosticCache
         s_entries.Clear();
         s_inFlight.Clear();
         s_latestRequested.Clear();
+        MemberEditAnalysis.Clear();
         CompilerDiagnosticCache.Clear();
     }
 
@@ -302,6 +663,7 @@ internal static class AnalyzerDiagnosticCache
             // overwrite the newer, which is the squiggle flicker the Stamp/Written split exists to
             // prevent. A key reached by this loop belongs to a cold document by construction.
             s_latestRequested.TryRemove(stale.Key, out _);
+            MemberEditAnalysis.Forget(stale.Key);
         }
     }
 }

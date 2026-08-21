@@ -161,7 +161,7 @@ internal static class SymbolHandlers
     /// The packs are not an either/or here the way a document request is: a query matches
     /// whatever it matches, and a control <c>ID</c> declared in an <c>.aspx</c> is as much a
     /// thing the user is looking for as a field declared in a <c>.cs</c>. Roslyn's declaration
-    /// search only ever sees its own compilations, so without this the markup half of a WebForms
+    /// index only ever covers its own documents, so without this the markup half of a WebForms
     /// solution is invisible to Ctrl+T.
     /// </remarks>
     public static async Task<SymbolInformation[]> WorkspaceSymbolsAsync(
@@ -170,8 +170,11 @@ internal static class SymbolHandlers
         if (string.IsNullOrWhiteSpace(p.Query))
             return Array.Empty<SymbolInformation>();
 
-        // Same reason as roslynSense/searchEverywhere: answering out of a half-loaded solution
-        // looks like a missing symbol rather than an unfinished load. See SolutionWarmup.
+        // What is waited for is the projects entering the workspace, not their compilations: the
+        // search reads Roslyn's per-document declaration index and never asks for a Compilation,
+        // so the expensive half of the warm is no longer on this path. A project that is not in
+        // the workspace at all, though, has no documents to index, and answering out of a
+        // half-loaded solution looks like a missing symbol rather than an unfinished load.
         await SolutionWarmup.WaitAsync(ct);
 
         var solution = WorkspaceService.TryGetMostRecentSolution();

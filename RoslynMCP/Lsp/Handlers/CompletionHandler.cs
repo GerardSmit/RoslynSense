@@ -21,6 +21,11 @@ namespace RoslynMCP.Lsp.Handlers;
 ///   and collapse the list to locals/keywords. (The public WithFrozenPartialSemantics is a
 ///   no-op outside editor hosts — see FrozenSemantics.)
 ///
+/// The list is assembled in two passes, as VS assembles it: the non-expanded providers are awaited
+/// and answered, while the import-completion providers run in the background and merge into this
+/// response if they finish in time and into the next one otherwise
+/// (see <see cref="RoslynMCP.Lsp.Completion.ExpandedCompletionPass"/>).
+///
 /// Roslyn decides <em>what</em> is in scope; ordering is ours (see
 /// <see cref="RoslynMCP.Lsp.Completion.CompletionRanker"/>): a CamelHumps match feeds a 64-bit
 /// relevance word whose bit order is the ranking, so locals beat members beat types, obsolete
@@ -52,6 +57,20 @@ internal static class CompletionHandler
         // LSPSnippetKey, so a committed snippet loses its placeholders anyway. Off, the same
         // choice Roslyn's LSP makes for non-VS clients.
         SnippetsBehavior = SnippetsRule.NeverInclude,
+    };
+
+    /// <summary>What the request itself computes and shows: everything except the import-completion
+    /// providers.</summary>
+    private static readonly RoslynCompletionOptions s_nonExpandedOptions = s_options with
+    {
+        ExpandedCompletionBehavior = ExpandedCompletionMode.NonExpandedItemsOnly,
+    };
+
+    /// <summary>The other half, run in the background and merged when it is ready — see
+    /// <see cref="ExpandedCompletionPass"/>.</summary>
+    private static readonly RoslynCompletionOptions s_expandedOptions = s_options with
+    {
+        ExpandedCompletionBehavior = ExpandedCompletionMode.ExpandedItemsOnly,
     };
 
     public static async Task<CompletionList> CompletionAsync(
@@ -127,26 +146,52 @@ internal static class CompletionHandler
         int predictedStart = service.GetDefaultCompletionListSpan(text, offset).Start;
         var semanticsTask = CompletionSemanticContext.CreateAsync(document, predictedStart, ct);
 
+        // The import-completion providers, started first so they run alongside the pass that is
+        // actually awaited, and memoized so that the request which does not get to wait for them
+        // still pays for them only once (see ExpandedCompletionPass).
+        var expandedPass = ExpandedCompletionPass.Start(
+            service, document, text, offset, predictedStart, s_expandedOptions, trigger);
+
         var completions = await service.GetCompletionsAsync(
-            document, offset, s_options, document.Project.Solution.Options, trigger,
+            document, offset, s_nonExpandedOptions, document.Project.Solution.Options, trigger,
             roles: null, cancellationToken: ct);
-        if (completions.ItemsList.Count == 0)
-            return new CompletionList(false, Array.Empty<CompletionItem>());
+
+        var expanded = await ExpandedCompletionPass.WithinGraceAsync(expandedPass, ct);
+
+        var itemsList = completions.ItemsList;
+        var span = completions.Span;
+        if (itemsList.Count == 0)
+        {
+            // Nothing in scope, but an unimported name can still be the whole answer (a type in a
+            // namespace this file has no using for, typed in an otherwise empty expression).
+            if (expanded is not { ItemsList.Count: > 0 })
+                return new CompletionList(false, Array.Empty<CompletionItem>());
+
+            itemsList = expanded.ItemsList;
+            span = expanded.Span;
+        }
+        else if (expanded is { ItemsList.Count: > 0 } && expanded.Span == span)
+        {
+            // Spans that disagree mean the two passes answered different positions — the memoized
+            // pass belongs to a caret this request is not at, so its items are left for the request
+            // that matches it.
+            itemsList = ExpandedCompletionPass.Merge(itemsList, expanded.ItemsList);
+        }
 
         // The span Roslyn wants replaced by the committed item (usually the partial word).
-        if (toRange(completions.Span) is not { } defaultRange)
+        if (toRange(span) is not { } defaultRange)
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
-        string prefix = completions.Span.Length > 0 && completions.Span.End <= text.Length
-            ? text.ToString(completions.Span)
+        string prefix = span.Length > 0 && span.End <= text.Length
+            ? text.ToString(span)
             : "";
-        string contextId = CompletionRanker.ContextId(text, completions.Span);
+        string contextId = CompletionRanker.ContextId(text, span);
 
-        var semantics = completions.Span.Start == predictedStart
+        var semantics = span.Start == predictedStart
             ? await semanticsTask
-            : await CompletionSemanticContext.CreateAsync(document, completions.Span.Start, ct);
+            : await CompletionSemanticContext.CreateAsync(document, span.Start, ct);
 
-        var ranked = CompletionRanker.Rank(completions.ItemsList, prefix, contextId, MaxItems, semantics);
+        var ranked = CompletionRanker.Rank(itemsList, prefix, contextId, MaxItems, semantics);
         if (ranked.Items.Count == 0)
             return new CompletionList(false, Array.Empty<CompletionItem>());
 

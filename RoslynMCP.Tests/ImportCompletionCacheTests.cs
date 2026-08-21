@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.Collections;
 using Microsoft.CodeAnalysis.Completion.Providers;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp;
+using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
@@ -193,15 +194,30 @@ public class ImportCompletionCacheTests
         return condition();
     }
 
+    /// <summary>
+    /// One completion request whose expanded pass is allowed to finish inside it. Import items
+    /// arrive on a background pass that a live request merges only if it lands inside the grace
+    /// window; what these tests assert is whether the index has anything to offer at all, so the
+    /// window is widened out of the picture.
+    /// </summary>
     private static async Task<CompletionItem[]> CompleteAtAsync(string path, SourceText text, int offset)
     {
         var position = text.Lines.GetLinePosition(offset);
-        var list = await CompletionHandler.CompletionAsync(
-            new CompletionParams(
-                new TextDocumentIdentifier(LspConverters.PathToUri(path)),
-                new Position(position.Line, position.Character)),
-            new LspResolveCache(),
-            default);
-        return list.Items;
+        var previousGrace = ExpandedCompletionPass.GraceWindow;
+        ExpandedCompletionPass.GraceWindow = TimeSpan.FromSeconds(30);
+        try
+        {
+            var list = await CompletionHandler.CompletionAsync(
+                new CompletionParams(
+                    new TextDocumentIdentifier(LspConverters.PathToUri(path)),
+                    new Position(position.Line, position.Character)),
+                new LspResolveCache(),
+                default);
+            return list.Items;
+        }
+        finally
+        {
+            ExpandedCompletionPass.GraceWindow = previousGrace;
+        }
     }
 }

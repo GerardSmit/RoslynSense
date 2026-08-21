@@ -699,6 +699,20 @@ internal static class WorkspaceService
                         "Install 'Visual Studio Build Tools' and relaunch the MCP server.");
                 var msbuildWorkspace = CreateWorkspace(diagnosticWriter, isLegacy);
 
+                // Persistent index storage opens only when Solution.FilePath is set, and this
+                // codebase never calls OpenSolutionAsync — projects are loaded individually — so
+                // without this every index (SyntaxTreeIndex, SymbolTreeInfo, ...) is rebuilt each
+                // daemon start. Must happen before the first project lands in the workspace, and
+                // only for the bound solution's own workspace: SQLite holds the DB exclusively,
+                // so a second workspace given the same path would silently degrade to NoOp.
+                if (BoundSolutionPath is { Length: > 0 } boundSolution
+                    && string.Equals(cacheKey, Path.GetFullPath(boundSolution),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    msbuildWorkspace.OnSolutionAdded(SolutionInfo.Create(
+                        SolutionId.CreateNewId(), VersionStamp.Create(), filePath: boundSolution));
+                }
+
                 var phases = new LoadPhaseTimings();
                 try
                 {
@@ -1956,11 +1970,57 @@ internal static class WorkspaceService
     /// </summary>
     public static void InstallOpenBufferBridge() =>
         OpenDocumentStore.OverlayableBufferChanged = path =>
+        {
             // Task.Run, because the store raises this from inside didOpen/didChange — synchronous
             // JSON-RPC handlers — and the awaits below all complete synchronously when the gates
             // are free. Every keystroke was therefore mutating each cached workspace, and running
             // its WorkspaceChanged fan-out, before the notification handler returned.
-            _ = Task.Run(() => ReconcileOpenBufferAsync(path));
+            string key = NormalizeReconcileKey(path);
+            var reconcile = Task.Run(() => ReconcileOpenBufferAsync(path));
+            s_pendingReconciles[key] = reconcile;
+            reconcile.ContinueWith(
+                _ => ((ICollection<KeyValuePair<string, Task>>)s_pendingReconciles)
+                    .Remove(new KeyValuePair<string, Task>(key, reconcile)),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        };
+
+    /// <summary>The reconcile each open file currently has in flight, if any. A request that
+    /// resolves the file between the keystroke and the reconcile landing would fork an overlay
+    /// off the stale base and build a frozen compilation there, only for the reconcile to move
+    /// <c>CurrentSolution</c> right after — one whole duplicate build per keystroke. Rendezvous
+    /// instead: see <see cref="AwaitPendingReconcileAsync"/>.</summary>
+    private static readonly ConcurrentDictionary<string, Task> s_pendingReconciles =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Bounded, for the case where the reconcile is stuck behind a workspace mid-load
+    /// (<see cref="LoadGateWait"/>): the overlay fork still covers correctness, so a request
+    /// never waits out somebody's MSBuild for what is only a caching optimization.</summary>
+    private static readonly TimeSpan ReconcileRendezvousBound = TimeSpan.FromMilliseconds(40);
+
+    /// <summary>
+    /// Waits — briefly — for <paramref name="filePath"/>'s in-flight buffer reconcile, so the
+    /// request that follows a keystroke binds against the reconciled solution instead of paying
+    /// for a throwaway fork. Returns immediately when nothing is pending, which is every request
+    /// outside the small window between didChange and the reconcile completing.
+    /// </summary>
+    internal static async Task AwaitPendingReconcileAsync(string filePath, CancellationToken ct)
+    {
+        if (!s_pendingReconciles.TryGetValue(NormalizeReconcileKey(filePath), out var pending)
+            || pending.IsCompleted)
+        {
+            return;
+        }
+
+        await Task.WhenAny(pending, Task.Delay(ReconcileRendezvousBound, ct));
+    }
+
+    private static string NormalizeReconcileKey(string path)
+    {
+        try { return Path.GetFullPath(path); }
+        catch (Exception) { return path; }
+    }
 
     /// <summary>
     /// Brings every loaded workspace's copy of <paramref name="filePath"/> in line with the editor:

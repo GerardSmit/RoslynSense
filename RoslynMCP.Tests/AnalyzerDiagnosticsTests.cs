@@ -1,4 +1,6 @@
-﻿using Microsoft.CodeAnalysis;
+﻿using System.Collections.Immutable;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
 using RoslynMCP.Lsp;
@@ -191,6 +193,357 @@ public class AnalyzerDiagnosticsTests
         var merged = DiagnosticsHandler.Merge(compiler, compiler).ToList();
 
         Assert.Equal(compiler.Length, merged.Count);
+    }
+
+    // ---- Incremental member-edit analysis ----
+
+    /// <summary>Three members, so that widening the compiler's span to the declarations either
+    /// side of the edit still leaves one whose findings can only come from the previous pass.</summary>
+    private const string ThreeMembers = """
+        namespace SampleProject;
+
+        public class Warnings
+        {
+            public void First()
+            {
+                int x = 42;
+            }
+
+            public int Increment(int value)
+            {
+                return value + 1;
+            }
+
+            public void Last()
+            {
+                int later = 7;
+            }
+        }
+        """;
+
+    private const string ThreeMembersWithUnusedUsing = "using System.Text;\r\n\r\n" + ThreeMembers;
+
+    /// <summary>A body edit: one line added inside the first member, nothing else touched.</summary>
+    private static Document InsertLineAfter(Document document, SourceText text, string anchor, string inserted)
+    {
+        int at = text.ToString().IndexOf(anchor, StringComparison.Ordinal);
+        Assert.True(at >= 0, $"anchor '{anchor}' not found");
+
+        var line = text.Lines.GetLineFromPosition(at);
+
+        // WithChanges, not SourceText.From: the change lineage is what lets Roslyn's differ see a
+        // single edit rather than a wholesale replacement — the same distinction the LSP didChange
+        // path makes between a ranged content change and a full-document one.
+        return document.WithText(
+            text.WithChanges(new TextChange(new TextSpan(line.End, 0), Environment.NewLine + inserted)));
+    }
+
+    private static async Task<Document> BaselineAsync(string source)
+    {
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+        return document.WithText(SourceText.From(source));
+    }
+
+    private static (string Id, string Text, int Line)[] Shape(
+        IEnumerable<Microsoft.CodeAnalysis.Diagnostic> diagnostics, SourceText text) =>
+        [.. diagnostics
+            .Where(d => d.Location.IsInSource)
+            .Select(d => (
+                d.Id,
+                Text: text.ToString(d.Location.SourceSpan),
+                Line: d.Location.GetLineSpan().StartLinePosition.Line))
+            .OrderBy(d => d.Line).ThenBy(d => d.Id, StringComparer.Ordinal)];
+
+    /// <summary>
+    /// A one-member edit is analysed as one member, and says exactly what a whole-file pass would.
+    /// </summary>
+    /// <remarks>
+    /// Asserted against the whole-file answer rather than against a hand-written expectation,
+    /// because the shortcut's only permitted difference from the long way round is its cost. The
+    /// splice counter is what proves the shortcut was the path taken — nothing else about the
+    /// result can tell.
+    /// </remarks>
+    [Fact]
+    public async Task ASingleMemberEditSaysWhatTheWholeFilePassWouldHaveSaid()
+    {
+        var baseline = await BaselineAsync(ThreeMembers);
+        var baseText = await baseline.GetTextAsync();
+        var edited = InsertLineAfter(baseline, baseText, "int x = 42;", "        int extra = 1;");
+        var editedText = await edited.GetTextAsync();
+
+        MemberEditAnalysis.Enabled = false;
+        try
+        {
+            AnalyzerDiagnosticCache.Clear();
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(baseline, default);
+            await CompilerDiagnosticCache.GetOrComputeAsync(baseline, default);
+            var wholeFileAnalyzer = await AnalyzerDiagnosticCache.GetOrComputeAsync(edited, default);
+            var wholeFileCompiler = await CompilerDiagnosticCache.GetOrComputeAsync(edited, default);
+
+            MemberEditAnalysis.Enabled = true;
+            AnalyzerDiagnosticCache.Clear();
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(baseline, default);
+            await CompilerDiagnosticCache.GetOrComputeAsync(baseline, default);
+
+            MemberEditAnalysis.ResetCounters();
+            var splicedAnalyzer = await AnalyzerDiagnosticCache.GetOrComputeAsync(edited, default);
+            var splicedCompiler = await CompilerDiagnosticCache.GetOrComputeAsync(edited, default);
+
+            Assert.True(MemberEditAnalysis.Splices > 0, "the edit did not take the incremental path");
+            Assert.Equal(Shape(wholeFileCompiler.Compiler, editedText), Shape(splicedCompiler.Compiler, editedText));
+            Assert.True(
+                AnalyzerDiagnosticCache.SameFindings(wholeFileAnalyzer, splicedAnalyzer),
+                "analyzer findings differ between the incremental and the whole-file pass");
+        }
+        finally
+        {
+            MemberEditAnalysis.Enabled = true;
+            AnalyzerDiagnosticCache.Clear();
+        }
+    }
+
+    /// <summary>
+    /// A finding below the edited member comes forward from the previous result, on the line the
+    /// edit pushed it onto.
+    /// </summary>
+    /// <remarks>
+    /// The whole difficulty of splicing. The carried diagnostics were resolved against the previous
+    /// syntax tree, so serving them unmoved draws squiggles a line short of the code they describe;
+    /// this is the case that catches a remap that silently does nothing.
+    /// </remarks>
+    [Fact]
+    public async Task ADiagnosticBelowTheEditedMemberMovesDownWithTheText()
+    {
+        var baseline = await BaselineAsync(ThreeMembers);
+        var baseText = await baseline.GetTextAsync();
+
+        AnalyzerDiagnosticCache.Clear();
+        var before = await CompilerDiagnosticCache.GetOrComputeAsync(baseline, default);
+        int lineBefore = Assert.Single(
+            before.Compiler.Where(d => d.Id == "CS0219" && baseText.ToString(d.Location.SourceSpan) == "later"))
+            .Location.GetLineSpan().StartLinePosition.Line;
+
+        var edited = InsertLineAfter(baseline, baseText, "int x = 42;", "        int extra = 1;");
+        var editedText = await edited.GetTextAsync();
+
+        MemberEditAnalysis.ResetCounters();
+        CompilerDiagnosticCache.ResetComputationCounter();
+        var after = await CompilerDiagnosticCache.GetOrComputeAsync(edited, default);
+
+        Assert.Equal(1L, CompilerDiagnosticCache.SpanBinds);
+
+        var moved = Assert.Single(
+            after.Compiler.Where(d => d.Id == "CS0219" && editedText.ToString(d.Location.SourceSpan) == "later"));
+        Assert.Equal(lineBefore + 1, moved.Location.GetLineSpan().StartLinePosition.Line);
+
+        // And the edit's own new finding is there, from the fresh span pass.
+        Assert.Contains(
+            after.Compiler,
+            d => d.Id == "CS0219" && editedText.ToString(d.Location.SourceSpan) == "extra");
+    }
+
+    /// <summary>
+    /// An unnecessary using stays greyed through a span pass.
+    /// </summary>
+    /// <remarks>
+    /// The compiler does not look at using directives when it is handed a span, so CS8019 cannot be
+    /// produced by an incremental pass at all — it can only be carried forward from the last
+    /// whole-file bind. Without that carry the fade blinked off on every keystroke inside a method
+    /// and back on at the next full analysis.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnnecessaryUsingSurvivesASpanPass()
+    {
+        var baseline = await BaselineAsync(ThreeMembersWithUnusedUsing);
+        var baseText = await baseline.GetTextAsync();
+
+        AnalyzerDiagnosticCache.Clear();
+        CompilerDiagnosticCache.ResetComputationCounter();
+        var before = await CompilerDiagnosticCache.GetOrComputeAsync(baseline, default);
+        var unused = Assert.Single(before.Compiler.Where(d => d.Id == "CS8019"));
+        int line = unused.Location.GetLineSpan().StartLinePosition.Line;
+
+        var edited = InsertLineAfter(baseline, baseText, "int x = 42;", "        int extra = 1;");
+
+        MemberEditAnalysis.ResetCounters();
+        var after = await CompilerDiagnosticCache.GetOrComputeAsync(edited, default);
+
+        Assert.Equal(1L, CompilerDiagnosticCache.SpanBinds);
+        var carried = Assert.Single(after.Compiler.Where(d => d.Id == "CS8019"));
+
+        // Above the edit, so its span does not move — and the message survives the rebuild the
+        // carry needs, which is what would break if it were reconstructed from the descriptor's
+        // unformatted template.
+        Assert.Equal(line, carried.Location.GetLineSpan().StartLinePosition.Line);
+        Assert.Equal(unused.GetMessage(), carried.GetMessage());
+    }
+
+    /// <summary>
+    /// A signature change is analysed whole-file.
+    /// </summary>
+    /// <remarks>
+    /// Two guards refuse it independently, and either alone would be enough: the version's semantic
+    /// half moves the moment a declaration does, and Roslyn's differ returns null for a member
+    /// whose signature is not equivalent to the one it replaced. The result is the one that
+    /// matters — every other file in the project has been invalidated too, and splicing into a
+    /// result computed against the old signature would keep reporting against it.
+    /// </remarks>
+    [Fact]
+    public async Task ASignatureEditFallsBackToTheWholeFile()
+    {
+        var baseline = await BaselineAsync(ThreeMembers);
+        var baseText = await baseline.GetTextAsync();
+
+        AnalyzerDiagnosticCache.Clear();
+        await CompilerDiagnosticCache.GetOrComputeAsync(baseline, default);
+        await AnalyzerDiagnosticCache.GetOrComputeAsync(baseline, default);
+
+        int at = baseText.ToString().IndexOf("public int Increment(int value)", StringComparison.Ordinal);
+        var edited = baseline.WithText(baseText.WithChanges(
+            new TextChange(new TextSpan(at, "public int Increment(int value)".Length),
+                "public int Increment(int value, int unusedParameter)")));
+        var editedText = await edited.GetTextAsync();
+
+        MemberEditAnalysis.ResetCounters();
+        CompilerDiagnosticCache.ResetComputationCounter();
+
+        string? version = await AnalyzerDiagnosticCache.GetVersionAsync(edited, default);
+        Assert.NotNull(version);
+
+        var compiler = await CompilerDiagnosticCache.GetOrComputeAsync(edited, default);
+
+        Assert.Null(await MemberEditAnalysis.TryComputeAsync(edited, version!, default));
+        Assert.Equal(0L, MemberEditAnalysis.Splices);
+        Assert.Equal(0L, CompilerDiagnosticCache.SpanBinds);
+
+        // And the whole-file answer is intact: the untouched members still report.
+        Assert.Contains(
+            compiler.Compiler,
+            d => d.Id == "CS0219" && editedText.ToString(d.Location.SourceSpan) == "later");
+    }
+
+    // ---- Cost buckets ----
+
+    /// <summary>
+    /// A pathological analyzer costs the file its own findings and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// One budget for the whole set meant the reverse: the semantic half timing out discarded every
+    /// analyzer's semantic results, returned <c>Failed</c>, and so stored nothing — which left the
+    /// cheap code-style squiggles missing and the whole pass to be run again, and time out again,
+    /// on the next request. The expensive bucket now runs on its own clock, and losing it is a
+    /// local loss.
+    /// </remarks>
+    [Fact]
+    public async Task AnExpensiveAnalyzerTimingOutStillPublishesAndCachesTheCheapOnes()
+    {
+        var baseline = await BaselineAsync(ThreeMembers);
+        var blocker = new BlocksUntilCancelledAnalyzer();
+
+        AnalyzerService.AdditionalAnalyzersForTesting = [blocker];
+        AnalyzerService.SlowBudgetOverrideForTesting = TimeSpan.FromMilliseconds(250);
+        try
+        {
+            AnalyzerDiagnosticCache.Clear();
+
+            var compilation = await baseline.Project.GetCompilationAsync();
+            var analyzers = AnalyzerService.GetAnalyzersFor(baseline.Project);
+            var driver = AnalyzerService.DriverForTesting(compilation!, baseline.Project, analyzers);
+            var (fast, slow) = await AnalyzerService.BucketsForTesting(driver, analyzers);
+
+            // A SemanticModel action is one of the two shapes that earns the slow bucket.
+            Assert.Contains(blocker, slow);
+            Assert.DoesNotContain(blocker, fast);
+            Assert.Equal(analyzers.Length, fast.Length + slow.Length);
+
+            var run = await AnalyzerService.RunDocumentAnalyzersWithStatusAsync(baseline, default);
+
+            Assert.False(run.Failed);
+            Assert.DoesNotContain(run.Diagnostics, d => d.Id == BlocksUntilCancelledAnalyzer.Id);
+
+            // The cheap code-style rules, which used to go down with the expensive one.
+            Assert.NotEmpty(run.Diagnostics);
+            Assert.Contains(run.Diagnostics, d => d.Id.StartsWith("IDE", StringComparison.Ordinal));
+
+            // Failed = false is what lets it be cached, which is the half of the bug that made the
+            // starvation repeat rather than merely happen.
+            string? version = await AnalyzerDiagnosticCache.GetVersionAsync(baseline, default);
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(baseline, default);
+            Assert.True(AnalyzerDiagnosticCache.IsComputed(baseline, version));
+        }
+        finally
+        {
+            AnalyzerService.AdditionalAnalyzersForTesting = ImmutableArray<DiagnosticAnalyzer>.Empty;
+            AnalyzerService.SlowBudgetOverrideForTesting = null;
+            AnalyzerDiagnosticCache.Clear();
+        }
+    }
+
+    /// <summary>The buckets partition the set, and the ordinary rules are all in the cheap one.</summary>
+    [Fact]
+    public async Task TheAnalyzerSetIsPartitionedIntoCostBuckets()
+    {
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+        var compilation = await document.Project.GetCompilationAsync();
+        var analyzers = AnalyzerService.GetAnalyzersFor(document.Project);
+        Assert.NotEmpty(analyzers);
+
+        var driver = AnalyzerService.DriverForTesting(compilation!, document.Project, analyzers);
+        var (fast, slow) = await AnalyzerService.BucketsForTesting(driver, analyzers);
+
+        Assert.Equal(analyzers.Length, fast.Length + slow.Length);
+        Assert.Empty(fast.Intersect(slow));
+        Assert.NotEmpty(fast);
+
+        // The expensive shapes are a small minority of a real analyzer set — 25 of 358 for this
+        // fixture, which is the whole point: one of them must not be able to cost the other 333
+        // their results.
+        Assert.True(slow.Length < fast.Length, $"{slow.Length} slow of {analyzers.Length}");
+
+        // Classification is cached on the analyzer instance, so asking twice must agree.
+        var (fastAgain, slowAgain) = await AnalyzerService.BucketsForTesting(driver, analyzers);
+        Assert.Equal(Names(fast), Names(fastAgain));
+        Assert.Equal(Names(slow), Names(slowAgain));
+
+        // The compiler analyzer is never de-prioritised, however it registers.
+        Assert.DoesNotContain(slow, AnalyzerService.IsCompilerAnalyzerForTesting);
+
+        static string Names(ImmutableArray<DiagnosticAnalyzer> a) =>
+            string.Join(", ", a.Select(x => x.GetType().Name).Order(StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// Registers the one action shape that guarantees a slot in the expensive bucket, and holds it
+    /// until its budget cancels it.
+    /// </summary>
+    /// <remarks>
+    /// Waits on the cancellation token's handle rather than for a duration: it finishes the instant
+    /// the slow budget fires and not a moment later, so the test measures the budget rather than
+    /// racing it.
+    /// </remarks>
+    [DiagnosticAnalyzer(LanguageNames.CSharp)]
+    private sealed class BlocksUntilCancelledAnalyzer : DiagnosticAnalyzer
+    {
+        public const string Id = "RSTEST001";
+
+        private static readonly DiagnosticDescriptor s_rule = new(
+            Id, "Never finishes", "Never finishes", "Test", DiagnosticSeverity.Warning,
+            isEnabledByDefault: true);
+
+        public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => [s_rule];
+
+        public override void Initialize(AnalysisContext context)
+        {
+            context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
+            context.EnableConcurrentExecution();
+            context.RegisterSemanticModelAction(static c =>
+            {
+                c.CancellationToken.WaitHandle.WaitOne();
+                c.CancellationToken.ThrowIfCancellationRequested();
+                c.ReportDiagnostic(Microsoft.CodeAnalysis.Diagnostic.Create(
+                    s_rule, c.SemanticModel.SyntaxTree.GetRoot().GetLocation()));
+            });
+        }
     }
 
     private static Document AddEditorConfig(Document document, string content)

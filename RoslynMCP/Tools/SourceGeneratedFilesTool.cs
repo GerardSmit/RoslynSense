@@ -169,6 +169,19 @@ public static class SourceGeneratedFilesTool
         var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
             csprojPath, cancellationToken: cancellationToken);
 
+        // Generators run in Balanced mode (see BalancedGeneratorConfiguration): generated trees
+        // are reattached, not regenerated, between saves. These tools exist to show what the
+        // generators produce *now*, so force one regeneration and read from the updated solution.
+        if (project is not null)
+        {
+            var workspace = project.Solution.Workspace;
+            await workspace.ProcessUpdateSourceGeneratorRequestAsync(
+                Microsoft.CodeAnalysis.Collections.ImmutableSegmentedList.Create<(ProjectId?, bool)>(
+                    (project.Id, true)),
+                cancellationToken);
+            project = workspace.CurrentSolution.GetProject(project.Id) ?? project;
+        }
+
         return (project, null);
     }
 

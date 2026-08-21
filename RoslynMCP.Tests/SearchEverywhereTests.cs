@@ -394,6 +394,56 @@ public class SearchEverywhereTests
     public void GeneratedFilesAreRecognisedByName(string name, bool generated) =>
         Assert.Equal(generated, SearchFileRules.IsGenerated(name));
 
+    [Fact]
+    public async Task AColdSolutionAnswersWithoutBuildingACompilation()
+    {
+        // The whole point of searching the declaration index: a solution nobody has compiled yet
+        // still answers. The old path went through SymbolFinder, which built every project's
+        // Compilation to read the same names — seconds of work inside a keystroke's budget, and
+        // the reason Search Everywhere had to wait for the background warm before it was useful.
+        using var workspace = new AdhocWorkspace();
+        string directory = Path.Combine(Path.GetTempPath(), "roslyn-sense-cold-search");
+        var projectId = ProjectId.CreateNewId();
+
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId, VersionStamp.Create(), "ColdProject", "ColdProject", LanguageNames.CSharp,
+                filePath: Path.Combine(directory, "ColdProject.csproj")))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Widget.cs",
+                """
+                namespace ColdSpace;
+
+                public class WidgetGateway
+                {
+                    public int SpinWidget() => 1;
+                }
+                """,
+                filePath: Path.Combine(directory, "Widget.cs"));
+
+        var project = solution.GetProject(projectId)!;
+        Assert.False(project.TryGetCompilation(out _), "the fixture was already compiled");
+
+        var hits = await SearchEverywhere.SearchAsync(
+            solution, "WidgetGateway", maxResults: 50, default, includeFiles: false);
+
+        var type = Assert.Single(hits, h => h.Kind == SearchItemKind.Type);
+        Assert.Equal("WidgetGateway", type.Name);
+        Assert.Equal("ColdSpace", type.Container);
+
+        var members = await SearchEverywhere.SearchAsync(
+            solution, "SpinWidget", maxResults: 50, default, includeFiles: false);
+        var member = Assert.Single(members, h => h.Kind == SearchItemKind.Member);
+        Assert.Equal(LspSymbolKind.Method, member.SymbolKind);
+        Assert.Equal("ColdSpace.WidgetGateway", member.Container);
+
+        // Nothing on the search path may have asked for one, on any project of the solution.
+        Assert.All(
+            solution.Projects,
+            p => Assert.False(p.TryGetCompilation(out _), $"{p.Name} was compiled by the search"));
+    }
+
     private static async Task<IReadOnlyList<SearchHit>> SearchAsync(
         string query, int maxResults = 50, bool includeFiles = true)
     {

@@ -30,7 +30,8 @@ namespace RoslynMCP.Services;
 /// <para>
 /// Validity is a fingerprint over every input that can change what evaluation would produce:
 /// the project file, the ancestor <c>Directory.Build.props/targets</c> chain, the restore graph
-/// (<c>project.assets.json</c>), the <em>names</em> of the source-shaped files under the project
+/// (<c>project.assets.json</c>, by size and timestamp — see
+/// <see cref="Fingerprint"/>), the <em>names</em> of the source-shaped files under the project
 /// directory (a file added or removed changes the evaluated document list without touching the
 /// project file), the global MSBuild properties the evaluation ran under, and the versions of
 /// this tool and of the contract assembly. Contents of source files are deliberately not part of
@@ -53,7 +54,7 @@ namespace RoslynMCP.Services;
 internal static class EvaluationCache
 {
     /// <summary>Bumped when the entry shape or fingerprint recipe changes.</summary>
-    private const int FormatVersion = 2;
+    private const int FormatVersion = 3;
 
     private static bool Enabled =>
         Environment.GetEnvironmentVariable("ROSLYNMCP_NO_EVAL_CACHE") is not ("1" or "true" or "on");
@@ -256,6 +257,18 @@ internal static class EvaluationCache
             sha.AppendData([1]);
         }
 
+        // Size and timestamp instead of contents, for inputs too large to read on every open.
+        // The trade is one-sided: any content change moves the timestamp, so a stamp can only
+        // ever miss spuriously (a rewrite with identical bytes), and a spurious miss is one
+        // ordinary evaluation — while reading the file for real would put megabytes of I/O on
+        // the hot path this cache exists to shorten.
+        void AddStamp(string label, string path)
+        {
+            AddText(label);
+            var file = new FileInfo(path);
+            AddText(file.Exists ? $"{file.Length}|{file.LastWriteTimeUtc.Ticks}" : "<absent>");
+        }
+
         AddText($"v{FormatVersion}");
         AddText(typeof(EvaluationCache).Assembly.GetName().Version?.ToString() ?? "");
         AddText(typeof(ProjectFileInfo).Assembly.GetName().Version?.ToString() ?? "");
@@ -277,7 +290,11 @@ internal static class EvaluationCache
                 AddFile("targets", Path.Combine(dir.FullName, "Directory.Build.targets"));
             }
 
-            AddFile("assets", Path.Combine(projectDir, "obj", "project.assets.json"));
+            // The restore graph is the one input measured in megabytes — 19MB across an
+            // 80-project solution, dwarfing every project file combined — so it is stamped, not
+            // read. A restore that changes anything rewrites it; one that changes nothing still
+            // bumps its timestamp, which costs a re-evaluation, not a wrong answer.
+            AddStamp("assets", Path.Combine(projectDir, "obj", "project.assets.json"));
 
             AddText("files");
             foreach (string relative in SourceShapedFiles(projectDir, watched))
@@ -378,27 +395,30 @@ internal static class EvaluationCache
         {
             string dir = pending.Pop();
 
-            IEnumerable<string> entries;
-            try { entries = Directory.EnumerateFileSystemEntries(dir); }
+            IEnumerable<FileSystemInfo> entries;
+            // FileSystemInfos rather than name strings: the enumeration already knows which
+            // entries are directories, where testing each name with Directory.Exists would pay
+            // a second stat per entry — measurable over a whole solution's worth of trees.
+            try { entries = new DirectoryInfo(dir).EnumerateFileSystemInfos(); }
             catch (Exception) { continue; }
 
-            foreach (string entry in entries)
+            foreach (var entry in entries)
             {
-                string name = Path.GetFileName(entry);
+                string name = entry.Name;
 
-                if (Directory.Exists(entry))
+                if (entry is DirectoryInfo)
                 {
                     if (!name.Equals("bin", StringComparison.OrdinalIgnoreCase)
                         && !name.Equals("obj", StringComparison.OrdinalIgnoreCase)
                         && !name.Equals("node_modules", StringComparison.OrdinalIgnoreCase)
                         && !name.StartsWith('.'))
                     {
-                        pending.Push(entry);
+                        pending.Push(entry.FullName);
                     }
                 }
                 else if (watched.Contains(Path.GetExtension(name)))
                 {
-                    names.Add(entry[(projectDir.Length + 1)..]);
+                    names.Add(entry.FullName[(projectDir.Length + 1)..]);
                 }
             }
         }

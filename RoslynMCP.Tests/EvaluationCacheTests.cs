@@ -201,6 +201,20 @@ public class EvaluationCacheTests : IDisposable
     }
 
     [Fact]
+    public async Task MissesAfterTheRestoreGraphChanges()
+    {
+        var (hit, _, _) = await StoreThenGetAsync(Properties);
+        Assert.True(hit);
+
+        // The restore graph is stamped (size + timestamp) rather than content-hashed — see the
+        // fingerprint — but a stamp appearing where none was is still a change.
+        Directory.CreateDirectory(Path.Combine(_projectDir, "obj"));
+        File.WriteAllText(Path.Combine(_projectDir, "obj", "project.assets.json"), "{}");
+
+        Assert.False(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+    }
+
+    [Fact]
     public async Task MissesAfterAFileOfARecordedExtensionAppears()
     {
         // The evaluation consumed a .json content file, so the entry records .json as watched —

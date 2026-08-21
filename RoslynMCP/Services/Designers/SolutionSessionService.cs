@@ -44,7 +44,7 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
 
     private readonly Lock _gate = new();
     private readonly List<FileSystemWatcher> _watchers = [];
-    private readonly ConcurrentDictionary<string, CancellationTokenSource> _pending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly KeyedDebouncer _pending = new("SolutionSession");
     private readonly ConcurrentQueue<WatchedRegeneration> _history = new();
 
     public string? SolutionPath { get; private set; }
@@ -65,7 +65,7 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
     public event Action<WatchedRegeneration>? Regenerated;
 
     /// <summary>Number of regenerations queued but not yet applied.</summary>
-    public int PendingCount => _pending.Count;
+    public int PendingCount => _pending.PendingCount;
 
     public void Open(string solutionPath, IEnumerable<string> projectDirectories, bool watch)
     {
@@ -152,12 +152,7 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
 
         _watchers.Clear();
 
-        foreach (var cts in _pending.Values)
-        {
-            try { cts.Cancel(); cts.Dispose(); } catch { }
-        }
-
-        _pending.Clear();
+        _pending.CancelAll();
     }
 
     private void OnChanged(string path)
@@ -166,45 +161,22 @@ public sealed class SolutionSessionService(DesignerRegenerationService regenerat
             return;
 
         // Restart this file's debounce window; the previous pending run is superseded.
-        var cts = new CancellationTokenSource();
-        if (_pending.TryRemove(path, out var previous))
+        _pending.Restart(path, DebounceDelay, async ct =>
         {
-            try { previous.Cancel(); previous.Dispose(); } catch { }
-        }
-
-        _pending[path] = cts;
-        _ = RegenerateAfterDebounceAsync(path, cts);
-    }
-
-    private async Task RegenerateAfterDebounceAsync(string path, CancellationTokenSource cts)
-    {
-        try
-        {
-            await Task.Delay(DebounceDelay, cts.Token);
-
-            var result = await regeneration.RegenerateAsync(path, dryRun: false, cts.Token);
-            Publish(new WatchedRegeneration(path, result.Outcome, DateTime.UtcNow, result.Errors)
+            try
             {
-                DesignerPath = result.DesignerPath,
-            });
-        }
-        catch (OperationCanceledException)
-        {
-            // Superseded by a newer change to the same file.
-        }
-        catch (Exception ex)
-        {
-            // A watcher callback runs on a pool thread with nobody to catch for it; an escaping
-            // exception would take the process down.
-            Publish(new WatchedRegeneration(path, DesignerOutcome.Failed, DateTime.UtcNow, [ex.Message]));
-        }
-        finally
-        {
-            if (_pending.TryGetValue(path, out var current) && ReferenceEquals(current, cts))
-                _pending.TryRemove(path, out _);
-
-            try { cts.Dispose(); } catch { }
-        }
+                var result = await regeneration.RegenerateAsync(path, dryRun: false, ct);
+                Publish(new WatchedRegeneration(path, result.Outcome, DateTime.UtcNow, result.Errors)
+                {
+                    DesignerPath = result.DesignerPath,
+                });
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // A failed regeneration is an answer the session should surface, not a log line.
+                Publish(new WatchedRegeneration(path, DesignerOutcome.Failed, DateTime.UtcNow, [ex.Message]));
+            }
+        });
     }
 
     private void Publish(WatchedRegeneration entry)

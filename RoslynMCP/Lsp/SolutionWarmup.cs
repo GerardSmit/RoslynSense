@@ -85,6 +85,67 @@ internal static class SolutionWarmup
     }
 
     /// <summary>
+    /// Reloads whatever of the bound solution has been unloaded since the warm-up ran, if
+    /// anything has. Cheap and a no-op when the solution is intact.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Start"/> runs once per solution, which was written for the second editor window
+    /// joining the first — and it means an eviction after the warm-up leaves the solution unloaded
+    /// forever. Evictions are routine, not exceptional: a build in a terminal changes restore
+    /// outputs, the <see cref="Services.RestoreWatcher"/> throws the workspace away so it reloads
+    /// with the new graph, and the "reloads" half only ever happened when the next request named a
+    /// file in the evicted project. Solution-wide views have no file to ask with, so the Solution
+    /// Explorer sat on "not loaded" and Search Everywhere on a shrunken solution until the daemon
+    /// was restarted.
+    /// <para>
+    /// Called from the debounced project-set notification rather than from the eviction itself, so
+    /// one build's burst of evictions becomes one reload. The missing-projects check runs before
+    /// any state is touched: when the set moved because a load <i>grew</i> it — the common case —
+    /// this discovers there is nothing to do and leaves the finished warm-up alone.
+    /// </para>
+    /// </remarks>
+    public static void EnsureLoaded()
+    {
+        string solution;
+        lock (s_gate)
+        {
+            // No warm-up has run (no editor session, or the feature is off), or one is running
+            // right now and will see the current state when it finishes.
+            if (s_solutionPath is not { } path || !s_warm.IsCompleted)
+                return;
+            solution = path;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var projects = PathHelper.GetProjectsFromSolution(solution);
+                if (projects.Count == 0)
+                    return;
+
+                var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects);
+                if (missing.Count == 0)
+                    return;
+
+                lock (s_gate)
+                {
+                    if (!s_warm.IsCompleted)
+                        return;
+                    s_warm = Task.Run(() => LoadAsync(solution));
+                }
+            }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn(
+                    $"Could not reload '{Path.GetFileName(solution)}' after its projects were " +
+                    $"unloaded: {ex.Message}. They will load as files in them are opened.",
+                    key: $"solution-warmup-rearm:{solution}");
+            }
+        });
+    }
+
+    /// <summary>
     /// Awaits the load a solution-wide request depends on, if one is running.
     /// </summary>
     /// <remarks>

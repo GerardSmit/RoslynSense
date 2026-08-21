@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using RoslynMCP.Config;
 using RoslynMCP.Lsp.Protocol;
 using StreamJsonRpc;
@@ -19,8 +18,7 @@ internal sealed class DiagnosticsPublisher : IDisposable
     private static readonly TimeSpan AnalyzerDebounce = TimeSpan.FromMilliseconds(1500);
 
     private readonly JsonRpc _rpc;
-    private readonly ConcurrentDictionary<string, CancellationTokenSource> _pending =
-        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Services.KeyedDebouncer _debounce = new("Lsp");
     private readonly CancellationTokenSource _disposed = new();
 
     public DiagnosticsPublisher(JsonRpc rpc) => _rpc = rpc;
@@ -34,33 +32,13 @@ internal sealed class DiagnosticsPublisher : IDisposable
     /// </summary>
     public Languages.LanguageSession? Languages { get; set; }
 
-    public void Schedule(string filePath, bool immediate)
-    {
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_disposed.Token);
-        var previous = _pending.Exchange(filePath, cts);
-        // Cancel only — disposing here races the in-flight task still holding the token
-        // (ObjectDisposedException inside Task.Delay); the GC reclaims cancelled sources.
-        previous?.Cancel();
-
-        _ = RunAsync(filePath, immediate, cts.Token);
-    }
-
-    public void Clear(string filePath)
-    {
-        if (_pending.TryRemove(filePath, out var cts))
+    public void Schedule(string filePath, bool immediate) =>
+        _debounce.Restart(filePath, immediate ? TimeSpan.Zero : Debounce, async ct =>
         {
-            cts.Cancel();
-            cts.Dispose();
-        }
-        _ = PublishAsync(filePath, Array.Empty<Protocol.Diagnostic>(), _disposed.Token);
-    }
-
-    private async Task RunAsync(string filePath, bool immediate, CancellationToken ct)
-    {
-        try
-        {
-            if (!immediate)
-                await Task.Delay(Debounce, ct);
+            // The session can detach between a schedule and its run; a disposed publisher must
+            // not push into a connection that is being torn down.
+            if (_disposed.IsCancellationRequested)
+                return;
 
             var diagnostics = await Handlers.DiagnosticsHandler.ComputeAsync(filePath, ct, Languages);
 
@@ -69,12 +47,12 @@ internal sealed class DiagnosticsPublisher : IDisposable
 
             if (LspFeatureOptions.AnalyzerDiagnostics)
                 await RunAnalyzerPhaseAsync(filePath, ct);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[Lsp] Diagnostics for '{filePath}' failed: {ex.Message}");
-        }
+        });
+
+    public void Clear(string filePath)
+    {
+        _debounce.Cancel(filePath);
+        _ = PublishAsync(filePath, Array.Empty<Protocol.Diagnostic>(), _disposed.Token);
     }
 
     /// <summary>Phase two. Cancelled outright by the next keystroke, which is the point:
@@ -98,22 +76,7 @@ internal sealed class DiagnosticsPublisher : IDisposable
     public void Dispose()
     {
         _disposed.Cancel();
-        foreach (var cts in _pending.Values)
-            cts.Dispose();
-        _pending.Clear();
+        _debounce.CancelAll();
         _disposed.Dispose();
-    }
-}
-
-file static class ConcurrentDictionaryExtensions
-{
-    /// <summary>Atomically swaps the value for a key, returning the previous value (or null).</summary>
-    public static CancellationTokenSource? Exchange(
-        this ConcurrentDictionary<string, CancellationTokenSource> dict,
-        string key, CancellationTokenSource value)
-    {
-        CancellationTokenSource? previous = null;
-        dict.AddOrUpdate(key, value, (_, old) => { previous = old; return value; });
-        return previous;
     }
 }

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion.Providers;
 using RoslynMCP.Services;
@@ -34,8 +33,7 @@ internal static class ImportCompletionWarmer
     /// symbol the user just declared.</summary>
     private static readonly TimeSpan Quiet = TimeSpan.FromMilliseconds(600);
 
-    private static readonly ConcurrentDictionary<string, CancellationTokenSource> s_pending =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly KeyedDebouncer s_debounce = new("ImportCompletionWarmer");
 
     /// <summary>Test seam: completes when the most recently scheduled warm-up has queued its
     /// work (not when the index build itself finishes — that is Roslyn's queue).</summary>
@@ -46,36 +44,24 @@ internal static class ImportCompletionWarmer
     /// file; <paramref name="immediate"/> skips the quiet period (didOpen — nothing is being
     /// typed, and the sooner a cold project's index exists the better).
     /// </summary>
-    public static void Schedule(string filePath, bool immediate = false)
-    {
-        var cts = new CancellationTokenSource();
-        var previous = s_pending.Exchange(filePath, cts);
-        previous?.Cancel();
-
-        LastScheduled = RunAsync(filePath, immediate, cts.Token);
-    }
-
-    private static async Task RunAsync(string filePath, bool immediate, CancellationToken ct)
-    {
-        try
+    public static void Schedule(string filePath, bool immediate = false) =>
+        LastScheduled = s_debounce.Restart(filePath, immediate ? TimeSpan.Zero : Quiet, async ct =>
         {
-            if (!immediate)
-                await Task.Delay(Quiet, ct);
-
-            var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
-            if (document is not null)
-                Queue(document.Project);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex)
-        {
-            // Warming is an optimization; completion still answers without it (just possibly
-            // stale, or missing import items until Roslyn's own post-request refresh runs).
-            ServiceLog.Warn(
-                $"Could not warm import-completion indexes for '{Path.GetFileName(filePath)}': {ex.Message}",
-                key: $"import-warm:{filePath}");
-        }
-    }
+            try
+            {
+                var document = await LspDocumentResolver.ResolveAsync(filePath, ct);
+                if (document is not null)
+                    Queue(document.Project);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Warming is an optimization; completion still answers without it (just possibly
+                // stale, or missing import items until Roslyn's own post-request refresh runs).
+                ServiceLog.Warn(
+                    $"Could not warm import-completion indexes for '{Path.GetFileName(filePath)}': {ex.Message}",
+                    key: $"import-warm:{filePath}");
+            }
+        });
 
     /// <summary>
     /// Queues both import-completion indexes of <paramref name="project"/> for a background
@@ -93,18 +79,5 @@ internal static class ImportCompletionWarmer
             types.QueueCacheWarmUpTask(project);
 
         ExtensionMemberImportCompletionHelper.SymbolComputer.QueueCacheWarmUpTask(project);
-    }
-}
-
-file static class ConcurrentDictionaryExtensions
-{
-    /// <summary>Atomically swaps the value for a key, returning the previous value (or null).</summary>
-    public static CancellationTokenSource? Exchange(
-        this ConcurrentDictionary<string, CancellationTokenSource> dict,
-        string key, CancellationTokenSource value)
-    {
-        CancellationTokenSource? previous = null;
-        dict.AddOrUpdate(key, value, (_, old) => { previous = old; return value; });
-        return previous;
     }
 }

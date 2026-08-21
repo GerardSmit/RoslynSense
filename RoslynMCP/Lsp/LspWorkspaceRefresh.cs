@@ -60,44 +60,18 @@ internal static class LspWorkspaceRefresh
     /// this only redraws one view, and a stale tree is visible in a way a stale lens is not.</summary>
     private static readonly TimeSpan NotifyQuiet = TimeSpan.FromMilliseconds(300);
 
-    private static readonly Lock s_notifyGate = new();
-    private static CancellationTokenSource? s_pendingNotify;
+    private static readonly Debouncer s_notify = new("Lsp");
 
-    private static void ScheduleProjectSetNotification()
-    {
-        CancellationTokenSource cts;
-        lock (s_notifyGate)
+    private static void ScheduleProjectSetNotification() =>
+        s_notify.Restart(NotifyQuiet, _ =>
         {
-            // Guarded the same way ScheduleRefresh guards its own: the source is disposed by the
-            // task that owns it, and cancelling a disposed one throws — which would escape here and
-            // leave the notification unscheduled entirely.
-            try { s_pendingNotify?.Cancel(); }
-            catch (ObjectDisposedException) { }
+            LspSessionRegistry.NotifyProjectSetChanged();
 
-            cts = s_pendingNotify = new CancellationTokenSource();
-        }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(NotifyQuiet, cts.Token);
-                LspSessionRegistry.NotifyProjectSetChanged();
-            }
-            catch (OperationCanceledException)
-            {
-                // Superseded — the newer schedule carries this signal.
-            }
-            finally
-            {
-                lock (s_notifyGate)
-                {
-                    if (ReferenceEquals(s_pendingNotify, cts))
-                        s_pendingNotify = null;
-                }
-
-                cts.Dispose();
-            }
+            // The same settled moment is when to notice that the set moved because something
+            // was unloaded — a restore watcher eviction after a build, an analyzer rebuild —
+            // and put the bound solution back. Loads reaching here cost one missing-projects
+            // check and nothing else.
+            SolutionWarmup.EnsureLoaded();
+            return Task.CompletedTask;
         });
-    }
 }

@@ -42,30 +42,25 @@ internal sealed class LspServer : IDisposable
     private bool _clientPullsDiagnostics;
     private bool _clientRefreshesCodeLens;
     private bool _clientRefreshesInlayHints;
-    private CancellationTokenSource? _refreshDebounce;
+    private readonly Services.Debouncer _refreshDebounce = new("Lsp");
 
     /// <summary>Nudges the client to re-request derived data after a change whose effects reach
     /// beyond the edited document: diagnostics (cross-file), code lens reference counts, and
     /// inlay hints all go stale on an edit somewhere else. Debounced — mirrors the ~2s batching
     /// in Roslyn's own LSP server. The client re-pulls the changed document itself immediately;
     /// this only covers everything else.</summary>
-    private void ScheduleClientRefresh(RefreshKind kinds = RefreshKind.All)
-    {
-        _refreshDebounce?.Cancel();
-        var cts = _refreshDebounce = new CancellationTokenSource();
-        _ = Task.Run(async () =>
+    private void ScheduleClientRefresh(RefreshKind kinds = RefreshKind.All) =>
+        _refreshDebounce.Restart(TimeSpan.FromSeconds(2), async ct =>
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(2), cts.Token);
-                await RefreshClientAsync(kinds, cts.Token);
+                await RefreshClientAsync(kinds, ct);
             }
             catch (Exception)
             {
-                // Cancelled by a newer edit, or the client went away.
+                // The client went away mid-send; not worth a log line per detach.
             }
         });
-    }
 
     /// <summary>Sends the refresh requests the client actually declared support for.
     /// Unsupported ones are skipped rather than sent-and-swallowed, because an unknown method
@@ -649,6 +644,10 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/impactedTests", UseSingleObjectParameterDeserialization = true)]
     public Task<ImpactedTestsResult> ImpactedTests(ImpactedTestsParams p, CancellationToken ct) =>
         Handlers.TestHandler.ImpactedAsync(p, ct);
+
+    [JsonRpcMethod("roslynSense/changedMembers", UseSingleObjectParameterDeserialization = true)]
+    public Task<ChangedMembersResult> ChangedMembers(ChangedMembersParams p, CancellationToken ct) =>
+        Handlers.ChangedMembersHandler.GetAsync(p, ct);
 
     [JsonRpcMethod("workspace/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceDiagnosticReport> WorkspaceDiagnostic(
@@ -1281,6 +1280,6 @@ internal sealed class LspServer : IDisposable
         OpenDocumentStore.CloseSession(SessionId);
         Handlers.SemanticTokensHandler.Forget(SessionId);
         _diagnostics?.Dispose();
-        _refreshDebounce?.Cancel();
+        _refreshDebounce.Cancel();
     }
 }

@@ -83,7 +83,7 @@ internal static class LspSessionRegistry
     private static readonly TimeSpan RefreshMaximumWait = TimeSpan.FromSeconds(5);
 
     private static readonly object s_refreshGate = new();
-    private static CancellationTokenSource? s_pendingRefresh;
+    private static readonly Services.Debouncer s_refreshDebounce = new("Lsp");
     private static RefreshKind s_pendingKinds;
     private static DateTime s_firstPendingUtc;
 
@@ -95,9 +95,7 @@ internal static class LspSessionRegistry
     /// </summary>
     public static void ScheduleRefresh(RefreshKind kinds)
     {
-        CancellationTokenSource cts;
         TimeSpan delay;
-
         lock (s_refreshGate)
         {
             // Union, so a coalesced burst still asks for everything its members wanted.
@@ -105,63 +103,32 @@ internal static class LspSessionRegistry
                 s_firstPendingUtc = DateTime.UtcNow;
             s_pendingKinds |= kinds;
 
-            // Guarded: the current source is disposed by its own task once that task is done with
-            // it, and cancelling a disposed source throws — which would escape this method and
-            // leave the refresh unscheduled entirely.
-            try { s_pendingRefresh?.Cancel(); }
-            catch (ObjectDisposedException) { }
-
-            // Not disposed here: the superseded task may still be inside its RPC holding this
-            // token, and disposing it under the gate made StreamJsonRpc throw
-            // ObjectDisposedException on a refresh whose kinds had already been drained — so those
-            // kinds were lost and nothing ever sent them. Each task disposes its own.
-            cts = s_pendingRefresh = new CancellationTokenSource();
-
             var waited = DateTime.UtcNow - s_firstPendingUtc;
             delay = waited >= RefreshMaximumWait ? TimeSpan.Zero : RefreshQuiet;
         }
 
-        _ = Task.Run(async () =>
+        s_refreshDebounce.Restart(delay, async _ =>
         {
+            RefreshKind kindsToSend;
+            lock (s_refreshGate)
+            {
+                kindsToSend = s_pendingKinds;
+                s_pendingKinds = default;
+            }
+
+            if (kindsToSend == default)
+                return;
+
             try
             {
-                if (delay > TimeSpan.Zero)
-                    await Task.Delay(delay, cts.Token);
-
-                RefreshKind kindsToSend;
-                lock (s_refreshGate)
-                {
-                    kindsToSend = s_pendingKinds;
-                    s_pendingKinds = default;
-                }
-
-                if (kindsToSend == default)
-                    return;
-
                 // Deliberately not the debounce token: past this point the kinds have been taken
                 // out of the pending set, so this task owns them and must deliver them even if a
                 // newer request supersedes the debounce a moment later.
                 await RequestRefreshAsync(kindsToSend);
             }
-            catch (OperationCanceledException)
-            {
-                // Superseded before draining — the later call carries these kinds and will send them.
-            }
             catch (Exception)
             {
                 // A client that cannot be told is not a reason to fault background work.
-            }
-            finally
-            {
-                // Stop pointing at a source that is about to become invalid, so the next caller
-                // creates a fresh one rather than cancelling this one.
-                lock (s_refreshGate)
-                {
-                    if (ReferenceEquals(s_pendingRefresh, cts))
-                        s_pendingRefresh = null;
-                }
-
-                cts.Dispose();
             }
         });
     }

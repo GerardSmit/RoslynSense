@@ -38,7 +38,7 @@ internal sealed class ConfigWatcher : IDisposable
     private readonly Action<ConfigReload> _apply;
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly object _gate = new();
-    private CancellationTokenSource? _debounce;
+    private readonly Services.Debouncer _debounce = new("Config");
     private EffectiveSettings _current;
     private string? _lastText;
 
@@ -166,29 +166,12 @@ internal sealed class ConfigWatcher : IDisposable
             || normalizedPath.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
-    private void OnEvent()
-    {
-        lock (_gate)
+    private void OnEvent() =>
+        _debounce.Restart(Debounce, _ =>
         {
-            _debounce?.Cancel();
-            var cts = _debounce = new CancellationTokenSource();
-            _ = ReloadAfterDelayAsync(cts.Token);
-        }
-    }
-
-    private async Task ReloadAfterDelayAsync(CancellationToken ct)
-    {
-        try
-        {
-            await Task.Delay(Debounce, ct);
             Reload();
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[Config] Reload failed: {ex.Message}");
-        }
-    }
+            return Task.CompletedTask;
+        });
 
     /// <summary>The debounced body — the unit under test.</summary>
     internal void Reload()
@@ -254,11 +237,7 @@ internal sealed class ConfigWatcher : IDisposable
 
     public void Dispose()
     {
-        lock (_gate)
-        {
-            _debounce?.Cancel();
-            _debounce = null;
-        }
+        _debounce.Cancel();
         foreach (var fsw in _watchers)
             fsw.Dispose();
         _watchers.Clear();

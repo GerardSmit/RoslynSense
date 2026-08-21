@@ -43,7 +43,7 @@ internal static class WatchedFilesHandler
 
     private static readonly object s_gate = new();
     private static readonly List<FileEvent> s_pending = [];
-    private static CancellationTokenSource? s_debounce;
+    private static readonly Services.Debouncer s_debounce = new("Lsp");
     private static DateTime s_firstPendingUtc;
 
     /// <summary>What a batch of events did — returned for tests and logging.</summary>
@@ -62,27 +62,23 @@ internal static class WatchedFilesHandler
 
     public static void Handle(DidChangeWatchedFilesParams p)
     {
+        TimeSpan delay;
         lock (s_gate)
         {
             if (s_pending.Count == 0)
                 s_firstPendingUtc = DateTime.UtcNow;
 
             s_pending.AddRange(p.Changes);
-            s_debounce?.Cancel();
-            var cts = s_debounce = new CancellationTokenSource();
-
-            var delay = DateTime.UtcNow - s_firstPendingUtc >= MaximumWait ? TimeSpan.Zero : Coalesce;
-            _ = FlushAfterDelayAsync(delay, cts.Token);
+            delay = DateTime.UtcNow - s_firstPendingUtc >= MaximumWait ? TimeSpan.Zero : Coalesce;
         }
+
+        s_debounce.Restart(delay, FlushAsync);
     }
 
-    private static async Task FlushAfterDelayAsync(TimeSpan delay, CancellationToken ct)
+    private static async Task FlushAsync(CancellationToken ct)
     {
         try
         {
-            if (delay > TimeSpan.Zero)
-                await Task.Delay(delay, ct);
-
             FileEvent[] batch;
             lock (s_gate)
             {

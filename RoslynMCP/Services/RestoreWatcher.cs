@@ -40,9 +40,8 @@ internal static class RestoreWatcher
     private static readonly ConcurrentDictionary<string, string> s_fingerprints =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Project file path → the debounce currently pending for it.</summary>
-    private static readonly ConcurrentDictionary<string, CancellationTokenSource> s_pending =
-        new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>The pending eviction check per project, replaced on every new event.</summary>
+    private static readonly KeyedDebouncer s_debounce = new("RestoreWatcher");
 
     /// <summary>Watched directory → the projects whose restore output lands in it.</summary>
     private static readonly ConcurrentDictionary<string, HashSet<string>> s_projectsByDirectory =
@@ -298,53 +297,22 @@ internal static class RestoreWatcher
     /// Restarts the wait for <paramref name="projectPath"/>, and evicts once it expires and the
     /// fingerprint has genuinely moved.
     /// </summary>
-    private static void Debounced(string projectPath)
-    {
-        var cts = new CancellationTokenSource();
-        if (s_pending.TryRemove(projectPath, out var previous))
+    private static void Debounced(string projectPath) =>
+        s_debounce.Restart(projectPath, Debounce, async _ =>
         {
-            previous.Cancel();
-            previous.Dispose();
-        }
+            string now = Fingerprint(projectPath);
+            if (s_fingerprints.TryGetValue(projectPath, out var before) && before == now)
+                return; // a no-op restore, or a file in obj/ that says nothing about references
 
-        s_pending[projectPath] = cts;
+            s_fingerprints[projectPath] = now;
 
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(Debounce, cts.Token);
-
-                string now = Fingerprint(projectPath);
-                if (s_fingerprints.TryGetValue(projectPath, out var before) && before == now)
-                    return; // a no-op restore, or a file in obj/ that says nothing about references
-
-                s_fingerprints[projectPath] = now;
-
-                if (await WorkspaceService.EvictProjectIfLoadedAsync(projectPath))
-                {
-                    Console.Error.WriteLine(
-                        $"[RestoreWatcher] Restore output changed for " +
-                        $"'{Path.GetFileName(projectPath)}'; evicted so it reloads with the new graph.");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Superseded by a later change in the same burst.
-            }
-            catch (Exception ex)
+            if (await WorkspaceService.EvictProjectIfLoadedAsync(projectPath))
             {
                 Console.Error.WriteLine(
-                    $"[RestoreWatcher] Refresh for '{Path.GetFileName(projectPath)}' failed: {ex.Message}");
-            }
-            finally
-            {
-                if (s_pending.TryGetValue(projectPath, out var current) && current == cts)
-                    s_pending.TryRemove(new KeyValuePair<string, CancellationTokenSource>(projectPath, cts));
-                cts.Dispose();
+                    $"[RestoreWatcher] Restore output changed for " +
+                    $"'{Path.GetFileName(projectPath)}'; evicted so it reloads with the new graph.");
             }
         });
-    }
 
     /// <summary>
     /// What this project's references were resolved from, reduced to a string that changes when they
@@ -436,16 +404,7 @@ internal static class RestoreWatcher
     internal static void ResetForTests()
     {
         StopAll();
-
-        foreach (string project in s_pending.Keys.ToList())
-        {
-            if (s_pending.TryRemove(project, out var cts))
-            {
-                cts.Cancel();
-                cts.Dispose();
-            }
-        }
-
+        s_debounce.CancelAll();
         s_warnedAboutCap = false;
         s_enabled = EnabledByDefault;
     }

@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
@@ -144,6 +144,80 @@ public static class SearchEverywhere
         }
 
         return deduped;
+    }
+
+    /// <summary>
+    /// The methods a query names, best first — the same ranking as the search box, restricted to
+    /// methods, and answering with symbols rather than with places in files.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// For naming a method in configuration, where what is known is the method and what is not is
+    /// the namespace it lives in. <c>GetString</c> finds every one of them;
+    /// <c>DotNetNuke.GetString</c> keeps the ones whose container says so — the query grammar is
+    /// the search box's, so anyone who has used Ctrl+T already knows it.
+    /// </para>
+    /// <para>
+    /// Only <see cref="MethodKind.Ordinary"/>. A constructor is reached by its type's name and an
+    /// accessor by its property's, and neither is a thing configuration can name.
+    /// </para>
+    /// </remarks>
+    public static async Task<IReadOnlyList<IMethodSymbol>> FindMethodsAsync(
+        Solution solution, string query, int maxResults, CancellationToken ct)
+    {
+        var request = SearchQuery.Parse(query, allowFiles: false, forcedOnly: SearchItemKind.Member);
+        if (request is null)
+            return [];
+
+        var matcher = request.NameMatcher;
+
+        // The predicate sees declaration names, not symbols: everything that fails here costs
+        // nothing beyond the match itself.
+        var symbols = await SymbolFinder.FindSourceDeclarationsAsync(
+            solution, name => matcher.Match(name) is not null, SymbolFilter.Member, ct);
+
+        var found = new List<(int Score, IMethodSymbol Method)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var symbol in symbols)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (symbol is not IMethodSymbol { MethodKind: MethodKind.Ordinary } method
+                || method.IsImplicitlyDeclared
+                || matcher.Match(method.Name) is not { } match
+                || !request.TryScoreContainer(ContainerOf(method), out int containerScore))
+            {
+                continue;
+            }
+
+            var location = method.Locations.FirstOrDefault(l => l.IsInSource);
+            if (location?.SourceTree?.FilePath is not { Length: > 0 } path
+                || SearchFileRules.IsExcluded(path)
+                || DotSettingsExclusions.IsExcluded(path))
+            {
+                continue;
+            }
+
+            // One file compiled for several target frameworks declares the same method once per
+            // project, and a list offering the same call three times is a list nobody trusts.
+            if (!seen.Add(method.ToDisplayString()))
+                continue;
+
+            found.Add((
+                Score(
+                    match.Score,
+                    Tier(method, isType: false, match.Score),
+                    containerScore,
+                    SearchFileRules.IsGenerated(path)),
+                method));
+        }
+
+        found.Sort((x, y) => x.Score != y.Score
+            ? x.Score.CompareTo(y.Score)
+            : string.CompareOrdinal(x.Method.ToDisplayString(), y.Method.ToDisplayString()));
+
+        return [.. found.Take(maxResults).Select(entry => entry.Method)];
     }
 
     /// <summary>

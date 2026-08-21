@@ -277,7 +277,8 @@ main {
 }
 
 .item-row input,
-.item-row select {
+.item-row select,
+.item-row .dropdown {
     min-width: 0;
     width: 100%;
     box-sizing: border-box;
@@ -368,8 +369,20 @@ main {
     opacity: 1;
 }
 
-.picker-caret {
-    color: var(--vscode-descriptionForeground);
+/*
+ * The chevron, drawn rather than taken from the platform — see `.dropdown`. Two borders of a
+ * square, turned; the same shape VS Code's own dropdowns carry, and it follows the text colour
+ * because it is made of the text colour.
+ */
+.chevron {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    margin-bottom: 3px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(45deg);
+    opacity: 0.8;
 }
 
 .picker-menu {
@@ -463,7 +476,9 @@ main {
 }
 
 .call-option {
-    display: block;
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
     width: 100%;
     padding: 2px 8px;
     text-align: left;
@@ -480,6 +495,46 @@ main {
 .call-option.active {
     color: var(--vscode-editorSuggestWidget-selectedForeground, var(--vscode-list-activeSelectionForeground));
     background: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground));
+}
+
+/*
+ * Where a searched-for method lives. Trails the signature rather than leading it: the question
+ * being answered is "which GetString", and the answer is the namespace — but the method is what
+ * is being read down the list.
+ */
+.declared-by {
+    flex: none;
+    max-width: 55%;
+    overflow: hidden;
+    color: var(--vscode-descriptionForeground);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Long names are cut at the front, so the class survives and the namespace is what goes. */
+    direction: rtl;
+    unicode-bidi: plaintext;
+}
+
+.call-option.active .declared-by,
+.call-option:hover .declared-by,
+.overload:hover .declared-by {
+    color: inherit;
+}
+
+.overload {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+    width: 100%;
+}
+
+/* A class among the methods, when the words typed could be either. */
+.call-option.call-class {
+    color: var(--vscode-descriptionForeground);
+}
+
+.call-option.call-class.active,
+.call-option.call-class:hover {
+    color: var(--vscode-editorSuggestWidget-selectedForeground, var(--vscode-list-activeSelectionForeground));
 }
 
 /* The characters that were typed, in the name being offered because of them. */
@@ -510,7 +565,6 @@ main {
 }
 
 .overload {
-    display: block;
     padding: 0;
     text-align: left;
     font-family: var(--vscode-editor-font-family);
@@ -570,6 +624,37 @@ main {
 /* ---------------------------------------------------------------------------
  * Controls
  * ------------------------------------------------------------------------- */
+
+/*
+ * A select and the multi-select sat side by side wearing different arrows: one the platform's,
+ * one the panel's. The platform's is turned off so that both wear the panel's.
+ */
+.dropdown {
+    position: relative;
+    display: inline-flex;
+    min-width: 0;
+}
+
+.dropdown select {
+    width: 100%;
+    padding-right: 22px;
+    appearance: none;
+}
+
+.dropdown::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    right: 9px;
+    width: 6px;
+    height: 6px;
+    margin-top: -5px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(45deg);
+    opacity: 0.8;
+    pointer-events: none;
+}
 
 input[type='text'],
 input[type='number'],

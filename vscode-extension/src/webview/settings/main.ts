@@ -417,7 +417,7 @@ function booleanControl(path: string[]): HTMLElement {
         set(path, select.value === '' ? null : select.value === 'true');
     });
 
-    return select;
+    return dropdown(select);
 }
 
 function enumControl(values: unknown[], path: string[]): HTMLElement {
@@ -430,7 +430,7 @@ function enumControl(values: unknown[], path: string[]): HTMLElement {
     const own = ownValue(path);
     select.value = own === undefined || own === null ? '' : String(own);
     select.addEventListener('change', () => set(path, select.value === '' ? null : select.value));
-    return select;
+    return dropdown(select);
 }
 
 function stringControl(path: string[]): HTMLElement {
@@ -788,7 +788,7 @@ function itemField(
         addOption(select, 'true', 'On');
         addOption(select, 'false', 'Off');
         select.value = typeof value === 'boolean' ? String(value) : '';
-        return select;
+        return dropdown(select);
     }
 
     // A closed list is a closed list wherever it appears. Inside an item it used to be a text box,
@@ -809,7 +809,7 @@ function itemField(
             addOption(select, current, `${current} (not a known value)`);
         }
         select.value = current;
-        return select;
+        return dropdown(select);
     }
 
     if (schema['x-choices'] === 'server') {
@@ -866,9 +866,8 @@ function choiceListField(name: string, path: string, value: unknown): HTMLElemen
     pills.className = 'pills';
 
     const caret = document.createElement('span');
-    caret.className = 'picker-caret';
+    caret.className = 'chevron';
     caret.setAttribute('aria-hidden', 'true');
-    caret.textContent = '⌄';
 
     face.append(pills, caret);
 
@@ -1088,7 +1087,7 @@ function choiceSelectField(name: string, path: string, value: unknown): HTMLElem
     ask();
     askAgain.add(ask);
 
-    return select;
+    return dropdown(select);
 }
 
 /** The field's value for the file, or undefined when it should be omitted from the item. */
@@ -1330,22 +1329,27 @@ function memberShapeEditor(
         asType: SettingsMsg.MemberShape | undefined
     ): Reading {
         if (asMember && asMember.resolvedType !== undefined && asMember.matches.length > 0) {
-            return { answer: asMember, typed: call.member };
+            return { answer: asMember, typed: call.member, alsoClasses: [] };
         }
         if (asType && asType.resolvedType !== undefined) {
             // The whole line is a class, so there is no member half-typed yet: the menu offers
             // every one it declares.
-            return { answer: asType, typed: '' };
+            return { answer: asType, typed: '', alsoClasses: [] };
         }
         if (asMember && asMember.resolvedType !== undefined) {
-            return { answer: asMember, typed: call.member };
+            return { answer: asMember, typed: call.member, alsoClasses: [] };
         }
-        // Neither resolved. The whole-line reading is the one whose suggestions were matched
-        // against the last thing typed rather than against the segment before it — but only while
-        // it has any, so that a line naming no class at all is left saying so.
-        return asType && asType.typeSuggestions.length > 0
-            ? { answer: asType, typed: '' }
-            : { answer: asMember ?? asType, typed: call.member };
+
+        // Nothing resolved, and `Modules.Localize` is either a class being typed or a method being
+        // searched for with nothing to say which. Both answers are offered rather than one of them
+        // guessed at — the methods first, since adopting one settles the whole line.
+        return asMember && asMember.matches.length > 0
+            ? {
+                answer: asMember,
+                typed: call.member,
+                alsoClasses: asType?.typeSuggestions ?? [],
+            }
+            : { answer: asType ?? asMember, typed: '', alsoClasses: [] };
     }
 
     function show(reading: Reading): void {
@@ -1362,7 +1366,14 @@ function memberShapeEditor(
 
         const matched = answerMessage.matches.filter((match) => match.matched);
 
-        status.classList.toggle('warn', answerMessage.matches.length > 0 && matched.length === 0);
+        // Nothing resolved the class, so these came from a search of the whole solution and are
+        // candidates rather than overloads of one method — each has to say where it lives.
+        const searched = answerMessage.resolvedType === undefined;
+
+        status.classList.toggle(
+            'warn',
+            !searched && answerMessage.matches.length > 0 && matched.length === 0
+        );
         status.textContent = answerMessage.problem
             ? answerMessage.problem
             : answerMessage.matches.length === 0
@@ -1372,20 +1383,38 @@ function memberShapeEditor(
                     : `${matched.length} of ${count(answerMessage.matches.length, 'overload')} match.`;
 
         for (const match of answerMessage.matches) {
-            overloads.append(overloadRow(match, 'overload'));
+            overloads.append(overloadRow(match, 'overload', searched));
         }
 
         drawMenu(reading);
-        drawPositions(matched[0]);
+
+        // Only against a settled class. Counting a parameter of one search hit out of forty says
+        // nothing about the method that ends up being named.
+        drawPositions(searched ? undefined : matched[0]);
     }
 
-    /** One overload, as a line that can be adopted by clicking it. */
-    function overloadRow(match: SettingsMsg.ShapeMatch, className: string): HTMLElement {
+    /** One method, as a line that can be adopted by clicking it. */
+    function overloadRow(
+        match: SettingsMsg.ShapeMatch,
+        className: string,
+        searched: boolean
+    ): HTMLElement {
         const line = document.createElement('button');
         line.type = 'button';
         line.className = match.matched ? `${className} matched` : className;
-        line.textContent = match.signature;
         line.title = `${match.declaredBy}.${match.name}`;
+
+        const signature = document.createElement('span');
+        signature.textContent = match.signature;
+        line.append(signature);
+
+        if (searched) {
+            const where = document.createElement('span');
+            where.className = 'declared-by';
+            where.textContent = match.declaredBy;
+            line.append(where);
+        }
+
         line.addEventListener('click', () =>
             adopt(
                 formatCall(
@@ -1412,8 +1441,15 @@ function memberShapeEditor(
         }
 
         if (answerMessage.matches.length > 0) {
+            const searched = answerMessage.resolvedType === undefined;
             for (const match of answerMessage.matches) {
-                menu.append(overloadRow(match, 'call-option'));
+                menu.append(overloadRow(match, 'call-option', searched));
+            }
+            // The other reading of the same words; see `pick`.
+            for (const name of reading.alsoClasses.slice(0, 20)) {
+                const line = option(name, segment(head(input.value)), () => adopt(`${name}.`));
+                line.classList.add('call-class');
+                menu.append(line);
             }
             open(true);
             return;
@@ -1612,6 +1648,8 @@ interface Reading {
     readonly answer?: SettingsMsg.MemberShape;
     /** The part of a member name typed so far, which the suggestions are narrowed by. */
     readonly typed: string;
+    /** Classes the other reading found, offered under the methods when both are possible. */
+    readonly alsoClasses: readonly string[];
 }
 
 /** A call taken apart, as the three fields that are stored. */
@@ -1820,6 +1858,20 @@ function typeOf(node: SchemaNode): string {
         return type.find((candidate) => candidate !== 'null') ?? 'null';
     }
     return type ?? 'object';
+}
+
+/**
+ * A select with the panel's own chevron on it.
+ *
+ * The platform draws its own arrow on a `<select>`, and it is not the one VS Code draws on the
+ * dropdowns beside it — so a page holding both had two shapes meaning the same thing. The native
+ * one is turned off and the chevron is drawn here, which is also the one the multi-select uses.
+ */
+function dropdown(select: HTMLSelectElement): HTMLElement {
+    const box = document.createElement('div');
+    box.className = 'dropdown';
+    box.append(select);
+    return box;
 }
 
 function addOption(select: HTMLSelectElement, value: string, text: string): void {

@@ -107,13 +107,25 @@ declare namespace SettingsMsg {
         readonly type: 'resolvable';
     }
 
+    /**
+     * The pending edits reached the file, so the page can stop holding them.
+     *
+     * Its own message rather than a flag on the state that follows it: a state also arrives when
+     * somebody else edits the file, and clearing on that one would throw away edits nobody had
+     * saved yet.
+     */
+    interface Saved {
+        readonly type: 'saved';
+    }
+
     type ToView =
         | State
         | ConnectionCompletions
         | ConnectionsResolved
         | SettingChoices
         | MemberShape
-        | Resolvable;
+        | Resolvable
+        | Saved;
 
     /**
      * The webview has loaded and holds nothing yet.
@@ -126,12 +138,28 @@ declare namespace SettingsMsg {
         readonly type: 'ready';
     }
 
-    /** Write one setting into the selected scope. `value: null` unsets it. */
-    interface SetSetting {
-        readonly type: 'set';
+    /**
+     * One setting changed, not yet written. `value: null` unsets it.
+     *
+     * Reported to the host as it happens even though nothing is written until a save, because the
+     * host is the half that outlives the page: closing the tab is what asks whether to keep these,
+     * and by then the webview is gone.
+     */
+    interface EditSetting {
+        readonly type: 'edit';
         readonly scope: Scope;
         readonly path: readonly string[];
         readonly value: unknown;
+    }
+
+    /** Write every pending edit. */
+    interface SaveSettings {
+        readonly type: 'save';
+    }
+
+    /** Drop every pending edit and show what is on disk again. */
+    interface DiscardEdits {
+        readonly type: 'discard';
     }
 
     /** Switch which scope the form edits. */
@@ -177,7 +205,9 @@ declare namespace SettingsMsg {
 
     type ToHost =
         | Ready
-        | SetSetting
+        | EditSetting
+        | SaveSettings
+        | DiscardEdits
         | SelectScope
         | OpenFile
         | CompleteConnection

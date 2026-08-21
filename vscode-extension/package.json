@@ -1326,7 +1326,7 @@
         "roslynSense.languages.valuesets": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Language features for strings whose allowed values live outside the code \u2014 the rows of a lookup table, most often. Completes a bound literal from the values themselves, explains on hover what a code means and where it is defined, and reports a string the set does not contain. Needs `valueSets` in `roslynsense.json` to have anything to do. Off leaves those literals as plain strings in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+          "markdownDescription": "Language features for a string that is really a code \u2014 an order status, a document type, a country \u2014 whose list of allowed values lives in a database table rather than in the code. Completes the literal from that list, explains on hover what the code means and where it is defined, and reports one the list does not have. Needs `valueSets` in `roslynsense.json` to have anything to do. Off leaves those literals as plain strings in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.msbuild": {
           "type": "boolean",

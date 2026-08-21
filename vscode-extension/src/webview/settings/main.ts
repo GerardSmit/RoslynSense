@@ -36,8 +36,50 @@ window.addEventListener('message', (event: MessageEvent<SettingsMsg.ToView>) => 
                 again();
             }
             break;
+        case 'saved':
+            pending.clear();
+            renderPending();
+            break;
     }
 });
+
+/**
+ * The settings changed since the last save, keyed by scope and path so that changing one of them
+ * twice writes it once.
+ *
+ * Nothing here has reached a file. The panel used to write on every commit, which made a file
+ * write out of every blur — including the ones that were on the way to somewhere else — and left
+ * no way to change your mind. The host is told about each edit as it happens all the same,
+ * because closing the tab is what asks whether to keep them and this page is gone by then.
+ */
+const pending = new Map<
+    string,
+    { readonly scope: SettingsMsg.Scope; readonly path: string[]; readonly value: unknown }
+>();
+
+function pendingKey(scope: SettingsMsg.Scope, path: readonly string[]): string {
+    return `${scope}\u0000${path.join('.')}`;
+}
+
+/** What the toolbar says about the edits waiting: how many, and the two things to do with them. */
+function renderPending(): void {
+    const save = document.getElementById('save') as HTMLButtonElement;
+    const discard = document.getElementById('discard') as HTMLButtonElement;
+    const label = document.getElementById('pending')!;
+
+    save.disabled = pending.size === 0;
+    discard.hidden = pending.size === 0;
+    label.textContent = pending.size === 0 ? '' : count(pending.size, 'unsaved change');
+}
+
+function save(): void {
+    // A field still being typed in has not committed yet, and it commits on leaving. Without this
+    // the edit somebody just made is the one Ctrl+S does not write.
+    if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+    }
+    vscode.postMessage({ type: 'save' });
+}
 
 /**
  * Controls whose answer came from the solution rather than from the schema.
@@ -89,6 +131,7 @@ function render(): void {
 
     renderScopes(state);
     renderNotice(state);
+    renderPending();
 
     const form = document.getElementById('form')!;
     form.textContent = '';
@@ -273,7 +316,7 @@ function renderSection(node: SchemaNode, path: string[], context: string): HTMLE
     if (node.description) {
         const blurb = document.createElement('p');
         blurb.className = 'group-description';
-        blurb.textContent = node.description;
+        blurb.append(prose(node.description));
         section.append(blurb);
     }
 
@@ -315,7 +358,7 @@ function renderSetting(node: SchemaNode, path: string[], context: string): HTMLE
     if (node.description) {
         const blurb = document.createElement('p');
         blurb.className = 'setting-description';
-        blurb.textContent = node.description;
+        blurb.append(prose(node.description));
         row.append(blurb);
     }
 
@@ -764,7 +807,7 @@ function itemRow(
     if (schema.description) {
         const blurb = document.createElement('p');
         blurb.className = 'item-help';
-        blurb.textContent = schema.description;
+        blurb.append(prose(schema.description));
         row.append(blurb);
     }
 
@@ -1447,9 +1490,7 @@ function memberShapeEditor(
             }
             // The other reading of the same words; see `pick`.
             for (const name of reading.alsoClasses.slice(0, 20)) {
-                const line = option(name, segment(head(input.value)), () => adopt(`${name}.`));
-                line.classList.add('call-class');
-                menu.append(line);
+                menu.append(option(name, segment(head(input.value)), () => adopt(`${name}.`)));
             }
             open(true);
             return;
@@ -1490,7 +1531,16 @@ function memberShapeEditor(
         const line = document.createElement('button');
         line.type = 'button';
         line.className = 'call-option';
-        line.append(highlight(name, typed));
+        line.title = name;
+
+        // One element rather than the fragment itself. The row is a flex container — an overload
+        // needs a signature and a place it is declared, one at each end — and a bare fragment's
+        // pieces each became a column of their own, so the tail of a highlighted name was thrown
+        // to the far right as if it were a second field.
+        const label = document.createElement('span');
+        label.append(highlight(name, typed));
+        line.append(label);
+
         line.addEventListener('click', choose);
         return line;
     }
@@ -1704,6 +1754,36 @@ function formatCall(type: string, member: string, parameters?: readonly string[]
     return parameters === undefined ? name : `${name}(${parameters.join(', ')})`;
 }
 
+/**
+ * A schema description, with what it writes in backticks set as code.
+ *
+ * The descriptions are markdown — the same strings feed VS Code's own settings UI, which renders
+ * them — so a page that set them as plain text showed the backticks around every file extension
+ * and every identifier in them.
+ */
+function prose(description: string): DocumentFragment {
+    const out = document.createDocumentFragment();
+
+    // Split on the backticks themselves: every odd piece is what was between a pair. An unpaired
+    // trailing backtick leaves its piece odd and unclosed, and setting it as code is the more
+    // useful reading of what the author meant.
+    const pieces = description.split('`');
+    for (let i = 0; i < pieces.length; i++) {
+        if (pieces[i] === '') {
+            continue;
+        }
+        if (i % 2 === 0) {
+            out.append(pieces[i]);
+            continue;
+        }
+        const code = document.createElement('code');
+        code.textContent = pieces[i];
+        out.append(code);
+    }
+
+    return out;
+}
+
 /** The typed fragment picked out of a suggestion, so it is clear why it is being offered. */
 function highlight(name: string, typed: string): DocumentFragment {
     const out = document.createDocumentFragment();
@@ -1801,8 +1881,19 @@ function escapeHatch(text: string): HTMLElement {
 // Values
 // ---------------------------------------------------------------------------
 
-/** What the scope being edited says itself, or undefined when it says nothing. */
+/**
+ * What the scope being edited says itself, or undefined when it says nothing.
+ *
+ * An unsaved edit answers ahead of the file, so the form shows what was typed rather than
+ * snapping back to disk on the next render — and `null`, the panel's "unset", reads as the scope
+ * saying nothing, which is what saving it would make true.
+ */
 function ownValue(path: string[]): unknown {
+    const edit = state ? pending.get(pendingKey(state.scope, path)) : undefined;
+    if (edit) {
+        return edit.value === null ? undefined : edit.value;
+    }
+
     const layer = state?.layers.find(
         (candidate) => candidate.scope === state!.scope && candidate.editable
     );
@@ -1847,7 +1938,9 @@ function set(path: string[], value: unknown): void {
     if (!state) {
         return;
     }
-    vscode.postMessage({ type: 'set', scope: state.scope, path, value });
+    pending.set(pendingKey(state.scope, path), { scope: state.scope, path, value });
+    vscode.postMessage({ type: 'edit', scope: state.scope, path, value });
+    renderPending();
 }
 
 function typeOf(node: SchemaNode): string {
@@ -1892,6 +1985,22 @@ function commitOnBlur(element: HTMLInputElement | HTMLTextAreaElement, commit: (
         }
     });
 }
+
+document.getElementById('save')!.addEventListener('click', save);
+
+document.getElementById('discard')!.addEventListener('click', () => {
+    pending.clear();
+    vscode.postMessage({ type: 'discard' });
+});
+
+// The shortcut every other editor in the window saves with. A webview does not get VS Code's own
+// keybindings, so a page that writes files has to bind it.
+window.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        save();
+    }
+});
 
 // The page holds nothing until the host sends it something, and the host does not know the script
 // has run until it says so. VS Code reloads a webview whenever it likes, which without this left

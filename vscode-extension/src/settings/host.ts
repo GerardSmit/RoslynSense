@@ -36,10 +36,63 @@ export function wire(
     let scope: ConfigScope = 'repo';
     let disposed = false;
 
+    /**
+     * The edits made since the last save, in the order they were made.
+     *
+     * Held here rather than only in the page because closing the tab is what asks whether to keep
+     * them, and the webview is gone by the time that question can be answered. Keyed by scope and
+     * path, so changing one setting twice before saving writes it once.
+     */
+    const pending = new Map<string, { scope: ConfigScope; path: readonly string[]; value: unknown }>();
+
     panel.onDidDispose(() => {
         disposed = true;
         onDispose();
+        void offerToKeep();
     });
+
+    /**
+     * The tab closed with edits nobody wrote. VS Code has no way to ask before a webview panel
+     * goes — there is no veto and no "are you sure" — so the question is asked after, where it can
+     * still save what the person typed rather than let it vanish silently.
+     */
+    async function offerToKeep(): Promise<void> {
+        if (pending.size === 0) {
+            return;
+        }
+
+        const keep = 'Save';
+        const answer = await vscode.window.showWarningMessage(
+            `RoslynSense settings closed with ${count(pending.size, 'unsaved change')}.`,
+            { modal: true },
+            keep
+        );
+
+        if (answer === keep) {
+            await saveAll();
+        }
+        pending.clear();
+    }
+
+    /** Writes every pending edit, weakest scope first, and reports the first failure. */
+    async function saveAll(): Promise<string | undefined> {
+        const edits = [...pending.values()];
+        pending.clear();
+
+        let written: string | undefined;
+        for (const edit of edits) {
+            // `null` over the wire is the panel's "unset"; `undefined` does not survive JSON, and
+            // removing the key is what puts the setting back to inherited.
+            written = await writeSetting(
+                edit.scope,
+                workingDirectory(),
+                edit.path as string[],
+                edit.value === null ? undefined : edit.value
+            );
+        }
+
+        return written;
+    }
 
     const post = (message: SettingsMsg.ToView) => {
         if (!disposed) {
@@ -139,19 +192,33 @@ export function wire(
                 return;
             }
 
-            case 'set': {
+            case 'edit':
+                pending.set(`${message.scope}\u0000${message.path.join('.')}`, {
+                    scope: message.scope,
+                    path: message.path,
+                    value: message.value,
+                });
+                return;
+
+            case 'discard':
+                pending.clear();
+                post({ type: 'saved' });
+                post(buildState(scope));
+                return;
+
+            case 'save': {
+                if (pending.size === 0) {
+                    return;
+                }
+
+                const changed = pending.size;
                 try {
-                    // `null` over the wire is the panel's "unset"; `undefined` does not survive
-                    // JSON, and removing the key is what puts the setting back to inherited.
-                    const value = message.value === null ? undefined : message.value;
-                    const written = await writeSetting(
-                        message.scope,
-                        workingDirectory(),
-                        message.path,
-                        value
-                    );
-                    post(buildState(scope, `Saved to ${written}`));
+                    const written = await saveAll();
+                    post({ type: 'saved' });
+                    post(buildState(scope, `${count(changed, 'change')} written to ${written}`));
                 } catch (error) {
+                    // Whatever did land is on disk; the state that follows is what actually is.
+                    post({ type: 'saved' });
                     post(buildState(scope, `Could not save: ${describe(error)}`));
                 }
                 return;
@@ -296,4 +363,8 @@ function normalize(filePath: string): string {
 
 function describe(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+function count(n: number, noun: string): string {
+    return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }

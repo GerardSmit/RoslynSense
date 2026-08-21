@@ -1,4 +1,4 @@
-﻿/*
+/*
  * The settings panel. Every colour is a VS Code theme variable, so the page follows the editor
  * into whatever theme it is wearing rather than approximating one.
  */
@@ -13,36 +13,41 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
- * Chrome: scope selector, file path, search, notice
+ * Chrome: search and save, then the scope being edited and the file it writes
  * ------------------------------------------------------------------------- */
 
 .chrome {
     position: sticky;
     top: 0;
     z-index: 1;
-    padding: 12px 20px 10px;
+    padding: 10px 20px;
     background: var(--vscode-editor-background);
     border-bottom: 1px solid var(--vscode-panel-border);
 }
 
-.scope-row {
+/*
+ * The two things that act on the whole page, on one line: what it is filtered by, and the one
+ * button that writes. Everything below this line is about a particular setting.
+ */
+.toolbar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
+    gap: 8px;
 }
 
-.scope-label {
-    color: var(--vscode-descriptionForeground);
-    text-transform: uppercase;
-    font-size: 0.85em;
-    letter-spacing: 0.06em;
+.scope-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    margin-top: 8px;
 }
 
 #scopes {
     display: flex;
     align-items: center;
     gap: 2px;
+    flex: none;
 }
 
 /* The separator makes the tab row read as what it is: the merge, weakest to strongest. The glyph
@@ -81,20 +86,33 @@ body {
     color: var(--vscode-descriptionForeground);
 }
 
+/* Trails the tabs on the same line: the tabs say which scope, this says which file it is. */
 .scope-file {
-    margin: 6px 0 0;
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-align: right;
     font-family: var(--vscode-editor-font-family);
     font-size: 0.9em;
     color: var(--vscode-descriptionForeground);
 }
 
-.search-row {
-    margin-top: 8px;
+.scope-file .linklike {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Cut at the front, so the file name survives and the directories are what go. */
+    direction: rtl;
+    unicode-bidi: plaintext;
 }
 
 #search {
-    width: 100%;
-    max-width: 360px;
+    flex: 1;
+    min-width: 0;
+    max-width: 420px;
     box-sizing: border-box;
     padding: 4px 8px;
     font: inherit;
@@ -102,6 +120,35 @@ body {
     background: var(--vscode-input-background);
     border: 1px solid var(--vscode-input-border, transparent);
     border-radius: 3px;
+}
+
+/* Pushed to the far edge whatever the search box does with the space between. */
+.save {
+    margin-left: auto;
+    flex: none;
+    padding: 4px 16px;
+    font: inherit;
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.save:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.save:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* How many edits are waiting, so the button is never the only thing that knows. */
+.pending {
+    flex: none;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
 }
 
 #search::placeholder {
@@ -142,9 +189,33 @@ main {
     font-weight: 600;
 }
 
+/*
+ * A top-level section announces itself: room above it, a larger heading, and a rule under the
+ * heading running the width of the page. Without one, "WebForms markup" arrived in the middle of
+ * a run of settings rows — each of which draws its own hairline — and read as one more row's
+ * label rather than as the start of something.
+ */
+main > .group {
+    margin-top: 44px;
+}
+
+main > .group:first-child {
+    margin-top: 20px;
+}
+
+main > .group > h2 {
+    padding-bottom: 6px;
+    font-size: 1.35em;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
 .group-description {
     margin: 4px 0 12px;
     color: var(--vscode-descriptionForeground);
+}
+
+main > .group > .group-description {
+    margin-top: 8px;
 }
 
 /* Nested groups step in, so `debugger` under the root reads as part of it. */
@@ -152,6 +223,17 @@ main {
     margin: 20px 0 0 16px;
     padding-left: 12px;
     border-left: 1px solid var(--vscode-panel-border);
+}
+
+/*
+ * What a description writes in backticks. The editor's font and the theme's own code colour, and
+ * no chip behind it: these paragraphs are mostly about file names and identifiers, and a
+ * background on each one turns a sentence into a row of boxes.
+ */
+code {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.95em;
+    color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
 }
 
 .setting {
@@ -527,25 +609,20 @@ main {
     width: 100%;
 }
 
-/* A class among the methods, when the words typed could be either. */
-.call-option.call-class {
-    color: var(--vscode-descriptionForeground);
-}
-
-.call-option.call-class.active,
-.call-option.call-class:hover {
-    color: var(--vscode-editorSuggestWidget-selectedForeground, var(--vscode-list-activeSelectionForeground));
-}
-
-/* The characters that were typed, in the name being offered because of them. */
+/*
+ * The characters that were typed, in the name being offered because of them. The list's own
+ * highlight colour, which is the one picked to carry against a list background in every theme —
+ * and the row around it stays at full foreground, because a highlight is only readable against
+ * text that is itself readable.
+ */
 .match {
-    color: var(--vscode-editorSuggestWidget-highlightForeground, var(--vscode-textLink-foreground));
+    color: var(--vscode-list-highlightForeground, var(--vscode-editorSuggestWidget-highlightForeground));
     font-weight: 600;
 }
 
 .call-option.active .match,
 .call-option:hover .match {
-    color: var(--vscode-editorSuggestWidget-focusHighlightForeground, inherit);
+    color: var(--vscode-list-focusHighlightForeground, var(--vscode-list-highlightForeground));
 }
 
 /* What the entry currently selects — the one thing three text boxes could never say. */

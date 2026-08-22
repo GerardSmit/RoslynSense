@@ -171,7 +171,14 @@ class Program
         // which a thin forwarding client never needs. If it ever falls back to in-process, the
         // static ctor runs lazily then; the cap there is the default (the daemon sets its own).
         if (sharedHostSolution is null)
+        {
             WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
+
+            // An in-process MCP server lives long enough to reload solutions; standby hosts are
+            // what make those reloads meet warm MSBuild processes. (In shared-host mode the
+            // daemon enables its own.)
+            RoslynMCP.Services.SharedBuildHost.EnableStandbys();
+        }
 
         // WithStdioServerTransport() would take stdout from Console.OpenStandardOutput(), whose
         // stream reports short and failed pipe writes as successes — silent data loss on a channel

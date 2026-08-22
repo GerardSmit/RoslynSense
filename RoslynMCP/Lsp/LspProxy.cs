@@ -133,6 +133,10 @@ internal static class LspProxy
             : startPath;
         WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
         WorkspaceService.EnsureRegistered();
+
+        // This process now hosts workspaces for a whole editor session, which is long enough to
+        // reload; standby hosts are what make those reloads meet warm MSBuild processes.
+        SharedBuildHost.EnableStandbys();
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         IOutputFormatter formatter = useToon ? new ToonFormatter() : new MarkdownFormatter();
         await using var services = Daemon.ToolHostServices.Build(settings, formatter, workingDir);

@@ -222,8 +222,37 @@ internal static partial class SharedBuildHost
             PrewarmShardAsync(workspace, properties, shard, index, evaluations, cancellationToken));
         if (legacy.Count > 0)
         {
+            // Two lanes when the second host is warm and there is enough serial work to split;
+            // one lane otherwise — see LegacySecondShard for why the standby is the condition.
+            // Greedy by file length, largest first (the list is already sorted): length is a
+            // rough proxy for evaluation cost, and rough is enough to keep one lane from
+            // holding both of the expensive projects.
+            List<string>? second = null;
+            if (legacy.Count >= 6
+                && s_standbys.TryGetValue($"{LegacySecondShard} {KeyFor(properties)}", out var ready)
+                && ready.IsCompletedSuccessfully)
+            {
+                var first = new List<string>();
+                second = [];
+                long firstLength = 0, secondLength = 0;
+                foreach (string path in legacy)
+                {
+                    long length;
+                    try { length = new FileInfo(path).Length; } catch (IOException) { length = 0; }
+
+                    if (firstLength <= secondLength) { first.Add(path); firstLength += length; }
+                    else { second.Add(path); secondLength += length; }
+                }
+                legacy = first;
+            }
+
             lanes = lanes.Append(PrewarmShardAsync(
                 workspace, properties, legacy, LegacyShard, evaluations, cancellationToken));
+            if (second is { Count: > 0 })
+            {
+                lanes = lanes.Append(PrewarmShardAsync(
+                    workspace, properties, second, LegacySecondShard, evaluations, cancellationToken));
+            }
         }
 
         int[] evaluated = await Task.WhenAll(lanes);
@@ -232,15 +261,24 @@ internal static partial class SharedBuildHost
             PoolSize, evaluated.Sum(), watch.Elapsed.TotalSeconds);
     }
 
-    /// <summary>Sentinel shard index for the one host that serves every legacy project of an
-    /// open. One lane, one host, on purpose: a second .NET Framework host — split statically,
-    /// stealing from a shared queue, and (with its handshake prepaid by ignition) engaged as an
-    /// extra evaluation slot both immediately and after the first evaluation — was measured a
-    /// net loss every way, because each host pays its own VS MSBuild initialisation per project
-    /// language, the parallel initialisations slow each other and every SDK shard beside them,
-    /// and the serial evaluation left to split never covers that. See the routing in
-    /// <see cref="PrewarmEvaluationsAsync"/>.</summary>
+    /// <summary>Sentinel shard index for the host that serves the legacy projects of an open.
+    /// On a cold open this is the only legacy lane, on purpose: a second .NET Framework host —
+    /// split statically, stealing from a shared queue, and (with its handshake prepaid by
+    /// ignition) engaged as an extra evaluation slot both immediately and after the first
+    /// evaluation — was measured a net loss every way, because each host pays its own VS
+    /// MSBuild initialisation per project language, the parallel initialisations slow each
+    /// other and every SDK shard beside them, and the serial evaluation left to split never
+    /// covers that. See the routing in <see cref="PrewarmEvaluationsAsync"/>.</summary>
     private const int LegacyShard = -2;
+
+    /// <summary>
+    /// The second legacy lane, used only when its host is already warm. Every refutation behind
+    /// <see cref="LegacyShard"/>'s one-lane rule traces to the second host paying its own VS
+    /// MSBuild initialisation on the open's critical path; a standby prepays exactly that, so a
+    /// reload that finds one warm can halve the lane's serial evaluation without paying what
+    /// made the split a loss. No warm standby, no split — a cold open still runs one lane.
+    /// </summary>
+    private const int LegacySecondShard = -3;
 
     /// <summary>
     /// Starts every BuildHost process a cold solution open is about to need — immediately,
@@ -444,6 +482,21 @@ internal static partial class SharedBuildHost
                         {
                             foreach (string path in provider.HostEvaluated)
                                 seen.Add(path);
+                        }
+
+                        // This host now holds real evaluations, so the next reload will retire
+                        // it. Its replacement starts warming once the load's dust settles. Both
+                        // legacy lanes are armed from either, so the next reload can split the
+                        // serial work a single lane did alone.
+                        if (shardIndex is LegacyShard or LegacySecondShard)
+                        {
+                            string suffix = KeyFor(properties);
+                            ScheduleStandby($"{LegacyShard} {suffix}", properties, shard[0]);
+                            ScheduleStandby($"{LegacySecondShard} {suffix}", properties, shard[0]);
+                        }
+                        else
+                        {
+                            ScheduleStandby(key, properties, shard[0]);
                         }
                     }
 
@@ -698,12 +751,196 @@ internal static partial class SharedBuildHost
             seen.Clear();
     }
 
+    /// <summary>
+    /// Replacement hosts warmed before anything needs them, keyed like <see cref="s_managers"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A reload retires every host whose evaluations it repeats — see
+    /// <see cref="RecycleIfAlreadyEvaluatedAsync"/>, which is correctness, not policy — so the
+    /// reload's first evaluation lands on a fresh process and pays MSBuild's initialisation
+    /// again. For the legacy lane that is the VS toolset parse, measured at ~2.4 s of an
+    /// 80-project reload's wall. The one thing a recycle can never claim is a host that has
+    /// evaluated only a synthetic project, so that host is prepared here, during the idle time
+    /// after a load, and promoted when the recycle happens.
+    /// </para>
+    /// <para>
+    /// One standby per pool key, which roughly doubles the resident host count while a solution
+    /// is loaded. That is the price of a reload meeting warm hosts, and it is the deliberate
+    /// trade; <c>ROSLYNMCP_NO_STANDBY=1</c> turns the nursery off for machines where the memory
+    /// matters more than the reload.
+    /// </para>
+    /// </remarks>
+    private static readonly ConcurrentDictionary<string, Task<BuildHostProcessManager>> s_standbys =
+        new(StringComparer.Ordinal);
+
+    /// <summary>The warm standby for <paramref name="key"/>, or null when none has finished.</summary>
+    private static BuildHostProcessManager? TakeStandby(string key)
+    {
+        if (!s_standbys.TryGetValue(key, out var standby) || !standby.IsCompletedSuccessfully
+            || !s_standbys.TryRemove(key, out _))
+        {
+            return null;
+        }
+
+        Console.Error.WriteLine("[BuildHost] A warm standby stepped in as the host.");
+        return standby.Result;
+    }
+
+    /// <summary>
+    /// Standbys are for processes that live long enough to reload — the daemon, an in-process
+    /// MCP server. A one-shot CLI run must not arm them: the nursery would warm against the
+    /// open's own tail, and it measured a fresh-process cold open ~3 s slower for hosts the
+    /// process will never use.
+    /// </summary>
+    public static void EnableStandbys() => s_standbysEnabled = true;
+
+    private static volatile bool s_standbysEnabled;
+
+    private static void ScheduleStandby(
+        string key, ImmutableDictionary<string, string> properties, string samplePath)
+    {
+        if (!s_standbysEnabled || Environment.GetEnvironmentVariable("ROSLYNMCP_NO_STANDBY") == "1")
+            return;
+
+        s_standbys.GetOrAdd(key, k => Task.Run(async () =>
+        {
+            try
+            {
+                return await WarmStandbyAsync(properties, samplePath, s_standbyShutdown.Token);
+            }
+            catch (Exception ex)
+            {
+                // Retired so the next load schedules a fresh attempt; a failed warm-up costs the
+                // next reload its head start, never its correctness.
+                s_standbys.TryRemove(k, out _);
+                Console.Error.WriteLine($"[BuildHost] Standby warm-up failed: {ex.Message}");
+                throw;
+            }
+        }));
+    }
+
+    /// <summary>
+    /// Cancelled at shutdown, so a process on its way out interrupts warm-ups instead of either
+    /// waiting seconds for them or abandoning their subprocesses. A one-shot CLI run arms
+    /// standbys like any other load; this is what keeps that from costing its exit anything.
+    /// </summary>
+    private static readonly CancellationTokenSource s_standbyShutdown = new();
+
+    private static async Task<BuildHostProcessManager> WarmStandbyAsync(
+        ImmutableDictionary<string, string> properties, string samplePath,
+        CancellationToken cancellationToken)
+    {
+        // Same discipline as pool warming: initialisation runs in time nobody wanted, never
+        // against the load the editor is waiting on.
+        var deadline = Stopwatch.StartNew();
+        while (Volatile.Read(ref s_inFlightLoads) > 0 && deadline.Elapsed < TimeSpan.FromSeconds(30))
+            await Task.Delay(150, cancellationToken);
+
+        var manager = new BuildHostProcessManager(
+            knownCommandLineParserLanguages: [LanguageNames.CSharp, LanguageNames.VisualBasic],
+            globalMSBuildProperties: properties);
+
+        string? dir = null;
+        try
+        {
+            // The sample path picks the host process kind — .NET Framework for a legacy sample,
+            // .NET for an SDK one; the synthetic project is what the host then evaluates,
+            // because connecting is not what makes a host warm.
+            await manager.GetBuildHostWithFallbackAsync(samplePath, cancellationToken);
+
+            dir = Path.Combine(Path.GetTempPath(), $"roslynsense-warmup-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            string? warmup = PathHelper.RequiresMsBuild(samplePath)
+                ? WriteLegacyWarmupProject(dir)
+                : WriteSdkWarmupProject(dir, samplePath);
+            if (warmup is null)
+                return manager;     // Spawned and connected; initialisation stays with the first load.
+
+            var watch = Stopwatch.StartNew();
+            var loader = new MSBuildProjectLoader(s_warmupWorkspace.Value, properties);
+            var provider = new BuildHostProjectFileInfoProvider(
+                manager, loader.ProjectFileExtensionRegistry, loader.Reporter, progress: null);
+            await loader.LoadInfosAsync(
+                [warmup], provider, ProjectMap.Create(), progress: null, cancellationToken);
+
+            Console.Error.WriteLine(
+                $"[BuildHost] Standby warmed in {watch.ElapsedMilliseconds} ms.");
+            return manager;
+        }
+        catch
+        {
+            await manager.DisposeAsync();
+            throw;
+        }
+        finally
+        {
+            if (dir is not null)
+                try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// A throwaway non-SDK project whose evaluation forces the VS toolset parse — the standard
+    /// targets under the VS install, which is what a legacy host's first evaluation pays for.
+    /// </summary>
+    private static string WriteLegacyWarmupProject(string dir)
+    {
+        string path = Path.Combine(dir, "Warmup.csproj");
+        File.WriteAllText(path, """
+            <?xml version="1.0" encoding="utf-8"?>
+            <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+              <PropertyGroup>
+                <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+                <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+                <OutputType>Library</OutputType>
+                <AssemblyName>RoslynSenseWarmup</AssemblyName>
+                <RootNamespace>RoslynSenseWarmup</RootNamespace>
+                <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+                <OutputPath>bin\$(Configuration)\</OutputPath>
+              </PropertyGroup>
+              <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+            </Project>
+            """);
+        return path;
+    }
+
+    /// <summary>
+    /// A throwaway project naming the same SDK and target framework as
+    /// <paramref name="samplePath"/>, so evaluating it parses the same targets the real projects
+    /// will need. Null when the sample's SDK cannot be read — then connecting was all the warmth
+    /// available.
+    /// </summary>
+    private static string? WriteSdkWarmupProject(string dir, string samplePath)
+    {
+        string? sdk = PathHelper.ReadProjectSdk(samplePath);
+        if (sdk is null or "")
+            return null;
+
+        string framework = ReadFirstTargetFramework(samplePath) ?? "net8.0";
+        string path = Path.Combine(dir, "Warmup.csproj");
+        File.WriteAllText(path, $"""
+            <Project Sdk="{sdk}">
+              <PropertyGroup>
+                <TargetFramework>{framework}</TargetFramework>
+                <EnableDefaultItems>false</EnableDefaultItems>
+              </PropertyGroup>
+            </Project>
+            """);
+        return path;
+    }
+
     private static BuildHostProcessManager ManagerFor(string key, ImmutableDictionary<string, string> properties)
     {
         s_lastUsed[key] = Interlocked.Increment(ref s_useClock);
 
+        // A warm standby, if one is ready, is the host — whether this key's previous host was
+        // just recycled or the key has never had one. Only a finished warm-up is taken: an
+        // unfinished one is waiting for loads to go idle, and the load calling here is exactly
+        // what it is waiting for, so blocking on it would be a deadlock. It stays in the nursery
+        // for the reload after this one.
         var manager = s_managers.GetOrAdd(key, _ => new Lazy<BuildHostProcessManager>(
-            () => new BuildHostProcessManager(
+            () => TakeStandby(key) ?? new BuildHostProcessManager(
                 knownCommandLineParserLanguages: [LanguageNames.CSharp, LanguageNames.VisualBasic],
                 globalMSBuildProperties: properties),
             LazyThreadSafetyMode.ExecutionAndPublication)).Value;
@@ -1030,6 +1267,28 @@ internal static partial class SharedBuildHost
     /// <summary>Tears down every host. Called when the process is shutting down.</summary>
     public static async Task DisposeAllAsync()
     {
+        // Standbys first: each is a subprocess just like a pool host, only not yet promoted.
+        // Cancelled and then awaited rather than abandoned — a warm-up still running holds the
+        // very process that would otherwise be orphaned, and cancelling first means the await is
+        // an interruption, not a wait for the warm-up to finish.
+        s_standbyShutdown.Cancel();
+        foreach (var (key, standby) in s_standbys.ToArray())
+        {
+            s_standbys.TryRemove(key, out _);
+            try
+            {
+                await (await standby).DisposeAsync();
+            }
+            catch (OperationCanceledException)
+            {
+                // The warm-up disposed its own manager on the way out.
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[BuildHost] Shutdown of a standby host failed: {ex.Message}");
+            }
+        }
+
         foreach (var (key, manager) in s_managers.ToArray())
         {
             s_managers.TryRemove(key, out _);

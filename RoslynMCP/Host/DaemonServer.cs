@@ -47,6 +47,10 @@ internal sealed class DaemonServer
         var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out _);
         DebuggerViewOptions.Current = settings.DebugView;
 
+        // A daemon lives long enough to reload; standby hosts are what make those reloads meet
+        // warm MSBuild processes instead of paying initialisation again.
+        SharedBuildHost.EnableStandbys();
+
         // Acquire the single-owner lock BEFORE any expensive setup (MSBuild registration, DI
         // build). This is what guarantees exactly one live host per solution: a daemon that
         // loses the race exits immediately, before listening on the pipe — so two daemons can

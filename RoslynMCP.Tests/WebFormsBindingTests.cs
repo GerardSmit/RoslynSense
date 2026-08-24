@@ -1,7 +1,9 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
+using Microsoft.Extensions.DependencyInjection;
+using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Languages.WebForms.Core;
@@ -372,6 +374,89 @@ public class WebFormsBindingTests
         Assert.Empty(await scenario.BindingDiagnosticsAsync());
     }
 
+    /// <summary>
+    /// And it offers the same completions, at the caret inside the attribute's quotes.
+    /// </summary>
+    /// <remarks>
+    /// The list has to be reached from the attribute-value branch rather than the code branch:
+    /// `SortExpression="…"` is not inline C#, so nothing takes it through the projection, and the
+    /// branch that does own it resolves the control's property, finds a string, and offers
+    /// nothing — at the one caret where the bound item's fields are the whole answer.
+    /// </remarks>
+    [Fact]
+    public async Task AConfiguredAttributeOffersTheBoundItemsFields()
+    {
+        using var configured = new Configured(Member("grid:Column", "SortExpression"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <grid:Column runat="server" ID="col" SortExpression="|" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var labels = (await scenario.CompleteAsync()).Items.Select(i => i.Label).ToArray();
+
+        Assert.Contains("Amount", labels);
+        Assert.Contains("Buyer", labels);
+        Assert.DoesNotContain("Secret", labels);
+    }
+
+    /// <summary>A dotted path walks the same way it does inside an <c>Eval</c>.</summary>
+    [Fact]
+    public async Task AConfiguredAttributeOffersTheMembersOfASegmentAlreadyWritten()
+    {
+        using var configured = new Configured(Member("grid:Column", "SortExpression"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <grid:Column runat="server" ID="col" SortExpression="Buyer.|" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var labels = (await scenario.CompleteAsync()).Items.Select(i => i.Label).ToArray();
+
+        Assert.Equal(["Name"], labels);
+    }
+
+    /// <summary>
+    /// And it is coloured like one: the member it names, in the colour a member gets.
+    /// </summary>
+    /// <remarks>
+    /// The grammar paints an attribute value as one string whatever is in it, so a page's grid
+    /// columns looked untouched next to the templates below them even where every name in them had
+    /// been resolved. The colour is the only thing that says the check happened.
+    /// </remarks>
+    [Fact]
+    public async Task AConfiguredAttributeIsColouredLikeAnEvalArgument()
+    {
+        using var configured = new Configured(Member("grid:Column", "SortExpression"));
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <grid:Column runat="server" ID="c|ol" SortExpression="Buyer.Name" />
+                    <grid:Column runat="server" ID="bad" SortExpression="Amont" />
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var coloured = await scenario.BindingColoursAsync();
+
+        Assert.True(coloured["Buyer"]);
+        Assert.True(coloured["Name"]);
+        Assert.False(coloured["Amont"]);
+    }
+
     /// <summary>And a misspelling in one is reported the same way.</summary>
     [Fact]
     public async Task AMisspelledMemberInAConfiguredAttributeIsReported()
@@ -417,6 +502,147 @@ public class WebFormsBindingTests
             """,
             ItemCodeBehind);
 
+        Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>
+    /// The container the editor talks to publishes the configured attributes, not just the
+    /// container-less one.
+    /// </summary>
+    /// <remarks>
+    /// Two registration paths exist — <c>Create</c> for a host that builds no container, and
+    /// <c>AddLanguagePacks</c> for the daemon and the MCP server — and the settings are a static
+    /// because the markup handlers are static. Publishing them from one path only is invisible in
+    /// every test that sets the static itself, and leaves every configured <c>SortExpression</c>
+    /// dead in the only host an editor ever connects to.
+    /// </remarks>
+    [Fact]
+    public void RegisteringThePacksIntoAContainerPublishesTheConfiguredAttributes()
+    {
+        var previous = MarkupBindingSettings.Current;
+        MarkupBindingSettings.Current = MarkupBindingSettings.None;
+
+        try
+        {
+            var config = new RoslynSenseConfig
+            {
+                WebForms = new WebFormsConfig
+                {
+                    DataExpressions = [new MarkupBindingEntry { Tag = "*", Attribute = "SortExpression" }],
+                },
+            };
+
+            var settings = EffectiveSettings.Resolve([], config, out _);
+            new ServiceCollection().AddLanguagePacks(settings);
+
+            var published = Assert.Single(MarkupBindingSettings.Current.Attributes);
+            Assert.Equal("SortExpression", published.Attribute);
+            Assert.NotNull(MarkupBindingSettings.Current.For(prefix: "telerik", "GridTemplateColumn", "SortExpression"));
+        }
+        finally
+        {
+            MarkupBindingSettings.Current = previous;
+        }
+    }
+
+    // ---- The container form ----------------------------------------------------------------
+
+    /// <summary>
+    /// A path handed the container rather than the item walks from the item all the same.
+    /// </summary>
+    /// <remarks>
+    /// <c>DataBinder.Eval(Container, "DataItem.Amount")</c> is the long-hand a generated page and a
+    /// hand-written one are both full of, and it was read as though the container were the item —
+    /// so its first segment named a member no order has and the whole path was reported wrong.
+    /// Which of the two forms is written is a question about the call, not about the path: the
+    /// first argument is the only thing that says it.
+    /// </remarks>
+    [Fact]
+    public async Task APathWrittenAgainstTheContainerResolvesFromTheItem()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <%# DataBinder.Eval(Container, "DataItem.Am|ount") %>
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        string? hover = await scenario.HoverBindingAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Amount", hover);
+        Assert.Empty(await scenario.BindingDiagnosticsAsync());
+    }
+
+    /// <summary>A misspelling after the hop is still reported.</summary>
+    [Fact]
+    public async Task AMisspellingAfterTheContainerHopIsReported()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <%# DataBinder.Eval(Container, "DataItem.Am|ont") %>
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var diagnostic = Assert.Single(await scenario.BindingDiagnosticsAsync());
+
+        Assert.Equal("WFB0001", diagnostic.Code);
+        Assert.Contains("Amont", diagnostic.Message);
+    }
+
+    /// <summary>
+    /// And the item form is left as it was: there the container's own hop is a mistake.
+    /// </summary>
+    [Fact]
+    public async Task APathWrittenAgainstTheItemStillReportsTheContainersHop()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <%# DataBinder.Eval(Container.DataItem, "DataIt|em.Amount") %>
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        var diagnostic = Assert.Single(await scenario.BindingDiagnosticsAsync());
+
+        Assert.Equal("WFB0001", diagnostic.Code);
+        Assert.Contains("DataItem", diagnostic.Message);
+    }
+
+    /// <summary>
+    /// A cast container reads as a container: what is not a <c>DataItem</c> holds one.
+    /// </summary>
+    [Fact]
+    public async Task ACastContainerIsStillAContainer()
+    {
+        using var scenario = Scenario.Create(
+            """
+            <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+            <asp:Repeater ID="rptOrders" runat="server" ItemType="Fixture.Order">
+                <ItemTemplate>
+                    <%# DataBinder.Eval((RepeaterItem)Container, "DataItem.Buyer.Na|me") %>
+                </ItemTemplate>
+            </asp:Repeater>
+            """,
+            ItemCodeBehind);
+
+        string? hover = await scenario.HoverBindingAsync();
+
+        Assert.NotNull(hover);
+        Assert.Contains("Name", hover);
         Assert.Empty(await scenario.BindingDiagnosticsAsync());
     }
 
@@ -1381,6 +1607,25 @@ public class WebFormsBindingTests
 
         public Task<RoslynMCP.Lsp.Protocol.Diagnostic[]> BindingDiagnosticsAsync() =>
             AspxBindingDiagnostics.DiagnosticsAsync(Document, default);
+
+        /// <summary>
+        /// The coloured runs of the page's binding paths, by the text each one covers, with the
+        /// resolved ones told apart from the unresolved ones.
+        /// </summary>
+        public async Task<Dictionary<string, bool>> BindingColoursAsync()
+        {
+            var found = new Dictionary<string, bool>(StringComparer.Ordinal);
+
+            await WebFormsLanguage.ColourBindingPathsAsync(
+                Document,
+                (span, type) => found[Document.Text[span.Start..span.End]] = type == Resolved,
+                property: Resolved, unknown: Unknown, default);
+
+            return found;
+        }
+
+        private const int Resolved = 1;
+        private const int Unknown = 2;
 
         /// <summary>What hover says about the format string under the caret.</summary>
         public async Task<string?> FormatHoverAsync() =>

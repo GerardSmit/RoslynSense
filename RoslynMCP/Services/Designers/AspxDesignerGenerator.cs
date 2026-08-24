@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using Microsoft.CodeAnalysis;
 using WebFormsCore.Nodes;
 using RoslynMCP.Languages.WebForms.Core;
@@ -53,12 +53,15 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
                 "that the code-behind class exists in this project.");
         }
 
+        var style = DesignerStyle.Detect(designerPath);
+
         var group = await FindInheritsGroupAsync(
             project, filePath, parseResult.ParseTree, codeBehind, compilation, projectDir, cancellationToken);
 
         if (group.Count > 1)
             return await GenerateForGroupAsync(
-                filePath, designerPath, parseResult, codeBehind, group, compilation, projectDir, cancellationToken);
+                filePath, designerPath, parseResult, codeBehind, group, style, compilation, projectDir,
+                cancellationToken);
 
         var fields = CollectFields(
             parseResult.ParseTree, codeBehind,
@@ -66,7 +69,8 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         var masterType = await ResolveMasterTypeAsync(
             parseResult, filePath, compilation, projectDir, cancellationToken);
 
-        return new DesignerResult(designerPath, Render(codeBehind, fields, masterType), []);
+        return new DesignerResult(
+            designerPath, Render(codeBehind, KeepExistingOrder(fields, style), masterType, style), []);
     }
 
     /// <summary>
@@ -83,6 +87,7 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         AspxParseResult parseResult,
         INamedTypeSymbol codeBehind,
         List<MarkupFile> group,
+        DesignerStyle style,
         Compilation compilation,
         string? projectDir,
         CancellationToken cancellationToken)
@@ -91,7 +96,7 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
 
         if (!PathsEqual(canonicalPath, filePath))
         {
-            return new DesignerResult(designerPath, Render(codeBehind, [], masterType: null), [])
+            return new DesignerResult(designerPath, Render(codeBehind, [], masterType: null, style), [])
             {
                 RelatedSources = [canonicalPath],
             };
@@ -106,7 +111,9 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
             parseResult, filePath, compilation, projectDir, cancellationToken);
 
         return new DesignerResult(
-            designerPath, Render(codeBehind, fields, masterType, nullableDirective: true), [])
+            designerPath,
+            Render(codeBehind, KeepExistingOrder(fields, style), masterType, style, nullableDirective: true),
+            [])
         {
             RelatedSources = [.. group.Select(file => file.Path).Where(path => !PathsEqual(path, filePath))],
         };
@@ -316,6 +323,30 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         return fields;
     }
 
+    /// <summary>
+    /// Puts the fields back in the order the designer file already declares them, with fields the
+    /// markup has newly gained appended in markup order.
+    /// </summary>
+    /// <remarks>
+    /// Markup order is the order Visual Studio would emit, but a designer file that has been around
+    /// for a while no longer matches it: controls get moved around the page, and Visual Studio only
+    /// rewrites the file when it happens to be open. Re-sorting on every regeneration produces a
+    /// diff of hundreds of moved lines that says nothing, so the file's own order wins and a real
+    /// change shows up as the addition it is.
+    /// </remarks>
+    private static List<DesignerField> KeepExistingOrder(List<DesignerField> fields, DesignerStyle style)
+    {
+        if (style.FieldOrder.Count == 0)
+            return fields;
+
+        var rank = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < style.FieldOrder.Count; i++)
+            rank.TryAdd(style.FieldOrder[i], i);
+
+        // OrderBy is stable, so the fields with no place yet stay in markup order behind the rest.
+        return [.. fields.OrderBy(field => rank.TryGetValue(field.Name, out var index) ? index : int.MaxValue)];
+    }
+
     private static IEnumerable<(string Name, INamedTypeSymbol Type)> EnumerateDesignerControls(RootNode root)
     {
         foreach (var control in root.AllChildren.OfType<ControlNode>())
@@ -434,7 +465,8 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
 
     // Visual Studio's designer files come out of CodeDOM, which indents otherwise-blank separator
     // lines to the current nesting level. Reproducing that exactly keeps regeneration from
-    // rewriting every line of a file Visual Studio wrote.
+    // rewriting every line of a file Visual Studio wrote. A file that has since been reformatted
+    // keeps its own conventions instead — see DesignerStyle.
     private const string Header =
         """
         //------------------------------------------------------------------------------
@@ -451,14 +483,14 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
 
     private static string Render(
         INamedTypeSymbol codeBehind, List<DesignerField> fields, INamedTypeSymbol? masterType,
-        bool nullableDirective = false)
+        DesignerStyle style, bool nullableDirective = false)
     {
         var ns = codeBehind.ContainingNamespace is { IsGlobalNamespace: false } containing
             ? containing.ToDisplayString()
             : null;
 
         var sb = new StringBuilder();
-        sb.Append(Header);
+        sb.Append(style.Header ?? Header);
 
         if (nullableDirective)
         {
@@ -469,24 +501,24 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         var indent = ns is null ? "" : "    ";
         if (ns is not null)
         {
-            sb.Append("namespace ").Append(ns).AppendLine(" {");
-            sb.AppendLine(indent);
-            sb.AppendLine(indent);
+            AppendBlockStart(sb, style, "", "namespace " + ns);
+            AppendBlank(sb, style, indent);
+            AppendBlank(sb, style, indent);
         }
 
-        sb.Append(indent).Append("public partial class ").Append(codeBehind.Name).AppendLine(" {");
+        AppendBlockStart(sb, style, indent, "public partial class " + codeBehind.Name);
 
         var memberIndent = indent + "    ";
         foreach (var field in fields)
         {
-            sb.AppendLine(memberIndent);
+            AppendBlank(sb, style, memberIndent);
             AppendField(sb, memberIndent, field);
         }
 
         if (masterType is not null)
         {
-            sb.AppendLine(memberIndent);
-            AppendMasterProperty(sb, memberIndent, masterType);
+            AppendBlank(sb, style, memberIndent);
+            AppendMasterProperty(sb, memberIndent, masterType, style);
         }
 
         sb.Append(indent).AppendLine("}");
@@ -495,6 +527,19 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
 
         return sb.ToString();
     }
+
+    /// <summary>Writes a declaration and its opening brace, on one line or two.</summary>
+    private static void AppendBlockStart(
+        StringBuilder sb, DesignerStyle style, string indent, string declaration)
+    {
+        if (style.BraceOnNewLine)
+            sb.Append(indent).AppendLine(declaration).Append(indent).AppendLine("{");
+        else
+            sb.Append(indent).Append(declaration).AppendLine(" {");
+    }
+
+    private static void AppendBlank(StringBuilder sb, DesignerStyle style, string indent) =>
+        sb.AppendLine(style.IndentBlankLines ? indent : "");
 
     private static void AppendField(StringBuilder sb, string indent, DesignerField field)
     {
@@ -511,7 +556,8 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         sb.Append(' ').Append(field.Name).AppendLine(";");
     }
 
-    private static void AppendMasterProperty(StringBuilder sb, string indent, INamedTypeSymbol masterType)
+    private static void AppendMasterProperty(
+        StringBuilder sb, string indent, INamedTypeSymbol masterType, DesignerStyle style)
     {
         var name = masterType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
             .Replace("global::", "", StringComparison.Ordinal);
@@ -522,9 +568,9 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         sb.Append(indent).AppendLine("/// <remarks>");
         sb.Append(indent).AppendLine("/// Auto-generated property.");
         sb.Append(indent).AppendLine("/// </remarks>");
-        sb.Append(indent).Append("public new ").Append(name).AppendLine(" Master {");
-        sb.Append(indent).AppendLine("    get {");
-        sb.Append(indent).Append("        return ((").Append(name).AppendLine(")(base.Master));");
+        AppendBlockStart(sb, style, indent, $"public new {name} Master");
+        AppendBlockStart(sb, style, indent + "    ", "get");
+        sb.Append(indent).Append("        ").Append("return ((").Append(name).AppendLine(")(base.Master));");
         sb.Append(indent).AppendLine("    }");
         sb.Append(indent).AppendLine("}");
     }

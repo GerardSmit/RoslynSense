@@ -143,11 +143,19 @@ internal sealed partial class WebFormsLanguage : ILanguageSemanticTokensProvider
     /// the window.
     /// </para>
     /// </remarks>
-    private static async Task ColourBindingPathsAsync(
+    internal static async Task ColourBindingPathsAsync(
         AspxDocument document, Action<TextSpan, int> add, int property, int unknown,
         CancellationToken ct)
     {
-        foreach (var argument in DataBindingService.AllArguments(document.Text))
+        // The configured attributes alongside the `Eval` arguments, because a page's grid columns
+        // carry exactly the same paths as its templates do and a reader has no way to tell that
+        // the one the grammar left as a plain string was checked at all.
+        var paths = DataBindingService.AllArguments(document.Text)
+            .Concat(MarkupBindingSites.Enumerate(document)
+                .Where(site => site.Binding.Kind == MarkupBindingKind.Member)
+                .Select(site => site.Value));
+
+        foreach (var argument in paths)
         {
             ct.ThrowIfCancellationRequested();
 

@@ -2,6 +2,7 @@ using RoslynMCP.Languages.WebForms.Core;
 using RoslynMCP.Languages.WebForms.Lsp;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
+using WebFormsCore.Nodes;
 
 namespace RoslynMCP.Languages.WebForms;
 
@@ -16,6 +17,12 @@ namespace RoslynMCP.Languages.WebForms;
 /// else anywhere that has to move with them. An element the parser never matched a close tag to
 /// is left alone — guessing where the missing tag would have been is exactly the blind edit the
 /// C# rule exists to prevent.
+/// <para>
+/// Plain HTML tags never reach the tree at all — a <c>&lt;div&gt;</c> with no
+/// <c>runat="server"</c> is literal output, which the parser emits as text — so they are paired
+/// from the source by <see cref="MarkupTagPairs"/> instead, under the same rule: no partner
+/// found, no ranges offered.
+/// </para>
 /// </remarks>
 internal sealed partial class WebFormsLanguage : ILanguageLinkedEditingProvider
 {
@@ -31,12 +38,14 @@ internal sealed partial class WebFormsLanguage : ILanguageLinkedEditingProvider
     {
         var document = await AspxDocumentService.GetAsync(
             LspConverters.UriToPath(p.TextDocument.Uri), ct);
-        if (document?.Tree is not { } root)
+        if (document is null)
             return null;
 
         int offset = LspConverters.ToOffset(document.SourceText, p.Position);
 
-        foreach (var element in AspxSymbolResolver.EnumerateElements(root))
+        // A file too broken to have produced a tree still has tags in it, and that is exactly
+        // when the user is retyping one, so the text scan below stands in for the tree.
+        foreach (var element in EnumerateElementsOrNone(document))
         {
             ct.ThrowIfCancellationRequested();
 
@@ -60,6 +69,19 @@ internal sealed partial class WebFormsLanguage : ILanguageLinkedEditingProvider
                 TagNamePattern);
         }
 
-        return null;
+        // A plain `<div>` is literal output, so the parser left it as text and there is no
+        // element to have found above. The pair is still there in the source.
+        if (MarkupTagPairs.At(document.Text, offset) is not { } pair)
+            return null;
+
+        return new LinkedEditingRanges(
+            [
+                AspxLanguageHandler.ToRange(document, pair.Open),
+                AspxLanguageHandler.ToRange(document, pair.Close),
+            ],
+            TagNamePattern);
     }
+
+    private static IEnumerable<ElementNode> EnumerateElementsOrNone(AspxDocument document) =>
+        document.Tree is { } root ? AspxSymbolResolver.EnumerateElements(root) : [];
 }

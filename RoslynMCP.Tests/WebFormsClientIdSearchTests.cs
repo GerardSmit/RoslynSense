@@ -209,18 +209,62 @@ public class WebFormsClientIdSearchTests
     }
 
     /// <summary>
-    /// An id whose containers name no control anywhere resolves to nothing at all.
+    /// An id that nothing in the solution corroborates resolves to nothing at all.
     /// </summary>
     /// <remarks>
     /// Empty rather than "the closest thing": the whole value of a pasted id is that it is exact,
     /// and a picker that offers a same-named control from another page has answered a question
-    /// nobody asked.
+    /// nobody asked. It is the floor under the skipping in
+    /// <see cref="AnUnknownContainerIsSkippedRatherThanFatal"/> — skip every segment that did not
+    /// match and what is left is the control's own name, which is no more this control than the
+    /// three others in the solution that share it.
     /// </remarks>
     [Fact]
     public async Task AnIdWhoseContainersDoNotMatchResolvesToNothing()
     {
-        Assert.Empty(await ResolveAsync("form1_rptNotHere_ctl00_lblDup"));
+        Assert.Empty(await ResolveAsync("frmNope_rptNotHere_ctl00_lblDup"));
         Assert.Empty(await ResolveAsync("form1_rptItems_ctl00_lblNoSuchControl"));
+    }
+
+    /// <summary>
+    /// A container segment that matches nothing is skipped, and the segments around it still say
+    /// which control the id is about.
+    /// </summary>
+    /// <remarks>
+    /// The containers of a real id are not all visible from the markup — a page adds a naming
+    /// container in code, a base class contributes one, DNN loads a module under a name no file
+    /// writes — and under the strict reading one such segment sinks an id whose other segments
+    /// name the right control exactly. It is a last resort rather than the rule: the strict
+    /// reading answers first, so an id that lines up whole is never traded for a guess.
+    /// </remarks>
+    [Fact]
+    public async Task AnUnknownContainerIsSkippedRatherThanFatal()
+    {
+        var hits = await ResolveAsync("dnn$ctr1831$NoSuchModule$rptItems$ctl00$ctl04$lblName");
+
+        var hit = Assert.Single(hits);
+        Assert.Equal("lblName", hit.Name);
+        Assert.Equal(FixturePaths.RepeaterAspxFile, hit.FilePath);
+    }
+
+    /// <summary>
+    /// And the skipping keeps every candidate the surviving segments allow, rather than picking
+    /// one.
+    /// </summary>
+    /// <remarks>
+    /// <c>rptNotHere</c> was the segment that told the two <c>lblDup</c>s apart, so dropping it
+    /// leaves an honest two answers. A picker showing both is the truthful shape of a guess; one
+    /// of them chosen arbitrarily would read as the certainty the strict path offers.
+    /// </remarks>
+    [Fact]
+    public async Task SkippingAContainerLeavesEveryCandidateItStillAllows()
+    {
+        var hits = await ResolveAsync("form1_rptNotHere_ctl00_lblDup");
+
+        Assert.Equal(2, hits.Count);
+        Assert.All(hits, hit => Assert.Equal("lblDup", hit.Name));
+        Assert.All(hits, hit => Assert.Equal(FixturePaths.NamingScopeAspxFile, hit.FilePath));
+        Assert.NotEqual(hits[0].Line, hits[1].Line);
     }
 
     /// <summary>An id that stopped at a container names the file, which is still an answer.</summary>

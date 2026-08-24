@@ -532,6 +532,10 @@ public class WebFormsLspTests
     [Fact]
     public async Task FindReferencesOnAHandlerIncludesTheAttributeThatNamesIt()
     {
+        // The markup half of the answer comes through the pack's reference contributor, so the
+        // pack has to be registered the way a serving host registers it.
+        new LanguageRegistry([new WebFormsLanguage(new MarkdownFormatter())]).Publish();
+
         var locations = await AspxLanguageHandler.ReferencesAsync(
             new ReferenceParams(
                 Doc(FixturePaths.DesignerAspxFile),
@@ -571,6 +575,8 @@ public class WebFormsLspTests
         // OrderItems.ascx wires OnItemDataBound to a method of the same name and the same
         // signature on AspxProject.OrderItemsControl. Nothing but the containing type tells the
         // two apart, and a rename that rewrote both would break a control nobody touched.
+        new LanguageRegistry([new WebFormsLanguage(new MarkdownFormatter())]).Publish();
+
         var locations = await AspxLanguageHandler.ReferencesAsync(
             new ReferenceParams(
                 Doc(FixturePaths.RepeaterAspxFile),

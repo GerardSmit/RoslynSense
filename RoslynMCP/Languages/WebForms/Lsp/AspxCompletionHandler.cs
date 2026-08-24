@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Languages.Formatting;
@@ -280,6 +280,22 @@ internal static class AspxCompletionHandler
         // nothing — which is exactly the caret where the components are worth having.
         if (await FormatComponentsAsync(document, offset, ct) is { } components)
             return components;
+
+        // And for the same reason one line up: a configured member attribute — a grid's
+        // `SortExpression` — is an ordinary string property on the control, so nothing below has
+        // anything to offer at a caret where the bound item's fields are the whole answer. The
+        // `Eval("…")` list, at the one position the code branch never reaches.
+        //
+        // Matched against the scanned context rather than against the parse tree: an attribute
+        // whose value is still empty is the caret completion exists for, and the parser gives that
+        // value no range at all.
+        if (context is { TagName: { } tagName, AttributeName: { Length: > 0 } attribute }
+            && MarkupBindingSettings.Current.For(context.TagPrefix, tagName, attribute)
+                is { Kind: MarkupBindingKind.Member }
+            && await DataBoundFieldsAsync(document, context.ReplaceSpan, offset, ct) is { } fields)
+        {
+            return fields;
+        }
 
         if (context.AttributeName is { Length: > 0 } name
             && AspxSymbolResolver.IsImplicitKeyAttribute(name))
@@ -679,6 +695,16 @@ internal static class AspxCompletionHandler
         if (DataBindingService.ArgumentAt(document.Text, offset) is not { } span)
             return null;
 
+        return await DataBoundFieldsAsync(document, span, offset, ct);
+    }
+
+    /// <summary>
+    /// The same list for a path written somewhere else — the value of an attribute the
+    /// configuration reads as a member path, whose span the caller found for itself.
+    /// </summary>
+    private static async Task<CompletionList?> DataBoundFieldsAsync(
+        AspxDocument document, TextSpan span, int offset, CancellationToken ct)
+    {
         // The path's own dots are walked too, so `Eval("Buyer.` offers the members of Buyer
         // rather than the members of the item all over again.
         var itemType = await DataBindingService.ItemTypeAsync(document, offset, ct);

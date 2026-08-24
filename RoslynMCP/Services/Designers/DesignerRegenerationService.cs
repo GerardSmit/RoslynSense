@@ -1,3 +1,4 @@
+﻿using System.Text;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Tools;
 
@@ -118,7 +119,11 @@ public sealed class DesignerRegenerationService(IEnumerable<IDesignerGenerator> 
 
         try
         {
-            await File.WriteAllTextAsync(result.DesignerPath, content, cancellationToken);
+            // Preserve the byte order mark the file already has — Visual Studio writes one, and
+            // silently dropping it on the first regeneration shows up as a whole-file diff in tools
+            // that key on encoding. A file that has none keeps none.
+            var encoding = new UTF8Encoding(DesignerStyle.Detect(result.DesignerPath).ByteOrderMark);
+            await File.WriteAllTextAsync(result.DesignerPath, content, encoding, cancellationToken);
         }
         catch (Exception ex)
         {

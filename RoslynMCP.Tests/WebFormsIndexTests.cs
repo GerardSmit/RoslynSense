@@ -1,4 +1,5 @@
-using Microsoft.CodeAnalysis.Text;
+﻿using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Languages.WebForms.Core;
@@ -27,6 +28,22 @@ public class WebFormsIndexTests
         new(LspConverters.PathToUri(path));
 
     private static WebFormsLanguage Pack() => new(new MarkdownFormatter());
+
+    /// <summary>
+    /// Turns the markup gutter on for one test and puts it back. Process-wide, which is why
+    /// these tests are in the shared collection.
+    /// </summary>
+    private static IDisposable MarkupLenses()
+    {
+        bool previous = LspFeatureOptions.WebFormsCodeLens;
+        LspFeatureOptions.WebFormsCodeLens = true;
+        return new Restore(() => LspFeatureOptions.WebFormsCodeLens = previous);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
+    }
 
     // ---- The index -------------------------------------------------------------------------
 
@@ -303,8 +320,23 @@ public class WebFormsIndexTests
     // ---- codeLens --------------------------------------------------------------------------
 
     [Fact]
+    public async Task MarkupGetsNoLensesUnlessTheEditorAsksForThem()
+    {
+        // The default, and the reason the setting exists: a count over every control ID lays the
+        // markup out rather than annotating it.
+        Assert.False(LspFeatureOptions.WebFormsCodeLens);
+
+        var lenses = await Pack().CodeLensAsync(
+            new CodeLensParams(Doc(FixturePaths.DesignerAspxFile)), default);
+
+        Assert.Empty(lenses);
+    }
+
+    [Fact]
     public async Task EveryControlWithAFieldGetsALens()
     {
+        using var lensesOn = MarkupLenses();
+
         var lenses = await Pack().CodeLensAsync(
             new CodeLensParams(Doc(FixturePaths.DesignerAspxFile)), default);
 
@@ -326,6 +358,7 @@ public class WebFormsIndexTests
     {
         // The markup pass reports the ID attribute the way Roslyn reports a declaration, so
         // without the filter a control nothing uses would read "1 reference".
+        using var lensesOn = MarkupLenses();
         new LanguageRegistry([Pack()]).Publish();
 
         var lenses = await Pack().CodeLensAsync(
@@ -347,6 +380,8 @@ public class WebFormsIndexTests
     public async Task AMarkupFileWithNoCodeBehindGetsNoLenses()
     {
         // Site.master declares controls but names no class, so no ID is a field declaration.
+        using var lensesOn = MarkupLenses();
+
         var lenses = await Pack().CodeLensAsync(
             new CodeLensParams(Doc(FixturePaths.SiteMasterFile)), default);
 
@@ -354,15 +389,17 @@ public class WebFormsIndexTests
     }
 
     [Fact]
-    public async Task AUserControlGetsNoLenses()
+    public async Task AUserControlGetsLensesToo()
     {
-        // OrderItems.ascx names a class and declares rptOrderItems, so every condition for a lens
-        // is met — a .ascx is close to nothing but control declarations, and a count over each one
-        // spaces the markup out rather than annotating it.
+        // OrderItems.ascx names a class and declares rptOrderItems. A user control is the file
+        // the density argument is strongest about, which is what the setting now decides — asked
+        // for, it holds for every markup file rather than for pages alone.
+        using var lensesOn = MarkupLenses();
+
         var lenses = await Pack().CodeLensAsync(
             new CodeLensParams(Doc(FixturePaths.OrderItemsAscxFile)), default);
 
-        Assert.Empty(lenses);
+        Assert.NotEmpty(lenses);
     }
 
     // ---- Helpers ---------------------------------------------------------------------------

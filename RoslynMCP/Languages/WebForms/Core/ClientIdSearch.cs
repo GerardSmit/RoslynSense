@@ -94,7 +94,7 @@ internal static class ClientIdSearch
 
         foreach (var reading in readings)
         {
-            if (Controls(files, reading, hosts, ct) is { Count: > 0 } controls)
+            if (Controls(files, reading, hosts, ct, lenient: false) is { Count: > 0 } controls)
                 return controls;
         }
 
@@ -104,6 +104,16 @@ internal static class ClientIdSearch
         {
             if (Files(files, reading) is { Count: > 0 } named)
                 return named;
+        }
+
+        // Nothing explained the id whole. Ask again with the unexplainable segments skipped: a
+        // real id carries containers this server cannot see — a control a page added in code, a
+        // module DNN loaded by a name no markup writes — and one such segment is enough to sink
+        // an id whose other segments name the right control exactly.
+        foreach (var reading in readings)
+        {
+            if (Controls(files, reading, hosts, ct, lenient: true) is { Count: > 0 } guessed)
+                return guessed;
         }
 
         return [];
@@ -123,7 +133,7 @@ internal static class ClientIdSearch
 
     private static List<SearchHit> Controls(
         List<IndexedFile> files, ClientIdSegments segments,
-        Dictionary<string, List<HostSite>> hosts, CancellationToken ct)
+        Dictionary<string, List<HostSite>> hosts, CancellationToken ct, bool lenient)
     {
         var kept = segments.Kept;
         var found = new List<(int Consumed, bool Named, SearchHit Hit)>();
@@ -147,7 +157,7 @@ internal static class ClientIdSearch
                     if (!control.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    if (Verify(file, control, left, hosts, depth: 0) is not { } verdict)
+                    if (Verify(file, control, left, hosts, depth: 0, lenient) is not { } verdict)
                         continue;
 
                     found.Add((verdict.Consumed, verdict.Named, Hit(file.Index, control)));
@@ -291,13 +301,56 @@ internal static class ClientIdSearch
     /// controls several deep — or naming the file itself, which is where a module control DNN
     /// loaded by name ends. Left over and matching neither, the candidate is somebody else's
     /// control that happens to share a name.
+    /// <para>
+    /// <paramref name="lenient"/> is the second pass, run only once the first has answered
+    /// nothing: it lets the id skip a segment as well, so that one container this server cannot
+    /// see does not sink an id whose other segments are exact. It still needs a segment that did
+    /// match — see <see cref="Skipping"/>.
+    /// </para>
     /// </remarks>
     private static (int Consumed, bool Named)? Verify(
         IndexedFile file, WebFormsControlId control, ReadOnlySpan<string> left,
-        Dictionary<string, List<HostSite>> hosts, int depth)
+        Dictionary<string, List<HostSite>> hosts, int depth, bool lenient)
     {
         ImmutableArray<string> ancestors = control.Ancestors.IsDefault ? [] : control.Ancestors;
 
+        var (consumed, unmatched) = lenient
+            ? Skipping(left, ancestors)
+            : Strictly(left, ancestors);
+
+        if (unmatched == 0)
+            return (consumed, Named: false);
+
+        // What is left may name the file. DNN's ModuleControlFactory calls a dynamically loaded
+        // module control after its `.ascx`, which is where a segment run like `OrderIntake_View`
+        // in the middle of an id comes from.
+        var rest = left[..unmatched];
+
+        if (Names(file.Index, string.Join('_', rest.ToArray())))
+            return (consumed + rest.Length, Named: true);
+
+        if (Outward(file, rest, hosts, depth, lenient) is { } outer)
+            return (consumed + outer.Consumed, outer.Named);
+
+        // Leftovers that reached neither a file name nor a host are dropped rather than fatal —
+        // but only alongside segments that did match. Nothing matched means nothing tied this
+        // candidate to the id but its own name, which is the same answer for every control in the
+        // solution that shares it.
+        return lenient && consumed > 0 ? (consumed, Named: false) : null;
+    }
+
+    /// <summary>
+    /// The ancestor segments matched right to left, and how much of the left the walk never
+    /// reached.
+    /// </summary>
+    /// <remarks>
+    /// Every segment of <paramref name="left"/> has to land, in order, somewhere in
+    /// <paramref name="ancestors"/>; extra ancestors are skipped freely, because a markup ancestor
+    /// that is not a naming container never reaches the id.
+    /// </remarks>
+    private static (int Consumed, int Unmatched) Strictly(
+        ReadOnlySpan<string> left, ImmutableArray<string> ancestors)
+    {
         int l = left.Length - 1;
         int a = ancestors.Length - 1;
         int consumed = 0;
@@ -313,20 +366,69 @@ internal static class ClientIdSearch
             a--;
         }
 
-        if (l < 0)
-            return (consumed, Named: false);
+        return (consumed, l + 1);
+    }
 
-        // What is left may name the file. DNN's ModuleControlFactory calls a dynamically loaded
-        // module control after its `.ascx`, which is where a segment run like `OrderIntake_View`
-        // in the middle of an id comes from.
-        var rest = left[..(l + 1)];
+    /// <summary>
+    /// The same walk with the id allowed to skip too: the longest run of segments that appears in
+    /// both, in order, and the prefix of <paramref name="left"/> in front of the first of them.
+    /// </summary>
+    /// <remarks>
+    /// Skipping on the ancestor side alone is what the id's shape justifies, and it is why
+    /// <see cref="Strictly"/> is the first answer. Skipping on the id's side as well is a guess,
+    /// made only once the strict reading has found nothing: a segment the index cannot account for
+    /// — a container a page added in code, a naming container from a base class — otherwise stops
+    /// the walk dead and takes every segment to its left with it, and those are the segments that
+    /// say which of the solution's four <c>Amount</c>s the paste is about.
+    /// <para>
+    /// Longest-common-subsequence rather than another greedy pass, because greed picks the wrong
+    /// one where a segment repeats: an id under <c>pnl / list / pnl</c> would spend its single
+    /// <c>pnl</c> on the innermost and then find nothing for <c>list</c>. Both sides are a handful
+    /// of segments, so the table is smaller than the string comparisons it saves.
+    /// </para>
+    /// </remarks>
+    private static (int Consumed, int Unmatched) Skipping(
+        ReadOnlySpan<string> left, ImmutableArray<string> ancestors)
+    {
+        int n = left.Length;
+        int m = ancestors.Length;
 
-        if (Names(file.Index, string.Join('_', rest.ToArray())))
-            return (consumed + rest.Length, Named: true);
+        if (n == 0 || m == 0)
+            return (0, n);
 
-        return Outward(file, rest, hosts, depth) is { } outer
-            ? (consumed + outer.Consumed, outer.Named)
-            : null;
+        // run[i, j] is the longest run shared by left[i..] and ancestors[j..].
+        var run = new int[n + 1, m + 1];
+
+        for (int i = n - 1; i >= 0; i--)
+        {
+            for (int j = m - 1; j >= 0; j--)
+            {
+                run[i, j] = left[i].Equals(ancestors[j], StringComparison.OrdinalIgnoreCase)
+                    ? run[i + 1, j + 1] + 1
+                    : Math.Max(run[i + 1, j], run[i, j + 1]);
+            }
+        }
+
+        if (run[0, 0] == 0)
+            return (0, n);
+
+        // Where the run starts is where the leftovers end: everything in front of the first
+        // matched segment is still the id's outer context, and still has a file name or a host to
+        // be explained by.
+        int first = 0;
+
+        for (int j = 0; first < n && j < m;)
+        {
+            if (left[first].Equals(ancestors[j], StringComparison.OrdinalIgnoreCase))
+                break;
+
+            if (run[first + 1, j] >= run[first, j + 1])
+                first++;
+            else
+                j++;
+        }
+
+        return (run[0, 0], first);
     }
 
     /// <summary>
@@ -341,7 +443,7 @@ internal static class ClientIdSearch
     /// </remarks>
     private static (int Consumed, bool Named)? Outward(
         IndexedFile file, ReadOnlySpan<string> left,
-        Dictionary<string, List<HostSite>> hosts, int depth)
+        Dictionary<string, List<HostSite>> hosts, int depth, bool lenient)
     {
         if (depth >= MaxHostDepth || left.Length == 0)
             return null;
@@ -356,8 +458,11 @@ internal static class ClientIdSearch
             if (!site.Control.Id.Equals(left[^1], StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            if (Verify(site.File, site.Control, left[..^1], hosts, depth + 1) is not { } verdict)
+            if (Verify(site.File, site.Control, left[..^1], hosts, depth + 1, lenient)
+                is not { } verdict)
+            {
                 continue;
+            }
 
             var candidate = (Consumed: verdict.Consumed + 1, verdict.Named);
 

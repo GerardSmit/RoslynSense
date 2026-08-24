@@ -63,10 +63,17 @@ internal static class AspxLanguageHandler
         // `Eval("Entity.Images")`. Also not a symbol: the argument is a string the runtime
         // reflects over, so the projection binds it to System.String and the caret's real
         // destination — the property the segment names — is reachable only from the item type.
+        // Anchored and then through the contributors, like every branch below that ends in a
+        // symbol: a property SqlMetal generated answers with the .dbml line, not the designer's
+        // restatement of it, and the packs compare with SymbolEqualityComparer, which only holds
+        // within the current solution's compilations.
         if (await DataBoundMemberAsync(document, offset, ct) is { } bound)
+        {
+            var (boundProject, member) = await AspxDocumentService.AnchorAsync(document, bound, ct);
             return WithoutDesigners(
-                await NavigationHandlers.DefinitionLocationsAsync(
-                    bound, document.Project, typeDefinition, ct));
+                await NavigationHandlers.ContributedDefinitionLocationsAsync(
+                    member, boundProject, typeDefinition, languages: null, ct));
+        }
 
         // The caret is already on the declaration, so there is no definition to go to — the
         // question a user asks here is the other one. See ControlIdUsagesAsync.
@@ -88,9 +95,10 @@ internal static class AspxLanguageHandler
 
         if (hit is { Symbol: { } symbol })
         {
+            var (anchorProject, anchored) = await AspxDocumentService.AnchorAsync(document, symbol, ct);
             return WithoutDesigners(
-                await NavigationHandlers.DefinitionLocationsAsync(
-                    symbol, document.Project, typeDefinition, ct));
+                await NavigationHandlers.ContributedDefinitionLocationsAsync(
+                    anchored, anchorProject, typeDefinition, languages: null, ct));
         }
 
         // Before the symbol lookup, for the reason the C# handler asks first: inside a literal
@@ -109,26 +117,20 @@ internal static class AspxLanguageHandler
             if (InProjection(document, projected) is { Length: > 0 } inMarkup)
                 return inMarkup;
 
-            // Through the contributors, as the C# handler does: one field must not answer with the
-            // markup ID from a .ascx.cs and with the designer line from the .ascx beside it.
-            var found = await NavigationHandlers.DefinitionLocationsAsync(
-                projected, document.Project, typeDefinition, ct);
-
-            // typeDefinition asks what type the control is, and the designer is not in that way.
-            if (typeDefinition)
-                return found;
-
-            // The symbol belongs to the projection's forked compilation, and the contributor
-            // compares with SymbolEqualityComparer, which never matches across two of them.
-            // AnchorAsync keys on the solution, which has not moved; the compilation has.
+            // Re-anchored unconditionally, not through AnchorAsync: the symbol belongs to the
+            // projection's forked compilation, which is never the solution's, so the same-solution
+            // shortcut would hand the contributors a symbol their SymbolEqualityComparer can never
+            // match. Then through the contributors, as the C# handler goes: one field must not
+            // answer with the markup ID from a .ascx.cs and with the designer line from the .ascx
+            // beside it.
             var current = await AspxDocumentService.CurrentProjectAsync(document, ct);
             var anchored = await current.GetCompilationAsync(ct) is { } compilation
                 ? SymbolFinder.FindSimilarSymbols(projected.OriginalDefinition, compilation, ct)
                     .FirstOrDefault() ?? projected
                 : projected;
 
-            return await NavigationHandlers.WithContributionsAsync(
-                [anchored.OriginalDefinition], current, [.. found], languages: null, ct);
+            return await NavigationHandlers.ContributedDefinitionLocationsAsync(
+                anchored, current, typeDefinition, languages: null, ct);
         }
 
         return [];
@@ -246,7 +248,9 @@ internal static class AspxLanguageHandler
 
         return
         [
-            .. (await AllReferencesAsync(target, project, includeDeclaration: false, ct))
+            .. (await NavigationHandlers.AllReferencesAsync(
+                    target, project, includeDeclaration: false, ct, languages: null,
+                    waitForCompleteScope: true))
                 .Where(location => !IsSelf(location, document.FilePath, range)),
         ];
     }
@@ -340,34 +344,20 @@ internal static class AspxLanguageHandler
         if (await ResolveAsync(p.TextDocument, p.Position, ct) is not var (document, offset))
             return [];
 
+        // The data-bound member between the parse's answer and the projection's, as in
+        // DefinitionAsync: the projection binds an Eval argument to System.String, which has
+        // implementations nobody asked about.
         var resolved = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
+            ?? await DataBoundMemberAsync(document, offset, ct)
             ?? await ProjectedSymbolAsync(document, offset, ct);
         if (resolved is null)
             return [];
 
+        // The C# handler's search, so Ctrl+F12 from markup and from the code-behind agree — the
+        // same widening, the same hierarchy walk, the same contributor pass and fallback.
         var (project, symbol) = await AspxDocumentService.AnchorAsync(document, resolved, ct);
-        var solution = project.Solution;
-        var results = new List<ISymbol>();
-
-        switch (symbol)
-        {
-            case INamedTypeSymbol { TypeKind: TypeKind.Interface } iface:
-                results.AddRange(await SymbolFinder.FindImplementationsAsync(iface, solution, cancellationToken: ct));
-                break;
-            case INamedTypeSymbol type:
-                results.AddRange(await SymbolFinder.FindDerivedClassesAsync(type, solution, cancellationToken: ct));
-                break;
-            default:
-                results.AddRange(await SymbolFinder.FindImplementationsAsync(symbol, solution, cancellationToken: ct));
-                results.AddRange(await SymbolFinder.FindOverridesAsync(symbol, solution, cancellationToken: ct));
-                break;
-        }
-
-        if (results.Count == 0)
-            results.Add(symbol);
-
-        return await HandlerHelpers.ToLocationsAsync(
-            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), project, ct);
+        return await NavigationHandlers.ImplementationLocationsAsync(
+            symbol, project, languages: null, ct);
     }
 
     public static async Task<LspLocation[]> ReferencesAsync(ReferenceParams p, CancellationToken ct)
@@ -406,40 +396,22 @@ internal static class AspxLanguageHandler
                 : callSites;
         }
 
-        var symbol = hit?.Symbol ?? await ProjectedSymbolAsync(document, offset, ct);
+        // The same pre-pass DefinitionAsync makes: an `Eval("Entity.Images")` argument binds to
+        // System.String in the projection, and the search that answers is the property's.
+        var symbol = hit?.Symbol
+            ?? await DataBoundMemberAsync(document, offset, ct)
+            ?? await ProjectedSymbolAsync(document, offset, ct);
         if (symbol is null)
             return [];
 
+        // The C# handler's search, contributors and all: it already lists the markup references
+        // through this pack's own contributor, and going through it is what gives a search started
+        // in markup the other packs' answers too — the model line for a generated member, with the
+        // designer's restatements of it withdrawn.
         var (project, target) = await AspxDocumentService.AnchorAsync(document, symbol, ct);
-        return await AllReferencesAsync(target, project, p.Context.IncludeDeclaration, ct);
-    }
-
-    /// <summary>
-    /// A symbol's references in code and in markup. Shared with the C# handler, so a
-    /// find-references started in the code-behind also lists the <c>OnClick=</c> that names it.
-    /// </summary>
-    public static async Task<LspLocation[]> AllReferencesAsync(
-        ISymbol symbol, Project project, bool includeDeclaration, CancellationToken ct)
-    {
-        var locations = new List<Microsoft.CodeAnalysis.Location>();
-
-        // The options the C# side searches under, so a find-references started in markup and one
-        // started in the code-behind cascade the hierarchy the same way.
-        foreach (var referenced in await SymbolFinder.FindReferencesAsync(
-                     symbol, project.Solution,
-                     FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol), ct))
-        {
-            if (includeDeclaration)
-                locations.AddRange(referenced.Definition.Locations.Where(l => l.IsInSource));
-            locations.AddRange(referenced.Locations.Select(r => r.Location));
-        }
-
-        var results = new List<LspLocation>(await HandlerHelpers.ToLocationsAsync(locations, project, ct));
-
-        foreach (var markup in await AspxReferenceService.FindAsync(symbol, project, ct))
-            results.Add(ToLocation(markup.FilePath, markup.Text, markup.Span));
-
-        return results.Distinct().ToArray();
+        return await NavigationHandlers.AllReferencesAsync(
+            target, project, p.Context.IncludeDeclaration, ct, languages: null,
+            waitForCompleteScope: true);
     }
 
     public static async Task<DocumentHighlight[]> DocumentHighlightAsync(
@@ -1134,16 +1106,6 @@ internal static class AspxLanguageHandler
 
     private static int Clamp(AspxDocument document, int offset) =>
         Math.Clamp(offset, 0, document.SourceText.Length);
-
-    private static LspLocation ToLocation(string filePath, SourceText text, TextSpan span)
-    {
-        int length = text.Length;
-        int start = Math.Clamp(span.Start, 0, length);
-        int end = Math.Clamp(span.End, start, length);
-        return new LspLocation(
-            LspConverters.PathToUri(filePath),
-            LspConverters.ToRange(text.Lines, TextSpan.FromBounds(start, end)));
-    }
 
     private static LspLocation FileStart(string path) =>
         new(LspConverters.PathToUri(path), new LspRange(new Position(0, 0), new Position(0, 0)));

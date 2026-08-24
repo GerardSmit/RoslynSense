@@ -1,4 +1,5 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
+using RoslynMCP.Config;
 using RoslynMCP.Languages.WebForms.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
@@ -63,13 +64,15 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
     /// </remarks>
     public async Task<LspCodeLens[]> CodeLensAsync(CodeLensParams p, CancellationToken ct)
     {
-        string path = LspConverters.UriToPath(p.TextDocument.Uri);
-
-        // A user control is nothing but control declarations, so the count lands on almost every
-        // line and pushes the markup apart — the gutter stops being an annotation and becomes the
-        // file's layout. The number is still one gesture away on any ID, by find-references.
-        if (IsUserControl(path))
+        // Off unless the editor asked for it. A markup file is close to nothing but control
+        // declarations, so the count lands on almost every line and pushes the markup apart — the
+        // gutter stops being an annotation and becomes the file's layout, and a user control is
+        // the extreme case. The number is still one gesture away on any ID, by find-references,
+        // which is why the default is off; see LspFeatureOptions.WebFormsCodeLens.
+        if (!LspFeatureOptions.WebFormsCodeLens)
             return [];
+
+        string path = LspConverters.UriToPath(p.TextDocument.Uri);
 
         var index = await WebFormsIndex.GetAsync(path, ct);
         var document = await AspxDocumentService.GetAsync(path, ct);
@@ -145,10 +148,6 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
                 [data.Uri, data.Line, data.Character, locations.Take(MaxReferenceLocations).ToArray()]),
         };
     }
-
-    /// <summary>Whether the path is a user control rather than a page.</summary>
-    private static bool IsUserControl(string path) =>
-        Path.GetExtension(path).Equals(".ascx", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsSelf(LspLocation location, CodeLensData data) =>
         location.Range.Start.Line == data.Line

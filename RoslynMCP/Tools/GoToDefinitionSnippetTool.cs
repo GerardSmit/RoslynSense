@@ -136,6 +136,18 @@ public static class GoToDefinitionSnippetTool
             : $"**{locations.Length} definitions**");
         sb.AppendLine();
 
+        sb.Append(await FormatLocationsAsync(locations, contextLines, cancellationToken));
+        return sb.ToString();
+    }
+
+    /// <summary>File positions rendered with their context lines — the shape a pack's
+    /// contribution has, which carries no symbol to describe.</summary>
+    private static async Task<string> FormatLocationsAsync(
+        RoslynMCP.Lsp.Protocol.Location[] locations, int contextLines,
+        CancellationToken cancellationToken)
+    {
+        var sb = new StringBuilder();
+
         foreach (var location in locations)
         {
             string path = RoslynMCP.Lsp.LspConverters.UriToPath(location.Uri);
@@ -173,9 +185,40 @@ public static class GoToDefinitionSnippetTool
         return sb.ToString();
     }
 
+    /// <param name="withContributions">
+    /// Whether the language packs get their say before the symbol is rendered — the same pass the
+    /// editor's F12 runs, so a member some model generated answers with the model's line rather
+    /// than the designer's restatement of it. On by default; a caller navigating <em>into</em>
+    /// generated code on purpose (the proto tool showing what protoc wrote) turns it off.
+    /// </param>
     internal static async Task<string> FormatDefinitionAsync(
-        ISymbol symbol, Project project, int contextLines, IOutputFormatter fmt, CancellationToken cancellationToken = default)
+        ISymbol symbol, Project project, int contextLines, IOutputFormatter fmt,
+        CancellationToken cancellationToken = default, bool withContributions = true)
     {
+        if (withContributions)
+        {
+            var raw = await HandlerHelpers.ToLocationsAsync(
+                symbol.OriginalDefinition.Locations.Where(l => l.IsInSource),
+                project, cancellationToken);
+            var merged = await NavigationHandlers.WithContributionsAsync(
+                [symbol.OriginalDefinition], project, [.. raw], languages: null, cancellationToken);
+
+            // Only when a pack actually changed the answer. The ordinary symbol has no pack with
+            // an opinion, and the rendering below — docs, members, decompilation — owns it.
+            if (!merged.SequenceEqual(raw))
+            {
+                var contributed = new StringBuilder();
+                contributed.AppendLine($"**Definition: {symbol.Name}**");
+                contributed.AppendLine();
+                contributed.AppendLine($"- **Symbol**: {symbol.ToDisplayString()}");
+                contributed.AppendLine($"- **Kind**: {symbol.Kind}");
+                contributed.AppendLine();
+                contributed.Append(await FormatLocationsAsync(
+                    merged, contextLines, cancellationToken));
+                return contributed.ToString();
+            }
+        }
+
         // For constructors, use the containing type name as the display header
         string displayName = symbol is IMethodSymbol { MethodKind: Microsoft.CodeAnalysis.MethodKind.Constructor }
             ? symbol.ContainingType?.Name ?? symbol.Name

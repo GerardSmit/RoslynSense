@@ -63,7 +63,8 @@ internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandle
             if (implementations.FirstOrDefault() is { } implementation)
             {
                 string report = await GoToDefinitionSnippetTool.FormatDefinitionAsync(
-                    implementation, project, contextLines, fmt, cancellationToken);
+                    implementation, project, contextLines, fmt, cancellationToken,
+                    withContributions: false);
 
                 // Said rather than silently dropped: this tool reports one definition, and a service
                 // implemented twice is a fact the caller has to hear from somewhere.
@@ -75,8 +76,12 @@ internal class ProtoGoToDefinition(IOutputFormatter fmt) : IGoToDefinitionHandle
 
             if (hit.Symbol is { } symbol)
             {
+                // This is the navigation that goes into generated code on purpose — from the
+                // model, protoc's output is the destination — so the contributor pass that would
+                // route the symbol back to the .proto stays off.
                 return await GoToDefinitionSnippetTool.FormatDefinitionAsync(
-                    symbol, project, contextLines, fmt, cancellationToken);
+                    symbol, project, contextLines, fmt, cancellationToken,
+                    withContributions: false);
             }
         }
 

@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -104,7 +104,7 @@ internal static class DataBindingService
     /// </remarks>
     private static bool IsBindingCallBefore(string text, int quote)
     {
-        if (!TryReadCall(text, quote, out string name, out int argument, out bool qualified))
+        if (!TryReadCall(text, quote, out string name, out int argument, out bool qualified, out _))
             return false;
 
         return argument switch
@@ -132,11 +132,13 @@ internal static class DataBindingService
     /// <returns>False when the quote is not an argument at all — the value of an attribute, a
     /// string in an expression that is not a call.</returns>
     private static bool TryReadCall(
-        string text, int quote, out string name, out int argument, out bool qualified)
+        string text, int quote, out string name, out int argument, out bool qualified,
+        out int open)
     {
         name = "";
         argument = 0;
         qualified = false;
+        open = -1;
 
         int depth = 0;
         int i = quote - 1;
@@ -182,6 +184,7 @@ internal static class DataBindingService
         return false;
 
     found:
+        open = i;
         int j = SkipWhitespaceBack(text, i - 1);
 
         int nameEnd = j + 1;
@@ -205,6 +208,74 @@ internal static class DataBindingService
     }
 
     /// <summary>
+    /// Whether the path at <paramref name="start"/> is written against the item's container rather
+    /// than against the item — <c>DataBinder.Eval(Container, "DataItem.Name")</c>, where the first
+    /// segment is the hop from the container to the item and the rest is an ordinary path.
+    /// </summary>
+    /// <remarks>
+    /// Decided by what the call passes rather than by the path, because the two forms are spelled
+    /// with the same words: <c>DataBinder.Eval(Container.DataItem, "Name")</c> hands over the item
+    /// and <c>DataBinder.Eval(Container, "DataItem.Name")</c> hands over the container, and only
+    /// the first argument says which. Anything that is not already a <c>DataItem</c> is taken to be
+    /// a container — a cast, an <c>e.Item</c>, a control found by name — because a path that does
+    /// not start with <c>DataItem</c> reads the same either way.
+    /// </remarks>
+    public static bool IsContainerRelative(string text, int start)
+    {
+        int quote = start - 1;
+
+        if (quote < 0
+            || text[quote] is not ('"' or '\'')
+            || !TryReadCall(text, quote, out string name, out int argument, out bool qualified, out int open)
+            || argument != 1
+            || !qualified
+            || Array.IndexOf(s_binderMethods, name) < 0
+            || open < 0)
+        {
+            return false;
+        }
+
+        string item = FirstArgument(text, open, quote);
+        return item.Length > 0 && !item.EndsWith("DataItem", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The text of the call's first argument: everything from the opening bracket to the comma
+    /// that ends it, brackets counted and strings stepped over so that neither one's commas end it
+    /// early.
+    /// </summary>
+    private static string FirstArgument(string text, int open, int limit)
+    {
+        int depth = 0;
+
+        for (int i = open + 1; i < limit; i++)
+        {
+            switch (text[i])
+            {
+                case '(' or '[':
+                    depth++;
+                    break;
+
+                case ')' or ']':
+                    depth--;
+                    break;
+
+                case '"' or '\'':
+                    int close = text.IndexOf(text[i], i + 1);
+                    if (close < 0 || close >= limit)
+                        return "";
+                    i = close;
+                    break;
+
+                case ',' when depth == 0:
+                    return text[(open + 1)..i].Trim();
+            }
+        }
+
+        return "";
+    }
+
+    /// <summary>
     /// The path's segments with the member each one named, resolved left to right from the item
     /// type. A segment that resolves to nothing ends the walk: everything after it is a member of
     /// a type nobody knows, so it is reported unresolved rather than guessed at.
@@ -215,6 +286,7 @@ internal static class DataBindingService
         var segments = ImmutableArray.CreateBuilder<DataBindingSegment>();
         ITypeSymbol? current = itemType;
         int start = argument.Start;
+        bool container = IsContainerRelative(text, argument.Start);
 
         while (start <= argument.End)
         {
@@ -237,6 +309,19 @@ internal static class DataBindingService
             {
                 current = Indexer(current, "Item") is { } self ? Indexed(self) : null;
 
+                if (end == argument.End)
+                    break;
+
+                start = end + 1;
+                continue;
+            }
+
+            // The container's own `DataItem`, which is the item the rest of the path walks from.
+            // No segment of its own: it names a member of the container rather than of the item,
+            // and the container is not what this walk knows about.
+            if (container && segments.Count == 0 && !indexed
+                && name.Equals("DataItem", StringComparison.OrdinalIgnoreCase))
+            {
                 if (end == argument.End)
                     break;
 

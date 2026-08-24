@@ -77,6 +77,112 @@ public class WebFormsEditorFeatureTests
         Assert.True(ranges.Ranges[0].Start.Line < ranges.Ranges[1].Start.Line);
     }
 
+    /// <summary>The markup the tag-pairing tests share: literal HTML the parser keeps as text.</summary>
+    private const string LiteralMarkup =
+        "<br>\r\n" +
+        "        <div><span>x</span><img src=\"a.png\">\r\n" +
+        "        <script>if (a < b) { var s = \"</div>\"; }</script>\r\n" +
+        "        <p>unclosed\r\n" +
+        "        <td title=\"a > b\">cell</td></div>";
+
+    private static async Task<LinkedEditingRanges?> LinkedEditingAtAsync(
+        string path, string buffer, string needle, int offsetIntoNeedle) =>
+        await s_language.LinkedEditingRangesAsync(
+            new TextDocumentPositionParams(Doc(path), PositionOf(buffer, needle, offsetIntoNeedle)),
+            default);
+
+    [Fact]
+    public async Task LinkedEditingPairsAPlainHtmlTagWithItsCloseTag()
+    {
+        string path = FixturePaths.DesignerAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace("<div><%= txtName.ClientID %></div>", LiteralMarkup);
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            // A `<div>` with no runat is literal output, so it never becomes an element and the
+            // pair has to come out of the source instead.
+            var div = await LinkedEditingAtAsync(path, buffer, "<div>", 2);
+            Assert.NotNull(div);
+            Assert.All(div!.Ranges, r => Assert.Equal("div", TextOf(buffer, r)));
+            Assert.True(div.Ranges[0].Start.Line < div.Ranges[1].Start.Line);
+
+            // Nested, and inside a `runat="server"` form: the close tag picked is the inner one.
+            var span = await LinkedEditingAtAsync(path, buffer, "<span>", 2);
+            Assert.NotNull(span);
+            Assert.All(span!.Ranges, r => Assert.Equal("span", TextOf(buffer, r)));
+            Assert.Equal(span.Ranges[0].Start.Line, span.Ranges[1].Start.Line);
+
+            // The `>` inside the attribute value does not end the tag early.
+            var cell = await LinkedEditingAtAsync(path, buffer, "<td ", 2);
+            Assert.NotNull(cell);
+            Assert.All(cell!.Ranges, r => Assert.Equal("td", TextOf(buffer, r)));
+        });
+    }
+
+    [Fact]
+    public async Task LinkedEditingLeavesTagsThatHaveNoPartnerAlone()
+    {
+        string path = FixturePaths.DesignerAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace("<div><%= txtName.ClientID %></div>", LiteralMarkup);
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            // Void elements have no close tag to keep in step.
+            Assert.Null(await LinkedEditingAtAsync(path, buffer, "<br>", 2));
+            Assert.Null(await LinkedEditingAtAsync(path, buffer, "<img", 2));
+
+            // `<p>` may stay open in HTML, so nothing here is provably its close tag.
+            Assert.Null(await LinkedEditingAtAsync(path, buffer, "<p>", 2));
+
+            // The first "</div>" in the buffer is inside a script body, where it is a string and
+            // not a tag — retyping it must not drag the real </div> along.
+            Assert.Null(await LinkedEditingAtAsync(path, buffer, "</div>", 3));
+        });
+    }
+
+    [Fact]
+    public async Task LinkedEditingPairsTemplateTagsAndTheTableSplitAcrossThem()
+    {
+        string path = FixturePaths.RepeaterAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace(
+                "            <ItemTemplate>",
+                "            <HeaderTemplate>\r\n" +
+                "                <table>\r\n" +
+                "                    <tr><th>Name</th></tr>\r\n" +
+                "            </HeaderTemplate>\r\n" +
+                "            <ItemTemplate>")
+            .Replace(
+                "        </asp:Repeater>",
+                "            <FooterTemplate>\r\n" +
+                "                </table>\r\n" +
+                "            </FooterTemplate>\r\n" +
+                "        </asp:Repeater>");
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            // A property tag is an element like any other, so this half comes from the tree.
+            var header = await LinkedEditingAtAsync(path, buffer, "<HeaderTemplate>", 2);
+            Assert.NotNull(header);
+            Assert.All(header!.Ranges, r => Assert.Equal("HeaderTemplate", TextOf(buffer, r)));
+            Assert.True(header.Ranges[0].Start.Line < header.Ranges[1].Start.Line);
+
+            var footer = await LinkedEditingAtAsync(path, buffer, "<FooterTemplate>", 2);
+            Assert.NotNull(footer);
+            Assert.All(footer!.Ranges, r => Assert.Equal("FooterTemplate", TextOf(buffer, r)));
+
+            // The table the header opens is closed in the footer, which is a pair only in the
+            // text: neither half is an element, and the tree puts a template boundary and the
+            // whole item template between them. Retyping either end still carries the other.
+            var table = await LinkedEditingAtAsync(path, buffer, "<table>", 2);
+            Assert.NotNull(table);
+            Assert.All(table!.Ranges, r => Assert.Equal("table", TextOf(buffer, r)));
+            Assert.Equal(PositionOf(buffer, "</table>", 2).Line, table.Ranges[1].Start.Line);
+        });
+    }
+
     [Fact]
     public async Task SelectionRangeWidensFromAnAttributeValueOutThroughTheElement()
     {

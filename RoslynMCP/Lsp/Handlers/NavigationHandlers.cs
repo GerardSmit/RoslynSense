@@ -179,6 +179,27 @@ internal static class NavigationHandlers
     }
 
     /// <summary>
+    /// <see cref="DefinitionLocationsAsync"/> followed by the contributor pass — the complete
+    /// definition answer for a symbol that did not come from a C# caret.
+    /// </summary>
+    /// <remarks>
+    /// The markup handlers resolve symbols of their own — an <c>Eval</c> argument, a control
+    /// attribute — and used to stop at the raw locations, which for a generated member is the
+    /// designer file the packs exist to redirect away from. The subject mirrors
+    /// <see cref="DefinitionAsync"/>: for typeDefinition the contributors are asked about the
+    /// type rather than the member holding it, so the gesture on a generated member still reaches
+    /// the model declaring its type.
+    /// </remarks>
+    public static async Task<LspLocation[]> ContributedDefinitionLocationsAsync(
+        ISymbol symbol, Project project, bool typeDefinition, LanguageSession? languages,
+        CancellationToken ct)
+    {
+        var locations = await DefinitionLocationsAsync(symbol, project, typeDefinition, ct);
+        var subject = (typeDefinition ? TypeOf(symbol) : symbol).OriginalDefinition;
+        return await WithContributionsAsync([subject], project, [.. locations], languages, ct);
+    }
+
+    /// <summary>
     /// What <c>textDocument/typeDefinition</c> is actually asking about: the type of the thing
     /// under the caret, or the thing itself when it has no type of its own. Applying it twice
     /// changes nothing, since none of the mapped results is a local, a parameter, a field, a
@@ -386,14 +407,28 @@ internal static class NavigationHandlers
                     await DefinitionLocationsAsync(target, document.Project, typeDefinition: false, ct));
             }
 
-            return redirectedLocations.Distinct().ToArray();
+            // The same pass DefinitionAsync runs after its redirect: a handler some pack
+            // generated still reaches the line it was generated from.
+            return await WithContributionsAsync(
+                redirected, document.Project, redirectedLocations, languages, ct);
         }
 
+        return await ImplementationLocationsAsync(symbol, document.Project, languages, ct);
+    }
+
+    /// <summary>
+    /// The implementations of a symbol, in C# and in the packs' files. Shared with the markup
+    /// handlers for the reason <see cref="AllReferencesAsync"/> is: Ctrl+F12 must not answer
+    /// differently for the same member depending on which file the gesture started in.
+    /// </summary>
+    public static async Task<LspLocation[]> ImplementationLocationsAsync(
+        ISymbol symbol, Project project, LanguageSession? languages, CancellationToken ct)
+    {
         // Implementations of a symbol live in projects that reference its declaring project, which
         // is the one direction lazy loading never took. Ctrl+F12 is always a deliberate gesture,
         // so it may wait for that scope the same way Shift+F12 does.
         var solution = await Services.SearchScopeService.WidenForSymbolAsync(
-            symbol, document.Project, Services.SearchScopeService.ExplicitSearchBudget, ct);
+            symbol, project, Services.SearchScopeService.ExplicitSearchBudget, ct);
         var results = new List<ISymbol>();
 
         switch (symbol)
@@ -420,7 +455,7 @@ internal static class NavigationHandlers
                  LanguageScope.Of(languages).Contributors<ILanguageImplementationContributor>())
         {
             int before = contributed.Count;
-            contributed.AddRange(await contributor.ImplementationsAsync(symbol, document.Project, ct));
+            contributed.AddRange(await contributor.ImplementationsAsync(symbol, project, ct));
 
             if (contributed.Count > before)
                 answered.Add(contributor);
@@ -428,13 +463,24 @@ internal static class NavigationHandlers
 
         // Only when nobody could answer. The fallback exists so Ctrl+F12 on a concrete member goes
         // somewhere rather than nowhere, but landing on the caret it was pressed on is the weakest
-        // answer there is — and a pack that found the hand-written implementation of a generated
-        // member has a better one.
+        // answer there is. The fallback answer is the symbol's own declaration, which for a
+        // generated member is a designer line — so the definition pass runs over it, and only a
+        // pack that withdrew the declaration may replace it: F12 on a generated property already
+        // answers the model line, and this verb falling back must not answer the designer instead.
+        // A pack that merely adds a model line beside a hand-written member changes nothing here,
+        // or Ctrl+F12 on an override would offer the contract next to the implementation it is on.
         if (results.Count == 0 && contributed.Count == 0)
-            results.Add(symbol);
+        {
+            var raw = await HandlerHelpers.ToLocationsAsync(
+                symbol.OriginalDefinition.Locations.Where(l => l.IsInSource), project, ct);
+            var merged = await WithContributionsAsync(
+                [symbol.OriginalDefinition], project, [.. raw], languages, ct);
+
+            return raw.Any(location => !merged.Contains(location)) ? merged : raw;
+        }
 
         var locations = new List<LspLocation>(await HandlerHelpers.ToLocationsAsync(
-            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), document.Project, ct));
+            results.SelectMany(s => s.Locations).Where(l => l.IsInSource), project, ct));
 
         if (answered.Count > 0)
             locations.RemoveAll(location => answered.Any(pack => pack.Supersedes(location)));

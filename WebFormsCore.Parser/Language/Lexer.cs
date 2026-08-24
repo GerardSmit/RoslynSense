@@ -1089,14 +1089,35 @@ public ref struct Lexer
         }
     }
 
+    /// <summary>
+    /// The characters a tag name — or the prefix before its colon — is made of.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This used to be ASCII alphanumerics only, following HTML5's tag-name production literally.
+    /// That is too narrow for both of the languages this lexer actually reads. System.Web's own tag
+    /// regex is <c>[\w:.]+</c>, so a server-control tag name is a CLR identifier — underscores and
+    /// non-ASCII letters included — optionally dotted; and a custom element (<c>&lt;my-widget&gt;</c>)
+    /// requires the hyphen by definition. The colon is excluded here because the caller splits the
+    /// prefix on it.
+    /// </para>
+    /// <para>
+    /// Reading a name too narrowly failed silently rather than loudly: <c>&lt;uc:Order_Panel&gt;</c>
+    /// truncated to <c>Order</c>, no longer matched its <c>&lt;%@ Register %&gt;</c> entry, and the
+    /// control degraded to the untyped <c>Control</c> base — which the designer then wrote into the
+    /// user's source tree as a field their code-behind could not compile against.
+    /// </para>
+    /// </remarks>
     private static bool IsTagCharacter(char c)
     {
-        // https://www.w3.org/TR/2011/WD-html5-20110525/syntax.html#syntax-tag-name
         return c
                 is >= (char)0x0030 and <= (char)0x0039 // U+0030 DIGIT ZERO (0) to U+0039 DIGIT NINE (9)
                 or >= (char)0x0061 and <= (char)0x007A // U+0061 LATIN SMALL LETTER A to U+007A LATIN SMALL LETTER Z
                 or >= (char)0x0041 and <= (char)0x005A // U+0041 LATIN CAPITAL LETTER A to U+005A LATIN CAPITAL LETTER Z
-            ;
+                or '_'
+                or '-'
+                or '.'
+            || c > (char)0x007F && char.IsLetterOrDigit(c);
     }
 
     private static bool IsSpaceCharacter(char c)

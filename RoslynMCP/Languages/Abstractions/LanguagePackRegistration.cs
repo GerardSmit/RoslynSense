@@ -1,4 +1,4 @@
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Languages.AppSettings;
 using RoslynMCP.Languages.Dbml;
@@ -82,6 +82,11 @@ internal static class LanguagePackRegistration
     /// <summary>Registers the enabled packs and the registry over them.</summary>
     public static void AddLanguagePacks(this IServiceCollection services, EffectiveSettings settings)
     {
+        // The same publish as Create, and it has to be here too: this is the path the daemon and
+        // the MCP server take, so leaving it to Create alone left every configured data-expression
+        // attribute dead in the only hosts an editor ever talks to.
+        MarkupBindingSettings.Current = settings.MarkupBindings;
+
         if (settings.WebForms)
             AddPack<WebFormsLanguage>(services);
         if (settings.Razor)

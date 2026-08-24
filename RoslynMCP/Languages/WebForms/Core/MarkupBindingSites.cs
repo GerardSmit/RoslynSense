@@ -33,6 +33,9 @@ internal static class MarkupBindingSites
         {
             foreach (var (key, value) in element.RawAttributes)
             {
+                // The parser gives an empty value no range at all, so there would be nothing to
+                // return but a span at the top of the file. Completion, which is the one pass that
+                // wants that caret, scans the text for it instead.
                 if (value.Value.Length == 0)
                     continue;
 

@@ -628,4 +628,100 @@ public class AnalyzerDiagnosticsTests
         Assert.True(AnalyzerDiagnosticCache.TryGetAnyVersion(document, null).IsEmpty);
         Assert.False(AnalyzerDiagnosticCache.LastComputeStored(document, null));
     }
+
+    /// <summary>
+    /// Trimming the findings cache must not move the result id: an analyzed file whose payload was
+    /// evicted still answers "unchanged", and the editor keeps the findings it already displays.
+    /// </summary>
+    /// <remarks>
+    /// The two facts were one record once, and that coupling is what made the Problems panel on a
+    /// solution larger than <c>MaxEntries</c> oscillate forever: every eviction changed an id,
+    /// every changed id forced a re-report without analyzer findings plus a recompute, and every
+    /// recompute's own trim evicted the next file. The count sawtoothed by hundreds and the sweep
+    /// never converged. This pins the split that ended it — whatever the cap is set to.
+    /// </remarks>
+    [Fact]
+    public async Task EvictedFindingsStayAnalyzedSoAnUnmovedFileAnswersUnchanged()
+    {
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+        AnalyzerDiagnosticCache.Clear();
+        AnalyzerDiagnosticCache.MaxEntriesOverrideForTesting = 1;
+        try
+        {
+            string uri = LspConverters.PathToUri(FixturePaths.WarningsFile);
+            string? version = await AnalyzerDiagnosticCache.GetVersionAsync(document, default);
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(document, default);
+
+            var first = Assert.IsType<FullDocumentDiagnosticReport>(await DiagnosticsHandler.PullAsync(
+                new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)), default));
+            Assert.EndsWith(":a", first.ResultId);
+
+            // A second document's store trims the first document past the (test-sized) ceiling.
+            var other = document.Project.Documents.First(d =>
+                d.FilePath is not null && d.FilePath.EndsWith("Calculator.cs", StringComparison.OrdinalIgnoreCase));
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(other, default);
+
+            Assert.False(AnalyzerDiagnosticCache.HasStoredFindings(document, version));
+            Assert.True(AnalyzerDiagnosticCache.IsComputed(document, version));
+
+            // The world did not move, so eviction must be invisible: same id, "unchanged".
+            var repeat = await DiagnosticsHandler.PullAsync(
+                new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)) { PreviousResultId = first.ResultId },
+                default);
+            Assert.IsType<UnchangedDocumentDiagnosticReport>(repeat);
+        }
+        finally
+        {
+            AnalyzerDiagnosticCache.MaxEntriesOverrideForTesting = null;
+            AnalyzerDiagnosticCache.Clear();
+        }
+    }
+
+    /// <summary>
+    /// A full report that has to be served while the stored findings are gone tags itself pending
+    /// (<c>:c</c>), so the refresh after the recompute is not answered "unchanged" and the real
+    /// findings are delivered.
+    /// </summary>
+    /// <remarks>
+    /// The comparison id says <c>:a</c> for an analyzed-but-evicted version — that is the other
+    /// test's invariant — so a report produced in that state would, if it echoed the same marker,
+    /// hand the client an id that already matches the analyzed world. The follow-up pull would
+    /// return "unchanged" and the analyzer findings would never arrive. The downgrade is the
+    /// bridge: <c>:c</c> mismatches the post-recompute <c>:a</c>, and the follow-up serves in full.
+    /// </remarks>
+    [Fact]
+    public async Task AFullReportWithoutStoredFindingsIsTaggedPendingAndConverges()
+    {
+        var (_, document) = await RoslynTestHelpers.OpenDocumentAsync(FixturePaths.WarningsFile);
+        AnalyzerDiagnosticCache.Clear();
+        AnalyzerDiagnosticCache.MaxEntriesOverrideForTesting = 1;
+        try
+        {
+            string uri = LspConverters.PathToUri(FixturePaths.WarningsFile);
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(document, default);
+
+            var other = document.Project.Documents.First(d =>
+                d.FilePath is not null && d.FilePath.EndsWith("Calculator.cs", StringComparison.OrdinalIgnoreCase));
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(other, default);
+
+            // Analyzed, evicted, and pulled fresh (no previous id): full, downgraded to pending.
+            var downgraded = Assert.IsType<FullDocumentDiagnosticReport>(await DiagnosticsHandler.PullAsync(
+                new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)), default));
+            Assert.EndsWith(":c", downgraded.ResultId);
+
+            // The recompute the pull queued stores again (joined here deterministically), and the
+            // client's :c id now mismatches the analyzed :a — the findings land.
+            await AnalyzerDiagnosticCache.GetOrComputeAsync(document, default);
+
+            var delivered = Assert.IsType<FullDocumentDiagnosticReport>(await DiagnosticsHandler.PullAsync(
+                new DocumentDiagnosticParams(new TextDocumentIdentifier(uri)) { PreviousResultId = downgraded.ResultId },
+                default));
+            Assert.EndsWith(":a", delivered.ResultId);
+        }
+        finally
+        {
+            AnalyzerDiagnosticCache.MaxEntriesOverrideForTesting = null;
+            AnalyzerDiagnosticCache.Clear();
+        }
+    }
 }

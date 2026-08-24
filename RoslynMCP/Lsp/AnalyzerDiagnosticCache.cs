@@ -340,12 +340,13 @@ internal static class AnalyzerDiagnosticCache
     /// Documents to keep analyzer results for.
     /// </summary>
     /// <remarks>
-    /// This was 64, which is a plausible number of open tabs and a poor number of analyzed files:
-    /// the workspace sweep reads this cache without computing, so every document past the ceiling
-    /// reported its compiler-only subset in the Problems panel and re-ran its pass the next time it
-    /// was pulled. The entries are diagnostics for one file — small, and bounded by how many files
-    /// have actually been analyzed — so the ceiling can sit well above any real working set and
-    /// stay a runaway guard rather than a working limit.
+    /// This bounds the findings payload only — the "this version was analyzed" fact lives in
+    /// <see cref="s_analyzedVersions"/> and is never trimmed, so crossing this ceiling costs
+    /// memory pressure relief, not correctness: an evicted-but-unmoved file still answers
+    /// "unchanged" and the editor keeps displaying what it already has. It stopped being safe to
+    /// treat this as "a runaway guard, never a working limit" the day a solution with more
+    /// analyzed files than entries turned every eviction into a re-report and the Problems panel
+    /// into a sawtooth; the split is what makes the number allowed to be wrong.
     /// </remarks>
     private const int MaxEntries = 2048;
 
@@ -353,6 +354,28 @@ internal static class AnalyzerDiagnosticCache
     // Lazy, not Task: ConcurrentDictionary may invoke a GetOrAdd factory more than once under
     // contention, and an analyzer pass is far too expensive to run twice for one version.
     private static readonly ConcurrentDictionary<(DocumentId, string), Lazy<Task<ImmutableArray<Diagnostic>>>> s_inFlight = new();
+
+    /// <summary>
+    /// The last version each document was fully analyzed as — the fact the result id is built
+    /// from, kept apart from the findings so that evicting one cannot forget the other.
+    /// </summary>
+    /// <remarks>
+    /// They were one record, and that coupling is what made the Problems panel oscillate on a
+    /// large solution: the id encodes "analyzers ran for this version", so when <see cref="Trim"/>
+    /// evicted a findings entry the file's id moved, the next sweep re-reported it without its
+    /// analyzer findings, queued a recompute, and that recompute's own Trim evicted the next
+    /// file's entry — a treadmill that never converged once the working set outgrew
+    /// <see cref="MaxEntries"/>. This map is a version string per document, small enough to never
+    /// need trimming, so eviction is now invisible to the protocol: an unmoved file answers
+    /// "unchanged" and the editor keeps showing the findings it already holds. Only a real
+    /// invalidation (<see cref="Evict"/>, <see cref="Clear"/>) removes the fact.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<DocumentId, string> s_analyzedVersions = new();
+
+    /// <summary>Runaway guard for <see cref="s_analyzedVersions"/>: a reloaded solution mints new
+    /// DocumentIds, so entries can only accumulate across reloads. Far above any real document
+    /// count — clearing costs one re-report wave, so it must never fire in normal use.</summary>
+    private const int MaxAnalyzedVersions = 65536;
 
     /// <summary>
     /// The most recent version anyone has asked to have analysed, per document.
@@ -442,7 +465,22 @@ internal static class AnalyzerDiagnosticCache
     /// <summary>Whether this exact document version has already been analyzed. An analyzed
     /// document with no findings is a real answer, not a miss — distinguishing the two is what
     /// keeps the pull path from re-queueing a background pass on every request.</summary>
+    /// <remarks>
+    /// This is the fact the result id encodes, and it deliberately survives <see cref="Trim"/>:
+    /// it answers "has this version been analyzed", not "are the findings still in memory". A
+    /// caller about to <em>serve</em> findings wants <see cref="HasStoredFindings"/> instead —
+    /// an analyzed-but-evicted version reports true here and false there, and the gap between
+    /// the two is what a full report must bridge with a fallback plus a recompute.
+    /// </remarks>
     public static bool IsComputed(Document document, string? version) =>
+        version is not null
+        && s_analyzedVersions.TryGetValue(document.Id, out var analyzed)
+        && analyzed == version;
+
+    /// <summary>Whether the findings for this exact document version are actually in the cache,
+    /// ready to serve. False for a version that was analyzed and then trimmed — the caller must
+    /// fall back and queue a recompute, and must not stamp its report as the analyzed answer.</summary>
+    public static bool HasStoredFindings(Document document, string? version) =>
         version is not null && s_entries.TryGetValue(document.Id, out var entry) && entry.Version == version;
 
     /// <summary>Cached diagnostics for this exact document version, without computing.</summary>
@@ -534,9 +572,12 @@ internal static class AnalyzerDiagnosticCache
     /// cannot move, and asking the editor to re-pull can only produce the same answer. Reported so
     /// the caller can decline to ask. Deliberately not a comparison of the findings: the pull path
     /// owes its follow-up whenever the analysers landed, whether or not they changed anything.
+    /// Payload-based, not <see cref="IsComputed"/>: a failed pass over an analyzed-but-evicted
+    /// version leaves that answering true, and refreshing on it would re-pull, miss, recompute,
+    /// fail, and refresh again — the loop this gate exists to break.
     /// </remarks>
     public static bool LastComputeStored(Document document, string? version) =>
-        version is not null && IsComputed(document, version);
+        HasStoredFindings(document, version);
 
     /// <summary>Cached diagnostics, computing and storing them on a miss.</summary>
     public static async Task<ImmutableArray<Diagnostic>> GetOrComputeAsync(
@@ -545,8 +586,11 @@ internal static class AnalyzerDiagnosticCache
         if (!LspFeatureOptions.AnalyzerDiagnostics)
             return ImmutableArray<Diagnostic>.Empty;
 
+        // Stored findings, not IsComputed: an analyzed version whose payload was trimmed is
+        // exactly the case a recompute is queued for, and answering it "already computed" with
+        // the empty set would make the eviction permanent.
         var version = await GetVersionAsync(document, ct);
-        if (IsComputed(document, version))
+        if (HasStoredFindings(document, version))
             return TryGet(document, version);
 
         if (version is null)
@@ -621,6 +665,12 @@ internal static class AnalyzerDiagnosticCache
                 break;
         }
 
+        // Only after a real store, so the id can never claim an answer that was never written.
+        // The guard mirrors s_declaredInterest's: reloads mint new DocumentIds, entries accumulate.
+        if (s_analyzedVersions.Count > MaxAnalyzedVersions)
+            s_analyzedVersions.Clear();
+        s_analyzedVersions[document.Id] = version;
+
         Trim();
         return run.Diagnostics;
     }
@@ -671,6 +721,7 @@ internal static class AnalyzerDiagnosticCache
     public static void Evict(DocumentId documentId)
     {
         s_entries.TryRemove(documentId, out _);
+        s_analyzedVersions.TryRemove(documentId, out _);
         s_latestRequested.TryRemove(documentId, out _);
         MemberEditAnalysis.Forget(documentId);
         CompilerDiagnosticCache.Evict(documentId);
@@ -680,18 +731,45 @@ internal static class AnalyzerDiagnosticCache
     public static void Clear()
     {
         s_entries.Clear();
+        s_analyzedVersions.Clear();
         s_inFlight.Clear();
         s_latestRequested.Clear();
         MemberEditAnalysis.Clear();
         CompilerDiagnosticCache.Clear();
     }
 
+    /// <summary>Test seam: a tiny ceiling makes eviction reachable without 2048 real documents.</summary>
+    internal static int? MaxEntriesOverrideForTesting { get; set; }
+
+    /// <summary>Findings entries trimmed since the last capacity log line.</summary>
+    private static int s_trimmedSinceLogged;
+
     private static void Trim()
     {
-        if (s_entries.Count <= MaxEntries)
+        int maxEntries = MaxEntriesOverrideForTesting ?? MaxEntries;
+        if (s_entries.Count <= maxEntries)
             return;
 
-        foreach (var stale in s_entries.OrderBy(e => e.Value.Stamp).Take(s_entries.Count - MaxEntries).ToList())
+        int trimming = s_entries.Count - maxEntries;
+
+        // Deliberately NOT s_analyzedVersions: trimming findings frees memory, and must stay
+        // invisible to the result id — see the field's remarks. Only the payload goes.
+        //
+        // Worth a log line, batched: sustained trimming means the analyzed working set is larger
+        // than this cache, which is exactly the condition that used to present as a silently
+        // oscillating Problems panel and cost a day of guessing. One line per ~256 evictions keeps
+        // the record without turning steady state into spam.
+        if ((s_trimmedSinceLogged += trimming) >= 256 && MaxEntriesOverrideForTesting is null)
+        {
+            Services.ServiceLog.Warn(
+                $"Analyzer findings cache trimmed {s_trimmedSinceLogged} entries since last report "
+                + $"(cap {maxEntries}, {s_analyzedVersions.Count} documents analyzed). The working "
+                + "set is larger than the cache; evicted files re-analyze on their next real change.",
+                key: "analyzer-cache-trim");
+            s_trimmedSinceLogged = 0;
+        }
+
+        foreach (var stale in s_entries.OrderBy(e => e.Value.Stamp).Take(trimming).ToList())
         {
             s_entries.TryRemove(stale.Key, out _);
 

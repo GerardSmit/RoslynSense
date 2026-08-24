@@ -664,13 +664,19 @@ internal static class WorkspaceDiagnosticsHandler
         foreach (string uri in stale)
         {
             var items = new List<Protocol.Diagnostic>();
+            var components = new List<string>();
 
-            foreach (var (project, document, _) in byUri[uri])
+            foreach (var (project, document, stamped) in byUri[uri])
             {
                 ct.ThrowIfCancellationRequested();
 
+                string component = stamped;
+
                 if (!byProject.TryGetValue(project.Id, out var byDocument))
+                {
+                    components.Add(component);
                     continue;
+                }
 
                 byDocument.TryGetValue(document.Id, out var bound);
                 string? version = await AnalyzerDiagnosticCache.GetVersionAsync(document, ct);
@@ -678,9 +684,19 @@ internal static class WorkspaceDiagnosticsHandler
                 // Cache-only for analyzers: a sweep that ran them would take minutes and pin the
                 // CPU. On a miss the previous analysis of this same text stands in, so an edit
                 // elsewhere does not blank every file's squiggles for a second.
+                //
+                // Gated on the stored findings, not on IsComputed: an analyzed version whose
+                // payload was trimmed still stamps "a" into the composed id — that is what keeps
+                // eviction invisible to an unmoved file — but a report actually being produced
+                // here cannot serve what is gone. It falls back, queues the recompute, and
+                // downgrades its own id's marker to "c" below, so the refresh that follows the
+                // recompute is not answered "unchanged" and the real findings do land.
                 var analyzer = AnalyzerDiagnosticCache.TryGet(document, version);
-                if (!AnalyzerDiagnosticCache.IsComputed(document, version))
+                if (!AnalyzerDiagnosticCache.HasStoredFindings(document, version))
                 {
+                    if (component.EndsWith(":a", StringComparison.Ordinal))
+                        component = string.Concat(component.AsSpan(0, component.Length - 1), "c");
+
                     analyzer = AnalyzerDiagnosticCache.TryGetAnyVersion(document, version);
 
                     // Only when there is a version to cache against. A document whose version
@@ -724,8 +740,14 @@ internal static class WorkspaceDiagnosticsHandler
                 {
                     items.AddRange(computed);
                 }
+
+                components.Add(component);
             }
 
+            // Recomposed from the per-owner markers this report was actually served with, rather
+            // than echoing composed[uri]: an owner served from fallback carries "c" here while the
+            // comparison id keeps saying "a", so the file stays stale until its recompute stores —
+            // at which point the sweep re-reports it with the real findings and the ids agree.
             reports.Add(new WorkspaceFullDocumentDiagnosticReport(
                 "full",
                 uri,
@@ -738,7 +760,9 @@ internal static class WorkspaceDiagnosticsHandler
                     d.Code,
                     d.Message))])
             {
-                ResultId = composed[uri],
+                ResultId = components.Count == 0
+                    ? composed[uri]
+                    : string.Join('|', components.OrderBy(v => v, StringComparer.Ordinal)),
             });
         }
 
@@ -798,8 +822,12 @@ internal static class WorkspaceDiagnosticsHandler
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine(
-                    $"[Lsp] Project-wide diagnostics for '{project.Name}' failed: {ex.Message}");
+                // The whole exception, not ex.Message: these passes crashed twenty thousand times
+                // in one session with two anonymous one-liners, and nothing recorded the frame.
+                // The key rate-limits the editor toast; stderr keeps every stack.
+                LspLog.Error(
+                    $"Project-wide diagnostics for '{project.Name}' failed: {ex}",
+                    key: "project-wide-diagnostics-crash");
             }
             finally
             {
@@ -848,8 +876,11 @@ internal static class WorkspaceDiagnosticsHandler
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine(
-                    $"[Lsp] Background analyzers for '{document.Name}' failed: {ex.Message}");
+                // Full stack for the same reason as the project-wide catch above: a message alone
+                // ("Object reference not set…") cost a day of guessing at the throwing frame.
+                LspLog.Error(
+                    $"Background analyzers for '{document.Name}' failed: {ex}",
+                    key: "background-analyzers-crash");
             }
             finally
             {

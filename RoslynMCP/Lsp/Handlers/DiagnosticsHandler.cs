@@ -234,6 +234,15 @@ internal static class DiagnosticsHandler
     /// <see cref="ConfigurationHandler"/> relies on the id moving to re-send a full report and wipe
     /// the squiggles the analyzers that were just disabled had drawn.
     /// </para>
+    /// <para>
+    /// "a" means analyzed, not findings-in-memory: it reads <see
+    /// cref="AnalyzerDiagnosticCache.IsComputed"/>, which survives the findings cache trimming its
+    /// payload. That is what keeps eviction out of the protocol — an unmoved file whose findings
+    /// were evicted still compares equal and answers "unchanged", and the editor keeps displaying
+    /// what it already holds. The other half of the contract lives at the report sites: a
+    /// <em>full</em> report that had to be served without the stored findings downgrades its own
+    /// stamped marker to "c", so the refresh after the recompute is not answered "unchanged".
+    /// </para>
     /// </remarks>
     internal static string AnalyzerMarker(Document document, string version) =>
         !LspFeatureOptions.AnalyzerDiagnostics ? "n"
@@ -273,8 +282,13 @@ internal static class DiagnosticsHandler
 
         string? version = await AnalyzerDiagnosticCache.GetVersionAsync(document, ct);
         var analyzer = AnalyzerDiagnosticCache.TryGet(document, version);
+
+        // Pending is about the stored findings, not IsComputed: an analyzed version whose payload
+        // was trimmed must still fall back and recompute when a full report is owed, because the
+        // findings themselves are gone. The unchanged comparison below stays on IsComputed via the
+        // marker, which is what lets that same eviction go unnoticed while the file is unmoved.
         bool analyzersPending = LspFeatureOptions.AnalyzerDiagnostics &&
-            !AnalyzerDiagnosticCache.IsComputed(document, version);
+            !AnalyzerDiagnosticCache.HasStoredFindings(document, version);
 
         // Nothing for this exact version yet: show the last analysis of this document rather than
         // dropping its squiggles on the floor. A declaration change moves the project's semantic
@@ -301,11 +315,19 @@ internal static class DiagnosticsHandler
         if (analyzersPending && version is not null)
             ComputeAnalyzersInBackground(document);
 
+        // A full report served while the stored findings are missing must not carry the "a" the
+        // marker composes for an analyzed-but-evicted version: the recompute just queued ends in a
+        // refresh, and a report already stamped "a" would have that follow-up answered "unchanged"
+        // — the findings would never arrive. Tagged "c", the follow-up mismatches and delivers.
+        string? reportId = resultId;
+        if (analyzersPending && resultId is not null && resultId.EndsWith(":a", StringComparison.Ordinal))
+            reportId = string.Concat(resultId.AsSpan(0, resultId.Length - 1), "c");
+
         return new FullDocumentDiagnosticReport(
             "full",
             WithEmbedded(ToProtocol(Merge(compiler.Compiler, analyzer)), compiler.Embedded))
         {
-            ResultId = resultId,
+            ResultId = reportId,
         };
     }
 
@@ -365,7 +387,11 @@ internal static class DiagnosticsHandler
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[Lsp] Background analyzers for '{document.Name}' failed: {ex.Message}");
+                // Full stack, keyed: message-only lines from this catch once hid a concurrency
+                // crash behind two anonymous one-liners repeated twenty thousand times.
+                LspLog.Error(
+                    $"Background analyzers for '{document.Name}' failed: {ex}",
+                    key: "background-analyzers-crash");
             }
             finally
             {

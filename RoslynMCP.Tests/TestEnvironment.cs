@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis.MSBuild;
 using RoslynMCP.Services;
 
@@ -44,6 +44,24 @@ internal static class TestEnvironment
         Environment.SetEnvironmentVariable(
             "ROSLYNMCP_EVAL_CACHE_DIR",
             Path.Combine(Path.GetTempPath(), "roslyn-sense-tests", "eval-cache-" + Environment.ProcessId));
+
+    /// <summary>
+    /// Keeps the suite off the network.
+    /// </summary>
+    /// <remarks>
+    /// Navigating into a dependency now reaches a symbol server and GitHub by default, which is
+    /// right for a running server and wrong for a test run: the suite has to pass on a machine
+    /// with no route out, and a test that quietly downloads a fourteen-megabyte PDB is neither
+    /// fast nor repeatable. Source embedded in a PDB stays on, since it needs no network. The
+    /// tests that are about fetching turn these back on for their own duration.
+    /// </remarks>
+    [ModuleInitializer]
+    internal static void KeepExternalSourceOffline()
+    {
+        Environment.SetEnvironmentVariable("ROSLYNMCP_SOURCE_LINK", "0");
+        Environment.SetEnvironmentVariable("ROSLYNMCP_SYMBOL_SERVER", "0");
+        Environment.SetEnvironmentVariable("ROSLYNMCP_REFERENCE_SOURCE", "0");
+    }
 
     /// <summary>
     /// Makes a background-thread crash name itself before it kills the testhost.

@@ -77,6 +77,49 @@ internal sealed class ShadowCopyAnalyzerAssemblyLoader : IAnalyzerAssemblyLoader
         return shadowPath;
     }
 
+    /// <summary>
+    /// The source directory <paramref name="shadowPath"/> was registered from, or null for a
+    /// path this loader never shadowed. This is how the rebuild refresh finds which of a
+    /// project's <see cref="Microsoft.CodeAnalysis.Diagnostics.AnalyzerFileReference"/>s came
+    /// from the rebuilt directory — after the rebind their <c>FullPath</c>s are shadow paths,
+    /// so nothing else can connect them back.
+    /// </summary>
+    public string? TryGetSourceDirectory(string shadowPath)
+    {
+        lock (_lock)
+        {
+            return _shadowToSourceDir.TryGetValue(shadowPath, out var sourceDir) ? sourceDir : null;
+        }
+    }
+
+    /// <summary>
+    /// Forgets everything this loader holds for <paramref name="sourceDir"/>: the ALC lease is
+    /// released (the registry marked that ALC stale on the same rebuild event, so it unloads once
+    /// unreferenced) and the loaded-assembly and shadow-path maps are cleared for it. The next
+    /// <see cref="Register"/>/<see cref="LoadFromPath"/> pair acquires a fresh ALC over a fresh
+    /// shadow copy of the rebuilt binaries.
+    /// </summary>
+    public void RefreshSourceDir(string sourceDir)
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                return;
+
+            if (_bySourceDir.Remove(sourceDir, out var entry))
+                entry.Lease.Dispose();
+
+            foreach (var (shadow, dir) in _shadowToSourceDir.ToList())
+            {
+                if (!string.Equals(dir, sourceDir, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                _shadowToSourceDir.Remove(shadow);
+                _loaded.Remove(shadow);
+            }
+        }
+    }
+
     /// <inheritdoc />
     public void AddDependencyLocation(string fullPath)
     {
@@ -90,20 +133,30 @@ internal sealed class ShadowCopyAnalyzerAssemblyLoader : IAnalyzerAssemblyLoader
         ArgumentException.ThrowIfNullOrEmpty(fullPath);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // NuGet-cache analyzers don't need shadow-copying — the cache is immutable
-        // and Roslyn's default loader handles them fine.
-        if (!_shadowCopy.NeedsShadowCopy(fullPath))
-            return Assembly.LoadFrom(fullPath);
-
         lock (_lock)
         {
             if (_loaded.TryGetValue(fullPath, out var cached))
                 return cached;
 
-            // Prefer the originating source dir recorded by Register so the registry
-            // key matches the source-dir-keyed eviction signal from ShadowCopyManager.
+            // The Register map decides the context, and it must be consulted before any
+            // immutability test: a registered path IS a shadow path, which sits under the
+            // shadow root — an "immutable" location — so asking NeedsShadowCopy first sent
+            // every shadow-copied analyzer to Assembly.LoadFrom. That pinned them in the
+            // non-collectible default ALC, where a rebuilt generator (same assembly name,
+            // new MVID, new shadow path) then failed its load with "assembly with same name
+            // is already loaded" — swallowed by AnalyzerFileReference, so the generator
+            // silently stopped producing anything.
             if (!_shadowToSourceDir.TryGetValue(fullPath, out var sourceDir))
+            {
+                // Not one of ours. NuGet / SDK analyzers are immutable, never rebuilt, and
+                // load fine in the default context.
+                if (!_shadowCopy.NeedsShadowCopy(fullPath))
+                    return Assembly.LoadFrom(fullPath);
+
+                // A mutable path that skipped Register still gets an isolated, collectible
+                // context keyed on its own directory.
                 sourceDir = Path.GetDirectoryName(Path.GetFullPath(fullPath))!;
+            }
 
             if (!_bySourceDir.TryGetValue(sourceDir, out var entry))
             {

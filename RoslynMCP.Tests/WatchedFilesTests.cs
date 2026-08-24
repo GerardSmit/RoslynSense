@@ -445,6 +445,110 @@ public class WatchedFilesTests
     }
 
     /// <summary>
+    /// The watcher echo of an ordinary save invalidates nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// A save produces a Changed event for a file whose text already reached the workspace on
+    /// didChange — the event is a restatement, not information. An open buffer outranks disk, so
+    /// the apply path answers NothingToDo, the outcome reports nothing happened, and no
+    /// RefreshKind.All goes out — which is what keeps a save from costing a re-pull of every open
+    /// document plus a workspace sweep. The semantic version is the deep assertion: had the loader
+    /// been re-applied, every analyzer result and diagnostic result id in the project would have
+    /// silently gone stale.
+    /// </remarks>
+    [Fact]
+    public async Task SavingAnOpenFileChangesNothing()
+    {
+        string session = $"watched-save-{Guid.NewGuid():N}";
+        string file = FixturePaths.CalculatorFile;
+
+        try
+        {
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, file);
+            OpenDocumentStore.Open(
+                session, file, Microsoft.CodeAnalysis.Text.SourceText.From(await File.ReadAllTextAsync(file)), 1);
+
+            var (_, before) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile, targetFilePath: file);
+            var semanticBefore = await before.GetDependentSemanticVersionAsync();
+
+            var outcome = await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Changed)], default);
+
+            Assert.False(outcome.DidAnything);
+
+            var (_, after) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile, targetFilePath: file);
+            Assert.Equal(semanticBefore, await after.GetDependentSemanticVersionAsync());
+        }
+        finally
+        {
+            OpenDocumentStore.CloseSession(session);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
+    /// A project that lists its compile items never gains a document from the watcher.
+    /// </summary>
+    /// <remarks>
+    /// Two projects can share one directory, and the watcher names every project in the changed
+    /// file's directory — so both are asked to apply every event there. For the project with
+    /// <c>EnableDefaultCompileItems=false</c> the answer must always be "not mine": treating a
+    /// Changed event for a file it lacks as an arrival, or reading its own explicit
+    /// <c>&lt;Compile Include&gt;</c> as evidence that a glob reaches the directory, both invented
+    /// a document in a project that does not compile the file — and every type the file declares
+    /// was then defined twice, as errors in a project nobody edited.
+    /// </remarks>
+    [Fact]
+    public async Task AnExplicitItemsProjectNeverGainsADocumentFromTheWatcher()
+    {
+        string session = $"watched-explicit-{Guid.NewGuid():N}";
+        string open = FixturePaths.CalculatorFile;
+        string created = Path.Combine(FixturePaths.SampleProjectDir, $"WatchedExplicit{Guid.NewGuid():N}.cs");
+
+        static async Task<List<string>> AardvarkDocumentsAsync()
+        {
+            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(FixturePaths.AlternateProjectFile);
+            return [.. project.Documents
+                .Select(d => Path.GetFileName(d.FilePath ?? ""))
+                .Where(n => n.Length > 0)
+                .Order(StringComparer.OrdinalIgnoreCase)];
+        }
+
+        try
+        {
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, open);
+            var before = await AardvarkDocumentsAsync();
+            Assert.Contains("AardvarkExternal.cs", before);
+
+            OpenDocumentStore.Open(
+                session, open, Microsoft.CodeAnalysis.Text.SourceText.From(await File.ReadAllTextAsync(open)), 1);
+
+            // The save echo: a Changed event for a file Aardvark has no document for.
+            var save = await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(open), FileChangeType.Changed)], default);
+            Assert.False(save.DidAnything);
+
+            // The scaffold: a Created event beside Aardvark's explicit items. SampleProject globs
+            // the directory and takes the file; Aardvark must not.
+            await File.WriteAllTextAsync(created,
+                "namespace SampleProject; public sealed class WatchedExplicitTarget { }");
+            await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(created), FileChangeType.Created)], default);
+
+            Assert.Equal(before, await AardvarkDocumentsAsync());
+        }
+        finally
+        {
+            OpenDocumentStore.CloseSession(session);
+            if (File.Exists(created))
+                File.Delete(created);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
     /// Rewriting a closed file with the content it already had costs nothing.
     /// </summary>
     /// <remarks>

@@ -1,4 +1,4 @@
-using RoslynMCP.Config;
+﻿using RoslynMCP.Config;
 using RoslynMCP.Daemon;
 using RoslynMCP.Services;
 
@@ -63,7 +63,14 @@ internal static class LspProxy
         }
         using var inboundScope = inbound;
 
-        var (config, _, _) = RoslynSenseConfigLoader.Load(startPath);
+        var (config, _, configError) = RoslynSenseConfigLoader.Load(startPath);
+
+        // To stderr, which the editor shows in the server's output channel — the one place a
+        // person looking for why nothing is configured will think to look. See DaemonServer for
+        // why a file that failed to load must not fail quietly.
+        if (configError is not null)
+            Console.Error.WriteLine($"[Config] {configError}; running on defaults.");
+
         var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out _);
 
         if (settings.SharedHost && solutionKey is not null)

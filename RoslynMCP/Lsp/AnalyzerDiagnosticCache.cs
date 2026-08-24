@@ -390,11 +390,54 @@ internal static class AnalyzerDiagnosticCache
         {
             var text = await document.GetTextAsync(ct);
             var semanticVersion = await document.Project.GetDependentSemanticVersionAsync(ct);
-            return $"{Convert.ToHexString(text.GetChecksum().AsSpan())}:{semanticVersion}";
+            return $"{ContentHash(text)}:{semanticVersion}";
         }
         catch (OperationCanceledException) { throw; }
         catch { return null; }
     }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<SourceText, string>
+        s_contentHashes = new();
+
+    /// <summary>
+    /// A hash that is equal exactly when <see cref="SourceText.ContentEquals"/> is true, however
+    /// the instance was produced.
+    /// </summary>
+    /// <remarks>
+    /// Not <see cref="SourceText.GetChecksum"/>, which describes the instance's construction as
+    /// much as its content: <c>SourceText.From(string)</c> defaults to SHA-1, loader texts to
+    /// SHA-256, and a stream-read text hashes its raw bytes, byte-order mark included. The same
+    /// file therefore took a different id depending on whether the open-buffer overlay or the disk
+    /// loader happened to back its document — and the overlay legitimately swaps between the two
+    /// when the base solution forks under it (a watched-file apply, a project add). Every such swap
+    /// flipped the result id of every open-but-unedited file and re-bound it for a change that
+    /// touched nothing. Hashing the characters makes the id a fact about the content alone.
+    /// Cached per instance, like the checksum it replaces.
+    /// </remarks>
+    private static string ContentHash(SourceText text) =>
+        s_contentHashes.GetValue(text, static t =>
+        {
+            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(
+                System.Security.Cryptography.HashAlgorithmName.SHA256);
+
+            char[] chunk = System.Buffers.ArrayPool<char>.Shared.Rent(16 * 1024);
+            try
+            {
+                for (int at = 0; at < t.Length; at += chunk.Length)
+                {
+                    int count = Math.Min(chunk.Length, t.Length - at);
+                    t.CopyTo(at, chunk, 0, count);
+                    hash.AppendData(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
+                        chunk.AsSpan(0, count)));
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<char>.Shared.Return(chunk);
+            }
+
+            return Convert.ToHexString(hash.GetHashAndReset());
+        });
 
     /// <summary>Whether this exact document version has already been analyzed. An analyzed
     /// document with no findings is a real answer, not a miss — distinguishing the two is what

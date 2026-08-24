@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
@@ -10,6 +10,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Services;
 
@@ -520,7 +521,7 @@ internal static class WorkspaceService
         string normalizedPath = Path.GetFullPath(projectPath);
         TaskCompletionSource<(Workspace, Project)>? ourTcs = null;
 
-        bool isDecompile = DecompiledSourceService.IsGeneratedProjectPath(normalizedPath);
+        bool isDecompile = ExternalSource.ExternalSourceProject.IsProjectPath(normalizedPath);
 
         // Owning-solution resolution is disk I/O (dir walk + .sln parse), so it is deferred to
         // the first cache MISS and memoized — cache hits never pay for it. When the project
@@ -650,7 +651,7 @@ internal static class WorkspaceService
         {
             if (isDecompile)
             {
-                (workspace, openedProject, decompileTempDir) = await DecompiledSourceService.OpenProjectAsync(
+                (workspace, openedProject, decompileTempDir) = await ExternalSource.ExternalSourceProject.OpenAsync(
                     normalizedPath,
                     cancellationToken);
             }
@@ -1503,7 +1504,7 @@ internal static class WorkspaceService
     public static async Task<string?> FindContainingProjectAsync(
         string filePath, CancellationToken cancellationToken = default)
     {
-        string? generatedProjectPath = DecompiledSourceService.TryGetGeneratedProjectPath(filePath);
+        string? generatedProjectPath = ExternalSource.ExternalSourceProject.TryGetProjectPath(filePath);
         if (!string.IsNullOrEmpty(generatedProjectPath))
             return generatedProjectPath;
 
@@ -1521,9 +1522,9 @@ internal static class WorkspaceService
     public static async Task<Document?> FindDocumentAsync(
         string filePath, CancellationToken cancellationToken = default)
     {
-        string? decompiled = DecompiledSourceService.TryGetGeneratedProjectPath(filePath);
-        if (!string.IsNullOrEmpty(decompiled))
-            return await TryFindInProjectAsync(decompiled, PathHelper.NormalizePath(filePath), cancellationToken);
+        string? external = ExternalSource.ExternalSourceProject.TryGetProjectPath(filePath);
+        if (!string.IsNullOrEmpty(external))
+            return await TryFindInProjectAsync(external, PathHelper.NormalizePath(filePath), cancellationToken);
 
         return (await FindOwnerAsync(filePath, cancellationToken)).Document;
     }
@@ -2244,8 +2245,20 @@ internal static class WorkspaceService
                                     continue;
 
                                 Lsp.AnalyzerDiagnosticCache.Evict(id);
-                                live.OnDocumentTextLoaderChanged(
-                                    id, new FileTextLoader(filePath, defaultEncoding: null));
+
+                                // A text change rather than a loader swap, for the same reason the
+                                // watcher's reload uses one: a fresh loader resets the document's
+                                // top-level version, so closing a tab whose buffer had only body
+                                // edits invalidated the whole project's analysis to revert one file.
+                                if (disk is not null)
+                                {
+                                    live.OnDocumentTextChanged(id, disk, PreservationMode.PreserveIdentity);
+                                }
+                                else
+                                {
+                                    live.OnDocumentTextLoaderChanged(
+                                        id, new FileTextLoader(filePath, defaultEncoding: null));
+                                }
                             }
                         }
                     }
@@ -2603,8 +2616,19 @@ internal static class WorkspaceService
         // Carried through: a caller that owns this file — the designer generator regenerating a
         // partial for the first time — is telling us it is compiled, and dropping the flag here
         // sent it straight into the legacy-project refusal it was passed to override.
+        //
+        // Only for a file the solution has never seen. When another project already holds this
+        // document, nothing "arrived" — the named project simply does not compile the file. The
+        // watcher names every project in the changed file's directory, so with two projects side
+        // by side, saving a file open from one invented a document for it in the other, and every
+        // type it declares was suddenly defined twice.
         if (documents.Count == 0)
+        {
+            if (live.CurrentSolution.GetDocumentIdsWithFilePath(fullPath).Any())
+                return FileSyncResult.NothingToDo;
+
             return await TryAddDocumentAsync(live, projectId, fullPath, authoritative);
+        }
 
         bool any = false;
         foreach (var document in documents)
@@ -2621,8 +2645,23 @@ internal static class WorkspaceService
             // positions, for the rest of the session.
             Lsp.AnalyzerDiagnosticCache.Evict(document.Id);
 
-            live.OnDocumentTextLoaderChanged(
-                document.Id, new FileTextLoader(fullPath, defaultEncoding: null));
+            // As a text change, not a loader swap, whenever the bytes are in hand. A new loader
+            // severs the incremental-parse lineage: the document's top-level version resets, the
+            // project's dependent semantic version moves, and every file in the project — plus
+            // every dependent project — re-binds and re-analyses for an edit that never left one
+            // method body. A text change diffs against the old tree, so a checkout that only
+            // touched bodies invalidates only the files it touched, the same economy an open
+            // buffer's keystrokes get. The loader stays as the fallback for a file that could not
+            // be read just now — lazy and correct, at the old price.
+            if (disk is not null)
+            {
+                live.OnDocumentTextChanged(document.Id, disk, PreservationMode.PreserveIdentity);
+            }
+            else
+            {
+                live.OnDocumentTextLoaderChanged(
+                    document.Id, new FileTextLoader(fullPath, defaultEncoding: null));
+            }
             any = true;
         }
         return any ? FileSyncResult.Applied : FileSyncResult.NothingToDo;
@@ -2669,6 +2708,15 @@ internal static class WorkspaceService
         // invisible: the caller reads that as success so no fallback runs, and its own .csproj
         // write is then suppressed as an echo of itself.
         if (!authoritative && PathHelper.RequiresMsBuild(project.FilePath ?? ""))
+            return FileSyncResult.NothingToDo;
+
+        // An SDK project that turned the default glob off compiles what it lists, exactly like a
+        // legacy one: the file that just appeared is not listed, and the .csproj write that lists
+        // it is its own event. The sibling scan inside GlobReaches cannot see this — an explicit
+        // <Compile Include> in the same directory reads as evidence the glob reaches there — so
+        // every file created beside such a project was added to it as well, and each type those
+        // files declare was defined twice.
+        if (!authoritative && DisablesDefaultCompileItems(project.FilePath ?? ""))
             return FileSyncResult.NothingToDo;
 
         if (!authoritative && !GlobReaches(project, directory))
@@ -2726,6 +2774,40 @@ internal static class WorkspaceService
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, bool Plain)>
         s_plainGlob = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Project file path → (stamp it was read at, whether it turns default items off).</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, bool Explicit)>
+        s_explicitItems = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether the project file itself sets <c>EnableDefaultCompileItems</c> or
+    /// <c>EnableDefaultItems</c> to false — the SDK spelling of "I list my compile items".
+    /// </summary>
+    /// <remarks>
+    /// Unreadable answers false: this guard exists to stop inventing documents, and the
+    /// <see cref="GlobReaches"/> check that follows already refuses when it cannot be sure.
+    /// </remarks>
+    private static bool DisablesDefaultCompileItems(string projectPath)
+    {
+        try
+        {
+            long ticks = new FileInfo(projectPath).LastWriteTimeUtc.Ticks;
+            if (s_explicitItems.TryGetValue(projectPath, out var cached) && cached.Ticks == ticks)
+                return cached.Explicit;
+
+            var root = Parser.ParseText(File.ReadAllText(projectPath)).RootSyntax;
+            bool disabled = root is not null && root.Descendants().Any(e =>
+                e.NameNode?.LocalName is "EnableDefaultCompileItems" or "EnableDefaultItems"
+                && string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase));
+
+            s_explicitItems[projectPath] = (ticks, disabled);
+            return disabled;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static bool HasPlainDefaultCompileGlob(string projectPath)
     {
         try
@@ -2745,15 +2827,10 @@ internal static class WorkspaceService
                 return false;
             }
 
-            var document = System.Xml.Linq.XDocument.Load(projectPath);
-            bool plain = document.Root is { } root
-                && (root.Attribute("Sdk") is not null
-                    || root.Elements().Any(e => e.Name.LocalName == "Sdk"))
-                && !root.Descendants().Any(e =>
-                    (e.Name.LocalName == "EnableDefaultCompileItems"
-                        && string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase))
-                    || e.Name.LocalName == "DefaultItemExcludes"
-                    || (e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null));
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            bool plain = document.RootSyntax is { } root
+                && (root.GetAttribute("Sdk") is not null || root.GetElementByLocalName("Sdk") is not null)
+                && !root.Descendants().Any(IsGlobConstraint);
 
             s_plainGlob[projectPath] = (ticks, plain);
             return plain;
@@ -2804,7 +2881,7 @@ internal static class WorkspaceService
                     // the repo root, so its DefaultItemExcludes went unseen.
                     pending.Remove(name);
 
-                    var root = System.Xml.Linq.XDocument.Load(path).Root;
+                    var root = Parser.ParseText(File.ReadAllText(path)).RootSyntax;
                     if (root is not null && root.Descendants().Any(IsGlobConstraint))
                         return true;
                 }
@@ -2822,11 +2899,11 @@ internal static class WorkspaceService
         return false;
     }
 
-    private static bool IsGlobConstraint(System.Xml.Linq.XElement e) =>
-        (e.Name.LocalName == "EnableDefaultCompileItems"
+    private static bool IsGlobConstraint(XmlElementBaseSyntax e) =>
+        (e.NameNode?.LocalName == "EnableDefaultCompileItems"
             && string.Equals(e.Value.Trim(), "false", StringComparison.OrdinalIgnoreCase))
-        || e.Name.LocalName == "DefaultItemExcludes"
-        || (e.Name.LocalName == "Compile" && e.Attribute("Remove") is not null);
+        || e.NameNode?.LocalName == "DefaultItemExcludes"
+        || (e.NameNode?.LocalName == "Compile" && e.GetAttribute("Remove") is not null);
 
     private static IReadOnlyList<string> FoldersFor(Project project, string fullPath)
     {
@@ -3262,43 +3339,161 @@ internal static class WorkspaceService
 
     /// <summary>
     /// Fired by <see cref="ShadowCopyService"/> when a watched analyzer / source-generator
-    /// directory is rebuilt. Evicts every cached workspace that pinned an ALC for that
-    /// directory so the next <see cref="GetOrOpenProjectAsync"/> call re-binds with fresh
-    /// shadow copies and a fresh ALC, picking up the new generator binaries.
+    /// directory is rebuilt. Swaps the affected projects' analyzer references to fresh shadow
+    /// copies in place, so the rebuilt generator's output reaches its consumers without the
+    /// solution reloading.
     /// </summary>
-    private static void OnAnalyzerDirectoryChanged(string sourceDir)
+    /// <remarks>
+    /// This used to evict every cached workspace that pinned the directory — for a solution
+    /// entry, the whole solution — so rebuilding one generator cost a full MSBuild reload of
+    /// every project in it, consumers and bystanders alike. Nothing about the reload was needed:
+    /// the registry hands out a fresh ALC for the directory on this same event, and the only
+    /// state actually stale is the handful of <c>AnalyzerFileReference</c>s whose shadow copies
+    /// came from it. Swapping those moves the consumers' semantic versions, which is what rolls
+    /// their diagnostics, analyzer results, and result ids forward; every other project keeps its
+    /// compilations. Eviction survives as the fallback for a workspace the swap cannot reach.
+    /// </remarks>
+    private static void OnAnalyzerDirectoryChanged(string sourceDir) =>
+        _ = Task.Run(() => RefreshAnalyzersForDirAsync(sourceDir));
+
+    /// <summary>Exposed for tests; the body of <see cref="OnAnalyzerDirectoryChanged"/>.</summary>
+    internal static async Task RefreshAnalyzersForDirAsync(string sourceDir)
     {
-        // Wait synchronously on a thread-pool callback — eviction here is best-effort
-        // and shouldn't dead-lock the watcher thread for long.
-        if (!s_cacheLock.Wait(0))
+        List<(string CacheKey, CachedWorkspaceEntry Entry)> pinned = [];
+
+        await s_cacheLock.WaitAsync();
+        try
         {
-            // If the lock is busy, schedule a retry once it's free.
-            _ = Task.Run(async () =>
+            if (!s_dirToProjects.TryGetValue(sourceDir, out var cacheKeys))
+                return;
+
+            foreach (var cacheKey in cacheKeys.ToList())
             {
-                await s_cacheLock.WaitAsync();
-                try { EvictForDirLocked(sourceDir); }
-                finally { s_cacheLock.Release(); }
-            });
-            return;
+                if (s_cache.TryGetValue(cacheKey, out var entry))
+                    pinned.Add((cacheKey, entry));
+            }
         }
-
-        try { EvictForDirLocked(sourceDir); }
         finally { s_cacheLock.Release(); }
-    }
 
-    private static void EvictForDirLocked(string sourceDir)
-    {
-        if (!s_dirToProjects.TryGetValue(sourceDir, out var cacheKeys))
-            return;
-
-        foreach (var cacheKey in cacheKeys.ToList())
+        bool anyRefreshed = false;
+        foreach (var (cacheKey, entry) in pinned)
         {
-            if (s_cache.TryGetValue(cacheKey, out var entry))
+            bool refreshed = false;
+            try
+            {
+                refreshed = await TryRefreshAnalyzersInPlaceAsync(entry, sourceDir);
+            }
+            catch (Exception ex)
             {
                 Console.Error.WriteLine(
-                    $"[WorkspaceService] Analyzer rebuild in '{sourceDir}', evicting workspace for '{cacheKey}'.");
-                EvictEntryLocked(cacheKey, entry, $"analyzers were rebuilt in '{sourceDir}'");
+                    $"[WorkspaceService] In-place analyzer refresh for '{cacheKey}' failed: {ex.Message}");
             }
+
+            if (refreshed)
+            {
+                anyRefreshed = true;
+                continue;
+            }
+
+            await s_cacheLock.WaitAsync();
+            try
+            {
+                if (s_cache.TryGetValue(cacheKey, out var current) && ReferenceEquals(current, entry))
+                {
+                    Console.Error.WriteLine(
+                        $"[WorkspaceService] Analyzer rebuild in '{sourceDir}', evicting workspace for '{cacheKey}'.");
+                    EvictEntryLocked(cacheKey, entry, $"analyzers were rebuilt in '{sourceDir}'");
+                }
+            }
+            finally { s_cacheLock.Release(); }
+        }
+
+        // The consumers' semantic versions moved, so the editor's diagnostics and result ids are
+        // stale; one coalesced refresh brings every window current.
+        if (anyRefreshed)
+            Lsp.LspSessionRegistry.ScheduleRefresh(Lsp.RefreshKind.All);
+    }
+
+    /// <summary>
+    /// Re-points every analyzer reference in <paramref name="entry"/> that came from
+    /// <paramref name="sourceDir"/> at a fresh shadow copy of the rebuilt binaries. Returns false
+    /// when this workspace cannot be refreshed this way and the caller should evict it instead.
+    /// </summary>
+    private static async Task<bool> TryRefreshAnalyzersInPlaceAsync(
+        CachedWorkspaceEntry entry, string sourceDir)
+    {
+        if (entry.Workspace is not MSBuildWorkspace live || entry.ShadowLoader is not { } loader)
+            return false;
+
+        if (!await entry.LoadGate.WaitAsync(LoadGateWait))
+            return false;
+
+        try
+        {
+            if (entry.IsDisposed)
+                return false;
+
+            // Which references came from the rebuilt directory, read out before the loader
+            // forgets its shadow-path map for it. Their FullPaths are shadow paths, so only the
+            // loader can connect them back to the source directory the watcher named.
+            var solution = live.CurrentSolution;
+            var swaps = new List<(ProjectId Project, AnalyzerReference Old, string OriginalPath)>();
+
+            foreach (var project in solution.Projects)
+            {
+                foreach (var reference in project.AnalyzerReferences)
+                {
+                    if (reference is not AnalyzerFileReference file
+                        || file.FullPath is not { Length: > 0 } shadowPath
+                        || !string.Equals(
+                            loader.TryGetSourceDirectory(shadowPath), sourceDir,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string original = Path.Combine(sourceDir, Path.GetFileName(shadowPath));
+                    if (!File.Exists(original))
+                        return false; // the rebuild removed an output the workspace references
+
+                    swaps.Add((project.Id, reference, original));
+                }
+            }
+
+            if (swaps.Count == 0)
+                return true; // pinned historically, referenced by nothing current — nothing stale
+
+            // Fresh shadow copies through a fresh ALC: the registry marked the old one stale on
+            // this same event, and the manager already invalidated the old shadow directory, so
+            // Register copies the new bytes and the first load acquires a new context.
+            loader.RefreshSourceDir(sourceDir);
+
+            var refreshedProjects = new HashSet<ProjectId>();
+            foreach (var (projectId, old, original) in swaps)
+            {
+                string fresh = loader.Register(original);
+                live.OnAnalyzerReferenceRemoved(projectId, old);
+                live.OnAnalyzerReferenceAdded(projectId, new AnalyzerFileReference(fresh, loader));
+                refreshedProjects.Add(projectId);
+            }
+
+            // The reference swap alone is not enough to re-execute the generators: the
+            // compilation tracker matches generators by identity (assembly name, version, type
+            // name) — all unchanged across a rebuild — and keeps the already-created V1
+            // instances so incremental state survives. forceRegeneration is the escape hatch
+            // Visual Studio pulls after a build completes: it discards the cached driver, so
+            // the next run instantiates generators from the swapped reference's new assembly.
+            foreach (var projectId in refreshedProjects)
+                live.EnqueueUpdateSourceGeneratorVersion(projectId, forceRegeneration: true);
+
+            Console.Error.WriteLine(
+                $"[WorkspaceService] Analyzer rebuild in '{sourceDir}': refreshed "
+                + $"{refreshedProjects.Count} project(s) in place; the solution stays loaded.");
+            return true;
+        }
+        finally
+        {
+            entry.LoadGate.Release();
         }
     }
 

@@ -1,4 +1,4 @@
-using System.IO.Pipes;
+﻿using System.IO.Pipes;
 using System.Reflection;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
@@ -43,8 +43,19 @@ internal sealed class DaemonServer
         RedirectConsoleToLog(solutionKey);
         string workingDir = Path.GetDirectoryName(solutionKey) ?? Directory.GetCurrentDirectory();
 
-        var (config, _, _) = RoslynSenseConfigLoader.Load(workingDir);
-        var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out _);
+        var (config, _, configError) = RoslynSenseConfigLoader.Load(workingDir);
+
+        // Said out loud, because the alternative is what it used to be: one field of the wrong
+        // type stops the whole file from loading, every setting in it silently goes back to its
+        // default, and the editor shows a solution configured by nobody with nothing anywhere to
+        // say why. ConfigWatcher says the same on a reload; the first load said nothing at all.
+        if (configError is not null)
+            Console.Error.WriteLine($"[Config] {configError}; running on defaults.");
+
+        var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out var configWarnings);
+
+        foreach (string warning in configWarnings)
+            Console.Error.WriteLine($"[Config] {warning}");
         DebuggerViewOptions.Current = settings.DebugView;
 
         // A daemon lives long enough to reload; standby hosts are what make those reloads meet
@@ -169,6 +180,12 @@ internal sealed class DaemonServer
 
         WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
         _lifecycle.UpdateIdleTimeout(TimeSpan.FromMinutes(settings.HostIdleMinutes));
+
+        // The reload log already described the debugger diff; this is what makes it true. The
+        // editor's settings push takes the same two steps in ConfigurationHandler — without them
+        // here, a roslynsense.json edit applied only at the next daemon start.
+        DebuggerViewOptions.Current = settings.DebugView;
+        Services.DebugSessionManager.GetSession()?.ApplyViewOptions(settings.DebugView);
 
         // Editors re-pull diagnostics, lenses and tokens so anything a toggle changed shows up
         // without a keystroke.

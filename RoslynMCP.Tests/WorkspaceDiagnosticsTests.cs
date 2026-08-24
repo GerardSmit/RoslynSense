@@ -496,21 +496,63 @@ public class WorkspaceDiagnosticsTests : IDisposable
     [Fact]
     public async Task EditingOneFileBindsThatOneTreeAndNoOther()
     {
-        LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
-        string path = FixturePaths.AspxPageHelperFile;
-        string text = await File.ReadAllTextAsync(path);
-
-        await RoslynTestHelpers.OpenProjectAsync(FixturePaths.AspxProjectFile);
-        OpenDocumentStore.Open(_session, path, SourceText.From(text), version: 1);
-
-        // Settle first. Analyzer passes finish in the background and the marker they move is part
-        // of the result id, so a document can go stale for reasons that have nothing to do with the
-        // edit under test. Sweep until one changes nothing, and measure from there.
-        var ids = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        bool settled = false;
-
-        for (int i = 0; i < 15 && !settled; i++)
+        // Analyzers off, like every other economy test here: their background passes land whenever
+        // the shared semaphore lets them, moving result-id markers at unpredictable moments — this
+        // test pins the sweep's work, and the marker machinery has its own tests.
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        try
         {
+            LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+            string path = FixturePaths.AspxPageHelperFile;
+            string text = await File.ReadAllTextAsync(path);
+
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.AspxProjectFile);
+            OpenDocumentStore.Open(_session, path, SourceText.From(text), version: 1);
+
+            var ids = await SweepUntilSettledAsync(FixturePaths.AspxProjectFile, "PageHelper.cs");
+            Assert.True(ids.Count > 5, $"the fixture needs several documents to tell 'one' from 'all'; saw {ids.Count}");
+
+            // A comment, deliberately: it moves this file's text and no declaration anywhere, which
+            // is the shape of almost every keystroke and the one the old sweep paid a whole
+            // compilation for.
+            OpenDocumentStore.Change(path, version: 2, _ => SourceText.From(text + Environment.NewLine + "// keystroke" + Environment.NewLine));
+
+            await MeasureSweepAsync(FixturePaths.AspxProjectFile, ids);
+
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+            Assert.True(
+                WorkspaceDiagnosticsHandler.TreesBound is > 0 and <= 2,
+                $"one file was edited and {WorkspaceDiagnosticsHandler.TreesBound} trees were bound "
+                + $"across {ids.Count} documents; a multi-targeted project binds it once per framework.");
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+        }
+    }
+
+    /// <summary>Sweeps until nothing is stale, returning the settled result ids.</summary>
+    /// <remarks>
+    /// Three things can unsettle a sweep through no fault of the test: a background analyzer pass
+    /// landing later and moving a "c" marker to "a"; another test's background warmer touching its
+    /// own cached solution, which the sweep then follows instead of this fixture's; and plain
+    /// staleness. Each iteration re-touches the fixture's entry so the sweep looks at it, and
+    /// settled means quiet, covering <paramref name="requiredUriSuffix"/>, with no compiler-only
+    /// marker still promising a re-report.
+    /// </remarks>
+    private static async Task<Dictionary<string, string>> SweepUntilSettledAsync(
+        string projectFile, string? requiredUriSuffix = null)
+    {
+        var ids = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // Generous: this outlasts the analyzer drain, whose passes share a quarter-of-the-cores
+        // semaphore with project-wide passes queued by whatever tests ran before — on eight cores
+        // that is two slots for everything.
+        for (int i = 0; i < 300; i++)
+        {
+            await WorkspaceService.GetOrOpenProjectAsync(projectFile);
+
             var report = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
                 new WorkspaceDiagnosticParams([.. ids.Select(kv => new PreviousResultId(kv.Key, kv.Value))]),
                 default);
@@ -523,29 +565,605 @@ public class WorkspaceDiagnosticsTests : IDisposable
             foreach (var r in full)
                 ids[r.Uri] = r.ResultId!;
 
-            settled = full.Count == 0;
-            if (!settled)
-                await Task.Delay(100);
+            bool covered = requiredUriSuffix is null
+                || ids.Keys.Any(k => k.EndsWith(requiredUriSuffix, StringComparison.OrdinalIgnoreCase));
+
+            if (full.Count == 0
+                && covered
+                && !ids.Values.Any(v => v.EndsWith(":c", StringComparison.Ordinal)))
+            {
+                return ids;
+            }
+
+            await Task.Delay(100);
         }
 
-        Assert.True(settled, "the sweep never reached a state where nothing was stale");
-        Assert.True(ids.Count > 5, $"the fixture needs several documents to tell 'one' from 'all'; saw {ids.Count}");
+        Assert.Fail("the sweep never settled; still compiler-only: " + string.Join(", ",
+            ids.Where(kv => kv.Value.EndsWith(":c", StringComparison.Ordinal))
+                .Select(kv => Path.GetFileName(kv.Key))));
+        return ids;
+    }
 
-        // A comment, deliberately: it moves this file's text and no declaration anywhere, which is
-        // the shape of almost every keystroke and the one the old sweep paid a whole compilation for.
-        OpenDocumentStore.Change(path, version: 2, _ => SourceText.From(text + Environment.NewLine + "// keystroke" + Environment.NewLine));
+    /// <summary>One sweep with the counters zeroed just before it, for asserting what it cost.</summary>
+    /// <remarks>
+    /// Retried when the report comes back with no items at all. The sweep follows whichever cached
+    /// solution was touched most recently, and another test's background warmer can touch its own
+    /// entry between this method's touch and the sweep — a solution with none of our documents
+    /// answers empty, which a sweep of this fixture never does while a document is open in it.
+    /// </remarks>
+    private static async Task<WorkspaceDiagnosticReport> MeasureSweepAsync(
+        string projectFile, Dictionary<string, string> ids)
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            await WorkspaceService.GetOrOpenProjectAsync(projectFile);
 
-        WorkspaceDiagnosticsHandler.ResetBindCounters();
+            WorkspaceDiagnosticsHandler.ResetBindCounters();
+            CompilerDiagnosticCache.ResetComputationCounter();
 
-        await WorkspaceDiagnosticsHandler.DiagnoseAsync(
-            new WorkspaceDiagnosticParams([.. ids.Select(kv => new PreviousResultId(kv.Key, kv.Value))]),
-            default);
+            var report = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+                new WorkspaceDiagnosticParams([.. ids.Select(kv => new PreviousResultId(kv.Key, kv.Value))]),
+                default);
 
-        Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
-        Assert.True(
-            WorkspaceDiagnosticsHandler.TreesBound is > 0 and <= 2,
-            $"one file was edited and {WorkspaceDiagnosticsHandler.TreesBound} trees were bound "
-            + $"across {ids.Count} documents; a multi-targeted project binds it once per framework.");
+            if (report.Items.Any())
+                return report;
+
+            await Task.Delay(100);
+        }
+
+        Assert.Fail("every measured sweep answered for a foreign solution (empty report)");
+        return null!;
+    }
+
+    /// <summary>
+    /// The watcher echo of an ordinary save costs the next sweep nothing at all.
+    /// </summary>
+    /// <remarks>
+    /// A save is a Changed event for an open file whose text already reached the workspace on
+    /// didChange. The apply path answers NothingToDo — the open buffer outranks disk — so no
+    /// version moves, no result id mismatches, and the sweep that follows must be able to say
+    /// "unchanged" for everything without binding a single tree or computing anything.
+    /// </remarks>
+    [Fact]
+    public async Task ASaveOfAnOpenFileCostsTheNextSweepNothing()
+    {
+        // Analyzers off, as in ASecondSweepAnswersUnchangedWithAnalyzersOff: their background
+        // passes land whenever a shared semaphore lets them, moving result-id markers from "c" to
+        // "a" at unpredictable moments. This test pins the sweep's economy, and the marker
+        // machinery has its own tests.
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        try
+        {
+            LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+            string path = FixturePaths.CalculatorFile;
+
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, path);
+            OpenDocumentStore.Open(_session, path, SourceText.From(await File.ReadAllTextAsync(path)), 1);
+
+            var ids = await SweepUntilSettledAsync(FixturePaths.SampleProjectFile, "Calculator.cs");
+            Assert.True(ids.Count > 0, "the settled sweep should have reported something to baseline");
+
+            var outcome = await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(path), FileChangeType.Changed)], default);
+            Assert.False(
+                outcome.DidAnything,
+                $"the save echo did something: reloaded={outcome.ReloadedWorkspace}, "
+                + $"evicted=[{string.Join(", ", outcome.EvictedProjects.Select(Path.GetFileName))}], "
+                + $"markup=[{string.Join(", ", (outcome.InvalidatedMarkup ?? []).Select(Path.GetFileName))}], "
+                + $"applied=[{string.Join(", ", (outcome.AppliedDocumentChanges ?? []).Select(Path.GetFileName))}]");
+
+            var report = await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            Assert.Empty(report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>());
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.TreesBound);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+            Assert.Equal(0L, CompilerDiagnosticCache.Computations);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+        }
+    }
+
+    /// <summary>
+    /// The sweep answers an edited open file from the document pull's cache instead of binding it
+    /// a second time.
+    /// </summary>
+    /// <remarks>
+    /// The sequence after every keystroke pause is: the pull binds the edited file (span-limited
+    /// when the edit allows it) and caches the result, then a refresh triggers a workspace sweep
+    /// that sees the same file stale. The sweep used to re-bind the whole file from scratch —
+    /// which for a large file is seconds of CPU per pause, and was what kept "Analyzing solution"
+    /// on screen while starving completion and semantic tokens. The computation counter is the
+    /// proof: the stale document is answered, and nothing is bound to answer it.
+    /// </remarks>
+    [Fact]
+    public async Task TheSweepServesAnEditedOpenFileFromThePullsCache()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        try
+        {
+            LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+            string path = FixturePaths.CalculatorFile;
+            string text = await File.ReadAllTextAsync(path);
+
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, path);
+            OpenDocumentStore.Open(_session, path, SourceText.From(text), 1);
+
+            var ids = await SweepUntilSettledAsync(FixturePaths.SampleProjectFile, "Calculator.cs");
+
+            OpenDocumentStore.Change(path, 2,
+                _ => SourceText.From(text + Environment.NewLine + "// keystroke" + Environment.NewLine));
+
+            // What the editor's own document pull does moments before any sweep: bind the edited
+            // file and store the result under the same contentHash:dependentSemanticVersion key.
+            var document = await LspDocumentResolver.ResolveAsync(path, default);
+            Assert.NotNull(document);
+            await CompilerDiagnosticCache.GetOrComputeAsync(document!, default);
+
+            await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            Assert.Equal(1L, WorkspaceDiagnosticsHandler.TreesBound);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+            Assert.Equal(0L, CompilerDiagnosticCache.Computations);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+        }
+    }
+
+    /// <summary>
+    /// An external change to a closed file — a checkout, a formatter, another agent — updates that
+    /// file and re-binds nothing else.
+    /// </summary>
+    /// <remarks>
+    /// The two halves of "a checkout costs what it changed": content that is genuinely different
+    /// must reach the workspace (the identical-content no-op is pinned in WatchedFilesTests), and
+    /// the sweep that follows must re-bind the changed file alone. The change is deliberately a
+    /// method-body one — a declaration change legitimately invalidates every file that can see it,
+    /// so it would prove nothing about the sweep's economy.
+    /// </remarks>
+    [Fact]
+    public async Task AnExternalChangeToAClosedFileRebindsOnlyThatFile()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+        string open = FixturePaths.CalculatorFile;
+        string closed = Path.Combine(FixturePaths.SampleProjectDir, $"SweepCheckout{Guid.NewGuid():N}.cs");
+        await File.WriteAllTextAsync(closed,
+            "namespace SampleProject; public sealed class CheckoutTarget { public int Value() { return 1; } }");
+
+        try
+        {
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, open);
+            OpenDocumentStore.Open(_session, open, SourceText.From(await File.ReadAllTextAsync(open)), 1);
+            await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(closed), FileChangeType.Created)], default);
+
+            var ids = await SweepUntilSettledAsync(
+                FixturePaths.SampleProjectFile, Path.GetFileName(closed));
+
+            await File.WriteAllTextAsync(closed,
+                "namespace SampleProject; public sealed class CheckoutTarget { public int Value() { return 2; } }");
+
+            var outcome = await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(closed), FileChangeType.Changed)], default);
+            Assert.Contains(closed, outcome.AppliedDocumentChanges ?? [], StringComparer.OrdinalIgnoreCase);
+
+            var report = await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            var full = report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>().ToList();
+            Assert.True(full.Count > 0,
+                $"no full reports; {report.Items.Count()} items total, "
+                + $"unchanged={report.Items.OfType<WorkspaceUnchangedDocumentDiagnosticReport>().Count()}");
+            Assert.True(
+                full.All(r => r.Uri.EndsWith(Path.GetFileName(closed), StringComparison.OrdinalIgnoreCase)),
+                "more than the changed file was re-reported: " + string.Join("; ", full.Select(r =>
+                    $"{Path.GetFileName(r.Uri)} was '{(ids.TryGetValue(r.Uri, out var old) ? old : "<none>")}' now '{r.ResultId}'")));
+            Assert.Equal(1L, WorkspaceDiagnosticsHandler.TreesBound);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+            if (File.Exists(closed))
+                File.Delete(closed);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
+    /// A declaration edit reaches the project that references the edited one — and still never
+    /// binds a whole compilation.
+    /// </summary>
+    /// <remarks>
+    /// The one scenario every single-project test is structurally blind to. Adding a public method
+    /// moves the dependent semantic version of the edited project <em>and</em> of every project
+    /// that references it, so their files all go stale together — which is correct, a consumer can
+    /// genuinely bind differently now — and the sweep must answer that with one bind per stale
+    /// tree. Falling back to <c>compilation.GetDiagnostics()</c> here would be the most expensive
+    /// possible regression: it is the multi-project case, so it pays once per project.
+    /// </remarks>
+    [Fact]
+    public async Task ADeclarationEditReachesTheDependentProjectATreeAtATime()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        string path = FixturePaths.LayeredAppWarehouseModuleFile;
+        string text = await File.ReadAllTextAsync(path);
+        try
+        {
+            LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+
+            // Opening Storefront pulls Warehouse in through its ProjectReference, so both live in
+            // one solution and the dependency edge the scenario is about actually exists.
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.LayeredAppStorefrontProjectFile);
+            OpenDocumentStore.Open(_session, path, SourceText.From(text), 1);
+
+            var ids = await SweepUntilSettledAsync(
+                FixturePaths.LayeredAppStorefrontProjectFile, "Startup.cs");
+            Assert.Contains(ids.Keys, k => k.EndsWith("WarehouseModule.cs", StringComparison.OrdinalIgnoreCase));
+
+            // A new public type: the declaration change that legitimately reaches consumers.
+            OpenDocumentStore.Change(path, 2, _ => SourceText.From(
+                text + Environment.NewLine
+                + "public static class SweepProbe { public static int Answer() => 42; }" + Environment.NewLine));
+
+            var report = await MeasureSweepAsync(FixturePaths.LayeredAppStorefrontProjectFile, ids);
+
+            var full = report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>().ToList();
+
+            // The edited file, and the dependent project's file — the propagation is the point.
+            Assert.Contains(full, r => r.Uri.EndsWith("WarehouseModule.cs", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(full, r => r.Uri.EndsWith("Startup.cs", StringComparison.OrdinalIgnoreCase));
+
+            // Both projects went stale at once, and neither was answered with a whole compilation.
+            Assert.True(WorkspaceDiagnosticsHandler.TreesBound > 0);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+            OpenDocumentStore.Close(_session, path);
+            await WorkspaceService.EvictProjectForTests(FixturePaths.LayeredAppStorefrontProjectFile);
+        }
+    }
+
+    /// <summary>
+    /// Closing a tab whose buffer had unsaved body edits re-reports that file and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// The close-path twin of the watcher's reload fix: the revert used to swap the document's
+    /// text loader, which resets its top-level version and moves the project's dependent semantic
+    /// version — so abandoning an edit in one file re-reported every file in the project. The
+    /// revert is a text change now, and this pins that closing costs exactly the file it reverted.
+    /// </remarks>
+    [Fact]
+    public async Task ClosingADirtyTabRevertsOnlyThatFile()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        try
+        {
+            LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+            string path = FixturePaths.CalculatorFile;
+            string text = await File.ReadAllTextAsync(path);
+
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, path);
+
+            // A second tab stays open for the whole test: the scope is "projects the user has
+            // documents open in", and closing the only open document would empty the sweep rather
+            // than exercise the revert.
+            string anchor = FixturePaths.ServicesFile;
+            OpenDocumentStore.Open(_session, anchor, SourceText.From(await File.ReadAllTextAsync(anchor)), 1);
+            OpenDocumentStore.Open(_session, path, SourceText.From(text), 1);
+
+            // The edit is settled into the ids first, so the measurement below sees only what the
+            // close itself changed — the revert from edited buffer back to disk text.
+            OpenDocumentStore.Change(path, 2,
+                _ => SourceText.From(text + Environment.NewLine + "// unsaved" + Environment.NewLine));
+            var ids = await SweepUntilSettledAsync(FixturePaths.SampleProjectFile, "Calculator.cs");
+
+            OpenDocumentStore.Close(_session, path);
+            await WorkspaceService.ReconcileOpenBufferAsync(path);
+
+            var report = await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            var full = report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>().ToList();
+            Assert.True(
+                full.Count > 0 && full.All(
+                    r => r.Uri.EndsWith("Calculator.cs", StringComparison.OrdinalIgnoreCase)),
+                "closing one dirty tab re-reported: " + string.Join(", ",
+                    full.Select(r => Path.GetFileName(r.Uri)).DefaultIfEmpty("nothing")));
+            Assert.Equal(1L, WorkspaceDiagnosticsHandler.TreesBound);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+        }
+    }
+
+    /// <summary>
+    /// Disk changing underneath an open buffer changes nothing: the buffer outranks the disk.
+    /// </summary>
+    /// <remarks>
+    /// The checkout-conflict case — git restores a file the user has unsaved edits in. The editor
+    /// will surface that conflict when the user saves; until then the workspace must keep serving
+    /// the buffer, and the watcher echo of the disk write must not invalidate anything or the
+    /// sweep would flap between the two texts.
+    /// </remarks>
+    [Fact]
+    public async Task AnExternalChangeToAnOpenFileLosesToTheBufferAndCostsNothing()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+        string path = Path.Combine(FixturePaths.SampleProjectDir, $"SweepConflict{Guid.NewGuid():N}.cs");
+        await File.WriteAllTextAsync(path,
+            "namespace SampleProject; public sealed class ConflictTarget { public int Value() { return 1; } }");
+
+        try
+        {
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, FixturePaths.CalculatorFile);
+            await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(path), FileChangeType.Created)], default);
+
+            // Open with an unsaved body edit, so buffer and disk genuinely differ.
+            OpenDocumentStore.Open(_session, path, SourceText.From(
+                "namespace SampleProject; public sealed class ConflictTarget { public int Value() { return 10; } }"), 1);
+
+            var ids = await SweepUntilSettledAsync(
+                FixturePaths.SampleProjectFile, Path.GetFileName(path));
+
+            // The checkout: disk now says something else again.
+            await File.WriteAllTextAsync(path,
+                "namespace SampleProject; public sealed class ConflictTarget { public int Value() { return 2; } }");
+
+            var outcome = await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(path), FileChangeType.Changed)], default);
+            Assert.False(outcome.DidAnything);
+
+            var report = await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            Assert.Empty(report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>());
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.TreesBound);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+            Assert.Equal(0L, CompilerDiagnosticCache.Computations);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+            OpenDocumentStore.Close(_session, path);
+            if (File.Exists(path))
+                File.Delete(path);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
+    /// A batch of body-only external changes — a branch switch — rebinds exactly those files.
+    /// </summary>
+    /// <remarks>
+    /// The single-file case is pinned separately; this is the shape the watcher actually delivers
+    /// for <c>git checkout</c>, one burst of Changed events. N files changed must cost N trees:
+    /// per-file it is the loader-swap regression (each reload resetting a top-level version would
+    /// re-report the whole project N times over), and per-batch it is the eviction regression (one
+    /// event too many and the entire workspace reloads).
+    /// </remarks>
+    [Fact]
+    public async Task ABranchSwitchRebindsExactlyTheFilesItChanged()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+
+        string Content(string name, int value) =>
+            $"namespace SampleProject; public sealed class {name} {{ public int Value() {{ return {value}; }} }}";
+
+        string stamp = $"{Guid.NewGuid():N}";
+        var files = new[] { "BranchA", "BranchB", "BranchC" }
+            .Select(name => (Name: name, Path: Path.Combine(FixturePaths.SampleProjectDir, $"Sweep{name}{stamp}.cs")))
+            .ToList();
+
+        try
+        {
+            foreach (var (name, path) in files)
+                await File.WriteAllTextAsync(path, Content(name, 1));
+
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, FixturePaths.CalculatorFile);
+            OpenDocumentStore.Open(
+                _session, FixturePaths.CalculatorFile,
+                SourceText.From(await File.ReadAllTextAsync(FixturePaths.CalculatorFile)), 1);
+
+            await WatchedFilesHandler.ProcessAsync(
+                [.. files.Select(f => new FileEvent(LspConverters.PathToUri(f.Path), FileChangeType.Created))],
+                default);
+
+            var ids = await SweepUntilSettledAsync(
+                FixturePaths.SampleProjectFile, Path.GetFileName(files[^1].Path));
+            foreach (var (_, path) in files)
+            {
+                Assert.True(
+                    ids.Keys.Any(k => k.EndsWith(Path.GetFileName(path), StringComparison.OrdinalIgnoreCase)),
+                    $"'{Path.GetFileName(path)}' never made it into the settled sweep");
+            }
+
+            // The switch: every file's method body moves, no declaration anywhere does.
+            foreach (var (name, path) in files)
+                await File.WriteAllTextAsync(path, Content(name, 2));
+
+            var outcome = await WatchedFilesHandler.ProcessAsync(
+                [.. files.Select(f => new FileEvent(LspConverters.PathToUri(f.Path), FileChangeType.Changed))],
+                default);
+            Assert.False(outcome.ReloadedWorkspace);
+            Assert.Empty(outcome.EvictedProjects);
+            foreach (var (_, path) in files)
+                Assert.Contains(path, outcome.AppliedDocumentChanges ?? [], StringComparer.OrdinalIgnoreCase);
+
+            var report = await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            var full = report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>().ToList();
+            var expected = files.Select(f => Path.GetFileName(f.Path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            Assert.True(
+                full.Count == files.Count
+                    && full.All(r => expected.Contains(Path.GetFileName(LspConverters.UriToPath(r.Uri)))),
+                $"{files.Count} files changed and these were re-reported: " + string.Join(", ",
+                    full.Select(r => Path.GetFileName(r.Uri)).DefaultIfEmpty("nothing")));
+            Assert.Equal(files.Count, (int)WorkspaceDiagnosticsHandler.TreesBound);
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+            foreach (var (_, path) in files)
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
+    /// A rename — the watcher sees a delete and a create — never reloads the workspace and never
+    /// binds a whole compilation.
+    /// </summary>
+    /// <remarks>
+    /// Moving a file legitimately re-reports the project: the document set changed, so its
+    /// dependent semantic version moves and every consumer of the old URI must learn it is gone.
+    /// What is pinned here is the ceiling — one live-workspace apply per event and a tree at a
+    /// time after it, because the eviction path this replaced made every rename cost a full
+    /// MSBuild reload of the solution.
+    /// </remarks>
+    [Fact]
+    public async Task ARenameIsAppliedInPlaceAndSweptATreeAtATime()
+    {
+        bool analyzers = LspFeatureOptions.AnalyzerDiagnostics;
+        LspFeatureOptions.AnalyzerDiagnostics = false;
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+        string stamp = $"{Guid.NewGuid():N}";
+        string before = Path.Combine(FixturePaths.SampleProjectDir, $"SweepRenameBefore{stamp}.cs");
+        string after = Path.Combine(FixturePaths.SampleProjectDir, $"SweepRenameAfter{stamp}.cs");
+        const string content =
+            "namespace SampleProject; public sealed class RenameTarget { public int Value() { return 1; } }";
+
+        try
+        {
+            await File.WriteAllTextAsync(before, content);
+
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, FixturePaths.CalculatorFile);
+            OpenDocumentStore.Open(
+                _session, FixturePaths.CalculatorFile,
+                SourceText.From(await File.ReadAllTextAsync(FixturePaths.CalculatorFile)), 1);
+            await WatchedFilesHandler.ProcessAsync(
+                [new FileEvent(LspConverters.PathToUri(before), FileChangeType.Created)], default);
+
+            var ids = await SweepUntilSettledAsync(
+                FixturePaths.SampleProjectFile, Path.GetFileName(before));
+
+            File.Move(before, after);
+            var outcome = await WatchedFilesHandler.ProcessAsync(
+                [
+                    new FileEvent(LspConverters.PathToUri(before), FileChangeType.Deleted),
+                    new FileEvent(LspConverters.PathToUri(after), FileChangeType.Created),
+                ],
+                default);
+
+            // In place: the rename must not have been answered by throwing the workspace away.
+            Assert.False(outcome.ReloadedWorkspace);
+            Assert.Empty(outcome.EvictedProjects);
+
+            var report = await MeasureSweepAsync(FixturePaths.SampleProjectFile, ids);
+
+            var full = report.Items.OfType<WorkspaceFullDocumentDiagnosticReport>().ToList();
+            Assert.Contains(full, r => r.Uri.EndsWith(Path.GetFileName(after), StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(full, r => r.Uri.EndsWith(Path.GetFileName(before), StringComparison.OrdinalIgnoreCase));
+
+            // The document set moved, so the project re-reports — but a tree at a time, never as
+            // a whole compilation.
+            Assert.Equal(0L, WorkspaceDiagnosticsHandler.WholeCompilationsBound);
+        }
+        finally
+        {
+            LspFeatureOptions.AnalyzerDiagnostics = analyzers;
+            foreach (string path in new[] { before, after })
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
+    /// Editing one markup file re-diagnoses that page and answers "unchanged" for every other.
+    /// </summary>
+    /// <remarks>
+    /// The markup twin of <see cref="EditingOneCodeBehindLeavesTheOtherPagesResultIdsAlone"/>: that
+    /// one pins the code-behind direction, this one the markup's own text. The pack's result id is
+    /// a content hash, so an unsaved buffer edit to one <c>.aspx</c> must move exactly one id — a
+    /// whole-site re-parse per keystroke is what made the original index unusable, and the sweep
+    /// runs every two seconds.
+    /// </remarks>
+    [Fact]
+    public async Task EditingOneMarkupFileRediagnosesOnlyThatPage()
+    {
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "solution";
+        await UseWebFormsAsync();
+
+        var first = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(), default);
+
+        var previous = first.Items
+            .OfType<WorkspaceFullDocumentDiagnosticReport>()
+            .Where(r => r.ResultId is not null && IsMarkup(r.Uri))
+            .Select(r => new PreviousResultId(r.Uri, r.ResultId!))
+            .ToArray();
+        Assert.True(previous.Length > 1, "This needs a site with more than one page to say anything.");
+
+        string page = FixturePaths.EventWiringAspxFile;
+        string text = await File.ReadAllTextAsync(page);
+        OpenDocumentStore.Open(_session, page, SourceText.From(text), version: 1);
+        try
+        {
+            OpenDocumentStore.Change(page, version: 2,
+                _ => SourceText.From(text + Environment.NewLine + "<%-- sweep economy probe --%>"));
+
+            var second = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+                new WorkspaceDiagnosticParams(previous), default);
+
+            var unchanged = second.Items
+                .OfType<WorkspaceUnchangedDocumentDiagnosticReport>()
+                .Select(r => r.Uri)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var id in previous)
+            {
+                if (id.Uri.EndsWith("EventWiring.aspx", StringComparison.OrdinalIgnoreCase))
+                {
+                    Assert.Contains(
+                        second.Items.OfType<WorkspaceFullDocumentDiagnosticReport>(),
+                        r => string.Equals(r.Uri, id.Uri, StringComparison.OrdinalIgnoreCase));
+                    continue;
+                }
+
+                Assert.True(
+                    unchanged.Contains(id.Uri),
+                    $"Editing EventWiring.aspx re-diagnosed '{id.Uri}', which does not include it. "
+                    + "This is the whole-site re-parse coming back.");
+            }
+        }
+        finally
+        {
+            OpenDocumentStore.Close(_session, page);
+            ProjectIndexCacheService.InvalidateProject(FixturePaths.AspxProjectFile);
+            await WorkspaceService.EvictProjectForTests(FixturePaths.AspxProjectFile);
+        }
     }
 
     /// <summary>

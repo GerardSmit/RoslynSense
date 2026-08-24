@@ -71,6 +71,36 @@ public class GeneratorBuildServiceTests : IDisposable
         Assert.Empty(unbuilt);
     }
 
+    /// <summary>
+    /// A generator built to a custom <c>OutputPath</c> is built, just not under <c>bin\</c> where
+    /// the fast probe looks — so the probe misses, and the load used to rebuild it on every fresh
+    /// daemon. Rebuilding is not merely wasted seconds: the DLL write it produces is a rebuild
+    /// event to every workspace pinning that directory, which is what turned "open the solution"
+    /// into "reload the solution". MSBuild is asked where the output really goes before any build
+    /// is paid for.
+    /// </summary>
+    [Fact]
+    public async Task WhenGeneratorIsBuiltToACustomOutputPathThenEnsureDoesNotRebuild()
+    {
+        File.WriteAllText(_generatorProject, File.ReadAllText(_generatorProject).Replace(
+            "<PropertyGroup>",
+            "<PropertyGroup>\n    <OutputPath>out\\</OutputPath>"));
+
+        // Where MSBuild's TargetPath points for this project: OutputPath plus the appended TFM.
+        string dll = Path.Combine(_tempDir, "Generator", "out", "netstandard2.0", "Generator.dll");
+        Directory.CreateDirectory(Path.GetDirectoryName(dll)!);
+        File.WriteAllBytes(dll, [1, 2, 3, 4]);
+        var stamp = File.GetLastWriteTimeUtc(dll);
+
+        await GeneratorBuildService.EnsureGeneratorsBuiltAsync(_consumerProject, CancellationToken.None);
+
+        // Untouched: a build would have overwritten the file at its own TargetPath.
+        Assert.Equal(stamp, File.GetLastWriteTimeUtc(dll));
+        Assert.False(
+            Directory.Exists(Path.Combine(_tempDir, "Generator", "bin")),
+            "a build ran despite the generator's output existing at its TargetPath");
+    }
+
     [Fact]
     public async Task WhenGeneratorNeverBuiltThenEnsureBuildsItsOutput()
     {

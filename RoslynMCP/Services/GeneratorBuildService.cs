@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Services;
 
@@ -81,6 +81,15 @@ internal static class GeneratorBuildService
             if (s_builtThisSession.ContainsKey(generator))
                 continue;
 
+            // The bin\ probe missed, but that only means "no output under bin\" — a generator
+            // built to a custom OutputPath or an artifacts/ layout is built, just elsewhere.
+            // Before paying a build subprocess (and the DLL write it produces, which is what used
+            // to churn every loaded workspace), ask MSBuild where the output actually goes and
+            // trust the file on disk. The evaluation is cached against the project file, so a
+            // warm session answers this from a stat.
+            if (await HasOutputAtMsBuildTargetPathAsync(generator, cancellationToken))
+                continue;
+
             report?.Invoke($"Building source generator {Path.GetFileNameWithoutExtension(generator)}");
 
             var run = s_inflight.GetOrAdd(generator, static key => RunBuildAsync(key));
@@ -159,13 +168,12 @@ internal static class GeneratorBuildService
         {
             try
             {
-                var document = XDocument.Load(path);
+                var document = Parser.ParseText(File.ReadAllText(path));
                 var items = new List<ProjectReferenceItem>();
 
-                foreach (var element in document.Descendants()
-                             .Where(e => e.Name.LocalName == "ProjectReference"))
+                foreach (var element in document.DescendantsByLocalName("ProjectReference"))
                 {
-                    string? include = element.Attribute("Include")?.Value;
+                    string? include = element.GetAttributeValue("Include");
                     if (string.IsNullOrWhiteSpace(include) || include.Contains('$'))
                         continue;
 
@@ -182,8 +190,8 @@ internal static class GeneratorBuildService
                     }
 
                     string? outputItemType =
-                        element.Attribute("OutputItemType")?.Value
-                        ?? element.Elements().FirstOrDefault(e => e.Name.LocalName == "OutputItemType")?.Value;
+                        element.GetAttributeValue("OutputItemType")
+                        ?? element.GetElementByLocalName("OutputItemType")?.Value;
 
                     items.Add(new ProjectReferenceItem(
                         referencedPath,
@@ -192,10 +200,11 @@ internal static class GeneratorBuildService
 
                 return items;
             }
-            catch (Exception)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // A project file that cannot be parsed contributes nothing to the scan; whatever
-                // is wrong with it will be reported by the load itself, with better context.
+                // A project file that cannot be read contributes nothing to the scan; whatever is
+                // wrong with it will be reported by the load itself, with better context. One that
+                // is merely malformed needs no catch: the parse is error-tolerant.
                 return [];
             }
         });
@@ -239,15 +248,113 @@ internal static class GeneratorBuildService
             string fallback = Path.GetFileNameWithoutExtension(path);
             try
             {
-                string? declared = XDocument.Load(path).Descendants()
-                    .FirstOrDefault(e => e.Name.LocalName == "AssemblyName")?.Value.Trim();
+                string? declared = Parser.ParseText(File.ReadAllText(path))
+                    .DescendantsByLocalName("AssemblyName")
+                    .FirstOrDefault()?.Value.Trim();
                 return string.IsNullOrEmpty(declared) || declared.Contains('$') ? fallback : declared;
             }
-            catch (Exception)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 return fallback;
             }
         });
+
+    /// <summary>Project file path → (stamp it was read at, the TargetPath MSBuild computed, or
+    /// null when the evaluation failed). Caching on the project file's own stamp means a warm
+    /// session answers <see cref="HasOutputAtMsBuildTargetPathAsync"/> with a stat.</summary>
+    private static readonly ConcurrentDictionary<string, (long Ticks, string? TargetPath)>
+        s_targetPaths = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether the generator's real output — where MSBuild says it goes, not where the bin probe
+    /// guessed — exists on disk. False when the evaluation fails or the file is absent, in which
+    /// case the caller builds, exactly as before this check existed.
+    /// </summary>
+    private static async Task<bool> HasOutputAtMsBuildTargetPathAsync(
+        string projectPath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            long ticks = new FileInfo(projectPath).LastWriteTimeUtc.Ticks;
+            if (!s_targetPaths.TryGetValue(projectPath, out var cached) || cached.Ticks != ticks)
+            {
+                cached = (ticks, await QueryTargetPathAsync(projectPath, cancellationToken));
+                s_targetPaths[projectPath] = cached;
+            }
+
+            return cached.TargetPath is { Length: > 0 } target && File.Exists(target);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Asks MSBuild for the project's <c>TargetPath</c> — an evaluation, not a build. Returns
+    /// null when it cannot be determined; ~a second on first ask, then cached by the caller.
+    /// </summary>
+    private static async Task<string?> QueryTargetPathAsync(
+        string projectPath, CancellationToken cancellationToken)
+    {
+        bool legacy = PathHelper.RequiresMsBuild(projectPath);
+        if (legacy && WorkspaceService.LegacyMsBuildDirectory is not { Length: > 0 })
+            return null;
+
+        var (fileName, arguments) = legacy
+            ? (Path.Combine(WorkspaceService.LegacyMsBuildDirectory!, "MSBuild.exe"),
+                $"\"{projectPath}\" -getProperty:TargetPath -nologo")
+            : ("dotnet", $"msbuild \"{projectPath}\" -getProperty:TargetPath -nologo");
+
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(projectPath)!,
+            }
+        };
+
+        BuildProcessHelper.ConfigureMsBuildEnvironment(process.StartInfo);
+
+        try
+        {
+            BuildProcessHelper.StartWithClosedInput(process);
+
+            var stdout = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            _ = process.StandardError.ReadToEndAsync(CancellationToken.None);
+
+            // Bounded: this is an optimization on the load path, and a wedged MSBuild here must
+            // degrade to "build it, as before", not hold the open hostage.
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            await process.WaitForExitAsync(timeout.Token);
+
+            if (process.ExitCode != 0)
+                return null;
+
+            string answer = (await stdout).Trim();
+            return answer.Length > 0 ? Path.GetFullPath(answer) : null;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            return null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// The build itself. Uncancellable by design, exactly like a restore: it is shared by every

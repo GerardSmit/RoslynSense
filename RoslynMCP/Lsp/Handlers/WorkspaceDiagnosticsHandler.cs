@@ -1,6 +1,5 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.Immutable;
-using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Config;
@@ -20,7 +19,7 @@ namespace RoslynMCP.Lsp.Handlers;
 /// </summary>
 internal static class WorkspaceDiagnosticsHandler
 {
-    private static readonly ConditionalWeakTable<Compilation, ConcurrentDictionary<string, bool>>
+    private static readonly ConcurrentDictionary<(ProjectId, string), (VersionStamp Version, bool Interested)>
         s_declaredInterest = new();
 
 
@@ -372,9 +371,14 @@ internal static class WorkspaceDiagnosticsHandler
     /// it, before the pack walks a directory or parses anything.
     /// </summary>
     /// <remarks>
-    /// Cached against the compilation rather than the project, because a compilation is a snapshot
-    /// — the answer cannot go stale for one — and because a sweep asks the same question of every
-    /// pack for every project on every request.
+    /// Cached per project and validated by the dependent semantic version, not held against a
+    /// Compilation instance. It used to be the latter, and that key was correct but useless in
+    /// the hot case: every edit forks the solution, so every sweep saw a Compilation it had never
+    /// answered for and called <see cref="Project.GetCompilationAsync"/> to re-ask — which forces
+    /// the edited project's final compilation, source generators included, once per keystroke
+    /// pause. Whether System.Web.UI.Control resolves cannot change when a method body does, and
+    /// the dependent semantic version is exactly the stamp that stands still across body edits
+    /// and moves on anything that could alter the answer.
     /// </remarks>
     private static async Task<bool> HasDeclaredInterestAsync(
         ILanguagePack pack, Project project, CancellationToken ct)
@@ -382,41 +386,34 @@ internal static class WorkspaceDiagnosticsHandler
         if (pack.WellKnownTypeNames.IsDefaultOrEmpty)
             return true;
 
+        var version = await project.GetDependentSemanticVersionAsync(ct);
+        var key = (project.Id, pack.Id);
+        if (s_declaredInterest.TryGetValue(key, out var cached) && cached.Version == version)
+            return cached.Interested;
+
         var compilation = await project.GetCompilationAsync(ct);
         if (compilation is null)
             return false;
 
-        return s_declaredInterest.GetOrCreateValue(compilation).GetOrAdd(
-            pack.Id,
-            _ => pack.WellKnownTypeNames.Any(name => compilation.GetTypeByMetadataName(name) is not null));
+        bool interested = pack.WellKnownTypeNames.Any(
+            name => compilation.GetTypeByMetadataName(name) is not null);
+
+        // A reloaded solution mints new ProjectIds, so entries can only accumulate; the ceiling
+        // is a runaway guard, far above any real project-times-pack count.
+        if (s_declaredInterest.Count > 8192)
+            s_declaredInterest.Clear();
+
+        s_declaredInterest[key] = (version, interested);
+        return interested;
     }
 
-    /// <summary>
-    /// Whether the id the client sent back still describes the world this sweep sees.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// A single component counts, not just the whole composition. A file that belongs to several
-    /// projects — every file of a multi-targeted project, and any file pulled in by a linked
-    /// <c>&lt;Compile Include="..\..."/&gt;</c> — is stamped here with one component per owner
-    /// joined by <c>'|'</c>, while the document pull answers for the one project it resolved and
-    /// returns that project's component alone.
-    /// </para>
-    /// <para>
-    /// The client does not keep the two apart. <c>getAllResultIds</c> overwrites the id stored for
-    /// a URI from the workspace sweep with the one from the document pull whenever it is tracking
-    /// that document, and sends the result back here as <c>previousResultIds</c> — so a composed
-    /// id was being compared against one of its own components and could never be equal. Every
-    /// such URI was therefore re-bound on every sweep for as long as it stayed open, which for a
-    /// multi-targeted project is every file in it.
-    /// </para>
-    /// <para>
-    /// Accepting a component loses nothing: a component only appears in the composition when its
-    /// owning project produced it in this same sweep, so an equal component means that project's
-    /// text and semantic version are both unmoved. The full composition is still what gets echoed
-    /// back in the report, so the client converges on it as soon as it stops tracking the document.
-    /// </para>
-    /// </remarks>
+    /// <summary>One stale document's answer: compiler diagnostics, and — when they were computed
+    /// alongside them — the embedded-language findings. Null embedded means "not computed here",
+    /// and the caller decides whether the document is open enough to be worth the token walk.</summary>
+    private sealed record BoundDocument(
+        ImmutableArray<Microsoft.CodeAnalysis.Diagnostic> Compiler,
+        IReadOnlyList<Protocol.Diagnostic>? Embedded);
+
     /// <summary>
     /// The compiler diagnostics of just the stale documents of one project, or <see langword="null"/>
     /// when a document could not be bound this way and the caller should bind the whole compilation.
@@ -446,40 +443,67 @@ internal static class WorkspaceDiagnosticsHandler
     /// agree with the pull rather than merely agree with itself.
     /// </para>
     /// </remarks>
-    private static async Task<ILookup<SyntaxTree?, Microsoft.CodeAnalysis.Diagnostic>?> BindStaleTreesAsync(
-        Compilation compilation,
+    private static async Task<Dictionary<DocumentId, BoundDocument>?> BindStaleDocumentsAsync(
+        Project project,
         IEnumerable<(Project Project, Document Document, string Version)> stale,
         CancellationToken ct)
     {
-        var found = new List<Microsoft.CodeAnalysis.Diagnostic>();
+        var found = new Dictionary<DocumentId, BoundDocument>();
+        Compilation? compilation = null;
 
         foreach (var document in stale.Select(owner => owner.Document).DistinctBy(d => d.Id))
         {
             ct.ThrowIfCancellationRequested();
 
+            // Through the pull path's cache for an open document. The pull has usually just bound
+            // this exact version — restricted to the edited member's span when the edit allowed it
+            // — and stored the result under the same checksum:dependentSemanticVersion key this
+            // sweep composed its result id from, so the common case is a lookup. Binding it again
+            // here was a second whole-file bind of the very file being typed in, on every sweep,
+            // which for a large file is what kept "Analyzing solution" on screen after every
+            // pause. Open documents only: on a miss the cache's compute also detects embedded
+            // languages, a walk over every token, and the closed documents a declaration edit
+            // makes stale must not pay that per file.
+            if (document.FilePath is { Length: > 0 } openPath && OpenDocumentStore.IsOpen(openPath))
+            {
+                Interlocked.Increment(ref TreesBound);
+                var cached = await CompilerDiagnosticCache.GetOrComputeAsync(document, ct);
+                found[document.Id] = new BoundDocument(
+                    [.. cached.Compiler.Where(d => d.Location.IsInSource)], cached.Embedded);
+                continue;
+            }
+
             // A tree the compilation does not hold cannot have a semantic model taken from it.
             // Reachable in principle if a document and its project were read from different
             // snapshots; the whole-compilation path still answers correctly, so this defers to it
             // for the project rather than reporting that document as having no diagnostics.
-            if (await document.GetSyntaxTreeAsync(ct) is not { } tree
-                || !compilation.ContainsSyntaxTree(tree))
-            {
+            if (await document.GetSyntaxTreeAsync(ct) is not { } tree)
                 return null;
-            }
+
+            // Not before the first closed stale document needs it: a body edit leaves only the
+            // edited (open) file stale, and forcing the project's final compilation for a sweep
+            // that will not bind against it re-runs its source generators per keystroke pause.
+            compilation ??= await project.GetCompilationAsync(ct);
+            if (compilation is null || !compilation.ContainsSyntaxTree(tree))
+                return null;
 
             Interlocked.Increment(ref TreesBound);
-            found.AddRange(compilation.GetSemanticModel(tree)
-                .GetDiagnostics(cancellationToken: ct)
-                .Where(d => d.Location.IsInSource));
+            found[document.Id] = new BoundDocument(
+                [.. compilation.GetSemanticModel(tree)
+                    .GetDiagnostics(cancellationToken: ct)
+                    .Where(d => d.Location.IsInSource)],
+                null);
         }
 
-        return found.ToLookup(d => d.Location.SourceTree);
+        return found;
     }
 
     /// <summary>
-    /// How much the sweep had to bind, split by how it bound it. Exposed for tests, which assert on
-    /// what was <em>not</em> bound — the reports are identical either way, so counting the work is
-    /// the only way to pin it.
+    /// How much the sweep answered a document at a time, against how often it fell back to a whole
+    /// compilation. A document served from <see cref="CompilerDiagnosticCache"/> counts here too —
+    /// the counter pins the unit of work, and the cache hit is the cheapest form of it. Exposed for
+    /// tests, which assert on what was <em>not</em> bound — the reports are identical either way,
+    /// so counting the work is the only way to pin it.
     /// </summary>
     internal static long TreesBound;
 
@@ -493,6 +517,32 @@ internal static class WorkspaceDiagnosticsHandler
         Interlocked.Exchange(ref WholeCompilationsBound, 0);
     }
 
+    /// <summary>
+    /// Whether the id the client sent back still describes the world this sweep sees.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A single component counts, not just the whole composition. A file that belongs to several
+    /// projects — every file of a multi-targeted project, and any file pulled in by a linked
+    /// <c>&lt;Compile Include="..\..."/&gt;</c> — is stamped here with one component per owner
+    /// joined by <c>'|'</c>, while the document pull answers for the one project it resolved and
+    /// returns that project's component alone.
+    /// </para>
+    /// <para>
+    /// The client does not keep the two apart. <c>getAllResultIds</c> overwrites the id stored for
+    /// a URI from the workspace sweep with the one from the document pull whenever it is tracking
+    /// that document, and sends the result back here as <c>previousResultIds</c> — so a composed
+    /// id was being compared against one of its own components and could never be equal. Every
+    /// such URI was therefore re-bound on every sweep for as long as it stayed open, which for a
+    /// multi-targeted project is every file in it.
+    /// </para>
+    /// <para>
+    /// Accepting a component loses nothing: a component only appears in the composition when its
+    /// owning project produced it in this same sweep, so an equal component means that project's
+    /// text and semantic version are both unmoved. The full composition is still what gets echoed
+    /// back in the report, so the client converges on it as soon as it stops tracking the document.
+    /// </para>
+    /// </remarks>
     internal static bool Matches(string previousId, string composed)
     {
         if (previousId == composed)
@@ -547,8 +597,8 @@ internal static class WorkspaceDiagnosticsHandler
         if (stale.Count == 0)
             return reports;
 
-        // One compilation per project that actually owns something stale, and not before now —
-        // and inside it, only the trees that went stale.
+        // Only the projects that actually own something stale, and inside each, only the documents
+        // that went stale — a compilation is forced only when a closed one is among them.
         var staleByProject = stale
             .SelectMany(uri => byUri[uri])
             .GroupBy(owner => owner.Project.Id)
@@ -558,7 +608,7 @@ internal static class WorkspaceDiagnosticsHandler
         // dependent semantic version of every project that references the edited one, so all of
         // their documents go stale together — serializing those made the sweep itself feel like the
         // reload this work exists to remove.
-        var byProject = new ConcurrentDictionary<ProjectId, ILookup<SyntaxTree?, Microsoft.CodeAnalysis.Diagnostic>>();
+        var byProject = new ConcurrentDictionary<ProjectId, Dictionary<DocumentId, BoundDocument>>();
         var wholeBound = new ConcurrentDictionary<ProjectId, bool>();
 
         await Parallel.ForEachAsync(
@@ -573,12 +623,10 @@ internal static class WorkspaceDiagnosticsHandler
                 // Same instance for every entry: they were all read out of one solution snapshot,
                 // and a solution returns one Project object per id.
                 var project = group.First().Project;
-                if (await project.GetCompilationAsync(token) is not { } compilation)
-                    return;
 
-                if (await BindStaleTreesAsync(compilation, group, token) is { } perTree)
+                if (await BindStaleDocumentsAsync(project, group, token) is { } perDocument)
                 {
-                    byProject[project.Id] = perTree;
+                    byProject[project.Id] = perDocument;
 
                     // Cache-only here, for the same reason analyzers are: the pass this reads is
                     // the whole-compilation one the tree-at-a-time bind exists to avoid, so a sweep
@@ -591,10 +639,22 @@ internal static class WorkspaceDiagnosticsHandler
                     return;
                 }
 
+                if (await project.GetCompilationAsync(token) is not { } compilation)
+                    return;
+
                 Interlocked.Increment(ref WholeCompilationsBound);
-                byProject[project.Id] = compilation.GetDiagnostics(token)
+                var byTree = compilation.GetDiagnostics(token)
                     .Where(d => d.Location.IsInSource)
                     .ToLookup(d => d.Location.SourceTree);
+
+                var fromWhole = new Dictionary<DocumentId, BoundDocument>();
+                foreach (var document in group.Select(owner => owner.Document).DistinctBy(d => d.Id))
+                {
+                    if (await document.GetSyntaxTreeAsync(token) is { } tree)
+                        fromWhole[document.Id] = new BoundDocument([.. byTree[tree]], null);
+                }
+
+                byProject[project.Id] = fromWhole;
 
                 // Nothing to add for this project: a whole-compilation pass already carries the
                 // family the per-tree path is missing, and merging it again would double it.
@@ -609,10 +669,10 @@ internal static class WorkspaceDiagnosticsHandler
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (!byProject.TryGetValue(project.Id, out var byTree))
+                if (!byProject.TryGetValue(project.Id, out var byDocument))
                     continue;
 
-                var tree = await document.GetSyntaxTreeAsync(ct);
+                byDocument.TryGetValue(document.Id, out var bound);
                 string? version = await AnalyzerDiagnosticCache.GetVersionAsync(document, ct);
 
                 // Cache-only for analyzers: a sweep that ran them would take minutes and pin the
@@ -643,7 +703,7 @@ internal static class WorkspaceDiagnosticsHandler
                     ? []
                     : ProjectWideDiagnosticCache.TryGetAnyVersion(project, document.FilePath);
 
-                IEnumerable<Microsoft.CodeAnalysis.Diagnostic> compiler = tree is null ? [] : byTree[tree];
+                IEnumerable<Microsoft.CodeAnalysis.Diagnostic> compiler = bound?.Compiler ?? [];
 
                 items.AddRange(DiagnosticsHandler.ToProtocol(
                     DiagnosticsHandler.Merge(compiler.Concat(wide), analyzer)));
@@ -652,12 +712,17 @@ internal static class WorkspaceDiagnosticsHandler
                 // the editor keeps one set per URI with the last report winning, so omitting them
                 // would erase what the document pull published. Detection walks every token and
                 // binds each literal's enclosing invocation, which is far too much for every file
-                // in a solution.
-                if (document.FilePath is { Length: > 0 } path
-                    && OpenDocumentStore.IsOpen(path)
-                    && await DiagnosticsHandler.EmbeddedDiagnosticsAsync(document, ct) is { Count: > 0 } embedded)
+                // in a solution — so when the bind came through the pull's cache, its stored
+                // embedded findings are the answer and the walk is not repeated per sweep.
+                if (bound?.Embedded is { } embedded)
                 {
                     items.AddRange(embedded);
+                }
+                else if (document.FilePath is { Length: > 0 } path
+                    && OpenDocumentStore.IsOpen(path)
+                    && await DiagnosticsHandler.EmbeddedDiagnosticsAsync(document, ct) is { Count: > 0 } computed)
+                {
+                    items.AddRange(computed);
                 }
             }
 

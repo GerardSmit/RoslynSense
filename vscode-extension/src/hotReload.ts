@@ -131,6 +131,25 @@ export function registerHotReload(
     );
 }
 
+/// Opens the daemon-side edit session and makes it the target of pending-edit tracking, which
+/// is what lets the toolbar button light up. Core launches get this via the environment merge
+/// below; .NET Framework launches call it directly, since their applies travel through the
+/// debugger and need no environment.
+export function bindHotReloadSession(client: LanguageClient, projectPath: string): void {
+    // Binding at launch rather than at the first apply is what lets an edit made straight
+    // after F5 light the toolbar button: until a project is bound there is no session
+    // to attribute the change to.
+    boundProject = projectPath;
+    setPending(false);
+
+    // Open the edit session now rather than at the first apply: this is the moment the built
+    // output matches the source, so the baseline predates the user's next edit. Failure is
+    // non-fatal — the first apply retries.
+    void client
+        .sendRequest<HotReloadResult>('roslynSense/hotReloadStart', { projectPath })
+        .catch(() => undefined);
+}
+
 /// Adds what a launch needs for its process to be reloadable later. Returns the merged
 /// environment, or the original when the tool has no agent to inject.
 export async function withHotReloadEnvironment(
@@ -154,18 +173,8 @@ export async function withHotReloadEnvironment(
             merged['DOTNET_STARTUP_HOOKS'] = `${callerHooks}${pathDelimiter()}${agentHooks}`;
         }
 
-        // Open the edit session now rather than at the first apply: this is the moment the built
-        // output matches the source, so the baseline predates the user's next edit. Failure is
-        // non-fatal — the first apply retries.
         if (projectPath) {
-            // Binding here rather than at the first apply is what lets an edit made straight
-            // after F5 light the toolbar button: until a project is bound there is no session
-            // to attribute the change to.
-            boundProject = projectPath;
-            setPending(false);
-            void client
-                .sendRequest<HotReloadResult>('roslynSense/hotReloadStart', { projectPath })
-                .catch(() => undefined);
+            bindHotReloadSession(client, projectPath);
         }
 
         return merged;

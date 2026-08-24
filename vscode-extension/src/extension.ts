@@ -471,6 +471,9 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
         symbolServer: config.get('symbolServer'),
         referenceSource: config.get('referenceSource'),
         fileNesting: { rules: config.get('fileNesting.rules') },
+        // Sent as a section for the same reason the debugger block is: a server that predates it
+        // ignores one property rather than a name it has no meaning for.
+        webforms: { codeLens: config.get('webforms.codeLens') },
         // Which System.Diagnostics debugger attributes the engines honour. Sent as a section so
         // an older server, which reads none of it, ignores one property instead of six.
         debugger: {
@@ -480,6 +483,8 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
             justMyCode: config.get('debugger.justMyCode'),
             rawView: config.get('debugger.rawView'),
             maxChildren: config.get('debugger.maxChildren'),
+            symbolInclude: config.get('debugger.symbolInclude'),
+            symbolExclude: config.get('debugger.symbolExclude'),
         },
         // Which language packs this connection wants. Per connection on the server too: the
         // daemon is shared, so another window — or an AI session on the same daemon — keeps
@@ -1356,6 +1361,12 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
             'roslynSense.dbmlRefreshTable',
             (uri: string, tableName: string) => refreshDbmlTable(uri, tableName)
         ),
+        // CodeLens "Add from database" on a .dbml <Database>: everything the database has that the
+        // model does not, picked and written in one go. Same client-side reasoning as the refresh —
+        // choosing a connection and choosing the objects are questions for the user.
+        vscode.commands.registerCommand('roslynSense.dbmlAddFromDatabase', (uri: string) =>
+            addFromDatabase(uri)
+        ),
         // Value sets are read once and kept, so this is how a migration that added a row reaches
         // the editor. The id differs from the server command for the reason above.
         vscode.commands.registerCommand('roslynSense.reloadValueSets', () => reloadValueSets())
@@ -1439,9 +1450,14 @@ interface DbmlRefreshResult {
  * deletes a property the solution may be full of references to — the database knowing the column
  * is gone does not mean the model is finished being edited.
  */
-async function refreshDbmlTable(uri: string, tableName: string): Promise<void> {
+/**
+ * The connection a schema operation should run against: the only one registered, or the one the
+ * user picks. Undefined means there is nothing usable or the user dismissed the picker, and the
+ * error has already been shown.
+ */
+async function pickDbmlConnection(title: string): Promise<string | undefined> {
     if (!client) {
-        return;
+        return undefined;
     }
 
     const list = await client.sendRequest<DbmlConnectionList>('workspace/executeCommand', {
@@ -1458,20 +1474,28 @@ async function refreshDbmlTable(uri: string, tableName: string): Promise<void> {
                 ? `RoslynSense: no SQL Server connection is registered. ${unsupported} cannot describe a schema.`
                 : 'RoslynSense: no database connection is registered. Add one with db_add_connection or --db.'
         );
+        return undefined;
+    }
+
+    if (available.length === 1) {
+        return available[0].alias;
+    }
+
+    const picked = await vscode.window.showQuickPick(
+        available.map((c) => ({ label: c.alias, description: c.provider })),
+        { title, placeHolder: 'Database connection' }
+    );
+    return picked?.label;
+}
+
+async function refreshDbmlTable(uri: string, tableName: string): Promise<void> {
+    if (!client) {
         return;
     }
 
-    let alias = available[0].alias;
-
-    if (available.length > 1) {
-        const picked = await vscode.window.showQuickPick(
-            available.map((c) => ({ label: c.alias, description: c.provider })),
-            { title: `Refresh ${tableName} from…`, placeHolder: 'Database connection' }
-        );
-        if (!picked) {
-            return;
-        }
-        alias = picked.label;
+    const alias = await pickDbmlConnection(`Refresh ${tableName} from…`);
+    if (!alias) {
+        return;
     }
 
     const plan = await client.sendRequest<DbmlRefreshPlan>('workspace/executeCommand', {
@@ -1522,6 +1546,98 @@ async function refreshDbmlTable(uri: string, tableName: string): Promise<void> {
         void vscode.window.showInformationMessage(`RoslynSense: ${result.message}`);
     } else {
         void vscode.window.showErrorMessage(`RoslynSense: ${result?.message ?? 'the refresh failed.'}`);
+    }
+}
+
+interface DbmlAddableObject {
+    name: string;
+    kind: string;
+}
+
+interface DbmlAddableList {
+    ok: boolean;
+    message: string;
+    objects?: DbmlAddableObject[];
+}
+
+interface DbmlAddResult {
+    ok: boolean;
+    message: string;
+    notes?: string[];
+}
+
+/**
+ * Adds tables, views and functions the database has and the model does not.
+ *
+ * Additions need no removal confirmation — nothing existing is touched — so the flow is the two
+ * questions only the user can answer (which connection, which objects) and then one write. The
+ * picker is grouped by kind so a database with three hundred procedures does not bury its tables.
+ */
+async function addFromDatabase(uri: string): Promise<void> {
+    if (!client) {
+        return;
+    }
+
+    const alias = await pickDbmlConnection('Add from database…');
+    if (!alias) {
+        return;
+    }
+
+    const list = await client.sendRequest<DbmlAddableList>('workspace/executeCommand', {
+        command: 'roslynSense.dbmlAddable',
+        arguments: [uri, alias],
+    });
+
+    if (!list?.ok) {
+        void vscode.window.showErrorMessage(
+            `RoslynSense: ${list?.message ?? 'the database could not be listed.'}`
+        );
+        return;
+    }
+
+    const objects = list.objects ?? [];
+
+    if (objects.length === 0) {
+        void vscode.window.showInformationMessage(`RoslynSense: ${list.message}`);
+        return;
+    }
+
+    const items: vscode.QuickPickItem[] = [];
+    let previousKind: string | undefined;
+
+    // The server sends the list grouped by kind already; the separators just name the groups.
+    for (const o of objects) {
+        if (o.kind !== previousKind) {
+            items.push({ label: `${o.kind}s`, kind: vscode.QuickPickItemKind.Separator });
+            previousKind = o.kind;
+        }
+        items.push({ label: o.name, description: o.kind });
+    }
+
+    const picked = await vscode.window.showQuickPick(items, {
+        title: 'Add from database',
+        placeHolder: 'Tables, views and functions not yet in the model',
+        canPickMany: true,
+        matchOnDescription: true,
+    });
+
+    if (!picked || picked.length === 0) {
+        return;
+    }
+
+    const result = await client.sendRequest<DbmlAddResult>('workspace/executeCommand', {
+        command: 'roslynSense.dbmlApplyAdd',
+        arguments: [uri, alias, picked.map((item) => item.label)],
+    });
+
+    for (const note of result?.notes ?? []) {
+        void vscode.window.showWarningMessage(`RoslynSense: ${note}`);
+    }
+
+    if (result?.ok) {
+        void vscode.window.showInformationMessage(`RoslynSense: ${result.message}`);
+    } else {
+        void vscode.window.showErrorMessage(`RoslynSense: ${result?.message ?? 'the add failed.'}`);
     }
 }
 
@@ -2381,6 +2497,9 @@ interface StructuredFrame {
     line: number;
     column: number;
     isExternal: boolean;
+    /** Set when the file was resolved from external source: 'embedded', 'source link',
+     *  'reference source' or 'decompiled'. */
+    sourceOrigin?: string;
 }
 
 interface StructuredVariable {
@@ -2569,7 +2688,11 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                             id: f.id,
                             name: f.name,
                             source: f.filePath
-                                ? { name: f.filePath.split(/[\\/]/).pop(), path: f.filePath }
+                                ? {
+                                      name: f.filePath.split(/[\\/]/).pop(),
+                                      path: f.filePath,
+                                      origin: f.sourceOrigin || undefined,
+                                  }
                                 : undefined,
                             line: f.line,
                             column: f.column || 1,

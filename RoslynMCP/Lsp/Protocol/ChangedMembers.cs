@@ -13,7 +13,9 @@ public sealed record ChangedMembersParams(
 public sealed record ChangedBlockInfo(
     [property: JsonPropertyName("startLine")] int StartLine,
     [property: JsonPropertyName("endLine")] int EndLine,
-    [property: JsonPropertyName("preview")] string Preview);
+    [property: JsonPropertyName("preview")] string Preview,
+    /// <summary>Whether every line of the run is staged already.</summary>
+    [property: JsonPropertyName("staged")] bool Staged);
 
 public sealed record ChangedMemberInfo(
     [property: JsonPropertyName("name")] string Name,
@@ -27,7 +29,10 @@ public sealed record ChangedMemberInfo(
     [property: JsonPropertyName("firstChangedLine")] int FirstChangedLine,
     [property: JsonPropertyName("changedLineCount")] int ChangedLineCount,
     /// <summary>The member's changed runs in file order; empty for a whole-file change.</summary>
-    [property: JsonPropertyName("blocks")] ChangedBlockInfo[] Blocks);
+    [property: JsonPropertyName("blocks")] ChangedBlockInfo[] Blocks,
+    /// <summary>Whether the member's whole change is staged — nothing of it is left dirty.
+    /// A client may read that as "already reviewed".</summary>
+    [property: JsonPropertyName("staged")] bool Staged);
 
 public sealed record ChangedMembersFileInfo(
     [property: JsonPropertyName("filePath")] string FilePath,
@@ -35,7 +40,13 @@ public sealed record ChangedMembersFileInfo(
     [property: JsonPropertyName("wholeFile")] bool WholeFile,
     [property: JsonPropertyName("members")] ChangedMemberInfo[] Members,
     /// <summary>Whether the file belongs to a test project.</summary>
-    [property: JsonPropertyName("isTest")] bool IsTest);
+    [property: JsonPropertyName("isTest")] bool IsTest,
+    /// <summary>The file's first changed line — the landing spot when there are no members to
+    /// click instead, as for non-C# files, which list with an empty member array.</summary>
+    [property: JsonPropertyName("firstChangedLine")] int FirstChangedLine,
+    /// <summary>Whether the file's whole change is staged. Always false outside the
+    /// uncommitted scope, where staging says nothing about what a diff contains.</summary>
+    [property: JsonPropertyName("staged")] bool Staged);
 
 /// <summary>
 /// The Changed Members view's data: each changed source file with the members the diff touched.

@@ -23,8 +23,19 @@ public enum GitChangeScope
 /// Inclusive 1-based line ranges in the <em>new</em> file. Empty means "the whole file" — a new,
 /// deleted, or untracked file, where asking which lines changed has no useful answer.
 /// </param>
-public sealed record ChangedFile(string FilePath, IReadOnlyList<LineRange> Ranges)
+/// <param name="UnstagedRanges">
+/// The lines that still differ from the index — the part of the change not staged yet, in the
+/// same coordinates as <paramref name="Ranges"/>. An empty list means the whole change is
+/// staged; <see langword="null"/> means nobody asked, and nothing counts as staged.
+/// </param>
+public sealed record ChangedFile(
+    string FilePath,
+    IReadOnlyList<LineRange> Ranges,
+    IReadOnlyList<LineRange>? UnstagedRanges = null)
 {
+    /// <summary>Stands in for "all of it" where a file has no per-line answer to give.</summary>
+    public static readonly IReadOnlyList<LineRange> Everything = [new LineRange(1, int.MaxValue)];
+
     public bool WholeFile => Ranges.Count == 0;
 
     public bool Touches(int line) =>
@@ -32,6 +43,16 @@ public sealed record ChangedFile(string FilePath, IReadOnlyList<LineRange> Range
 
     public bool TouchesAny(IEnumerable<int> lines) =>
         WholeFile || lines.Any(Touches);
+
+    /// <summary>
+    /// Whether every line of the given run is already staged — the run is part of the change
+    /// against HEAD, and no part of it is still dirty against the index.
+    /// </summary>
+    public bool IsStaged(int start, int end) =>
+        UnstagedRanges is { } unstaged && !unstaged.Any(r => r.Start <= end && r.End >= start);
+
+    /// <summary>Whether the file's whole change is staged.</summary>
+    public bool IsFullyStaged => IsStaged(1, int.MaxValue);
 }
 
 public readonly record struct LineRange(int Start, int End);
@@ -112,6 +133,12 @@ public static partial class GitChangeService
         var files = ParseUnifiedDiff(stdout, repository).ToDictionary(
             f => f.FilePath, StringComparer.OrdinalIgnoreCase);
 
+        // Which part of the change is staged, so a client can treat staging as "reviewed".
+        // Only for the uncommitted scope: against a merge base or an older ref, everything
+        // committed would read as staged, which says nothing about whether anyone looked at it.
+        if (scope == GitChangeScope.Uncommitted)
+            await MarkUnstagedAsync(repository, files, ct);
+
         // Untracked files never appear in a diff, and a brand new source file is exactly the
         // change most worth running tests for. It has no "before", so the whole file is changed.
         if (scope == GitChangeScope.Uncommitted)
@@ -125,7 +152,7 @@ public static partial class GitChangeService
                 {
                     string path = Path.GetFullPath(Path.Combine(repository, line.Trim()));
                     if (path.Length > 0 && !files.ContainsKey(path))
-                        files[path] = new ChangedFile(path, []);
+                        files[path] = new ChangedFile(path, [], ChangedFile.Everything);
                 }
             }
         }
@@ -134,6 +161,36 @@ public static partial class GitChangeService
             files.Values.OrderBy(f => f.FilePath, StringComparer.OrdinalIgnoreCase).ToList(),
             description,
             DiffTarget: diffTarget);
+    }
+
+    /// <summary>
+    /// Fills in each file's unstaged lines from the working-tree-against-index diff. Both diffs
+    /// number their new side by the working tree, so the two sets of ranges line up; a file the
+    /// index already matches gets an empty list, which reads as "all of it is staged".
+    /// </summary>
+    private static async Task MarkUnstagedAsync(
+        string repository, Dictionary<string, ChangedFile> files, CancellationToken ct)
+    {
+        var (exitCode, stdout, _) = await RunGitAsync(
+            repository, "diff --unified=0 --no-color --no-ext-diff --", ct);
+
+        // Without an answer, nothing is claimed to be staged — the safe direction, since the
+        // client uses staged-ness to hide rows.
+        if (exitCode != 0)
+            return;
+
+        var unstaged = ParseUnifiedDiff(stdout, repository).ToDictionary(
+            f => f.FilePath, StringComparer.OrdinalIgnoreCase);
+
+        foreach (string path in files.Keys.ToList())
+        {
+            files[path] = files[path] with
+            {
+                UnstagedRanges = unstaged.TryGetValue(path, out var dirty)
+                    ? (dirty.WholeFile ? ChangedFile.Everything : dirty.Ranges)
+                    : [],
+            };
+        }
     }
 
     /// <summary>

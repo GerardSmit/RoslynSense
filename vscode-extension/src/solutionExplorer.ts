@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { State } from 'vscode-languageclient/node';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { onClientReady } from './clientReady';
+import { SolutionMemories, TreeMemory } from './explorerMemory';
 import { isUnder, normalisePath } from './paths';
 import { composite, restore, snapshot, UndoStack } from './solutionUndo';
 import type { Snapshot, UndoStep } from './solutionUndo';
@@ -99,6 +100,13 @@ export function registerSolutionExplorer(
     let startupProject: string | undefined =
         context.workspaceState.get('roslynSense.startupProject', undefined);
 
+    /// The remembered tree shape per solution — see explorerMemory.ts. `memory` follows whichever
+    /// solution the view is showing; which one that is, is learned from the roots listing.
+    const memories = new SolutionMemories(
+        context.workspaceState.get('roslynSense.explorerMemory', undefined));
+    let memory = new TreeMemory();
+    let memorySolution: string | undefined;
+
     const changeEmitter = new vscode.EventEmitter<SolutionTreeNode | undefined>();
     const nodesById = new Map<string, SolutionTreeNode>();
     const log = vscode.window.createOutputChannel('RoslynSense Solution Explorer');
@@ -179,6 +187,14 @@ export function registerSolutionExplorer(
                     parentById.set(child.id, nodeId);
                 }
             });
+            // The roots name the solution, and the solution names which memory applies — a
+            // filtered listing does not count, because its shape is the filter's, not the user's.
+            if (!nodeId && !filter) {
+                const solutionRoot = children.find((child) => child.id.startsWith('solution:'));
+                if (solutionRoot) {
+                    adoptSolution(solutionRoot);
+                }
+            }
             return children;
         } catch (error) {
             // Silently returning [] made a failed request indistinguishable from an empty node,
@@ -302,6 +318,124 @@ export function registerSolutionExplorer(
         },
     });
     context.subscriptions.push(view, changeEmitter);
+
+    // The remembered shape follows the view's own events, so it costs nothing to keep and is
+    // always current — there is no moment at which it has to be captured before a shutdown.
+    context.subscriptions.push(
+        view.onDidExpandElement((event) => {
+            memory.expand(event.element.id);
+            saveMemory();
+        }),
+        view.onDidCollapseElement((event) => {
+            memory.collapse(event.element.id);
+            saveMemory();
+        }),
+        view.onDidChangeSelection((event) => {
+            // An emptied selection keeps the previous answer: focusing an editor clears the
+            // tree's selection, and forgetting the file on every focus change remembers nothing.
+            const first = event.selection[0];
+            if (first) {
+                memory.select(first.id);
+                saveMemory();
+            }
+        })
+    );
+
+    /// Debounced: replaying a remembered tree fires one expand event per row it walks through,
+    /// and each would otherwise write the whole record again.
+    let memorySaveTimer: NodeJS.Timeout | undefined;
+    const saveMemory = () => {
+        if (!memorySolution) {
+            return;
+        }
+        clearTimeout(memorySaveTimer);
+        memorySaveTimer = setTimeout(() => {
+            if (memorySolution) {
+                void context.workspaceState.update(
+                    'roslynSense.explorerMemory',
+                    memories.remember(memorySolution, memory.snapshot()));
+            }
+        }, 500);
+    };
+
+    /** Points the memory at the solution the roots name, replaying its remembered shape once. */
+    function adoptSolution(root: SolutionTreeNode): void {
+        const solution = root.id.slice('solution:'.length);
+        if (solution === memorySolution) {
+            return;
+        }
+        // Rebinding to another solution: what this one looked like is filed away first, because
+        // the debounced write still pending would otherwise file it under the new solution.
+        if (memorySolution) {
+            clearTimeout(memorySaveTimer);
+            void context.workspaceState.update(
+                'roslynSense.explorerMemory',
+                memories.remember(memorySolution, memory.snapshot()));
+        }
+        memorySolution = solution;
+        memory = TreeMemory.from(memories.recall(solution));
+        // After the roots listing resolves, not during it: the replay reveals, a reveal walks
+        // getParent, and VS Code has not taken delivery of this very listing yet.
+        setTimeout(() => void restoreMemory(root), 0);
+    }
+
+    /**
+     * Replays the remembered shape: expands what was expanded, then selects what was selected.
+     *
+     * Top-down, because a row can only be expanded once its parent has listed it. A row
+     * remembered under a branch that no longer exists is simply never reached, which is the
+     * whole cleanup story for renamed and deleted folders.
+     */
+    async function restoreMemory(root: SolutionTreeNode): Promise<void> {
+        const queue = [root];
+        while (queue.length > 0) {
+            const node = queue.shift()!;
+            if (!memory.isExpanded(node.id)) {
+                continue;
+            }
+            try {
+                await view.reveal(node, { select: false, focus: false, expand: true });
+            } catch {
+                continue;
+            }
+            // Expanding made VS Code list the branch, which filled the caches — read the children
+            // back from there rather than asking the server the same question twice.
+            const listed = childrenOf(node.id);
+            queue.push(...(listed.length > 0 ? listed : await fetchChildren(node.id)));
+        }
+
+        const selectedId = memory.selected;
+        if (!selectedId || (state.revealActiveFile && vscode.window.activeTextEditor)) {
+            // Follow mode is about to reveal the active editor; racing it with the remembered
+            // selection would leave the tree on whichever reveal happened to finish last.
+            return;
+        }
+        const node = nodesById.get(selectedId);
+        if (node) {
+            try {
+                await view.reveal(node, { select: true, focus: false });
+            } catch {
+                // The row has since left VS Code's model; there is nothing to select.
+            }
+        } else if (selectedId.startsWith('file:')) {
+            // Under a branch the walk did not open — the server can still name the chain to it.
+            await revealUri(vscode.Uri.file(selectedId.slice('file:'.length)));
+        }
+    }
+
+    /// Who a node listed, read back from the record of listings.
+    function childrenOf(parentId: string): SolutionTreeNode[] {
+        const children: SolutionTreeNode[] = [];
+        for (const [id, parent] of parentById) {
+            if (parent === parentId) {
+                const node = nodesById.get(id);
+                if (node) {
+                    children.push(node);
+                }
+            }
+        }
+        return children;
+    }
 
     /// Refreshing one node re-fetches only its branch, and collapses whatever was open inside it —
     /// which is also the only way to collapse a subtree, since VS Code exposes no collapse API.
@@ -1075,6 +1209,30 @@ export function registerSolutionExplorer(
             setToggle('fileNesting', !state.fileNesting)
         ),
 
+        // The ... menu keeps one row per option and checks the ones that are on. VS Code paints
+        // that check from a toggled state extensions cannot contribute, so the checked row is a
+        // command of its own whose title carries the tick, and clicking it turns the option off.
+        // These are hidden from the command palette; the plainly named commands above are what
+        // it offers.
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.followCurrentFileChecked',
+            () => setToggle('revealActiveFile', false)
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.showAllFilesChecked',
+            () => setToggle('showAllFiles', false)
+        ),
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.showIgnoredChecked',
+            () => setToggle('showIgnored', false)
+        ),
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.fileNesting', () =>
+            setToggle('fileNesting', true)
+        ),
+        vscode.commands.registerCommand('roslynSense.solutionExplorer.fileNestingChecked', () =>
+            setToggle('fileNesting', false)
+        ),
+
         vscode.commands.registerCommand('roslynSense.solutionExplorer.goToNode', () =>
             searchSolution(getClient, view)
         ),
@@ -1674,7 +1832,14 @@ export function registerSolutionExplorer(
                 refresh();
             }
         }),
-        onNode('roslynSense.solutionExplorer.collapseDescendants', (node) => refresh(node)),
+        onNode('roslynSense.solutionExplorer.collapseDescendants', (node) => {
+            // The refresh below collapses the branch without firing a single collapse event, so
+            // the memory has to be told by hand — or it would re-expand the subtree the user
+            // just asked to fold away, next time the solution opens.
+            memory.forgetDescendants(node.id, (id) => parentById.get(id) ?? parentIdOf(id));
+            saveMemory();
+            refresh(node);
+        }),
         onNode('roslynSense.solutionExplorer.compareSelected', async (_node, selected) => {
             const uris = urisOf(selected);
             if (uris.length !== 2) {

@@ -162,4 +162,62 @@ public class ChangedMemberServiceTests
         Assert.Equal("Outer.Inner", member.ContainerType);
         Assert.Equal("", member.Namespace);
     }
+
+    /// <summary>Two changed runs in Total: lines 17 and 18 of <see cref="Source"/>.</summary>
+    private static IReadOnlyList<ChangedMember> CollectWithUnstaged(
+        LineRange[] ranges, LineRange[] unstaged) =>
+        ChangedMemberService.CollectMembers(
+            CSharpSyntaxTree.ParseText(Source).GetRoot(),
+            new ChangedFile(@"C:\repo\OrderService.cs", ranges, unstaged));
+
+    [Fact]
+    public void CollectMembers_WithoutAnUnstagedAnswer_NothingCountsAsStaged()
+    {
+        var member = Assert.Single(Collect(new LineRange(18, 18)));
+
+        Assert.False(member.Staged);
+        Assert.False(Assert.Single(member.Blocks).Staged);
+    }
+
+    [Fact]
+    public void CollectMembers_AMemberWithNothingLeftDirtyIsStaged()
+    {
+        var member = Assert.Single(CollectWithUnstaged([new LineRange(18, 18)], []));
+
+        Assert.True(member.Staged);
+        Assert.True(Assert.Single(member.Blocks).Staged);
+    }
+
+    [Fact]
+    public void CollectMembers_AStillDirtyMemberIsNotStaged()
+    {
+        var member = Assert.Single(
+            CollectWithUnstaged([new LineRange(18, 18)], [new LineRange(18, 18)]));
+
+        Assert.False(member.Staged);
+        Assert.False(Assert.Single(member.Blocks).Staged);
+    }
+
+    [Fact]
+    public void CollectMembers_HalfStagedMemberKeepsTheStagedBlockApart()
+    {
+        // Two runs inside Total; only the second is still dirty.
+        var member = Assert.Single(CollectWithUnstaged(
+            [new LineRange(17, 17), new LineRange(18, 18)],
+            [new LineRange(18, 18)]));
+
+        Assert.False(member.Staged);
+        Assert.Equal([true, false], member.Blocks.Select(b => b.Staged));
+    }
+
+    [Fact]
+    public void CollectMembers_APartlyDirtyRunIsNotStaged()
+    {
+        // The run covers 17-18 and only 18 is dirty: no part of it is finished business.
+        var block = Assert.Single(
+            Assert.Single(CollectWithUnstaged([new LineRange(17, 18)], [new LineRange(18, 18)]))
+                .Blocks);
+
+        Assert.False(block.Staged);
+    }
 }

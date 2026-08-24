@@ -31,14 +31,18 @@ internal static class ChangedMembersHandler
                     f.FilePath,
                     f.WholeFile,
                     IsTest: f.IsTest,
+                    FirstChangedLine: f.FirstChangedLine,
+                    Staged: f.Staged,
                     Members:
                     f.Members
                         .Select(m => new ChangedMemberInfo(
                             m.Name, m.ContainerType, m.Namespace, m.Kind,
                             m.StartLine, m.EndLine, m.FirstChangedLine, m.ChangedLineCount,
                             m.Blocks
-                                .Select(b => new ChangedBlockInfo(b.StartLine, b.EndLine, b.Preview))
-                                .ToArray()))
+                                .Select(b => new ChangedBlockInfo(
+                                    b.StartLine, b.EndLine, b.Preview, b.Staged))
+                                .ToArray(),
+                            m.Staged))
                         .ToArray()))
                 .ToArray(),
             set.Description,

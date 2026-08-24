@@ -8,7 +8,8 @@ namespace RoslynMCP.Services;
 /// <summary>One contiguous run of changed lines inside a member, clipped to the member.</summary>
 /// <param name="Preview">The first changed line's text, trimmed — enough for a list of blocks
 /// to read as "which edit is this" without opening anything.</param>
-public sealed record ChangedBlock(int StartLine, int EndLine, string Preview);
+/// <param name="Staged">Whether every line of the run is already staged.</param>
+public sealed record ChangedBlock(int StartLine, int EndLine, string Preview, bool Staged);
 
 /// <summary>One member declaration the diff touched, located where it is in the file now.</summary>
 /// <param name="FirstChangedLine">The first changed line inside the member — where a click that
@@ -16,6 +17,8 @@ public sealed record ChangedBlock(int StartLine, int EndLine, string Preview);
 /// because every line is changed and the name is the only line worth landing on.</param>
 /// <param name="Blocks">The member's changed runs, in file order. Empty for a whole-file change,
 /// where "which lines" has no useful answer.</param>
+/// <param name="Staged">Whether nothing in the member is left to stage — the whole of its
+/// change is in the index already.</param>
 public sealed record ChangedMember(
     string Name,
     string ContainerType,
@@ -25,18 +28,24 @@ public sealed record ChangedMember(
     int EndLine,
     int FirstChangedLine,
     int ChangedLineCount,
-    IReadOnlyList<ChangedBlock> Blocks);
+    IReadOnlyList<ChangedBlock> Blocks,
+    bool Staged);
 
-/// <summary>A changed source file and the members the diff touched inside it.</summary>
-/// <param name="Members">Empty when the file could not be read or parsed — the file is still
-/// worth listing, there is just nothing below it to point at.</param>
+/// <summary>A changed file and the members the diff touched inside it.</summary>
+/// <param name="Members">Empty when the file is not C# or could not be read or parsed — the
+/// file is still worth listing, there is just nothing below it to point at.</param>
 /// <param name="IsTest">Whether the nearest project file calls itself a test project — the
 /// half of a diff a reviewer usually wants to see apart, or not at all.</param>
+/// <param name="FirstChangedLine">The file's first changed line — where a click on the file
+/// itself should land when there are no members to click instead.</param>
+/// <param name="Staged">Whether the file's whole change is staged.</param>
 public sealed record ChangedMemberFile(
     string FilePath,
     bool WholeFile,
     IReadOnlyList<ChangedMember> Members,
-    bool IsTest);
+    bool IsTest,
+    int FirstChangedLine = 1,
+    bool Staged = false);
 
 /// <summary>What the diff touched, member by member, or why that could not be answered.</summary>
 /// <param name="DiffBaseRef">The revision the diff compared against, for a client that wants to
@@ -77,16 +86,22 @@ public static class ChangedMemberService
         {
             ct.ThrowIfCancellationRequested();
 
-            if (!file.FilePath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
-                continue;
-
             // Generated designer files change whenever their source does and nobody reviews them.
             if (file.FilePath.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase)
                 || file.FilePath.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            // Only C# breaks down into members; anything else — markup, contracts, configs —
+            // lists as a bare file the client may show or hide.
+            bool isCSharp = file.FilePath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
+
             files.Add(new ChangedMemberFile(
-                file.FilePath, file.WholeFile, ReadMembers(file, ct), IsInTestProject(file.FilePath)));
+                file.FilePath,
+                file.WholeFile,
+                isCSharp ? ReadMembers(file, ct) : [],
+                IsInTestProject(file.FilePath),
+                file.WholeFile ? 1 : file.Ranges.Min(r => r.Start),
+                file.IsFullyStaged));
         }
 
         return new ChangedMemberSet(files, changes.Description, DiffBaseRef: changes.DiffTarget);
@@ -169,7 +184,8 @@ public static class ChangedMemberService
                     .Select(r =>
                     {
                         int from = Math.Max(r.Start, start);
-                        return new ChangedBlock(from, Math.Min(r.End, end), Preview(lines, from));
+                        int to = Math.Min(r.End, end);
+                        return new ChangedBlock(from, to, Preview(lines, from), file.IsStaged(from, to));
                     })
                     .OrderBy(b => b.StartLine)
                     .ToList();
@@ -189,7 +205,8 @@ public static class ChangedMemberService
                 file.WholeFile
                     ? end - start + 1
                     : blocks.Sum(b => b.EndLine - b.StartLine + 1),
-                blocks));
+                blocks,
+                file.WholeFile ? file.IsFullyStaged : blocks.All(b => b.Staged)));
         }
 
         members.Sort((a, b) => a.StartLine.CompareTo(b.StartLine));

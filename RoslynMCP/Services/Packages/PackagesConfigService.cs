@@ -1,5 +1,5 @@
 using System.IO.Compression;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using NuGet.Common;
 using NuGet.Protocol.Core.Types;
 using NuGet.Versioning;
@@ -41,12 +41,12 @@ public static class PackagesConfigService
 
         try
         {
-            return XDocument.Load(path)
-                .Descendants("package")
+            return Parser.ParseText(File.ReadAllText(path))
+                .DescendantsByLocalName("package")
                 .Select(e => new PackagesConfigEntry(
-                    e.Attribute("id")?.Value ?? "",
-                    e.Attribute("version")?.Value ?? "",
-                    e.Attribute("targetFramework")?.Value))
+                    e.GetAttributeValue("id") ?? "",
+                    e.GetAttributeValue("version") ?? "",
+                    e.GetAttributeValue("targetFramework")))
                 .Where(p => p.Id.Length > 0)
                 .OrderBy(p => p.Id, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -290,9 +290,9 @@ public static class PackagesConfigService
     {
         try
         {
-            string? version = XDocument.Load(projectPath)
-                .Descendants()
-                .FirstOrDefault(e => e.Name.LocalName == "TargetFrameworkVersion")
+            string? version = Parser.ParseText(File.ReadAllText(projectPath))
+                .DescendantsByLocalName("TargetFrameworkVersion")
+                .FirstOrDefault()
                 ?.Value;
 
             // "v4.7.2" is how legacy projects spell it; packages.config wants "net472".
@@ -306,19 +306,21 @@ public static class PackagesConfigService
         }
     }
 
+    /// <remarks>
+    /// Element names are written without a prefix, which is what a legacy project wants: it binds
+    /// the MSBuild namespace as the default one on <c>&lt;Project&gt;</c>, so an unprefixed child
+    /// is already in it. The old writer had to carry the namespace around because it matched on
+    /// resolved names; this one matches on the name as written.
+    /// </remarks>
     private static void WriteReferences(
         string projectPath, string packagesRoot, string folderName, IReadOnlyList<string> assemblies)
     {
-        var document = XDocument.Load(projectPath);
-        if (document.Root is null)
+        var document = Parser.ParseText(File.ReadAllText(projectPath));
+        if (document.RootSyntax is not { } original)
             return;
 
-        var ns = document.Root.Name.Namespace;
+        var root = original;
         string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
-
-        var group = document.Root.Elements(ns + "ItemGroup")
-            .FirstOrDefault(g => g.Elements(ns + "Reference").Any())
-            ?? AddGroup(document.Root, ns);
 
         foreach (string assembly in assemblies)
         {
@@ -326,41 +328,57 @@ public static class PackagesConfigService
             string hintPath = Path.GetRelativePath(projectDirectory, assembly);
 
             // Replacing rather than appending is what makes an upgrade work: the old version's
-            // HintPath must not survive alongside the new one.
-            document.Root.Descendants(ns + "Reference")
-                .Where(r => ReferenceName(r).Equals(name, StringComparison.OrdinalIgnoreCase))
-                .ToList()
-                .ForEach(r => r.Remove());
+            // HintPath must not survive alongside the new one. Re-found each time round the loop,
+            // because every removal returns a new tree and leaves the remaining matches pointing
+            // into the one before it.
+            while (ReferenceNamed(root, name) is { } stale)
+                root = root.RemoveNode(stale, SyntaxRemoveOptions.KeepNoTrivia)!;
 
-            group.Add(new XElement(ns + "Reference",
-                new XAttribute("Include", name),
-                new XElement(ns + "HintPath", hintPath),
-                new XElement(ns + "Private", "True")));
+            root = root.GetOrAddElement(
+                "ItemGroup",
+                group => group.GetElementByLocalName("Reference") is not null,
+                out var itemGroup);
+
+            root = root.ReplaceNode(
+                itemGroup,
+                itemGroup.AddChild(Reference(name, hintPath).NormalizeTrivia(itemGroup)));
         }
 
-        document.Save(projectPath);
+        File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
+    }
+
+    /// <summary>One <c>Reference</c> item, built flat and away from the document.</summary>
+    private static XmlElementBaseSyntax Reference(string name, string hintPath)
+    {
+        var reference = (XmlElementBaseSyntax)Parser.ParseText("<Reference></Reference>").RootSyntax!;
+
+        reference = reference.SetAttribute("Include", name);
+        reference = reference.AddElement("HintPath", out _, (_, element) => element.WithText(hintPath));
+
+        return reference.AddElement("Private", out _, (_, element) => element.WithText("True"));
     }
 
     private static void RemoveReferences(string projectPath, string folderName)
     {
         try
         {
-            var document = XDocument.Load(projectPath);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return;
 
-            var ns = document.Root.Name.Namespace;
-            var stale = document.Root.Descendants(ns + "Reference")
-                .Where(r => r.Element(ns + "HintPath")?.Value is { } hint &&
-                            hint.Contains(folderName, StringComparison.OrdinalIgnoreCase))
-                .ToList();
+            var root = original;
+            bool removed = false;
 
-            if (stale.Count == 0)
+            while (ReferenceInto(root, folderName) is { } stale)
+            {
+                root = root.RemoveNode(stale, SyntaxRemoveOptions.KeepNoTrivia)!;
+                removed = true;
+            }
+
+            if (!removed)
                 return;
 
-            foreach (var reference in stale)
-                reference.Remove();
-            document.Save(projectPath);
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
         }
         catch (Exception ex)
         {
@@ -370,17 +388,23 @@ public static class PackagesConfigService
         }
     }
 
-    private static XElement AddGroup(XElement root, XNamespace ns)
-    {
-        var group = new XElement(ns + "ItemGroup");
-        root.Add(group);
-        return group;
-    }
+    /// <summary>The first <c>Reference</c> to an assembly of a given simple name.</summary>
+    private static XmlElementBaseSyntax? ReferenceNamed(XmlElementBaseSyntax root, string name) =>
+        root.DescendantsByLocalName("Reference")
+            .FirstOrDefault(reference =>
+                ReferenceName(reference).Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>The first <c>Reference</c> whose hint path points into a package folder.</summary>
+    private static XmlElementBaseSyntax? ReferenceInto(XmlElementBaseSyntax root, string folderName) =>
+        root.DescendantsByLocalName("Reference")
+            .FirstOrDefault(reference =>
+                reference.GetElementByLocalName("HintPath")?.Value is { } hint &&
+                hint.Contains(folderName, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The simple name of a reference, which is the assembly name before any comma.</summary>
-    private static string ReferenceName(XElement reference)
+    private static string ReferenceName(XmlElementBaseSyntax reference)
     {
-        string include = reference.Attribute("Include")?.Value ?? "";
+        string include = reference.GetAttributeValue("Include") ?? "";
         int comma = include.IndexOf(',');
         return (comma < 0 ? include : include[..comma]).Trim();
     }
@@ -388,40 +412,61 @@ public static class PackagesConfigService
     private static void WriteConfigEntry(
         string configPath, string id, string version, string targetFramework)
     {
-        var document = File.Exists(configPath)
-            ? XDocument.Load(configPath)
-            : new XDocument(new XElement("packages"));
+        var document = Parser.ParseText(
+            File.Exists(configPath) ? File.ReadAllText(configPath) : NewConfig);
 
-        var root = document.Root ?? new XElement("packages");
+        if (document.RootSyntax is not { } original)
+            return;
 
-        root.Elements("package")
-            .Where(e => string.Equals(e.Attribute("id")?.Value, id, StringComparison.OrdinalIgnoreCase))
-            .ToList()
-            .ForEach(e => e.Remove());
+        var root = Without(original, id).AddElement("package", out _, (_, package) => package
+            .SetAttribute("id", id)
+            .SetAttribute("version", version)
+            .SetAttribute("targetFramework", targetFramework));
 
-        root.Add(new XElement("package",
-            new XAttribute("id", id),
-            new XAttribute("version", version),
-            new XAttribute("targetFramework", targetFramework)));
-
-        document.Save(configPath);
+        File.WriteAllText(configPath, document.ReplaceNode(original, root).ToFullString());
     }
 
     private static void RemoveConfigEntry(string configPath, string id)
     {
         try
         {
-            var document = XDocument.Load(configPath);
-            document.Root?.Elements("package")
-                .Where(e => string.Equals(e.Attribute("id")?.Value, id, StringComparison.OrdinalIgnoreCase))
-                .ToList()
-                .ForEach(e => e.Remove());
-            document.Save(configPath);
+            var document = Parser.ParseText(File.ReadAllText(configPath));
+
+            if (document.RootSyntax is not { } original)
+                return;
+
+            File.WriteAllText(
+                configPath, document.ReplaceNode(original, Without(original, id)).ToFullString());
         }
         catch (Exception ex)
         {
             ServiceLog.Warn(
                 $"Could not update packages.config: {ex.Message}", key: $"packages-config-write:{configPath}");
         }
+    }
+
+    /// <summary>
+    /// An empty packages.config, for a project that has none yet. The line break is what the first
+    /// entry indents against: a document written on one line gets its children on one line too.
+    /// </summary>
+    private const string NewConfig = "<packages>\r\n</packages>";
+
+    /// <summary>
+    /// The <c>packages</c> element without any entry for a package, whatever its case.
+    /// </summary>
+    /// <remarks>
+    /// One at a time and re-found each time: a removal returns a new tree, so the second match of
+    /// a batch would otherwise be removed from a document that no longer exists.
+    /// </remarks>
+    private static XmlElementBaseSyntax Without(XmlElementBaseSyntax root, string id)
+    {
+        while (root.GetElementsByLocalName("package")
+                   .FirstOrDefault(package => string.Equals(
+                       package.GetAttributeValue("id"), id, StringComparison.OrdinalIgnoreCase)) is { } entry)
+        {
+            root = root.RemoveNode(entry, SyntaxRemoveOptions.KeepNoTrivia)!;
+        }
+
+        return root;
     }
 }

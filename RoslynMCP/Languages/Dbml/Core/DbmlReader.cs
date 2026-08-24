@@ -12,8 +12,8 @@ namespace RoslynMCP.Languages.Dbml.Core;
 /// A full-fidelity parse, for the reasons <c>ResxReader</c> sets out: every character of the source
 /// is a node, so a span already <em>is</em> a range in the buffer, and the parse is error-tolerant,
 /// so a file being typed into still yields its tables rather than stopping at the caret. The
-/// <c>XDocument</c> the refresh command writes with is a separate read for a separate job — it
-/// normalizes entities, which would move every span it produced.
+/// refresh command parses the file again for its own job; nothing is shared, because reading for
+/// spans and editing for a minimal diff want the tree at different moments.
 /// </para>
 /// <para>
 /// Element names are matched without their namespace. A <c>.dbml</c> declares
@@ -54,7 +54,7 @@ internal static class DbmlReader
             Attribute(database, "Class") is { Length: > 0 } @class ? @class : name,
             Attribute(database, "ContextNamespace"),
             Attribute(database, "EntityNamespace"),
-            database.Span.ToRoslyn(),
+            database.Span.ToRoslynSpan(),
             SelectionSpan(database),
             tables.ToImmutable(),
             functions.ToImmutable());
@@ -78,7 +78,7 @@ internal static class DbmlReader
             // A table with no Member is exposed under its own name, dot and all; that is what
             // SqlMetal does, and a member name is not this reader's to invent.
             Attribute(element, "Member") is { Length: > 0 } member ? member : name,
-            element.Span.ToRoslyn(),
+            element.Span.ToRoslynSpan(),
             SelectionSpan(element),
             types.ToImmutable());
     }
@@ -114,7 +114,7 @@ internal static class DbmlReader
 
         return new DbmlType(
             name,
-            element.Span.ToRoslyn(),
+            element.Span.ToRoslynSpan(),
             SelectionSpan(element),
             columns.ToImmutable(),
             associations.ToImmutable(),
@@ -140,7 +140,7 @@ internal static class DbmlReader
             // "not null". Read it as nullable, which is the reading that cannot fabricate a
             // constraint the database does not have.
             Flag(element, "CanBeNull", whenAbsent: true),
-            element.Span.ToRoslyn(),
+            element.Span.ToRoslynSpan(),
             SelectionSpan(element));
     }
 
@@ -159,7 +159,7 @@ internal static class DbmlReader
             Attribute(element, "OtherKey") ?? string.Empty,
             Attribute(element, "Type") ?? string.Empty,
             Flag(element, "IsForeignKey"),
-            element.Span.ToRoslyn(),
+            element.Span.ToRoslynSpan(),
             SelectionSpan(element));
     }
 
@@ -172,7 +172,7 @@ internal static class DbmlReader
             name,
             Attribute(element, "Method") is { Length: > 0 } method ? method : name,
             Flag(element, "IsComposable"),
-            element.Span.ToRoslyn(),
+            element.Span.ToRoslynSpan(),
             SelectionSpan(element));
     }
 
@@ -186,21 +186,20 @@ internal static class DbmlReader
     /// The member is preferred because it is the half a reader coming from C# recognises — F12 on
     /// <c>Product.Name</c> should land on <c>Member="Name"</c> and not on a <c>Name="ProductName"</c>
     /// beside it. The span is the value <em>as written</em>, so a name carrying an entity reference
-    /// is longer than the decoded string and must not be rewritten in place; see
-    /// <see cref="XmlSpans.ValueSpan"/>.
+    /// is longer than the decoded string and must not be rewritten in place.
     /// </remarks>
     private static TextSpan SelectionSpan(XmlElementBaseSyntax element)
     {
         foreach (string name in (ReadOnlySpan<string>)["Member", "Class", "Name"])
         {
             if (AttributeNode(element, name) is { } attribute
-                && attribute.ValueSpan() is { IsEmpty: false } span)
+                && attribute.ValueSpan.ToRoslynSpan() is { IsEmpty: false } span)
             {
                 return span;
             }
         }
 
-        return element.NameSpan();
+        return element.NameSpan.ToRoslynSpan();
     }
 
     private static XmlAttributeSyntax? AttributeNode(XmlElementBaseSyntax element, string name)
@@ -215,7 +214,7 @@ internal static class DbmlReader
     }
 
     private static string? Attribute(XmlElementBaseSyntax element, string name) =>
-        AttributeNode(element, name) is { } attribute ? attribute.DecodedValue() : null;
+        AttributeNode(element, name) is { } attribute ? attribute.Value : null;
 
     /// <summary>
     /// A boolean attribute, read the way the .NET XML serializer LINQ to SQL uses reads one — so

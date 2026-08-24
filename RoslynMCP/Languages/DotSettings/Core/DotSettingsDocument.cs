@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Languages.DotSettings.Core;
 
@@ -51,32 +51,24 @@ internal sealed record DotSettingsDocument(string FilePath, ImmutableArray<DotSe
 /// </remarks>
 internal static class DotSettingsReader
 {
-    private static readonly XNamespace s_xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
-
+    /// <remarks>
+    /// A malformed layer contributes what it can rather than nothing and rather than failing the
+    /// resolve — these files are merged by hand often enough that a conflict marker must not take
+    /// the solution down with it, and the entries either side of one are still readable.
+    /// </remarks>
     public static ImmutableArray<DotSettingsEntry> Read(string xml)
     {
-        XDocument document;
-
-        try
-        {
-            document = XDocument.Parse(xml);
-        }
-        catch (System.Xml.XmlException)
-        {
-            // A malformed layer contributes nothing rather than failing the resolve. These files
-            // are merged by hand often enough that a conflict marker must not take the solution
-            // down with it.
-            return [];
-        }
-
-        if (document.Root is null)
+        if (Parser.ParseText(xml).RootSyntax is not { } root)
             return [];
 
         var entries = ImmutableArray.CreateBuilder<DotSettingsEntry>();
 
-        foreach (var element in document.Root.Elements())
+        // By local name: the key attribute is the XAML namespace's, which every one of these files
+        // binds to the `x:` prefix, and matching the prefix rather than the binding is what the
+        // library offers. Nothing else in the format is called `Key`.
+        foreach (var element in root.Elements)
         {
-            if (element.Attribute(s_xaml + "Key")?.Value is not { Length: > 0 } key)
+            if (element.GetAttributeValueByLocalName("Key") is not { Length: > 0 } key)
                 continue;
 
             if (Parse(key) is { } parsed)

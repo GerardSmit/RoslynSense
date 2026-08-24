@@ -1,6 +1,6 @@
 using System.ComponentModel;
 using System.Text;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
 
@@ -125,11 +125,11 @@ public static class ListProjectsTool
     {
         var slnDir = Path.GetDirectoryName(slnxPath)!;
         var projects = new List<(string Name, string RelativePath, string Type)>();
-        var doc = XDocument.Load(slnxPath);
+        var doc = Parser.ParseText(File.ReadAllText(slnxPath));
 
         foreach (var elem in doc.Descendants("Project"))
         {
-            var pathAttr = elem.Attribute("Path")?.Value;
+            var pathAttr = elem.GetAttributeValue("Path");
             if (string.IsNullOrEmpty(pathAttr) || !IsProjectFile(pathAttr)) continue;
 
             string fullPath = Path.GetFullPath(Path.Combine(slnDir, pathAttr.Replace('/', Path.DirectorySeparatorChar)));

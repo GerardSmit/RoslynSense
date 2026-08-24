@@ -158,6 +158,40 @@ public class BindingRedirectLensTests
         Assert.Equal("No config file to fix binding redirects in.", result);
     }
 
+    /// <summary>
+    /// The squiggle is on the value that is wrong, not at the start of the element two lines
+    /// above it.
+    /// </summary>
+    [Fact]
+    public void ADiagnosticSitsOnTheTextTheFindingIsAbout()
+    {
+        var finding = new BindingRedirectFinding(
+            BindingRedirectProblem.Stale, "Newtonsoft.Json", "30ad4fe6b2a6aeed", "neutral",
+            "12.0.0.0", "13.0.0.0", "out of date", 4, new ConfigSpan(6, 55, 6, 63));
+
+        var diagnostic = Assert.Single(BindingRedirectHandler.ToDiagnostics(
+            new BindingRedirectReport("Contoso.csproj", "web.config", [finding])));
+
+        Assert.Equal(6, diagnostic.Range.Start.Line);
+        Assert.Equal(55, diagnostic.Range.Start.Character);
+        Assert.Equal(6, diagnostic.Range.End.Line);
+        Assert.Equal(63, diagnostic.Range.End.Character);
+    }
+
+    /// <summary>
+    /// A finding the document could not be read precisely enough to place still lands on its
+    /// line rather than on nothing.
+    /// </summary>
+    [Fact]
+    public void ADiagnosticWithNoSpanFallsBackToItsLine()
+    {
+        var diagnostic = Assert.Single(BindingRedirectHandler.ToDiagnostics(
+            new BindingRedirectReport("Contoso.csproj", "web.config", [Stale("Newtonsoft.Json")])));
+
+        Assert.Equal(4, diagnostic.Range.Start.Line);
+        Assert.Equal(0, diagnostic.Range.Start.Character);
+    }
+
     private static JsonElement[] Arguments(object[] arguments) =>
         JsonSerializer.Deserialize<JsonElement[]>(JsonSerializer.Serialize(arguments))!;
 

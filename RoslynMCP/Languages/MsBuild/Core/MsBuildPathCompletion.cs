@@ -23,7 +23,7 @@ internal static class MsBuildPathCompletion
         if (Path.GetDirectoryName(document.FilePath) is not { Length: > 0 } root)
             return [];
 
-        string typed = context.Attribute?.Value is { } value ? XmlSpans.Decode(value) : string.Empty;
+        string typed = context.Attribute?.Value is { } value ? value : string.Empty;
 
         // Everything before the last separator is the directory being listed; what follows is the
         // prefix the client filters on, and is not ours to filter again.

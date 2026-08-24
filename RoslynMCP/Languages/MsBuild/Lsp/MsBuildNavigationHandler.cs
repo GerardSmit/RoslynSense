@@ -47,7 +47,7 @@ internal static class MsBuildNavigationHandler
     private static Location[] CentralVersion(MsBuildDocument document, in MsBuildContext context)
     {
         string? id = context.IsPackageId() && context.Attribute is { } attribute
-            ? XmlSpans.Decode(attribute.Value)
+            ? attribute.Value
             : context.Sibling("Include") ?? context.Sibling("Update");
 
         if (id is not { Length: > 0 })
@@ -83,7 +83,7 @@ internal static class MsBuildNavigationHandler
         if (context.Attribute is not { } attribute)
             return [];
 
-        string spec = XmlSpans.Decode(attribute.Value);
+        string spec = attribute.Value;
 
         // An import whose path is built from properties — `$(MSBuildThisFileDirectory)build.props`
         // — cannot be resolved without evaluating the project, which this path may not do. Better

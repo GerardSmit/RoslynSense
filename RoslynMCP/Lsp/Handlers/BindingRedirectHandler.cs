@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis.Text;
+using Microsoft.Language.Xml;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Packages;
@@ -253,79 +255,53 @@ internal static class BindingRedirectHandler
     /// <c>assemblyIdentity</c>.
     /// </summary>
     /// <remarks>
-    /// By text rather than by parsing: <see cref="System.Xml.Linq.XDocument"/> records the line an
-    /// element starts on and nothing about where its attributes sit, and a hover has to answer for
-    /// a document that is mid-edit and may not parse at all. What is checked is the element the
-    /// attribute is written inside: the tag opened nearest before it on the line, or — when the
-    /// line opens none, which is the hand-wrapped form — the tag still open at the end of the line
-    /// above. A config file is full of <c>name=</c> that belong to something else.
+    /// <para>
+    /// Parsed, not scanned. A hover has to answer for a document that is mid-edit and may not be
+    /// well-formed, which is exactly what the full-fidelity parser is built for: it never throws,
+    /// and an attribute still being typed keeps a positioned span. That span is what the range
+    /// comes from, so a hover covers the characters that are actually there — the text scan this
+    /// replaces had to reason about which tag a line continued, and got the answer from the shape
+    /// of the whitespace rather than from the markup.
+    /// </para>
+    /// <para>
+    /// The element is matched by local name, because a config written by hand sometimes binds the
+    /// assembly namespace to a prefix — <c>&lt;asm:assemblyIdentity&gt;</c> — rather than as the
+    /// default one.
+    /// </para>
+    /// <para>
+    /// The name returned is decoded and the range is not: the name is what a lookup is done with,
+    /// and the range is where the characters sit. An entity reference makes the two different
+    /// lengths, which is why neither is measured off the other.
+    /// </para>
     /// </remarks>
     internal static (string Name, Range Range)? IdentityNameAt(string text, Position position)
     {
-        var lines = text.Split('\n');
-        if (position.Line < 0 || position.Line >= lines.Length)
+        var source = SourceText.From(text);
+
+        if (position.Line < 0 || position.Line >= source.Lines.Count)
             return null;
 
-        string line = lines[position.Line].TrimEnd('\r');
+        int offset = source.Lines[position.Line].Start + position.Character;
 
-        var match = System.Text.RegularExpressions.Regex.Match(
-            line, """(?<=\bname\s*=\s*")[^"]+""");
-
-        if (!match.Success ||
-            position.Character < match.Index ||
-            position.Character > match.Index + match.Length)
+        foreach (var element in Parser.ParseText(text).DescendantsByLocalName("assemblyIdentity"))
         {
-            return null;
+            if (element.GetAttributeByLocalName("name") is not { } attribute)
+                continue;
+
+            var span = attribute.ValueSpan.ToRoslynSpan();
+
+            if (offset < span.Start || offset > span.End)
+                continue;
+
+            var start = source.Lines.GetLinePosition(span.Start);
+            var last = source.Lines.GetLinePosition(span.End);
+
+            return (attribute.Value, new Range(
+                new Position(start.Line, start.Character),
+                new Position(last.Line, last.Character)));
         }
 
-        if (!InsideIdentity(lines, position.Line, line, match.Index))
-            return null;
-
-        return (match.Value, new Range(
-            new Position(position.Line, match.Index),
-            new Position(position.Line, match.Index + match.Length)));
-    }
-
-    /// <summary>Whether the attribute at <paramref name="attribute"/> is written inside an
-    /// <c>assemblyIdentity</c> tag.</summary>
-    private static bool InsideIdentity(string[] lines, int lineIndex, string line, int attribute)
-    {
-        int opened = line.LastIndexOf('<', Math.Max(0, attribute - 1));
-
-        // The tag opens on this line, so it is the one this attribute belongs to whatever the
-        // line above says.
-        if (opened >= 0)
-            return Names(line, opened);
-
-        // No tag opens before the attribute, so it continues the one above — but only while that
-        // one is still open. A closed element followed by a bare attribute is not markup this has
-        // anything to say about, and treating it as one would answer for the wrong element.
-        if (lineIndex == 0)
-            return false;
-
-        string previous = lines[lineIndex - 1].TrimEnd('\r');
-        int previousOpened = previous.LastIndexOf('<');
-
-        return previousOpened >= 0 &&
-            previous.IndexOf('>', previousOpened) < 0 &&
-            Names(previous, previousOpened);
-
-        // The tag's own name, past a closing slash and past a namespace prefix — a config written
-        // by hand sometimes binds the assembly namespace to a prefix rather than as the default.
-        static bool Names(string text, int open)
-        {
-            var tag = text.AsSpan(open + 1).TrimStart('/');
-
-            int end = tag.IndexOfAny(" \t/>".AsSpan());
-            if (end >= 0)
-                tag = tag[..end];
-
-            int colon = tag.IndexOf(':');
-            if (colon >= 0)
-                tag = tag[(colon + 1)..];
-
-            return tag.SequenceEqual("assemblyIdentity".AsSpan());
-        }
+        return null;
     }
 
     /// <summary>The assembly's path as the reader thinks of it — from the project, not from the
@@ -459,17 +435,36 @@ internal static class BindingRedirectHandler
         return new Position(line, text.Length - lastBreak - 1);
     }
 
+    /// <summary>
+    /// The squiggle sits on the text the finding is about — the <c>newVersion</c> that names the
+    /// wrong version, the <c>oldVersion</c> whose range falls short — and not on the element that
+    /// contains it.
+    /// </summary>
+    /// <remarks>
+    /// A zero-width range at the start of the <c>dependentAssembly</c> line put every message in
+    /// the file three lines above the attribute it was describing, and a missing redirect — which
+    /// has no element at all — at the top of the document, where it read as a complaint about
+    /// <c>&lt;configuration&gt;</c>. The span is the analysis's answer to "where"; the line is
+    /// what is left when the document could not be read that precisely.
+    /// </remarks>
     private static Diagnostic ToDiagnostic(BindingRedirectFinding finding)
     {
-        int line = Math.Max(0, finding.Line);
+        var range = finding.Span is { } span
+            ? new Range(
+                new Position(span.Line, span.Character),
+                new Position(span.EndLine, span.EndCharacter))
+            : Whole(Math.Max(0, finding.Line));
 
         return new Diagnostic(
-            new Range(new Position(line, 0), new Position(line, 0)),
+            range,
             Severity(finding.Problem),
             Code,
             Source,
             finding.Message);
     }
+
+    private static Range Whole(int line) =>
+        new(new Position(line, 0), new Position(line, 0));
 
     /// <summary>
     /// Stale and missing redirects fail at runtime, so they are warnings. The rest are true but

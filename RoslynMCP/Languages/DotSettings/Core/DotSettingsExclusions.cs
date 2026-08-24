@@ -54,6 +54,22 @@ internal static class DotSettingsExclusions
     /// <summary>Whether a <c>.DotSettings</c> layer in this file's solution excludes it.</summary>
     public static bool IsExcluded(string absolutePath)
     {
+        try
+        {
+            return IsExcludedCore(absolutePath);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The answer is advisory and the callers are searches asking about thousands of
+            // paths per keystroke — some of which a loaded project still lists after their
+            // folder was deleted on disk. One unanswerable path must degrade to "not excluded",
+            // never take the whole search with it.
+            return false;
+        }
+    }
+
+    private static bool IsExcludedCore(string absolutePath)
+    {
         if (!Enabled || string.IsNullOrEmpty(absolutePath))
             return false;
 

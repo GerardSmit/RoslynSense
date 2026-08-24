@@ -1,4 +1,4 @@
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Languages.WebForms.Core;
@@ -256,9 +256,9 @@ public class FileOperationsTests : IAsyncLifetime
                 new DeleteFilesParams([new FileDelete(LspConverters.PathToUri(markup))]),
                 default);
 
-            var items = XDocument.Load(project).Descendants()
-                .Where(e => e.Name.LocalName is "Content" or "Compile")
-                .Select(e => e.Attribute("Include")?.Value)
+            var items = Parser.ParseText(File.ReadAllText(project)).Descendants()
+                .Where(e => e.NameNode?.LocalName is "Content" or "Compile")
+                .Select(e => e.GetAttributeValue("Include"))
                 .ToList();
 
             // A project still listing a page that is gone does not build.
@@ -330,10 +330,10 @@ public class FileOperationsTests : IAsyncLifetime
             Assert.NotNull(edit);
             Assert.Equal(2, Assert.IsType<object[]>(edit!.DocumentChanges).OfType<RenameFile>().Count());
 
-            var items = XDocument.Load(project).Descendants()
-                .Where(e => e.Name.LocalName is "Content" or "Compile")
+            var items = Parser.ParseText(File.ReadAllText(project)).Descendants()
+                .Where(e => e.NameNode?.LocalName is "Content" or "Compile")
                 .ToList();
-            var includes = items.Select(e => e.Attribute("Include")?.Value).ToList();
+            var includes = items.Select(e => e.GetAttributeValue("Include")).ToList();
 
             // A project pointing at the folder the page left does not build.
             Assert.Contains(Path.Combine("Pages", "Page.aspx"), includes);
@@ -344,8 +344,8 @@ public class FileOperationsTests : IAsyncLifetime
             // DependentUpon is relative to the item's own folder, and all three landed in the
             // same one, so the nesting is spelled exactly as it was before the move.
             Assert.All(
-                items.Where(e => e.Name.LocalName == "Compile"),
-                e => Assert.Equal("Page.aspx", e.Element(e.Name.Namespace + "DependentUpon")?.Value));
+                items.Where(e => e.NameNode?.LocalName == "Compile"),
+                e => Assert.Equal("Page.aspx", e.GetElementByLocalName("DependentUpon")?.Value));
         }
         finally
         {
@@ -390,10 +390,10 @@ public class FileOperationsTests : IAsyncLifetime
                 markup + ".designer.cs", renamed + ".designer.cs");
             await ProjectMutationService.RenameFileItemAsync(markup, renamed);
 
-            var items = XDocument.Load(project).Descendants()
-                .Where(e => e.Name.LocalName is "Content" or "Compile")
+            var items = Parser.ParseText(File.ReadAllText(project)).Descendants()
+                .Where(e => e.NameNode?.LocalName is "Content" or "Compile")
                 .ToList();
-            var includes = items.Select(e => e.Attribute("Include")?.Value).ToList();
+            var includes = items.Select(e => e.GetAttributeValue("Include")).ToList();
 
             Assert.Contains("Home.aspx", includes);
             Assert.Contains("Home.aspx.cs", includes);
@@ -404,8 +404,8 @@ public class FileOperationsTests : IAsyncLifetime
             Assert.Contains("MyDefault.aspx", includes);
 
             Assert.All(
-                items.Where(e => e.Name.LocalName == "Compile"),
-                e => Assert.Equal("Home.aspx", e.Element(e.Name.Namespace + "DependentUpon")?.Value));
+                items.Where(e => e.NameNode?.LocalName == "Compile"),
+                e => Assert.Equal("Home.aspx", e.GetElementByLocalName("DependentUpon")?.Value));
         }
         finally
         {
@@ -442,10 +442,10 @@ public class FileOperationsTests : IAsyncLifetime
 
             await ProjectMutationService.RenameFileItemAsync(source, renamed);
 
-            var items = XDocument.Load(project).Descendants()
-                .Where(e => e.Name.LocalName is "Content" or "Compile")
+            var items = Parser.ParseText(File.ReadAllText(project)).Descendants()
+                .Where(e => e.NameNode?.LocalName is "Content" or "Compile")
                 .ToList();
-            var includes = items.Select(e => e.Attribute("Include")?.Value).ToList();
+            var includes = items.Select(e => e.GetAttributeValue("Include")).ToList();
 
             Assert.Contains(@"Views\Default.aspx", includes);
             Assert.Contains(@"Views\Default.aspx.cs", includes);
@@ -456,8 +456,8 @@ public class FileOperationsTests : IAsyncLifetime
             // DependentUpon points at a sibling, so the folder moving does not change it.
             Assert.Equal(
                 "Default.aspx",
-                items.Single(e => e.Name.LocalName == "Compile")
-                    .Element(items[0].Name.Namespace + "DependentUpon")?.Value);
+                items.Single(e => e.NameNode?.LocalName == "Compile")
+                    .GetElementByLocalName("DependentUpon")?.Value);
         }
         finally
         {

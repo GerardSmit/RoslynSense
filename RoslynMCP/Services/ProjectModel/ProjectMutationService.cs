@@ -1,6 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Text;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 
 using RoslynMCP.Languages.DotSettings.Core;
 namespace RoslynMCP.Services.ProjectModel;
@@ -97,11 +97,9 @@ public static class ProjectMutationService
     {
         try
         {
-            var root = XDocument.Load(projectPath).Root;
-            return root?.Attribute("Sdk") is not null ||
-                   root?.Elements().Any(e => e.Name.LocalName == "Sdk") == true;
+            return IsSdkStyle(Parser.ParseText(File.ReadAllText(projectPath)).RootSyntax);
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return true; // assume modern; the CLI reports a better error than a guess would
         }
@@ -112,37 +110,41 @@ public static class ProjectMutationService
     {
         try
         {
-            var document = XDocument.Load(projectPath);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return "The project file is empty.";
 
-            var ns = document.Root.Name.Namespace;
             string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
             string include = Path.GetRelativePath(projectDirectory, referencedProjectPath);
 
-            bool alreadyThere = document.Root.Descendants(ns + "ProjectReference")
-                .Any(r => string.Equals(r.Attribute("Include")?.Value, include, StringComparison.OrdinalIgnoreCase));
+            bool alreadyThere = original.DescendantsByLocalName("ProjectReference")
+                .Any(r => string.Equals(
+                    r.GetAttributeValue("Include"), include, StringComparison.OrdinalIgnoreCase));
             if (alreadyThere)
                 return null;
 
-            var group = document.Root.Elements(ns + "ItemGroup")
-                .FirstOrDefault(g => g.Elements(ns + "ProjectReference").Any());
-            if (group is null)
-            {
-                group = new XElement(ns + "ItemGroup");
-                document.Root.Add(group);
-            }
+            var reference = (XmlElementBaseSyntax)Parser
+                .ParseText("<ProjectReference></ProjectReference>")
+                .RootSyntax!;
 
-            var reference = new XElement(ns + "ProjectReference", new XAttribute("Include", include));
+            reference = reference.SetAttribute("Include", include);
+
             if (ReadProperty(referencedProjectPath, "ProjectGuid") is { Length: > 0 } guid)
             {
-                reference.Add(
-                    new XElement(ns + "Project", guid),
-                    new XElement(ns + "Name", Path.GetFileNameWithoutExtension(referencedProjectPath)));
+                reference = reference.AddElement("Project", out _, (_, e) => e.WithText(guid));
+                reference = reference.AddElement("Name", out _, (_, e) =>
+                    e.WithText(Path.GetFileNameWithoutExtension(referencedProjectPath)));
             }
 
-            group.Add(reference);
-            document.Save(projectPath);
+            var root = original.GetOrAddElement(
+                "ItemGroup",
+                group => group.GetElementByLocalName("ProjectReference") is not null,
+                out var itemGroup);
+
+            root = root.ReplaceNode(
+                itemGroup, itemGroup.AddChild(reference.NormalizeTrivia(itemGroup)));
+
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
             SelfWriteTracker.Note(projectPath);
             return null;
         }
@@ -156,25 +158,28 @@ public static class ProjectMutationService
     {
         try
         {
-            var document = XDocument.Load(projectPath);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return;
 
-            var ns = document.Root.Name.Namespace;
             string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
             string include = Path.GetRelativePath(projectDirectory, referencedProjectPath);
 
-            var stale = document.Root.Descendants(ns + "ProjectReference")
-                .Where(r => string.Equals(
-                    r.Attribute("Include")?.Value, include, StringComparison.OrdinalIgnoreCase))
-                .ToList();
+            var root = original;
+            bool changed = false;
 
-            if (stale.Count == 0)
+            // Re-found each time round: a removal returns a new tree, and the next match found
+            // before it belongs to the one before.
+            while (Referencing(root, include) is { } stale)
+            {
+                root = root.RemoveNode(stale, SyntaxRemoveOptions.KeepNoTrivia)!;
+                changed = true;
+            }
+
+            if (!changed)
                 return;
 
-            foreach (var reference in stale)
-                reference.Remove();
-            document.Save(projectPath);
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
             SelfWriteTracker.Note(projectPath);
         }
         catch (Exception ex)
@@ -378,14 +383,12 @@ public static class ProjectMutationService
 
         try
         {
-            var document = XDocument.Load(projectPath, LoadOptions.PreserveWhitespace);
-            if (document.Root is not { } root)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return new MutationResult(false, "The project file is empty.");
 
-            var ns = root.Name.Namespace;
-
-            bool already = root.Descendants(ns + "Reference").Any(r =>
-                (r.Attribute("Include")?.Value ?? "")
+            bool already = original.DescendantsByLocalName("Reference").Any(r =>
+                (r.GetAttributeValue("Include") ?? "")
                     .Split(',')[0]
                     .Trim()
                     .Equals(assemblyName, StringComparison.OrdinalIgnoreCase));
@@ -394,13 +397,16 @@ public static class ProjectMutationService
 
             // Beside the other assembly references when there are any, so the file keeps the
             // grouping its author gave it.
-            var group = root.Descendants(ns + "Reference").FirstOrDefault()?.Parent
-                ?? new XElement(ns + "ItemGroup");
-            if (group.Parent is null)
-                root.Add(group);
+            var root = original.GetOrAddElement(
+                "ItemGroup",
+                group => group.GetElementByLocalName("Reference") is not null,
+                out var itemGroup);
 
-            group.Add(new XElement(ns + "Reference", new XAttribute("Include", assemblyName)));
-            document.Save(projectPath);
+            root = root.ReplaceNode(
+                itemGroup,
+                itemGroup.AddElement("Reference", out _, (_, e) => e.SetAttribute("Include", assemblyName)));
+
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
             SelfWriteTracker.Note(projectPath);
         }
         catch (Exception ex)
@@ -511,21 +517,29 @@ public static class ProjectMutationService
         {
             // Nothing here rewrites structure, so the file keeps the formatting its author gave
             // it and the change reads as the one-line move it is.
-            var document = XDocument.Load(projectPath, LoadOptions.PreserveWhitespace);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return;
 
             string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
             string newInclude = Path.GetRelativePath(projectDirectory, newFull);
+            var root = original;
             bool changed = false;
 
-            foreach (var item in document.Root.Descendants())
+            // By index rather than over a captured list: every edit returns a new tree, so the
+            // items after the one just rewritten have to be looked up again in it. Nothing here
+            // adds or removes an element, so document order is the same each time and the index
+            // still names the same item.
+            for (int index = 0; ; index++)
             {
+                if (root.Descendants().ElementAtOrDefault(index) is not { } item)
+                    break;
+
                 // Remove is in there because an excluded file that gets renamed would otherwise
                 // fall back into the glob it was taken out of.
-                var attribute = item.Attribute("Include")
-                    ?? item.Attribute("Update")
-                    ?? item.Attribute("Remove");
+                var attribute = item.GetAttribute("Include")
+                    ?? item.GetAttribute("Update")
+                    ?? item.GetAttribute("Remove");
                 if (attribute is null || !NamesOneFile(attribute.Value))
                     continue;
 
@@ -534,30 +548,36 @@ public static class ProjectMutationService
                 // DependentUpon is relative to the item's own folder, and for the item being
                 // renamed that folder is the one it is moving to.
                 string itemDirectory = Path.GetDirectoryName(itemPath)!;
+                var rewritten = item;
 
                 if (itemPath.Equals(oldFull, StringComparison.OrdinalIgnoreCase))
                 {
-                    attribute.Value = newInclude;
+                    rewritten = rewritten.SetAttribute(attribute.Name, newInclude);
                     itemDirectory = Path.GetDirectoryName(newFull)!;
-                    changed = true;
                 }
                 else if (movedFolder && itemPath.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
                 {
                     string moved = Path.Combine(newFull, itemPath[oldPrefix.Length..]);
-                    attribute.Value = Path.GetRelativePath(projectDirectory, moved);
+                    rewritten = rewritten.SetAttribute(
+                        attribute.Name, Path.GetRelativePath(projectDirectory, moved));
                     // DependentUpon is relative to the item's own folder, and the whole folder
                     // moved together, so those values stay correct — but the folder they resolve
                     // against is the new one.
                     itemDirectory = Path.GetDirectoryName(moved)!;
-                    changed = true;
                 }
 
-                changed |= RewriteDependentUpon(item, itemDirectory, oldFull, newFull);
+                rewritten = RewriteDependentUpon(rewritten, itemDirectory, oldFull, newFull) ?? rewritten;
+
+                if (ReferenceEquals(rewritten, item))
+                    continue;
+
+                root = root.ReplaceNode(item, rewritten);
+                changed = true;
             }
 
             if (changed)
             {
-                document.Save(projectPath);
+                File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
                 SelfWriteTracker.Note(projectPath);
             }
         }
@@ -570,25 +590,26 @@ public static class ProjectMutationService
         }
     }
 
-    /// <returns>Whether the metadata was pointing at the renamed file and now points at it.</returns>
-    private static bool RewriteDependentUpon(
-        XElement item, string itemDirectory, string oldFull, string newFull)
+    /// <returns>
+    /// The item with its metadata pointing at the renamed file, or <c>null</c> when the metadata
+    /// was not about it.
+    /// </returns>
+    private static XmlElementBaseSyntax? RewriteDependentUpon(
+        XmlElementBaseSyntax item, string itemDirectory, string oldFull, string newFull)
     {
-        var metadata = item.Element(item.Name.Namespace + "DependentUpon");
-        string? value = metadata?.Value.Trim() ?? item.Attribute("DependentUpon")?.Value;
+        var metadata = item.GetElementByLocalName("DependentUpon");
+        string? value = metadata?.Value.Trim() ?? item.GetAttributeValue("DependentUpon");
         if (value is null || !NamesOneFile(value))
-            return false;
+            return null;
 
         if (!ResolveAgainst(itemDirectory, value).Equals(oldFull, StringComparison.OrdinalIgnoreCase))
-            return false;
+            return null;
 
         string updated = Path.GetRelativePath(itemDirectory, newFull);
-        if (metadata is not null)
-            metadata.Value = updated;
-        else
-            item.SetAttributeValue("DependentUpon", updated);
 
-        return true;
+        return metadata is not null
+            ? item.ReplaceNode(metadata, metadata.WithText(updated))
+            : item.SetAttribute("DependentUpon", updated);
     }
 
     /// <summary>
@@ -712,14 +733,13 @@ public static class ProjectMutationService
 
         try
         {
-            var document = XDocument.Load(projectPath);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is null)
                 return new MutationResult(false, "The project file could not be read.");
 
             RemoveCompileItem(projectPath, full);
 
-            bool sdkStyle = document.Root.Attribute("Sdk") is not null ||
-                            document.Root.Elements().Any(e => e.Name.LocalName == "Sdk");
+            bool sdkStyle = IsSdkStyle(document.RootSyntax);
             string? enableDefaults = ReadProperty(projectPath, "EnableDefaultCompileItems");
             bool globbed = sdkStyle &&
                 !string.Equals(enableDefaults, "false", StringComparison.OrdinalIgnoreCase);
@@ -727,20 +747,29 @@ public static class ProjectMutationService
             if (globbed)
             {
                 // Reloaded: RemoveCompileItem may have written the file out from under us.
-                document = XDocument.Load(projectPath);
-                var ns = document.Root!.Name.Namespace;
+                document = Parser.ParseText(File.ReadAllText(projectPath));
+                var original = document.RootSyntax!;
 
                 var missing = DefaultGlobsFor(full)
-                    .Where(item => !document.Descendants(ns + item).Any(e => string.Equals(
-                        e.Attribute("Remove")?.Value, include, StringComparison.OrdinalIgnoreCase)))
+                    .Where(item => !original.DescendantsByLocalName(item).Any(e => string.Equals(
+                        e.GetAttributeValue("Remove"), include, StringComparison.OrdinalIgnoreCase)))
                     .ToList();
 
                 if (missing.Count > 0)
                 {
-                    document.Root.Add(new XElement(ns + "ItemGroup",
-                        missing.Select(item =>
-                            new XElement(ns + item, new XAttribute("Remove", include)))));
-                    document.Save(projectPath);
+                    // Built away from the document and placed in one go: growing it in place would
+                    // mean finding the group again in the tree each addition returned.
+                    var group = (XmlElementBaseSyntax)Parser
+                        .ParseText("<ItemGroup></ItemGroup>")
+                        .RootSyntax!;
+
+                    foreach (string item in missing)
+                        group = group.AddElement(item, out _, (_, e) => e.SetAttribute("Remove", include));
+
+                    var root = original.AddChild(group.NormalizeTrivia(original));
+
+                    File.WriteAllText(
+                        projectPath, document.ReplaceNode(original, root).ToFullString());
                     SelfWriteTracker.Note(projectPath);
                 }
             }
@@ -852,14 +881,14 @@ public static class ProjectMutationService
     {
         try
         {
-            return XDocument.Load(projectPath)
-                .Descendants()
-                .FirstOrDefault(e => e.Name.LocalName == name)
+            return Parser.ParseText(File.ReadAllText(projectPath))
+                .DescendantsByLocalName(name)
+                .FirstOrDefault()
                 ?.Value.Trim() is { Length: > 0 } value
                 ? value
                 : null;
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return null;
         }
@@ -873,33 +902,33 @@ public static class ProjectMutationService
     {
         try
         {
-            var document = XDocument.Load(projectPath);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return null;
 
             // SDK-style projects include **/*.cs unless the author opted out.
-            bool sdkStyle = document.Root.Attribute("Sdk") is not null ||
-                            document.Root.Elements().Any(e => e.Name.LocalName == "Sdk");
             string? enableDefaults = ReadProperty(projectPath, "EnableDefaultCompileItems");
-            if (sdkStyle && !string.Equals(enableDefaults, "false", StringComparison.OrdinalIgnoreCase))
+            if (IsSdkStyle(original) &&
+                !string.Equals(enableDefaults, "false", StringComparison.OrdinalIgnoreCase))
+            {
                 return null;
+            }
 
             if (!fullPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
                 return null;
 
-            var ns = document.Root.Name.Namespace;
             string include = Path.GetRelativePath(projectDirectory, fullPath);
 
-            var group = document.Root.Elements(ns + "ItemGroup")
-                .FirstOrDefault(g => g.Elements(ns + "Compile").Any());
-            if (group is null)
-            {
-                group = new XElement(ns + "ItemGroup");
-                document.Root.Add(group);
-            }
+            var root = original.GetOrAddElement(
+                "ItemGroup",
+                group => group.GetElementByLocalName("Compile") is not null,
+                out var itemGroup);
 
-            group.Add(new XElement(ns + "Compile", new XAttribute("Include", include)));
-            document.Save(projectPath);
+            root = root.ReplaceNode(
+                itemGroup,
+                itemGroup.AddElement("Compile", out _, (_, e) => e.SetAttribute("Include", include)));
+
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
             SelfWriteTracker.Note(projectPath);
             return "added it to the project file";
         }
@@ -916,26 +945,26 @@ public static class ProjectMutationService
     {
         try
         {
-            var document = XDocument.Load(projectPath);
-            if (document.Root is null)
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
                 return;
 
             string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
             string include = Path.GetRelativePath(projectDirectory, fullPath);
 
-            var stale = document.Descendants()
-                .Where(e => e.Name.LocalName is "Compile" or "None" or "Content" or "EmbeddedResource")
-                .Where(e => string.Equals(
-                    e.Attribute("Include")?.Value ?? e.Attribute("Update")?.Value,
-                    include, StringComparison.OrdinalIgnoreCase))
-                .ToList();
+            var root = original;
+            bool changed = false;
 
-            if (stale.Count == 0)
+            while (ItemFor(root, include) is { } stale)
+            {
+                root = root.RemoveNode(stale, SyntaxRemoveOptions.KeepNoTrivia)!;
+                changed = true;
+            }
+
+            if (!changed)
                 return;
 
-            foreach (var element in stale)
-                element.Remove();
-            document.Save(projectPath);
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
             SelfWriteTracker.Note(projectPath);
         }
         catch (Exception ex)
@@ -945,6 +974,28 @@ public static class ProjectMutationService
                 key: $"compile-item-remove:{projectPath}");
         }
     }
+
+    /// <summary>
+    /// Whether a parsed project uses the SDK format, by either spelling: the attribute on
+    /// <c>&lt;Project&gt;</c> or an <c>&lt;Sdk&gt;</c> element under it.
+    /// </summary>
+    private static bool IsSdkStyle(XmlElementBaseSyntax? root) =>
+        root?.GetAttribute("Sdk") is not null || root?.GetElementByLocalName("Sdk") is not null;
+
+    /// <summary>The first <c>ProjectReference</c> to a given relative path.</summary>
+    private static XmlElementBaseSyntax? Referencing(XmlElementBaseSyntax root, string include) =>
+        root.DescendantsByLocalName("ProjectReference")
+            .FirstOrDefault(reference => string.Equals(
+                reference.GetAttributeValue("Include"), include, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>The first item of any compiled kind naming a given relative path.</summary>
+    private static XmlElementBaseSyntax? ItemFor(XmlElementBaseSyntax root, string include) =>
+        root.Descendants().FirstOrDefault(element =>
+            element.NameNode?.LocalName is "Compile" or "None" or "Content" or "EmbeddedResource" &&
+            string.Equals(
+                element.GetAttributeValue("Include") ?? element.GetAttributeValue("Update"),
+                include,
+                StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The nearest project above a file, which owns it for item purposes.</summary>
     private static string? FindOwningProject(string filePath)

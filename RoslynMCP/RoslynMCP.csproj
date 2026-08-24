@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
@@ -19,7 +19,8 @@
            exact characters in the buffer and an edit rewrites one value without reformatting the
            file. Error-tolerant, which is what an open document needs — `Version="` with no closing
            quote still parses, and the attribute node is still there to complete against. -->
-      <PackageReference Include="GerardSmit.Language.Xml" Version="2.1.0" />
+      <PackageReference Include="GerardSmit.Language.Xml" Version="3.0.0" />
+      <PackageReference Include="GerardSmit.Language.Xml.Roslyn" Version="3.0.0" />
       <PackageReference Include="ICSharpCode.Decompiler" Version="10.1.1.8388" />
       <PackageReference Include="JsonPath.Net" Version="2.1.1" />
       <PackageReference Include="Microsoft.AspNetCore.Razor.Language" Version="6.0.36" />

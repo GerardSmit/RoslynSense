@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
-using System.Xml.Linq;
+using Microsoft.CodeAnalysis.Text;
+using Microsoft.Language.Xml;
+using RoslynMCP.Languages;
 using RoslynMCP.Services.ProjectModel;
 
 namespace RoslynMCP.Services.Packages;
@@ -24,6 +26,12 @@ public enum BindingRedirectProblem
 }
 
 /// <param name="Line">0-based line of the <c>dependentAssembly</c>, or -1 when there is no element yet.</param>
+/// <param name="Span">
+/// The text this is actually about — the <c>newVersion</c> that names the wrong version, the
+/// <c>oldVersion</c> whose range falls short, the <c>name</c> of an assembly nothing ships. It
+/// is <see langword="null"/> only when the document could not be located that precisely, and
+/// the reader then gets the line.
+/// </param>
 public sealed record BindingRedirectFinding(
     BindingRedirectProblem Problem,
     string AssemblyName,
@@ -32,7 +40,8 @@ public sealed record BindingRedirectFinding(
     string? ConfiguredVersion,
     string RequiredVersion,
     string Message,
-    int Line);
+    int Line,
+    ConfigSpan? Span = null);
 
 public sealed record BindingRedirectReport(
     string ProjectPath,
@@ -59,7 +68,6 @@ public sealed record BindingRedirectReport(
 /// </remarks>
 public static class BindingRedirectService
 {
-    private static readonly XNamespace s_asm = "urn:schemas-microsoft-com:asm.v1";
 
     /// <summary>
     /// The config file whose redirects apply to this project, or <c>null</c> when it has none.
@@ -121,9 +129,23 @@ public static class BindingRedirectService
         if (shipped.Count == 0)
             return new BindingRedirectReport(projectPath, configPath, []);
 
-        var configured = Read(configPath);
+        string text;
+        try
+        {
+            text = File.ReadAllText(configPath);
+        }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not read binding redirects from '{Path.GetFileName(configPath)}': {ex.Message}",
+                key: $"binding-read:{configPath}");
+            return new BindingRedirectReport(projectPath, configPath, []);
+        }
 
-        return new BindingRedirectReport(projectPath, configPath, Compare(shipped, configured));
+        var configured = ReadText(text, out var section);
+
+        return new BindingRedirectReport(
+            projectPath, configPath, Compare(shipped, configured, section));
     }
 
     /// <summary>
@@ -298,95 +320,9 @@ public static class BindingRedirectService
     {
         var applicable = Fixable(findings).ToList();
 
-        if (applicable.Count == 0)
-            return (null, []);
-
-        XDocument document;
-        try
-        {
-            document = XDocument.Parse(xml, LoadOptions.PreserveWhitespace);
-        }
-        catch (Exception ex)
-        {
-            ServiceLog.Warn($"Could not rewrite binding redirects: {ex.Message}", key: "binding-write");
-            return (null, []);
-        }
-
-        var binding = EnsureAssemblyBinding(document);
-
-        foreach (var finding in applicable)
-        {
-            var element = binding
-                .Elements(s_asm + "dependentAssembly")
-                .FirstOrDefault(e => Matches(e, finding));
-
-            if (element is null)
-            {
-                element = new XElement(
-                    s_asm + "dependentAssembly",
-                    new XElement(
-                        s_asm + "assemblyIdentity",
-                        new XAttribute("name", finding.AssemblyName),
-                        new XAttribute("publicKeyToken", finding.PublicKeyToken!),
-                        new XAttribute("culture", finding.Culture)),
-                    new XElement(s_asm + "bindingRedirect"));
-
-                binding.Add(element);
-            }
-
-            var redirect = element.Element(s_asm + "bindingRedirect");
-            if (redirect is null)
-            {
-                redirect = new XElement(s_asm + "bindingRedirect");
-                element.Add(redirect);
-            }
-
-            // From zero rather than from the version that happened to be found: a redirect exists
-            // to catch every older binding, and narrowing it to the one this analysis saw is how a
-            // redirect that worked stops working after an unrelated package moves.
-            redirect.SetAttributeValue("oldVersion", $"0.0.0.0-{finding.RequiredVersion}");
-            redirect.SetAttributeValue("newVersion", finding.RequiredVersion);
-        }
-
-        using var writer = new StringWriter();
-        document.Save(writer, SaveOptions.DisableFormatting);
-        return (writer.ToString(), applicable);
-    }
-
-    private static bool Matches(XElement dependentAssembly, BindingRedirectFinding finding)
-    {
-        var identity = dependentAssembly.Element(s_asm + "assemblyIdentity");
-        if (identity is null)
-            return false;
-
-        return string.Equals(
-                identity.Attribute("name")?.Value, finding.AssemblyName, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(
-                identity.Attribute("publicKeyToken")?.Value ?? "",
-                finding.PublicKeyToken ?? "",
-                StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static XElement EnsureAssemblyBinding(XDocument document)
-    {
-        var configuration = document.Root
-            ?? throw new InvalidOperationException("The configuration file has no root element.");
-
-        var runtime = configuration.Element("runtime");
-        if (runtime is null)
-        {
-            runtime = new XElement("runtime");
-            configuration.Add(runtime);
-        }
-
-        var binding = runtime.Element(s_asm + "assemblyBinding");
-        if (binding is null)
-        {
-            binding = new XElement(s_asm + "assemblyBinding");
-            runtime.Add(binding);
-        }
-
-        return binding;
+        return applicable.Count == 0
+            ? (null, [])
+            : BindingRedirectRewriter.Rewrite(xml, applicable);
     }
 
     /// <summary>Every <c>dependentAssembly</c> the file declares, with the line it sits on.</summary>
@@ -394,7 +330,7 @@ public static class BindingRedirectService
     {
         try
         {
-            return Redirects(XDocument.Load(configPath, LoadOptions.SetLineInfo));
+            return ReadText(File.ReadAllText(configPath), out _);
         }
         catch (Exception ex)
         {
@@ -406,48 +342,81 @@ public static class BindingRedirectService
     }
 
     /// <summary>
-    /// The same, from text the caller already has — an editor buffer, which is what a hover has to
-    /// answer about. Silent on malformed XML rather than logged: a config being typed into is
-    /// unparseable half the time, and that is not news.
+    /// The same, from text the caller already has — an editor buffer, which is what a hover has
+    /// to answer about.
     /// </summary>
-    internal static IReadOnlyList<ConfiguredRedirect> ReadText(string xml)
+    /// <remarks>
+    /// The parse is error-tolerant, so a config in the middle of being typed into still reports
+    /// the redirects around the caret rather than nothing at all from the first malformation
+    /// onwards.
+    /// </remarks>
+    internal static IReadOnlyList<ConfiguredRedirect> ReadText(string xml) => ReadText(xml, out _);
+
+    /// <inheritdoc cref="ReadText(string)"/>
+    /// <param name="section">
+    /// Where the <c>assemblyBinding</c> element is written, which is the only place a redirect
+    /// that was never added is missing from. Nothing else in the file has anything to do with it,
+    /// so a finding about one has nowhere else to point.
+    /// </param>
+    internal static IReadOnlyList<ConfiguredRedirect> ReadText(string xml, out ConfigSpan? section)
     {
-        try
+        var text = SourceText.From(xml);
+        var binding = ConfigXml.Section(Parser.ParseText(xml));
+
+        if (binding is null)
         {
-            return Redirects(XDocument.Parse(xml, LoadOptions.SetLineInfo));
-        }
-        catch (System.Xml.XmlException)
-        {
+            section = null;
             return [];
         }
+
+        section = ConfigSpan.From(text, binding.NameSpan.ToRoslynSpan());
+
+        return binding.GetElementsByLocalName("dependentAssembly")
+            .Select(element => Parse(element, text))
+            .OfType<ConfiguredRedirect>()
+            .ToList();
     }
 
-    private static IReadOnlyList<ConfiguredRedirect> Redirects(XDocument document) =>
-        document.Root?
-            .Elements("runtime")
-            .Elements(s_asm + "assemblyBinding")
-            .Elements(s_asm + "dependentAssembly")
-            .Select(Parse)
-            .OfType<ConfiguredRedirect>()
-            .ToList() ?? [];
-
-    private static ConfiguredRedirect? Parse(XElement dependentAssembly)
+    /// <summary>
+    /// One <c>dependentAssembly</c>, with a span for each part of it a finding can be about.
+    /// </summary>
+    /// <remarks>
+    /// Values are decoded and spans are not: the decoded string is what a version parses from,
+    /// and the span is where the characters are. An entity reference makes the two different
+    /// lengths, which is exactly why the span is taken from the tree rather than measured off the
+    /// value.
+    /// </remarks>
+    private static ConfiguredRedirect? Parse(XmlElementBaseSyntax dependentAssembly, SourceText text)
     {
-        var identity = dependentAssembly.Element(s_asm + "assemblyIdentity");
-        if (identity?.Attribute("name")?.Value is not { Length: > 0 } name)
+        if (dependentAssembly.GetElementByLocalName("assemblyIdentity") is not { } identity)
             return null;
 
-        var redirect = dependentAssembly.Element(s_asm + "bindingRedirect");
-        var range = ParseRange(redirect?.Attribute("oldVersion")?.Value);
+        var name = identity.GetAttributeByLocalName("name");
+        if (name?.Value is not { Length: > 0 } assembly)
+            return null;
+
+        var token = identity.GetAttributeByLocalName("publicKeyToken");
+
+        var redirect = dependentAssembly.GetElementByLocalName("bindingRedirect");
+        var oldVersion = redirect?.GetAttributeByLocalName("oldVersion");
+        var newVersion = redirect?.GetAttributeByLocalName("newVersion");
+
+        var range = ParseRange(oldVersion?.Value);
 
         return new ConfiguredRedirect(
-            name,
-            Nullify(identity.Attribute("publicKeyToken")?.Value),
-            identity.Attribute("culture")?.Value is { Length: > 0 } culture ? culture : "neutral",
+            assembly,
+            Nullify(token?.Value),
+            identity.GetAttributeByLocalName("culture")?.Value is { Length: > 0 } culture
+                ? culture
+                : "neutral",
             range.Low,
             range.High,
-            ParseVersion(redirect?.Attribute("newVersion")?.Value),
-            (dependentAssembly as System.Xml.IXmlLineInfo).LineNumber - 1);
+            ParseVersion(newVersion?.Value),
+            text.Lines.GetLinePosition(dependentAssembly.NameSpan.ToRoslynSpan().Start).Line,
+            ConfigSpan.From(text, name.ValueSpan.ToRoslynSpan()),
+            ConfigSpan.From(text, token?.ValueSpan.ToRoslynSpan() ?? default),
+            ConfigSpan.From(text, oldVersion?.ValueSpan.ToRoslynSpan() ?? default),
+            ConfigSpan.From(text, newVersion?.ValueSpan.ToRoslynSpan() ?? default));
     }
 
     /// <summary>
@@ -573,9 +542,13 @@ public static class BindingRedirectService
     /// <summary>
     /// Everything the shipped assemblies bind to, against everything that is actually there.
     /// </summary>
+    /// <param name="section">
+    /// <inheritdoc cref="ReadText(string, out ConfigSpan)" path="/param[@name='section']"/>
+    /// </param>
     private static IReadOnlyList<BindingRedirectFinding> Compare(
         IReadOnlyList<AssemblyFileInfo> shipped,
-        IReadOnlyList<ConfiguredRedirect> configured)
+        IReadOnlyList<ConfiguredRedirect> configured,
+        ConfigSpan? section = null)
     {
         var present = new Dictionary<string, AssemblyIdentityInfo>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in shipped)
@@ -622,7 +595,8 @@ public static class BindingRedirectService
                         null, actual.Version.ToString(),
                         $"{actual.Name} is referenced at {wanted[key]} but {actual.Version} ships; " +
                         "without a binding redirect this fails at runtime.",
-                        -1));
+                        -1,
+                        section));
                 }
                 continue;
             }
@@ -635,7 +609,8 @@ public static class BindingRedirectService
                     redirect.NewVersion?.ToString(), actual.Version.ToString(),
                     $"The binding redirect for {actual.Name} names " +
                     $"{redirect.NewVersion?.ToString() ?? "no version"}, but {actual.Version} ships.",
-                    redirect.Line));
+                    redirect.Line,
+                    redirect.NewVersionSpan ?? redirect.NameSpan));
             }
             else if (conflicted && (redirect.OldLow is null || redirect.OldLow > wanted[key]))
             {
@@ -645,7 +620,8 @@ public static class BindingRedirectService
                     redirect.NewVersion?.ToString(), actual.Version.ToString(),
                     $"{actual.Name} is referenced at {wanted[key]}, below the redirect's " +
                     $"oldVersion range starting at {redirect.OldLow?.ToString() ?? "nothing"}.",
-                    redirect.Line));
+                    redirect.Line,
+                    redirect.OldVersionSpan ?? redirect.NameSpan));
             }
         }
 
@@ -659,7 +635,8 @@ public static class BindingRedirectService
                     redirect.NewVersion?.ToString(), "",
                     $"The redirect for {redirect.Name} declares no publicKeyToken, so the runtime " +
                     "ignores it — only strong-named assemblies can be redirected.",
-                    redirect.Line));
+                    redirect.Line,
+                    redirect.TokenSpan ?? redirect.NameSpan));
             }
             else if (!present.ContainsKey(redirect.Key))
             {
@@ -668,7 +645,8 @@ public static class BindingRedirectService
                     redirect.Name, redirect.PublicKeyToken, redirect.Culture,
                     redirect.NewVersion?.ToString(), "",
                     $"Nothing this project ships is {redirect.Name}, so its redirect has no effect.",
-                    redirect.Line));
+                    redirect.Line,
+                    redirect.NameSpan));
             }
         }
 
@@ -699,7 +677,11 @@ public static class BindingRedirectService
         Version? OldLow,
         Version? OldHigh,
         Version? NewVersion,
-        int Line)
+        int Line,
+        ConfigSpan? NameSpan = null,
+        ConfigSpan? TokenSpan = null,
+        ConfigSpan? OldVersionSpan = null,
+        ConfigSpan? NewVersionSpan = null)
     {
         public string Key => $"{Name}|{PublicKeyToken ?? ""}|{Culture}";
     }

@@ -84,7 +84,7 @@ internal static class DbmlCompletionResolver
 
         if (attribute is not null)
         {
-            var valueSpan = attribute.ValueSpan();
+            var valueSpan = attribute.ValueSpan.ToRoslynSpan();
             bool onValue = attribute.ValueNode is not null
                            && offset >= valueSpan.Start && offset <= valueSpan.End;
 
@@ -94,7 +94,7 @@ internal static class DbmlCompletionResolver
                 NameOf(element),
                 NameOf(element?.ParentElement),
                 attribute.Name,
-                onValue ? valueSpan : attribute.NameNode?.Span.ToRoslyn() ?? default);
+                onValue ? valueSpan : attribute.NameNode?.Span.ToRoslynSpan() ?? default);
         }
 
         if (element is null)
@@ -147,8 +147,8 @@ internal static class DbmlCompletionResolver
 
     private static TextSpan? NameSpanOf(XmlElementBaseSyntax element) => element switch
     {
-        XmlElementSyntax { StartTag.NameNode: { } name } => name.Span.ToRoslyn(),
-        XmlEmptyElementSyntax { NameNode: { } name } => name.Span.ToRoslyn(),
+        XmlElementSyntax { StartTag.NameNode: { } name } => name.Span.ToRoslynSpan(),
+        XmlEmptyElementSyntax { NameNode: { } name } => name.Span.ToRoslynSpan(),
         _ => null,
     };
 

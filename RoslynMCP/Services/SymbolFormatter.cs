@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using Microsoft.CodeAnalysis;
 
 namespace RoslynMCP.Services;
@@ -107,42 +107,58 @@ internal static partial class SymbolFormatter
     /// </remarks>
     private static string RenderDocFragment(string inner, Compilation? compilation)
     {
-        try
+        var document = Parser.ParseText($"<doc>{inner}</doc>");
+
+        // The parse never throws, so the fallback is chosen rather than caught. A comment with a
+        // stray angle bracket in it parses into something, and that something is not what the
+        // author wrote — the regex clean-up at least leaves their words intact.
+        if (!document.ContainsDiagnostics && document.RootSyntax is { } root)
         {
-            var root = XElement.Parse($"<doc>{inner}</doc>", LoadOptions.PreserveWhitespace);
             var sb = new StringBuilder();
             RenderDocNodes(root, sb, compilation);
             return WhitespaceRunRegex().Replace(sb.ToString(), " ").Trim();
         }
-        catch (XmlException)
-        {
-            var text = SeeCrefRegex().Replace(inner, m => CodeSpan(CrefText(m.Groups[1].Value, compilation)));
-            text = ParamrefRegex().Replace(text, "`$1`");
-            text = XmlTagRegex().Replace(text, "");
-            return WhitespaceRunRegex().Replace(text, " ").Trim();
-        }
+
+        var text = SeeCrefRegex().Replace(inner, m => CodeSpan(CrefText(m.Groups[1].Value, compilation)));
+        text = ParamrefRegex().Replace(text, "`$1`");
+        text = XmlTagRegex().Replace(text, "");
+        return WhitespaceRunRegex().Replace(text, " ").Trim();
     }
 
-    private static void RenderDocNodes(XElement parent, StringBuilder sb, Compilation? compilation)
+    /// <remarks>
+    /// Anything that is not an element is prose, and prose is taken as written: entity references
+    /// and CDATA are what an author reaches for to put an angle bracket in a sentence, and both
+    /// decode back to the sentence they meant. Comments are the one thing dropped — they are notes
+    /// to the next author, not documentation for the reader.
+    /// </remarks>
+    private static void RenderDocNodes(
+        XmlElementBaseSyntax parent, StringBuilder sb, Compilation? compilation)
     {
-        foreach (var node in parent.Nodes())
+        if (parent is not XmlElementSyntax { Content: var content })
+            return;
+
+        foreach (var node in content)
         {
             switch (node)
             {
-                case XText text:
-                    sb.Append(text.Value);
+                case XmlElementBaseSyntax element:
+                    RenderDocElement(element, sb, compilation);
                     break;
 
-                case XElement element:
-                    RenderDocElement(element, sb, compilation);
+                case XmlCommentSyntax:
+                    break;
+
+                default:
+                    sb.Append(XmlEscaping.Decode(node.ToFullString()));
                     break;
             }
         }
     }
 
-    private static void RenderDocElement(XElement element, StringBuilder sb, Compilation? compilation)
+    private static void RenderDocElement(
+        XmlElementBaseSyntax element, StringBuilder sb, Compilation? compilation)
     {
-        switch (element.Name.LocalName)
+        switch (element.NameNode?.LocalName)
         {
             case "see" or "seealso":
                 RenderReference(element, sb, compilation);
@@ -150,7 +166,7 @@ internal static partial class SymbolFormatter
 
             // A name, not prose: the reader is looking for it in the signature above.
             case "paramref" or "typeparamref":
-                if (element.Attribute("name")?.Value is { Length: > 0 } name)
+                if (element.GetAttributeValue("name") is { Length: > 0 } name)
                     sb.Append(CodeSpan(name));
                 break;
 
@@ -183,23 +199,24 @@ internal static partial class SymbolFormatter
     /// <c>&lt;see cref="T:System.String"&gt;the name&lt;/see&gt;</c> means to say "the name", not
     /// "<c>string</c>".
     /// </remarks>
-    private static void RenderReference(XElement element, StringBuilder sb, Compilation? compilation)
+    private static void RenderReference(
+        XmlElementBaseSyntax element, StringBuilder sb, Compilation? compilation)
     {
         string label = WhitespaceRunRegex().Replace(element.Value, " ").Trim();
 
-        if (element.Attribute("href")?.Value is { Length: > 0 } href)
+        if (element.GetAttributeValue("href") is { Length: > 0 } href)
         {
             sb.Append(label.Length > 0 ? $"[{label}]({href})" : href);
             return;
         }
 
-        if (element.Attribute("cref")?.Value is { Length: > 0 } cref)
+        if (element.GetAttributeValue("cref") is { Length: > 0 } cref)
         {
             sb.Append(label.Length > 0 ? label : CodeSpan(CrefText(cref, compilation)));
             return;
         }
 
-        if (element.Attribute("langword")?.Value is { Length: > 0 } langword)
+        if (element.GetAttributeValue("langword") is { Length: > 0 } langword)
         {
             sb.Append(CodeSpan(label.Length > 0 ? label : langword));
             return;

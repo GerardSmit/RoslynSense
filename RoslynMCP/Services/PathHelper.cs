@@ -1,7 +1,8 @@
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
-using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
+using Microsoft.Language.Xml;
+using DiagnosticSeverity = Microsoft.CodeAnalysis.DiagnosticSeverity;
 
 namespace RoslynMCP.Services;
 
@@ -188,12 +189,12 @@ internal static partial class PathHelper
 
     private static bool IsLegacySolutionXml(string slnxPath, string slnDir)
     {
-        var doc = System.Xml.Linq.XDocument.Load(slnxPath);
+        var doc = Parser.ParseText(File.ReadAllText(slnxPath));
         var projectElements = doc.Descendants("Project");
 
         foreach (var proj in projectElements)
         {
-            var pathAttr = proj.Attribute("Path")?.Value;
+            var pathAttr = proj.GetAttributeValue("Path");
             if (string.IsNullOrEmpty(pathAttr)) continue;
             if (!pathAttr.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) &&
                 !pathAttr.EndsWith(".vbproj", StringComparison.OrdinalIgnoreCase) &&
@@ -256,12 +257,27 @@ internal static partial class PathHelper
     public static string? FindNearestSolution(string path)
     {
         var normalized = NormalizePath(path);
-        var dir = File.Exists(normalized) ? Path.GetDirectoryName(normalized) : normalized;
+
+        // A path the workspace still lists can be gone from disk — a folder deleted under a
+        // loaded project. File.Exists is false for such a file, so testing for a directory is
+        // what keeps the walk from enumerating the file path itself as one.
+        var dir = Directory.Exists(normalized) ? normalized : Path.GetDirectoryName(normalized);
 
         while (dir is not null)
         {
-            var slnFiles = FindSolutionFiles(dir);
-            if (slnFiles.Length >= 1) return slnFiles[0];
+            if (Directory.Exists(dir))
+            {
+                try
+                {
+                    var slnFiles = FindSolutionFiles(dir);
+                    if (slnFiles.Length >= 1) return slnFiles[0];
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Deleted between the check and the enumeration, or unreadable: an ancestor
+                    // may still hold the solution.
+                }
+            }
             dir = Path.GetDirectoryName(dir);
         }
 
@@ -290,10 +306,10 @@ internal static partial class PathHelper
         {
             if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
             {
-                var doc = XDocument.Load(solutionPath);
+                var doc = Parser.ParseText(File.ReadAllText(solutionPath));
                 foreach (var elem in doc.Descendants("Project"))
                 {
-                    var rel = elem.Attribute("Path")?.Value;
+                    var rel = elem.GetAttributeValue("Path");
                     if (!string.IsNullOrEmpty(rel) && rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
                         result.Add(Path.GetFullPath(Path.Combine(slnDir, rel.Replace('/', Path.DirectorySeparatorChar))));
                 }

@@ -1,4 +1,4 @@
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Services.Packages;
 
@@ -24,33 +24,22 @@ public static class CentralPackageVersionWriter
             if (!File.Exists(propsPath))
                 return false;
 
-            // PreserveWhitespace plus DisableFormatting is what keeps the rest of the file
-            // byte-identical; without them a single version bump reindents the whole document.
-            var document = XDocument.Load(propsPath, LoadOptions.PreserveWhitespace);
-            if (document.Root is null)
+            string original = File.ReadAllText(propsPath);
+            var document = Parser.ParseText(original);
+
+            if (Declaration(document, packageId) is not { } element)
                 return false;
 
-            var element = document.Root
-                .Descendants()
-                .FirstOrDefault(e =>
-                    (e.Name.LocalName is "PackageVersion" or "GlobalPackageReference") &&
-                    (Matches(e.Attribute("Include"), packageId) || Matches(e.Attribute("Update"), packageId)));
+            if (element.GetAttributeValue("Version") == version)
+                return true;
 
-            if (element is null)
-                return false;
+            // Every character of the source is in the tree, so writing the tree back out is the
+            // original file with one attribute value different — there is no formatting pass to
+            // preserve anything through, and nothing to tell not to reindent.
+            File.WriteAllText(
+                propsPath,
+                document.ReplaceNode(element, element.SetAttribute("Version", version)).ToFullString());
 
-            if (element.Attribute("Version") is { } attribute)
-            {
-                if (attribute.Value == version)
-                    return true;
-                attribute.Value = version;
-            }
-            else
-            {
-                element.SetAttributeValue("Version", version);
-            }
-
-            Save(document, propsPath);
             return true;
         }
         catch (Exception ex)
@@ -63,24 +52,22 @@ public static class CentralPackageVersionWriter
     }
 
     /// <summary>
-    /// Writes the document back without adding anything the original did not have. Most
-    /// Directory.Packages.props files carry no XML declaration, and inserting one would show up as
-    /// a change on every line-ending-sensitive diff for a version bump nobody asked to reformat.
+    /// The element declaring a package's central version, by either <c>Include</c> or
+    /// <c>Update</c> and whatever the file's element names are prefixed with.
     /// </summary>
-    private static void Save(XDocument document, string path)
+    private static XmlElementBaseSyntax? Declaration(XmlDocumentSyntax document, string packageId)
     {
-        var settings = new System.Xml.XmlWriterSettings
+        foreach (var element in document.Descendants())
         {
-            OmitXmlDeclaration = document.Declaration is null,
-            Indent = false,
-            NewLineHandling = System.Xml.NewLineHandling.None,
-            // XmlWriter's default UTF8 encoding emits a preamble. Almost no Directory.Packages.props
-            // has a BOM, and adding one turns a version bump into a first-line diff nobody asked for.
-            Encoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-        };
+            if (element.NameNode?.LocalName is "PackageVersion" or "GlobalPackageReference" &&
+                (Matches(element.GetAttributeValue("Include"), packageId) ||
+                    Matches(element.GetAttributeValue("Update"), packageId)))
+            {
+                return element;
+            }
+        }
 
-        using var writer = System.Xml.XmlWriter.Create(path, settings);
-        document.Save(writer);
+        return null;
     }
 
     /// <summary>
@@ -103,7 +90,6 @@ public static class CentralPackageVersionWriter
         return null;
     }
 
-    private static bool Matches(XAttribute? attribute, string packageId) =>
-        attribute is not null &&
-        attribute.Value.Equals(packageId, StringComparison.OrdinalIgnoreCase);
+    private static bool Matches(string? value, string packageId) =>
+        value is not null && value.Equals(packageId, StringComparison.OrdinalIgnoreCase);
 }

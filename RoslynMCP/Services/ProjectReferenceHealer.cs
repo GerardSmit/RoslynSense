@@ -1,5 +1,5 @@
 using System.Collections.Immutable;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using Microsoft.CodeAnalysis;
 
 namespace RoslynMCP.Services;
@@ -223,34 +223,33 @@ internal static class ProjectReferenceHealer
 
         try
         {
-            var xml = XDocument.Load(projectFile);
+            var xml = Parser.ParseText(File.ReadAllText(projectFile));
 
             foreach (var element in xml.Descendants())
             {
-                if (element.Name.LocalName == "ProjectReference"
-                    && Resolve(element.Attribute("Include")?.Value) is { } target)
+                if (element.NameNode?.LocalName == "ProjectReference"
+                    && Resolve(element.GetAttributeValue("Include")) is { } target)
                 {
                     // ReferenceOutputAssembly="false" declares a build-ordering or analyzer
                     // relationship (source generators use it), not a compilation reference —
                     // healing one would hand the compiler a project it was told not to see.
-                    string? refOutput = element.Attribute("ReferenceOutputAssembly")?.Value
-                        ?? element.Elements()
-                            .FirstOrDefault(e => e.Name.LocalName == "ReferenceOutputAssembly")?.Value;
+                    string? refOutput = element.GetAttributeValue("ReferenceOutputAssembly")
+                        ?? element.GetElementByLocalName("ReferenceOutputAssembly")?.Value;
                     if (!string.Equals(refOutput?.Trim(), "false", StringComparison.OrdinalIgnoreCase))
                         projectRefs.Add(target);
                 }
-                else if (element.Name.LocalName == "Reference")
+                else if (element.NameNode?.LocalName == "Reference")
                 {
-                    var hint = element.Elements()
-                        .FirstOrDefault(e => e.Name.LocalName == "HintPath")?.Value;
+                    var hint = element.GetElementByLocalName("HintPath")?.Value;
                     if (Resolve(hint) is { } assembly)
                         hinted.Add(assembly);
                 }
             }
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Unreadable or not XML: nothing to declare is the honest answer.
+            // Unreadable: nothing to declare is the honest answer. Malformed needs no catch — the
+            // parse is error-tolerant, and the references above the damage still count.
         }
 
         return (projectRefs, hinted);

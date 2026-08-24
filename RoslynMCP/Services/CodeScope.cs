@@ -1,4 +1,4 @@
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Services;
 
@@ -106,19 +106,21 @@ public static class CodeScope
 
         try
         {
-            var doc = XDocument.Load(csprojPath);
-            foreach (var element in doc.Descendants())
+            var document = Parser.ParseText(File.ReadAllText(csprojPath));
+
+            foreach (var element in document.DescendantNodes().OfType<XmlElementBaseSyntax>())
             {
-                if (element.Name.LocalName is "AssemblyName" or "RootNamespace" &&
+                if (element.NameNode?.LocalName is "AssemblyName" or "RootNamespace" &&
                     !string.IsNullOrWhiteSpace(element.Value))
                 {
                     names.Add(element.Value.Trim());
                 }
             }
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Unreadable project file; the filename below still yields a usable prefix.
+            // Unreadable project file; the filename below still yields a usable prefix. A
+            // malformed one needs no catch — the parse is error-tolerant and simply finds less.
         }
 
         // The file name is a namespace hint in its own right — a project can compile into an

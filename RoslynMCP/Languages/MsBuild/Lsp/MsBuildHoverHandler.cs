@@ -132,7 +132,7 @@ internal static class MsBuildHoverHandler
     {
         // A package id, wherever it is written.
         if (context.IsPackageId() && context.Attribute is { } attribute)
-            return Package(XmlSpans.Decode(attribute.Value), Version(context));
+            return Package(attribute.Value, Version(context));
 
         if (context.IsPackageVersion())
             return Package(context.Sibling("Include") ?? context.Sibling("Update") ?? "", Version(context));
@@ -153,7 +153,7 @@ internal static class MsBuildHoverHandler
 
     private static string? Version(in MsBuildContext context) =>
         context.IsPackageVersion() && context.Attribute is { } attribute
-            ? XmlSpans.Decode(attribute.Value)
+            ? attribute.Value
             : context.Sibling("Version") ?? context.Sibling("VersionOverride");
 
     /// <summary>

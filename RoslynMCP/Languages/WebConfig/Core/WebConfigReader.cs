@@ -71,7 +71,7 @@ internal static class WebConfigReader
 
         // Decoded, because this name is compared against the one a C# literal or a markup
         // expression passes. The span stays raw — it is where the characters are.
-        string decoded = name.DecodedValue();
+        string decoded = name.Value;
 
         if (decoded.Length == 0)
             return null;
@@ -91,12 +91,12 @@ internal static class WebConfigReader
     /// </summary>
     /// <remarks>
     /// A range that is merely close is worse than none: it is what a peek highlights, what a lens
-    /// sits on and what a rename would rewrite. The comparison is the one <see cref="XmlSpans"/>
-    /// documents — the written form spans more characters than the decoded string.
+    /// sits on and what a rename would rewrite. Hence the length comparison — the written form of
+    /// a value carrying an entity reference spans more characters than the decoded string.
     /// </remarks>
     private static TextSpan NameSpan(XmlAttributeSyntax attribute, string decoded)
     {
-        var span = attribute.ValueSpan();
+        var span = attribute.ValueSpan.ToRoslynSpan();
         return span.Length == decoded.Length ? span : default;
     }
 
@@ -112,7 +112,7 @@ internal static class WebConfigReader
     }
 
     private static string? Attribute(XmlElementBaseSyntax element, string name) =>
-        AttributeNode(element, name) is { } attribute ? attribute.DecodedValue() : null;
+        AttributeNode(element, name) is { } attribute ? attribute.Value : null;
 
     /// <summary>A name without its prefix, so a config written with one still reads.</summary>
     private static string LocalName(XmlElementBaseSyntax element) =>

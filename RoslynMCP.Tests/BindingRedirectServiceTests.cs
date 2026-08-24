@@ -266,6 +266,125 @@ public class BindingRedirectServiceTests
         Assert.All(info.References, reference => Assert.NotEqual(new Version(0, 0, 0, 0), reference.Version));
     }
 
+    /// <summary>
+    /// A finding points at the attribute value it is about, not at the element around it.
+    /// </summary>
+    /// <remarks>
+    /// The reader of a warning on a <c>dependentAssembly</c> has to work out which of the four
+    /// version numbers written under it is the wrong one. The reader of a warning on the
+    /// <c>newVersion</c> value does not.
+    /// </remarks>
+    [Fact]
+    public void EachPartOfARedirectIsReadWithItsOwnSpan()
+    {
+        var redirect = Assert.Single(BindingRedirectService.Read(Write(Config)));
+
+        Assert.Equal("Newtonsoft.Json", TextAt(Config, redirect.NameSpan));
+        Assert.Equal("30ad4fe6b2a6aeed", TextAt(Config, redirect.TokenSpan));
+        Assert.Equal("0.0.0.0-12.0.0.0", TextAt(Config, redirect.OldVersionSpan));
+        Assert.Equal("12.0.0.0", TextAt(Config, redirect.NewVersionSpan));
+
+        // The identity and the redirect are on different lines, and each span names its own.
+        Assert.Equal(5, redirect.NameSpan!.Line);
+        Assert.Equal(6, redirect.NewVersionSpan!.Line);
+    }
+
+    /// <summary>
+    /// A redirect that does not exist yet is missing from the <c>assemblyBinding</c> section, so
+    /// that is what the section span points at — the top of the document is a complaint about
+    /// <c>&lt;configuration&gt;</c>, which has nothing to do with it.
+    /// </summary>
+    [Fact]
+    public void TheSectionIsWhereAMissingRedirectIsMissingFrom()
+    {
+        BindingRedirectService.ReadText(Config, out var section);
+
+        Assert.Equal("assemblyBinding", TextAt(Config, section));
+        Assert.Equal(3, section!.Line);
+    }
+
+    /// <summary>
+    /// The fix moves version numbers and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// Written with tabs, with CRLF, and with no space before <c>/&gt;</c>, because those are the
+    /// three things a rewrite through <c>XDocument</c> silently changed on
+    /// every line of the file — turning a two-value fix into a diff nobody could review.
+    /// </remarks>
+    [Fact]
+    public void AFixChangesTheVersionsAndNotOneOtherCharacter()
+    {
+        string original = Tabbed;
+
+        var (text, _) = BindingRedirectService.Rewrite(
+            original, [Stale("Newtonsoft.Json", "30ad4fe6b2a6aeed", "12.0.0.0", "13.0.0.0")]);
+
+        Assert.Equal(original.Replace("12.0.0.0", "13.0.0.0"), text);
+    }
+
+    /// <summary>A redirect that is already right is not rewritten with the same text.</summary>
+    [Fact]
+    public void ARedirectThatAlreadyNamesWhatShipsIsLeftAlone()
+    {
+        var (text, _) = BindingRedirectService.Rewrite(
+            Tabbed, [Stale("Newtonsoft.Json", "30ad4fe6b2a6aeed", "12.0.0.0", "12.0.0.0")]);
+
+        Assert.Null(text);
+    }
+
+    /// <summary>
+    /// An added redirect is written in the file's own indentation and line endings, indented one
+    /// level inside the section it joins.
+    /// </summary>
+    [Fact]
+    public void AnAddedRedirectIsWrittenTheWayTheFileIs()
+    {
+        var finding = new BindingRedirectFinding(
+            BindingRedirectProblem.Missing, "Contoso.Core", "abcdef0123456789", "neutral",
+            null, "2.0.0.0", "", -1);
+
+        var (text, _) = BindingRedirectService.Rewrite(Tabbed, [finding]);
+
+        Assert.NotNull(text);
+        Assert.Contains(
+            "\r\n\t\t\t<dependentAssembly>\r\n" +
+            "\t\t\t\t<assemblyIdentity name=\"Contoso.Core\" publicKeyToken=\"abcdef0123456789\" " +
+            "culture=\"neutral\" />\r\n" +
+            "\t\t\t\t<bindingRedirect oldVersion=\"0.0.0.0-2.0.0.0\" newVersion=\"2.0.0.0\" />\r\n" +
+            "\t\t\t</dependentAssembly>\r\n\t\t</assemblyBinding>",
+            text);
+
+        // And the redirect that was already there is character for character what it was.
+        Assert.Contains(
+            "\t\t\t\t<bindingRedirect oldVersion=\"0.0.0.0-12.0.0.0\" newVersion=\"12.0.0.0\"/>",
+            text);
+    }
+
+    /// <summary>The same config as <see cref="Config"/>, written the way a legacy project's
+    /// really is.</summary>
+    private const string Tabbed =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n" +
+        "<configuration>\r\n" +
+        "\t<runtime>\r\n" +
+        "\t\t<assemblyBinding xmlns=\"urn:schemas-microsoft-com:asm.v1\">\r\n" +
+        "\t\t\t<dependentAssembly>\r\n" +
+        "\t\t\t\t<assemblyIdentity name=\"Newtonsoft.Json\" publicKeyToken=\"30ad4fe6b2a6aeed\" " +
+        "culture=\"neutral\"/>\r\n" +
+        "\t\t\t\t<bindingRedirect oldVersion=\"0.0.0.0-12.0.0.0\" newVersion=\"12.0.0.0\"/>\r\n" +
+        "\t\t\t</dependentAssembly>\r\n" +
+        "\t\t</assemblyBinding>\r\n" +
+        "\t</runtime>\r\n" +
+        "</configuration>\r\n";
+
+    private static string TextAt(string document, ConfigSpan? span)
+    {
+        Assert.NotNull(span);
+        Assert.Equal(span!.Line, span.EndLine);
+
+        string line = document.Split('\n')[span.Line].TrimEnd('\r');
+        return line[span.Character..span.EndCharacter];
+    }
+
     private static BindingRedirectFinding Stale(
         string name, string token, string? configured, string required) =>
         new(BindingRedirectProblem.Stale, name, token, "neutral", configured, required, "", 5);

@@ -2,7 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using RoslynMCP.Languages.DotSettings.Core;
 using RoslynMCP.Tools;
 
@@ -547,21 +547,20 @@ public static class CoverageService
 
     private static CoverageData ParseCoberturaXml(string path)
     {
-        var doc = XDocument.Load(path);
-        var root = doc.Root!;
+        var root = Parser.ParseText(File.ReadAllText(path)).RootSyntax!;
 
         var data = new CoverageData
         {
-            LineCoverageRate = ParseDouble(root.Attribute("line-rate")?.Value),
-            BranchCoverageRate = ParseDouble(root.Attribute("branch-rate")?.Value),
-            LinesValid = ParseInt(root.Attribute("lines-valid")?.Value),
-            LinesCovered = ParseInt(root.Attribute("lines-covered")?.Value),
-            BranchesValid = ParseInt(root.Attribute("branches-valid")?.Value),
-            BranchesCovered = ParseInt(root.Attribute("branches-covered")?.Value),
+            LineCoverageRate = ParseDouble(root.GetAttributeValue("line-rate")),
+            BranchCoverageRate = ParseDouble(root.GetAttributeValue("branch-rate")),
+            LinesValid = ParseInt(root.GetAttributeValue("lines-valid")),
+            LinesCovered = ParseInt(root.GetAttributeValue("lines-covered")),
+            BranchesValid = ParseInt(root.GetAttributeValue("branches-valid")),
+            BranchesCovered = ParseInt(root.GetAttributeValue("branches-covered")),
         };
 
         // Collect source directories for resolving relative filenames
-        var sources = root.Element("sources")?.Elements("source")
+        var sources = root.GetElement("sources")?.GetElements("source")
             .Select(s => s.Value)
             .Where(s => !string.IsNullOrWhiteSpace(s))
             .ToList() ?? [];
@@ -570,10 +569,10 @@ public static class CoverageService
         {
             foreach (var cls in package.Descendants("class"))
             {
-                string fileName = cls.Attribute("filename")?.Value ?? "";
-                string className = cls.Attribute("name")?.Value ?? "";
-                double lineRate = ParseDouble(cls.Attribute("line-rate")?.Value);
-                double branchRate = ParseDouble(cls.Attribute("branch-rate")?.Value);
+                string fileName = cls.GetAttributeValue("filename") ?? "";
+                string className = cls.GetAttributeValue("name") ?? "";
+                double lineRate = ParseDouble(cls.GetAttributeValue("line-rate"));
+                double branchRate = ParseDouble(cls.GetAttributeValue("branch-rate"));
 
                 string normalizedFile = ResolveFilePath(fileName, sources);
 
@@ -593,15 +592,15 @@ public static class CoverageService
                 };
 
                 // Parse lines (only direct children of <lines>, not nested in <methods>)
-                var classLines = cls.Element("lines");
+                var classLines = cls.GetElement("lines");
                 if (classLines is not null)
                 {
-                    foreach (var line in classLines.Elements("line"))
+                    foreach (var line in classLines.GetElements("line"))
                     {
-                        int lineNum = ParseInt(line.Attribute("number")?.Value);
-                        int hits = ParseInt(line.Attribute("hits")?.Value);
-                        bool isBranch = string.Equals(line.Attribute("branch")?.Value, "True", StringComparison.OrdinalIgnoreCase);
-                        string? conditionCoverage = line.Attribute("condition-coverage")?.Value;
+                        int lineNum = ParseInt(line.GetAttributeValue("number"));
+                        int hits = ParseInt(line.GetAttributeValue("hits"));
+                        bool isBranch = string.Equals(line.GetAttributeValue("branch"), "True", StringComparison.OrdinalIgnoreCase);
+                        string? conditionCoverage = line.GetAttributeValue("condition-coverage");
 
                         var lineCov = new LineCoverage
                         {
@@ -617,22 +616,30 @@ public static class CoverageService
                 }
 
                 // Parse methods
-                var methodsElement = cls.Element("methods");
+                var methodsElement = cls.GetElement("methods");
                 if (methodsElement is not null)
                 {
-                    foreach (var method in methodsElement.Elements("method"))
+                    foreach (var method in methodsElement.GetElements("method"))
                     {
-                        string methodName = method.Attribute("name")?.Value ?? "";
-                        string signature = method.Attribute("signature")?.Value ?? "";
+                        string methodName = method.GetAttributeValue("name") ?? "";
+                        string signature = method.GetAttributeValue("signature") ?? "";
 
-                        var methodLinesElement = method.Element("lines");
-                        var methodLines = (methodLinesElement?.Elements("line") ?? []).Select(l => new LineCoverage
+                        var methodLines = new List<LineCoverage>();
+
+                        if (method.GetElement("lines") is { } methodLinesElement)
                         {
-                            LineNumber = ParseInt(l.Attribute("number")?.Value),
-                            Hits = ParseInt(l.Attribute("hits")?.Value),
-                            IsBranch = string.Equals(l.Attribute("branch")?.Value, "True", StringComparison.OrdinalIgnoreCase),
-                            ConditionCoverage = l.Attribute("condition-coverage")?.Value,
-                        }).ToList();
+                            foreach (var l in methodLinesElement.GetElements("line"))
+                            {
+                                methodLines.Add(new LineCoverage
+                                {
+                                    LineNumber = ParseInt(l.GetAttributeValue("number")),
+                                    Hits = ParseInt(l.GetAttributeValue("hits")),
+                                    IsBranch = string.Equals(
+                                        l.GetAttributeValue("branch"), "True", StringComparison.OrdinalIgnoreCase),
+                                    ConditionCoverage = l.GetAttributeValue("condition-coverage"),
+                                });
+                            }
+                        }
 
                         int coveredLines = methodLines.Count(l => l.Hits > 0);
                         int totalLines = methodLines.Count;

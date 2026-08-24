@@ -79,7 +79,7 @@ internal sealed partial class WebConfigLanguage : ILanguageCompletionProvider
 
         foreach (var attribute in root.DescendantNodes().OfType<XmlAttributeSyntax>())
         {
-            var span = attribute.ValueSpan();
+            var span = attribute.ValueSpan.ToRoslynSpan();
 
             // Inclusive at both ends: the caret sits between the quotes of an empty value, and
             // at the far end of one being typed.

@@ -45,8 +45,8 @@ internal static class MsBuildSymbolHandler
                     name,
                     Detail(child),
                     Kind(child.Name),
-                    LspConverters.ToRange(lines, child.Span.ToRoslyn()),
-                    LspConverters.ToRange(lines, XmlSpans.NameSpan(child)),
+                    LspConverters.ToRange(lines, child.Span.ToRoslynSpan()),
+                    LspConverters.ToRange(lines, child.NameSpan.ToRoslynSpan()),
                     []));
             }
 
@@ -54,8 +54,8 @@ internal static class MsBuildSymbolHandler
                 Label(group),
                 null,
                 Kind(group.Name),
-                LspConverters.ToRange(lines, group.Span.ToRoslyn()),
-                LspConverters.ToRange(lines, XmlSpans.NameSpan(group)),
+                LspConverters.ToRange(lines, group.Span.ToRoslynSpan()),
+                LspConverters.ToRange(lines, group.NameSpan.ToRoslynSpan()),
                 [.. children]));
         }
 
@@ -66,20 +66,20 @@ internal static class MsBuildSymbolHandler
     private static string? Detail(XmlElementBaseSyntax element) =>
         (element.GetAttributeValue("Version")
          ?? element.GetAttributeValue("VersionOverride")) is { Length: > 0 } version
-            ? XmlSpans.Decode(version)
+            ? version
             : null;
 
     /// <summary>A group's condition, which is usually the only thing distinguishing two of them.</summary>
     private static string Label(XmlElementBaseSyntax element) =>
         element.GetAttributeValue("Condition") is { Length: > 0 } condition
-            ? $"{element.Name} when {XmlSpans.Decode(condition)}"
+            ? $"{element.Name} when {condition}"
             : element.Name;
 
     private static string? Spec(XmlElementBaseSyntax element) =>
         (element.GetAttributeValue("Include")
          ?? element.GetAttributeValue("Update")
          ?? element.GetAttributeValue("Remove")) is { Length: > 0 } spec
-            ? XmlSpans.Decode(spec)
+            ? spec
             : null;
 
     private static int Kind(string name) => name switch

@@ -41,7 +41,7 @@ internal readonly record struct DbmlReference(
     /// empty string there matches nothing, because an unprefixed attribute reports its prefix as null.
     /// </remarks>
     private static string Attribute(XmlElementBaseSyntax? element, string name) =>
-        XmlSpans.Decode(element?.GetAttributeValue(name));
+        element?.GetAttributeValue(name);
 }
 
 /// <summary>
@@ -108,7 +108,7 @@ internal static class DbmlReferences
         if (attribute is null || element is null)
             return null;
 
-        var valueSpan = attribute.ValueSpan();
+        var valueSpan = attribute.ValueSpan.ToRoslynSpan();
 
         if (attribute.ValueNode is null || offset < valueSpan.Start || offset > valueSpan.End)
             return null;
@@ -137,7 +137,7 @@ internal static class DbmlReferences
                 if (KindOf(elementName, attribute.Name ?? string.Empty) is not { } kind)
                     continue;
 
-                var valueSpan = attribute.ValueSpan();
+                var valueSpan = attribute.ValueSpan.ToRoslynSpan();
 
                 if (attribute.ValueNode is null || valueSpan.IsEmpty)
                     continue;

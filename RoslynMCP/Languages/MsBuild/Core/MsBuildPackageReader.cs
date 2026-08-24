@@ -75,14 +75,14 @@ internal static class MsBuildPackageReader
                 }
             }
 
-            if (id is null || XmlSpans.Decode(id.Value) is not { Length: > 0 } packageId)
+            if (id is null || id.Value is not { Length: > 0 } packageId)
                 continue;
 
             results.Add(new MsBuildPackageRef(
                 packageId,
-                version is null ? null : XmlSpans.Decode(version.Value),
-                id.ValueSpan(),
-                version?.ValueSpan() ?? default,
+                version is null ? null : version.Value,
+                id.ValueSpan.ToRoslynSpan(),
+                version?.ValueSpan.ToRoslynSpan() ?? default,
                 version));
         }
 
@@ -109,14 +109,14 @@ internal static class MsBuildPackageReader
                     version ??= attribute;
             }
 
-            if (id is null || XmlSpans.Decode(id.Value) is not { Length: > 0 } packageId)
+            if (id is null || id.Value is not { Length: > 0 } packageId)
                 continue;
 
             results.Add(new MsBuildPackageRef(
                 packageId,
-                version is null ? null : XmlSpans.Decode(version.Value),
-                id.ValueSpan(),
-                version?.ValueSpan() ?? default,
+                version is null ? null : version.Value,
+                id.ValueSpan.ToRoslynSpan(),
+                version?.ValueSpan.ToRoslynSpan() ?? default,
                 version));
         }
 

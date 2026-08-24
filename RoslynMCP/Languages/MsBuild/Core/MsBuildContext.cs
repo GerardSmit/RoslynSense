@@ -97,7 +97,7 @@ internal readonly record struct MsBuildContext(
     /// </remarks>
     public string? Sibling(string name) => Empty(Element?.GetAttributeValue(name));
 
-    private static string? Empty(string? value) => value is { Length: > 0 } ? XmlSpans.Decode(value) : null;
+    private static string? Empty(string? value) => value is { Length: > 0 } ? value : null;
 }
 
 internal static class MsBuildContextResolver
@@ -178,7 +178,7 @@ internal static class MsBuildContextResolver
 
         if (attribute is not null)
         {
-            var valueSpan = attribute.ValueSpan();
+            var valueSpan = attribute.ValueSpan.ToRoslynSpan();
             bool onValue = attribute.ValueNode is not null && Touches(valueSpan, offset);
 
             return new MsBuildContext(
@@ -190,7 +190,7 @@ internal static class MsBuildContextResolver
                 elementName,
                 attribute.Name,
                 path,
-                onValue ? valueSpan : attribute.NameNode?.Span.ToRoslyn() ?? default,
+                onValue ? valueSpan : attribute.NameNode?.Span.ToRoslynSpan() ?? default,
                 MsBuildPadding.None);
         }
 
@@ -223,7 +223,7 @@ internal static class MsBuildContextResolver
         // answer here, not a gap: an empty line inside a <PropertyGroup> is where the next property
         // is typed, and offering nothing there is the difference between the feature working and
         // appearing not to.
-        var content = element.ContentSpan();
+        var content = element.ContentSpan.ToRoslynSpan();
         var flags = MsBuildLocationFlags.Element | MsBuildLocationFlags.Value
                     | (whitespace ? MsBuildLocationFlags.Whitespace : 0)
                     | (invalid ? MsBuildLocationFlags.Invalid : 0);

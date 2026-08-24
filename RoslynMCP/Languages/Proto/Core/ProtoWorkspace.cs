@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Services;
@@ -376,20 +376,16 @@ internal static class ProtoWorkspace
     /// </remarks>
     private static ImmutableArray<string> ReadProtobufItems(string projectPath)
     {
-        XDocument document;
+        XmlDocumentSyntax document;
         try
         {
-            document = XDocument.Load(projectPath);
+            document = Parser.ParseText(File.ReadAllText(projectPath));
         }
         catch (IOException)
         {
             return [];
         }
         catch (UnauthorizedAccessException)
-        {
-            return [];
-        }
-        catch (System.Xml.XmlException)
         {
             return [];
         }
@@ -401,20 +397,18 @@ internal static class ProtoWorkspace
         var included = new List<string>();
         var removed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var element in document.Descendants())
+        foreach (var element in document.DescendantsByLocalName(
+            "Protobuf", StringComparison.OrdinalIgnoreCase))
         {
-            if (!element.Name.LocalName.Equals("Protobuf", StringComparison.OrdinalIgnoreCase))
-                continue;
-
             foreach (string attribute in (ReadOnlySpan<string>)["Include", "Update"])
             {
-                if (element.Attribute(attribute)?.Value is { Length: > 0 } value)
+                if (element.GetAttributeValue(attribute) is { Length: > 0 } value)
                     Expand(directory, value, included);
             }
 
             foreach (string attribute in (ReadOnlySpan<string>)["Remove", "Exclude"])
             {
-                if (element.Attribute(attribute)?.Value is { Length: > 0 } value)
+                if (element.GetAttributeValue(attribute) is { Length: > 0 } value)
                 {
                     var taken = new List<string>();
                     Expand(directory, value, taken);

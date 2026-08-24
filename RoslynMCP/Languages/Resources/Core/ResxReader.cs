@@ -22,9 +22,6 @@ internal readonly record struct ResxContents(
 /// <see cref="System.Xml.XmlReader"/> stops at the first malformation, which in an open document is
 /// wherever the caret is. This parser is error-tolerant, so a half-typed buffer — the normal state
 /// of a file being edited — still yields every entry, including the ones after the break.
-///
-/// Spans come from <see cref="XmlSpans"/>, which carries the one sharp edge worth knowing: an
-/// attribute's value node spans its quotes too.
 /// </remarks>
 internal static class ResxReader
 {
@@ -71,8 +68,8 @@ internal static class ResxReader
                 case "name":
                     // Decoded, because this key is compared against the one a `GetString` call in C#
                     // passes. The span stays raw — it is where the characters are.
-                    key = attribute.DecodedValue();
-                    keySpan = attribute.ValueSpan();
+                    key = attribute.Value;
+                    keySpan = attribute.ValueSpan.ToRoslynSpan();
                     break;
 
                 case "type":
@@ -94,11 +91,11 @@ internal static class ResxReader
             switch (child.Name)
             {
                 case "value":
-                    value = child.DecodedValue();
-                    valueSpan = child.ContentSpan();
+                    value = child.Value;
+                    valueSpan = child.ContentSpan.ToRoslynSpan();
                     break;
                 case "comment":
-                    comment = child.DecodedValue();
+                    comment = child.Value;
                     break;
             }
         }

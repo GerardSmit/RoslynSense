@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
-using System.Xml;
-using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Services;
 
@@ -256,12 +255,12 @@ internal static class SearchScopeService
     /// nothing.</summary>
     private static List<string> ProjectReferencesOf(string projectPath)
     {
-        XDocument document;
+        XmlDocumentSyntax document;
         try
         {
-            document = XDocument.Load(projectPath);
+            document = Parser.ParseText(File.ReadAllText(projectPath));
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or XmlException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return [];
         }
@@ -269,13 +268,11 @@ internal static class SearchScopeService
         string directory = Path.GetDirectoryName(projectPath) ?? string.Empty;
         var results = new List<string>();
 
-        foreach (var element in document.Descendants())
+        foreach (var element in document.DescendantsByLocalName(
+            "ProjectReference", StringComparison.OrdinalIgnoreCase))
         {
-            if (!element.Name.LocalName.Equals("ProjectReference", StringComparison.OrdinalIgnoreCase)
-                || element.Attribute("Include")?.Value is not { Length: > 0 } include)
-            {
+            if (element.GetAttributeValue("Include") is not { Length: > 0 } include)
                 continue;
-            }
 
             results.Add(Normalize(
                 Path.Combine(directory, include.Replace('\\', Path.DirectorySeparatorChar))));

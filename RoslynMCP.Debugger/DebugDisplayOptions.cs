@@ -32,6 +32,11 @@ public sealed class DebugDisplayOptions
     /// <c>RootHidden</c> replaces it with its own children.</summary>
     public bool Browsable { get; set; } = true;
 
+    /// <summary>Show a value through its own <c>ToString</c> override when nothing else claims
+    /// it — VS's "call string-conversion function on objects in variables windows". Function
+    /// evaluation, with everything that implies.</summary>
+    public bool CallToString { get; set; } = true;
+
     /// <summary>
     /// Step past code marked <c>DebuggerStepThrough</c>, <c>DebuggerHidden</c> or
     /// <c>DebuggerNonUserCode</c>, and past frames with no symbols at all.
@@ -47,12 +52,27 @@ public sealed class DebugDisplayOptions
     /// <summary>How many elements of an array or collection to list before truncating.</summary>
     public int MaxChildren { get; set; } = 100;
 
+    /// <summary>
+    /// Globs for the only modules whose symbols load, when non-empty — VS's "Load only
+    /// specified modules". A glob without a path separator matches the module's file name;
+    /// with one, its full path. See <see cref="SymbolGlobs"/>.
+    /// </summary>
+    public string[] SymbolInclude { get; set; } = [];
+
+    /// <summary>
+    /// Globs for modules whose symbols never load, winning over <see cref="SymbolInclude"/> —
+    /// VS's "Load all modules, unless excluded". A module without symbols cannot bind source
+    /// breakpoints, exactly as if it had shipped without a PDB.
+    /// </summary>
+    public string[] SymbolExclude { get; set; } = [];
+
     /// <summary>Everything off — the unfiltered view of what is actually in memory.</summary>
     public static DebugDisplayOptions Raw => new()
     {
         DebuggerDisplay = false,
         TypeProxy = false,
         Browsable = false,
+        CallToString = false,
         JustMyCode = false,
         RawView = false,
     };
@@ -62,8 +82,11 @@ public sealed class DebugDisplayOptions
         DebuggerDisplay = DebuggerDisplay,
         TypeProxy = TypeProxy,
         Browsable = Browsable,
+        CallToString = CallToString,
         JustMyCode = JustMyCode,
         RawView = RawView,
         MaxChildren = MaxChildren,
+        SymbolInclude = SymbolInclude,
+        SymbolExclude = SymbolExclude,
     };
 }

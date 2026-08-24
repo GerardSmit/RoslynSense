@@ -133,6 +133,20 @@ public sealed class BreakpointSpec
     public bool Temporary { get; set; }
 
     public BreakpointKind Kind { get; set; }
+
+    /// <summary>IL form: the module the token lives in. Matched by full path, falling back to
+    /// file name for shadow-copied modules. Takes precedence over the source and entry forms
+    /// when <see cref="MethodToken"/> is set.</summary>
+    public string ModulePath { get; set; } = "";
+
+    /// <summary>IL form: a MethodDef token in <see cref="ModulePath"/>; 0 when unused. Set by the
+    /// host when the requested file is decompiled or fetched source — paths no PDB records — so
+    /// binding cannot go through documents and goes straight to the IL instead.</summary>
+    public int MethodToken { get; set; }
+
+    /// <summary>IL form: the offset within the method's IL body; meaningful only with
+    /// <see cref="MethodToken"/>.</summary>
+    public int IlOffset { get; set; }
 }
 
 public sealed class StackFrame
@@ -152,6 +166,16 @@ public sealed class StackFrame
     public uint Column { get; set; }
 
     public int ThreadId { get; set; }
+
+    /// <summary>The module the frame executes in — filled for frames without symbols, so the
+    /// host can resolve external source for them.</summary>
+    public string ModulePath { get; set; } = "";
+
+    /// <summary>The frame's MethodDef token in <see cref="ModulePath"/>; 0 when unknown.</summary>
+    public int MethodToken { get; set; }
+
+    /// <summary>The IP within the method's IL; -1 when unknown.</summary>
+    public int IlOffset { get; set; } = -1;
 }
 
 public sealed class DebugThread

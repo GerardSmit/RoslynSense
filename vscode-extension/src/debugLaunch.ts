@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
-import { withHotReloadEnvironment } from './hotReload';
+import { bindHotReloadSession, withHotReloadEnvironment } from './hotReload';
 
 /**
  * Real debugging of the user's own app, without ms-dotnettools.csharp.
@@ -352,10 +352,15 @@ export function registerDebugLaunch(
                 config.env = { ...target.env, ...(config.env ?? {}) };
 
                 // Hot reload has to be decided before the process starts, and it costs nothing
-                // when unused, so it is on unless the configuration turns it off. Not for .NET
-                // Framework: there the edit goes through the debugger, not a startup hook.
-                if (config.hotReload !== false && !target.isNetFramework) {
-                    config.env = await withHotReloadEnvironment(client, config.env, target.projectPath);
+                // when unused, so it is on unless the configuration turns it off. .NET Framework
+                // needs no environment — its edits go through the debugger, not a startup hook —
+                // but still needs the session bound, or the toolbar button never appears.
+                if (config.hotReload !== false) {
+                    if (target.isNetFramework) {
+                        bindHotReloadSession(client, target.projectPath);
+                    } else {
+                        config.env = await withHotReloadEnvironment(client, config.env, target.projectPath);
+                    }
                 }
 
                 // Web apps: open the browser once Kestrel announces its address, matching what

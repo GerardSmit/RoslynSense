@@ -208,6 +208,9 @@ internal static class Program
                             Line = (uint)Math.Max(0, request.Line),
                         },
                         Force = request.Force,
+                        ModulePath = request.ModulePath ?? "",
+                        MethodToken = request.MethodToken,
+                        IlOffset = request.IlOffset,
                     });
                     break;
 
@@ -220,6 +223,8 @@ internal static class Program
                             FilePath = request.FilePath ?? "",
                             Line = (uint)Math.Max(0, request.Line),
                         },
+                        MethodToken = request.MethodToken,
+                        IlOffset = request.IlOffset,
                     });
                     break;
 

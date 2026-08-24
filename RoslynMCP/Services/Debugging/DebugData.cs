@@ -16,13 +16,25 @@ internal static class DebugJson
 /// <param name="Id">Frame index, 0 being the innermost. Doubles as the DAP frame id.</param>
 /// <param name="IsExternal">Framework, native, or symbol-less code — rendered subtly and
 /// collapsed in the markdown surface.</param>
+/// <param name="ModulePath">The module the frame executes in — carried for frames without
+/// source, so external-source resolution can find the method behind them.</param>
+/// <param name="MethodToken">The frame's MethodDef token in <paramref name="ModulePath"/>;
+/// 0 when the engine did not say.</param>
+/// <param name="IlOffset">Where the IP is within the method's IL; -1 when unknown.</param>
+/// <param name="SourceOrigin">How <paramref name="FilePath"/> was obtained when it is not the
+/// PDB's own answer: <c>embedded</c>, <c>source link</c>, <c>reference source</c> or
+/// <c>decompiled</c>. Empty for ordinary project frames.</param>
 public sealed record StackFrameInfo(
     int Id,
     string Name,
     string FilePath,
     int Line,
     int Column,
-    bool IsExternal);
+    bool IsExternal,
+    string ModulePath = "",
+    int MethodToken = 0,
+    int IlOffset = -1,
+    string SourceOrigin = "");
 
 /// <summary>
 /// One variable in scope, or one child of an expandable one.

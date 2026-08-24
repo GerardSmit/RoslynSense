@@ -321,6 +321,9 @@ public sealed class WorkerDebugEngine : IDebugEngine
                 FilePath = request.Location?.FilePath,
                 Line = (int)(request.Location?.Line ?? 0),
                 Force = request.Force,
+                ModulePath = request.ModulePath.Length > 0 ? request.ModulePath : null,
+                MethodToken = request.MethodToken,
+                IlOffset = request.IlOffset,
             });
 
             return response.RunToLocation ?? new RunToLocationResponse { Ok = true };
@@ -341,6 +344,8 @@ public sealed class WorkerDebugEngine : IDebugEngine
                 FrameIndex = request.FrameIndex,
                 FilePath = request.Location?.FilePath,
                 Line = (int)(request.Location?.Line ?? 0),
+                MethodToken = request.MethodToken,
+                IlOffset = request.IlOffset,
             });
 
             return response.SetNextStatement ?? new SetNextStatementResponse { Ok = true };

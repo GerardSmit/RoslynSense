@@ -50,6 +50,29 @@ public class StructuredDebugTests
         Assert.Empty(DebuggerService.ParseStackFrames(@"^error,msg=""Thread is not stopped"""));
     }
 
+    [Fact]
+    public void ManagedFramesCarryTheClrAddressSoExternalSourceCanFindThem()
+    {
+        // A sourceless framework frame names its code by module id, method token and IL offset —
+        // the identity external-source resolution needs. The nested clr-addr braces must not
+        // truncate the frame, and the fields must survive into the record.
+        const string response = """
+            ^done,stack=[frame={level="0",clr-addr={module-id="{a1b2c3d4-e5f6-4a1b-9c2d-3e4f5a6b7c8d}",method-token="0x06000A11",il-offset="7",native-offset="52"},func="System.Console.WriteLine()",addr="0x00007ff8"},frame={level="1",func="App.Main",file="App.cs",fullname="C:\\src\\App.cs",line="3"}]
+            """;
+
+        var frames = DebuggerService.ParseStackFrames(
+            response,
+            id => id == "a1b2c3d4-e5f6-4a1b-9c2d-3e4f5a6b7c8d" ? @"C:\dotnet\System.Console.dll" : null);
+
+        Assert.Equal(2, frames.Count);
+        Assert.Equal("System.Console.WriteLine()", frames[0].Name);
+        Assert.Equal(@"C:\dotnet\System.Console.dll", frames[0].ModulePath);
+        Assert.Equal(0x06000A11, frames[0].MethodToken);
+        Assert.Equal(7, frames[0].IlOffset);
+        Assert.Equal(@"C:\src\App.cs", frames[1].FilePath);
+        Assert.Equal(0, frames[1].MethodToken);
+    }
+
     // === MI tuple splitting ===
 
     [Fact]

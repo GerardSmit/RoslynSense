@@ -27,7 +27,35 @@ internal sealed partial class DebuggerService
         if (_state != DebugState.Stopped)
             return [];
 
-        return ParseStackFrames(await SendCommandAsync("-stack-list-frames", cancellationToken));
+        var response = await SendCommandAsync("-stack-list-frames", cancellationToken);
+        var frames = ParseStackFrames(response, ModulePathForId);
+
+        // A frame naming a module this session has not mapped yet — a newly loaded assembly, or
+        // the first stop — is worth one refresh of the module list.
+        if (frames.Any(f => f is { FilePath.Length: 0, MethodToken: > 0, ModulePath.Length: 0 }))
+        {
+            await RefreshModuleMapAsync(cancellationToken);
+            frames = ParseStackFrames(response, ModulePathForId);
+        }
+
+        return await ExternalFrameResolver.EnrichAsync(frames, cancellationToken);
+    }
+
+    /// <summary>Module paths by MVID: netcoredbg names a frame's module by id, while the source
+    /// resolver needs the file the id belongs to.</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _modulePathsById =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private string? ModulePathForId(string moduleId) =>
+        _modulePathsById.TryGetValue(moduleId, out string? path) ? path : null;
+
+    private async Task RefreshModuleMapAsync(CancellationToken cancellationToken)
+    {
+        foreach (var module in await GetModulesAsync(cancellationToken))
+        {
+            if (ExternalSource.DebugFrameSource.TryReadMvid(module.Path) is { } mvid)
+                _modulePathsById[mvid] = module.Path;
+        }
     }
 
     public async Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(
@@ -229,9 +257,19 @@ internal sealed partial class DebuggerService
         if (_netcoredbgProcess is null or { HasExited: true })
             return "Error: no debug session is active.";
 
-        string response = await SendCommandAsync(
-            $"-break-insert -t \"{Path.GetFullPath(filePath).Replace("\\", "/")}:{line}\"",
-            cancellationToken);
+        // Decompiled and fetched files translate the same way SetBreakpointAsync does: the
+        // PDB-recorded path for the line when there is one, the method's name otherwise.
+        string location = $"\"{Path.GetFullPath(filePath).Replace("\\", "/")}:{line}\"";
+        var mapped = await ExternalSource.DebugSourceMapper.TryMapAsync(
+            PathHelper.NormalizePath(filePath), line, cancellationToken);
+        if (mapped is not null)
+        {
+            location = mapped.DocumentPath.Length > 0
+                ? $"\"{EscapeMiString(mapped.DocumentPath)}:{mapped.Line}\""
+                : $"\"{EscapeMiString(mapped.MethodDisplayName)}\"";
+        }
+
+        string response = await SendCommandAsync($"-break-insert -t {location}", cancellationToken);
 
         if (IsError(response))
             return $"Error: {ExtractMiField(response, "msg")}";
@@ -419,15 +457,15 @@ internal sealed partial class DebuggerService
     private static bool IsError(string response) =>
         response.Contains("^error", StringComparison.Ordinal);
 
-    internal static IReadOnlyList<StackFrameInfo> ParseStackFrames(string response)
+    internal static IReadOnlyList<StackFrameInfo> ParseStackFrames(
+        string response, Func<string, string?>? modulePathForId = null)
     {
         if (IsError(response))
             return [];
 
         var frames = new List<StackFrameInfo>();
-        foreach (Match match in StackFrameRegex().Matches(response))
+        foreach (string content in FrameTuples(response))
         {
-            string content = match.Groups[1].Value;
             string function = ExtractMiField(content, "func") ?? "";
             string file = ExtractMiField(content, "fullname") ?? ExtractMiField(content, "file") ?? "";
 
@@ -440,10 +478,29 @@ internal sealed partial class DebuggerService
             bool external = function is "[Native Frames]" ||
                             (function.Length == 0 && file.Length == 0);
 
+            var (moduleId, methodToken, ilOffset) = ParseClrAddress(content);
+
             frames.Add(new StackFrameInfo(
-                level, function.Length == 0 ? "unknown" : function, file, line, column, external));
+                level, function.Length == 0 ? "unknown" : function, file, line, column, external,
+                ModulePath: moduleId.Length > 0 ? modulePathForId?.Invoke(moduleId) ?? "" : "",
+                MethodToken: methodToken,
+                IlOffset: ilOffset));
         }
         return frames;
+    }
+
+    /// <summary>
+    /// The frame tuples of a <c>stack=[frame={...},frame={...}]</c> response. Brace-aware,
+    /// because a managed frame nests a <c>clr-addr={...}</c> block that a flat regex would
+    /// truncate the frame at.
+    /// </summary>
+    private static IEnumerable<string> FrameTuples(string response)
+    {
+        int start = response.IndexOf("stack=[", StringComparison.Ordinal);
+        if (start >= 0)
+            return SplitMiTuples(response[(start + "stack=[".Length)..]);
+
+        return StackFrameRegex().Matches(response).Select(m => m.Groups[1].Value);
     }
 
     /// <summary>The <c>name</c>/<c>value</c> pairs of a <c>variables=[]</c> or <c>locals=[]</c>

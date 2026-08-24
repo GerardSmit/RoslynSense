@@ -64,6 +64,10 @@ public sealed partial class DebugSession : IDebugSession
     /// Exception stop policy: unhandled exceptions always stop; first-chance stops only when
     /// this is set (default report-and-continue).
     private volatile bool _breakOnFirstChance;
+
+    /// <summary>Whether the current stop is an exception stop — the only time the frame list
+    /// carries a <c>$exception</c> row, exactly as VS's Locals window does.</summary>
+    private volatile bool _stoppedOnException;
     /// Module that produced each bound breakpoint key, so an unload (app-domain recycle) can
     /// return those breakpoints to pending and let the next LoadModule rebind them.
     private readonly ConcurrentDictionary<string, string> _boundModule = new(StringComparer.OrdinalIgnoreCase);
@@ -258,21 +262,52 @@ public sealed partial class DebugSession : IDebugSession
             var thread = _stoppedThread;
             if (thread is null)
                 return new RunToLocationResponse { Ok = false, Error = "debuggee is not stopped" };
-            var resolved = ResolveBestLocation(location.FilePath, (int)location.Line, (int)location.Column);
-            if (resolved is null)
-                return new RunToLocationResponse { Ok = false, Error = "no executable location found" };
 
-            var spec = new BreakpointSpec
+            BreakpointSpec spec;
+            BreakpointLocation? resolved;
+            if (request.MethodToken != 0)
             {
-                Id = $"run-to:{Guid.NewGuid():N}",
-                FilePath = resolved.Actual!.FilePath,
-                Line = resolved.Actual.Line,
-                Column = resolved.Actual.Column,
-                EndLine = resolved.Actual.EndLine,
-                EndColumn = resolved.Actual.EndColumn,
-                Temporary = true,
-                Kind = BreakpointKind.Source,
-            };
+                // The host already mapped a decompiled or fetched file to IL; no document in any
+                // PDB names this file, so document resolution would only fail.
+                var range = SourceRangeOf(location.FilePath, (int)location.Line, (int)location.Column);
+                resolved = new BreakpointLocation
+                {
+                    Requested = range,
+                    Actual = range.Clone(),
+                    Verified = true,
+                    Kind = BreakpointKind.Source,
+                };
+                spec = new BreakpointSpec
+                {
+                    Id = $"run-to:{Guid.NewGuid():N}",
+                    FilePath = location.FilePath,
+                    Line = location.Line,
+                    Column = location.Column,
+                    ModulePath = request.ModulePath,
+                    MethodToken = request.MethodToken,
+                    IlOffset = request.IlOffset,
+                    Temporary = true,
+                    Kind = BreakpointKind.Source,
+                };
+            }
+            else
+            {
+                resolved = ResolveBestLocation(location.FilePath, (int)location.Line, (int)location.Column);
+                if (resolved is null)
+                    return new RunToLocationResponse { Ok = false, Error = "no executable location found" };
+
+                spec = new BreakpointSpec
+                {
+                    Id = $"run-to:{Guid.NewGuid():N}",
+                    FilePath = resolved.Actual!.FilePath,
+                    Line = resolved.Actual.Line,
+                    Column = resolved.Actual.Column,
+                    EndLine = resolved.Actual.EndLine,
+                    EndColumn = resolved.Actual.EndColumn,
+                    Temporary = true,
+                    Kind = BreakpointKind.Source,
+                };
+            }
             lock (_specLock)
                 _specs.Add(spec);
             foreach (var module in LoadedModules())
@@ -294,6 +329,41 @@ public sealed partial class DebugSession : IDebugSession
             var frame = FrameAt(thread, request.FrameIndex) as CorDebugILFrame;
             if (frame is null)
                 return new SetNextStatementResponse { Ok = false, Error = "no managed IL frame selected" };
+
+            if (request.MethodToken != 0)
+            {
+                // IL form, mapped by the host from a decompiled or fetched file: legal only when
+                // the target method is the one the frame is already executing.
+                if ((int)frame.Function.Token != request.MethodToken)
+                    return new SetNextStatementResponse
+                    {
+                        Ok = false,
+                        Error = "target is in a different method than the selected frame",
+                    };
+                try
+                {
+                    var ilHr = frame.TryCanSetIP(request.IlOffset);
+                    if (ilHr != HRESULT.S_OK)
+                        return new SetNextStatementResponse { Ok = false, Error = $"Set Next Statement rejected: {ilHr}" };
+                    frame.SetIP(request.IlOffset);
+                    var moved = SourceRangeOf(location.FilePath, (int)location.Line, (int)location.Column);
+                    Emit(
+                        DebugEventKind.Paused,
+                        "set next statement",
+                        DescribeMethod(frame),
+                        ThreadId(thread),
+                        moved.FilePath,
+                        (int)moved.Line,
+                        (int)moved.Column,
+                        actualLocation: moved);
+                    return new SetNextStatementResponse { Ok = true, Actual = moved };
+                }
+                catch (Exception ex)
+                {
+                    return new SetNextStatementResponse { Ok = false, Error = ex.Message };
+                }
+            }
+
             var target = ResolveBestLocationInFrame(frame, location.FilePath, (int)location.Line, (int)location.Column);
             if (target is null)
                 return new SetNextStatementResponse
@@ -328,6 +398,7 @@ public sealed partial class DebugSession : IDebugSession
 
     public void Continue() => Enqueue(() =>
     {
+        _stoppedOnException = false;
         _stoppedThread = null;
         try { _process?.Continue(false); } catch { }
     });
@@ -458,6 +529,7 @@ public sealed partial class DebugSession : IDebugSession
             }
             lock (_stepperLock)
                 _steppers.Add(stepper);
+            _stoppedOnException = false;
             _stoppedThread = null;
             _process?.Continue(false);
         }
@@ -480,6 +552,9 @@ public sealed partial class DebugSession : IDebugSession
             foreach (var frame in Safe(() => chain.Frames) ?? Array.Empty<CorDebugFrame>())
             {
                 var (file, line, column) = FrameLocation(frame);
+                var (modulePath, methodToken, ilOffset) = file.Length == 0
+                    ? FrameIdentity(frame)
+                    : ("", 0, -1);
                 frames.Add(new StackFrame
                 {
                     Index = index++,
@@ -488,6 +563,9 @@ public sealed partial class DebugSession : IDebugSession
                     Line = (uint)line,
                     Column = (uint)column,
                     ThreadId = ThreadId(thread),
+                    ModulePath = modulePath,
+                    MethodToken = methodToken,
+                    IlOffset = ilOffset,
                 });
                 if (index >= 128)
                     return frames;
@@ -623,20 +701,23 @@ public sealed partial class DebugSession : IDebugSession
 
         try
         {
+            // Invariant culture, so a value read out of the locals list parses back in on any
+            // host, and '\'A\'' assigns the character rather than its opening quote.
+            var invariant = System.Globalization.CultureInfo.InvariantCulture;
             object parsed = type switch
             {
                 CorElementType.Boolean => bool.Parse(literal),
-                CorElementType.Char => literal.Length > 0 ? literal[0] : '\0',
-                CorElementType.I1 => sbyte.Parse(literal),
-                CorElementType.U1 => byte.Parse(literal),
-                CorElementType.I2 => short.Parse(literal),
-                CorElementType.U2 => ushort.Parse(literal),
-                CorElementType.I4 => int.Parse(literal),
-                CorElementType.U4 => uint.Parse(literal),
-                CorElementType.I8 => long.Parse(literal),
-                CorElementType.U8 => ulong.Parse(literal),
-                CorElementType.R4 => float.Parse(literal),
-                CorElementType.R8 => double.Parse(literal),
+                CorElementType.Char => literal is ['\'', var quoted, '\''] ? quoted : literal.Length > 0 ? literal[0] : '\0',
+                CorElementType.I1 => sbyte.Parse(literal, invariant),
+                CorElementType.U1 => byte.Parse(literal, invariant),
+                CorElementType.I2 => short.Parse(literal, invariant),
+                CorElementType.U2 => ushort.Parse(literal, invariant),
+                CorElementType.I4 => int.Parse(literal, invariant),
+                CorElementType.U4 => uint.Parse(literal, invariant),
+                CorElementType.I8 => long.Parse(literal, invariant),
+                CorElementType.U8 => ulong.Parse(literal, invariant),
+                CorElementType.R4 => float.Parse(literal, invariant),
+                CorElementType.R8 => double.Parse(literal, invariant),
                 _ => throw new NotSupportedException($"values of type {type} cannot be assigned"),
             };
 
@@ -751,6 +832,7 @@ public sealed partial class DebugSession : IDebugSession
     private CorDebugValue? ResolvePath(CorDebugILFrame ilFrame, string expr, out string error)
     {
         error = string.Empty;
+        _inspectionFrame = ilFrame;
         var segments = expr.Replace(" ", string.Empty)
             .Split('.', StringSplitOptions.RemoveEmptyEntries);
         if (segments.Length == 0)
@@ -766,12 +848,22 @@ public sealed partial class DebugSession : IDebugSession
             var (name, indexes, isCall) = ParseSegment(segments[s]);
             if (s == 0)
             {
-                current = isCall ? null : RootValue(ilFrame, name, argNames, localNames);
+                current = name == ExceptionMarker && CurrentExceptionValue() is { } thrown
+                    ? thrown
+                    : isCall ? null : RootValue(ilFrame, name, argNames, localNames);
 
                 // Not an argument or local: it may be a member of `this`, which is how a member is
                 // normally written inside an instance method.
                 if (current is null && RootValue(ilFrame, "this", argNames, localNames) is { } self)
                     current = MemberValue(self, name, isCall, out error);
+
+                // A local the compiler moved into a capture class still answers to its own name.
+                if (current is null && !isCall)
+                    current = CapturedValue(ilFrame, name, localNames);
+
+                // A bare static of the frame's own type, written the way it is written in code.
+                if (current is null && !isCall)
+                    current = FrameStaticValue(ilFrame, name);
 
                 if (current is null)
                 {
@@ -784,12 +876,14 @@ public sealed partial class DebugSession : IDebugSession
             }
             else
             {
-                // '$raw' and '$proxy' are the two segments that are not members: they select which
+                // '$raw' and friends are the segments that are not members: they select which
                 // *view* of the value the rest of the path walks through.
                 current = name switch
                 {
-                    RawMarker => current,
+                    RawMarker or StaticsMarker => current,
                     ProxyMarker => ProxyValue(current!, out error),
+                    ResultsMarker => EnumerableItems(current!, out error),
+                    _ when name.StartsWith(MoreMarker, StringComparison.Ordinal) => current,
                     _ => MemberValue(current!, name, isCall, out error),
                 };
                 if (current is null)
@@ -798,10 +892,10 @@ public sealed partial class DebugSession : IDebugSession
 
             foreach (var index in indexes)
             {
-                current = ElementValue(current, index);
+                current = IndexValue(current, index, out var indexError);
                 if (current is null)
                 {
-                    error = $"cannot index into '{name}'";
+                    error = indexError.Length > 0 ? indexError : $"cannot index into '{name}'";
                     return null;
                 }
             }
@@ -810,17 +904,19 @@ public sealed partial class DebugSession : IDebugSession
     }
 
     /// <summary>
-    /// Splits one path segment into its member name, any array indexers, and whether it was
-    /// written as a call — <c>Items[0]</c>, <c>Count</c>, <c>ToString()</c>.
+    /// Splits one path segment into its member name, any indexers, and whether it was written as
+    /// a call — <c>Items[0]</c>, <c>grid[1,2]</c>, <c>pairs["a"]</c>, <c>ToString()</c>.
     /// </summary>
-    private static (string Name, List<int> Indexes, bool IsCall) ParseSegment(string segment)
+    /// <remarks>Each parsed index is an <c>int[]</c> (one entry per dimension) or a string key
+    /// for a keyed indexer; <see cref="IndexValue"/> takes them apart again.</remarks>
+    private static (string Name, List<object> Indexes, bool IsCall) ParseSegment(string segment)
     {
         // Only parameterless calls are supported; arguments would need to be evaluated too.
         var isCall = segment.EndsWith("()", StringComparison.Ordinal);
         if (isCall)
             segment = segment[..^2];
 
-        var indexes = new List<int>();
+        var indexes = new List<object>();
         var bracket = segment.IndexOf('[');
         var name = bracket < 0 ? segment : segment[..bracket];
         while (bracket >= 0)
@@ -828,11 +924,101 @@ public sealed partial class DebugSession : IDebugSession
             var close = segment.IndexOf(']', bracket);
             if (close < 0)
                 break;
-            if (int.TryParse(segment[(bracket + 1)..close], out var idx))
-                indexes.Add(idx);
+            var body = segment[(bracket + 1)..close];
+            if (body.Length >= 2 && body[0] == '"' && body[^1] == '"')
+            {
+                indexes.Add(body[1..^1]);
+            }
+            else
+            {
+                var parts = body.Split(',');
+                var numeric = new int[parts.Length];
+                var parsed = true;
+                for (var p = 0; p < parts.Length; p++)
+                    parsed &= int.TryParse(parts[p], out numeric[p]);
+                if (parsed)
+                    indexes.Add(numeric);
+            }
             bracket = segment.IndexOf('[', close);
         }
         return (name, indexes, isCall);
+    }
+
+    /// <summary>
+    /// Applies one indexer: array element access for a numeric index (multi-dimensional included),
+    /// and the type's own <c>get_Item</c> for anything else — a list's position, a dictionary's
+    /// string key.
+    /// </summary>
+    private CorDebugValue? IndexValue(CorDebugValue value, object index, out string error)
+    {
+        error = string.Empty;
+        var target = Safe(() => Dereference(value));
+
+        if (index is int[] numeric)
+        {
+            if (target is CorDebugArrayValue array)
+            {
+                return Safe(() => numeric.Length == 1
+                    ? array.GetElementAtPosition(numeric[0])
+                    : array.GetElement(numeric.Length, numeric));
+            }
+            if (numeric.Length != 1)
+            {
+                error = "only an array takes a multi-dimensional index";
+                return null;
+            }
+            return InvokeIndexer(value, CreateIntValue(numeric[0], ref error), ref error);
+        }
+
+        if (index is string key)
+            return InvokeIndexer(value, RunEval(eval => eval.NewString(key), out error), ref error);
+
+        return null;
+    }
+
+    private CorDebugValue? InvokeIndexer(CorDebugValue value, CorDebugValue? argument, ref string error)
+    {
+        if (argument is null)
+            return null;
+        if (FindMethod(value, "get_Item") is not { } found)
+        {
+            error = "the value has no indexer";
+            return null;
+        }
+        return InvokeFunction(found.Function, [found.Instance, argument], out error);
+    }
+
+    /// <summary>An <c>int</c> in the debuggee holding <paramref name="number"/>, to hand to an
+    /// indexer. Creating one is synchronous — the debuggee never runs for it.</summary>
+    private CorDebugValue? CreateIntValue(int number, ref string error)
+    {
+        var thread = _stoppedThread;
+        if (thread is null)
+        {
+            error = "not stopped";
+            return null;
+        }
+        try
+        {
+            var created = thread.CreateEval().CreateValue(CorElementType.I4, null);
+            var generic = Extensions.As<CorDebugGenericValue>(created);
+            var pointer = Marshal.AllocHGlobal(sizeof(int));
+            try
+            {
+                Marshal.WriteInt32(pointer, number);
+                generic.SetValue(pointer);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+            return created;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return null;
+        }
     }
 
     private static CorDebugValue? RootValue(
@@ -862,50 +1048,94 @@ public sealed partial class DebugSession : IDebugSession
         return null;
     }
 
-    /// A named field (or auto-property backing field) of an object value, searching the class
-    /// hierarchy within the declaring module.
+    /// A named field of an object value, searching the class hierarchy. The name matches directly,
+    /// as an auto-property backing field, or as a state-machine hoisted local ("<name>5__N") — the
+    /// three shapes the compiler stores a source name under.
     private static CorDebugValue? FieldValue(CorDebugValue value, string name)
     {
         var target = Safe(() => Dereference(value));
         if (target is not CorDebugObjectValue obj)
             return null;
-        var cls = Safe(() => obj.Class);
-        for (var depth = 0; cls is not null && depth < 16; depth++)
-        {
-            var module = Safe(() => cls.Module);
-            if (module is null)
-                return null;
-            var metadata = Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(module));
-            if (metadata is null)
-                return null;
 
-            foreach (var candidate in new[] { name, $"<{name}>k__BackingField" })
+        var backing = $"<{name}>k__BackingField";
+        var hoisted = $"<{name}>5__";
+        foreach (var (cls, metadata, typeDef) in TypeChain(value))
+        {
+            foreach (var field in Fields(metadata, typeDef))
             {
-                var token = Safe(() =>
+                var fieldName = Safe(() => metadata.GetFieldProps(field).szField);
+                if (fieldName is null)
+                    continue;
+                if (fieldName == name || fieldName == backing ||
+                    fieldName.StartsWith(hoisted, StringComparison.Ordinal))
                 {
-                    var field = metadata.FindField(cls.Token, candidate, IntPtr.Zero, 0);
-                    return (mdFieldDef?)field;
-                });
-                if (token is { } fieldToken)
-                {
-                    var result = Safe(() => obj.GetFieldValue(cls!.Raw, fieldToken));
+                    var result = Safe(() => obj.GetFieldValue(cls.Raw, field));
                     if (result is not null)
                         return result;
                 }
             }
-
-            // Walk to the base type when it lives in the same module (TypeDef extends only).
-            var currentCls = cls;
-            cls = Safe(() =>
-            {
-                var props = metadata.GetTypeDefProps(currentCls.Token);
-                var extends = props.ptkExtends;
-                return extends.Type == CorTokenType.mdtTypeDef && extends.Rid != 0
-                    ? module.GetClassFromToken((mdTypeDef)extends)
-                    : null;
-            });
         }
         return null;
+    }
+
+    /// <summary>A named static field anywhere in the value's type chain, read against the frame
+    /// the inspection is happening in.</summary>
+    private CorDebugValue? StaticFieldValue(CorDebugValue value, string name)
+    {
+        var frame = _inspectionFrame;
+        foreach (var (cls, metadata, typeDef) in TypeChain(value))
+        {
+            var token = Safe(() =>
+            {
+                var field = metadata.FindField(typeDef, name, IntPtr.Zero, 0);
+                return (mdFieldDef?)field;
+            });
+            if (token is { } fieldToken && fieldToken.Rid != 0)
+            {
+                var result = Safe(() => cls.GetStaticFieldValue((int)fieldToken, frame?.Raw));
+                if (result is not null)
+                    return result;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>A local the compiler moved into a capture class, found by searching the frame's
+    /// compiler-generated locals for a field with the user's name.</summary>
+    private CorDebugValue? CapturedValue(
+        CorDebugILFrame ilFrame, string name, Dictionary<int, string> localNames)
+    {
+        var locals = Safe(() => ilFrame.LocalVariables);
+        if (locals is null)
+            return null;
+        for (var i = 0; i < locals.Length; i++)
+        {
+            if (localNames.TryGetValue(i, out var localName) && IsCompilerGeneratedName(localName) &&
+                IsDisplayClass(locals[i]) && FieldValue(locals[i], name) is { } captured)
+                return captured;
+        }
+        return null;
+    }
+
+    /// <summary>A static field of the frame's own declaring type, which is how a bare static name
+    /// resolves inside the method that shares its type.</summary>
+    private static CorDebugValue? FrameStaticValue(CorDebugILFrame ilFrame, string name)
+    {
+        try
+        {
+            var function = ilFrame.Function;
+            var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(function.Module);
+            var declaring = (mdTypeDef)metadata.GetMethodProps(function.Token).pClass;
+            var field = metadata.FindField(declaring, name, IntPtr.Zero, 0);
+            if (field.Rid == 0)
+                return null;
+            var cls = function.Module.GetClassFromToken(declaring);
+            return cls.GetStaticFieldValue((int)field, ilFrame.Raw);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // --- function evaluation ------------------------------------------------------------------
@@ -931,7 +1161,9 @@ public sealed partial class DebugSession : IDebugSession
             return;
 
         _evalFaulted = faulted;
-        _evalResult = faulted ? null : Safe(() => eval.Result);
+        // On a fault the result is the exception object itself, which is worth keeping: "threw
+        // NullReferenceException" narrows a failure in a way "threw an exception" never will.
+        _evalResult = Safe(() => eval.Result);
         _evalDone?.Set();
     }
 
@@ -944,8 +1176,34 @@ public sealed partial class DebugSession : IDebugSession
     /// callbacks arrive on the runtime's own thread. The debuggee is left stopped exactly where it
     /// was, because the callback is excluded from the auto-continue in <c>OnAnyEvent</c>.
     /// </remarks>
-    private CorDebugValue? InvokeFunction(CorDebugFunction function, CorDebugValue[] args, out string error) =>
-        RunEval(eval => eval.CallFunction(function.Raw, args.Length, args.Select(a => a.Raw).ToArray()), out error);
+    private CorDebugValue? InvokeFunction(CorDebugFunction function, CorDebugValue[] args, out string error)
+    {
+        // A method declared on a generic type must be called with the instantiation's type
+        // arguments — plain CallFunction makes the runtime throw TypeLoadException ("used with
+        // the wrong number of generic arguments") inside the evaluation, which is how every
+        // List<T>.Count on .NET Framework used to come back as an eval fault.
+        var typeArguments = DeclaringTypeIsGeneric(function) && args.Length > 0
+            ? TypeArgumentsOf(args[0])
+            : null;
+
+        return RunEval(
+            eval =>
+            {
+                var raw = args.Select(a => a.Raw).ToArray();
+                if (typeArguments is { Length: > 0 })
+                    eval.CallParameterizedFunction(function.Raw, typeArguments.Length, typeArguments, raw.Length, raw);
+                else
+                    eval.CallFunction(function.Raw, raw.Length, raw);
+            },
+            out error);
+    }
+
+    private static bool DeclaringTypeIsGeneric(CorDebugFunction function) =>
+        Safe(() =>
+        {
+            var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(function.Module);
+            return metadata.GetTypeDefProps(function.Class.Token).szTypeDef.Contains('`');
+        }) == true;
 
     /// <summary>
     /// Runs one evaluation in the debuggee — a call, or a constructor for a debugger view type —
@@ -996,7 +1254,7 @@ public sealed partial class DebugSession : IDebugSession
 
             if (_evalFaulted)
             {
-                error = "the evaluated member threw an exception";
+                error = DescribeEvalFault(_evalResult);
                 return null;
             }
 
@@ -1014,6 +1272,26 @@ public sealed partial class DebugSession : IDebugSession
         }
     }
 
+    /// <summary>What a faulted evaluation should report: the thrown exception's type and message
+    /// when they can be read, rather than the fact that something somewhere threw.</summary>
+    private string DescribeEvalFault(CorDebugValue? exception)
+    {
+        if (exception is null)
+            return "the evaluated member threw an exception";
+
+        var type = TypeNameOf(exception);
+        if (type.Length == 0)
+            return "the evaluated member threw an exception";
+
+        var message = Safe(() => FieldValue(exception, "_message")) is { } messageField
+            ? DescribeValue(messageField, applyDisplay: false)
+            : null;
+
+        return message is { Length: > 0 } and not "null"
+            ? $"the evaluated member threw {type}: {message}"
+            : $"the evaluated member threw {type}";
+    }
+
     /// <summary>
     /// Finds a method by name on a value's type, walking base types within the declaring module.
     /// </summary>
@@ -1024,42 +1302,23 @@ public sealed partial class DebugSession : IDebugSession
         // CallFunction must stay the original reference — passing the dereferenced object makes
         // the runtime fault the evaluation.
         var target = Safe(() => Dereference(value));
-        if (target is not CorDebugObjectValue obj)
+        if (target is not CorDebugObjectValue)
             return null;
 
-        var cls = Safe(() => obj.Class);
-        for (var depth = 0; cls is not null && depth < 16; depth++)
+        foreach (var (cls, metadata, typeDef) in TypeChain(value))
         {
-            var module = Safe(() => cls.Module);
-            if (module is null)
-                return null;
-
-            var metadata = Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(module));
-            if (metadata is null)
-                return null;
-
             var token = Safe(() =>
             {
-                var method = metadata.FindMethod(cls.Token, name, IntPtr.Zero, 0);
+                var method = metadata.FindMethod(typeDef, name, IntPtr.Zero, 0);
                 return (mdMethodDef?)method;
             });
 
             if (token is { } methodToken)
             {
-                var function = Safe(() => module.GetFunctionFromToken(methodToken));
+                var function = Safe(() => cls.Module.GetFunctionFromToken(methodToken));
                 if (function is not null)
                     return (function, value);
             }
-
-            var currentCls = cls;
-            cls = Safe(() =>
-            {
-                var props = metadata.GetTypeDefProps(currentCls.Token);
-                var extends = props.ptkExtends;
-                return extends.Type == CorTokenType.mdtTypeDef && extends.Rid != 0
-                    ? module.GetClassFromToken((mdTypeDef)extends)
-                    : null;
-            });
         }
 
         return null;
@@ -1075,6 +1334,8 @@ public sealed partial class DebugSession : IDebugSession
 
         if (!callOnly && FieldValue(value, name) is { } field)
             return field;
+        if (!callOnly && StaticFieldValue(value, name) is { } staticField)
+            return staticField;
 
         // A computed property has no backing field, so it has to be invoked.
         foreach (var candidate in callOnly ? [name] : new[] { $"get_{name}", name })
@@ -1082,7 +1343,14 @@ public sealed partial class DebugSession : IDebugSession
             if (FindMethod(value, candidate) is not { } found)
                 continue;
 
-            var result = InvokeFunction(found.Function, [found.Instance], out error);
+            // A static getter takes no instance; handing it one faults the evaluation.
+            var isStatic = Safe(() =>
+            {
+                var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(found.Function.Module);
+                return metadata.GetMethodProps(found.Function.Token).pdwAttr.HasFlag(CorMethodAttr.mdStatic);
+            }) == true;
+
+            var result = InvokeFunction(found.Function, isStatic ? [] : [found.Instance], out error);
             if (result is not null)
                 return result;
 
@@ -1097,18 +1365,22 @@ public sealed partial class DebugSession : IDebugSession
         return null;
     }
 
-    private static CorDebugValue? ElementValue(CorDebugValue value, int index)
-    {
-        var target = Safe(() => Dereference(value));
-        return target is CorDebugArrayValue array
-            ? Safe(() => array.GetElementAtPosition(index))
-            : null;
-    }
+    /// <summary>The exception this session is stopped on, or null at any other kind of stop.</summary>
+    private CorDebugValue? CurrentExceptionValue() =>
+        _stoppedOnException ? Safe(() => _stoppedThread?.CurrentException) : null;
+
+    /// <summary>The frame the current inspection is rooted in — the statics context for
+    /// <see cref="StaticFieldValue"/>, which cannot thread a frame through every member path.</summary>
+    private CorDebugILFrame? _inspectionFrame;
 
     private static CorDebugValue Dereference(CorDebugValue value)
     {
         if (value is CorDebugReferenceValue reference && Safe(() => (bool?)reference.IsNull) != true)
-            return Safe(() => reference.Dereference()) ?? value;
+            value = Safe(() => reference.Dereference()) ?? value;
+        // A boxed value describes as its contents, not as "the box" — an `object` local holding
+        // 42 reads 42, exactly as if it had never been boxed.
+        if (value is CorDebugBoxValue box)
+            return Safe(() => box.Object) ?? value;
         return value;
     }
 
@@ -1370,14 +1642,24 @@ public sealed partial class DebugSession : IDebugSession
             var callback = new CorDebugManagedCallback();
             callback.OnLoadModule += (_, e) =>
             {
-                // Diagnostic visibility for WebForms shadow-copy / App_Web_* module loads.
                 var moduleName = Safe(() => e.Module.Name) ?? string.Empty;
-                if (moduleName.Length > 0)
+
+                // The ASP.NET page compiler produces App_Web_*.dll by the dozen per page, and
+                // each one processed here costs a PDB probe per breakpoint plus an EnC JIT flag
+                // in the debuggee. Only inline markup code ever lives in them, so unless a
+                // breakpoint targets a markup file they are skipped outright — TryBindBreakpoint
+                // applies the same rule per spec. The site's own assemblies are shadow-copied
+                // under the same "Temporary ASP.NET Files" root but keep their names, and stay
+                // fully processed.
+                var generated = IsGeneratedWebFormsModule(moduleName);
+                if (moduleName.Length > 0 && !generated)
                     Emit(DebugEventKind.Module, moduleName, string.Empty, 0);
-                RegisterEncModule(e.Module, moduleName);
+                if (!generated)
+                    RegisterEncModule(e.Module, moduleName);
                 foreach (var spec in SpecsSnapshot())
                     TryBindBreakpoint(e.Module, spec);
-                ReportMissingSymbols(e.Module, moduleName);
+                if (!generated)
+                    ReportMissingSymbols(e.Module, moduleName);
             };
             callback.OnUnloadModule += (_, e) =>
             {
@@ -1399,6 +1681,7 @@ public sealed partial class DebugSession : IDebugSession
                 var bound = TryGetBoundSpec(file, line, out var spec);
                 if (bound && spec.Temporary)
                     RemoveBreakpoint(file, line);
+                _stoppedOnException = false;
                 _stoppedThread = e.Thread;
                 // Without the id the client cannot tell which breakpoint stopped it, which is
                 // what hit conditions, logpoints and value watches are keyed by.
@@ -1419,18 +1702,29 @@ public sealed partial class DebugSession : IDebugSession
                     return;
                 }
 
+                _stoppedOnException = false;
                 _stoppedThread = e.Thread;
                 var (file, line, column) = ThreadLocation(e.Thread);
                 Emit(DebugEventKind.Step, "step", MethodOf(e.Thread), ThreadId(e.Thread), file, line, column);
             };
             callback.OnException += (_, e) =>
             {
+                // An exception raised by the code an evaluation is running belongs to the eval:
+                // it completes as EvalException, and stopping on it here would leave the process
+                // suspended with the eval's caller waiting on a completion that can never come.
+                if (_pendingEval is not null)
+                {
+                    Emit(DebugEventKind.Diagnostic, $"exception during evaluation in {MethodOf(e.Thread)}", string.Empty, 0);
+                    return;
+                }
+
                 // Unhandled (second-chance) exceptions always stop; first-chance stops only
                 // under the session policy. Auto-continued first-chance exceptions are reported
                 // as Output so the UI never treats a running process as stopped.
                 var unhandled = e.Unhandled != 0;
                 if (unhandled || _breakOnFirstChance)
                 {
+                    _stoppedOnException = true;
                     _stoppedThread = e.Thread;
                     var (file, line, column) = ThreadLocation(e.Thread);
                     Emit(
@@ -1463,7 +1757,9 @@ public sealed partial class DebugSession : IDebugSession
                 // catch-all and marks the stop by setting _stoppedThread). Resume everything else.
                 if (e.Kind is CorDebugManagedCallbackKind.Breakpoint or CorDebugManagedCallbackKind.StepComplete)
                     return;
-                if (e.Kind is CorDebugManagedCallbackKind.Exception && _stoppedThread is not null)
+                // ... unless an eval is running: the stop context belongs to the breakpoint the
+                // eval started from, and the exception must run on to complete the eval.
+                if (e.Kind is CorDebugManagedCallbackKind.Exception && _stoppedThread is not null && _pendingEval is null)
                     return;
 
                 // An eval's completion must leave the debuggee stopped: resuming here would run
@@ -1776,6 +2072,19 @@ public sealed partial class DebugSession : IDebugSession
             && !lower.Contains(@"\gac_");
     }
 
+    /// True for an App_Web_*.dll the ASP.NET page compiler generated. These hold nothing but
+    /// markup-generated classes and inline &lt;% %&gt; code, so only a breakpoint in a markup
+    /// file can ever bind in one — everything else the debugger would do per module (EnC
+    /// flagging, PDB probes, load narration) is waste multiplied by dozens per page.
+    internal static bool IsGeneratedWebFormsModule(string moduleName) =>
+        Path.GetFileName(moduleName).StartsWith("App_Web_", StringComparison.OrdinalIgnoreCase);
+
+    /// True when the breakpoint sits in a WebForms markup file — the one thing that binds into
+    /// a generated App_Web_*.dll rather than the site's own assemblies.
+    internal static bool TargetsMarkup(BreakpointSpec spec) =>
+        Path.GetExtension(spec.FilePath).ToLowerInvariant()
+            is ".aspx" or ".ascx" or ".master" or ".ashx" or ".asax" or ".asmx";
+
     /// JIT-flag a freshly loaded user module for EnC (only valid during the LoadModule callback)
     /// and remember it by simple assembly name as an ApplyHotReload target.
     private void RegisterEncModule(CorDebugModule module, string moduleName)
@@ -1814,6 +2123,10 @@ public sealed partial class DebugSession : IDebugSession
     private void ReportMissingSymbols(CorDebugModule module, string moduleName)
     {
         if (moduleName.Length == 0 || !IsUserModule(moduleName))
+            return;
+        // Excluded by the symbol globs is deliberate, not a missing PDB — reporting it would
+        // tell the user to go fix a build that is fine.
+        if (!SymbolGlobs.WantsSymbols(_display, moduleName))
             return;
         bool hasSourceSpecs;
         lock (_specLock)
@@ -2752,10 +3065,76 @@ public sealed partial class DebugSession : IDebugSession
 
     private void TryBindBreakpoint(CorDebugModule module, BreakpointSpec spec)
     {
-        if (spec.FilePath.Length > 0)
+        // A generated App_Web_*.dll can only satisfy a markup breakpoint; probing its PDB for
+        // anything else is a per-module, per-spec cost a WebForms site pays dozens of times over.
+        if (spec.MethodToken == 0 &&
+            !TargetsMarkup(spec) &&
+            IsGeneratedWebFormsModule(Safe(() => module.Name) ?? string.Empty))
+        {
+            return;
+        }
+
+        if (spec.MethodToken != 0)
+            TryBindIlBreakpoint(module, spec);
+        else if (spec.FilePath.Length > 0)
             TryBindSourceBreakpoint(module, spec);
         else
             TryBindEntryBreakpoint(module, spec);
+    }
+
+    /// IL-form binding, for breakpoints in decompiled or fetched external source: the file the
+    /// user pointed at appears in no PDB, but the host already mapped the line to a MethodDef
+    /// token and IL offset, so the breakpoint goes straight onto the IL. The spec keeps the
+    /// external file and line for reporting and removal.
+    private void TryBindIlBreakpoint(CorDebugModule module, BreakpointSpec spec)
+    {
+        var key = SourceKey(spec.FilePath, (int)spec.Line);
+        if (_bound.ContainsKey(key))
+            return;
+        try
+        {
+            var moduleName = Safe(() => module.Name) ?? string.Empty;
+            if (!ModuleMatchesSpec(moduleName, spec.ModulePath))
+                return;
+
+            var function = module.GetFunctionFromToken((mdMethodDef)spec.MethodToken);
+            var breakpoint = function.ILCode.CreateBreakpoint(spec.IlOffset);
+            breakpoint.Activate(true);
+            spec.Kind = spec.Kind == BreakpointKind.Unspecified ? BreakpointKind.Source : spec.Kind;
+            var location = SourceRangeOf(spec.FilePath, (int)spec.Line, (int)spec.Column);
+            _bound[key] = breakpoint;
+            _boundModule[key] = moduleName;
+            _boundSpecs[key] = spec;
+            _boundKeyByRequest[key] = key;
+            Emit(
+                DebugEventKind.BreakpointBound,
+                $"bound at IL offset 0x{spec.IlOffset:X} in {Path.GetFileName(moduleName)}",
+                string.Empty,
+                0,
+                location.FilePath,
+                (int)location.Line,
+                (int)location.Column,
+                requestedLocation: location,
+                actualLocation: location,
+                breakpointId: spec.Id);
+        }
+        catch
+        {
+            // Token not in this module / body not yet JIT-visible — stays pending.
+        }
+    }
+
+    /// <summary>Whether a loaded module is the one an IL-form spec names. Shadow copies keep the
+    /// file name but move the directory, so the fallback compares names only.</summary>
+    private static bool ModuleMatchesSpec(string moduleName, string specModulePath)
+    {
+        if (moduleName.Length == 0 || specModulePath.Length == 0)
+            return false;
+        if (string.Equals(moduleName, specModulePath, StringComparison.OrdinalIgnoreCase))
+            return true;
+        return string.Equals(
+            Path.GetFileName(moduleName), Path.GetFileName(specModulePath),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     /// Source-line binding via the module's PDB: document lookup → method at line → sequence
@@ -2890,6 +3269,11 @@ public sealed partial class DebugSession : IDebugSession
     /// </remarks>
     private SymbolReader? ReaderFor(CorDebugModule module, string moduleName)
     {
+        // Checked before the cache and never stored in it: the globs can change mid-session,
+        // and a cached null would pin the old policy until the module reloads.
+        if (!SymbolGlobs.WantsSymbols(_display, moduleName))
+            return null;
+
         lock (_readers)
         {
             if (_readers.TryGetValue(moduleName, out var cached))
@@ -3035,6 +3419,29 @@ public sealed partial class DebugSession : IDebugSession
         return (string.Empty, 0, 0);
     }
 
+    /// <summary>
+    /// What identifies a frame's code when its module has no symbols: the module file, the
+    /// method's token, and the IP's IL offset. The host resolves external source from these.
+    /// </summary>
+    private static (string ModulePath, int MethodToken, int IlOffset) FrameIdentity(CorDebugFrame frame)
+    {
+        try
+        {
+            if (frame is not CorDebugILFrame ilFrame)
+                return ("", 0, -1);
+
+            var function = frame.Function;
+            var modulePath = Safe(() => function.Module.Name) ?? "";
+            return modulePath.Length == 0
+                ? ("", 0, -1)
+                : (modulePath, (int)function.Token, (int)ilFrame.IP.pnOffset);
+        }
+        catch
+        {
+            return ("", 0, -1);
+        }
+    }
+
     private bool TryGetSourceStepRange(CorDebugILFrame frame, out COR_DEBUG_STEP_RANGE range)
     {
         range = default;
@@ -3089,13 +3496,22 @@ public sealed partial class DebugSession : IDebugSession
             var function = frame.Function;
             var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(function.Module);
             // Metadata parameter names (PDB param enumeration returned E_NOTIMPL on framework PDBs).
+            // In an instance method the frame's argument 0 is `this`, and the declared parameters
+            // follow it — parameter sequence numbers alone are one-based over the declared list,
+            // so aligning them without the shift labels `this` with the first parameter's name and
+            // every argument after it with its left neighbour's.
             try
             {
+                var isStatic = metadata.GetMethodProps(function.Token).pdwAttr.HasFlag(CorMethodAttr.mdStatic);
+                if (!isStatic)
+                    args[0] = "this";
+                var shift = isStatic ? -1 : 0;
+
                 foreach (var parameterToken in Extensions.EnumParams(metadata, function.Token))
                 {
                     var parameter = metadata.GetParamProps(parameterToken);
                     if (parameter.pulSequence > 0 && !string.IsNullOrEmpty(parameter.szName))
-                        args.TryAdd(parameter.pulSequence - 1, parameter.szName);
+                        args.TryAdd(parameter.pulSequence + shift, parameter.szName);
                 }
             }
             catch
@@ -3165,16 +3581,49 @@ public sealed partial class DebugSession : IDebugSession
         }
     }
 
-    private void AppendValues(
-        List<DebugVariable> into, string kind, CorDebugValue[]? values, Dictionary<int, string> names)
+    /// <summary>An array as VS heads it: element type and lengths — <c>int[3]</c>,
+    /// <c>int[2,3]</c>, and <c>int[2][]</c> with the outer length inside the first bracket.</summary>
+    private static string ArrayDisplayOf(CorDebugArrayValue array)
     {
-        if (values is null)
-            return;
-        for (var i = 0; i < values.Length; i++)
+        var rank = Safe(() => (int?)array.Rank) ?? 1;
+        var lengths = rank > 1 && Safe(() => array.GetDimensions(rank)) is { } dimensions
+            ? string.Join(",", dimensions)
+            : (Safe(() => (int?)array.Count) ?? 0).ToString();
+
+        var element = ElementTypeNameOf(array);
+        var bracket = element.IndexOf('[');
+        return bracket < 0
+            ? $"{element}[{lengths}]"
+            : $"{element[..bracket]}[{lengths}]{element[bracket..]}";
+    }
+
+    /// <summary>A delegate as VS shows it: <c>{Method = the method it points at}</c>, which is
+    /// what anyone stopping on a callback actually wants to know.</summary>
+    private string? DelegateDisplayOf(CorDebugValue value)
+    {
+        if (!_display.CallToString || _displayDepth >= MaxDisplayDepth || !IsDelegateValue(value))
+            return null;
+
+        _displayDepth++;
+        try
         {
-            var name = names.TryGetValue(i, out var symbol) ? symbol : $"{kind}{i}";
-            into.Add(Row(name, values[i], kind, name));
+            var method = MemberValue(value, "Method", callOnly: false, out _);
+            return method is null ? null : "{Method = " + DescribeValue(method) + "}";
         }
+        finally
+        {
+            _displayDepth--;
+        }
+    }
+
+    private static bool IsDelegateValue(CorDebugValue value)
+    {
+        foreach (var (_, metadata, typeDef) in TypeChain(value))
+        {
+            if (Safe(() => metadata.GetTypeDefProps(typeDef).szTypeDef) == "System.MulticastDelegate")
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -3197,12 +3646,34 @@ public sealed partial class DebugSession : IDebugSession
                 dereferenced = Safe(() => reference.Dereference()) ?? value;
             }
             if (dereferenced is CorDebugStringValue str)
-                return $"\"{Safe(() => str.GetString(str.Length)) ?? string.Empty}\"";
+            {
+                var length = Safe(() => (int?)str.Length) ?? 0;
+                var shown = Safe(() => str.GetString(Math.Min(length, MaxStringDisplayLength))) ?? string.Empty;
+                return QuoteString(shown, truncated: length > MaxStringDisplayLength);
+            }
             var scalar = TryReadScalar(dereferenced);
             if (scalar is not null)
                 return scalar;
+            // A boxed primitive whose unboxed object will not hand over its bits directly still
+            // holds them in the primitive's own m_value field.
+            if (PrimitiveElementTypeOf(TypeNameOf(dereferenced)) is not null &&
+                Safe(() => FieldValue(dereferenced, "m_value")) is { } unboxed &&
+                TryReadScalar(Dereference(unboxed)) is { } unboxedScalar)
+                return unboxedScalar;
+            if (NullableDisplayOf(dereferenced) is { } nullableDisplay)
+                return nullableDisplay;
+            if (dereferenced is CorDebugArrayValue array)
+                return ArrayDisplayOf(array);
+            if (EnumDisplayOf(dereferenced) is { } enumDisplay)
+                return enumDisplay;
+            if (WellKnownStructDisplayOf(dereferenced) is { } structDisplay)
+                return structDisplay;
             if (applyDisplay && DisplayStringFor(value) is { } display)
                 return display;
+            if (applyDisplay && DelegateDisplayOf(value) is { } delegateDisplay)
+                return delegateDisplay;
+            if (applyDisplay && ToStringDisplayOf(value) is { } text)
+                return text;
             // No display string: the type's own name says more than the element type ("Class")
             // the runtime reports for every object alike.
             if (TypeNameOf(value) is { Length: > 0 } typeName)
@@ -3215,6 +3686,319 @@ public sealed partial class DebugSession : IDebugSession
         }
     }
 
+    /// <summary>
+    /// A <c>Nullable&lt;T&gt;</c> is its value or "null" — never its type name, and never its
+    /// <c>hasValue</c>/<c>value</c> fields, which are an implementation detail no debugger shows.
+    /// </summary>
+    private string? NullableDisplayOf(CorDebugValue value)
+    {
+        var typeName = TypeNameOf(value);
+        if (typeName is not "System.Nullable`1" && !typeName.StartsWith("System.Nullable<", StringComparison.Ordinal))
+            return null;
+
+        var hasValue = Safe(() => FieldValue(value, "hasValue"));
+        if (hasValue is null || TryReadScalar(Dereference(hasValue)) is not { } flag)
+            return null;
+
+        if (!string.Equals(flag, bool.TrueString, StringComparison.OrdinalIgnoreCase))
+            return "null";
+
+        return Safe(() => FieldValue(value, "value")) is { } inner
+            ? DescribeValue(inner)
+            : null;
+    }
+
+    /// <summary>
+    /// An enum is its member's name — <c>Wednesday</c>, or <c>Sweet | Salty</c> for a flags
+    /// combination — and only a value no member accounts for shows as a number.
+    /// </summary>
+    private static string? EnumDisplayOf(CorDebugValue value)
+    {
+        foreach (var (_, metadata, typeDef) in TypeChain(value))
+        {
+            if (!ExtendsSystemEnum(metadata, typeDef))
+                return null;
+
+            if (RawIntegerOf(Safe(() => FieldValue(value, "value__"))) is not { } underlying)
+                return null;
+
+            var literals = new List<(string Name, long Value)>();
+            foreach (var field in Fields(metadata, typeDef))
+            {
+                var props = Safe<GetFieldPropsResult?>(() => metadata.GetFieldProps(field));
+                if (props is null || !props.Value.pdwAttr.HasFlag(CorFieldAttr.fdLiteral))
+                    continue;
+                if (ConstantOf(props.Value) is { } constant)
+                    literals.Add((props.Value.szField, constant));
+            }
+
+            foreach (var (name, constant) in literals)
+            {
+                if (constant == underlying)
+                    return name;
+            }
+
+            // No single member matches: a [Flags] combination, when the declared members cover
+            // every set bit between them.
+            if (underlying != 0)
+            {
+                var parts = new List<string>();
+                var remaining = underlying;
+                foreach (var (name, constant) in literals)
+                {
+                    if (constant != 0 && (remaining & constant) == constant)
+                    {
+                        parts.Add(name);
+                        remaining &= ~constant;
+                    }
+                }
+                if (remaining == 0 && parts.Count > 0)
+                    return string.Join(" | ", parts);
+            }
+
+            return underlying.ToString();
+        }
+        return null;
+    }
+
+    private static bool ExtendsSystemEnum(MetaDataImport metadata, mdTypeDef typeDef) =>
+        Safe(() =>
+        {
+            var extends = metadata.GetTypeDefProps(typeDef).ptkExtends;
+            return extends.Type switch
+            {
+                CorTokenType.mdtTypeRef => metadata.GetTypeRefProps((mdTypeRef)extends).szName == "System.Enum",
+                CorTokenType.mdtTypeDef => metadata.GetTypeDefProps((mdTypeDef)extends).szTypeDef == "System.Enum",
+                _ => false,
+            };
+        }) == true;
+
+    /// <summary>A literal field's constant, zero-extended so it compares against
+    /// <see cref="RawIntegerOf"/> of the same width.</summary>
+    private static long? ConstantOf(GetFieldPropsResult props)
+    {
+        var pointer = props.ppValue;
+        if (pointer == IntPtr.Zero)
+            return null;
+
+        return props.pdwCPlusTypeFlag switch
+        {
+            CorElementType.Boolean or CorElementType.I1 or CorElementType.U1 => Marshal.ReadByte(pointer),
+            CorElementType.Char or CorElementType.I2 or CorElementType.U2 => (ushort)Marshal.ReadInt16(pointer),
+            CorElementType.I4 or CorElementType.U4 => (uint)Marshal.ReadInt32(pointer),
+            CorElementType.I8 or CorElementType.U8 => Marshal.ReadInt64(pointer),
+            _ => null,
+        };
+    }
+
+    /// <summary>A value's raw bits as an integer, zero-extended from its own width.</summary>
+    private static long? RawIntegerOf(CorDebugValue? value)
+    {
+        if (value is null || Safe(() => Dereference(value)) is not { } target)
+            return null;
+
+        try
+        {
+            var generic = Extensions.As<CorDebugGenericValue>(target);
+            var size = target.Size;
+            var pointer = Marshal.AllocHGlobal(Math.Max(size, 8));
+            try
+            {
+                Marshal.WriteInt64(pointer, 0, 0);
+                generic.GetValue(pointer);
+                return size switch
+                {
+                    1 => Marshal.ReadByte(pointer),
+                    2 => (ushort)Marshal.ReadInt16(pointer),
+                    4 => (uint)Marshal.ReadInt32(pointer),
+                    _ => Marshal.ReadInt64(pointer),
+                };
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The framework structs whose value lives in private fields the runtime cannot read as a
+    /// scalar: decimal, DateTime, TimeSpan and Guid all reconstruct from their .NET Framework
+    /// field layout, with no function evaluation.
+    /// </summary>
+    private string? WellKnownStructDisplayOf(CorDebugValue value)
+    {
+        try
+        {
+            return TypeNameOf(value) switch
+            {
+                "System.Decimal" => DecimalDisplayOf(value),
+                "System.DateTime" => DateTimeDisplayOf(value),
+                "System.TimeSpan" => TimeSpanDisplayOf(value),
+                "System.Guid" => GuidDisplayOf(value),
+                _ => null,
+            };
+        }
+        catch
+        {
+            // A layout this reconstruction does not know (or corrupt bits) falls back to the
+            // type name rather than showing an invented value.
+            return null;
+        }
+    }
+
+    private static string? DecimalDisplayOf(CorDebugValue value)
+    {
+        if (RawIntegerOf(FieldValue(value, "flags")) is not { } flags ||
+            RawIntegerOf(FieldValue(value, "hi")) is not { } hi ||
+            RawIntegerOf(FieldValue(value, "lo")) is not { } lo ||
+            RawIntegerOf(FieldValue(value, "mid")) is not { } mid)
+            return null;
+
+        var scale = (byte)((flags >> 16) & 0xFF);
+        var negative = (flags & 0x8000_0000L) != 0;
+        return new decimal((int)(uint)lo, (int)(uint)mid, (int)(uint)hi, negative, scale)
+            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static string? DateTimeDisplayOf(CorDebugValue value)
+    {
+        if (RawIntegerOf(FieldValue(value, "dateData")) is not { } data)
+            return null;
+
+        var ticks = data & 0x3FFF_FFFF_FFFF_FFFF;
+        return ticks <= DateTime.MaxValue.Ticks
+            ? new DateTime(ticks).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : null;
+    }
+
+    private static string? TimeSpanDisplayOf(CorDebugValue value) =>
+        RawIntegerOf(FieldValue(value, "_ticks")) is { } ticks
+            ? TimeSpan.FromTicks(ticks).ToString()
+            : null;
+
+    private static string? GuidDisplayOf(CorDebugValue value)
+    {
+        var parts = new long[11];
+        var names = new[] { "_a", "_b", "_c", "_d", "_e", "_f", "_g", "_h", "_i", "_j", "_k" };
+        for (var i = 0; i < names.Length; i++)
+        {
+            if (RawIntegerOf(FieldValue(value, names[i])) is not { } part)
+                return null;
+            parts[i] = part;
+        }
+
+        return new Guid(
+            (int)(uint)parts[0], (short)(ushort)parts[1], (short)(ushort)parts[2],
+            (byte)parts[3], (byte)parts[4], (byte)parts[5], (byte)parts[6],
+            (byte)parts[7], (byte)parts[8], (byte)parts[9], (byte)parts[10]).ToString();
+    }
+
+    /// <summary>
+    /// A value whose type overrides <c>ToString</c> shows what that override says — VS's "call
+    /// string-conversion function". A default inherited from a framework root does not count:
+    /// <c>Object.ToString</c> prints the type name, which the fallback already shows for free.
+    /// </summary>
+    private string? ToStringDisplayOf(CorDebugValue value)
+    {
+        if (!_display.CallToString || _displayDepth >= MaxDisplayDepth)
+            return null;
+        if (FindMethod(value, "ToString") is not { } found || DeclaredOnFrameworkRoot(found.Function))
+            return null;
+
+        _displayDepth++;
+        try
+        {
+            var result = InvokeFunction(found.Function, [found.Instance], out _);
+            if (result is null)
+                return null;
+
+            return Safe(() => Dereference(result)) is CorDebugStringValue str
+                ? Safe(() => str.GetString(str.Length))
+                : null;
+        }
+        finally
+        {
+            _displayDepth--;
+        }
+    }
+
+    /// <summary>How much of a string the one-line value shows. A 4 MB payload does not belong in
+    /// a value column — VS caps its summaries the same way.</summary>
+    private const int MaxStringDisplayLength = 1024;
+
+    /// <summary>A string literal the way VS writes one: quoted, control characters escaped, and
+    /// an ellipsis when the value goes on past the cap.</summary>
+    private static string QuoteString(string text, bool truncated)
+    {
+        var builder = new System.Text.StringBuilder(text.Length + 8);
+        builder.Append('"');
+        foreach (var c in text)
+        {
+            switch (c)
+            {
+                case '\\': builder.Append("\\\\"); break;
+                case '"': builder.Append("\\\""); break;
+                case '\r': builder.Append("\\r"); break;
+                case '\n': builder.Append("\\n"); break;
+                case '\t': builder.Append("\\t"); break;
+                case '\0': builder.Append("\\0"); break;
+                default: builder.Append(c); break;
+            }
+        }
+        if (truncated)
+            builder.Append("...");
+        builder.Append('"');
+        return builder.ToString();
+    }
+
+    private static CorElementType? PrimitiveElementTypeOf(string typeName) => typeName switch
+    {
+        "System.Boolean" => CorElementType.Boolean,
+        "System.Char" => CorElementType.Char,
+        "System.SByte" => CorElementType.I1,
+        "System.Byte" => CorElementType.U1,
+        "System.Int16" => CorElementType.I2,
+        "System.UInt16" => CorElementType.U2,
+        "System.Int32" => CorElementType.I4,
+        "System.UInt32" => CorElementType.U4,
+        "System.Int64" => CorElementType.I8,
+        "System.UInt64" => CorElementType.U8,
+        "System.Single" => CorElementType.R4,
+        "System.Double" => CorElementType.R8,
+        "System.IntPtr" => CorElementType.I,
+        "System.UIntPtr" => CorElementType.U,
+        // The C#-spelled names too: type naming renders "int", and a boxed primitive resolves
+        // its element type through that same rendering.
+        "bool" => CorElementType.Boolean,
+        "char" => CorElementType.Char,
+        "sbyte" => CorElementType.I1,
+        "byte" => CorElementType.U1,
+        "short" => CorElementType.I2,
+        "ushort" => CorElementType.U2,
+        "int" => CorElementType.I4,
+        "uint" => CorElementType.U4,
+        "long" => CorElementType.I8,
+        "ulong" => CorElementType.U8,
+        "float" => CorElementType.R4,
+        "double" => CorElementType.R8,
+        _ => null,
+    };
+
+    /// <summary>Whether a found method is declared on one of the framework's root types, whose
+    /// <c>ToString</c> defaults say nothing a type name does not.</summary>
+    private static bool DeclaredOnFrameworkRoot(CorDebugFunction function) =>
+        Safe(() =>
+        {
+            var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(function.Module);
+            return metadata.GetTypeDefProps(function.Class.Token).szTypeDef;
+        }) is null or "System.Object" or "System.ValueType" or "System.Enum" or "System.Exception"
+            or "System.Delegate" or "System.MulticastDelegate" or "System.Type";
+
     private static string? TryReadScalar(CorDebugValue value)
     {
         try
@@ -3224,19 +4008,32 @@ public sealed partial class DebugSession : IDebugSession
             try
             {
                 generic.GetValue(pointer);
-                return value.Type switch
+                // The exact type sees through an unboxed primitive, whose plain Type is the box's
+                // class rather than the element type of what it holds; when even that reports a
+                // class, the metadata name still identifies a primitive.
+                var type = Safe(() => (CorElementType?)value.ExactType?.Type) ?? value.Type;
+                if (type is CorElementType.ValueType or CorElementType.Class)
+                    type = PrimitiveElementTypeOf(TypeNameOf(value)) ?? type;
+                // Invariant culture throughout: a value read out on a Dutch host must parse back
+                // in on any other, and VS shows "Infinity", not "∞".
+                var invariant = System.Globalization.CultureInfo.InvariantCulture;
+                return type switch
                 {
                     CorElementType.Boolean => (Marshal.ReadByte(pointer) != 0).ToString(),
-                    CorElementType.I1 => ((sbyte)Marshal.ReadByte(pointer)).ToString(),
-                    CorElementType.U1 => Marshal.ReadByte(pointer).ToString(),
-                    CorElementType.I2 => Marshal.ReadInt16(pointer).ToString(),
-                    CorElementType.U2 => ((ushort)Marshal.ReadInt16(pointer)).ToString(),
-                    CorElementType.I4 => Marshal.ReadInt32(pointer).ToString(),
-                    CorElementType.U4 => ((uint)Marshal.ReadInt32(pointer)).ToString(),
-                    CorElementType.I8 => Marshal.ReadInt64(pointer).ToString(),
-                    CorElementType.U8 => ((ulong)Marshal.ReadInt64(pointer)).ToString(),
-                    CorElementType.R4 => BitConverter.Int32BitsToSingle(Marshal.ReadInt32(pointer)).ToString(),
-                    CorElementType.R8 => BitConverter.Int64BitsToDouble(Marshal.ReadInt64(pointer)).ToString(),
+                    CorElementType.Char => $"'{(char)Marshal.ReadInt16(pointer)}'",
+                    CorElementType.I1 => ((sbyte)Marshal.ReadByte(pointer)).ToString(invariant),
+                    CorElementType.U1 => Marshal.ReadByte(pointer).ToString(invariant),
+                    CorElementType.I2 => Marshal.ReadInt16(pointer).ToString(invariant),
+                    CorElementType.U2 => ((ushort)Marshal.ReadInt16(pointer)).ToString(invariant),
+                    CorElementType.I4 => Marshal.ReadInt32(pointer).ToString(invariant),
+                    CorElementType.U4 => ((uint)Marshal.ReadInt32(pointer)).ToString(invariant),
+                    CorElementType.I8 => Marshal.ReadInt64(pointer).ToString(invariant),
+                    CorElementType.U8 => ((ulong)Marshal.ReadInt64(pointer)).ToString(invariant),
+                    CorElementType.R4 => BitConverter.Int32BitsToSingle(Marshal.ReadInt32(pointer)).ToString(invariant),
+                    CorElementType.R8 => BitConverter.Int64BitsToDouble(Marshal.ReadInt64(pointer)).ToString(invariant),
+                    // Native-sized values — IntPtr, handles — read as VS shows them: an address.
+                    CorElementType.I or CorElementType.U or CorElementType.Ptr or CorElementType.FnPtr =>
+                        value.Size == 8 ? $"0x{Marshal.ReadInt64(pointer):x16}" : $"0x{Marshal.ReadInt32(pointer):x8}",
                     _ => null,
                 };
             }

@@ -15,19 +15,30 @@ internal sealed class ExternalSourceScope : IDisposable
 {
     private readonly bool _external = LspFeatureOptions.ExternalSource;
     private readonly bool _sourceLink = LspFeatureOptions.SourceLink;
+    private readonly bool _symbolServer = LspFeatureOptions.SymbolServer;
+    private readonly bool _referenceSource = LspFeatureOptions.ReferenceSource;
 
-    private ExternalSourceScope()
+    private ExternalSourceScope(bool fetching)
     {
-        LspFeatureOptions.ExternalSource = false;
-        LspFeatureOptions.SourceLink = false;
+        LspFeatureOptions.ExternalSource = fetching;
+        LspFeatureOptions.SourceLink = fetching;
+        LspFeatureOptions.SymbolServer = fetching;
+        LspFeatureOptions.ReferenceSource = fetching;
     }
 
     /// <summary>Nothing but decompilation can answer, until the scope is disposed.</summary>
-    public static ExternalSourceScope Offline() => new();
+    public static ExternalSourceScope Offline() => new(fetching: false);
+
+    /// <summary>
+    /// Lifts the suite-wide ban on reaching out, for the tests whose subject is the fetch itself.
+    /// </summary>
+    public static ExternalSourceScope Online() => new(fetching: true);
 
     public void Dispose()
     {
         LspFeatureOptions.ExternalSource = _external;
         LspFeatureOptions.SourceLink = _sourceLink;
+        LspFeatureOptions.SymbolServer = _symbolServer;
+        LspFeatureOptions.ReferenceSource = _referenceSource;
     }
 }

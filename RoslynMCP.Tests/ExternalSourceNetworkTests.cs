@@ -14,6 +14,8 @@ public class ExternalSourceNetworkTests
     [RequiresNetworkFact]
     public async Task WhenNavigatingToAFrameworkTypeThenItsRealSourceIsFetched()
     {
+        using var online = ExternalSourceScope.Online();
+
         var symbol = await RoslynTestHelpers.GetNamedTypeAsync(
             FixturePaths.SampleProjectFile, "System.String");
         var project = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
@@ -36,6 +38,8 @@ public class ExternalSourceNetworkTests
     [RequiresNetworkFact]
     public async Task WhenAFrameworkAssemblyIsAskedAboutThenItsSymbolsCarryASourceLinkMap()
     {
+        using var online = ExternalSourceScope.Online();
+
         var symbol = await RoslynTestHelpers.GetNamedTypeAsync(
             FixturePaths.SampleProjectFile, "System.Text.StringBuilder");
         var project = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
@@ -54,8 +58,12 @@ public class ExternalSourceNetworkTests
     [RequiresFrameworkSnapshotFact]
     public async Task WhenAFrameworkAssemblyHasNoSymbolsThenThePublishedSnapshotIsRead()
     {
-        var result = await ReferenceSourceService.TryResolveAsync(
-            symbol: null, "System.Net.WebClient", FrameworkSystemAssembly()!, default);
+        using var online = ExternalSourceScope.Online();
+
+        // Through the facade rather than the service directly, so this covers the whole path a
+        // navigation takes — including leaving the file openable as a document.
+        var result = await ExternalSourceService.TryResolveTypeAsync(
+            FrameworkSystemAssembly()!, "System.Net.WebClient", default);
 
         Assert.NotNull(result);
         Assert.Equal(ExternalSourceKind.ReferenceSource, result!.Kind);
@@ -63,6 +71,11 @@ public class ExternalSourceNetworkTests
 
         string text = await File.ReadAllTextAsync(result.FilePath);
         Assert.Contains("class WebClient", text);
+
+        // Reading it is not the point; being able to ask questions about it is.
+        var document = await WorkspaceService.FindDocumentAsync(result.FilePath, default);
+        Assert.NotNull(document);
+        Assert.NotNull(await document!.GetSemanticModelAsync(default));
     }
 
     internal static string? FrameworkSystemAssembly()

@@ -76,6 +76,46 @@ public static class DebuggerAttributes
         return blob is null ? null : ReadStringArgument(blob);
     }
 
+    /// <summary>A <c>DebuggerDisplay</c> in full: the value format, plus the <c>Name</c> and
+    /// <c>Type</c> named arguments a collection view uses to relabel its entry rows.</summary>
+    public sealed record DisplayAttribute(string? Value, string? Name, string? Type);
+
+    /// <summary>Decodes a token's <c>DebuggerDisplay</c>, named arguments included.</summary>
+    public static DisplayAttribute? DisplayOf(MetaDataImport metadata, mdToken token)
+    {
+        var blob = Blob(metadata, token, Display);
+        if (blob is null || blob.Length < 3 || blob[0] != 0x01 || blob[1] != 0x00)
+            return null;
+
+        var offset = 2;
+        var value = ReadSerString(blob, ref offset);
+
+        string? name = null;
+        string? type = null;
+        if (offset + 2 <= blob.Length)
+        {
+            // NumNamed (u2), then per named argument: kind byte (0x53 field / 0x54 property),
+            // element type byte (0x0E = string), then the name and value SerStrings.
+            var named = blob[offset] | (blob[offset + 1] << 8);
+            offset += 2;
+            for (var i = 0; i < named && offset + 2 <= blob.Length; i++)
+            {
+                var kind = blob[offset++];
+                var element = blob[offset++];
+                if (kind is not (0x53 or 0x54) || element != 0x0E)
+                    break;
+                var argumentName = ReadSerString(blob, ref offset);
+                var argumentValue = ReadSerString(blob, ref offset);
+                if (argumentName == "Name")
+                    name = argumentValue;
+                else if (argumentName == "Type")
+                    type = argumentValue;
+            }
+        }
+
+        return new DisplayAttribute(value, name, type);
+    }
+
     /// <summary>
     /// The browsable state declared on a field or property, defaulting to
     /// <see cref="BrowsableState.Collapsed"/> when the attribute is absent.

@@ -64,6 +64,12 @@ public sealed class WorkerRequest
     public bool Flag { get; set; }
     public bool Force { get; set; }
 
+    /// <summary>IL form of 'runToLocation' and 'setNextStatement', for locations in decompiled
+    /// or fetched source that no PDB document names. 0 when unused.</summary>
+    public string? ModulePath { get; set; }
+    public int MethodToken { get; set; }
+    public int IlOffset { get; set; }
+
     /// <summary>How long a graceful shutdown may take before the debuggee is terminated.</summary>
     public double TimeoutSeconds { get; set; }
 }

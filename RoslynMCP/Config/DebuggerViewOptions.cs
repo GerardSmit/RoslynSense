@@ -22,6 +22,10 @@ public sealed class DebuggerConfig
     /// <summary>Honour <c>DebuggerBrowsableAttribute</c> when listing members.</summary>
     public bool? Browsable { get; init; }
 
+    /// <summary>Show values through their <c>ToString</c> override when no attribute claims
+    /// them — VS's "call string-conversion function on objects in variables windows".</summary>
+    public bool? CallToString { get; init; }
+
     /// <summary>Step past <c>DebuggerStepThrough</c>, <c>DebuggerHidden</c>,
     /// <c>DebuggerNonUserCode</c>, and code with no symbols.</summary>
     public bool? JustMyCode { get; init; }
@@ -32,6 +36,13 @@ public sealed class DebuggerConfig
 
     /// <summary>How many children of one value to list before truncating. Null = 100.</summary>
     public int? MaxChildren { get; init; }
+
+    /// <summary>Globs for the only modules whose symbols load, when non-empty. A glob without
+    /// a path separator matches the module file name; with one, its full path.</summary>
+    public string[]? SymbolInclude { get; init; }
+
+    /// <summary>Globs for modules whose symbols never load, winning over the include list.</summary>
+    public string[]? SymbolExclude { get; init; }
 }
 
 /// <summary>
@@ -82,14 +93,23 @@ public static class DebuggerViewOptions
             ? v
             : config?.MaxChildren is > 0 ? config.MaxChildren.Value : 100;
 
+        // Semicolon-separated in the environment, mirroring PATH — a glob can contain a comma.
+        static string[] Globs(string environment, string[]? configured) =>
+            Environment.GetEnvironmentVariable(environment) is { Length: > 0 } env
+                ? env.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                : configured ?? [];
+
         return new DebugDisplayOptions
         {
             DebuggerDisplay = Resolve1("--no-debugger-display", "ROSLYNMCP_DEBUGGER_DISPLAY", config?.DebuggerDisplay),
             TypeProxy = Resolve1("--no-type-proxy", "ROSLYNMCP_DEBUGGER_TYPE_PROXY", config?.TypeProxy),
             Browsable = Resolve1("--no-debugger-browsable", "ROSLYNMCP_DEBUGGER_BROWSABLE", config?.Browsable),
+            CallToString = Resolve1("--no-call-tostring", "ROSLYNMCP_DEBUGGER_CALL_TOSTRING", config?.CallToString),
             JustMyCode = Resolve1("--no-just-my-code", "ROSLYNMCP_JUST_MY_CODE", config?.JustMyCode),
             RawView = Resolve1("--no-raw-view", "ROSLYNMCP_DEBUGGER_RAW_VIEW", config?.RawView),
             MaxChildren = maxChildren,
+            SymbolInclude = Globs("ROSLYNMCP_SYMBOL_INCLUDE", config?.SymbolInclude),
+            SymbolExclude = Globs("ROSLYNMCP_SYMBOL_EXCLUDE", config?.SymbolExclude),
         };
     }
 
@@ -107,11 +127,21 @@ public static class DebuggerViewOptions
         Toggle("debuggerDisplay", before.DebuggerDisplay, after.DebuggerDisplay);
         Toggle("typeProxy", before.TypeProxy, after.TypeProxy);
         Toggle("debuggerBrowsable", before.Browsable, after.Browsable);
+        Toggle("callToString", before.CallToString, after.CallToString);
         Toggle("justMyCode", before.JustMyCode, after.JustMyCode);
         Toggle("rawView", before.RawView, after.RawView);
 
         if (before.MaxChildren != after.MaxChildren)
             changes.Add($"debugger maxChildren: {before.MaxChildren} → {after.MaxChildren}");
+
+        void Globs(string name, string[] old, string[] @new)
+        {
+            if (!old.SequenceEqual(@new, StringComparer.OrdinalIgnoreCase))
+                changes.Add($"{name}: [{string.Join(", ", old)}] → [{string.Join(", ", @new)}]");
+        }
+
+        Globs("symbolInclude", before.SymbolInclude, after.SymbolInclude);
+        Globs("symbolExclude", before.SymbolExclude, after.SymbolExclude);
 
         return changes;
     }

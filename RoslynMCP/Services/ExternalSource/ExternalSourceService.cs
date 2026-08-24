@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 
 namespace RoslynMCP.Services.ExternalSource;
@@ -139,18 +139,37 @@ public static class ExternalSourceService
 
         if (linked is not null)
         {
-            return new ExternalSourceResult(
-                linked.Embedded ? ExternalSourceKind.Embedded : ExternalSourceKind.SourceLink,
-                assemblyPath,
-                linked.FilePath,
-                // Sequence points count from one; everything above the LSP counts from zero.
-                [new LinePosition(Math.Max(0, linked.Line - 1), 0)],
-                linked.Url);
+            return Prepared(
+                new ExternalSourceResult(
+                    linked.Embedded ? ExternalSourceKind.Embedded : ExternalSourceKind.SourceLink,
+                    assemblyPath,
+                    linked.FilePath,
+                    // Sequence points count from one; everything above the LSP counts from zero.
+                    [new LinePosition(Math.Max(0, linked.Line - 1), 0)],
+                    linked.Url),
+                reflectionTypeName);
         }
 
-        return await ReferenceSourceService
+        var published = await ReferenceSourceService
             .TryResolveAsync(symbol, reflectionTypeName, assemblyPath, ct)
             .ConfigureAwait(false);
+
+        return published is null ? null : Prepared(published, reflectionTypeName);
+    }
+
+    /// <summary>
+    /// Leaves a fetched file ready to be opened as a document, not just read as text.
+    /// </summary>
+    /// <remarks>
+    /// A file under a cache root belongs to no project, and every language feature begins by
+    /// asking which project owns the file. The sidecar written here is that answer, so hover,
+    /// F12 and completion work inside a dependency's source the same way they do inside a
+    /// decompilation.
+    /// </remarks>
+    private static ExternalSourceResult Prepared(ExternalSourceResult result, string reflectionTypeName)
+    {
+        ExternalSourceProject.Ensure(result, reflectionTypeName);
+        return result;
     }
 
     private static async Task<ExternalSourceResult?> DecompiledAsync(

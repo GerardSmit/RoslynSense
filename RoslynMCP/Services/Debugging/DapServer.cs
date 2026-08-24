@@ -390,11 +390,16 @@ internal sealed class DapServer
                         };
                         if (frame.FilePath.Length > 0)
                         {
-                            entry["source"] = new JsonObject
+                            var source = new JsonObject
                             {
                                 ["name"] = Path.GetFileName(frame.FilePath),
                                 ["path"] = frame.FilePath,
                             };
+                            // Resolved external source — say where it came from, the way VS
+                            // labels decompiled frames.
+                            if (frame.SourceOrigin.Length > 0)
+                                source["origin"] = frame.SourceOrigin;
+                            entry["source"] = source;
                         }
                         if (frame.IsExternal)
                             entry["presentationHint"] = "subtle";

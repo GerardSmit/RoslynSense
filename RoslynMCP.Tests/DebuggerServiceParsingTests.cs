@@ -153,6 +153,20 @@ public class DebuggerServiceParsingTests
     }
 
     [Fact]
+    public void ParseStoppedFrame_ExternalStopCarriesTheClrAddress()
+    {
+        // A step into framework code stops with no file; the clr-addr block is what lets the
+        // stop be resolved to external source.
+        var line = @"*stopped,reason=""end-stepping-range"",frame={level=""0"",clr-addr={module-id=""{a1b2c3d4-e5f6-4a1b-9c2d-3e4f5a6b7c8d}"",method-token=""0x06000D1F"",il-offset=""3"",native-offset=""17""},func=""System.String.Concat()"",addr=""0x0000""},thread-id=""1""";
+        var frame = DebuggerService.ParseStoppedFrame(line);
+
+        Assert.Equal("", frame.FilePath);
+        Assert.Equal("a1b2c3d4-e5f6-4a1b-9c2d-3e4f5a6b7c8d", frame.ModuleId);
+        Assert.Equal(0x06000D1F, frame.MethodToken);
+        Assert.Equal(3, frame.IlOffset);
+    }
+
+    [Fact]
     public void ParseStoppedFrame_MissingFieldsDefaultGracefully()
     {
         var frame = DebuggerService.ParseStoppedFrame("*stopped");

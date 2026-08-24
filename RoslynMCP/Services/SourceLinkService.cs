@@ -146,6 +146,23 @@ public static class SourceLinkService
             return null;
         }
 
+        return await TryResolveDocumentAsync(pdbReader, assemblyPath, documentHandle, line, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The local file for one PDB document: unpacked from the PDB when it carries the source,
+    /// downloaded from where its Source Link map points otherwise. Shared between navigation,
+    /// which chose the document from a declaration, and the debugger, which chose it from the
+    /// stopped frame's sequence point.
+    /// </summary>
+    internal static async Task<SourceLinkResult?> TryResolveDocumentAsync(
+        MetadataReader pdbReader,
+        string assemblyPath,
+        DocumentHandle documentHandle,
+        int line,
+        CancellationToken ct)
+    {
         var document = pdbReader.GetDocument(documentHandle);
         string documentPath = pdbReader.GetString(document.Name);
         byte[] hash = pdbReader.GetBlobBytes(document.Hash);
@@ -160,7 +177,9 @@ public static class SourceLinkService
                 return new SourceLinkResult(saved, line, Url: null, Embedded: true);
         }
 
-        if (!Config.LspFeatureOptions.ExternalSource)
+        // The debugger calls in without the public entry points' Source Link gate, so it is
+        // re-checked here before anything leaves the machine.
+        if (!Config.LspFeatureOptions.SourceLink || !Config.LspFeatureOptions.ExternalSource)
             return null;
 
         string? map = ReadSourceLinkMap(pdbReader, assemblyPath);
@@ -427,13 +446,32 @@ public static class SourceLinkService
         return null;
     }
 
-    /// <summary>Writes source unpacked from a PDB to the cache, so an editor has a file to open.</summary>
-    private static string? SaveEmbedded(string assemblyPath, string documentPath, byte[] content)
-    {
-        string target = Path.Combine(
+    /// <summary>
+    /// Where the local copy of an embedded document lives, computed without writing anything —
+    /// so a cached file can be matched back to the PDB document it was unpacked from.
+    /// </summary>
+    internal static string EmbeddedCachePath(string assemblyPath, string documentPath) =>
+        Path.Combine(
             ExternalSourceCache.EmbeddedDirectory,
             ExternalSourceCache.Fingerprint($"{assemblyPath}\n{documentPath}"),
             Path.GetFileName(documentPath.Replace('\\', '/')));
+
+    /// <summary>
+    /// Where the local copy of a Source Link document lives, from the map already read out of
+    /// the PDB; null when the map has no entry for the document. Computed without fetching.
+    /// </summary>
+    internal static string? SourceLinkCachePath(string map, string documentPath) =>
+        ResolveUrl(map, documentPath) is { } url
+            ? Path.Combine(
+                CacheDirectory,
+                ExternalSourceCache.Fingerprint(url),
+                Path.GetFileName(documentPath.Replace('\\', '/')))
+            : null;
+
+    /// <summary>Writes source unpacked from a PDB to the cache, so an editor has a file to open.</summary>
+    private static string? SaveEmbedded(string assemblyPath, string documentPath, byte[] content)
+    {
+        string target = EmbeddedCachePath(assemblyPath, documentPath);
 
         if (File.Exists(target))
             return target;
@@ -452,6 +490,7 @@ public static class SourceLinkService
             CacheDirectory,
             ExternalSourceCache.Fingerprint(url),
             Path.GetFileName(documentPath.Replace('\\', '/')));
+        // Kept in step with SourceLinkCachePath, which predicts this location from the map.
 
         if (File.Exists(cached))
             return cached;

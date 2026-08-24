@@ -185,7 +185,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         return sb.ToString();
     }
 
-    public Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
+    public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
         string filePath, int line, string? condition = null, string? hitCondition = null,
         string? logMessage = null, CancellationToken cancellationToken = default)
     {
@@ -193,7 +193,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         _ = (hitCondition, logMessage);
 
         if (_state == DebuggerService.DebugState.NotStarted)
-            return Task.FromResult<(string, int?)>(("Error: No debug session is active.", null));
+            return ("Error: No debug session is active.", null);
 
         var id = Interlocked.Increment(ref _nextBreakpointId);
         var spec = new BreakpointSpec
@@ -205,21 +205,39 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             Enabled = true,
         };
 
+        // A line in a decompiled or fetched file names no PDB document, so document binding
+        // cannot find it — but the file's own sequence-point map can be read backwards to the
+        // MethodDef token and IL offset the line compiles from, and the engine binds on that.
+        string note = "";
+        var target = await ExternalSource.DebugSourceMapper.TryMapAsync(
+            spec.FilePath, line, cancellationToken);
+        if (target is not null)
+        {
+            spec.ModulePath = target.AssemblyPath;
+            spec.MethodToken = target.MethodToken;
+            spec.IlOffset = target.IlOffset;
+            spec.Line = (uint)target.Line;
+            spec.Column = (uint)target.Column;
+            note = target.Exact
+                ? $" ({target.Origin}, IL offset 0x{target.IlOffset:X})"
+                : $" ({target.Origin}: no line-level offsets exist, so it binds at the entry of" +
+                  $" {target.MethodDisplayName})";
+        }
+
         try
         {
             Engine.AddBreakpoint(spec);
         }
         catch (Exception ex)
         {
-            return Task.FromResult<(string, int?)>(($"Error: {ex.Message}", null));
+            return ($"Error: {ex.Message}", null);
         }
 
-        _breakpoints[id] = new DebuggerService.BreakpointInfo(id, spec.FilePath, line);
+        _breakpoints[id] = new DebuggerService.BreakpointInfo(id, spec.FilePath, (int)spec.Line);
 
         // A breakpoint that cannot bind yet stays pending until a matching module loads, which is
         // how code in shadow-copied and generated ASP.NET assemblies gets caught.
-        return Task.FromResult<(string, int?)>(
-            ($"Breakpoint #{id} set at {Path.GetFileName(spec.FilePath)}:{line}.", id));
+        return ($"Breakpoint #{id} set at {Path.GetFileName(spec.FilePath)}:{spec.Line}{note}.", id);
     }
 
     public Task<string> RemoveBreakpointAsync(int breakpointId, CancellationToken cancellationToken = default)
@@ -292,9 +310,52 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             return "The process exited.";
 
         var frame = CurrentFrame;
-        return frame is null
-            ? "Stopped."
-            : FormatPosition(frame);
+        if (frame is null)
+            return "Stopped.";
+
+        return FormatPosition(await EnrichStoppedFrameAsync(frame, cancellationToken));
+    }
+
+    /// <summary>
+    /// A stop with no source — external code — resolved through the enriched top stack frame,
+    /// so a step into a dependency reports the file the executing statement was resolved to.
+    /// The stored current frame is updated too, so the status surface agrees.
+    /// </summary>
+    private async Task<DebuggerService.StoppedFrame> EnrichStoppedFrameAsync(
+        DebuggerService.StoppedFrame frame, CancellationToken cancellationToken)
+    {
+        if (frame.FilePath.Length > 0)
+            return frame;
+
+        try
+        {
+            var frames = await GetStackFramesAsync(cancellationToken);
+            if (frames.FirstOrDefault() is not { FilePath.Length: > 0 } top)
+                return frame;
+
+            var enriched = frame with
+            {
+                FilePath = top.FilePath,
+                Line = top.Line,
+                SourceOrigin = top.SourceOrigin,
+            };
+
+            lock (_gate)
+            {
+                if (ReferenceEquals(_currentFrame, frame))
+                    _currentFrame = enriched;
+            }
+
+            return enriched;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not resolve external source for the stop location: {ex.Message}",
+                key: "debug-stop-source");
+            return frame;
+        }
     }
 
     public Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default) =>
@@ -325,7 +386,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<string> GetStackTraceAsync(CancellationToken cancellationToken = default) =>
         RequireStopped(async () =>
         {
-            var frames = await Engine.StackTraceAsync();
+            var frames = await GetStackFramesAsync(cancellationToken);
             if (frames.Count == 0)
                 return "No stack frames available.";
 
@@ -336,7 +397,8 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                 var location = string.IsNullOrEmpty(frame.FilePath)
                     ? ""
                     : $" ({Path.GetFileName(frame.FilePath)}:{frame.Line})";
-                sb.AppendLine($"  #{frame.Index} {frame.Method}{location}");
+                var origin = frame.SourceOrigin.Length > 0 ? $" ({frame.SourceOrigin})" : "";
+                sb.AppendLine($"  #{frame.Id} {frame.Name}{location}{origin}");
             }
             return sb.ToString();
         });
@@ -368,15 +430,19 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         try
         {
             var frames = await Engine.StackTraceAsync();
-            return frames
+            var mapped = frames
                 .Select(f => new StackFrameInfo(
                     (int)f.Index,
                     string.IsNullOrEmpty(f.Method) ? "unknown" : f.Method,
                     f.FilePath,
                     (int)f.Line,
                     (int)f.Column,
-                    IsExternal: string.IsNullOrEmpty(f.FilePath)))
+                    IsExternal: string.IsNullOrEmpty(f.FilePath),
+                    ModulePath: f.ModulePath,
+                    MethodToken: f.MethodToken,
+                    IlOffset: f.IlOffset))
                 .ToList();
+            return await ExternalFrameResolver.EnrichAsync(mapped, cancellationToken);
         }
         catch
         {
@@ -536,10 +602,24 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (_state == DebuggerService.DebugState.NotStarted)
             return "Error: No debug session is active.";
 
-        var response = await Engine.RunToLocationAsync(new RunToLocationRequest
+        var request = new RunToLocationRequest
         {
             Location = new SourceRange { FilePath = filePath, Line = (uint)Math.Max(0, line) },
-        });
+        };
+
+        // A location in a decompiled or fetched file is translated to IL here, because the
+        // engine's document resolution cannot see a file no PDB records.
+        var target = await ExternalSource.DebugSourceMapper.TryMapAsync(
+            PathHelper.NormalizePath(filePath), line, cancellationToken);
+        if (target is not null)
+        {
+            request.Location.Line = (uint)target.Line;
+            request.ModulePath = target.AssemblyPath;
+            request.MethodToken = target.MethodToken;
+            request.IlOffset = target.IlOffset;
+        }
+
+        var response = await Engine.RunToLocationAsync(request);
 
         if (!response.Ok)
             return $"Error: {response.Error}";
@@ -555,11 +635,24 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (CurrentFrame is null)
             return "Error: The instruction pointer can only be moved while the target is stopped.";
 
-        var response = await Engine.SetNextStatementAsync(new SetNextStatementRequest
+        var request = new SetNextStatementRequest
         {
             FrameIndex = (uint)_selectedFrame,
             Location = new SourceRange { FilePath = filePath, Line = (uint)Math.Max(0, line) },
-        });
+        };
+
+        // For a decompiled or fetched file the line is translated to an IL offset here; the
+        // engine verifies the offset belongs to the selected frame's own method before moving.
+        var target = await ExternalSource.DebugSourceMapper.TryMapAsync(
+            PathHelper.NormalizePath(filePath), line, cancellationToken);
+        if (target is not null)
+        {
+            request.Location.Line = (uint)target.Line;
+            request.MethodToken = target.MethodToken;
+            request.IlOffset = target.IlOffset;
+        }
+
+        var response = await Engine.SetNextStatementAsync(request);
 
         if (!response.Ok)
             return $"Error: {response.Error}";
@@ -902,7 +995,10 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (!string.IsNullOrEmpty(frame.Function))
             sb.AppendLine($"**Function:** {frame.Function}");
         if (!string.IsNullOrEmpty(frame.FilePath))
-            sb.AppendLine($"**Location:** {Path.GetFileName(frame.FilePath)}:{frame.Line}");
+        {
+            var origin = frame.SourceOrigin.Length > 0 ? $" ({frame.SourceOrigin})" : "";
+            sb.AppendLine($"**Location:** {Path.GetFileName(frame.FilePath)}:{frame.Line}{origin}");
+        }
         return sb.ToString();
     }
 

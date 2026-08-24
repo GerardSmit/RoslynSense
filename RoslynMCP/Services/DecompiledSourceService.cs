@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -119,19 +119,40 @@ internal static class DecompiledSourceService
     {
         var manifest = await ReadManifestAsync(manifestPath, cancellationToken);
 
-        if (!File.Exists(manifest.SourceFilePath))
+        return await OpenSingleFileProjectAsync(
+            manifest.AssemblyPath,
+            manifest.SourceFilePath,
+            BuildProjectName(manifest),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// An ad-hoc project holding one file, referencing everything beside the assembly it came
+    /// from. What gives a file outside the solution hover, navigation and completion.
+    /// </summary>
+    /// <remarks>
+    /// Shared with the fetched-source paths, which have a real file and a real assembly but no
+    /// decompiler in sight. The compilation is not expected to be clean — framework source names
+    /// partial declarations that are not here — but a semantic model does not need it to be, and
+    /// diagnostics are suppressed for these files anyway.
+    /// </remarks>
+    internal static async Task<(Workspace Workspace, Project Project, string? TempDir)> OpenSingleFileProjectAsync(
+        string assemblyPath,
+        string sourceFilePath,
+        string projectName,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(sourceFilePath))
             throw new FileNotFoundException(
-                $"Decompiled source file '{manifest.SourceFilePath}' does not exist.",
-                manifest.SourceFilePath);
+                $"Source file '{sourceFilePath}' does not exist.", sourceFilePath);
 
         var workspace = new AdhocWorkspace();
         string? tempDir = null;
         try
         {
-            string projectName = BuildProjectName(manifest);
             var projectId = ProjectId.CreateNewId(projectName);
 
-            var (metadataReferences, createdTempDir) = CreateMetadataReferences(manifest.AssemblyPath);
+            var (metadataReferences, createdTempDir) = CreateMetadataReferences(assemblyPath);
             tempDir = createdTempDir;
 
             var solution = workspace.CurrentSolution
@@ -147,23 +168,23 @@ internal static class DecompiledSourceService
                     new CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview))
                 .AddMetadataReferences(projectId, metadataReferences);
 
-            string sourceText = await File.ReadAllTextAsync(manifest.SourceFilePath, cancellationToken);
-            var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(manifest.SourceFilePath));
+            string sourceText = await File.ReadAllTextAsync(sourceFilePath, cancellationToken);
+            var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(sourceFilePath));
             solution = solution.AddDocument(
                 documentId,
-                Path.GetFileName(manifest.SourceFilePath),
+                Path.GetFileName(sourceFilePath),
                 SourceText.From(sourceText, s_utf8NoBom),
-                filePath: manifest.SourceFilePath);
+                filePath: sourceFilePath);
 
             if (!workspace.TryApplyChanges(solution))
             {
                 throw new InvalidOperationException(
-                    $"Failed to create AdhocWorkspace project for decompiled source '{manifest.SourceFilePath}'.");
+                    $"Failed to create AdhocWorkspace project for '{sourceFilePath}'.");
             }
 
             var project = workspace.CurrentSolution.GetProject(projectId)
                 ?? throw new InvalidOperationException(
-                    $"Generated decompiled project '{projectName}' was not found after creation.");
+                    $"Generated project '{projectName}' was not found after creation.");
 
             return (workspace, project, tempDir);
         }
@@ -274,6 +295,212 @@ internal static class DecompiledSourceService
                 key: $"decompile:{resolved}:{reflectionTypeName}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// Decompiles the type declaring a stopped frame's method and maps the frame's IL offset to
+    /// a line in the decompiled text, through the sequence points the decompiler emits for its
+    /// own output. This is what makes stepping into a dependency without symbols land on the
+    /// executing statement rather than at the top of the file.
+    /// </summary>
+    /// <returns>The cached decompiled file and the 1-based position of the statement the IL
+    /// offset falls in; the type declaration when the method has no mappable statement there;
+    /// null when the type cannot be decompiled.</returns>
+    public static async Task<(string FilePath, int Line, int Column)?> TryDecompileFrameAsync(
+        string assemblyPath,
+        string reflectionTypeName,
+        int methodToken,
+        int ilOffset,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        try
+        {
+            var map = await Task.Run(
+                () => FrameMapFor(assemblyPath, reflectionTypeName, cancellationToken),
+                cancellationToken);
+
+            if (map.PointsByToken.TryGetValue(methodToken, out var points))
+            {
+                int picked = DebugFrameSource.PickSequencePoint(
+                    [.. points.Select(p => (p.Offset, IsHidden: false))], ilOffset);
+                if (picked >= 0)
+                    return (map.FilePath, points[picked].Line, points[picked].Column);
+            }
+
+            var (line, character) = SourceMemberLocator.FindTypeDeclaration(
+                map.SourceText, reflectionTypeName, cancellationToken);
+            return (map.FilePath, line + 1, character + 1);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not map a frame into '{reflectionTypeName}' from " +
+                $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
+                key: $"decompile-frame:{assemblyPath}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The frame map read backwards: which MethodDef token and IL offset a line of the decompiled
+    /// text corresponds to, so a breakpoint set inside a <c>Decompiled.cs</c> can bind on the IL.
+    /// Slides down to the next line carrying a sequence point, like breakpoints in real source do.
+    /// </summary>
+    /// <returns>The token, offset, and the 1-based line actually mapped; null when no line at or
+    /// below the requested one carries a sequence point, or the on-disk text has drifted from the
+    /// text the map was built for.</returns>
+    public static async Task<(int MethodToken, int IlOffset, int Line, int Column)?> TryMapLineToIlAsync(
+        string assemblyPath,
+        string reflectionTypeName,
+        string filePath,
+        int line,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        try
+        {
+            var map = await Task.Run(
+                () => FrameMapFor(assemblyPath, reflectionTypeName, cancellationToken),
+                cancellationToken);
+
+            // The map's lines are only meaningful against the text it was built from. The cache
+            // file is deterministic, but guard against an edited or stale copy on disk.
+            string onDisk = await File.ReadAllTextAsync(map.FilePath, cancellationToken);
+            if (!string.Equals(onDisk, map.SourceText, StringComparison.Ordinal)
+                || !string.Equals(
+                    Path.GetFullPath(map.FilePath), Path.GetFullPath(filePath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            (int Token, int Offset, int Line, int Column)? best = null;
+            foreach (var (token, points) in map.PointsByToken)
+            {
+                foreach (var (offset, pointLine, column) in points)
+                {
+                    if (pointLine < line)
+                        continue;
+                    bool better = best is not { } b
+                        || pointLine < b.Line
+                        || (pointLine == b.Line && offset < b.Offset);
+                    if (better)
+                        best = (token, offset, pointLine, column);
+                }
+            }
+
+            return best is { } picked
+                ? (picked.Token, picked.Offset, picked.Line, picked.Column)
+                : null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not map line {line} of a decompiled file back into " +
+                $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
+                key: $"decompile-line:{assemblyPath}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>The manifest beside a decompiled source file, when the path is one.</summary>
+    public static async Task<(string AssemblyPath, string TypeReflectionName)?> TryReadFrameManifestAsync(
+        string filePath, CancellationToken cancellationToken = default)
+    {
+        if (!IsDecompiledPath(filePath) || TryGetGeneratedProjectPath(filePath) is not { } manifestPath)
+            return null;
+
+        try
+        {
+            var manifest = await ReadManifestAsync(manifestPath, cancellationToken);
+            return (manifest.AssemblyPath, manifest.TypeReflectionName);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not read the decompiled manifest beside '{filePath}': {ex.Message}",
+                key: $"decompile-manifest:{filePath}");
+            return null;
+        }
+    }
+
+    /// <summary>One decompiled type with its IL-offset→line map, cached because a stop usually
+    /// steps through the same method many times.</summary>
+    private sealed record DecompiledFrameMap(
+        string FilePath,
+        string SourceText,
+        IReadOnlyDictionary<int, List<(int Offset, int Line, int Column)>> PointsByToken);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (string Assembly, long Stamp, string Type), DecompiledFrameMap> s_frameMaps = new();
+
+    private static DecompiledFrameMap FrameMapFor(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken)
+    {
+        long stamp;
+        try
+        {
+            stamp = File.GetLastWriteTimeUtc(assemblyPath).Ticks;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            stamp = 0;
+        }
+
+        return s_frameMaps.GetOrAdd(
+            (assemblyPath, stamp, reflectionTypeName),
+            _ => BuildFrameMap(assemblyPath, reflectionTypeName, cancellationToken));
+    }
+
+    /// <remarks>
+    /// The text has to be written through a token writer that records positions back into the
+    /// syntax tree — sequence points are built from those positions, and text produced any other
+    /// way would leave them all at line zero. No reference-assembly redirect happens here, unlike
+    /// the navigation path: the module and token came from the debuggee's loader, and they are
+    /// only meaningful against that exact file.
+    /// </remarks>
+    private static DecompiledFrameMap BuildFrameMap(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken)
+    {
+        var settings = new DecompilerSettings();
+        var decompiler = new CSharpDecompiler(assemblyPath, CreateLenientResolver(assemblyPath), settings)
+        {
+            CancellationToken = cancellationToken
+        };
+
+        var tree = decompiler.DecompileType(new DecompilerFullTypeName(reflectionTypeName));
+
+        var writer = new StringWriter();
+        var tokenWriter = ICSharpCode.Decompiler.CSharp.OutputVisitor.TokenWriter
+            .CreateWriterThatSetsLocationsInAST(writer);
+        tree.AcceptVisitor(new ICSharpCode.Decompiler.CSharp.OutputVisitor.CSharpOutputVisitor(
+            tokenWriter, settings.CSharpFormattingOptions));
+        string sourceText = writer.ToString();
+
+        var pointsByToken = new Dictionary<int, List<(int Offset, int Line, int Column)>>();
+        foreach (var (function, points) in decompiler.CreateSequencePoints(tree))
+        {
+            if (function?.Method is not { MetadataToken.IsNil: false } method)
+                continue;
+
+            int token = System.Reflection.Metadata.Ecma335.MetadataTokens.GetToken(method.MetadataToken);
+            var mapped = points
+                .Where(p => !p.IsHidden)
+                .Select(p => (p.Offset, p.StartLine, p.StartColumn))
+                .OrderBy(p => p.Offset)
+                .ToList();
+
+            if (mapped.Count > 0)
+                pointsByToken[token] = mapped;
+        }
+
+        var (filePath, _) = PersistDecompiledType(assemblyPath, reflectionTypeName, sourceText);
+        return new DecompiledFrameMap(filePath, sourceText, pointsByToken);
     }
 
     /// <summary>

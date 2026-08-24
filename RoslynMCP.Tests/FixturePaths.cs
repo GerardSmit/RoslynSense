@@ -57,6 +57,12 @@ internal static class FixturePaths
     public static string EventWiringCodeBehindFile => Path.Combine(AspxProjectDir, "EventWiring.aspx.cs");
     public static string TypedRepeaterAscxFile => Path.Combine(AspxProjectDir, "TypedRepeater.ascx");
     public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");
+
+    /// <summary>The dbml-backed WebForms trio: a typed repeater whose <c>Eval</c> reads a property
+    /// SqlMetal generated, for the navigation that must land in the model.</summary>
+    public static string SalesGridAspxFile => Path.Combine(AspxProjectDir, "SalesGrid.aspx");
+    public static string SalesDbmlFile => Path.Combine(AspxProjectDir, "Sales.dbml");
+    public static string SalesDesignerFile => Path.Combine(AspxProjectDir, "Sales.designer.cs");
     public static string RepeaterCodeBehindFile => Path.Combine(AspxProjectDir, "Repeater.aspx.cs");
 
     /// <summary>Two repeaters whose templates declare the same <c>ID</c>, for the FindControl
@@ -270,6 +276,7 @@ internal static class FixturePaths
     /// </summary>
     public static string LayeredAppDir => Path.Combine(s_fixturesRoot, "LayeredApp");
     public static string LayeredAppSolutionFile => Path.Combine(LayeredAppDir, "LayeredApp.sln");
+    public static string LayeredAppStorefrontProjectFile => Path.Combine(LayeredAppDir, "Storefront", "Storefront.csproj");
     public static string LayeredAppWarehouseModuleFile => Path.Combine(LayeredAppDir, "Warehouse", "WarehouseModule.cs");
     public static string LayeredAppStartupFile => Path.Combine(LayeredAppDir, "Storefront", "Startup.cs");
 

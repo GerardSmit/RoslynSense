@@ -25,6 +25,54 @@ namespace RoslynMCP.Services.Database;
 /// </remarks>
 public sealed partial class MssqlDbProvider : IDbSchemaIntrospector
 {
+    /// <summary>
+    /// Everything a <c>.dbml</c> could model, and nothing the server shipped: <c>sysdiagrams</c> and
+    /// the diagramming procedures are marked <c>is_ms_shipped</c> and are exactly what a picker over
+    /// this list must not offer.
+    /// </summary>
+    private const string ObjectListSql = """
+        SELECT s.name AS SchemaName, o.name AS ObjectName, o.type AS ObjectType
+        FROM sys.objects o
+            INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+        WHERE o.type IN ('U', 'V', 'FN', 'IF', 'TF', 'P') AND o.is_ms_shipped = 0
+        ORDER BY s.name, o.name
+        """;
+
+    private const string RoutineSql = """
+        SELECT s.name AS SchemaName, o.name AS ObjectName, o.type AS ObjectType
+        FROM sys.objects o
+            INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+        WHERE o.object_id = OBJECT_ID(@table) AND o.type IN ('FN', 'IF', 'TF', 'P')
+        """;
+
+    private const string ParameterSql = """
+        SELECT
+            p.name          AS ParameterName,
+            ty.name         AS TypeName,
+            p.is_output     AS IsOutput,
+            p.max_length    AS MaxLength,
+            p.precision     AS [Precision],
+            p.scale         AS Scale,
+            p.parameter_id  AS Ordinal
+        FROM sys.parameters p
+            INNER JOIN sys.types ty ON ty.user_type_id = p.user_type_id
+        WHERE p.object_id = OBJECT_ID(@table)
+        ORDER BY p.parameter_id
+        """;
+
+    /// <summary>
+    /// A procedure's first result set, statically analysed. <c>QUOTENAME</c> rather than
+    /// concatenation because the routine's name arrives from a file in the workspace; resolving it to
+    /// an <c>object_id</c> first and quoting what the catalogue says the parts are called is what
+    /// keeps the name from ever reaching the parser as SQL.
+    /// </summary>
+    private const string ResultSetSql = """
+        DECLARE @sql nvarchar(max) =
+            N'EXEC ' + QUOTENAME(OBJECT_SCHEMA_NAME(OBJECT_ID(@table)))
+                     + N'.' + QUOTENAME(OBJECT_NAME(OBJECT_ID(@table)));
+        EXEC sp_describe_first_result_set @tsql = @sql;
+        """;
+
     private const string ColumnSql = """
         SELECT
             s.name          AS SchemaName,
@@ -40,7 +88,8 @@ public sealed partial class MssqlDbProvider : IDbSchemaIntrospector
             c.column_id     AS Ordinal,
             CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END AS IsPrimaryKey
         FROM sys.columns c
-            INNER JOIN sys.tables  t  ON t.object_id = c.object_id
+            INNER JOIN sys.objects t  ON t.object_id = c.object_id
+                                      AND t.type IN ('U', 'V', 'IF', 'TF')
             INNER JOIN sys.schemas s  ON s.schema_id = t.schema_id
             INNER JOIN sys.types   ty ON ty.user_type_id = c.user_type_id
             LEFT JOIN (
@@ -153,6 +202,150 @@ public sealed partial class MssqlDbProvider : IDbSchemaIntrospector
             }),
         ];
     }
+
+    public async Task<IReadOnlyList<DbSchemaObject>> ListSchemaObjectsAsync(CancellationToken ct)
+    {
+        var objects = new List<DbSchemaObject>();
+
+        await foreach (var row in ReadAsync(ObjectListSql, string.Empty, ct).ConfigureAwait(false))
+        {
+            objects.Add(new DbSchemaObject(
+                row.GetString(row.GetOrdinal("SchemaName")),
+                row.GetString(row.GetOrdinal("ObjectName")),
+                Kind(row.GetString(row.GetOrdinal("ObjectType")))));
+        }
+
+        return objects;
+    }
+
+    public async Task<DbFunctionSchema?> DescribeFunctionAsync(
+        string functionName, CancellationToken ct)
+    {
+        string? schema = null, name = null;
+        var kind = DbSchemaObjectKind.StoredProcedure;
+
+        await foreach (var row in ReadAsync(RoutineSql, functionName, ct).ConfigureAwait(false))
+        {
+            schema = row.GetString(row.GetOrdinal("SchemaName"));
+            name = row.GetString(row.GetOrdinal("ObjectName"));
+            kind = Kind(row.GetString(row.GetOrdinal("ObjectType")));
+        }
+
+        if (schema is null || name is null)
+            return null;
+
+        var parameters = ImmutableArray.CreateBuilder<DbParameterSchema>();
+        DbParameterSchema? returnValue = null;
+
+        await foreach (var row in ReadAsync(ParameterSql, functionName, ct).ConfigureAwait(false))
+        {
+            string typeName = row.GetString(row.GetOrdinal("TypeName"));
+            short maxLength = row.GetInt16(row.GetOrdinal("MaxLength"));
+
+            var parameter = new DbParameterSchema(
+                Name: row.GetString(row.GetOrdinal("ParameterName")).TrimStart('@'),
+                SqlType: typeName,
+                IsOutput: row.GetBoolean(row.GetOrdinal("IsOutput")),
+                MaxLength: CharacterLength(typeName, maxLength),
+                Precision: row.GetByte(row.GetOrdinal("Precision")),
+                Scale: row.GetByte(row.GetOrdinal("Scale")));
+
+            // Parameter zero is the catalogue's spelling of a scalar function's return value.
+            if (row.GetInt32(row.GetOrdinal("Ordinal")) == 0)
+                returnValue = parameter;
+            else
+                parameters.Add(parameter);
+        }
+
+        (ImmutableArray<DbColumnSchema> Columns, string? Note) result = kind switch
+        {
+            // A table-valued function's rows are ordinary sys.columns rows on the object itself.
+            DbSchemaObjectKind.TableFunction =>
+                ((await DescribeTableSchemaAsync(functionName, ct).ConfigureAwait(false))
+                    ?.Columns ?? [], null),
+
+            DbSchemaObjectKind.StoredProcedure =>
+                await DescribeResultSetAsync(functionName, ct).ConfigureAwait(false),
+
+            _ => ([], null),
+        };
+
+        return new DbFunctionSchema(
+            schema, name, kind, parameters.ToImmutable(), returnValue,
+            result.Columns, result.Note);
+    }
+
+    /// <summary>
+    /// A procedure's result shape, or an empty shape and the reason.
+    /// </summary>
+    /// <remarks>
+    /// <c>sp_describe_first_result_set</c> analyses statically and refuses a procedure built on
+    /// dynamic SQL or a temp table. That is an answer rather than a failure — the procedure is still
+    /// addable, its element just cannot carry columns — so the error becomes a note for the user
+    /// instead of an exception for the caller.
+    /// </remarks>
+    private async Task<(ImmutableArray<DbColumnSchema> Columns, string? Note)> DescribeResultSetAsync(
+        string procedureName, CancellationToken ct)
+    {
+        var columns = ImmutableArray.CreateBuilder<DbColumnSchema>();
+        string? note = null;
+
+        try
+        {
+            await foreach (var row in ReadAsync(ResultSetSql, procedureName, ct).ConfigureAwait(false))
+            {
+                if (row.GetBoolean(row.GetOrdinal("is_hidden")))
+                    continue;
+
+                int ordinal = row.GetInt32(row.GetOrdinal("column_ordinal"));
+
+                // An unnamed column cannot be a member. Naming it here would generate a property the
+                // procedure's author never wrote; saying so lets them alias it instead.
+                if (row.IsDBNull(row.GetOrdinal("name"))
+                    || row.GetString(row.GetOrdinal("name")) is not { Length: > 0 } columnName)
+                {
+                    note = $"Column {ordinal} of {procedureName} has no name and was skipped.";
+                    continue;
+                }
+
+                // "nvarchar(50)" — the bare type is the half the type map wants; length, precision
+                // and scale arrive in their own fields.
+                string typeName = row.GetString(row.GetOrdinal("system_type_name"));
+                int parenthesis = typeName.IndexOf('(');
+                if (parenthesis > 0)
+                    typeName = typeName[..parenthesis];
+
+                columns.Add(new DbColumnSchema(
+                    Name: columnName,
+                    SqlType: typeName,
+                    IsNullable: row.GetBoolean(row.GetOrdinal("is_nullable")),
+                    IsPrimaryKey: false,
+                    IsIdentity: row.GetBoolean(row.GetOrdinal("is_identity_column")),
+                    IsComputed: false,
+                    IsRowVersion: typeName.Equals("timestamp", StringComparison.OrdinalIgnoreCase)
+                                  || typeName.Equals("rowversion", StringComparison.OrdinalIgnoreCase),
+                    Ordinal: ordinal,
+                    MaxLength: CharacterLength(typeName, row.GetInt16(row.GetOrdinal("max_length"))),
+                    Precision: row.GetByte(row.GetOrdinal("precision")),
+                    Scale: row.GetByte(row.GetOrdinal("scale"))));
+            }
+        }
+        catch (DbException ex)
+        {
+            return ([], $"The result shape of {procedureName} could not be determined: {ex.Message}");
+        }
+
+        return (columns.ToImmutable(), note);
+    }
+
+    private static DbSchemaObjectKind Kind(string objectType) => objectType.TrimEnd() switch
+    {
+        "U" => DbSchemaObjectKind.Table,
+        "V" => DbSchemaObjectKind.View,
+        "FN" => DbSchemaObjectKind.ScalarFunction,
+        "IF" or "TF" => DbSchemaObjectKind.TableFunction,
+        _ => DbSchemaObjectKind.StoredProcedure,
+    };
 
     /// <summary>
     /// The length in the unit the type is measured in, or nothing where length says nothing.

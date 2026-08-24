@@ -1,4 +1,4 @@
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 
 namespace RoslynMCP.Languages.Dbml.Core;
 
@@ -7,23 +7,22 @@ namespace RoslynMCP.Languages.Dbml.Core;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="XDocument"/> rather than the parser the rest of the pack reads with, and the split is
-/// deliberate. Reading needs exact spans over text that is frequently half-typed, which is what
-/// <c>Microsoft.Language.Xml</c> is for; writing needs to add elements and leave every byte it did not
-/// touch alone, which is what <c>PreserveWhitespace</c> plus <c>DisableFormatting</c> does and what a
-/// full-fidelity red-green tree would need a whole editing layer to do.
+/// The same full-fidelity tree the rest of the pack reads with. Every character of the source is a
+/// node, so a model that was edited in three places and written back out is the original file
+/// everywhere else — the diff of a refresh is the columns that changed and nothing besides. That is
+/// what this used to need <c>PreserveWhitespace</c>, <c>DisableFormatting</c>, hand-copied indent
+/// text and a <c>TextWriter</c> subclass that lied about its encoding to achieve, and none of it is
+/// needed when the writer never reformats in the first place.
 /// </para>
 /// <para>
-/// Every element is created in the LINQ to SQL namespace. An element in no namespace is well-formed
-/// XML and is silently ignored by SqlMetal — a refresh that appeared to work and generated nothing.
+/// Elements are written unprefixed, which is what a <c>.dbml</c> wants: the LINQ to SQL namespace is
+/// bound as the default one on the root element, so an unprefixed child is already in it. An element
+/// in no namespace is well-formed XML and is silently ignored by SqlMetal — a refresh that appeared
+/// to work and generated nothing.
 /// </para>
 /// </remarks>
 internal static class DbmlWriter
 {
-    /// <summary>The namespace every element in a <c>.dbml</c> is in.</summary>
-    public static readonly XNamespace Namespace =
-        "http://schemas.microsoft.com/linqtosql/dbml/2007";
-
     /// <summary>
     /// The file with the plan applied, or <c>null</c> when it does not parse or does not contain the
     /// table the plan is for.
@@ -31,98 +30,222 @@ internal static class DbmlWriter
     /// <param name="includeRemovals">Whether to delete the columns the database no longer has. False
     /// is the answer when the user was asked and said to keep them, and it is also the safe default:
     /// a kept column is a property that still compiles.</param>
+    /// <remarks>
+    /// The row type is found again before every edit. Each one returns a new tree, so the element
+    /// the last lookup produced belongs to the document as it was before — editing through it would
+    /// build a model none of the earlier changes are in.
+    /// </remarks>
     public static string? Apply(string xml, DbmlRefreshPlan plan, bool includeRemovals)
     {
-        XDocument document;
+        var document = Parser.ParseText(xml);
 
-        try
-        {
-            document = XDocument.Parse(xml, LoadOptions.PreserveWhitespace);
-        }
-        catch (System.Xml.XmlException)
-        {
-            // A model that does not parse is one the user is mid-edit in, and overwriting it from the
-            // database would take their edit with it.
-            return null;
-        }
-
-        if (document.Root is not { } root)
+        // A root the parser synthesized an end tag for is a model the user is mid-edit in, and
+        // overwriting it from the database would take their edit with it.
+        if (document.RootSyntax is not XmlElementSyntax { EndTag.Span.Length: > 0 } original)
             return null;
 
-        if (TableElement(root, plan.TableName) is not { } table)
+        if (RowType(original, plan.TableName) is null)
             return null;
 
-        if (table.Elements(Namespace + "Type").FirstOrDefault() is not { } rowType)
-            return null;
+        XmlElementBaseSyntax root = original;
 
         foreach (var draft in plan.Added)
-            Insert(rowType, ColumnElement(draft), afterColumns: true);
+        {
+            if (RowType(root, plan.TableName) is { } rowType)
+                root = root.ReplaceNode(rowType, Insert(rowType, Column(draft), afterColumns: true));
+        }
 
         foreach (var update in plan.Updated)
         {
-            if (ColumnElement(rowType, update.Existing.Name) is { } element)
-                Update(element, update.Refreshed);
+            if (RowType(root, plan.TableName)?.Column(update.Existing.Name) is { } element)
+                root = root.ReplaceNode(element, Updated(element, update.Refreshed));
         }
 
         if (includeRemovals)
         {
             foreach (var column in plan.Removed)
             {
-                if (ColumnElement(rowType, column.Name) is { } element)
-                    Remove(element);
+                if (RowType(root, plan.TableName)?.Column(column.Name) is { } element)
+                    root = root.RemoveNode(element, SyntaxRemoveOptions.KeepNoTrivia)!;
             }
         }
 
         foreach (var draft in plan.Associations)
         {
             if (TypeElement(root, draft.OwnerTypeName) is { } owner)
-                Insert(owner, AssociationElement(draft), afterColumns: false);
+                root = root.ReplaceNode(owner, Insert(owner, Association(draft), afterColumns: false));
         }
 
-        using var writer = new DeclaredEncodingWriter(document.Declaration?.Encoding);
-        document.Save(writer, SaveOptions.DisableFormatting);
-        return writer.ToString();
+        return document.ReplaceNode(original, root).ToFullString();
     }
 
     /// <summary>
-    /// A <see cref="StringWriter"/> that reports the encoding the document declared rather than the
-    /// one a string is held in.
+    /// The file with new tables and functions written into it, or <c>null</c> when it does not parse.
     /// </summary>
     /// <remarks>
-    /// <see cref="XDocument.Save(TextWriter, SaveOptions)"/> rewrites the XML declaration from the
-    /// writer's <see cref="TextWriter.Encoding"/>, and a plain <c>StringWriter</c>'s is UTF-16 —
-    /// because a .NET string is. So saving a file that says <c>encoding="utf-8"</c> through one
-    /// silently turns the first line into <c>encoding="utf-16"</c>, which is then written to disk as
-    /// UTF-8 and is a lie about the bytes underneath it. Reporting the declared encoding leaves the
-    /// line exactly as the file had it.
+    /// <para>
+    /// Tables go after the last <c>&lt;Table&gt;</c> and functions after the last
+    /// <c>&lt;Function&gt;</c>, falling back to each other's end, because that is the order SqlMetal
+    /// writes and the order every hand-maintained model keeps — an added table appearing under the
+    /// functions would read as misfiled even though SqlMetal would accept it.
+    /// </para>
+    /// <para>
+    /// The nested content is composed as text using the document's own indent unit and line ending
+    /// rather than node by node: the tree auto-indents an inserted element, but a subtree built by
+    /// hand would need its trivia normalised against conventions this file already knows how to
+    /// state, and text it states them in is text a test can assert on exactly.
+    /// </para>
     /// </remarks>
-    private sealed class DeclaredEncodingWriter(string? declaredEncoding) : StringWriter
+    public static string? AddObjects(
+        string xml,
+        IReadOnlyList<DbmlTableDraft> tables,
+        IReadOnlyList<DbmlFunctionDraft> functions)
     {
-        public override System.Text.Encoding Encoding { get; } = Resolve(declaredEncoding);
+        var document = Parser.ParseText(xml);
 
-        /// <summary>
-        /// UTF-8 for a name .NET does not know, and for a file with no declaration at all — which is
-        /// what an XML document with none means.
-        /// </summary>
-        private static System.Text.Encoding Resolve(string? name)
-        {
-            if (name is not { Length: > 0 })
-                return new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        if (document.RootSyntax is not XmlElementSyntax { EndTag.Span.Length: > 0 } original)
+            return null;
 
-            try
-            {
-                return System.Text.Encoding.GetEncoding(name);
-            }
-            catch (ArgumentException)
-            {
-                return new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-            }
-        }
+        string unit = original.GetIndentUnit();
+        string newLine = original.GetNewLine();
+
+        XmlElementBaseSyntax root = original;
+
+        foreach (var draft in tables)
+            root = InsertTopLevel(root, TableElement(draft, unit, newLine), asFunction: false);
+
+        foreach (var draft in functions)
+            root = InsertTopLevel(root, FunctionElement(draft, unit, newLine), asFunction: true);
+
+        return document.ReplaceNode(original, root).ToFullString();
     }
 
-    private static XElement? TableElement(XElement root, string tableName) =>
-        root.Elements(Namespace + "Table").FirstOrDefault(t =>
-            string.Equals(t.Attribute("Name")?.Value, tableName, StringComparison.OrdinalIgnoreCase));
+    /// <summary>
+    /// The root with one new top-level element among its own kind: a table after the tables, a
+    /// function after the functions.
+    /// </summary>
+    private static XmlElementBaseSyntax InsertTopLevel(
+        XmlElementBaseSyntax root, XmlElementBaseSyntax element, bool asFunction)
+    {
+        if (root is not XmlElementSyntax { Content: var content })
+            return root;
+
+        var lastTable = root.GetElementsByLocalName("Table").LastOrDefault();
+        var lastFunction = root.GetElementsByLocalName("Function").LastOrDefault();
+
+        int index;
+
+        if (asFunction)
+        {
+            // After the last function; a model that has none gets its first at the end, which is
+            // after the tables.
+            index = lastFunction is null ? -1 : content.IndexOf(lastFunction) + 1;
+        }
+        else if (lastTable is not null)
+        {
+            index = content.IndexOf(lastTable) + 1;
+        }
+        else
+        {
+            // No tables yet: before the functions, or at the end of a model that has neither.
+            var firstFunction = root.GetElementsByLocalName("Function").FirstOrDefault();
+            index = firstFunction is null ? -1 : content.IndexOf(firstFunction);
+        }
+
+        return root.InsertChild(element, index);
+    }
+
+    private static XmlElementBaseSyntax TableElement(
+        DbmlTableDraft draft, string unit, string newLine)
+    {
+        var text = new System.Text.StringBuilder();
+
+        text.Append(StartTag(Empty("Table")
+            .SetAttribute("Name", draft.Name)
+            .SetAttribute("Member", draft.Member)));
+        text.Append(newLine);
+
+        text.Append(unit).Append(unit);
+        text.Append(StartTag(Empty("Type").SetAttribute("Name", draft.TypeName)));
+        text.Append(newLine);
+
+        foreach (var column in draft.Columns)
+            text.Append(unit).Append(unit).Append(unit)
+                .Append(Column(column).ToFullString()).Append(newLine);
+
+        text.Append(unit).Append(unit).Append("</Type>").Append(newLine);
+        text.Append(unit).Append("</Table>");
+
+        return Parse(text.ToString());
+    }
+
+    private static XmlElementBaseSyntax FunctionElement(
+        DbmlFunctionDraft draft, string unit, string newLine)
+    {
+        var function = Empty("Function")
+            .SetAttribute("Name", draft.Name)
+            .SetAttribute("Method", draft.Method);
+
+        if (draft.IsComposable)
+            function = function.SetAttribute("IsComposable", "true");
+
+        var text = new System.Text.StringBuilder();
+
+        text.Append(StartTag(function)).Append(newLine);
+
+        foreach (var parameter in draft.Parameters)
+        {
+            var element = Empty("Parameter")
+                .SetAttribute("Name", parameter.Name)
+                .SetAttribute("Type", parameter.ClrType)
+                .SetAttribute("DbType", parameter.DbType);
+
+            if (parameter.Direction is { } direction)
+                element = element.SetAttribute("Direction", direction);
+
+            text.Append(unit).Append(unit).Append(element.ToFullString()).Append(newLine);
+        }
+
+        if (draft.ElementTypeName is { } elementType)
+        {
+            text.Append(unit).Append(unit);
+            text.Append(StartTag(Empty("ElementType").SetAttribute("Name", elementType)));
+            text.Append(newLine);
+
+            foreach (var column in draft.ElementColumns)
+                text.Append(unit).Append(unit).Append(unit)
+                    .Append(Column(column).ToFullString()).Append(newLine);
+
+            text.Append(unit).Append(unit).Append("</ElementType>").Append(newLine);
+        }
+        else if (draft.ReturnClrType is { } returnType)
+        {
+            var element = Empty("Return").SetAttribute("Type", returnType);
+
+            if (draft.ReturnDbType is { } dbType)
+                element = element.SetAttribute("DbType", dbType);
+
+            text.Append(unit).Append(unit).Append(element.ToFullString()).Append(newLine);
+        }
+
+        text.Append(unit).Append("</Function>");
+
+        return Parse(text.ToString());
+    }
+
+    /// <summary>An attribute-only element reopened as a start tag, for composing nested text.</summary>
+    private static string StartTag(XmlElementBaseSyntax empty) =>
+        empty.ToFullString()[..^2].TrimEnd() + ">";
+
+    private static XmlElementBaseSyntax Parse(string text) =>
+        (XmlElementBaseSyntax)Parser.ParseText(text).RootSyntax!;
+
+    /// <summary>The <c>&lt;Type&gt;</c> a table's rows are described by.</summary>
+    private static XmlElementBaseSyntax? RowType(XmlElementBaseSyntax root, string tableName) =>
+        root.GetElementsByLocalName("Table")
+            .FirstOrDefault(table => string.Equals(
+                table.GetAttributeValue("Name"), tableName, StringComparison.OrdinalIgnoreCase))
+            ?.GetElementByLocalName("Type");
 
     /// <summary>
     /// A <c>&lt;Type&gt;</c> anywhere in the model, inherited ones included.
@@ -131,34 +254,37 @@ internal static class DbmlWriter
     /// A descendant search rather than a walk of the tables: an association's owner is named, and a
     /// derived type is nested inside its base's element rather than under the table directly.
     /// </remarks>
-    private static XElement? TypeElement(XElement root, string typeName) =>
-        root.Descendants(Namespace + "Type").FirstOrDefault(t =>
-            string.Equals(t.Attribute("Name")?.Value, typeName, StringComparison.Ordinal));
+    private static XmlElementBaseSyntax? TypeElement(XmlElementBaseSyntax root, string typeName) =>
+        root.DescendantsByLocalName("Type").FirstOrDefault(type => string.Equals(
+            type.GetAttributeValue("Name"), typeName, StringComparison.Ordinal));
 
-    private static XElement? ColumnElement(XElement type, string columnName) =>
-        type.Elements(Namespace + "Column").FirstOrDefault(c =>
-            string.Equals(
-                c.Attribute("Name")?.Value ?? c.Attribute("Member")?.Value,
-                columnName,
-                StringComparison.OrdinalIgnoreCase));
+    /// <summary>
+    /// A column by the name it has in the database, or by the property it maps to when the two
+    /// differ.
+    /// </summary>
+    private static XmlElementBaseSyntax? Column(this XmlElementBaseSyntax type, string columnName) =>
+        type.GetElementsByLocalName("Column").FirstOrDefault(column => string.Equals(
+            column.GetAttributeValue("Name") ?? column.GetAttributeValue("Member"),
+            columnName,
+            StringComparison.OrdinalIgnoreCase));
 
-    private static XElement ColumnElement(DbmlColumnDraft draft)
+    private static XmlElementBaseSyntax Column(DbmlColumnDraft draft)
     {
-        var element = new XElement(Namespace + "Column",
-            new XAttribute("Name", draft.Name),
-            new XAttribute("Type", draft.ClrType),
-            new XAttribute("DbType", draft.DbType));
+        var element = Empty("Column")
+            .SetAttribute("Name", draft.Name)
+            .SetAttribute("Type", draft.ClrType)
+            .SetAttribute("DbType", draft.DbType);
 
         // Only the attributes that are not the default, which is what SqlMetal writes and therefore
         // what a refresh has to write for the file not to churn on the next run.
         if (draft.IsPrimaryKey)
-            element.SetAttributeValue("IsPrimaryKey", "true");
+            element = element.SetAttribute("IsPrimaryKey", "true");
         if (draft.IsDbGenerated)
-            element.SetAttributeValue("IsDbGenerated", "true");
+            element = element.SetAttribute("IsDbGenerated", "true");
         if (draft.IsVersion)
-            element.SetAttributeValue("IsVersion", "true");
+            element = element.SetAttribute("IsVersion", "true");
         if (!draft.CanBeNull)
-            element.SetAttributeValue("CanBeNull", "false");
+            element = element.SetAttribute("CanBeNull", "false");
 
         return element;
     }
@@ -172,74 +298,70 @@ internal static class DbmlWriter
     /// opinion about them. An attribute that has become the default is removed rather than set to
     /// <c>false</c>, so the element reads the way a freshly generated one does.
     /// </remarks>
-    private static void Update(XElement element, DbmlColumnDraft draft)
+    private static XmlElementBaseSyntax Updated(XmlElementBaseSyntax element, DbmlColumnDraft draft)
     {
-        element.SetAttributeValue("Type", draft.ClrType);
-        element.SetAttributeValue("DbType", draft.DbType);
-        element.SetAttributeValue("IsPrimaryKey", draft.IsPrimaryKey ? "true" : null);
-        element.SetAttributeValue("IsDbGenerated", draft.IsDbGenerated ? "true" : null);
-        element.SetAttributeValue("IsVersion", draft.IsVersion ? "true" : null);
-        element.SetAttributeValue("CanBeNull", draft.CanBeNull ? null : "false");
+        element = element
+            .SetAttribute("Type", draft.ClrType)
+            .SetAttribute("DbType", draft.DbType);
+
+        element = Flag(element, "IsPrimaryKey", draft.IsPrimaryKey ? "true" : null);
+        element = Flag(element, "IsDbGenerated", draft.IsDbGenerated ? "true" : null);
+        element = Flag(element, "IsVersion", draft.IsVersion ? "true" : null);
+
+        return Flag(element, "CanBeNull", draft.CanBeNull ? null : "false");
     }
 
-    private static XElement AssociationElement(DbmlAssociationDraft draft)
+    /// <summary>One attribute set to a value, or taken off when the value is <c>null</c>.</summary>
+    private static XmlElementBaseSyntax Flag(XmlElementBaseSyntax element, string name, string? value)
     {
-        var element = new XElement(Namespace + "Association",
-            new XAttribute("Name", draft.Name),
-            new XAttribute("Member", draft.Member),
-            new XAttribute("ThisKey", draft.ThisKey),
-            new XAttribute("OtherKey", draft.OtherKey),
-            new XAttribute("Type", draft.TargetTypeName));
+        if (value is not null)
+            return element.SetAttribute(name, value);
+
+        return element.GetAttribute(name) is { } attribute
+            ? element.RemoveAttribute(attribute)
+            : element;
+    }
+
+    private static XmlElementBaseSyntax Association(DbmlAssociationDraft draft)
+    {
+        var element = Empty("Association")
+            .SetAttribute("Name", draft.Name)
+            .SetAttribute("Member", draft.Member)
+            .SetAttribute("ThisKey", draft.ThisKey)
+            .SetAttribute("OtherKey", draft.OtherKey)
+            .SetAttribute("Type", draft.TargetTypeName);
 
         // The child end says so; the parent end is a collection and says nothing, which is how LINQ
         // to SQL tells the two halves of one Name apart.
-        if (draft.IsForeignKey)
-            element.SetAttributeValue("IsForeignKey", "true");
-
-        return element;
+        return draft.IsForeignKey ? element.SetAttribute("IsForeignKey", "true") : element;
     }
 
+    /// <summary>An attribute-only element, which is how a <c>.dbml</c> writes both of these.</summary>
+    private static XmlElementBaseSyntax Empty(string name) =>
+        (XmlElementBaseSyntax)Parser.ParseText($"<{name} />").RootSyntax!;
+
     /// <summary>
-    /// Inserts an element among its own kind, indented like its neighbours.
+    /// The type with an element inserted among its own kind, indented like its neighbours.
     /// </summary>
     /// <remarks>
     /// Columns before associations, matching the order SqlMetal writes and every hand-edited model
-    /// follows. The indentation is copied from the whitespace in front of an existing sibling rather
-    /// than computed, because a model indented with tabs, or with two spaces, or not at all is a model
-    /// this must not reformat — the diff of a refresh should be the columns that changed.
+    /// follows. The indentation is the library's to work out from what the document already does; a
+    /// model indented with tabs, or with two spaces, or not at all is a model this must not reformat.
     /// </remarks>
-    private static void Insert(XElement type, XElement element, bool afterColumns)
+    private static XmlElementBaseSyntax Insert(
+        XmlElementBaseSyntax type, XmlElementBaseSyntax element, bool afterColumns)
     {
-        var columns = type.Elements(Namespace + "Column").ToList();
-        var associations = type.Elements(Namespace + "Association").ToList();
+        var anchor = afterColumns
+            ? type.GetElementsByLocalName("Column").LastOrDefault()
+            : type.GetElementsByLocalName("Association").LastOrDefault()
+                ?? type.GetElementsByLocalName("Column").LastOrDefault();
 
-        XElement? anchor = afterColumns
-            ? columns.LastOrDefault()
-            : associations.LastOrDefault() ?? columns.LastOrDefault();
+        // The index is into the content, which is nodes and not only elements, so it is counted
+        // there rather than among the siblings of the anchor's kind.
+        int index = anchor is null || type is not XmlElementSyntax { Content: var content }
+            ? -1
+            : content.IndexOf(anchor) + 1;
 
-        if (anchor is null)
-        {
-            type.Add(element);
-            return;
-        }
-
-        // The element first and the whitespace second, because each insert goes immediately after the
-        // anchor and so the later call ends up in front of the earlier one. The whitespace copied is
-        // the anchor's own leading break and indent, which is what the new line needs too.
-        anchor.AddAfterSelf(element);
-
-        if (anchor.PreviousNode is XText indent)
-            anchor.AddAfterSelf(new XText(indent.Value));
-    }
-
-    /// <summary>
-    /// Removes an element and the whitespace that indented it, so a deletion does not leave a blank
-    /// line where the column was.
-    /// </summary>
-    private static void Remove(XElement element)
-    {
-        var indent = element.PreviousNode as XText;
-        element.Remove();
-        indent?.Remove();
+        return type.InsertChild(element, index);
     }
 }

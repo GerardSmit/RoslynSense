@@ -260,8 +260,9 @@ public class DbmlRefreshPlanTests
     [Fact]
     public void TheDeclaredEncodingSurvivesTheWrite()
     {
-        // XDocument rewrites the declaration from the writer's encoding, and a StringWriter's is
-        // UTF-16 — so a file saying utf-8 came back saying utf-16 and was then written as UTF-8.
+        // The declaration is text in the tree like everything else, so it comes back out as it
+        // went in. A writer that re-emits it from its own encoding turned a file saying utf-8 into
+        // one saying utf-16, which was then written to disk as UTF-8.
         var database = Parse(TwoTables);
         var plan = DbmlRefreshPlanner.Plan(
             database.TableNamed("dbo.Orders")!, OrdersSchema(), [], database);

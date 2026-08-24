@@ -77,6 +77,16 @@ internal sealed partial class DbmlLanguage : ILanguageCodeLensProvider, ILanguag
         var lines = view.Text.Lines;
         var lenses = new List<LspCodeLens>();
 
+        // On the <Database> element, so it reads as the file's own action the way the per-table
+        // refresh reads as the table's. Like refresh it needs no binding — it reads the catalogue
+        // and writes the file — so it is offered on a model whose project has never been built.
+        if (Spanned(view.Database))
+        {
+            lenses.Add(new LspCodeLens(
+                LspConverters.ToRange(lines, LensSpan(view.Database)),
+                new Command("Add from database", "roslynSense.dbmlAddFromDatabase", [uri])));
+        }
+
         // Refresh does not depend on the binding — it reads the database and rewrites the file — so
         // it is offered on a model whose project has never been built, which is exactly when a table
         // is most likely to be half-written.

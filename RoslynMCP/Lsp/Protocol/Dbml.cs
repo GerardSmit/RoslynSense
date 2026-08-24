@@ -41,3 +41,23 @@ public sealed record DbmlRefreshPlanResult(
 public sealed record DbmlRefreshResult(
     [property: JsonPropertyName("ok")] bool Ok,
     [property: JsonPropertyName("message")] string Message);
+
+/// <summary>One database object the model does not have yet, as a line the picker can show.</summary>
+/// <param name="Kind">In words — <c>table</c>, <c>view</c>, <c>function</c>, <c>table function</c>,
+/// <c>stored procedure</c> — because the client shows it rather than switches on it.</param>
+public sealed record DbmlAddableObject(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("kind")] string Kind);
+
+/// <summary>What the database offers that the model does not contain.</summary>
+public sealed record DbmlAddableList(
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("objects")] DbmlAddableObject[]? Objects = null);
+
+/// <summary>The outcome of adding objects, with anything worth saying about the ones that came in
+/// imperfect — a procedure whose result shape could not be read, say.</summary>
+public sealed record DbmlAddResult(
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("notes")] string[]? Notes = null);

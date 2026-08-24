@@ -63,7 +63,8 @@ internal sealed partial class DbmlLanguage : ILanguagePack
     public LanguageCapabilities Capabilities { get; } = new(
         CompletionTriggerCharacters: ["<", "\"", "'"],
         SignatureHelpTriggerCharacters: [],
-        Commands: [ConnectionsCommand, PlanRefreshCommand, ApplyRefreshCommand],
+        Commands: [ConnectionsCommand, PlanRefreshCommand, ApplyRefreshCommand,
+            AddableCommand, ApplyAddCommand],
         FileOperationGlobs: [],
         SemanticTokenTypes: [],
         SemanticTokenModifiers: [],

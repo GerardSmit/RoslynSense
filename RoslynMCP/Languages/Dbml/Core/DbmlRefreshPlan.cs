@@ -153,7 +153,7 @@ internal static class DbmlRefreshPlanner
     /// refresh cannot create, and inventing a member name that differs from the column would break
     /// the binding this whole pack rests on.
     /// </remarks>
-    private static DbmlColumnDraft Draft(DbColumnSchema column) => new(
+    internal static DbmlColumnDraft Draft(DbColumnSchema column) => new(
         Name: column.Name,
         Member: column.Name,
         ClrType: DbmlTypeMap.ClrTypeFor(column.SqlType),

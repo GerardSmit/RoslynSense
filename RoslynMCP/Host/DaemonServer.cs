@@ -189,7 +189,7 @@ internal sealed class DaemonServer
 
         // Editors re-pull diagnostics, lenses and tokens so anything a toggle changed shows up
         // without a keystroke.
-        Lsp.LspSessionRegistry.ScheduleRefresh(Lsp.RefreshKind.All);
+        Lsp.LspSessionRegistry.ScheduleRefresh(Lsp.RefreshKind.All, "config-reload");
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)

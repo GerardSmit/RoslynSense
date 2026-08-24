@@ -42,7 +42,7 @@ internal static class LspWorkspaceRefresh
         // a superseded one mid-send, and it has a maximum wait so a steady stream of project-set
         // changes cannot hold the refresh off forever. This used to be a second, subtly different
         // implementation of the same thing, with both of those bugs.
-        LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
+        LspSessionRegistry.ScheduleRefresh(RefreshKind.All, "workspace-changed");
 
         // Not part of the debounced refresh above: that one carries LSP refresh kinds, and the
         // Solution Explorer is a custom view the protocol has no kind for. It draws which projects

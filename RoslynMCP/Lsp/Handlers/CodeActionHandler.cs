@@ -91,7 +91,7 @@ internal static class CodeActionHandler
                     var context = new CodeFixContext(document, diagnostic, (a, _) => collected.Add(a), ct);
                     try { await provider.RegisterCodeFixesAsync(context); }
                     catch (OperationCanceledException) { throw; }
-                    catch { /* provider crashed — skip */ }
+                    catch (Exception ex) { LogProviderCrash("Code fix", provider.GetType(), ex); }
 
                     actions.AddRange(collected.Select(a => new Offered(a, "quickfix", a.Title)));
                 }
@@ -112,7 +112,7 @@ internal static class CodeActionHandler
             var context = new CodeRefactoringContext(document, span, a => collected.Add(a), ct);
             try { await provider.ComputeRefactoringsAsync(context); }
             catch (OperationCanceledException) { throw; }
-            catch { /* provider crashed — skip */ }
+            catch (Exception ex) { LogProviderCrash("Refactoring", provider.GetType(), ex); }
 
             actions.AddRange(collected.Select(a => new Offered(a, "refactor", a.Title)));
         }
@@ -169,7 +169,7 @@ internal static class CodeActionHandler
                     results.AddRange(Offer(fix.Action, nesting));
             }
             catch (OperationCanceledException) { throw; }
-            catch { /* provider crashed — skip */ }
+            catch (Exception ex) { LogProviderCrash("Configuration fix", provider.GetType(), ex); }
         }
 
         return results;
@@ -330,5 +330,24 @@ internal static class CodeActionHandler
         {
             return null; // action can't produce a preview — drop it
         }
+    }
+
+    /// <summary>Providers that have already had their crash logged this process.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, byte> s_crashedProviders = new();
+
+    /// <summary>
+    /// A crashed provider is skipped, but not silently: the visible symptom is "no lightbulb",
+    /// and with nothing in the log that used to be undiagnosable. Full stack once per provider
+    /// type per process — the lightbulb re-asks on every cursor move, and a broken provider fails
+    /// the same way every time, so repeats would only bury the record.
+    /// </summary>
+    private static void LogProviderCrash(string kind, Type provider, Exception ex)
+    {
+        if (!s_crashedProviders.TryAdd(provider, 0))
+            return;
+
+        LspLog.Warn(
+            $"{kind} provider '{provider.Name}' crashed and is skipped (logged once per session): {ex}",
+            key: $"code-action-provider-{provider.Name}");
     }
 }

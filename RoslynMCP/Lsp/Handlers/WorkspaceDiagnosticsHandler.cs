@@ -173,7 +173,65 @@ internal static class WorkspaceDiagnosticsHandler
         // came back twice with two ids; the protocol allows one report per document, and the client
         // keeps one id, so the other mismatched on every later sweep and that file was re-bound for
         // the rest of the session. Merged rather than dropped, for the same reason frameworks are.
-        return new WorkspaceDiagnosticReport([.. MergeByUri(reports)]);
+        var merged = MergeByUri(reports).ToList();
+        NoteSweepConvergence(merged, previous);
+        return new WorkspaceDiagnosticReport([.. merged]);
+    }
+
+    /// <summary>Sweeps in a row that re-reported at least one file. A healthy sweep converges: a
+    /// couple of passes after an edit, everything answers "unchanged".</summary>
+    private static int s_consecutiveChurningSweeps;
+
+    /// <summary>
+    /// Detects the sweep failing to converge, and names the churning files while it is happening.
+    /// </summary>
+    /// <remarks>
+    /// Every class of result-id bug this handler's history records — multi-target ids, linked-file
+    /// ids, the analyzer cache evicting the fact the id was built from — presented the same way: a
+    /// Problems panel that never settles, nothing in the log, and the cause reconstructed by hand
+    /// from probe traffic. The signature is cheap to detect at the source: full reports on many
+    /// consecutive sweeps, when a converging session answers "unchanged" within a pass or two of
+    /// any edit. Ten in a row is past anything a real editing pause produces; the repeat logging
+    /// stays keyed and sparse so a long-lived loop cannot flood the log it is meant to explain.
+    /// </remarks>
+    private static void NoteSweepConvergence(
+        IReadOnlyList<object> merged, IReadOnlyDictionary<string, string> previous)
+    {
+        var full = merged.OfType<WorkspaceFullDocumentDiagnosticReport>().ToList();
+        if (full.Count == 0)
+        {
+            s_consecutiveChurningSweeps = 0;
+            return;
+        }
+
+        int streak = Interlocked.Increment(ref s_consecutiveChurningSweeps);
+        if (streak != 10 && streak % 100 != 0)
+            return;
+
+        var samples = full.Take(3).Select(report =>
+        {
+            previous.TryGetValue(report.Uri, out string? before);
+            return $"'{Path.GetFileName(LspConverters.UriToPath(report.Uri))}' "
+                + $"[{Abbreviate(before)} -> {Abbreviate(report.ResultId)}]";
+        });
+
+        Services.ServiceLog.Warn(
+            $"The workspace sweep has re-reported files on {streak} consecutive passes "
+            + $"({full.Count} full / {merged.Count - full.Count} unchanged this pass) — result ids "
+            + $"are churning instead of converging. E.g. {string.Join(", ", samples)}.",
+            key: "sweep-not-converging");
+    }
+
+    /// <summary>A result id short enough to read in a log line: ids are checksum:semanticVersion
+    /// :marker per owning project, joined by '|', and the head plus the trailing marker is what a
+    /// reader diffs — whether the content moved, and whether the analyzed state flipped.</summary>
+    private static string Abbreviate(string? resultId)
+    {
+        if (resultId is null)
+            return "(none)";
+
+        return string.Join('|', resultId.Split('|').Select(component =>
+            component.Length <= 24 ? component : $"{component[..12]}…{component[^4..]}"));
     }
 
     /// <summary>Collapses reports that name the same document into one.</summary>
@@ -818,7 +876,7 @@ internal static class WorkspaceDiagnosticsHandler
                 // Only when the answer moved, or the refresh runs the sweep that starts the pass
                 // that asks for the refresh.
                 if (moved)
-                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics);
+                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "project-wide-pass-stored");
             }
             catch (Exception ex)
             {
@@ -872,7 +930,7 @@ internal static class WorkspaceDiagnosticsHandler
                 // editor to re-pull, which ran another sweep, which missed again. Editing a
                 // signature never converged — the very symptom this was meant to remove.
                 if (!AnalyzerDiagnosticCache.SameFindings(before, after))
-                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics);
+                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "analyzer-recompute-stored");
             }
             catch (Exception ex)
             {

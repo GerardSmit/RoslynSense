@@ -33,7 +33,7 @@ internal sealed partial class ValuesLanguage : ILanguageCommandProvider
 
         // The open documents were told the old values were the whole truth, and the diagnostics
         // they are showing were computed against them. Nothing else invalidates those.
-        LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics);
+        LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "value-set-edit");
 
         string[] refreshed = id is { Length: > 0 }
             ? [id]

@@ -64,8 +64,14 @@ internal static class ProjectWideDiagnosticCache
         {
             throw;
         }
-        catch
+        catch (Exception ex)
         {
+            // Same cascade as the analyzer cache's version: a null here silently blocks the
+            // project's whole-compilation warnings from ever refreshing, so the reason must land
+            // in the log rather than vanish.
+            Services.ServiceLog.Warn(
+                $"Could not derive a project-wide diagnostics version for '{project.Name}': {ex}",
+                key: "diagnostics-version-derivation");
             return null;
         }
     }

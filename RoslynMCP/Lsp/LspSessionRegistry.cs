@@ -87,13 +87,23 @@ internal static class LspSessionRegistry
     private static RefreshKind s_pendingKinds;
     private static DateTime s_firstPendingUtc;
 
+    /// <summary>What asked for the refreshes currently pending, and when recent ones were sent —
+    /// a refresh loop presents as an editor that re-pulls forever with nothing in the log naming
+    /// the instigator, so every send remembers its reasons and heavy traffic gets summarized.</summary>
+    private static readonly List<string> s_pendingReasons = new();
+    private static readonly Queue<(DateTime Utc, string[] Reasons)> s_recentSends = new();
+    private static readonly TimeSpan SendWindow = TimeSpan.FromMinutes(10);
+    private static int s_sendsSinceLogged;
+
     /// <summary>
     /// <see cref="RequestRefreshAsync"/>, coalesced. Callers that fire once per document must use
     /// this: a refresh is not a per-document message — it tells the editor to re-pull
     /// <em>everything</em>, including a full <c>workspace/diagnostic</c> sweep. Sending one per
     /// document turned opening a folder of ten files into ten whole-workspace re-pulls.
     /// </summary>
-    public static void ScheduleRefresh(RefreshKind kinds)
+    /// <param name="reason">Short slug naming why, for the traffic summary — "analyzer-pass-stored",
+    /// "workspace-reload". A refresh storm's log line is only as useful as these are honest.</param>
+    public static void ScheduleRefresh(RefreshKind kinds, string? reason = null)
     {
         TimeSpan delay;
         lock (s_refreshGate)
@@ -102,6 +112,7 @@ internal static class LspSessionRegistry
             if (s_pendingKinds == default)
                 s_firstPendingUtc = DateTime.UtcNow;
             s_pendingKinds |= kinds;
+            s_pendingReasons.Add(reason ?? "unspecified");
 
             var waited = DateTime.UtcNow - s_firstPendingUtc;
             delay = waited >= RefreshMaximumWait ? TimeSpan.Zero : RefreshQuiet;
@@ -110,14 +121,19 @@ internal static class LspSessionRegistry
         s_refreshDebounce.Restart(delay, async _ =>
         {
             RefreshKind kindsToSend;
+            string[] reasons;
             lock (s_refreshGate)
             {
                 kindsToSend = s_pendingKinds;
                 s_pendingKinds = default;
+                reasons = [.. s_pendingReasons];
+                s_pendingReasons.Clear();
             }
 
             if (kindsToSend == default)
                 return;
+
+            NoteRefreshSent(reasons);
 
             try
             {
@@ -131,6 +147,37 @@ internal static class LspSessionRegistry
                 // A client that cannot be told is not a reason to fault background work.
             }
         });
+    }
+
+    /// <summary>
+    /// One summary line per 50 refreshes: how many went out in the last ten minutes and on whose
+    /// behalf. Each refresh costs the client a re-pull of every open document plus a workspace
+    /// sweep, so sustained volume is always worth a name in the log — a background loop asking
+    /// over and over used to be invisible until someone counted sweeps by hand.
+    /// </summary>
+    private static void NoteRefreshSent(string[] reasons)
+    {
+        lock (s_recentSends)
+        {
+            var now = DateTime.UtcNow;
+            s_recentSends.Enqueue((now, reasons));
+            while (s_recentSends.Count > 0 && now - s_recentSends.Peek().Utc > SendWindow)
+                s_recentSends.Dequeue();
+
+            if (++s_sendsSinceLogged < 50)
+                return;
+            s_sendsSinceLogged = 0;
+
+            var histogram = s_recentSends
+                .SelectMany(send => send.Reasons)
+                .GroupBy(r => r, StringComparer.Ordinal)
+                .OrderByDescending(g => g.Count())
+                .Select(g => $"{g.Key}×{g.Count()}");
+
+            LspLog.Info(
+                $"{s_recentSends.Count} client refreshes in the last {SendWindow.TotalMinutes:0} min "
+                + $"(requests: {string.Join(", ", histogram)}).");
+        }
     }
 
     /// <summary>

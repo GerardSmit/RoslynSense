@@ -101,7 +101,7 @@ internal static class WatchedFilesHandler
             // Coalesced: several batches can land in a row during a checkout, and a refresh costs
             // the client a re-pull of every open document plus a workspace sweep.
             if (outcome.DidAnything)
-                LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
+                LspSessionRegistry.ScheduleRefresh(RefreshKind.All, "watched-files");
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)

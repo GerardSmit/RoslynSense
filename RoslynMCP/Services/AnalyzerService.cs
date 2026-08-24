@@ -211,7 +211,9 @@ internal static class AnalyzerService
                 }
                 catch (Exception ex)
                 {
-                    ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex.Message}", key: "analyzer-failure");
+                    // The whole exception: a driver-level failure (as opposed to one analyzer's,
+                    // which onAnalyzerException names) has no other record of its frame.
+                    ServiceLog.Error($"Analyzers failed for '{document.Name}': {ex}", key: "analyzer-failure");
                     return new AnalyzerRun(ImmutableArray<Diagnostic>.Empty, Failed: true);
                 }
             }
@@ -249,7 +251,7 @@ internal static class AnalyzerService
                 catch (Exception ex)
                 {
                     ServiceLog.Error(
-                        $"Expensive analyzers failed for '{document.Name}': {ex.Message}",
+                        $"Expensive analyzers failed for '{document.Name}': {ex}",
                         key: "analyzer-slow-failure");
                 }
             }

@@ -167,7 +167,7 @@ internal static class DesignerWatchBridge
             // Deliberately no AnalyzerDiagnosticCache.Clear(): the entries are keyed by DocumentId,
             // so the regenerated document's own results are the only stale ones and they age out on
             // their version key. Clearing threw away every other file's analysis in every solution.
-            LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
+            LspSessionRegistry.ScheduleRefresh(RefreshKind.All, "designer-regenerated");
         }
         catch (Exception ex)
         {

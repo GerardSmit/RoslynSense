@@ -3411,7 +3411,7 @@ internal static class WorkspaceService
         // The consumers' semantic versions moved, so the editor's diagnostics and result ids are
         // stale; one coalesced refresh brings every window current.
         if (anyRefreshed)
-            Lsp.LspSessionRegistry.ScheduleRefresh(Lsp.RefreshKind.All);
+            Lsp.LspSessionRegistry.ScheduleRefresh(Lsp.RefreshKind.All, "workspace-reload");
     }
 
     /// <summary>

@@ -120,7 +120,7 @@ internal static class PackageStatusCache
                     s_gate.Release();
                 }
 
-                LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics);
+                LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "package-status");
             }
             catch (Exception ex)
             {

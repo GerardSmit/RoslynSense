@@ -168,7 +168,7 @@ internal static class LspProxy
             replaced.Add(currentProvider);
             currentProvider = fresh;
             WorkspaceService.MaxCachedWorkspaces = reload.Settings.MaxWorkspaces;
-            LspSessionRegistry.ScheduleRefresh(RefreshKind.All);
+            LspSessionRegistry.ScheduleRefresh(RefreshKind.All, "config-reload");
         });
 
         await LspSessionHost.RunAsync(stdin, stdout, services, cts.Token);

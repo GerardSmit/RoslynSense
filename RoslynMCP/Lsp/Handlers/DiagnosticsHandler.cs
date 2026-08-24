@@ -383,7 +383,7 @@ internal static class DiagnosticsHandler
                     document, CancellationToken.None);
 
                 if (AnalyzerDiagnosticCache.LastComputeStored(document, version))
-                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics);
+                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "analyzer-pass-stored");
             }
             catch (Exception ex)
             {

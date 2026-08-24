@@ -416,7 +416,16 @@ internal static class AnalyzerDiagnosticCache
             return $"{ContentHash(text)}:{semanticVersion}";
         }
         catch (OperationCanceledException) { throw; }
-        catch { return null; }
+        catch (Exception ex)
+        {
+            // Null is not a harmless miss: an unversionable document is re-reported under a
+            // never-matching id on every sweep, and its analyzer pass can never be cached. A
+            // swallowed reason here once left that cascade with nothing to search but a guess.
+            Services.ServiceLog.Warn(
+                $"Could not derive a diagnostics version for '{document.Name}': {ex}",
+                key: "diagnostics-version-derivation");
+            return null;
+        }
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<SourceText, string>

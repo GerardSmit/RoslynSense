@@ -60,7 +60,7 @@ internal sealed record ValueSettings
         {
             Enabled = true,
             Sets = sets,
-            Bindings = ReadBindings(config.Bindings, sets, warnings),
+            Bindings = ReadBindings(config.Bindings, config.Properties, sets, warnings),
             UnknownValueDiagnostic = config.UnknownValueDiagnostic ?? true,
             Severity = ReadSeverity(config.Severity, warnings),
         };
@@ -131,16 +131,26 @@ internal sealed record ValueSettings
         return entries.ToImmutable();
     }
 
+    /// <summary>
+    /// The two sections that name a place in C#, as the one list the rest of the pack reads.
+    /// </summary>
+    /// <remarks>
+    /// <c>properties</c> is <c>bindings</c> with the two fields a member holding a value has no
+    /// answer for left off, so it folds in as a binding with no value position — which is exactly
+    /// what such a binding already meant. Nothing downstream has to learn a second shape, and a
+    /// property written either way behaves identically.
+    /// </remarks>
     private static ImmutableArray<ValueBinding> ReadBindings(
-        IReadOnlyList<ValueBindingEntry>? configured, ImmutableArray<ValueSetDefinition> sets,
-        List<string> warnings)
+        IReadOnlyList<ValueBindingEntry>? configured, IReadOnlyList<ValuePropertyEntry>? properties,
+        ImmutableArray<ValueSetDefinition> sets, List<string> warnings)
     {
-        if (configured is not { Count: > 0 })
+        if (configured is not { Count: > 0 } && properties is not { Count: > 0 })
             return [];
 
-        var bindings = ImmutableArray.CreateBuilder<ValueBinding>(configured.Count);
+        var bindings = ImmutableArray.CreateBuilder<ValueBinding>(
+            (configured?.Count ?? 0) + (properties?.Count ?? 0));
 
-        foreach (var entry in configured)
+        foreach (var entry in configured ?? [])
         {
             if (entry.Set is not { Length: > 0 } id)
             {
@@ -179,6 +189,38 @@ internal sealed record ValueSettings
                     : entry.ContainingType,
                 ParameterTypes = entry.ParameterTypes is { } types ? [.. types] : null,
                 ValueIndex = index,
+            });
+        }
+
+        foreach (var entry in properties ?? [])
+        {
+            if (entry.Set is not { Length: > 0 } id)
+            {
+                warnings.Add("valueSets.properties: an entry names no set; skipped.");
+                continue;
+            }
+
+            if (!sets.Any(set => set.Id.Equals(id, StringComparison.OrdinalIgnoreCase)))
+            {
+                warnings.Add($"valueSets.properties: no set named '{id}'; the property is skipped.");
+                continue;
+            }
+
+            if (entry.MemberName is not { Length: > 0 } member || string.IsNullOrWhiteSpace(member))
+            {
+                warnings.Add($"valueSets.properties for '{id}': no memberName; skipped.");
+                continue;
+            }
+
+            bindings.Add(new ValueBinding
+            {
+                SetId = id,
+                MemberName = member,
+                ContainingType = string.IsNullOrWhiteSpace(entry.ContainingType)
+                    ? null
+                    : entry.ContainingType,
+                ParameterTypes = null,
+                ValueIndex = null,
             });
         }
 

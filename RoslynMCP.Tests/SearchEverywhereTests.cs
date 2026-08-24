@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis;
+using RoslynMCP.Languages.DotSettings.Core;
 using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Lsp.Search;
@@ -442,6 +443,53 @@ public class SearchEverywhereTests
         Assert.All(
             solution.Projects,
             p => Assert.False(p.TryGetCompilation(out _), $"{p.Name} was compiled by the search"));
+    }
+
+    [Fact]
+    public async Task ADocumentWhoseFolderVanishedDoesNotFailTheSearch()
+    {
+        // A loaded project can keep listing a file whose folder was deleted on disk. The
+        // .DotSettings exclusion check runs on every candidate path, and it used to throw
+        // DirectoryNotFoundException out of the whole search for as long as the stale document
+        // stayed in the workspace — every Ctrl+T dead until the project reloaded.
+        var root = Directory.CreateTempSubdirectory("roslyn-sense-vanished-");
+        bool wasEnabled = DotSettingsExclusions.Enabled;
+        try
+        {
+            // A real solution file above the documents, so the exclusion check takes its full
+            // path: nearest-solution walk first, then the layer lookup.
+            File.WriteAllText(Path.Combine(root.FullName, "Sample.sln"), "");
+            DotSettingsExclusions.Enabled = true;
+            DotSettingsExclusions.Clear();
+
+            using var workspace = new AdhocWorkspace();
+            var projectId = ProjectId.CreateNewId();
+            var solution = workspace.CurrentSolution
+                .AddProject(ProjectInfo.Create(
+                    projectId, VersionStamp.Create(), "Vanishing", "Vanishing", LanguageNames.CSharp,
+                    filePath: Path.Combine(root.FullName, "Vanishing.csproj")))
+                .AddDocument(
+                    DocumentId.CreateNewId(projectId),
+                    "Widget.cs",
+                    "namespace VanishSpace; public class WidgetGateway { }",
+                    filePath: Path.Combine(root.FullName, "Widget.cs"))
+                .AddDocument(
+                    DocumentId.CreateNewId(projectId),
+                    "AssemblyInfo.cs",
+                    "public class GhostWidget { }",
+                    filePath: Path.Combine(root.FullName, "Deleted", "Properties", "AssemblyInfo.cs"));
+
+            var hits = await SearchEverywhere.SearchAsync(
+                solution, "Widget", maxResults: 50, default, includeFiles: false);
+
+            Assert.Contains(hits, h => h.Kind == SearchItemKind.Type && h.Name == "WidgetGateway");
+        }
+        finally
+        {
+            DotSettingsExclusions.Enabled = wasEnabled;
+            DotSettingsExclusions.Clear();
+            root.Delete(recursive: true);
+        }
     }
 
     private static async Task<IReadOnlyList<SearchHit>> SearchAsync(

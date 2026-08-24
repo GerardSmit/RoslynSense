@@ -1,4 +1,4 @@
-namespace RoslynMCP.Config;
+﻿namespace RoslynMCP.Config;
 
 /// <summary>
 /// Feature switches for the editor-facing paths. Static because the LSP handlers and the
@@ -47,6 +47,26 @@ public static class LspFeatureOptions
     /// behaviour, which is the better trade only on a solution too large to hold at once.
     /// </remarks>
     public static bool LoadEntireSolution { get; set; } = EnvFlag("ROSLYNMCP_LOAD_ENTIRE_SOLUTION", true);
+
+    /// <summary>
+    /// Reference counts in the gutter of a WebForms markup file — <c>.aspx</c>, <c>.ascx</c> and
+    /// the rest of the pack's files. Off by default, unlike every other switch here.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A markup file is close to nothing but control declarations, so the count lands on almost
+    /// every line: the gutter stops annotating the markup and starts laying it out, and a
+    /// user control is the extreme case. The number is still one gesture away on any <c>ID</c>,
+    /// by find-references — which is the better default, and why this one starts off.
+    /// </para>
+    /// <para>
+    /// Process-wide like the switches around it, though it describes an editor rather than a
+    /// solution: the per-connection channel is <c>roslynSense.languages.*</c> alone, and adding a
+    /// second one for a gutter is not worth what it costs. Two windows on one daemon share the
+    /// answer, and the last one to write it wins.
+    /// </para>
+    /// </remarks>
+    public static bool WebFormsCodeLens { get; set; } = EnvFlag("ROSLYNMCP_WEBFORMS_CODE_LENS", false);
 
     /// <summary>Per-document time budget for an analyzer pass.</summary>
     public static TimeSpan AnalyzerTimeout { get; set; } =

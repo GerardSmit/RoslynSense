@@ -78,12 +78,15 @@ declare namespace SettingsMsg {
         readonly type: string;
     }
 
-    /** One overload the configured class and member select. */
+    /** One member the configured class and member name select. */
     interface ShapeMatch {
         readonly declaredBy: string;
         readonly name: string;
         readonly signature: string;
+        /** Empty for a property or a field, which have no parameter list to tell them apart. */
         readonly parameters: readonly ShapeParameter[];
+        /** `method`, `indexer`, `property` or `field` — a list can hold more than one kind. */
+        readonly kind: string;
         /** Whether the configured parameter list selects this one. */
         readonly matched: boolean;
     }
@@ -201,6 +204,12 @@ declare namespace SettingsMsg {
         readonly containingType?: string;
         readonly memberName?: string;
         readonly parameterTypes?: readonly string[];
+        /**
+         * Which kinds of member the setting can name — a value set binds properties and fields as
+         * well as methods, and a lookup binds only methods. Absent or empty means methods and
+         * indexers, which is what every caller wanted before any of them asked for anything else.
+         */
+        readonly kinds?: readonly string[];
     }
 
     type ToHost =

@@ -58,11 +58,15 @@ public sealed record SettingChoicesResult(
 /// the member names the type offers.</param>
 /// <param name="ParameterTypes">Positional type names that must match, <c>"*"</c> for one
 /// parameter of any type. Null matches any arity.</param>
+/// <param name="Kinds">Which of <c>method</c>, <c>indexer</c>, <c>property</c> and <c>field</c> to
+/// answer with. Empty means methods and indexers, which is what a setting naming a call shape
+/// wants and what every caller wanted before a setting named a member holding a value.</param>
 public sealed record MemberShapeParams(
     [property: JsonPropertyName("containingType")] string? ContainingType = null,
     [property: JsonPropertyName("memberName")] string? MemberName = null,
     [property: JsonPropertyName("parameterTypes")] string[]? ParameterTypes = null,
-    [property: JsonPropertyName("maxResults")] int MaxResults = 20);
+    [property: JsonPropertyName("maxResults")] int MaxResults = 20,
+    [property: JsonPropertyName("kinds")] string[]? Kinds = null);
 
 public sealed record MemberShapeParameter(
     [property: JsonPropertyName("name")] string Name,
@@ -73,12 +77,16 @@ public sealed record MemberShapeParameter(
 /// <param name="Matched">Whether the configured signature selects this overload. Overloads that
 /// miss are still returned, because "there are three of these and you matched one" is the fact the
 /// page exists to show.</param>
+/// <param name="Kind">Which of <c>method</c>, <c>indexer</c>, <c>property</c> and <c>field</c> this
+/// is. A property and a field have no parameters at all, so a row about one is a different row from
+/// a row about an overload — and only the answer knows which it turned out to be.</param>
 public sealed record MemberShapeMatch(
     [property: JsonPropertyName("declaredBy")] string DeclaredBy,
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("signature")] string Signature,
     [property: JsonPropertyName("parameters")] MemberShapeParameter[] Parameters,
-    [property: JsonPropertyName("matched")] bool Matched);
+    [property: JsonPropertyName("matched")] bool Matched,
+    [property: JsonPropertyName("kind")] string Kind);
 
 /// <param name="ResolvedType">The type name as C# spells it, once a fragment resolved to exactly
 /// one type — what the field should be corrected to.</param>

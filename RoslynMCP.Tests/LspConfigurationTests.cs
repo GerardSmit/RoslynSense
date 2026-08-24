@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using RoslynMCP.Config;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Services.ProjectModel;
@@ -84,6 +84,29 @@ public class LspConfigurationTests
             """));
 
         Assert.False(changed);
+    }
+
+    [Fact]
+    public void TheMarkupGutterIsOffUntilTheEditorAsksForIt()
+    {
+        bool markupLenses = LspFeatureOptions.WebFormsCodeLens;
+        try
+        {
+            ConfigurationHandler.Apply(Settings("""{"roslynSense": {"webforms": {"codeLens": true}}}"""));
+            Assert.True(LspFeatureOptions.WebFormsCodeLens);
+
+            // A client too old to send the section leaves the value where it was, rather than
+            // being read as an editor that asked for it off.
+            ConfigurationHandler.Apply(Settings("""{"roslynSense": {"sourceLink": true}}"""));
+            Assert.True(LspFeatureOptions.WebFormsCodeLens);
+
+            ConfigurationHandler.Apply(Settings("""{"roslynSense": {"webforms": {"codeLens": false}}}"""));
+            Assert.False(LspFeatureOptions.WebFormsCodeLens);
+        }
+        finally
+        {
+            LspFeatureOptions.WebFormsCodeLens = markupLenses;
+        }
     }
 
     [Fact]

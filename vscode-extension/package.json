@@ -355,12 +355,12 @@
       },
       {
         "command": "roslynSense.changedMembers.showBlocks",
-        "title": "Show Individual Changes",
+        "title": "Individual Changes",
         "category": "RoslynSense"
       },
       {
         "command": "roslynSense.changedMembers.hideBlocks",
-        "title": "Hide Individual Changes",
+        "title": "✓ Individual Changes",
         "category": "RoslynSense"
       },
       {
@@ -375,12 +375,67 @@
       },
       {
         "command": "roslynSense.changedMembers.showTests",
-        "title": "Show Test Projects",
+        "title": "Test Projects",
         "category": "RoslynSense"
       },
       {
         "command": "roslynSense.changedMembers.hideTests",
-        "title": "Hide Test Projects",
+        "title": "✓ Test Projects",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.showOtherFiles",
+        "title": "Other Files",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.hideOtherFiles",
+        "title": "✓ Other Files",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.showReviewed",
+        "title": "Reviewed",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewSimpleTreeActive",
+        "title": "✓ View as Tree by File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewFullTreeActive",
+        "title": "✓ View as Tree by Namespace",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewFlatActive",
+        "title": "✓ View as Flat List",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.clickOpensDiffActive",
+        "title": "✓ Click Opens Git Diff",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.clickOpensEditorActive",
+        "title": "✓ Click Opens Editor",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.scopeUncommittedActive",
+        "title": "✓ Compare: Uncommitted Changes",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.scopeBranchActive",
+        "title": "✓ Compare: Whole Branch",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.hideReviewed",
+        "title": "✓ Reviewed",
         "category": "RoslynSense"
       },
       {
@@ -598,6 +653,31 @@
         "icon": "$(list-tree)"
       },
       {
+        "command": "roslynSense.solutionExplorer.followCurrentFileChecked",
+        "title": "✓ Follow Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showAllFilesChecked",
+        "title": "✓ Show All Files",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showIgnoredChecked",
+        "title": "✓ Show Ignored Folders",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.fileNesting",
+        "title": "File Nesting",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.fileNestingChecked",
+        "title": "✓ File Nesting",
+        "category": "RoslynSense"
+      },
+      {
         "command": "roslynSense.solutionExplorer.runProject",
         "title": "Run Project",
         "category": "RoslynSense",
@@ -659,11 +739,6 @@
           "id": "roslynSense",
           "title": "RoslynSense",
           "icon": "media/roslyn-sense.svg"
-        },
-        {
-          "id": "roslynSenseCoverage",
-          "title": "Test Coverage",
-          "icon": "media/coverage.svg"
         }
       ]
     },
@@ -673,16 +748,18 @@
           "id": "roslynSense.solutionExplorer",
           "name": "Solution",
           "contextualTitle": "Solution Explorer",
-          "icon": "media/solution.svg"
+          "icon": "media/solution.svg",
+          "initialSize": 4
         },
         {
           "id": "roslynSense.changedMembers",
           "name": "Changed Members",
           "contextualTitle": "Changed Members",
-          "icon": "$(git-compare)"
+          "icon": "$(git-compare)",
+          "initialSize": 1
         }
       ],
-      "roslynSenseCoverage": [
+      "test": [
         {
           "id": "roslynSense.coverage",
           "name": "Coverage",
@@ -734,11 +811,11 @@
         "url": "./schemas/launchSettings.schema.json"
       },
       {
-        "fileMatch": "**/roslynsense.json",
+        "fileMatch": "**/[Rr]oslyn[Ss]ense.json",
         "url": "./schemas/roslynsense.schema.json"
       },
       {
-        "fileMatch": "**/roslynsense.local.json",
+        "fileMatch": "**/[Rr]oslyn[Ss]ense.local.json",
         "url": "./schemas/roslynsense.schema.json"
       }
     ],
@@ -921,6 +998,62 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.changedMembers.showReviewed",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewSimpleTreeActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFullTreeActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFlatActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensDiffActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensEditorActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeUncommittedActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeBranchActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.followCurrentFileChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showAllFilesChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showIgnoredChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNesting",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNestingChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideReviewed",
+          "when": "false"
+        },
+        {
           "command": "roslynSense.changedMembers.markReviewed",
           "when": "false"
         },
@@ -1056,8 +1189,18 @@
           "group": "1_view@1"
         },
         {
+          "command": "roslynSense.changedMembers.viewSimpleTreeActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView == simpleTree",
+          "group": "1_view@1"
+        },
+        {
           "command": "roslynSense.changedMembers.viewFullTree",
           "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView != fullTree",
+          "group": "1_view@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFullTreeActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView == fullTree",
           "group": "1_view@2"
         },
         {
@@ -1066,44 +1209,89 @@
           "group": "1_view@3"
         },
         {
+          "command": "roslynSense.changedMembers.viewFlatActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView == flat",
+          "group": "1_view@3"
+        },
+        {
           "command": "roslynSense.changedMembers.clickOpensDiff",
-          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn == editor",
-          "group": "2_click@1"
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn != gitDiff",
+          "group": "3_click@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensDiffActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn == gitDiff",
+          "group": "3_click@2"
         },
         {
           "command": "roslynSense.changedMembers.clickOpensEditor",
-          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn == gitDiff",
-          "group": "2_click@1"
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn != editor",
+          "group": "3_click@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensEditorActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn == editor",
+          "group": "3_click@1"
         },
         {
           "command": "roslynSense.changedMembers.showBlocks",
           "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersBlocks",
-          "group": "1_view@4"
+          "group": "2_show@1"
         },
         {
           "command": "roslynSense.changedMembers.hideBlocks",
           "when": "view == roslynSense.changedMembers && roslynSense.changedMembersBlocks",
-          "group": "1_view@4"
+          "group": "2_show@1"
         },
         {
           "command": "roslynSense.changedMembers.showTests",
           "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersTests",
-          "group": "1_view@5"
+          "group": "2_show@2"
         },
         {
           "command": "roslynSense.changedMembers.hideTests",
           "when": "view == roslynSense.changedMembers && roslynSense.changedMembersTests",
-          "group": "1_view@5"
+          "group": "2_show@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.showOtherFiles",
+          "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersOtherFiles",
+          "group": "2_show@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideOtherFiles",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOtherFiles",
+          "group": "2_show@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.showReviewed",
+          "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersReviewed",
+          "group": "2_show@4"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideReviewed",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersReviewed",
+          "group": "2_show@4"
         },
         {
           "command": "roslynSense.changedMembers.scopeUncommitted",
-          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope == branch",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope != uncommitted",
+          "group": "0_scope@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeUncommittedActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope == uncommitted",
           "group": "0_scope@1"
         },
         {
           "command": "roslynSense.changedMembers.scopeBranch",
-          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope == uncommitted",
-          "group": "0_scope@1"
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope != branch",
+          "group": "0_scope@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeBranchActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope == branch",
+          "group": "0_scope@2"
         },
         {
           "command": "roslynSense.buildCoverageMap",
@@ -1131,7 +1319,7 @@
           "group": "1_view@1"
         },
         {
-          "command": "roslynSense.solutionExplorer.unfollowCurrentFile",
+          "command": "roslynSense.solutionExplorer.followCurrentFileChecked",
           "when": "view == roslynSense.solutionExplorer && roslynSense.revealActiveFile",
           "group": "1_view@1"
         },
@@ -1141,7 +1329,7 @@
           "group": "1_view@2"
         },
         {
-          "command": "roslynSense.solutionExplorer.hideNonProjectFiles",
+          "command": "roslynSense.solutionExplorer.showAllFilesChecked",
           "when": "view == roslynSense.solutionExplorer && roslynSense.showAllFiles",
           "group": "1_view@2"
         },
@@ -1151,13 +1339,18 @@
           "group": "1_view@3"
         },
         {
-          "command": "roslynSense.solutionExplorer.hideIgnored",
+          "command": "roslynSense.solutionExplorer.showIgnoredChecked",
           "when": "view == roslynSense.solutionExplorer && roslynSense.showIgnored",
           "group": "1_view@3"
         },
         {
-          "command": "roslynSense.solutionExplorer.toggleFileNesting",
-          "when": "view == roslynSense.solutionExplorer",
+          "command": "roslynSense.solutionExplorer.fileNesting",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.fileNesting",
+          "group": "1_view@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNestingChecked",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.fileNesting",
           "group": "1_view@4"
         },
         {
@@ -1174,12 +1367,12 @@
       "view/item/context": [
         {
           "command": "roslynSense.changedMembers.openDiff",
-          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|MemberReviewed|Block)$/",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|MemberReviewed|Block|OtherFile)$/",
           "group": "inline@1"
         },
         {
           "command": "roslynSense.changedMembers.openFile",
-          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|MemberReviewed|Block)$/",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|MemberReviewed|Block|OtherFile)$/",
           "group": "inline@2"
         },
         {
@@ -1436,7 +1629,7 @@
           ],
           "enumDescriptions": [
             "Group members under the file they are in.",
-            "Group members by namespace and type. A namespace with a single change is shown as one row instead of a group.",
+            "Group members by namespace and type.",
             "One flat list of members, ordered by file and line."
           ],
           "default": "simpleTree",
@@ -1459,6 +1652,16 @@
           "type": "boolean",
           "default": true,
           "description": "List changes in test projects too. Test files carry a beaker icon so the two halves of a diff stay tellable apart."
+        },
+        "roslynSense.changedMembers.showOtherFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "List changed files that are not C# too — markup like .aspx, contracts like .proto, configs. They have no members to break down, so each is one row that opens the file at its first changed line."
+        },
+        "roslynSense.changedMembers.showReviewed": {
+          "type": "boolean",
+          "default": true,
+          "description": "List changes that are already reviewed — ticked off by hand, or staged. Staged runs count as reviewed, so `git add` on a file, a hunk, or a line takes it off the list when this is off."
         },
         "roslynSense.changedMembers.showBlocks": {
           "type": "boolean",
@@ -1519,6 +1722,22 @@
           "minimum": 1,
           "maximum": 10000,
           "description": "How many children of one value to list before truncating."
+        },
+        "roslynSense.debugger.symbolInclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Load symbols only for modules matching these globs, when the list is non-empty. A glob without a path separator matches the module's file name (MyCompany.*.dll); with one, its full path. Empty loads symbols for every module not excluded."
+        },
+        "roslynSense.debugger.symbolExclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Never load symbols for modules matching these globs, taking precedence over the include list. A module without symbols cannot bind source breakpoints. ASP.NET's generated App_Web_*.dll page assemblies are already skipped without configuration."
         },
         "roslynSense.hotReload.applyOnSave": {
           "type": "boolean",
@@ -1636,6 +1855,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Reference counts, navigation and hover over `<appSettings>` and `<connectionStrings>` in `web.config` and `app.config`, joined to the code that reads them — `ConfigurationManager.AppSettings[\"…\"]` in C# and `<%$ AppSettings: … %>` in WebForms markup. Off disables it for this window; `roslynsense.json` is what turns it off for the whole solution. Binding redirects in the same files are unaffected — their warnings, the fix on each one, the installed version on hover over an `<assemblyIdentity>` and the lens that brings the whole file up to date are not this pack's and stay on. Takes effect on reload."
+        },
+        "roslynSense.webforms.codeLens": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show a reference count above every server control in `.aspx`, `.ascx` and the other WebForms markup files. Off by default: markup is close to nothing but control declarations, so a count lands on almost every line and spaces the file out rather than annotating it — the same number is one gesture away on any `ID` through Find All References. Applies to every window on this solution's server."
         },
         "roslynSense.solutionExplorer.fileIcons": {
           "type": "string",

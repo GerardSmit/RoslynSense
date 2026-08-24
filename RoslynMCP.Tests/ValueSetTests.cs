@@ -119,22 +119,37 @@ public class ValueSetTests
         Assert.Contains("Did you mean 'order_rejected'?", found.Message, StringComparison.Ordinal);
     }
 
-    /// <summary>The message has to make sense in the Problems panel, where the code is not visible.</summary>
+    /// <summary>
+    /// The message has to make sense in the Problems panel, where the code is not visible — and it
+    /// is a line in a list there, so the query stays out of it. What was written, how many values
+    /// there are and which set they belong to is the whole of what is actionable.
+    /// </summary>
     [Fact]
-    public async Task TheMessageSaysWhereTheValuesComeFrom()
+    public async Task TheMessageNamesTheSetAndLeavesTheQueryOutOfIt()
     {
         var set = new ValueSetDefinition
         {
             Id = "orderStatus",
             Connection = "shop",
-            Query = "SELECT [Code] FROM Shop_OrderStatus",
+            Query = "SELECT [Code] FROM Shop_OrderStatus ORDER BY [Code]",
         };
 
         var connections = new DbConnectionRegistry([Answering("shop", Rows(["order_rejected"]))]);
         var found = Assert.Single(
             await DiagnosticsAsync("order_bogus", Standard(set), connections));
 
-        Assert.Contains("shop: SELECT [Code] FROM Shop_OrderStatus", found.Message, StringComparison.Ordinal);
+        Assert.Equal(
+            "'order_bogus' is not one of the 1 values of 'orderStatus'.", found.Message);
+    }
+
+    /// <summary>The empty literal reads as a sentence rather than as a pair of quotes.</summary>
+    [Fact]
+    public async Task TheEmptyStringIsReportedByName()
+    {
+        var found = Assert.Single(await DiagnosticsAsync("", after: "var blank"));
+
+        Assert.Equal(
+            "The empty string is not one of the 10 values of 'orderStatus'.", found.Message);
     }
 
     /// <summary>The comparison the code does is usually case-insensitive, so the default is too.</summary>
@@ -227,14 +242,117 @@ public class ValueSetTests
         Assert.Equal("order_bogus", At(text, edit.Range));
     }
 
+    /// <summary>
+    /// The case the whole feature is for: two fresh quotes and a caret between them is somebody who
+    /// does not know the codes, and an empty literal is a different span from a written one.
+    /// </summary>
     [Fact]
-    public async Task HoverNamesTheMemberTheValueIsAboutAndWhereTheValuesLive()
+    public async Task CompletionInsideAnEmptyLiteralOffersTheValues()
+    {
+        var items = await CompletionAsync("", after: "var blank");
+
+        Assert.Contains(items, item => item.Label == "order_rejected");
+    }
+
+    [Fact]
+    public async Task CompletionInsideAnEmptyComparisonOffersTheValues()
+    {
+        var items = await CompletionAsync("", after: "var compared");
+
+        Assert.Contains(items, item => item.Label == "order_rejected");
+    }
+
+    /// <summary>
+    /// Where the edit lands is the whole of it. An edit that starts on the opening quote is one the
+    /// client filters its own list against a <c>"</c> with, which is a list of nothing — and
+    /// committing it would take the quotes with it.
+    /// </summary>
+    [Fact]
+    public async Task CompletingAnEmptyLiteralWritesBetweenTheQuotesRatherThanOverThem()
+    {
+        var (items, text) = await CompletionWithTextAsync("", after: "var blank");
+        var edit = Assert.Single(items, item => item.Label == "order_rejected").TextEdit;
+
+        Assert.NotNull(edit);
+        Assert.Equal("", At(text, edit.Range));
+        Assert.Equal("\"\"", Around(text, edit.Range));
+    }
+
+    /// <summary>Half a code typed replaces the half, not the quotes around it.</summary>
+    [Fact]
+    public async Task CompletingAPartlyTypedLiteralReplacesOnlyWhatIsTyped()
+    {
+        var (items, text) = await CompletionWithTextAsync("order_", after: "var typing");
+        var edit = Assert.Single(items, item => item.Label == "order_rejected").TextEdit;
+
+        Assert.NotNull(edit);
+        Assert.Equal("order_", At(text, edit.Range));
+    }
+
+    /// <summary>
+    /// The squiggle keeps the quotes even though the edit does not: an empty literal has nothing
+    /// between them to underline, and an invisible error is not one.
+    /// </summary>
+    [Fact]
+    public async Task TheDiagnosticOnAnEmptyLiteralUnderlinesSomethingVisible()
+    {
+        var (reported, text) = await DiagnosticsWithTextAsync("", after: "var blank");
+
+        Assert.Equal("\"\"", At(text, Assert.Single(reported).Range));
+    }
+
+    [Fact]
+    public async Task HoverLeadsWithWhatTheCodeMeans()
+    {
+        var set = new ValueSetDefinition { Id = "orderStatus", Query = "SELECT [Code], [Name] FROM x" };
+        var connections = new DbConnectionRegistry(
+        [
+            Answering("shop", Rows(
+                ["order_rejected", "order_subpat"], labels: ["Rejected by the shop", "Held"])),
+        ]);
+
+        var hover = await HoverAsync("order_rejected", Standard(set), connections);
+
+        Assert.NotNull(hover);
+        Assert.Equal(
+            "**order_rejected** — Rejected by the shop\n\nOne of the 2 `orderStatus` values.",
+            hover.Contents.Value);
+    }
+
+    /// <summary>
+    /// A set whose query selects one column has no labels, and then there is nothing to say beyond
+    /// which set this belongs to — so the tooltip says that and stops.
+    /// </summary>
+    [Fact]
+    public async Task HoverOnASetWithNoLabelsSaysOnlyWhichSetItIs()
     {
         var hover = await HoverAsync("order_rejected");
 
         Assert.NotNull(hover);
-        Assert.Contains("OrderController.OrderStatus_Get", hover.Contents.Value, StringComparison.Ordinal);
-        Assert.Contains("roslynsense.json", hover.Contents.Value, StringComparison.Ordinal);
+        Assert.Equal("**order_rejected**\n\nOne of the 10 `orderStatus` values.", hover.Contents.Value);
+    }
+
+    /// <summary>
+    /// Neither the member nor the query. The member is the identifier two characters away and the
+    /// query is a fact about the configuration; both used to push the label out of sight.
+    /// </summary>
+    [Fact]
+    public async Task HoverLeavesOutTheMemberAndTheQuery()
+    {
+        var set = new ValueSetDefinition
+        {
+            Id = "orderStatus",
+            Connection = "shop",
+            Query = "SELECT [Code] FROM Shop_OrderStatus",
+        };
+
+        var connections = new DbConnectionRegistry([Answering("shop", Rows(["order_rejected"]))]);
+        var hover = await HoverAsync("order_rejected", Standard(set), connections);
+
+        Assert.NotNull(hover);
+        Assert.DoesNotContain("Shop_OrderStatus", hover.Contents.Value, StringComparison.Ordinal);
+        Assert.DoesNotContain("SELECT", hover.Contents.Value, StringComparison.Ordinal);
+        Assert.DoesNotContain("OrderStatus_Get", hover.Contents.Value, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -385,6 +503,117 @@ public class ValueSetTests
         Assert.Contains(warnings, warning => warning.Contains("'typo'", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// A property entry is a binding with no value position, which is what such a binding already
+    /// meant — so the rest of the pack never learns there were two sections.
+    /// </summary>
+    [Fact]
+    public void APropertyEntryBecomesABindingThatHoldsTheValue()
+    {
+        var warnings = new List<string>();
+
+        var settings = ValueSettings.Resolve(
+            enabled: true,
+            new ValueSetsConfig
+            {
+                Sets = [new ValueSetEntry { Id = "orderStatus", Values = ["order_shipped"] }],
+                Properties =
+                [
+                    new ValuePropertyEntry
+                    {
+                        Set = "orderStatus",
+                        ContainingType = "Contoso.Shop.OrderStatus",
+                        MemberName = "Code",
+                    },
+                ],
+            },
+            warnings);
+
+        var binding = Assert.Single(settings.Bindings);
+
+        Assert.Equal("orderStatus", binding.SetId);
+        Assert.Equal("Contoso.Shop.OrderStatus", binding.ContainingType);
+        Assert.Equal("Code", binding.MemberName);
+        Assert.Null(binding.ValueIndex);
+        Assert.Null(binding.ParameterTypes);
+        Assert.Empty(warnings);
+    }
+
+    /// <summary>Both sections end up in the one list, in the order they were declared.</summary>
+    [Fact]
+    public void MethodsAndPropertiesEndUpInTheSameList()
+    {
+        var warnings = new List<string>();
+
+        var settings = ValueSettings.Resolve(
+            enabled: true,
+            new ValueSetsConfig
+            {
+                Sets = [new ValueSetEntry { Id = "orderStatus", Values = ["order_shipped"] }],
+                Bindings =
+                [
+                    new ValueBindingEntry
+                    {
+                        Set = "orderStatus", MemberName = "SetStatus", ValueIndex = 0,
+                    },
+                ],
+                Properties =
+                [
+                    new ValuePropertyEntry { Set = "orderStatus", MemberName = "Code" },
+                ],
+            },
+            warnings);
+
+        Assert.Equal(["SetStatus", "Code"], settings.Bindings.Select(binding => binding.MemberName));
+        Assert.Empty(warnings);
+    }
+
+    /// <summary>
+    /// The same strictness the bindings get, for the same reason: an entry naming a set that is not
+    /// there binds nothing and says nothing about why.
+    /// </summary>
+    [Fact]
+    public void APropertyNamingASetThatIsNotThereIsDroppedWithAWarning()
+    {
+        var warnings = new List<string>();
+
+        var settings = ValueSettings.Resolve(
+            enabled: true,
+            new ValueSetsConfig
+            {
+                Sets = [new ValueSetEntry { Id = "orderStatus", Values = ["order_shipped"] }],
+                Properties = [new ValuePropertyEntry { Set = "typo", MemberName = "Code" }],
+            },
+            warnings);
+
+        Assert.Empty(settings.Bindings);
+        Assert.Contains(
+            warnings,
+            warning => warning.Contains("valueSets.properties", StringComparison.Ordinal)
+                && warning.Contains("'typo'", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void APropertyWithNoMemberNameIsDroppedWithAWarning()
+    {
+        var warnings = new List<string>();
+
+        var settings = ValueSettings.Resolve(
+            enabled: true,
+            new ValueSetsConfig
+            {
+                Sets = [new ValueSetEntry { Id = "orderStatus", Values = ["order_shipped"] }],
+                Properties = [new ValuePropertyEntry { Set = "orderStatus" }],
+            },
+            warnings);
+
+        Assert.Empty(settings.Bindings);
+        Assert.Contains(
+            warnings,
+            warning => warning.Contains("valueSets.properties", StringComparison.Ordinal)
+                && warning.Contains("no memberName", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void ASetWithNeitherAQueryNorValuesIsDroppedWithAWarning()
     {
@@ -463,6 +692,13 @@ public class ValueSetTests
                     var typo = OrderStatus_Get("order_rejcted");
                     var shouted = OrderStatus_Get("ORDER_REJECTED");
                     var two = OrderStatus_Get("order_two_args", 1);
+
+                    // The caret has just arrived and nothing is written yet, which is the moment
+                    // the list is for. Three of them, because an empty literal is a different span
+                    // from a written one and each surface has to survive it.
+                    var blank = OrderStatus_Get("");
+                    var typing = OrderStatus_Get("order_");
+                    var compared = status.Code == "";
 
                     if (status?.Code is "order_ispat_one" or "order_ispat_two") { }
                     if (status.Code == "order_bogus") { }
@@ -544,23 +780,34 @@ public class ValueSetTests
     }
 
     private static async Task<IReadOnlyList<LspDiagnostic>> DiagnosticsAsync(
-        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null)
+        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null,
+        string? after = null)
     {
-        var (pack, context, _) = await EmbeddedAsync(value, settings, connections);
-        return await pack.DiagnosticsAsync(context, default);
+        var (found, _) = await DiagnosticsWithTextAsync(value, settings, connections, after);
+        return found;
+    }
+
+    private static async Task<(IReadOnlyList<LspDiagnostic> Found, string Text)> DiagnosticsWithTextAsync(
+        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null,
+        string? after = null)
+    {
+        var (pack, context, text) = await EmbeddedAsync(value, settings, connections, after);
+        return (await pack.DiagnosticsAsync(context, default), text);
     }
 
     private static async Task<IReadOnlyList<CompletionItem>> CompletionAsync(
-        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null)
+        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null,
+        string? after = null)
     {
-        var (items, _) = await CompletionWithTextAsync(value, settings, connections);
+        var (items, _) = await CompletionWithTextAsync(value, settings, connections, after);
         return items;
     }
 
     private static async Task<(IReadOnlyList<CompletionItem> Items, string Text)> CompletionWithTextAsync(
-        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null)
+        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null,
+        string? after = null)
     {
-        var (pack, context, text) = await EmbeddedAsync(value, settings, connections);
+        var (pack, context, text) = await EmbeddedAsync(value, settings, connections, after);
 
         var list = await pack.CompletionAsync(
             context,
@@ -571,16 +818,18 @@ public class ValueSetTests
     }
 
     private static async Task<Hover?> HoverAsync(
-        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null)
+        string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null,
+        string? after = null)
     {
-        var (pack, context, _) = await EmbeddedAsync(value, settings, connections);
+        var (pack, context, _) = await EmbeddedAsync(value, settings, connections, after);
         return await pack.HoverAsync(context, default);
     }
 
     private static async Task<(ValuesLanguage Pack, EmbeddedStringContext Context, string Text)> EmbeddedAsync(
-        string value, ValueSettings? settings, DbConnectionRegistry? connections)
+        string value, ValueSettings? settings, DbConnectionRegistry? connections,
+        string? after = null)
     {
-        var (pack, document, token, model, text) = await SetupAsync(value, settings, connections);
+        var (pack, document, token, model, text) = await SetupAsync(value, settings, connections, after);
 
         // Through DetectAsync, so every feature test covers the claim as well as the answer.
         Assert.Equal("ValueSet", await pack.DetectAsync(document, token, model, default));
@@ -589,8 +838,12 @@ public class ValueSetTests
             pack, "ValueSet", [], document, model, token, token.SpanStart + 1), text);
     }
 
+    /// <param name="after">Text the literal comes after, for a value the fixture writes more than
+    /// once — <c>""</c> being all of them at once.</param>
     private static async Task<(ValuesLanguage Pack, Document Document, SyntaxToken Token, SemanticModel Model, string Text)>
-        SetupAsync(string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null)
+        SetupAsync(
+            string value, ValueSettings? settings = null, DbConnectionRegistry? connections = null,
+            string? after = null)
     {
         var workspace = new AdhocWorkspace();
         var projectId = ProjectId.CreateNewId();
@@ -608,7 +861,15 @@ public class ValueSetTests
         var root = await document.GetSyntaxRootAsync(default);
 
         string literal = $"\"{value}\"";
-        int index = text.IndexOf(literal, StringComparison.Ordinal);
+
+        int from = 0;
+        if (after is { Length: > 0 })
+        {
+            from = text.IndexOf(after, StringComparison.Ordinal);
+            Assert.True(from >= 0, $"'{after}' is not in the fixture");
+        }
+
+        int index = text.IndexOf(literal, from, StringComparison.Ordinal);
         Assert.True(index >= 0, $"{literal} is not in the fixture");
 
         return (
@@ -622,12 +883,25 @@ public class ValueSetTests
     /// <summary>The text a range covers, for asserting where an edit or a squiggle landed.</summary>
     private static string At(string text, RoslynMCP.Lsp.Protocol.Range range)
     {
+        var (start, end) = Bounds(text, range);
+        return text[start..end];
+    }
+
+    /// <summary>The same with a character on either side, which is the only way to say where an
+    /// empty range sits.</summary>
+    private static string Around(string text, RoslynMCP.Lsp.Protocol.Range range)
+    {
+        var (start, end) = Bounds(text, range);
+        return text[(start - 1)..(end + 1)];
+    }
+
+    private static (int Start, int End) Bounds(string text, RoslynMCP.Lsp.Protocol.Range range)
+    {
         var lines = Microsoft.CodeAnalysis.Text.SourceText.From(text).Lines;
 
-        int start = lines[range.Start.Line].Start + range.Start.Character;
-        int end = lines[range.End.Line].Start + range.End.Character;
-
-        return text[start..end];
+        return (
+            lines[range.Start.Line].Start + range.Start.Character,
+            lines[range.End.Line].Start + range.End.Character);
     }
 
     // ---- A database that answers whatever the test says ---------------------------------------------

@@ -383,6 +383,16 @@ internal static class ValueSiteSearch
     /// The literal without its quotes, which is what the value actually is. Falls back to the whole
     /// token for a shape the prefix walk does not recognise.
     /// </summary>
+    /// <remarks>
+    /// An empty literal is nothing but its delimiters, so counting the run of quotes counts the
+    /// closing ones too: <c>""</c> reads as two opening quotes with no room for content behind
+    /// them. Half the run is the opening delimiter, and what is left between the halves is an empty
+    /// span — a caret position, which is the right answer and not the same as having no answer.
+    /// Returning the whole token there instead would hand completion an edit that swallows the
+    /// quotes, and a client filters the list against the text in front of the caret, so an edit
+    /// starting one character early leaves every item matched against a <c>"</c> and none of them
+    /// shown.
+    /// </remarks>
     private static TextSpan Content(SyntaxToken token)
     {
         string text = token.Text;
@@ -391,11 +401,22 @@ internal static class ValueSiteSearch
         while (start < text.Length && (text[start] == '@' || text[start] == '$'))
             start++;
 
-        int quotes = 0;
-        while (start + quotes < text.Length && text[start + quotes] == '"')
-            quotes++;
+        int run = 0;
+        while (start + run < text.Length && text[start + run] == '"')
+            run++;
 
-        return quotes == 0 || text.Length < start + (2 * quotes)
+        int quotes = Math.Min(run, (text.Length - start) / 2);
+
+        // Capping the run below what was counted is only ever right when the literal is empty —
+        // the halves are its two delimiters. With content behind them the run was not all
+        // delimiters either, but there is no telling where the opening one ends: a verbatim
+        // literal whose content starts with an escaped quote (`@"""x"`) reads as a three-quote
+        // run over a one-quote delimiter, and any split invented here puts the span down inside
+        // the escape. That shape keeps the whole-token fallback it always had.
+        if (quotes < run && text.Length - start - 2 * quotes > 0)
+            return token.Span;
+
+        return quotes == 0
             ? token.Span
             : TextSpan.FromBounds(token.SpanStart + start + quotes, token.Span.End - quotes);
     }

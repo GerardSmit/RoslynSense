@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Completion;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Languages.DotSettings.Core;
@@ -164,7 +165,26 @@ public static class SearchEverywhere
     /// </para>
     /// </remarks>
     public static async Task<IReadOnlyList<IMethodSymbol>> FindMethodsAsync(
-        Solution solution, string query, int maxResults, CancellationToken ct)
+        Solution solution, string query, int maxResults, CancellationToken ct) =>
+        [.. (await FindMembersAsync(
+            solution, query, maxResults,
+            symbol => symbol is IMethodSymbol { MethodKind: MethodKind.Ordinary }
+                && !symbol.IsImplicitlyDeclared,
+            ct)).Cast<IMethodSymbol>()];
+
+    /// <summary>
+    /// The same, for whichever kinds of member the caller accepts — a property or a field as
+    /// readily as a method.
+    /// </summary>
+    /// <remarks>
+    /// Configuration names members that are not methods: a set of allowed string values is carried
+    /// as often by an entity's <c>Code</c> property as by a call taking one. The predicate rather
+    /// than a kind flag because the callers already own the question — a setting that accepts a
+    /// property but not an indexer is answering it more precisely than an enum here could.
+    /// </remarks>
+    public static async Task<IReadOnlyList<ISymbol>> FindMembersAsync(
+        Solution solution, string query, int maxResults, Func<ISymbol, bool> accept,
+        CancellationToken ct)
     {
         var request = SearchQuery.Parse(query, allowFiles: false, forcedOnly: SearchItemKind.Member);
         if (request is null)
@@ -177,26 +197,25 @@ public static class SearchEverywhere
         var symbols = await SymbolFinder.FindSourceDeclarationsAsync(
             solution, name => matcher.Match(name) is not null, SymbolFilter.Member, ct);
 
-        var found = new List<(int Score, IMethodSymbol Method)>();
+        var found = new List<(int Score, ISymbol Member)>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var symbol in symbols)
         {
             ct.ThrowIfCancellationRequested();
 
-            if (symbol is not IMethodSymbol { MethodKind: MethodKind.Ordinary } method
-                || method.IsImplicitlyDeclared
-                || matcher.Match(method.Name) is not { } match
+            if (!accept(symbol)
+                || matcher.Match(symbol.Name) is not { } match
                 || !request.TryScoreContainer(
-                    method.ContainingType?.ToDisplayString()
-                        ?? method.ContainingNamespace?.ToDisplayString()
+                    symbol.ContainingType?.ToDisplayString()
+                        ?? symbol.ContainingNamespace?.ToDisplayString()
                         ?? "",
                     out int containerScore))
             {
                 continue;
             }
 
-            var location = method.Locations.FirstOrDefault(l => l.IsInSource);
+            var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
             if (location?.SourceTree?.FilePath is not { Length: > 0 } path
                 || SearchFileRules.IsExcluded(path)
                 || DotSettingsExclusions.IsExcluded(path))
@@ -204,26 +223,44 @@ public static class SearchEverywhere
                 continue;
             }
 
-            // One file compiled for several target frameworks declares the same method once per
+            // One file compiled for several target frameworks declares the same member once per
             // project, and a list offering the same call three times is a list nobody trusts.
-            if (!seen.Add(method.ToDisplayString()))
+            if (!seen.Add(symbol.ToDisplayString()))
                 continue;
 
             found.Add((
                 Score(
                     match.Score,
-                    Tier(DeclaredSymbolInfoKind.Method, SearchItemKind.Member, match.Score),
+                    Tier(DeclaredKind(symbol), SearchItemKind.Member, match.Score),
                     containerScore,
                     SearchFileRules.IsGenerated(path)),
-                method));
+                symbol));
         }
 
         found.Sort((x, y) => x.Score != y.Score
             ? x.Score.CompareTo(y.Score)
-            : string.CompareOrdinal(x.Method.ToDisplayString(), y.Method.ToDisplayString()));
+            : string.CompareOrdinal(x.Member.ToDisplayString(), y.Member.ToDisplayString()));
 
-        return [.. found.Take(maxResults).Select(entry => entry.Method)];
+        return [.. found.Take(maxResults).Select(entry => entry.Member)];
     }
+
+    /// <summary>
+    /// The bound symbol said in the terms the ranking uses, which are the parser's — so a method
+    /// keeps the tier a method has and a property does not borrow it.
+    /// </summary>
+    private static DeclaredSymbolInfoKind DeclaredKind(ISymbol symbol) => symbol switch
+    {
+        IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor } =>
+            DeclaredSymbolInfoKind.Constructor,
+        IMethodSymbol { IsExtensionMethod: true } => DeclaredSymbolInfoKind.ExtensionMethod,
+        IMethodSymbol => DeclaredSymbolInfoKind.Method,
+        IPropertySymbol { IsIndexer: true } => DeclaredSymbolInfoKind.Indexer,
+        IPropertySymbol => DeclaredSymbolInfoKind.Property,
+        IFieldSymbol { IsConst: true } => DeclaredSymbolInfoKind.Constant,
+        IFieldSymbol => DeclaredSymbolInfoKind.Field,
+        IEventSymbol => DeclaredSymbolInfoKind.Event,
+        _ => DeclaredSymbolInfoKind.Field,
+    };
 
     /// <summary>
     /// Score first, then the shortest name — <c>List</c> before <c>ListView</c> for the same
@@ -357,7 +394,17 @@ public static class SearchEverywhere
 
         // Only a document that matched something pays for its text. The index stores spans as
         // offsets, and a line-and-column is what a client can open.
-        var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+        SourceText text;
+        try
+        {
+            text = await document.GetTextAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Same contract as the index above: a file deleted out from under the workspace is
+            // this document's rows lost, not the search's.
+            return [];
+        }
         string path = document.FilePath!;
         bool isGenerated = SearchFileRules.IsGenerated(path);
 

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using RoslynMCP.Config;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
@@ -86,6 +86,15 @@ internal static class ConfigurationHandler
         if (Bool(section, "referenceSource") is { } referenceSource)
             LspFeatureOptions.ReferenceSource = referenceSource;
 
+        // Sent as a section, the way the debugger switches are, so an older server ignores one
+        // property rather than a name it has no meaning for.
+        if (section.TryGetProperty("webforms", out var webforms)
+            && webforms.ValueKind == JsonValueKind.Object
+            && Bool(webforms, "codeLens") is { } markupLenses)
+        {
+            LspFeatureOptions.WebFormsCodeLens = markupLenses;
+        }
+
         ApplyFileNestingRules(section);
 
         if (String(section, "workspaceDiagnostics") is { Length: > 0 } scope
@@ -133,6 +142,8 @@ internal static class ConfigurationHandler
         {
             updated.MaxChildren = count;
         }
+        updated.SymbolInclude = Strings(debugger, "symbolInclude") ?? current.SymbolInclude;
+        updated.SymbolExclude = Strings(debugger, "symbolExclude") ?? current.SymbolExclude;
 
         if (DebuggerViewOptions.Describe(current, updated).Count == 0)
             return;
@@ -146,7 +157,17 @@ internal static class ConfigurationHandler
     /// </summary>
     public static async Task HandleAsync(DidChangeConfigurationParams p, CancellationToken ct)
     {
-        if (!Apply(p.Settings))
+        // Compared around Apply rather than reported by it: the return value is about the
+        // analyzer caches, and this invalidates nothing — the lenses simply have to be asked for
+        // again, since a markup file the user is looking at keeps the gutter it was given until
+        // the client re-pulls.
+        bool markupLenses = LspFeatureOptions.WebFormsCodeLens;
+        bool analyzersChanged = Apply(p.Settings);
+
+        if (markupLenses != LspFeatureOptions.WebFormsCodeLens)
+            await LspSessionRegistry.RequestRefreshAsync(RefreshKind.CodeLens, ct);
+
+        if (!analyzersChanged)
             return;
 
         // Severity changes are invisible until the cached results are gone: every entry was
@@ -256,6 +277,15 @@ internal static class ConfigurationHandler
     private static string? String(JsonElement section, string name) =>
         section.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
+            : null;
+
+    /// <summary>An array of strings, or null when absent — so an unmentioned setting keeps its
+    /// current value while an explicit <c>[]</c> clears it.</summary>
+    private static string[]? Strings(JsonElement section, string name) =>
+        section.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Array
+            ? [.. value.EnumerateArray()
+                .Where(static e => e.ValueKind == JsonValueKind.String)
+                .Select(static e => e.GetString()!)]
             : null;
 }
 

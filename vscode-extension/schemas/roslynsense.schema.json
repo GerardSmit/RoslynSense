@@ -191,7 +191,11 @@
               "rank"
             ],
             "title": "Override",
-            "description": "One customization segment and how strongly it wins."
+            "description": "One customization segment and how strongly it wins.",
+            "x-summary": [
+              "pattern",
+              "rank"
+            ]
           },
           "title": "Overrides",
           "description": "Customization segments beside a base file, such as DNN's `Portal-*`. Replaces the preset's set rather than adding to it."
@@ -255,7 +259,31 @@
               }
             },
             "title": "Convention",
-            "description": "One way of getting from a call site to the resx file it reads."
+            "description": "One way of getting from a call site to the resx file it reads.",
+            "x-exclusive": [
+              {
+                "alternatives": [
+                  {
+                    "title": "Folder beside the file",
+                    "fields": [
+                      "siblingFolder"
+                    ]
+                  },
+                  {
+                    "title": "Folder at the project root",
+                    "fields": [
+                      "rootFolder"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "x-summary": [
+              "id",
+              "siblingFolder",
+              "rootFolder",
+              "fixedName"
+            ]
           },
           "title": "Conventions",
           "description": "Named ways of turning a call-site file into a resx base name. Merged into the preset's by id."
@@ -348,7 +376,13 @@
                 ],
                 "pattern": "^-?(?:0|[1-9]\\d*)$",
                 "title": "File name is parameter",
-                "description": "Which parameter carries it, counted from 0. Only used when the file name comes from an argument."
+                "description": "Which parameter carries it, counted from 0. Only used when the file name comes from an argument.",
+                "x-when": {
+                  "field": "rootSource",
+                  "equals": [
+                    "argument"
+                  ]
+                }
               },
               "rootConstant": {
                 "type": [
@@ -356,7 +390,13 @@
                   "null"
                 ],
                 "title": "Fixed name",
-                "description": "The file name itself, for a helper that always reads one file. Only used when the file name is fixed."
+                "description": "The file name itself, for a helper that always reads one file. Only used when the file name is fixed.",
+                "x-when": {
+                  "field": "rootSource",
+                  "equals": [
+                    "constant"
+                  ]
+                }
               },
               "defaultKeySuffix": {
                 "type": [
@@ -392,7 +432,12 @@
               "positions": {
                 "keyIndex": "key",
                 "rootIndex": "file name"
-              }
+              },
+              "label": "Method",
+              "memberKinds": [
+                "method",
+                "indexer"
+              ]
             }
           },
           "title": "Lookups",
@@ -552,7 +597,31 @@
               }
             },
             "title": "Set",
-            "description": "One list of codes, and where it comes from."
+            "description": "One list of codes, and where it comes from.",
+            "x-exclusive": [
+              {
+                "alternatives": [
+                  {
+                    "title": "From a database query",
+                    "fields": [
+                      "connection",
+                      "query"
+                    ]
+                  },
+                  {
+                    "title": "Values written here",
+                    "fields": [
+                      "values"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "x-summary": [
+              "id",
+              "query",
+              "values"
+            ]
           },
           "title": "Sets",
           "description": "Where the lists of codes come from. Each set is a query against a configured database connection, or the codes written out here."
@@ -618,8 +687,8 @@
                 "description": "Which parameter carries the value, counted from 0. Leave empty for a property, a field, or a method whose return value is one of the set."
               }
             },
-            "title": "Binding",
-            "description": "One member, and the set its values come from. A method with a parameter position takes the value as that argument; a method without one returns it; a property or field holds it, and every literal compared or assigned to it is checked.",
+            "title": "Method",
+            "description": "One method, and the set its values come from. Give a parameter position and the value is that argument; leave it empty and the method returns a code, so what is checked is every literal its result is compared against.",
             "x-shape": {
               "kind": "member",
               "type": "containingType",
@@ -627,11 +696,69 @@
               "parameters": "parameterTypes",
               "positions": {
                 "valueIndex": "value"
-              }
+              },
+              "label": "Method",
+              "memberKinds": [
+                "method",
+                "indexer"
+              ]
             }
           },
-          "title": "Where they are written",
-          "description": "The places in C# that carry a code — the method that takes one, the property that holds one. Every literal written there is checked against the list."
+          "title": "Methods",
+          "description": "The methods that carry a code — the one that takes it as an argument, the one that returns it. Every literal written at the call is checked against the list."
+        },
+        "properties": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "set": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Set",
+                "description": "Which list above this member's codes come from.",
+                "x-choices": "server"
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the property or field. Leave empty to match the member on any class, which is the escape hatch for a code carried by a `Code` property on a dozen entities."
+              },
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Property",
+                "description": "The property or field name."
+              }
+            },
+            "title": "Property",
+            "description": "One property or field, and the set its values come from. `order.Status.Code == \"SHIPPED\"` is the shape this is for: nothing is called, so every literal the member is compared or assigned is what gets checked.",
+            "x-shape": {
+              "kind": "member",
+              "type": "containingType",
+              "member": "memberName",
+              "label": "Property",
+              "memberKinds": [
+                "property",
+                "field"
+              ]
+            }
+          },
+          "title": "Properties",
+          "description": "The properties and fields that hold a code — an order's `Status.Code`, a document's `TypeCode`. Every literal compared or assigned to one of them is checked against the list."
         },
         "unknownValueDiagnostic": {
           "type": [
@@ -656,7 +783,7 @@
         }
       },
       "title": "Allowed string values",
-      "description": "Some strings are really codes: an order status, a document type, a country. The list of codes is in a database table or a spreadsheet somewhere, and nothing in C# knows it, so `\"SHIPED\"` compiles and fails at run time. Say where the list comes from under Sets, and which method or property carries a code under Where they are written — those literals then complete from the list, hover with what each code means, and are reported when the list does not have them."
+      "description": "Some strings are really codes: an order status, a document type, a country. The list of codes is in a database table or a spreadsheet somewhere, and nothing in C# knows it, so `\"SHIPED\"` compiles and fails at run time. Say where the list comes from under Sets, then name the methods and the properties that carry a code — those literals then complete from the list, hover with what each code means, and are reported when the list does not have them."
     },
     "webForms": {
       "type": "object",
@@ -710,7 +837,11 @@
               }
             },
             "title": "Attribute",
-            "description": "One attribute, and how its value reads."
+            "description": "One attribute, and how its value reads.",
+            "x-summary": [
+              "tag",
+              "attribute"
+            ]
           },
           "title": "Data expressions",
           "description": "The attributes to read as a path from the bound item. A grid's `SortExpression` and `DataField` are the usual ones."
@@ -768,6 +899,14 @@
           "title": "DebuggerBrowsable",
           "description": "Honour `DebuggerBrowsableAttribute` when listing members."
         },
+        "callToString": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Call ToString",
+          "description": "Show values through their own `ToString` override when no attribute claims them — VS's \"call string-conversion function on objects in variables windows\"."
+        },
         "justMyCode": {
           "type": [
             "boolean",
@@ -793,6 +932,34 @@
           "pattern": "^-?(?:0|[1-9]\\d*)$",
           "title": "Max children",
           "description": "How many children of one value to list before truncating. Defaults to 100."
+        },
+        "symbolInclude": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Load symbols only for",
+          "description": "Globs for the only modules whose symbols load, when the list is non-empty. A glob without a path separator matches the module's file name (`MyCompany.*.dll`); with one, its full path (`**\\bin\\**`). Empty loads symbols for every module not excluded."
+        },
+        "symbolExclude": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Never load symbols for",
+          "description": "Globs for modules whose symbols never load, taking precedence over the include list. A module without symbols cannot bind source breakpoints — the same trade VS's \"Load all modules, unless excluded\" makes. ASP.NET's generated `App_Web_*.dll` page assemblies are already skipped without any configuration."
         }
       },
       "title": "Debugger view",

@@ -44,7 +44,7 @@ internal sealed partial class ValuesLanguage : IEmbeddedDiagnosticProvider
         return
         [
             new LspDiagnostic(
-                LspConverters.ToRange(text.Lines, site.Span),
+                LspConverters.ToRange(text.Lines, Shown(context, site)),
                 LspConverters.ToLspSeverity(Settings.Severity),
                 UnknownValue,
                 DiagnosticSource,
@@ -53,12 +53,14 @@ internal sealed partial class ValuesLanguage : IEmbeddedDiagnosticProvider
     }
 
     /// <summary>
-    /// What is wrong, where the answer lives, and the value that was probably meant.
+    /// What is wrong, and the value that was probably meant.
     /// </summary>
     /// <remarks>
-    /// The origin is in the message rather than only on hover because this diagnostic is read in
-    /// the Problems panel as often as in the editor, and "not a value of orderStatus" is not
-    /// actionable to someone who has never seen that name before. The query is.
+    /// Deliberately not where the values come from. A message is read in a list in the Problems
+    /// panel, one line among hundreds, and a <c>SELECT</c> with a join and an <c>ORDER BY</c> in it
+    /// pushes the three things that matter — what was written, how many values there are, which set
+    /// — off the end of that line. Nobody fixes this diagnostic by reading the query; they fix it by
+    /// taking the suggestion or opening the completion list.
     /// </remarks>
     private static string Message(ValueSite site, ValueSetContents contents)
     {
@@ -70,6 +72,6 @@ internal sealed partial class ValuesLanguage : IEmbeddedDiagnosticProvider
                 : string.Empty;
 
         return $"{written} is not one of the {contents.Values.Length} values of "
-            + $"'{site.Set.Id}', from {site.Set.Origin.Replace("`", "")}.{suggestion}";
+            + $"'{site.Set.Id}'.{suggestion}";
     }
 }

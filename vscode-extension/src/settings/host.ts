@@ -175,6 +175,9 @@ export function wire(
                         containingType: message.containingType,
                         memberName: message.memberName,
                         parameterTypes: message.parameterTypes,
+                        // Which kinds of member the setting can name; the server offers every kind
+                        // when the page does not narrow it.
+                        kinds: message.kinds,
                     }
                 );
 

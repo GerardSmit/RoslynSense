@@ -505,10 +505,10 @@ A **method with no parameter position** is read as returning one, so literals co
 result are checked too.
 
 You get completion from the column itself — with the second column, if the query selects one, shown
-beside each value as a label — hover saying what a code means and where the list comes from, and
-`VAL0001` on a string the set does not contain, with the nearest value offered:
+beside each value as a label — hover saying what a code means, and `VAL0001` on a string the set
+does not contain, with the nearest value offered:
 
-> `'order_wait_for_logn'` is not one of the 7 values of `'orderStatus'`, from shop: SELECT [Code], [Description] FROM Shop_OrderStatus ORDER BY [SortOrder]. Did you mean `'order_wait_for_login'`?
+> `'order_wait_for_logn'` is not one of the 7 values of `'orderStatus'`. Did you mean `'order_wait_for_login'`?
 
 An error rather than a warning, because that is what it is — the same class of mistake as a
 misspelled member name. `"severity": "warning"` while a codebase catches up.
@@ -574,6 +574,11 @@ workflow, disable the Microsoft C# extension for the workspace (Extensions → C
 - `roslynSense.languages.resx` — resource-key features in `.resx` files and at the call sites that
   read them, in this window (default on). `--no-resources` is the solution-wide switch. See
   [Resources](#resources).
+- `roslynSense.webforms.codeLens` — a reference count above every server control in `.aspx`, `.ascx`
+  and their siblings (default **off**). Markup is close to nothing but control declarations, so a
+  count on almost every line spaces the file out rather than annotating it; the same number is one
+  gesture away on any `ID` through Find All References. Unlike the settings above it this one
+  reaches the server, so every window on that solution sees it.
 - `roslynSense.trace.server` — LSP trace for debugging.
 
 These are VS Code settings: per window, synced by Settings Sync, and about this editor. Everything

@@ -49,6 +49,7 @@ internal static class SettingsAssistHandler
         {
             "resources.lookups[].fallbacks" => ConventionIds(p.Config),
             "valueSets.bindings[].set" => ValueSetIds(p.Config),
+            "valueSets.properties[].set" => ValueSetIds(p.Config),
             "valueSets.sets[].connection" => ConnectionAliases(p.Config),
             _ => [],
         });
@@ -211,6 +212,7 @@ internal static class SettingsAssistHandler
         string member = (p.MemberName ?? "").Trim();
 
         int max = p.MaxResults is > 0 and <= 50 ? p.MaxResults : 20;
+        var kinds = KindsOf(p.Kinds);
 
         // A shape with no type is the deliberate escape hatch — it matches any type declaring a
         // member of that name — so it is a state to be helped through, not an error.
@@ -220,18 +222,18 @@ internal static class SettingsAssistHandler
             {
                 return new MemberShapeResult(
                     [], [], [],
-                    Problem: "Name a class and a method, or a method on its own to match it on "
-                        + "any class.");
+                    Problem: $"Name a class and a {Noun(kinds)}, or a {Noun(kinds)} on its own to "
+                        + "match it on any class.");
             }
 
-            var anywhere = await SearchAsync(solution, member, max, ct);
+            var anywhere = await SearchAsync(solution, member, max, kinds, ct);
 
             return new MemberShapeResult(
                 [], [], anywhere,
                 Problem: anywhere.Length == 0
                     ? "Matching any type that declares this member."
-                    : "Matching any class that declares this method. Choose one below to name "
-                        + "its class.");
+                    : $"Matching any class that declares this {Noun(kinds)}. Choose one below to "
+                        + "name its class.");
         }
 
         var resolved = await ResolveAsync(solution, type, ct);
@@ -241,7 +243,7 @@ internal static class SettingsAssistHandler
             // The whole line handed to the search box's own grammar: `DotNetNuke.GetString` means
             // a method called GetString somewhere under DotNetNuke, and somebody writing a lookup
             // knows the method they saw at a call site and not the namespace it was declared in.
-            var anywhere = await SearchAsync(solution, $"{type}.{member}", max, ct);
+            var anywhere = await SearchAsync(solution, $"{type}.{member}", max, kinds, ct);
 
             // The miss is said even when there are near names to offer. The suggestions are the
             // remedy, not a reason to keep quiet about it: an entry naming a type that is not
@@ -249,11 +251,11 @@ internal static class SettingsAssistHandler
             return new MemberShapeResult(
                 await TypeSuggestionsAsync(solution, type, ct), [], anywhere,
                 Problem: anywhere.Length > 0
-                    ? $"No class named '{type}'. Choose a method below to name its class."
+                    ? $"No class named '{type}'. Choose a {Noun(kinds)} below to name its class."
                     : $"No type named '{type}' in this solution or its references.");
         }
 
-        var declared = Members(resolved).ToList();
+        var declared = Members(resolved, kinds).ToList();
         string[] names = [.. declared.Select(m => Spelling(m)).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
 
         if (member.Length == 0)
@@ -279,7 +281,8 @@ internal static class SettingsAssistHandler
                 [.. MemberSignature.CallParameters(m).Select(
                     parameter => new MemberShapeParameter(
                         parameter.Name, parameter.Type.ToDisplayString(MemberSignature.TypeName)))],
-                expected is not { } wanted || MemberSignature.Matches(m, wanted)))
+                expected is not { } wanted || MemberSignature.Matches(m, wanted),
+                KindName(m)))
             .OrderByDescending(m => m.Matched)
             .ThenBy(m => m.Parameters.Length)
             .Take(max)
@@ -296,33 +299,35 @@ internal static class SettingsAssistHandler
     }
 
     /// <summary>
-    /// Methods of that name anywhere in the solution, as the shapes that would name them.
+    /// Members of that name anywhere in the solution, as the shapes that would name them.
     /// </summary>
     /// <remarks>
-    /// The answer to "I know the method and not the namespace it lives in", which is the ordinary
+    /// The answer to "I know the member and not the namespace it lives in", which is the ordinary
     /// state of someone writing one of these: they are looking at a call site, where the namespace
     /// is a <c>using</c> at the top of some other file. Ranked by
-    /// <see cref="SearchEverywhere.FindMethodsAsync"/> so the query grammar is the one Ctrl+T
+    /// <see cref="SearchEverywhere.FindMembersAsync"/> so the query grammar is the one Ctrl+T
     /// already taught them — a leading word narrows by container.
     /// </remarks>
     private static async Task<MemberShapeMatch[]> SearchAsync(
-        Solution solution, string query, int max, CancellationToken ct)
+        Solution solution, string query, int max, MemberKinds kinds, CancellationToken ct)
     {
         if (Named(query).Length < MinimumSearch)
             return [];
 
-        var found = await SearchEverywhere.FindMethodsAsync(solution, query, max, ct);
+        var found = await SearchEverywhere.FindMembersAsync(
+            solution, query, max, member => Wanted(member, kinds), ct);
 
-        return [.. found.Select(method => new MemberShapeMatch(
-            method.ContainingType.ToDisplayString(MemberSignature.DeclarationName),
-            Spelling(method),
-            Signature(method),
-            [.. MemberSignature.CallParameters(method).Select(
+        return [.. found.Select(member => new MemberShapeMatch(
+            member.ContainingType?.ToDisplayString(MemberSignature.DeclarationName) ?? "",
+            Spelling(member),
+            Signature(member),
+            [.. MemberSignature.CallParameters(member).Select(
                 parameter => new MemberShapeParameter(
                     parameter.Name, parameter.Type.ToDisplayString(MemberSignature.TypeName)))],
-            // Every one of them is a method that could be named here; which overload a signature
+            // Every one of them is a member that could be named here; which overload a signature
             // then selects is the question asked once a class is settled on.
-            Matched: true))];
+            Matched: true,
+            KindName(member)))];
     }
 
     /// <summary>The part of a query that names the thing rather than where it lives.</summary>
@@ -340,8 +345,29 @@ internal static class SettingsAssistHandler
     /// The member as a call site writes it, which is the form a configured signature is written
     /// against — so an extension method loses the receiver it is invoked on.
     /// </summary>
+    /// <remarks>
+    /// A property or a field is not called at all, so it is written the way it is declared instead:
+    /// the type in front of the name, and for a property which of the two accessors it has. That
+    /// last part is the one thing about a property this page can say that the name does not — a
+    /// get-only property is a member a literal is compared against and never assigned to.
+    /// </remarks>
     private static string Signature(ISymbol member)
     {
+        if (member is IFieldSymbol field)
+            return $"{field.Type.ToDisplayString(s_shortType)} {field.Name}";
+
+        if (member is IPropertySymbol { IsIndexer: false } property)
+        {
+            string accessors = property switch
+            {
+                { GetMethod: not null, SetMethod: not null } => "get; set;",
+                { GetMethod: not null } => "get;",
+                _ => "set;",
+            };
+
+            return $"{property.Type.ToDisplayString(s_shortType)} {property.Name} {{ {accessors} }}";
+        }
+
         var parameters = MemberSignature.CallParameters(member).Select(
             parameter => $"{parameter.Type.ToDisplayString(s_shortType)} {parameter.Name}");
 
@@ -349,6 +375,90 @@ internal static class SettingsAssistHandler
             ? $"this[{string.Join(", ", parameters)}]"
             : $"{member.Name}({string.Join(", ", parameters)})";
     }
+
+    /// <summary>Which kind of member a row is about, in the words the request asks for them by.</summary>
+    private static string KindName(ISymbol member) => member switch
+    {
+        IPropertySymbol { IsIndexer: true } => "indexer",
+        IPropertySymbol => "property",
+        IFieldSymbol => "field",
+        _ => "method",
+    };
+
+    /// <summary>
+    /// Which kinds of member an answer may contain.
+    /// </summary>
+    /// <remarks>
+    /// A setting naming a call shape wants methods and indexers; a setting naming a member that
+    /// holds a value wants properties and fields. Asked for by the request rather than decided here,
+    /// because the schema already says which a given setting is — and a page offering a property
+    /// where only a call will bind is a page walking someone into an entry that does nothing.
+    /// </remarks>
+    [Flags]
+    private enum MemberKinds
+    {
+        Method = 1,
+        Indexer = 2,
+        Property = 4,
+        Field = 8,
+
+        /// <summary>What every caller wanted before any of them wanted anything else.</summary>
+        Called = Method | Indexer,
+    }
+
+    /// <summary>
+    /// The requested kinds, defaulting to the callable ones. An unrecognised name is ignored rather
+    /// than refused: it can only come from a newer page than this server, and answering with the
+    /// kinds it did recognise is more useful than answering with nothing.
+    /// </summary>
+    private static MemberKinds KindsOf(string[]? requested)
+    {
+        if (requested is not { Length: > 0 })
+            return MemberKinds.Called;
+
+        MemberKinds kinds = 0;
+
+        foreach (string name in requested)
+        {
+            kinds |= name.Trim().ToLowerInvariant() switch
+            {
+                "method" => MemberKinds.Method,
+                "indexer" => MemberKinds.Indexer,
+                "property" => MemberKinds.Property,
+                "field" => MemberKinds.Field,
+                _ => 0,
+            };
+        }
+
+        return kinds == 0 ? MemberKinds.Called : kinds;
+    }
+
+    /// <summary>What to call the thing being named, so the sentences fit what is being looked for.</summary>
+    private static string Noun(MemberKinds kinds) =>
+        kinds == MemberKinds.Called ? "method"
+            : (kinds & MemberKinds.Called) == 0 ? "property"
+            : "member";
+
+    /// <summary>
+    /// Whether a member is one of the kinds asked for and something configuration could name at
+    /// all.
+    /// </summary>
+    /// <remarks>
+    /// A backing field is skipped by the same rule that skips an accessor: it is the compiler's
+    /// spelling of a member already listed, and offering both would have someone choose the one
+    /// nothing can be written against. Accessibility is deliberately not filtered — it never was
+    /// for methods, and a configuration file is written by someone who can see the source.
+    /// </remarks>
+    private static bool Wanted(ISymbol member, MemberKinds kinds) =>
+        !member.IsImplicitlyDeclared
+        && member switch
+        {
+            IMethodSymbol { MethodKind: MethodKind.Ordinary } => kinds.HasFlag(MemberKinds.Method),
+            IPropertySymbol { IsIndexer: true } => kinds.HasFlag(MemberKinds.Indexer),
+            IPropertySymbol => kinds.HasFlag(MemberKinds.Property),
+            IFieldSymbol { AssociatedSymbol: null } => kinds.HasFlag(MemberKinds.Field),
+            _ => false,
+        };
 
     /// <summary>Unqualified, because the row is already about one type and the column is narrow.</summary>
     private static readonly SymbolDisplayFormat s_shortType = new(
@@ -365,7 +475,7 @@ internal static class SettingsAssistHandler
     /// <c>PortalModuleBase.LocalizeText</c> is reached from every module that derives from it, and
     /// someone who typed the derived module's name should still see the member they meant.
     /// </remarks>
-    private static IEnumerable<ISymbol> Members(INamedTypeSymbol type)
+    private static IEnumerable<ISymbol> Members(INamedTypeSymbol type, MemberKinds kinds)
     {
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
@@ -373,16 +483,13 @@ internal static class SettingsAssistHandler
         {
             foreach (var member in scope.GetMembers())
             {
-                if (member is IMethodSymbol { MethodKind: MethodKind.Ordinary } method
-                    && !method.IsImplicitlyDeclared)
+                // The kind is part of the key because an override and the member it overrides are
+                // two symbols spelling one thing, while a property and a method of the same name
+                // are two things — and only the second pair should both be listed.
+                if (Wanted(member, kinds)
+                    && seen.Add(KindName(member) + "/" + Spelling(member) + "/" + Signature(member)))
                 {
-                    if (seen.Add(method.Name + "/" + Signature(method)))
-                        yield return method;
-                }
-                else if (member is IPropertySymbol { IsIndexer: true } indexer
-                    && seen.Add("Item/" + Signature(indexer)))
-                {
-                    yield return indexer;
+                    yield return member;
                 }
             }
         }

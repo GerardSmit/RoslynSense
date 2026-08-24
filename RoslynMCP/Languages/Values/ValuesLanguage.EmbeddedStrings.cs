@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.Values.Core;
 
 namespace RoslynMCP.Languages.Values;
@@ -35,4 +36,15 @@ internal sealed partial class ValuesLanguage : IConfiguredStringLanguage
         Settings.Enabled
             ? ValueSiteSearch.Match(Settings, context.SemanticModel, context.Token, ct)
             : null;
+
+    /// <summary>
+    /// The span the reader is meant to see, which is not always the one completion writes over.
+    /// </summary>
+    /// <remarks>
+    /// An empty literal has empty content, and a squiggle or a hover highlight over nothing is a
+    /// squiggle nobody can see. The quotes come back for the two features that only point at the
+    /// literal; completion, which replaces it, keeps the empty span so its edit lands between them.
+    /// </remarks>
+    private static TextSpan Shown(EmbeddedStringContext context, ValueSite site) =>
+        site.Span.IsEmpty ? context.Token.Span : site.Span;
 }

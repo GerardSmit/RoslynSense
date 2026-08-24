@@ -42,7 +42,15 @@ internal sealed record ValueSetDefinition
     public StringComparer Comparer =>
         CaseSensitive ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
 
-    /// <summary>Where the values come from, in one phrase, for hover and for a warning message.</summary>
+    /// <summary>
+    /// Where the values come from, in one phrase, for a surface that is about the set itself.
+    /// </summary>
+    /// <remarks>
+    /// Kept off the diagnostic and off hover. Both of those are read while looking at one status
+    /// code, and a query — long, joined, ordered — answers a question nobody was asking there while
+    /// crowding out the ones they were. Where the values come from is a fact about the
+    /// configuration, and it belongs wherever the configuration is what is on screen.
+    /// </remarks>
     public string Origin =>
         FromDatabase
             ? Connection is { Length: > 0 } alias ? $"`{alias}`: `{Query}`" : $"`{Query}`"

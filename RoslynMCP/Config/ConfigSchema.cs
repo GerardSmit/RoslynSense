@@ -85,7 +85,7 @@ public static class ConfigSchema
             ["webForms.dataExpressions[].source"] = ("Formats the value of", "For a format string, which sibling attribute names the value being formatted — `[ItemType].[Control.DataField]` reads this tag's `DataField` and resolves it against the bound item. That is what tells a `{0:dd-MM-yyyy}` it is formatting a date."),
             ["webForms.unknownMemberDiagnostic"] = ("Report unknown members", "WFB0001 — a name the bound item type does not have. Only ever reported when that type is known: a container with no `ItemType` whose `DataSource` cannot be traced says nothing rather than something wrong."),
             ["webForms.severity"] = ("Report them as", "How loudly WFB0001 is reported. A warning by default, because a path is resolved case-insensitively through `TypeDescriptor` and can be satisfied at runtime by a type this tool never sees."),
-            ["valueSets"] = ("Allowed string values", "Some strings are really codes: an order status, a document type, a country. The list of codes is in a database table or a spreadsheet somewhere, and nothing in C# knows it, so `\"SHIPED\"` compiles and fails at run time. Say where the list comes from under Sets, and which method or property carries a code under Where they are written — those literals then complete from the list, hover with what each code means, and are reported when the list does not have them."),
+            ["valueSets"] = ("Allowed string values", "Some strings are really codes: an order status, a document type, a country. The list of codes is in a database table or a spreadsheet somewhere, and nothing in C# knows it, so `\"SHIPED\"` compiles and fails at run time. Say where the list comes from under Sets, then name the methods and the properties that carry a code — those literals then complete from the list, hover with what each code means, and are reported when the list does not have them."),
             ["valueSets.unknownValueDiagnostic"] = ("Report unknown values", "VAL0001 — a string that is not one of its set's values. Only ever reported for a set that loaded completely: an unreachable database says nothing rather than something wrong."),
             ["valueSets.severity"] = ("Report them as", "How loudly VAL0001 is reported. An error by default, because a code the table does not have is a branch that can never be taken. Soften it while a codebase catches up."),
             ["valueSets.sets"] = ("Sets", "Where the lists of codes come from. Each set is a query against a configured database connection, or the codes written out here."),
@@ -95,13 +95,18 @@ public static class ConfigSchema
             ["valueSets.sets[].query"] = ("Query", "The query producing the values — `SELECT [Code] FROM Shop_OrderStatus ORDER BY [Code]`. The first column is the value; a second column, if there is one, is shown beside it as a label."),
             ["valueSets.sets[].values"] = ("Values", "The values written out, for a set with no database behind it. Ignored when a query is set."),
             ["valueSets.sets[].caseSensitive"] = ("Match casing exactly", "Off by default, because the comparison the code does usually is case-insensitive too."),
-            ["valueSets.bindings"] = ("Where they are written", "The places in C# that carry a code — the method that takes one, the property that holds one. Every literal written there is checked against the list."),
-            ["valueSets.bindings[]"] = ("Binding", "One member, and the set its values come from. A method with a parameter position takes the value as that argument; a method without one returns it; a property or field holds it, and every literal compared or assigned to it is checked."),
+            ["valueSets.bindings"] = ("Methods", "The methods that carry a code — the one that takes it as an argument, the one that returns it. Every literal written at the call is checked against the list."),
+            ["valueSets.bindings[]"] = ("Method", "One method, and the set its values come from. Give a parameter position and the value is that argument; leave it empty and the method returns a code, so what is checked is every literal its result is compared against."),
             ["valueSets.bindings[].set"] = ("Set", "Which list above this member's codes come from."),
             ["valueSets.bindings[].containingType"] = ("Class", "The full name of the class or interface declaring the member. Leave empty to match the member on any class."),
             ["valueSets.bindings[].memberName"] = ("Member", "The method, property or field name, or `Item` for an indexer."),
             ["valueSets.bindings[].parameterTypes"] = ("Parameters", "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."),
             ["valueSets.bindings[].valueIndex"] = ("Value is parameter", "Which parameter carries the value, counted from 0. Leave empty for a property, a field, or a method whose return value is one of the set."),
+            ["valueSets.properties"] = ("Properties", "The properties and fields that hold a code — an order's `Status.Code`, a document's `TypeCode`. Every literal compared or assigned to one of them is checked against the list."),
+            ["valueSets.properties[]"] = ("Property", "One property or field, and the set its values come from. `order.Status.Code == \"SHIPPED\"` is the shape this is for: nothing is called, so every literal the member is compared or assigned is what gets checked."),
+            ["valueSets.properties[].set"] = ("Set", "Which list above this member's codes come from."),
+            ["valueSets.properties[].containingType"] = ("Class", "The full name of the class or interface declaring the property or field. Leave empty to match the member on any class, which is the escape hatch for a code carried by a `Code` property on a dozen entities."),
+            ["valueSets.properties[].memberName"] = ("Property", "The property or field name."),
 
             ["resources"] = ("Resource lookups", "How `.resx` files are found and which call shapes carry a resource key."),
             ["resources.preset"] = ("Preset", "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting."),
@@ -144,9 +149,12 @@ public static class ConfigSchema
             ["debugger.debuggerDisplay"] = ("DebuggerDisplay", "Format values using their type's `DebuggerDisplayAttribute`."),
             ["debugger.typeProxy"] = ("DebuggerTypeProxy", "Expand values through their type's `DebuggerTypeProxyAttribute`."),
             ["debugger.browsable"] = ("DebuggerBrowsable", "Honour `DebuggerBrowsableAttribute` when listing members."),
+            ["debugger.callToString"] = ("Call ToString", "Show values through their own `ToString` override when no attribute claims them — VS's \"call string-conversion function on objects in variables windows\"."),
             ["debugger.justMyCode"] = ("Just My Code", "Step past `DebuggerStepThrough`, `DebuggerHidden`, `DebuggerNonUserCode`, and code with no symbols."),
             ["debugger.rawView"] = ("Raw View", "Offer a Raw View child whenever a proxy or a hidden member means the listed children are not the object's own fields."),
             ["debugger.maxChildren"] = ("Max children", "How many children of one value to list before truncating. Defaults to 100."),
+            ["debugger.symbolInclude"] = ("Load symbols only for", "Globs for the only modules whose symbols load, when the list is non-empty. A glob without a path separator matches the module's file name (`MyCompany.*.dll`); with one, its full path (`**\\bin\\**`). Empty loads symbols for every module not excluded."),
+            ["debugger.symbolExclude"] = ("Never load symbols for", "Globs for modules whose symbols never load, taking precedence over the include list. A module without symbols cannot bind source breakpoints — the same trade VS's \"Load all modules, unless excluded\" makes. ASP.NET's generated `App_Web_*.dll` page assemblies are already skipped without any configuration."),
 
             ["tableFormat"] = ("Table format", "How tabular tool output is rendered: `markdown` (default) or `toon`."),
             ["preload"] = ("Preload", "Solutions or projects to load on startup. Omitted auto-discovers the first solution in the working directory; an empty list disables preloading."),
@@ -247,6 +255,7 @@ public static class ConfigSchema
         {
             "resources.lookups[].fallbacks",
             "valueSets.bindings[].set",
+            "valueSets.properties[].set",
             "valueSets.sets[].connection",
         };
 
@@ -255,10 +264,18 @@ public static class ConfigSchema
     /// of them instead of five text boxes.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Declared here rather than hard-coded in the page because the shape is not specific to
     /// resource lookups. "A class, a member on it, and which parameter carries what" is what every
     /// setting naming a call shape needs, and the next one should get the same editor by adding a
     /// line here.
+    /// </para>
+    /// <para>
+    /// <c>label</c> is what the row calls the thing being named and <c>memberKinds</c> is what the
+    /// server should offer for it, which are the two halves of the same fact: a shape asking for a
+    /// property should say "Property" and be answered with properties. <c>parameters</c> and
+    /// <c>positions</c> are absent for a member that is not called, since a property has neither.
+    /// </para>
     /// </remarks>
     private static readonly Dictionary<string, JsonObject> s_shapes =
         new(StringComparer.OrdinalIgnoreCase)
@@ -274,6 +291,8 @@ public static class ConfigSchema
                     ["keyIndex"] = "key",
                     ["rootIndex"] = "file name",
                 },
+                ["label"] = "Method",
+                ["memberKinds"] = new JsonArray("method", "indexer"),
             },
 
             // The second one, which is what the note above was written in anticipation of: a value
@@ -288,7 +307,119 @@ public static class ConfigSchema
                 {
                     ["valueIndex"] = "value",
                 },
+                ["label"] = "Method",
+                ["memberKinds"] = new JsonArray("method", "indexer"),
             },
+
+            // And the third, which is the same triple with the call taken out of it: a property is
+            // named by class and name alone, so the shape carries neither a signature nor a
+            // position and the editor draws two fields rather than four.
+            ["valueSets.properties[]"] = new JsonObject
+            {
+                ["kind"] = "member",
+                ["type"] = "containingType",
+                ["member"] = "memberName",
+                ["label"] = "Property",
+                ["memberKinds"] = new JsonArray("property", "field"),
+            },
+        };
+
+    /// <summary>
+    /// Fields of one list item that are alternatives to each other, so the page offers a choice
+    /// between them rather than a form with two halves that must not both be filled in.
+    /// </summary>
+    /// <remarks>
+    /// A value set is a query or a written-out list, never both; a convention looks beside the file
+    /// or down from the project root, never both. Nothing in JSON Schema says so — <c>oneOf</c>
+    /// would, but it says it as a validation rule rather than as a thing to draw, and a form built
+    /// from a failed validation is a form that tells someone off for a state it walked them into.
+    /// </remarks>
+    private static readonly Dictionary<string, JsonArray> s_exclusive =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["valueSets.sets[]"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["alternatives"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["title"] = "From a database query",
+                            ["fields"] = new JsonArray("connection", "query"),
+                        },
+                        new JsonObject
+                        {
+                            ["title"] = "Values written here",
+                            ["fields"] = new JsonArray("values"),
+                        },
+                    },
+                },
+            },
+
+            ["resources.conventions[]"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["alternatives"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["title"] = "Folder beside the file",
+                            ["fields"] = new JsonArray("siblingFolder"),
+                        },
+                        new JsonObject
+                        {
+                            ["title"] = "Folder at the project root",
+                            ["fields"] = new JsonArray("rootFolder"),
+                        },
+                    },
+                },
+            },
+        };
+
+    /// <summary>
+    /// Fields that only apply once a sibling field says a particular thing, so the page can leave
+    /// them out until they mean something.
+    /// </summary>
+    /// <remarks>
+    /// A lookup's file name comes from an argument, a type argument, the containing file or a
+    /// constant, and each of those answers makes exactly one of the remaining fields relevant. Both
+    /// shown at once is two fields where one of them can only ever be ignored — which is how they
+    /// get filled in and then quietly do nothing.
+    /// </remarks>
+    private static readonly Dictionary<string, JsonObject> s_when =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["resources.lookups[].rootIndex"] = new JsonObject
+            {
+                ["field"] = "rootSource",
+                ["equals"] = new JsonArray("argument"),
+            },
+
+            ["resources.lookups[].rootConstant"] = new JsonObject
+            {
+                ["field"] = "rootSource",
+                ["equals"] = new JsonArray("constant"),
+            },
+        };
+
+    /// <summary>
+    /// Which fields, in order, say what a collapsed list item is — the one line a closed row shows.
+    /// </summary>
+    /// <remarks>
+    /// Spelled out rather than guessed from the first string field, because the field that
+    /// identifies an item is not reliably the first one and a row labelled with the wrong half of
+    /// itself is a list nobody can scan. An item with an <see cref="s_shapes"/> entry needs none of
+    /// this: the call form it composes is already the sentence that names it.
+    /// </remarks>
+    private static readonly Dictionary<string, string[]> s_summaries =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["valueSets.sets[]"] = ["id", "query", "values"],
+            ["resources.conventions[]"] = ["id", "siblingFolder", "rootFolder", "fixedName"],
+            ["resources.overrides[]"] = ["pattern", "rank"],
+            ["webForms.dataExpressions[]"] = ["tag", "attribute"],
         };
 
     /// <summary>Every path the descriptions table knows about, for the test that checks it is complete.</summary>
@@ -316,6 +447,15 @@ public static class ConfigSchema
         if (s_shapes.TryGetValue(path, out var shape))
             obj["x-shape"] = shape.DeepClone();
 
+        if (s_exclusive.TryGetValue(path, out var exclusive))
+            obj["x-exclusive"] = exclusive.DeepClone();
+
+        if (s_when.TryGetValue(path, out var when))
+            obj["x-when"] = when.DeepClone();
+
+        if (s_summaries.TryGetValue(path, out var summary))
+            obj["x-summary"] = new JsonArray([.. summary.Select(field => (JsonNode)JsonValue.Create(field))]);
+
         return obj;
     }
 
@@ -330,13 +470,29 @@ public static class ConfigSchema
     /// fields can be described separately — <c>resources.lookups</c> is a list of call shapes, and
     /// <c>resources.lookups[].keyIndex</c> is which parameter carries the key.
     /// </remarks>
+    /// <remarks>
+    /// Which segments are keywords cannot be decided by reading them, because a setting is allowed
+    /// to be called <c>properties</c> — <c>valueSets.properties</c> is one — and its name arrives
+    /// as the same word as the keyword that introduces it. What separates them is position: the
+    /// segment after a <c>properties</c> keyword is always a name, whatever it says. Read by the
+    /// word alone, <c>valueSets.properties</c> came out as <c>valueSets</c>, which silently gave a
+    /// whole section the wrong title and left every field in it undescribed.
+    /// </remarks>
     private static string PathOf(JsonSchemaExporterContext context)
     {
         var segments = new List<string>();
+        bool nameNext = false;
 
         // A span, so no LINQ: the exporter hands the path out without allocating it.
         foreach (string segment in context.Path)
         {
+            if (nameNext)
+            {
+                segments.Add(segment);
+                nameNext = false;
+                continue;
+            }
+
             // A dictionary's value. The keys are the person's own, so there is nothing to name.
             if (segment is "additionalProperties")
                 return string.Empty;
@@ -350,7 +506,13 @@ public static class ConfigSchema
                 continue;
             }
 
-            if (segment is "$" or "properties" or "anyOf" or "oneOf" or "$defs")
+            if (segment is "properties")
+            {
+                nameNext = true;
+                continue;
+            }
+
+            if (segment is "$" or "anyOf" or "oneOf" or "$defs")
                 continue;
 
             if (int.TryParse(segment, out _))

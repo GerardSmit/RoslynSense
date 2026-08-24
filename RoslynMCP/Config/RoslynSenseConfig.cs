@@ -136,8 +136,18 @@ public sealed class ValueSetsConfig
     /// <summary>The sets themselves. Each needs an <c>id</c> and either a query or a list.</summary>
     public IReadOnlyList<ValueSetEntry>? Sets { get; init; }
 
-    /// <summary>Where in C# each set's values are written.</summary>
+    /// <summary>The methods that take, or return, one of a set's values.</summary>
     public IReadOnlyList<ValueBindingEntry>? Bindings { get; init; }
+
+    /// <summary>The properties and fields that hold one of a set's values.</summary>
+    /// <remarks>
+    /// The same thing a <see cref="ValueBindingEntry"/> with no <see cref="ValueBindingEntry.ValueIndex"/>
+    /// already means, said in a form that does not ask for the two fields a member holding a value
+    /// has no answer for. A property is the commonest shape this pack meets — an entity's
+    /// <c>Code</c>, compared against a literal at every branch — and making it the easy entry is
+    /// what stops that case being written as a method binding with the parameter fields left blank.
+    /// </remarks>
+    public IReadOnlyList<ValuePropertyEntry>? Properties { get; init; }
 
     /// <summary>
     /// Whether a literal that is not one of the set's values is reported. Default on.
@@ -211,6 +221,29 @@ public sealed class ValueBindingEntry
 
     /// <summary>Which parameter carries the value, counted from 0. Methods only.</summary>
     public int? ValueIndex { get; init; }
+}
+
+/// <summary>
+/// One property or field whose value is from a set: what is checked is every literal it is compared
+/// or assigned.
+/// </summary>
+/// <remarks>
+/// A <see cref="ValueBindingEntry"/> without a <see cref="ValueBindingEntry.ValueIndex"/> already
+/// says this, and the two are folded together as soon as the configuration is read. They are
+/// separate in the file because a member that holds a value has no parameter list and no value
+/// position, and a form that asks for both of them anyway is a form that invites two fields to be
+/// filled in wrongly.
+/// </remarks>
+public sealed class ValuePropertyEntry
+{
+    /// <summary>The <see cref="ValueSetEntry.Id"/> this binds.</summary>
+    public string? Set { get; init; }
+
+    /// <summary>The full name of the class or interface declaring the member.</summary>
+    public string? ContainingType { get; init; }
+
+    /// <summary>The property's or field's name.</summary>
+    public string? MemberName { get; init; }
 }
 
 /// <summary>

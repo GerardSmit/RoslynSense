@@ -174,13 +174,16 @@ export function wire(
             if (!token.isCancellationRequested) {
                 post({ type: 'results', id: message.id, tab: message.tab, ...result });
             }
-        } catch {
+        } catch (error) {
             if (!token.isCancellationRequested) {
+                // The server's message names the actual failure (a stale path, a dead
+                // connection); the guess is only for errors that carry no message at all.
+                const detail = error instanceof Error ? error.message : '';
                 post({
                     type: 'error',
                     scope: 'search',
                     id: message.id,
-                    message: 'Search failed — is the workspace still loading?',
+                    message: detail || 'Search failed — is the workspace still loading?',
                 });
             }
         }

@@ -73,6 +73,11 @@ function renderPending(): void {
 }
 
 function save(): void {
+    // An item open in its dialog is an edit like any other, and Ctrl+S over it means the same
+    // thing Done does — otherwise saving from inside the dialog writes everything except the item
+    // being looked at.
+    openDialog?.finish();
+
     // A field still being typed in has not committed yet, and it commits on leaving. Without this
     // the edit somebody just made is the one Ctrl+S does not write.
     if (document.activeElement instanceof HTMLElement) {
@@ -89,6 +94,27 @@ function save(): void {
  * reopened. They ask again when the host says there is something new to ask.
  */
 const askAgain = new Set<() => void>();
+
+/**
+ * Where a control's "ask again" also goes while something short-lived is building its controls.
+ *
+ * The item dialog is opened and closed many times over a panel's life, and every control it built
+ * would otherwise go on being asked again for the rest of it — against a form that is no longer on
+ * screen. What it registers here is what it takes away when it closes.
+ */
+let collecting: Set<() => void> | undefined;
+
+/**
+ * The item dialog currently open, as the two things that can happen to it from outside: a save
+ * takes what is in it, and a re-render takes the list it was editing away. Only ever one, since
+ * the dialog covers the page it was opened from.
+ */
+let openDialog: { readonly finish: () => void; readonly dismiss: () => void } | undefined;
+
+function registerAsk(ask: () => void): void {
+    askAgain.add(ask);
+    collecting?.add(ask);
+}
 
 /**
  * Questions to the host are answered out of band, and several controls have one outstanding at
@@ -128,6 +154,10 @@ function render(): void {
     if (!state) {
         return;
     }
+
+    // A state arriving while an item is open replaces the list the dialog was editing, so the
+    // dialog goes with it rather than writing back into a form that is no longer on the page.
+    openDialog?.dismiss();
 
     renderScopes(state);
     renderNotice(state);
@@ -267,6 +297,12 @@ interface SchemaNode {
     'x-choices'?: string;
     /** Several fields that together name a call shape; see {@link MemberShapeSpec}. */
     'x-shape'?: MemberShapeSpec;
+    /** Groups of fields of which exactly one group is filled in; see {@link ExclusiveGroup}. */
+    'x-exclusive'?: readonly ExclusiveGroup[];
+    /** On a field: the sibling field whose value decides whether this one applies at all. */
+    'x-when'?: FieldCondition;
+    /** On a list item: the fields that together say which item this is, in a collapsed row. */
+    'x-summary'?: readonly string[];
 }
 
 /**
@@ -281,10 +317,39 @@ interface MemberShapeSpec {
     type: string;
     /** The field holding the member name. */
     member: string;
-    /** The field holding the positional parameter types. */
-    parameters: string;
+    /**
+     * The field holding the positional parameter types. Absent where the shape names something
+     * with no parameter list — a property or a field — and the line is then a plain member name.
+     */
+    parameters?: string;
     /** Field name → what that parameter carries, in words: `{ keyIndex: "key" }`. */
-    positions: Record<string, string>;
+    positions?: Record<string, string>;
+    /** What the row is called: `Method`, `Property`. Defaults to `Method`. */
+    label?: string;
+    /** Which kinds of member the setting can name, of `method`, `indexer`, `property`, `field`. */
+    memberKinds?: readonly string[];
+}
+
+/**
+ * Two ways of saying the same thing, of which an item says one: a set is a query against a
+ * connection or a list of values written out, and it is never both.
+ *
+ * Shown as a choice rather than as every field at once, because the fields of the alternative that
+ * is not chosen are not merely empty — writing them is what makes the item ambiguous.
+ */
+interface ExclusiveGroup {
+    readonly alternatives: readonly Alternative[];
+}
+
+interface Alternative {
+    readonly title: string;
+    readonly fields: readonly string[];
+}
+
+/** A field that only applies while a sibling field says one of these values. */
+interface FieldCondition {
+    readonly field: string;
+    readonly equals: readonly string[];
 }
 
 function properties(node: SchemaNode): [string, SchemaNode][] {
@@ -704,82 +769,577 @@ function stringifyMapValue(value: unknown): string {
     return JSON.stringify(value);
 }
 
-/** A list of objects, each edited as a small form built from the item schema's properties. */
+/**
+ * A list of objects, each shown as one line and edited in a dialog.
+ *
+ * Every item used to render its whole form inline, which turned a list of six lookups into six
+ * repeated forms and made the page a wall: what a list says — which members it binds, in what
+ * order — was the one thing it could not be read for. A line per item says that, and the form is
+ * where it has always been, one click away.
+ *
+ * The items are held here as values rather than read back out of the DOM, because a dialog only
+ * has the item being edited on screen and the other five still have to be written.
+ */
 function objectListControl(itemSchema: SchemaNode, path: string[]): HTMLElement {
     const box = document.createElement('div');
     box.className = 'item-editor block';
 
     const list = document.createElement('div');
+    list.className = 'item-list';
     box.append(list);
+
+    const own = ownValue(path);
+    const items: Record<string, unknown>[] = Array.isArray(own)
+        ? own
+            .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+            .map((entry) => ({ ...entry }))
+        : [];
+
+    const add = addButton('Add item', () =>
+        edit({}, (value) => {
+            items.push(value);
+            return items.length - 1;
+        })
+    );
+
+    function commit(): void {
+        const result = items.filter((item) => Object.keys(item).length > 0);
+        setIfChanged(path, result.length === 0 ? null : result);
+    }
+
+    /**
+     * Opens the dialog on a copy, and puts what came back where `place` says. Cancelling leaves
+     * the list exactly as it was, which is what makes an item added and then thought better of
+     * disappear rather than arrive empty.
+     */
+    function edit(
+        value: Record<string, unknown>,
+        place: (edited: Record<string, unknown>) => number,
+        existing?: number
+    ): void {
+        openItemDialog({
+            title: itemSchema.title ?? 'Item',
+            itemSchema,
+            value,
+            listPath: path,
+            onDone: (edited) => {
+                // An item edited down to nothing is not an item. `commit` already filters it out
+                // of the value, so leaving it in the list would show a "(empty)" line for something
+                // the file does not have — the same disagreement Remove exists to avoid, so it
+                // ends the same way.
+                if (Object.keys(edited).length === 0) {
+                    if (existing !== undefined) {
+                        items.splice(existing, 1);
+                    }
+                    draw();
+                    commit();
+                    add.focus();
+                    return;
+                }
+
+                const at = place(edited);
+                draw();
+                commit();
+                focusRow(at);
+            },
+            // Back where it was opened from: the row for an item that was already there, and the
+            // button that would have made one for an item that never arrived.
+            onCancel: () => (existing === undefined ? add.focus() : focusRow(existing)),
+        });
+    }
+
+    function focusRow(index: number): void {
+        const row = list.children[index] as HTMLElement | undefined;
+        row?.querySelector<HTMLButtonElement>('.item-edit')?.focus();
+    }
+
+    function draw(): void {
+        list.textContent = '';
+
+        if (items.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'item-empty';
+            empty.textContent = 'Nothing here yet.';
+            list.append(empty);
+            return;
+        }
+
+        items.forEach((item, index) => {
+            const row = document.createElement('div');
+            row.className = 'item-summary';
+
+            const summary = document.createElement('span');
+            summary.className = 'item-summary-text';
+            summary.textContent = summarize(itemSchema, item);
+            summary.title = summary.textContent;
+
+            const open = document.createElement('button');
+            open.type = 'button';
+            open.className = 'linklike item-edit';
+            open.textContent = 'Edit';
+            open.addEventListener('click', () =>
+                edit(
+                    { ...item },
+                    (edited) => {
+                        items[index] = edited;
+                        return index;
+                    },
+                    index
+                )
+            );
+
+            const drop = document.createElement('button');
+            drop.type = 'button';
+            drop.className = 'linklike remove';
+            drop.textContent = 'Remove';
+            drop.addEventListener('click', () => {
+                items.splice(index, 1);
+                draw();
+                commit();
+                add.focus();
+            });
+
+            row.append(summary, open, drop);
+            list.append(row);
+        });
+    }
+
+    draw();
+    box.append(add);
+    return box;
+}
+
+/**
+ * One item as a line: what it names, in the words the form would show for it.
+ *
+ * A shape says itself — the call is the item — and everything else is composed from the fields the
+ * schema nominates. An item with nothing in it still gets a line, because "empty" is a state
+ * somebody has to be able to see and fix.
+ */
+function summarize(itemSchema: SchemaNode, value: Record<string, unknown>): string {
+    const parts: string[] = [];
+    const shape = itemSchema['x-shape'];
+    const owned = shape ? shapeFields(shape) : new Set<string>();
+
+    if (shape) {
+        const call = shapeSummary(shape, value);
+        if (call !== '') {
+            parts.push(call);
+        }
+    }
+
+    const named = itemSchema['x-summary'];
+    const fields = named ?? properties(itemSchema).map(([name]) => name);
+
+    // Without a schema's say-so, a field or two beyond the shape: the point of the line is to tell
+    // one item from its neighbours, and the whole item spelled out is the wall this replaced.
+    const room = named ? fields.length : shape ? 1 : 2;
+    let taken = 0;
+
+    for (const name of fields) {
+        if (owned.has(name) || taken >= room) {
+            continue;
+        }
+        const written = summaryText(value[name]);
+        if (written !== '') {
+            parts.push(written);
+            taken++;
+        }
+    }
+
+    return parts.length === 0 ? `${itemSchema.title ?? 'Item'} (empty)` : parts.join('  ·  ');
+}
+
+/** The call a shape names, written the way the shape editor's own line writes it. */
+function shapeSummary(shape: MemberShapeSpec, value: Record<string, unknown>): string {
+    const type = text(value[shape.type]);
+    const member = text(value[shape.member]);
+    if (type === '' && member === '') {
+        return '';
+    }
+
+    const stored =
+        shape.parameters !== undefined && Array.isArray(value[shape.parameters])
+            ? (value[shape.parameters] as unknown[]).map(text)
+            : undefined;
+
+    return formatCall(type, member, stored && stored.length > 0 ? stored : undefined);
+}
+
+function summaryText(value: unknown): string {
+    if (value === undefined || value === null || value === '') {
+        return '';
+    }
+    return Array.isArray(value) ? value.map(text).join(', ') : String(value);
+}
+
+/**
+ * The per-item form, and the reader that turns it back into the item.
+ *
+ * The same rows the list used to draw inline, now the contents of the dialog. Fields the item does
+ * not currently have — the alternative that is not chosen, a field whose condition does not hold —
+ * are marked rather than removed, so that what is on screen and what is written stay one thing.
+ */
+function itemForm(
+    itemSchema: SchemaNode,
+    value: Record<string, unknown>,
+    listPath: readonly string[]
+): { body: HTMLElement; read: () => Record<string, unknown> } {
+    const body = document.createElement('div');
+    body.className = 'item-form';
 
     const shape = itemSchema['x-shape'];
     const owned = shape ? shapeFields(shape) : new Set<string>();
 
-    const addItem = (value: Record<string, unknown>) => {
-        const item = document.createElement('fieldset');
-        item.className = 'item';
-
-        if (itemSchema.title) {
-            const caption = document.createElement('legend');
-            caption.textContent = itemSchema.title;
-            item.append(caption);
+    // A field belonging to an alternative is drawn by the group, in the place the first of the
+    // group's fields would have been — so the choice sits where the fields it governs are.
+    const groups = itemSchema['x-exclusive'] ?? [];
+    const claimedBy = new Map<string, ExclusiveGroup>();
+    for (const group of groups) {
+        for (const alternative of group.alternatives) {
+            for (const field of alternative.fields) {
+                claimedBy.set(field, group);
+            }
         }
+    }
 
+    if (shape) {
+        body.append(memberShapeEditor(shape, itemSchema, value, listPath));
+    }
+
+    const drawn = new Set<ExclusiveGroup>();
+    for (const [name, child] of properties(itemSchema)) {
         // The fields a shape editor owns are drawn by it, together and in its own order, rather
         // than as five text boxes that only mean something read as a group.
-        for (const [name, child] of properties(itemSchema)) {
-            if (!owned.has(name)) {
-                item.append(itemRow(name, child, value[name], path));
+        if (owned.has(name)) {
+            continue;
+        }
+
+        const group = claimedBy.get(name);
+        if (group) {
+            if (!drawn.has(group)) {
+                drawn.add(group);
+                body.append(exclusiveGroup(group, itemSchema, value, listPath));
             }
+            continue;
         }
 
-        if (shape) {
-            item.prepend(memberShapeEditor(shape, itemSchema, value, path));
-        }
+        body.append(itemRow(name, child, value[name], listPath));
+    }
 
-        const actions = document.createElement('div');
-        actions.className = 'item-actions';
-        actions.append(removeButton(item, commit));
-        item.append(actions);
+    // One listener for the whole form: any field changing may be the one another field's condition
+    // reads, and re-checking every condition is cheaper than working out which.
+    const recheck = () => applyConditions(body);
+    body.addEventListener('change', recheck);
+    body.addEventListener('input', recheck);
+    applyConditions(body);
 
-        list.append(item);
-        return item;
+    return { body, read: () => readFields(body) };
+}
+
+/**
+ * The choice between two ways of filling an item in, as a row of plain words.
+ *
+ * Which one is chosen to start with is which one the item already says something under — a set
+ * with a query opens on Query — and the first, for an item that says nothing yet.
+ */
+function exclusiveGroup(
+    group: ExclusiveGroup,
+    itemSchema: SchemaNode,
+    value: Record<string, unknown>,
+    listPath: readonly string[]
+): HTMLElement {
+    const box = document.createElement('div');
+    box.className = 'alternatives';
+
+    const choice = document.createElement('div');
+    choice.className = 'alt-choice';
+    choice.setAttribute('role', 'radiogroup');
+    box.append(choice);
+
+    // Said only while an alternative that is not on screen still holds something, because that is
+    // the only time the choice decides the fate of anything already written.
+    const note = document.createElement('p');
+    note.className = 'item-help';
+    note.hidden = true;
+    box.append(note);
+
+    const filled = (field: string) => {
+        const held = value[field];
+        return (
+            held !== undefined &&
+            held !== null &&
+            held !== '' &&
+            !(Array.isArray(held) && held.length === 0)
+        );
     };
 
-    const own = ownValue(path);
-    if (Array.isArray(own)) {
-        for (const entry of own) {
-            if (entry && typeof entry === 'object') {
-                addItem(entry as Record<string, unknown>);
-            }
-        }
-    }
-
-    function commit(): void {
-        const result: Record<string, unknown>[] = [];
-        for (const item of list.querySelectorAll<HTMLElement>('.item')) {
-            const value: Record<string, unknown> = {};
-            for (const field of item.querySelectorAll<HTMLElement>('[data-field]')) {
-                const parsed = readItemField(field);
-                if (parsed !== undefined) {
-                    value[field.dataset.field!] = parsed;
-                }
-            }
-            if (Object.keys(value).length > 0) {
-                result.push(value);
-            }
-        }
-        setIfChanged(path, result.length === 0 ? null : result);
-    }
-
-    box.append(
-        addButton('Add item', () => {
-            const item = addItem({});
-            item.querySelector<HTMLElement>('input, select')?.focus();
-        })
+    const active = Math.max(
+        0,
+        group.alternatives.findIndex((alternative) => alternative.fields.some(filled))
     );
-    commitOnLeave(box, commit);
+
+    const panels: HTMLElement[] = [];
+    const name = `alt-${++nextToken}`;
+
+    group.alternatives.forEach((alternative, index) => {
+        const option = document.createElement('label');
+        option.className = 'alt-option';
+
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = name;
+        radio.checked = index === active;
+        radio.addEventListener('change', () => choose(index));
+        // A click on the option that is already chosen changes nothing and so raises no `change`,
+        // but it is still somebody saying which alternative they mean — which is the whole of what
+        // is being waited for here.
+        radio.addEventListener('click', () => choose(index));
+
+        option.append(radio, document.createTextNode(alternative.title));
+        choice.append(option);
+
+        const panel = document.createElement('div');
+        panel.className = 'alt-fields';
+        for (const field of alternative.fields) {
+            const child = itemSchema.properties?.[field];
+            if (child) {
+                panel.append(itemRow(field, child, value[field], listPath));
+            }
+        }
+
+        panels.push(panel);
+        box.append(panel);
+    });
+
+    /**
+     * Whether somebody has said, here, which alternative they mean.
+     *
+     * Opening on an alternative is not the same as choosing it. An item written before this choice
+     * existed can have both alternatives filled in, and dropping the one the dialog happened not to
+     * open on would throw away a value nobody was asked about — the item would come back out of the
+     * dialog missing something, with nothing on screen having said so.
+     */
+    let decided = false;
+
+    function choose(chosen: number): void {
+        decided = true;
+        show(chosen);
+    }
+
+    /**
+     * Only the chosen alternative is on screen, and only it is written — once the choice has been
+     * made. Until then an alternative that is off screen but says something is written back
+     * unchanged; one that says nothing has nothing to lose and is dropped from the start.
+     */
+    function show(chosen: number): void {
+        const holding: string[] = [];
+
+        panels.forEach((panel, index) => {
+            const chosenHere = index === chosen;
+            const holds = group.alternatives[index].fields.some(filled);
+            if (!chosenHere && holds) {
+                holding.push(group.alternatives[index].title);
+            }
+
+            panel.hidden = !chosenHere;
+            panel.dataset.omit = chosenHere || (!decided && holds) ? 'false' : 'true';
+        });
+
+        note.hidden = decided || holding.length === 0;
+        note.textContent =
+            `${holding.join(' and ')} still says something, and is being left as it is. `
+            + 'Choosing an option here keeps only that option’s fields.';
+    }
+
+    show(active);
     return box;
+}
+
+/**
+ * Which conditional rows apply right now. A row whose condition does not hold is off the screen
+ * and out of the item — a lookup taking its file name from a constant has no parameter index, and
+ * writing one anyway is a setting that says two things at once.
+ */
+function applyConditions(root: HTMLElement): void {
+    for (const row of root.querySelectorAll<HTMLElement>('[data-when-field]')) {
+        const driver = root.querySelector<HTMLElement>(
+            `[data-field="${CSS.escape(row.dataset.whenField!)}"]`
+        );
+        const equals = JSON.parse(row.dataset.whenEquals ?? '[]') as string[];
+        // Compared without regard to case, because the server reads these values that way too: a
+        // file saying `Argument` is fully valid to it, and hiding the row it drives — which also
+        // omits the field on commit — would drop a working setting over a capital letter.
+        const said = fieldText(driver ?? row).toLowerCase();
+        const shown = driver !== null && equals.some((value) => value.toLowerCase() === said);
+
+        row.hidden = !shown;
+        row.dataset.omit = shown ? 'false' : 'true';
+    }
+}
+
+/**
+ * Says on an element what `applyConditions` reads back: which sibling field decides it, and the
+ * answers that keep it.
+ *
+ * `itemRow` stamps the row it builds, and so must anything drawn in place of a row — the shape
+ * editor draws some of its fields as a line of chips over a hidden input, and neither of those is
+ * an `item-row`. A condition nobody stamps is a condition nobody applies: the field stays on
+ * screen and its value goes to the file whatever the field it depends on says.
+ */
+function stampCondition(element: HTMLElement, when: FieldCondition | undefined): void {
+    if (!when) {
+        return;
+    }
+    element.dataset.whenField = when.field;
+    element.dataset.whenEquals = JSON.stringify(when.equals);
+}
+
+/** What a field currently says, for the conditions that read one. */
+function fieldText(field: HTMLElement): string {
+    if (field instanceof HTMLSelectElement || field instanceof HTMLInputElement) {
+        return field.value;
+    }
+    return field.dataset.value ?? '';
+}
+
+/** Every field on the form that still applies, as the item to write. */
+function readFields(root: HTMLElement): Record<string, unknown> {
+    const value: Record<string, unknown> = {};
+    for (const field of root.querySelectorAll<HTMLElement>('[data-field]')) {
+        if (field.closest('[data-omit="true"]')) {
+            continue;
+        }
+        const parsed = readItemField(field);
+        if (parsed !== undefined) {
+            value[field.dataset.field!] = parsed;
+        }
+    }
+    return value;
+}
+
+/**
+ * The item's form, over the page, until it is done with.
+ *
+ * A dialog rather than an expanding row because the form is tall — a shape editor with its
+ * suggestions and its evidence is most of a screen — and because editing one item is a thing with
+ * a beginning and an end: Done writes it into the list, Escape and clicking away leave it alone.
+ * Nothing here reaches a file; the list commits into the pending edits as it always did.
+ */
+function openItemDialog(options: {
+    readonly title: string;
+    readonly itemSchema: SchemaNode;
+    readonly value: Record<string, unknown>;
+    readonly listPath: readonly string[];
+    readonly onDone: (value: Record<string, unknown>) => void;
+    readonly onCancel: () => void;
+}): void {
+    // The dialog covers the page it was opened from, and a second one over the first would leave
+    // the first unreachable and still holding an unread edit. The Edit and Add buttons are behind
+    // the overlay, but the keyboard can still reach them, so the activation is refused here rather
+    // than guarded at every place that offers one.
+    if (openDialog) {
+        return;
+    }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+
+    const panel = document.createElement('div');
+    panel.className = 'modal';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', options.title);
+
+    const heading = document.createElement('h3');
+    heading.className = 'modal-title';
+    heading.textContent = options.title;
+
+    // The controls the dialog builds ask the server for what they offer, and would go on being
+    // asked again after it is closed. What it registered is what it takes with it.
+    const registered = new Set<() => void>();
+    const outer = collecting;
+    collecting = registered;
+    const form = itemForm(options.itemSchema, options.value, options.listPath);
+    collecting = outer;
+
+    const body = document.createElement('div');
+    body.className = 'modal-body';
+    body.append(form.body);
+
+    const actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'linklike';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => close(false));
+
+    const done = document.createElement('button');
+    done.type = 'button';
+    done.className = 'save';
+    done.textContent = 'Done';
+    done.addEventListener('click', () => close(true));
+
+    actions.append(cancel, done);
+    panel.append(heading, body, actions);
+    overlay.append(panel);
+
+    function close(commit: boolean): void {
+        openDialog = undefined;
+        document.removeEventListener('keydown', onEscape);
+
+        // A field being typed in has not been read yet, and the shape editor's line is one of them.
+        if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+        }
+
+        const edited = commit ? form.read() : undefined;
+
+        for (const ask of registered) {
+            askAgain.delete(ask);
+        }
+        overlay.remove();
+
+        if (edited) {
+            options.onDone(edited);
+        } else {
+            options.onCancel();
+        }
+    }
+
+    // Clicking the page behind the dialog leaves the item alone; clicking inside it does not.
+    overlay.addEventListener('mousedown', (event) => {
+        if (event.target === overlay) {
+            close(false);
+        }
+    });
+
+    /**
+     * Escape leaves the item alone, from wherever the focus happens to be.
+     *
+     * On the overlay it only worked while the focus was inside the dialog, and the focus is not
+     * always there: clicking the page behind it, or a control that gave the focus back to the body,
+     * left the one key that cancels doing nothing at all.
+     *
+     * The controls inside stop Escape from reaching this while they have something of their own
+     * open — a suggestion list closes before the dialog does — and so does the search box while
+     * there is a query to clear, because this listens where they bubble to rather than ahead of
+     * them.
+     */
+    const onEscape = (event: KeyboardEvent): void => {
+        if (event.key === 'Escape') {
+            event.stopPropagation();
+            close(false);
+        }
+    };
+    document.addEventListener('keydown', onEscape);
+
+    openDialog = { finish: () => close(true), dismiss: () => close(false) };
+
+    document.body.append(overlay);
+    body.querySelector<HTMLElement>('input:not([type="hidden"]), select, textarea, button')?.focus();
 }
 
 /**
@@ -797,6 +1357,10 @@ function itemRow(
 ): HTMLElement {
     const row = document.createElement('div');
     row.className = 'item-row';
+
+    // A field that only applies under some other field's answer says so here; the form reads these
+    // back in `applyConditions`, which is also what hides the row and drops the value.
+    stampCondition(row, schema['x-when']);
 
     const label = document.createElement('label');
     label.textContent = schema.title ?? name;
@@ -870,6 +1434,13 @@ function itemField(
         input.dataset.kind = 'list';
         input.placeholder = 'Comma-separated';
         input.value = Array.isArray(value) ? value.join(', ') : '';
+    } else if (type === 'integer' || type === 'number') {
+        // Written as a number rather than as the text of one. A quoted `"0"` where the schema says
+        // integer does not fail the field — it fails the whole file, and every setting in it goes
+        // back to its default with nothing in the editor to say so.
+        input.type = 'number';
+        input.dataset.kind = 'number';
+        input.value = value === undefined || value === null ? '' : String(value);
     } else {
         input.dataset.kind = 'text';
         input.value = value === undefined || value === null ? '' : String(value);
@@ -1080,7 +1651,7 @@ function choiceListField(name: string, path: string, value: unknown): HTMLElemen
     drawPills();
     drawMenu();
     ask();
-    askAgain.add(ask);
+    registerAsk(ask);
 
     return box;
 }
@@ -1128,7 +1699,7 @@ function choiceSelectField(name: string, path: string, value: unknown): HTMLElem
 
     draw([]);
     ask();
-    askAgain.add(ask);
+    registerAsk(ask);
 
     return dropdown(select);
 }
@@ -1166,6 +1737,10 @@ function readItemField(field: HTMLElement): unknown {
             .filter((part) => part.length > 0);
         return parts.length > 0 ? parts : undefined;
     }
+    if (kind === 'number') {
+        const parsed = Number(text);
+        return Number.isFinite(parsed) ? parsed : undefined;
+    }
     return text;
 }
 
@@ -1175,12 +1750,16 @@ function readItemField(field: HTMLElement): unknown {
 
 /** Every field the shape editor draws itself. */
 function shapeFields(shape: MemberShapeSpec): Set<string> {
-    return new Set([
-        shape.type,
-        shape.member,
-        shape.parameters,
-        ...Object.keys(shape.positions),
-    ]);
+    const fields = new Set<string>([shape.type, shape.member]);
+    // A shape naming something with no parameter list — a property, a field — has neither of these,
+    // and the fields it does not claim are drawn as ordinary rows.
+    if (shape.parameters !== undefined) {
+        fields.add(shape.parameters);
+    }
+    for (const field of Object.keys(shape.positions ?? {})) {
+        fields.add(field);
+    }
+    return fields;
 }
 
 /**
@@ -1209,21 +1788,29 @@ function memberShapeEditor(
     const box = document.createElement('div');
     box.className = 'shape';
 
-    // The three fields the line stands for. Hidden rather than dropped: `commit` reads them like
-    // every other field in the item, so what lands in the file is unchanged by any of this.
-    const stored: readonly string[] | undefined = Array.isArray(value[shape.parameters])
-        ? (value[shape.parameters] as unknown[]).map(text)
-        : undefined;
+    // Whether the line has a signature on it at all. A property is named and that is the whole of
+    // it; offering parentheses there would offer a distinction that does not exist.
+    const takesParameters = shape.parameters !== undefined;
+    const what = shape.label ?? 'Method';
+
+    // The fields the line stands for. Hidden rather than dropped: the form reads them like every
+    // other field in the item, so what lands in the file is unchanged by any of this.
+    const stored: readonly string[] | undefined =
+        takesParameters && Array.isArray(value[shape.parameters!])
+            ? (value[shape.parameters!] as unknown[]).map(text)
+            : undefined;
 
     const typeField = hiddenField(shape.type, 'text', value[shape.type]);
     const memberField = hiddenField(shape.member, 'text', value[shape.member]);
-    const parametersField = hiddenField(shape.parameters, 'list', stored?.join(', '));
+    const parametersField = takesParameters
+        ? hiddenField(shape.parameters!, 'list', stored?.join(', '))
+        : undefined;
 
     const row = document.createElement('div');
     row.className = 'item-row';
 
     const label = document.createElement('label');
-    label.textContent = 'Method';
+    label.textContent = what;
     label.htmlFor = `call-${++nextToken}`;
 
     const well = document.createElement('div');
@@ -1235,7 +1822,9 @@ function memberShapeEditor(
     input.className = 'call-input';
     input.spellcheck = false;
     input.autocomplete = 'off';
-    input.placeholder = 'Namespace.Class.Method(string, *)';
+    input.placeholder = takesParameters
+        ? 'Namespace.Class.Method(string, *)'
+        : `Namespace.Class.${what}`;
     input.setAttribute('role', 'combobox');
     input.setAttribute('aria-autocomplete', 'list');
     input.setAttribute('aria-expanded', 'false');
@@ -1255,9 +1844,10 @@ function memberShapeEditor(
 
     const help = document.createElement('p');
     help.className = 'item-help';
-    help.textContent =
-        'Leave the class off to match any class declaring the method. Add parentheses to pick one '
-        + 'overload, and * for a parameter of any type.';
+    help.textContent = takesParameters
+        ? 'Leave the class off to match any class declaring the method. Add parentheses to pick one '
+        + 'overload, and * for a parameter of any type.'
+        : `Leave the class off to match any class declaring the ${what.toLowerCase()}.`;
     row.append(help);
 
     box.append(row);
@@ -1277,22 +1867,33 @@ function memberShapeEditor(
     positionRows.className = 'shape-positions';
     box.append(positionRows);
 
-    for (const field of Object.keys(shape.positions)) {
-        const hidden = hiddenField(field, 'text', value[field]);
+    for (const field of Object.keys(shape.positions ?? {})) {
+        // 'number', because a position is an index: see itemField for what a quoted one costs.
+        const hidden = hiddenField(field, 'number', value[field]);
+        // A position field can be conditional like any other — a lookup taking its file name from a
+        // constant has no parameter to point at — and the schema says so on the field, not on the
+        // shape. The field is drawn here rather than as an ordinary row, so the condition has to be
+        // carried onto what is drawn instead: this input, and the chips row `drawPositions` builds.
+        stampCondition(hidden, itemSchema.properties?.[field]?.['x-when']);
         positions.set(field, hidden);
         box.append(hidden);
     }
 
-    box.append(typeField, memberField, parametersField);
+    box.append(typeField, memberField);
+    if (parametersField) {
+        box.append(parametersField);
+    }
 
     // ---- what the line says ------------------------------------------------------------------
 
     /** The line taken apart, onto the fields that are written to the file. */
     function sync(): void {
-        const call = parseCall(input.value);
+        const call = parseCall(input.value, takesParameters);
         typeField.value = call.type;
         memberField.value = call.member;
-        parametersField.value = (call.parameters ?? []).join(', ');
+        if (parametersField) {
+            parametersField.value = (call.parameters ?? []).join(', ');
+        }
     }
 
     let timer: number | undefined;
@@ -1314,7 +1915,7 @@ function memberShapeEditor(
     let generation = 0;
 
     function ask(): void {
-        const call = parseCall(input.value);
+        const call = parseCall(input.value, takesParameters);
         const mine = ++generation;
 
         let asMember: SettingsMsg.MemberShape | undefined;
@@ -1337,6 +1938,7 @@ function memberShapeEditor(
                 containingType: call.type,
                 memberName: call.member,
                 parameterTypes: call.parameters ?? [],
+                kinds: shape.memberKinds,
             }),
             (message) => {
                 asMember = message;
@@ -1353,6 +1955,7 @@ function memberShapeEditor(
                     token,
                     containingType: head(input.value),
                     memberName: '',
+                    kinds: shape.memberKinds,
                 }),
                 (message) => {
                     asType = message;
@@ -1417,16 +2020,26 @@ function memberShapeEditor(
             'warn',
             !searched && answerMessage.matches.length > 0 && matched.length === 0
         );
+        // A shape with no parameter list has no overloads to count: what there is to say is which
+        // member it settled on.
         status.textContent = answerMessage.problem
             ? answerMessage.problem
             : answerMessage.matches.length === 0
                 ? ''
-                : matched.length === answerMessage.matches.length
-                    ? `${count(matched.length, 'overload')} — all of them.`
-                    : `${matched.length} of ${count(answerMessage.matches.length, 'overload')} match.`;
+                : !takesParameters
+                    ? resolvedMember(matched[0] ?? answerMessage.matches[0])
+                    : matched.length === answerMessage.matches.length
+                        ? `${count(matched.length, 'overload')} — all of them.`
+                        : `${matched.length} of ${count(answerMessage.matches.length, 'overload')} match.`;
 
-        for (const match of answerMessage.matches) {
-            overloads.append(overloadRow(match, 'overload', searched));
+        // Only against a settled class, where "these are the overloads this entry selects" is a
+        // short, checkable claim. Search candidates are offered in the completion menu alone:
+        // drawn here as well, twenty of them pushed the rest of the form off the screen while
+        // saying nothing the menu was not already saying.
+        if (!searched) {
+            for (const match of answerMessage.matches) {
+                overloads.append(overloadRow(match, 'overload', searched));
+            }
         }
 
         drawMenu(reading);
@@ -1434,9 +2047,32 @@ function memberShapeEditor(
         // Only against a settled class. Counting a parameter of one search hit out of forty says
         // nothing about the method that ends up being named.
         drawPositions(searched ? undefined : matched[0]);
+
+        // The position rows were just built anew, and a row that has only this moment been put on
+        // the page has never been through `applyConditions` — every server answer would otherwise
+        // put a conditional row back on screen regardless of what its condition says.
+        reapplyConditions();
     }
 
-    /** One method, as a line that can be adopted by clicking it. */
+    /**
+     * Re-checks the conditions across the whole item form, from inside a redraw of part of it.
+     *
+     * The form is the root because a condition names a sibling field — the dropdown that decides a
+     * position row is an ordinary row elsewhere in the same dialog, not inside this editor.
+     */
+    function reapplyConditions(): void {
+        const form = box.closest<HTMLElement>('.item-form');
+        if (form) {
+            applyConditions(form);
+        }
+    }
+
+    /** What one match resolved to, in the words the line itself is written in. */
+    function resolvedMember(match: SettingsMsg.ShapeMatch): string {
+        return `${match.declaredBy}.${match.name}`;
+    }
+
+    /** One member, as a line that can be adopted by clicking it. */
     function overloadRow(
         match: SettingsMsg.ShapeMatch,
         className: string,
@@ -1445,16 +2081,21 @@ function memberShapeEditor(
         const line = document.createElement('button');
         line.type = 'button';
         line.className = match.matched ? `${className} matched` : className;
-        line.title = `${match.declaredBy}.${match.name}`;
+        line.title = match.kind
+            ? `${resolvedMember(match)} — ${match.kind}`
+            : resolvedMember(match);
 
-        const signature = document.createElement('span');
-        signature.textContent = match.signature;
-        line.append(signature);
+        const written = document.createElement('span');
+        written.textContent = match.signature;
+        line.append(written);
 
-        if (searched) {
+        // Where a searched-for member lives, or — for a setting that binds several kinds at once —
+        // which kind this one is. The same quiet column either way, and never both.
+        const detail = searched ? match.declaredBy : takesParameters ? '' : match.kind ?? '';
+        if (detail !== '') {
             const where = document.createElement('span');
             where.className = 'declared-by';
-            where.textContent = match.declaredBy;
+            where.textContent = detail;
             line.append(where);
         }
 
@@ -1463,7 +2104,9 @@ function memberShapeEditor(
                 formatCall(
                     match.declaredBy,
                     match.name,
-                    match.parameters.map((parameter) => parameter.type)
+                    takesParameters
+                        ? match.parameters.map((parameter) => parameter.type)
+                        : undefined
                 )
             )
         );
@@ -1562,7 +2205,7 @@ function memberShapeEditor(
             return;
         }
 
-        for (const [field, what] of Object.entries(shape.positions)) {
+        for (const [field, carries] of Object.entries(shape.positions ?? {})) {
             const hidden = positions.get(field);
             if (!hidden) {
                 continue;
@@ -1570,6 +2213,9 @@ function memberShapeEditor(
 
             const line = document.createElement('div');
             line.className = 'item-row';
+            // The same condition the hidden field carries, so the chips go off the screen with the
+            // value rather than inviting a choice that is about to be thrown away.
+            stampCondition(line, itemSchema.properties?.[field]?.['x-when']);
 
             const name = document.createElement('label');
             name.textContent = itemSchema.properties?.[field]?.title ?? field;
@@ -1608,7 +2254,7 @@ function memberShapeEditor(
 
             const blurb = document.createElement('p');
             blurb.className = 'item-help';
-            blurb.textContent = `Which parameter carries the ${what}.`;
+            blurb.textContent = `Which parameter carries the ${carries}.`;
             line.append(blurb);
 
             positionRows.append(line);
@@ -1678,7 +2324,7 @@ function memberShapeEditor(
 
     sync();
     ask();
-    askAgain.add(ask);
+    registerAsk(ask);
 
     return box;
 }
@@ -1728,10 +2374,14 @@ function segment(name: string): string {
  * The class is everything before the last dot, so a line with no dot at all names no class — which
  * is the documented escape hatch for matching any class that declares the member, and reads as one:
  * `GetString(string)` is a method, said without saying whose.
+ *
+ * `withParameters` is false for a shape that names something with no parameter list; the whole line
+ * is then a name, and a stray parenthesis in it is part of what did not resolve rather than the
+ * start of a signature.
  */
-function parseCall(line: string): Call {
+function parseCall(line: string, withParameters = true): Call {
     const trimmed = line.trim();
-    const open = trimmed.indexOf('(');
+    const open = withParameters ? trimmed.indexOf('(') : -1;
     const name = (open < 0 ? trimmed : trimmed.slice(0, open)).trim();
     const inside = open < 0 ? undefined : trimmed.slice(open + 1).replace(/\)\s*$/, '');
     const dot = name.lastIndexOf('.');

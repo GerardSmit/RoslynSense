@@ -37,6 +37,17 @@ public class SettingsAssistTests
             {
             }
 
+            public class OrderStatus
+            {
+                public string Code { get; set; }
+
+                public string Description { get; }
+
+                public string LegacyCode;
+
+                public string Format(string pattern) => pattern;
+            }
+
             public interface ILocalizedControl
             {
             }
@@ -276,6 +287,103 @@ public class SettingsAssistTests
         Assert.Equal("GetString(string key)", extension.Signature);
     }
 
+    // ---- Members that are not called ----------------------------------------------------------
+
+    /// <summary>
+    /// A setting naming a member that holds a value asks for properties, and gets no methods —
+    /// offering a method there would walk someone into an entry that binds nothing.
+    /// </summary>
+    [Fact]
+    public async Task AskingForPropertiesAnswersWithPropertiesAndFieldsOnly()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.OrderStatus", Kinds: ["property", "field"]));
+
+        Assert.Contains("Code", result.MemberSuggestions);
+        Assert.Contains("LegacyCode", result.MemberSuggestions);
+        Assert.DoesNotContain("Format", result.MemberSuggestions);
+    }
+
+    /// <summary>And the other way round, which is what every caller asked for before any of them
+    /// asked for anything else.</summary>
+    [Fact]
+    public async Task AskingForNothingInParticularStillAnswersWithMethods()
+    {
+        var result = await ShapeAsync(new MemberShapeParams("Contoso.Web.OrderStatus"));
+
+        Assert.Contains("Format", result.MemberSuggestions);
+        Assert.DoesNotContain("Code", result.MemberSuggestions);
+    }
+
+    /// <summary>
+    /// A property has no parameters at all, so the row about one is written the way it is declared
+    /// rather than the way it would be called.
+    /// </summary>
+    [Fact]
+    public async Task APropertyIsWrittenAsItIsDeclaredAndHasNoParameters()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.OrderStatus", "Code", Kinds: ["property", "field"]));
+
+        var match = Assert.Single(result.Matches);
+
+        Assert.Equal("property", match.Kind);
+        Assert.Equal("string Code { get; set; }", match.Signature);
+        Assert.Empty(match.Parameters);
+        Assert.True(match.Matched);
+    }
+
+    /// <summary>A get-only property says so, which is the one thing about it the name does not.</summary>
+    [Fact]
+    public async Task AGetOnlyPropertySaysSo()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.OrderStatus", "Description", Kinds: ["property"]));
+
+        Assert.Equal("string Description { get; }", Assert.Single(result.Matches).Signature);
+    }
+
+    [Fact]
+    public async Task AFieldIsWrittenAsItIsDeclaredToo()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            "Contoso.Web.OrderStatus", "LegacyCode", Kinds: ["property", "field"]));
+
+        var match = Assert.Single(result.Matches);
+
+        Assert.Equal("field", match.Kind);
+        Assert.Equal("string LegacyCode", match.Signature);
+    }
+
+    /// <summary>
+    /// The class is as optional here as it is for a method: someone writing this is looking at a
+    /// property on an entity whose namespace is a `using` in some other file.
+    /// </summary>
+    [Fact]
+    public async Task APropertyIsFoundAcrossTheSolutionWithNoClassNamed()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            ContainingType: "", MemberName: "LegacyCode", Kinds: ["property", "field"]));
+
+        var match = Assert.Single(result.Matches);
+
+        Assert.Equal("Contoso.Web.OrderStatus", match.DeclaredBy);
+        Assert.Equal("field", match.Kind);
+    }
+
+    /// <summary>
+    /// The solution-wide search is a search for what was asked for, not a method search with the
+    /// answer filtered afterwards — a method of that name is simply not one of the answers.
+    /// </summary>
+    [Fact]
+    public async Task TheSolutionWideSearchForAPropertyFindsNoMethods()
+    {
+        var result = await ShapeAsync(new MemberShapeParams(
+            ContainingType: "", MemberName: "Format", Kinds: ["property", "field"]));
+
+        Assert.Empty(result.Matches);
+    }
+
     // ---- The values a setting can take -------------------------------------------------------
 
     /// <summary>
@@ -325,6 +433,33 @@ public class SettingsAssistTests
             new SettingChoicesParams("resources.lookups[].fallbacks", config)).Items;
 
         Assert.NotEmpty(choices);
+    }
+
+    /// <summary>
+    /// Both sections that name a place in C# point at the same sets, so both are answered from the
+    /// file being edited rather than from the server's own configuration.
+    /// </summary>
+    [Theory]
+    [InlineData("valueSets.bindings[].set")]
+    [InlineData("valueSets.properties[].set")]
+    public void EitherWayOfNamingAMemberOffersTheSetsTheFileDeclares(string path)
+    {
+        var config = JsonDocument.Parse("""
+            {
+                "valueSets": {
+                    "sets": [
+                        { "id": "orderStatus", "query": "SELECT [Code] FROM Shop_OrderStatus" }
+                    ]
+                }
+            }
+            """).RootElement;
+
+        var choices = SettingsAssistHandler.Choices(new SettingChoicesParams(path, config)).Items;
+
+        var set = Assert.Single(choices);
+
+        Assert.Equal("orderStatus", set.Value);
+        Assert.Contains("Shop_OrderStatus", set.Detail!, StringComparison.Ordinal);
     }
 
     [Fact]

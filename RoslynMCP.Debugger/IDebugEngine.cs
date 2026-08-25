@@ -118,9 +118,17 @@ public interface IDebugEngine : IDisposable
 }
 
 /// <summary>
-/// Creates the engine appropriate to a target: in-process when the bitness matches, otherwise a
-/// worker of the target's bitness.
+/// Creates the engine appropriate to a target: a worker of the target's bitness whenever one is
+/// installed, in-process only as the fallback for a bitness-matched target without workers.
 /// </summary>
+/// <remarks>
+/// A worker is preferred even when the bitness matches, for two reasons. Edit-and-Continue:
+/// <c>ApplyChanges</c> faults rather than fails on a bad stop shape, and only a disposable
+/// worker may take that risk — the in-process engine refuses every apply by design, which made
+/// hot reload structurally impossible for bitness-matched targets (the x64 IIS Express default
+/// among them). And uniformity: one engine path exercised everywhere instead of two that
+/// diverge only in the environments tests do not cover.
+/// </remarks>
 public static class DebugEngineFactory
 {
     /// <summary>
@@ -131,21 +139,19 @@ public static class DebugEngineFactory
     public static IDebugEngine ForProcess(int pid, uint sessionId = 1)
     {
         var targetArch = ProcessArch.OfProcess(pid);
+        var worker = FindWorker(targetArch);
+        if (worker is not null)
+            return new WorkerDebugEngine(worker, sessionId);
+
         if (targetArch == ProcessArch.Host)
             return new InProcessDebugEngine(sessionId);
 
-        var worker = FindWorker(targetArch);
-        if (worker is null)
-        {
-            throw new InvalidOperationException(
-                $"Process {pid} is {Describe(targetArch)} but this host is {Describe(ProcessArch.Host)}, " +
-                "and ICorDebug cannot attach across architectures. The matching debug worker was not " +
-                $"found (expected under '{WorkerDirectory}/{Suffix(targetArch)}'). Either install it or " +
-                $"run the target as {Describe(ProcessArch.Host)} — for IIS Express, use the " +
-                $"{Describe(ProcessArch.Host)} iisexpress.exe.");
-        }
-
-        return new WorkerDebugEngine(worker, sessionId);
+        throw new InvalidOperationException(
+            $"Process {pid} is {Describe(targetArch)} but this host is {Describe(ProcessArch.Host)}, " +
+            "and ICorDebug cannot attach across architectures. The matching debug worker was not " +
+            $"found (expected under '{WorkerDirectory}/{Suffix(targetArch)}'). Either install it or " +
+            $"run the target as {Describe(ProcessArch.Host)} — for IIS Express, use the " +
+            $"{Describe(ProcessArch.Host)} iisexpress.exe.");
     }
 
     /// <summary>
@@ -159,21 +165,19 @@ public static class DebugEngineFactory
     public static IDebugEngine ForExecutable(string executablePath, uint sessionId = 1)
     {
         var targetArch = ProcessArch.OfExecutable(executablePath);
+        var worker = FindWorker(targetArch);
+        if (worker is not null)
+            return new WorkerDebugEngine(worker, sessionId);
+
         if (targetArch == ProcessArch.Host)
             return new InProcessDebugEngine(sessionId);
 
-        var worker = FindWorker(targetArch);
-        if (worker is null)
-        {
-            throw new InvalidOperationException(
-                $"'{Path.GetFileName(executablePath)}' is {Describe(targetArch)} but this host is " +
-                $"{Describe(ProcessArch.Host)}, and ICorDebug cannot debug across architectures. " +
-                $"The matching debug worker was not found (expected under " +
-                $"'{WorkerDirectory}/{Suffix(targetArch)}'). Either install it, or build the " +
-                $"project as {Describe(ProcessArch.Host)}.");
-        }
-
-        return new WorkerDebugEngine(worker, sessionId);
+        throw new InvalidOperationException(
+            $"'{Path.GetFileName(executablePath)}' is {Describe(targetArch)} but this host is " +
+            $"{Describe(ProcessArch.Host)}, and ICorDebug cannot debug across architectures. " +
+            $"The matching debug worker was not found (expected under " +
+            $"'{WorkerDirectory}/{Suffix(targetArch)}'). Either install it, or build the " +
+            $"project as {Describe(ProcessArch.Host)}.");
     }
 
     /// <summary>Locates the published worker for an architecture, or null when absent.</summary>
@@ -194,7 +198,19 @@ public static class DebugEngineFactory
         return null;
     }
 
-    private static string Suffix(DebugArch arch) => arch == DebugArch.X86 ? "x86" : "x64";
+    /// <summary>The <c>workers/</c> subfolder an architecture's worker is published to.</summary>
+    public static string Suffix(DebugArch arch) => arch switch
+    {
+        DebugArch.X86 => "x86",
+        DebugArch.Arm64 => "arm64",
+        _ => "x64",
+    };
 
-    private static string Describe(DebugArch arch) => arch == DebugArch.X86 ? "32-bit" : "64-bit";
+    /// <summary>How an architecture should read in a message to the user.</summary>
+    public static string Describe(DebugArch arch) => arch switch
+    {
+        DebugArch.X86 => "32-bit x86",
+        DebugArch.Arm64 => "64-bit arm64",
+        _ => "64-bit x64",
+    };
 }

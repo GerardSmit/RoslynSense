@@ -64,12 +64,17 @@ public class CrossBitnessDebugTests
     }
 
     [Fact]
-    public void WhenBitnessMatchesThenNoWorkerIsUsed()
+    public void WhenBitnessMatchesTheWorkerIsStillPreferred()
     {
-        // The test host is x64 and so is this process, so an x64 target debugs in-process.
+        // A worker is used even for a bitness-matched target: only the disposable worker may
+        // call ApplyChanges, so routing matched targets in-process quietly disabled their hot
+        // reload. In-process remains the fallback for installs without staged workers.
         using var engine = DebugEngineFactory.ForProcess(Environment.ProcessId);
 
-        Assert.IsType<InProcessDebugEngine>(engine);
+        if (DebugEngineFactory.FindWorker(ProcessArch.Host) is not null)
+            Assert.IsType<WorkerDebugEngine>(engine);
+        else
+            Assert.IsType<InProcessDebugEngine>(engine);
     }
 }
 

@@ -80,12 +80,12 @@ public static class MemorySnapshotService
         var workerPath = DebugEngineFactory.FindWorker(targetArch);
         if (workerPath is null)
         {
-            var host = ProcessArch.Host == DebugArch.X86 ? "32-bit" : "64-bit";
-            var target = targetArch == DebugArch.X86 ? "32-bit" : "64-bit";
+            var host = DebugEngineFactory.Describe(ProcessArch.Host);
+            var target = DebugEngineFactory.Describe(targetArch);
             throw new InvalidOperationException(
                 $"Process {pid} is {target} but this host is {host}, and heap inspection cannot " +
                 $"cross architectures. The matching worker was not found (expected under " +
-                $"'workers/{(targetArch == DebugArch.X86 ? "x86" : "x64")}'). Either install it or " +
+                $"'workers/{DebugEngineFactory.Suffix(targetArch)}'). Either install it or " +
                 $"run the target as {host}.");
         }
 

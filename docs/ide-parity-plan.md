@@ -1170,8 +1170,10 @@ Three pieces:
      mode rather than breaking on your behalf — Rider's `ApplyEncChangesSync` asserts the debugger
      session's main thread and runs off a paused session.
 
-     The engine therefore refuses while the target is running and says why. The refusal is the
-     feature: the alternative to that message is a dead process.
+     The engine therefore never applies against a running target. An apply that arrives without
+     a genuine debug-event stop — or at a stop whose thread is not in user code of the edited
+     module's own app domain — is queued, reported as queued, and flushed at the next
+     breakpoint, step or exception stop. The alternative to that queue is a dead process.
    - **`TrySetJITCompilerFlags(CORDEBUG_JIT_ENABLE_ENC)` had its result thrown away.** A module
      that fails to flag is not updatable, and `ApplyChanges` faults on it rather than failing, so
      the one signal that predicts a crash was being discarded. The HRESULT is now checked and an
@@ -1181,7 +1183,9 @@ Three pieces:
    editor's language server and every other chat's loaded workspace, which is not something to
    stake on a native call that faults instead of failing. Only `WorkerDebugEngine` — a separate,
    disposable process — may make it. That guard is what turned the second reproduction of the
-   crash from an outage into a reported error.
+   crash from an outage into a reported error. `DebugEngineFactory` therefore routes every
+   .NET Framework session through a worker whenever one is staged, even when the bitness
+   matches; in-process is only the fallback for installs without workers.
 
    Three further things the runtime does *not* do for you, all now handled — `ApplyChanges` takes
    metadata and IL and updates the runtime, and nothing else:
@@ -1199,9 +1203,12 @@ Three pieces:
      the debugger's view can disagree from that point on. Further edits would build on that, so
      they are refused.
 
-   Not handled, deliberately: `FunctionRemapOpportunity` / `ICorDebugILFrame2::RemapFunction`.
-   Frames already executing an edited method finish on the old version and the next call gets the
-   new one, which is the documented first-version behavior.
+   `FunctionRemapOpportunity` / `ICorDebugILFrame2::RemapFunction` is handled: a frame stopped
+   inside an edited method jumps to the edited version at the mapped sequence point instead of
+   finishing on the old code — the Rider/Visual Studio behaviour. If the remap fails the frame
+   falls back to finishing the old version, which is the documented default. Applies are also
+   MVID-keyed across app domains: every loaded instance of the edited module with the same MVID
+   receives the delta, provided its domain has a safely-stopped user-code thread.
 
    `RoslynMCP.Tests/FrameworkHotReloadTests.cs` proves the whole path: an MSBuild-built `net48`
    x86 target, launched under the worker, broken at a breakpoint, edited, applied, resumed, and

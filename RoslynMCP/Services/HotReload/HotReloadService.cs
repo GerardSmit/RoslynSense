@@ -197,19 +197,31 @@ internal sealed class HotReloadService
 
         var (applied, errors) = await HotReloadAgentServer.Instance.ApplyAsync(deltas, cancellationToken);
 
-        var (frameworkApplied, frameworkErrors) = await ApplyToFrameworkSessionAsync(
+        var (frameworkApplied, queued, frameworkErrors) = await ApplyToFrameworkSessionAsync(
             solution, deltas, cancellationToken);
 
         applied = [.. applied, .. frameworkApplied];
         errors = [.. errors, .. frameworkErrors];
 
-        string summary = applied.Count == 0
-            ? errors.Count > 0
+        // A queued edit is a success with a different tense: the debuggee could not take it
+        // safely right now (nothing of the user's is stopped in it), so the debug engine holds
+        // it and lands it at the next breakpoint. Saying "applied" for it would be a lie the
+        // user discovers mid-debugging.
+        string summary = (applied.Count, queued.Count) switch
+        {
+            (0, 0) => errors.Count > 0
                 ? "The delta was computed but no running target accepted it."
-                : "The delta was computed but nothing is running to apply it to."
-            : $"Applied {deltas.Count} module update(s) to {string.Join(", ", applied)}.";
+                : "The delta was computed but nothing is running to apply it to.",
+            (0, _) =>
+                $"Edit queued for {string.Join(", ", queued)}; it will be applied at the next breakpoint.",
+            (_, 0) => $"Applied {deltas.Count} module update(s) to {string.Join(", ", applied)}.",
+            _ => $"Applied to {string.Join(", ", applied)}; queued for {string.Join(", ", queued)} " +
+                 "(applies at the next breakpoint).",
+        };
 
-        return new HotReloadOutcome(applied.Count > 0, summary, reported, applied, errors);
+        return new HotReloadOutcome(
+            applied.Count > 0 || queued.Count > 0, summary, reported,
+            [.. applied, .. queued.Select(q => $"{q} (queued)")], errors);
     }
 
     /// <summary>
@@ -222,7 +234,7 @@ internal sealed class HotReloadService
     /// skipped rather than reported as a failure: a solution can easily contain projects the
     /// running app never loads.
     /// </remarks>
-    private static async Task<(IReadOnlyList<string> Applied, IReadOnlyList<string> Errors)>
+    private static async Task<(IReadOnlyList<string> Applied, IReadOnlyList<string> Queued, IReadOnlyList<string> Errors)>
         ApplyToFrameworkSessionAsync(
             Solution solution, IReadOnlyList<HotReloadDelta> deltas, CancellationToken cancellationToken)
     {
@@ -240,10 +252,11 @@ internal sealed class HotReloadService
                 .ToList();
 
         if (icor is null && remotePids.Count == 0)
-            return ([], []);
+            return ([], [], []);
 
         var names = ModuleNames(solution);
         var applied = new List<string>();
+        var queued = new List<string>();
         var errors = new List<string>();
 
         foreach (var delta in deltas)
@@ -273,11 +286,13 @@ internal sealed class HotReloadService
             }
         }
 
-        return (applied, errors);
+        return (applied, queued, errors);
 
         void Record(string assemblyName, bool ok, string error)
         {
-            if (ok)
+            if (ok && error.StartsWith(Debugger.DebugSession.DeltaQueuedPrefix, StringComparison.Ordinal))
+                queued.Add($"{assemblyName} (debuggee)");
+            else if (ok)
                 applied.Add($"{assemblyName} (debuggee)");
             else if (!error.Contains("is not loaded", StringComparison.OrdinalIgnoreCase) &&
                      !error.Contains("does not debug .NET Framework", StringComparison.OrdinalIgnoreCase))

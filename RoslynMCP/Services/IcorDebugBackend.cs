@@ -707,17 +707,17 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (_engine is null)
             return (false, "No .NET Framework debug session is attached.");
 
-        // An edit needs the target stopped, so a running one is broken into first and resumed
+        // An edit prefers the target stopped, so a running one is broken into first and resumed
         // afterwards — the user asked to apply an edit, not to be told to go and press pause.
         // It has to be a full Break All rather than a bare suspend: applying immediately after
-        // ICorDebugProcess::Stop faults inside ApplyChanges instead of failing.
+        // ICorDebugProcess::Stop faults inside ApplyChanges instead of failing. When even the
+        // Break All produces no usable stop, the engine is still asked: it queues the delta and
+        // applies it at the next real breakpoint instead of losing the edit.
         bool paused = false;
         if (CurrentFrame is null)
         {
-            string result = await InterruptAsync(cancellationToken);
-            if (CurrentFrame is null)
-                return (false, $"the target could not be suspended to apply the edit: {result}");
-            paused = true;
+            await InterruptAsync(cancellationToken);
+            paused = CurrentFrame is not null;
         }
 
         try

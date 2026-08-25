@@ -190,7 +190,15 @@ internal sealed class DebugCommandPipeServer : IDisposable
             Convert.FromBase64String(request.PdbDelta ?? ""),
             ct);
 
-        return ok ? "Applied." : $"Error: {error}";
+        if (!ok)
+            return $"Error: {error}";
+
+        // "Queued" is a success with a caveat the user has to hear — the edit lands at the next
+        // breakpoint, not now — so the engine's message survives the pipe instead of being
+        // flattened to "Applied."
+        return error.StartsWith(RoslynMCP.Debugger.DebugSession.DeltaQueuedPrefix, StringComparison.Ordinal)
+            ? error
+            : "Applied.";
     }
 
     private static string Json<T>(T value) =>

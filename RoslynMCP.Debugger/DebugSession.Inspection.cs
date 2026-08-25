@@ -1363,8 +1363,10 @@ public sealed partial class DebugSession
             stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
             stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
             stepper.StepOut();
+            // Still the same logical step, so _steppingThreadId is left alone: this step-out is
+            // how the original step continues, not a new one.
             lock (_stepperLock)
-                _steppers.Add(stepper);
+                _steppers.Add((ThreadId(thread), stepper));
             return true;
         }
         catch
@@ -1374,4 +1376,36 @@ public sealed partial class DebugSession
     }
 
     private readonly Lock _stepperLock = new();
+
+    /// <summary>
+    /// The thread the in-flight step was armed on, or 0 when no step is outstanding.
+    /// </summary>
+    private int _steppingThreadId;
+
+    /// <summary>
+    /// Cancels every armed stepper, because something other than a step decided where the target
+    /// stops.
+    /// </summary>
+    /// <remarks>
+    /// Without this, a step interrupted by a breakpoint or an exception leaves its stepper armed in
+    /// the runtime. The next time the user continues, that stepper completes and the session
+    /// reports a step nobody asked for — arriving, from the client's point of view, as the target
+    /// stopping at random. Deactivating is also what makes the thread check on step completes
+    /// meaningful: it bounds how long a stale stepper can survive.
+    /// </remarks>
+    private void DeactivateSteppers()
+    {
+        lock (_stepperLock)
+        {
+            foreach (var (_, stepper) in _steppers)
+            {
+                // A stepper whose thread or process has already gone throws here; there is nothing
+                // to cancel in that case, which is the outcome we wanted anyway.
+                try { _ = stepper.TryDeactivate(); }
+                catch { }
+            }
+            _steppers.Clear();
+        }
+        _steppingThreadId = 0;
+    }
 }

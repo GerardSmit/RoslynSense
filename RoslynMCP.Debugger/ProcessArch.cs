@@ -3,18 +3,29 @@ using System.Runtime.InteropServices;
 
 namespace RoslynMCP.Debugger;
 
-/// Process/PE architecture, so the host debugs a target through a worker of matching bitness —
-/// ICorDebug cannot attach across x86/x64.
+/// Process/PE architecture, so the host debugs a target through a worker of matching architecture —
+/// ICorDebug cannot attach across architectures.
 public enum DebugArch
 {
     X64,
     X86,
+    Arm64,
 }
 
 public static class ProcessArch
 {
-    /// The bitness this host process runs as.
-    public static DebugArch Host => Environment.Is64BitProcess ? DebugArch.X64 : DebugArch.X86;
+    private const ushort ImageFileMachineUnknown = 0;
+    private const ushort ImageFileMachineI386 = 0x014C;
+    private const ushort ImageFileMachineAmd64 = 0x8664;
+    private const ushort ImageFileMachineArm64 = 0xAA64;
+
+    /// The architecture this host process runs as.
+    public static DebugArch Host => RuntimeInformation.ProcessArchitecture switch
+    {
+        Architecture.X86 => DebugArch.X86,
+        Architecture.Arm64 => DebugArch.Arm64,
+        _ => DebugArch.X64,
+    };
 
     /// Read a managed/native executable's target architecture from its PE header. AnyCPU
     /// assemblies (I386 machine + no 32-bit-required flag) run as the OS bitness, so they map to
@@ -29,7 +40,8 @@ public static class ProcessArch
             var machine = headers.CoffHeader.Machine;
             return machine switch
             {
-                Machine.Amd64 or Machine.Arm64 or Machine.IA64 => DebugArch.X64,
+                Machine.Amd64 => DebugArch.X64,
+                Machine.Arm64 => DebugArch.Arm64,
                 Machine.I386 => IsAnyCpu(headers) ? Host : DebugArch.X86,
                 _ => Host,
             };
@@ -69,12 +81,49 @@ public static class ProcessArch
         try
         {
             using var process = System.Diagnostics.Process.GetProcessById(pid);
-            if (IsWow64Process(process.Handle, out var isWow64))
-                return isWow64 ? DebugArch.X86 : DebugArch.X64;
+
+            // IsWow64Process2 reports which machine the process is emulating and which the OS runs
+            // natively, so it can tell an arm64-native process from an x64 one. Plain
+            // IsWow64Process only answers "is this emulated", which on an arm64 OS collapses
+            // arm64 and x64 into the same answer.
+            if (IsWow64Process2(process.Handle, out var processMachine, out var nativeMachine))
+            {
+                // A known emulated machine is a direct answer.
+                switch (processMachine)
+                {
+                    case ImageFileMachineI386:
+                        return DebugArch.X86;
+                    case ImageFileMachineAmd64:
+                        return DebugArch.X64;
+                    case ImageFileMachineArm64:
+                        return DebugArch.Arm64;
+                }
+
+                // Otherwise the process is native to the OS — except on arm64, where x64 processes
+                // do not necessarily report as emulated. Trusting the native machine there would
+                // call every x64 target arm64 and send it to a worker that cannot attach to it, so
+                // that one case is settled from the image instead.
+                if (processMachine == ImageFileMachineUnknown && nativeMachine != ImageFileMachineArm64)
+                {
+                    return nativeMachine switch
+                    {
+                        ImageFileMachineI386 => DebugArch.X86,
+                        ImageFileMachineAmd64 => DebugArch.X64,
+                        _ => Host,
+                    };
+                }
+            }
+            else if (IsWow64Process(process.Handle, out var isWow64))
+            {
+                // Windows too old for IsWow64Process2. It cannot distinguish arm64 from x64, but
+                // such a Windows predates arm64 anyway.
+                return isWow64 ? DebugArch.X86 : Host;
+            }
         }
         catch
         {
-            // Process gone, or not enough rights to open it; fall back to the executable image.
+            // Process gone, not enough rights to open it, or a Windows too old for
+            // IsWow64Process2; fall back to the executable image.
         }
 
         try
@@ -94,4 +143,7 @@ public static class ProcessArch
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool IsWow64Process(IntPtr hProcess, out bool wow64Process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool IsWow64Process2(IntPtr hProcess, out ushort processMachine, out ushort nativeMachine);
 }

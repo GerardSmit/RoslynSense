@@ -294,7 +294,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
     {
         try
         {
-            await SendAsync(new WorkerRequest
+            var response = await SendAsync(new WorkerRequest
             {
                 Op = "applyDelta",
                 Name = assemblyName,
@@ -303,7 +303,9 @@ public sealed class WorkerDebugEngine : IDebugEngine
                 PdbDelta = Convert.ToBase64String(pdb),
             });
 
-            return (true, "");
+            // A successful response still carries a message when the edit was queued rather
+            // than applied (DebugSession.DeltaQueuedPrefix); the caller tells the user which.
+            return (true, response.Error);
         }
         catch (Exception ex)
         {

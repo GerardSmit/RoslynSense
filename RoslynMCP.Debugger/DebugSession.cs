@@ -685,10 +685,11 @@ public sealed partial class DebugSession : IDebugSession
         {
             foreach (var frame in Safe(() => chain.Frames) ?? Array.Empty<CorDebugFrame>())
             {
-                var (file, line, column) = FrameLocation(frame);
-                var (modulePath, methodToken, ilOffset) = file.Length == 0
-                    ? FrameIdentity(frame)
-                    : ("", 0, -1);
+                var (file, line, column, endLine, endColumn) = FrameSpan(frame);
+                // Filled for every frame, not only the ones without source. External-source
+                // resolution skips frames that already have a file, and a frame with source still
+                // needs its module and token to be reported as an active statement.
+                var (modulePath, methodToken, ilOffset) = FrameIdentity(frame);
                 frames.Add(new StackFrame
                 {
                     Index = index++,
@@ -696,6 +697,8 @@ public sealed partial class DebugSession : IDebugSession
                     FilePath = file,
                     Line = (uint)line,
                     Column = (uint)column,
+                    EndLine = (uint)Math.Max(0, endLine),
+                    EndColumn = (uint)Math.Max(0, endColumn),
                     ThreadId = ThreadId(thread),
                     ModulePath = modulePath,
                     MethodToken = methodToken,
@@ -3002,8 +3005,11 @@ public sealed partial class DebugSession : IDebugSession
             return;
 
         var assemblyName = Path.GetFileNameWithoutExtension(moduleName);
-        if (assemblyName.Length > 0)
-            _encModules[assemblyName] = module;
+        if (assemblyName.Length == 0)
+            return;
+
+        _encModules[assemblyName] = module;
+        QueueHistoryReplay(module, assemblyName);
     }
 
     /// One-time "no symbols" diagnostic per user module, only when source breakpoints exist —
@@ -3204,12 +3210,45 @@ public sealed partial class DebugSession : IDebugSession
 
     /// <summary>Deltas accepted while no safe stop existed, applied in order at the next real
     /// debug-event stop. Session thread only.</summary>
-    private readonly Queue<(string AssemblyName, byte[] Metadata, byte[] Il, byte[] Pdb)> _pendingDeltas = new();
+    private readonly Queue<PendingDelta> _pendingDeltas = new();
+
+    /// <summary>One edit still waiting for a stop it can safely be applied from.</summary>
+    /// <param name="Sequence">Its position in this session's edit history, which is also what
+    /// keeps a symbol reader from being told about the same edit twice.</param>
+    /// <param name="Target">The one module instance to apply to, when this is a replay into a
+    /// freshly loaded module. Null means the ordinary case: every loaded instance of the
+    /// assembly.</param>
+    private sealed record PendingDelta(
+        long Sequence,
+        string AssemblyName,
+        byte[] Metadata,
+        byte[] Il,
+        byte[] Pdb,
+        string? Map,
+        CorDebugModule? Target = null);
+
+    /// <summary>
+    /// Every edit applied in this session, in order, keyed by the build it was computed against.
+    /// </summary>
+    /// <remarks>
+    /// A hosted app recycles its app domain and loads the same assemblies again from scratch, at
+    /// which point the running code is the code that was built, not the code the user has been
+    /// editing for the last half hour. Keyed by MVID so a rebuild — a genuinely different image
+    /// that happens to share the name — is never handed edits computed against the old one.
+    /// </remarks>
+    private readonly ConcurrentDictionary<Guid, List<PendingDelta>> _deltaHistory = new();
+
+    /// <summary>Replays a module load asked for, waiting to be moved onto the session thread.
+    /// Separate because <see cref="_pendingDeltas"/> belongs to the session thread and module
+    /// loads arrive on the runtime's callback thread.</summary>
+    private readonly ConcurrentQueue<PendingDelta> _replayDeltas = new();
+
+    private long _deltaSequence;
 
     /// Apply one EnC metadata+IL delta to a live module (by simple assembly name), marshalled
     /// onto the session thread. Applied immediately from a safe break state, queued otherwise.
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(
-        string assemblyName, byte[] metadata, byte[] il, byte[] pdb)
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb, string? symbolMap = null)
         => InvokeAsync<(bool Ok, string Error)>(() =>
     {
         if (_encPoisoned)
@@ -3219,6 +3258,11 @@ public sealed partial class DebugSession : IDebugSession
         var process = _process;
         if (process is null)
             return (false, "no process");
+
+        // Before anything else, so a module that reloaded is caught up on the edits it missed
+        // before this one is offered to it. A delta computed against a later generation cannot be
+        // applied to a module still on an earlier one, and the queue is what keeps them in order.
+        DrainReplays();
 
         // A stop alone is not enough. What ApplyChanges tolerates was mapped empirically against
         // IIS Express: from a break state whose adopted thread sits in user code of the edited
@@ -3236,14 +3280,43 @@ public sealed partial class DebugSession : IDebugSession
         if (_stoppedThread is null || _pendingDeltas.Count > 0 ||
             (!StoppedThreadIsUserCodeIn(module) && !UserCodeIsStoppedIn(module)))
         {
-            _pendingDeltas.Enqueue((assemblyName, metadata, il, pdb));
+            _pendingDeltas.Enqueue(new PendingDelta(
+                NextDeltaSequence(), assemblyName, metadata, il, pdb, symbolMap));
             return (true, DeltaQueuedPrefix +
                 "no user code is stopped in the edited module's app domain, so the edit is " +
                 "queued and will be applied at the next breakpoint hit in the app's own code");
         }
 
-        return ApplyDeltaCore(module, assemblyName, metadata, il, pdb);
+        return ApplyDeltaCore(
+            module,
+            new PendingDelta(NextDeltaSequence(), assemblyName, metadata, il, pdb, symbolMap));
     });
+
+    private long NextDeltaSequence() => Interlocked.Increment(ref _deltaSequence);
+
+    /// <summary>
+    /// Moves replays the callback thread asked for onto the session thread's own queue.
+    /// </summary>
+    /// <remarks>
+    /// Ordered by the edit each one is, not by when it was queued. A delta is only valid against the
+    /// generation immediately before it, and a replay is by definition an older edit than anything
+    /// still waiting — so an edit queued while the app was running, followed by a recycle, has to
+    /// let the reloaded module catch up first or it is handed a delta several generations ahead of
+    /// the baseline it actually has.
+    /// </remarks>
+    private void DrainReplays()
+    {
+        if (_replayDeltas.IsEmpty)
+            return;
+
+        while (_replayDeltas.TryDequeue(out var replay))
+            _pendingDeltas.Enqueue(replay);
+
+        var ordered = _pendingDeltas.OrderBy(d => d.Sequence).ToArray();
+        _pendingDeltas.Clear();
+        foreach (var delta in ordered)
+            _pendingDeltas.Enqueue(delta);
+    }
 
     /// <summary>The apply itself plus everything the runtime does not do for the debugger:
     /// symbol store update, breakpoint invalidation and rebind. Session thread, stopped
@@ -3252,14 +3325,17 @@ public sealed partial class DebugSession : IDebugSession
     /// Applied to every loaded instance of the module, not just the registered one: a hosted
     /// app can load the same assembly into more than one app domain (matched by MVID so a
     /// different build of the same name is never touched), and an instance left on the old
-    /// code would silently diverge from the one the user watched update.
+    /// code would silently diverge from the one the user watched update. A replay is the exception:
+    /// it exists precisely because one instance is behind the others, so it goes to that one alone.
     /// </remarks>
-    private (bool Ok, string Error) ApplyDeltaCore(
-        CorDebugModule module, string assemblyName, byte[] metadata, byte[] il, byte[] pdb)
+    private (bool Ok, string Error) ApplyDeltaCore(CorDebugModule module, PendingDelta delta)
     {
+        var (_, assemblyName, metadata, il, pdb, symbolMap, target) = delta;
+
         try
         {
-            var instances = InstancesOf(module, assemblyName);
+            List<CorDebugModule> instances =
+                target is not null ? [target] : InstancesOf(module, assemblyName);
             var metaPtr = System.Runtime.InteropServices.Marshal.AllocHGlobal(metadata.Length);
             var ilPtr = System.Runtime.InteropServices.Marshal.AllocHGlobal(il.Length);
             try
@@ -3285,20 +3361,87 @@ public sealed partial class DebugSession : IDebugSession
                 System.Runtime.InteropServices.Marshal.FreeHGlobal(ilPtr);
             }
 
-            if (instances.Count > 1)
+            if (target is null && instances.Count > 1)
             {
                 Emit(DebugEventKind.Diagnostic,
                     $"hot reload: {assemblyName} is loaded {instances.Count} times; " +
                     "the edit was applied to every instance", string.Empty, 0);
             }
 
-            RefreshSymbolsAfterEdit(assemblyName, pdb);
+            // Only edits that reached the runtime are worth replaying into a module that reloads
+            // later, and only once — a replay is already in the history it came from.
+            if (target is null)
+                RememberDelta(module, delta);
+
+            // Exactly the instances the runtime delta reached, and no others. An instance
+            // InstancesOf declined to update keeps the code it is running, so its symbols have to
+            // keep describing that code — and matching readers by name alone would hand this delta
+            // to the reader of a different build that happens to share the assembly name.
+            RefreshSymbolsAfterEdit(
+                assemblyName, pdb, EncSymbolMap.Parse(symbolMap), delta.Sequence, instances);
             return (true, string.Empty);
         }
         catch (Exception ex)
         {
             return (false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Files an applied edit under the build it was computed against, so a module that loads later
+    /// can be brought up to the same generation.
+    /// </summary>
+    /// <remarks>
+    /// A module with no MVID to read — dynamic, or an image the debugger cannot open — is not
+    /// remembered: there would be no way to tell later whether a reloaded module is the same build,
+    /// and replaying an edit into the wrong one corrupts it.
+    /// </remarks>
+    private void RememberDelta(CorDebugModule module, PendingDelta delta)
+    {
+        if (MvidOf(module) is not { } mvid)
+            return;
+
+        var history = _deltaHistory.GetOrAdd(mvid, _ => []);
+        lock (history)
+        {
+            if (!history.Any(d => d.Sequence == delta.Sequence))
+                history.Add(delta);
+        }
+    }
+
+    /// <summary>
+    /// Queues this session's edit history into a module that has just loaded, when it is the same
+    /// build those edits were computed against.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes hot reload survive an application recycle: the host tears the app domain
+    /// down and loads the assemblies again from their built images, and without this the running
+    /// code silently reverts to the last build while the editor still shows the edits. Queued
+    /// rather than applied here, because this runs on the runtime's callback thread during a module
+    /// load — the stop shape ApplyChanges needs is the one the pending-delta queue already waits
+    /// for.
+    /// </remarks>
+    private void QueueHistoryReplay(CorDebugModule module, string assemblyName)
+    {
+        if (_encPoisoned || _deltaHistory.IsEmpty)
+            return;
+        if (MvidOf(module) is not { } mvid || !_deltaHistory.TryGetValue(mvid, out var history))
+            return;
+
+        PendingDelta[] replays;
+        lock (history)
+            replays = [.. history];
+
+        if (replays.Length == 0)
+            return;
+
+        foreach (var delta in replays)
+            _replayDeltas.Enqueue(delta with { Target = module });
+
+        Emit(DebugEventKind.Diagnostic,
+            $"hot reload: {assemblyName} was loaded again; its {replays.Length} applied edit(s) " +
+            "will be re-applied at the next breakpoint hit in the app's own code",
+            string.Empty, 0);
     }
 
     /// <summary>
@@ -3412,6 +3555,7 @@ public sealed partial class DebugSession : IDebugSession
     /// </summary>
     private void FlushPendingDeltas()
     {
+        DrainReplays();
         if (_pendingDeltas.Count == 0)
             return;
         if (_stoppedThread is null)
@@ -3424,7 +3568,8 @@ public sealed partial class DebugSession : IDebugSession
 
         while (_pendingDeltas.Count > 0)
         {
-            var (assemblyName, metadata, il, pdb) = _pendingDeltas.Peek();
+            var pending = _pendingDeltas.Peek();
+            string assemblyName = pending.AssemblyName;
 
             if (_encPoisoned)
             {
@@ -3432,9 +3577,20 @@ public sealed partial class DebugSession : IDebugSession
                 return;
             }
 
+            // A replay names the one instance it is catching up, and that instance can itself have
+            // gone away — a host that recycled once can recycle again before the next stop. Its
+            // edits are still in the history, so the new instance will be offered them in turn;
+            // this one is dropped rather than applied to a module that no longer exists.
+            if (pending.Target is { } replayTarget && !StillLoaded(replayTarget))
+            {
+                _pendingDeltas.Dequeue();
+                continue;
+            }
+
             // Not loaded (an app-domain recycle unloaded it) or still no safe context here:
             // keep the queue for a later stop rather than dropping the user's edit.
-            if (!_encModules.TryGetValue(assemblyName, out var module))
+            var module = pending.Target;
+            if (module is null && !_encModules.TryGetValue(assemblyName, out module))
             {
                 Emit(DebugEventKind.Diagnostic,
                     $"hot reload: '{assemblyName}' is not loaded right now; its queued edit waits for a later stop",
@@ -3461,7 +3617,7 @@ public sealed partial class DebugSession : IDebugSession
                 return;
             }
 
-            var (ok, error) = ApplyDeltaCore(module, assemblyName, metadata, il, pdb);
+            var (ok, error) = ApplyDeltaCore(module, pending);
             _pendingDeltas.Dequeue();
 
             Emit(DebugEventKind.Diagnostic,
@@ -3472,10 +3628,35 @@ public sealed partial class DebugSession : IDebugSession
 
             if (!ok)
             {
+                // Everything behind the failed edit is dropped, and those edits were reported to
+                // the user as accepted — the compiler's baseline has already moved past them. Every
+                // later edit would be computed against generations the debuggee never received, so
+                // the session stops accepting them rather than building on a fiction.
                 _pendingDeltas.Clear();
+                _encPoisoned = true;
+                Emit(DebugEventKind.Diagnostic,
+                    "hot reload: the edits still queued behind it were dropped; this session can no " +
+                    "longer be edited, so restart it to pick the changes back up",
+                    string.Empty, 0);
                 return;
             }
         }
+    }
+
+    /// <summary>Whether a module the session held on to is still one the process has loaded.</summary>
+    private bool StillLoaded(CorDebugModule module)
+    {
+        var key = Safe(() => InstanceKey(module));
+        if (key is null)
+            return false;
+
+        foreach (var candidate in LoadedModules())
+        {
+            if (string.Equals(Safe(() => InstanceKey(candidate)), key, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -3600,35 +3781,51 @@ public sealed partial class DebugSession : IDebugSession
     /// <c>ApplyChanges</c> updates the runtime and nothing else. Line numbers, sequence points and
     /// local scopes for the edited method live in the debugger's symbol reader, which still holds
     /// the pre-edit PDB — so without this every breakpoint and every reported location in that
-    /// method silently points at the old source. The unmanaged reader takes the delta directly
-    /// (this is what MDbg's ApplyEdit does); a portable reader has no equivalent, so its cache is
-    /// dropped instead and the stale entry is at least not kept.
+    /// method silently points at the old source. The unmanaged reader takes the delta directly;
+    /// a portable reader has no equivalent, so its cache is dropped instead and the stale entry is
+    /// at least not kept.
     /// </remarks>
-    private void RefreshSymbolsAfterEdit(string assemblyName, byte[] pdb)
+    /// <param name="map">How the edit moved the lines of methods the delta does not describe.
+    /// Without it only the changed methods come out right and everything below them in the same
+    /// file drifts; see <see cref="EncSymbolMap"/>.</param>
+    /// <param name="sequence">Which edit this is, so a reader is never told about the same one
+    /// twice — the replay into a reloaded module walks over edits some readers already have.</param>
+    /// <param name="instances">The module instances the runtime delta actually reached. Exactly
+    /// these, because a reader describes the code one image is running: an instance that was left
+    /// on the old code has to keep the old line numbers, and an instance behind on generations has
+    /// to be caught up one edit at a time.</param>
+    private void RefreshSymbolsAfterEdit(
+        string assemblyName, byte[] pdb, EncSymbolMap? map, long sequence,
+        IReadOnlyList<CorDebugModule> instances)
     {
-        KeyValuePair<string, SymbolReader?>[] snapshot;
-        lock (_readers)
-            snapshot = [.. _readers];
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var (path, reader) in snapshot)
+        foreach (var instance in instances)
         {
-            if (!string.Equals(
-                    Path.GetFileNameWithoutExtension(path), assemblyName, StringComparison.OrdinalIgnoreCase))
-            {
+            string path = Safe(() => instance.Name) ?? string.Empty;
+            // Two app domains sharing one image share one reader, and telling it twice about the
+            // same edit would move its lines twice as far as the edit did.
+            if (path.Length == 0 || !seenPaths.Add(path))
                 continue;
-            }
+
+            // Opened here rather than looked up. A recycled app domain shadow-copies the assembly
+            // to a path nothing has read symbols for yet, and letting the first breakpoint bind
+            // create that reader afterwards would start it at the built code — with every replayed
+            // edit missing and no sign that anything was wrong.
+            var reader = ReaderFor(instance, path);
+            if (reader is null)
+                continue;
+
+            // Already told about this edit; see the replay path.
+            if (reader.AppliedEdits.Contains(sequence))
+                continue;
 
             bool updated = false;
-            if (reader?.Unmanaged is { } unmanaged && pdb.Length > 0)
+            if (reader.Unmanaged is { } unmanaged && pdb.Length > 0)
             {
-                // By file rather than by IStream: the reader accepts a path, and it keeps the
-                // COM plumbing out of a path that already has enough ways to fail.
-                string temporary = Path.Combine(
-                    Path.GetTempPath(), $"roslyn-sense-enc-{Guid.NewGuid():N}.pdb");
                 try
                 {
-                    File.WriteAllBytes(temporary, pdb);
-                    updated = unmanaged.TryUpdateSymbolStore(temporary, null) == HRESULT.S_OK;
+                    updated = UpdateSymbolStoreAfterEdit(unmanaged, pdb, map);
                 }
                 catch (Exception ex)
                 {
@@ -3636,23 +3833,23 @@ public sealed partial class DebugSession : IDebugSession
                         $"the symbol store could not be updated after the edit: {ex.Message}",
                         string.Empty, 0);
                 }
-                finally
-                {
-                    try { File.Delete(temporary); } catch { }
-                }
             }
 
-            if (!updated)
+            // Recorded only once it worked, so a reader that has to be rebuilt is offered the edit
+            // again rather than being treated as though it had taken it.
+            if (updated)
             {
-                lock (_readers)
-                    _readers.Remove(path);
-                if (reader is not null)
-                    _retiredReaders.Add(reader);
-                Emit(DebugEventKind.Diagnostic,
-                    $"line information for {assemblyName} is stale after the edit; " +
-                    "breakpoints in changed methods may bind to the wrong line.",
-                    string.Empty, 0);
+                reader.AppliedEdits.Add(sequence);
+                continue;
             }
+
+            lock (_readers)
+                _readers.Remove(path);
+            _retiredReaders.Add(reader);
+            Emit(DebugEventKind.Diagnostic,
+                $"line information for {assemblyName} is stale after the edit; " +
+                "breakpoints in changed methods may bind to the wrong line.",
+                string.Empty, 0);
         }
 
         // A method token alone no longer identifies code: the edited method has a new version, and
@@ -3700,6 +3897,183 @@ public sealed partial class DebugSession : IDebugSession
         foreach (var module in LoadedModules())
             foreach (var spec in SpecsSnapshot())
                 TryBindBreakpoint(module, spec);
+    }
+
+    /// <summary>
+    /// Hands one unmanaged reader the delta PDB, together with how far every method the delta does
+    /// not describe has moved.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The plain update takes the delta and nothing else, which is enough for the methods that were
+    /// edited and wrong for every method below them in the same file: those still carry the line
+    /// numbers they had before the edit inserted or removed lines above them, and the error grows
+    /// with each further edit. The Edit-and-Continue entry point takes the same delta plus a list of
+    /// "this method moved by N lines", which is exactly what the compiler's own line map says.
+    /// </para>
+    /// <para>
+    /// Falls back to the plain update when the reader does not offer the richer one, so a reader
+    /// implementation without it still gets the edited methods right rather than nothing.
+    /// </para>
+    /// </remarks>
+    private static bool UpdateSymbolStoreAfterEdit(
+        SymUnmanagedReader unmanaged, byte[] pdb, EncSymbolMap? map)
+    {
+        if (unmanaged.Raw is ISymUnmanagedENCUpdate enc)
+        {
+            // Computed before the update, because it asks the reader where the methods used to be.
+            var moved = MovedMethods(unmanaged, map);
+
+            // The native side reads `count` entries from the pointer; one spare element only exists
+            // so there is something to take a reference to when nothing moved.
+            var buffer = new SYMLINEDELTA[Math.Max(1, moved.Count)];
+            moved.CopyTo(buffer);
+
+            var hr = enc.UpdateSymbolStore2(new ByteArrayStream(pdb), ref buffer[0], moved.Count);
+            if (hr == HRESULT.S_OK)
+                return true;
+
+            // Only a reader that never started is offered the delta a second time. Any other
+            // failure may have taken part of it, and handing the same delta over again would then
+            // apply half of it twice — the fallback is for readers without this entry point, not a
+            // retry.
+            if (hr != HRESULT.E_NOTIMPL && hr != HRESULT.E_NOINTERFACE)
+                return false;
+        }
+
+        // By file rather than by stream: this reader accepts a path, and the fallback is not the
+        // place to introduce a second way of failing.
+        string temporary = Path.Combine(Path.GetTempPath(), $"roslyn-sense-enc-{Guid.NewGuid():N}.pdb");
+        try
+        {
+            File.WriteAllBytes(temporary, pdb);
+            return unmanaged.TryUpdateSymbolStore(temporary, null) == HRESULT.S_OK;
+        }
+        finally
+        {
+            try { File.Delete(temporary); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Every method in the edited files that the delta does not describe, paired with how many
+    /// lines it moved.
+    /// </summary>
+    /// <remarks>
+    /// The compiler reports line movements per file as runs — "from this line on, add N" — while
+    /// the symbol store wants them per method, so each method is placed by the line it starts on.
+    /// Methods the delta already describes are skipped: their new lines are in the delta PDB, and
+    /// shifting them again would move them twice.
+    /// </remarks>
+    private static List<SYMLINEDELTA> MovedMethods(SymUnmanagedReader reader, EncSymbolMap? map)
+    {
+        var moved = new List<SYMLINEDELTA>();
+        if (map is null)
+            return moved;
+
+        var edited = new HashSet<int>(map.UpdatedMethods);
+
+        foreach (var file in map.Files)
+        {
+            if (file.Shifts.Length == 0)
+                continue;
+
+            if (DocumentFor(reader, file.File) is not { } document)
+                continue;
+            if (reader.TryGetMethodsInDocument(document.Raw, out var methods) != HRESULT.S_OK)
+                continue;
+
+            foreach (var method in methods ?? [])
+            {
+                if (method is null)
+                    continue;
+
+                int token = method.Token;
+                if (edited.Contains(token))
+                    continue;
+
+                int line = FirstLineOf(method);
+                if (line <= 0)
+                    continue;
+
+                // Symbol lines count from 1, the compiler's line map from 0.
+                int delta = file.ShiftAt(line - 1);
+                if (delta != 0)
+                    moved.Add(new SYMLINEDELTA { mdMethod = token, delta = delta });
+            }
+        }
+
+        return moved;
+    }
+
+    /// <summary>
+    /// The reader's document for a compiler-reported path.
+    /// </summary>
+    /// <remarks>
+    /// Asked for by path first, since that is what a PDB stores. The scan by file name behind it
+    /// covers the case where the two spell the same file differently — a deterministic build with
+    /// mapped source roots being the usual reason — because giving up there would silently mean
+    /// "nothing in this file moved".
+    /// </remarks>
+    private static SymUnmanagedDocument? DocumentFor(SymUnmanagedReader reader, string path)
+    {
+        if (reader.TryGetDocument(path, Guid.Empty, Guid.Empty, Guid.Empty, out var document) == HRESULT.S_OK &&
+            document is not null)
+        {
+            return document;
+        }
+
+        string name = Path.GetFileName(path);
+        if (name.Length == 0)
+            return null;
+
+        if (reader.TryGetDocuments(out var documents) != HRESULT.S_OK)
+            return null;
+
+        SymUnmanagedDocument? match = null;
+        foreach (var candidate in documents ?? [])
+        {
+            string url = Safe(() => candidate?.URL) ?? string.Empty;
+            if (!string.Equals(Path.GetFileName(url), name, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Two files with the same name in different folders cannot be told apart from a name,
+            // and shifting the wrong one is worse than shifting neither.
+            if (match is not null)
+                return null;
+            match = candidate;
+        }
+
+        return match;
+    }
+
+    /// <summary>The first line the method has code on, or 0 when its symbols say nothing.</summary>
+    /// <remarks>
+    /// Sequence points are not ordered by line — a compiler-generated state machine reorders them
+    /// freely — so this is the minimum rather than the first. The hidden marker is excluded because
+    /// it is a sentinel line number, not a place in the file.
+    /// </remarks>
+    private static int FirstLineOf(SymUnmanagedMethod method)
+    {
+        const int HiddenLine = 0xFEEFEE;
+
+        int count = Safe(() => (int?)method.SequencePointCount) ?? 0;
+        if (count <= 0)
+            return 0;
+
+        if (Safe(() => method.GetSequencePoints(count).lines) is not { Length: > 0 } lines)
+            return 0;
+
+        int first = 0;
+        foreach (int line in lines)
+        {
+            if (line <= 0 || line >= HiddenLine)
+                continue;
+            if (first == 0 || line < first)
+                first = line;
+        }
+
+        return first;
     }
 
     // --- breakpoints ----------------------------------------------------------------------------
@@ -3869,6 +4243,17 @@ public sealed partial class DebugSession : IDebugSession
 
         public SymUnmanagedReader? Unmanaged { get; }
         public PortablePdbReader? Portable { get; }
+
+        /// <summary>
+        /// Which edits this reader has already been told about, by their sequence number.
+        /// </summary>
+        /// <remarks>
+        /// A delta may reach the same reader twice — once for the edit itself and again when a
+        /// module reloads and the session replays its history into the new instance. Applying it
+        /// twice would shift every line in the file by twice what the edit actually moved, so the
+        /// reader remembers rather than the caller guessing.
+        /// </remarks>
+        public HashSet<long> AppliedEdits { get; } = [];
 
         /// <summary>Which kind of symbols these are — one of <see cref="SymbolOrigins"/>.</summary>
         public string Origin { get; }
@@ -5135,23 +5520,42 @@ public sealed partial class DebugSession : IDebugSession
     /// Map a frame's IP to source through the module PDB's sequence points.
     private (string File, int Line, int Column) FrameLocation(CorDebugFrame frame)
     {
+        var span = FrameSpan(frame);
+        return (span.File, span.Line, span.Column);
+    }
+
+    /// <summary>
+    /// The whole source span of the statement a frame's IP is inside, not only its start.
+    /// </summary>
+    /// <remarks>
+    /// The end is what makes the location a statement rather than a point, which is what an
+    /// active-statement report has to be: the compiler decides whether an edit is safe by asking
+    /// whether it overlaps a statement that is currently executing, and a zero-width point at the
+    /// statement's start overlaps almost nothing.
+    /// </remarks>
+    private (string File, int Line, int Column, int EndLine, int EndColumn) FrameSpan(CorDebugFrame frame)
+    {
         try
         {
             if (frame is not CorDebugILFrame ilFrame)
-                return (string.Empty, 0, 0);
+                return (string.Empty, 0, 0, 0, 0);
             var function = frame.Function;
             var moduleName = function.Module.Name;
             var reader = ReaderFor(function.Module, moduleName);
             if (reader is null)
-                return (string.Empty, 0, 0);
+                return (string.Empty, 0, 0, 0, 0);
             var match = SequencePointAtOffset(reader, function.Token, ilFrame.IP.pnOffset);
             if (match is not null)
-                return (match.Value.FilePath, match.Value.Line, match.Value.Column);
+            {
+                return (
+                    match.Value.FilePath, match.Value.Line, match.Value.Column,
+                    match.Value.EndLine, match.Value.EndColumn);
+            }
         }
         catch
         {
         }
-        return (string.Empty, 0, 0);
+        return (string.Empty, 0, 0, 0, 0);
     }
 
     /// <summary>

@@ -194,10 +194,24 @@ public sealed class StackFrame
     /// <summary>1-based; 0 when unknown.</summary>
     public uint Column { get; set; }
 
+    /// <summary>
+    /// Where the statement at the IP ends. 0 when the symbols did not say.
+    /// </summary>
+    /// <remarks>
+    /// Carried because a frame is not only a place to show — it is also a statement that is
+    /// currently executing, and telling the compiler which statements those are is what lets it
+    /// refuse an edit to a method that is on a stack. A point is not enough for that; the span is.
+    /// </remarks>
+    public uint EndLine { get; set; }
+
+    /// <summary>1-based; 0 when unknown.</summary>
+    public uint EndColumn { get; set; }
+
     public int ThreadId { get; set; }
 
-    /// <summary>The module the frame executes in — filled for frames without symbols, so the
-    /// host can resolve external source for them.</summary>
+    /// <summary>The module the frame executes in, always filled when the runtime says. The host
+    /// resolves external source from it for frames without symbols, and identifies the module an
+    /// active statement belongs to for the ones with.</summary>
     public string ModulePath { get; set; } = "";
 
     /// <summary>The frame's MethodDef token in <see cref="ModulePath"/>; 0 when unknown.</summary>

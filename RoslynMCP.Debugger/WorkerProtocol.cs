@@ -64,6 +64,10 @@ public sealed class WorkerRequest
     public string? IlDelta { get; set; }
     public string? PdbDelta { get; set; }
 
+    /// <summary>A serialized <see cref="EncSymbolMap"/> beside the PDB delta: the line movements
+    /// the delta itself cannot express. Plain JSON rather than base64 — it is text already.</summary>
+    public string? SymbolMap { get; set; }
+
     /// <summary>The exception stop policy, sent by 'exceptionPolicy'.</summary>
     public ExceptionPolicy? ExceptionPolicy { get; set; }
 

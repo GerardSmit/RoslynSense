@@ -197,7 +197,8 @@ internal static class Program
                         request.Name ?? "",
                         Convert.FromBase64String(request.MetadataDelta ?? ""),
                         Convert.FromBase64String(request.IlDelta ?? ""),
-                        Convert.FromBase64String(request.PdbDelta ?? ""));
+                        Convert.FromBase64String(request.PdbDelta ?? ""),
+                        request.SymbolMap);
                     response.Ok = ok;
                     response.Error = error;
                     break;

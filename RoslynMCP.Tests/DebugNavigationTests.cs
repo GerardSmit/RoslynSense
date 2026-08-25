@@ -189,7 +189,8 @@ public class DebugNavigationTests
         public Task<(bool Ok, RoslynMCP.Debugger.DebugVariable? Variable, string Error)> SetVariableAsync(
             uint frameIndex, string name, string value) =>
             Task.FromResult<(bool, RoslynMCP.Debugger.DebugVariable?, string)>((true, null, ""));
-        public Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il, byte[] pdb) =>
+        public Task<(bool Ok, string Error)> ApplyDeltaAsync(
+            string assemblyName, byte[] metadata, byte[] il, byte[] pdb, string? symbolMap = null) =>
             Task.FromResult((true, ""));
         public Task<RoslynMCP.Debugger.RunToLocationResponse> RunToLocationAsync(
             RoslynMCP.Debugger.RunToLocationRequest request) =>

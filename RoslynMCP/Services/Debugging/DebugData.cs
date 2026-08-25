@@ -25,6 +25,9 @@ internal static class DebugJson
 /// <param name="MethodToken">The frame's MethodDef token in <paramref name="ModulePath"/>;
 /// 0 when the engine did not say.</param>
 /// <param name="IlOffset">Where the IP is within the method's IL; -1 when unknown.</param>
+/// <param name="EndLine">Where the executing statement ends; 0 when the symbols did not say. This
+/// is what makes the frame reportable as an active statement rather than only as a location.</param>
+/// <param name="EndColumn">The statement's end column; 0 when unknown.</param>
 /// <param name="SourceOrigin">How <paramref name="FilePath"/> was obtained when it is not the
 /// PDB's own answer: <c>embedded</c>, <c>source link</c>, <c>reference source</c> or
 /// <c>decompiled</c>. Empty for ordinary project frames.</param>
@@ -39,7 +42,9 @@ public sealed record StackFrameInfo(
     int MethodToken = 0,
     int IlOffset = -1,
     string SourceOrigin = "",
-    bool IsNonUserCode = false);
+    bool IsNonUserCode = false,
+    int EndLine = 0,
+    int EndColumn = 0);
 
 /// <summary>
 /// One variable in scope, or one child of an expandable one.

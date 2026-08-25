@@ -58,7 +58,7 @@ internal sealed class HotReloadService
     private static readonly ConcurrentDictionary<string, HotReloadService> s_sessions =
         new(StringComparer.OrdinalIgnoreCase);
 
-    private readonly UnitTestingHotReloadService _encService;
+    private readonly EncEditSession _encService;
     private readonly string _projectPath;
 
     /// <summary>Per-document file stamps, so an apply re-reads only what actually changed.</summary>
@@ -82,7 +82,7 @@ internal sealed class HotReloadService
 
     private static readonly SemaphoreSlim s_startGate = new(1, 1);
 
-    private HotReloadService(UnitTestingHotReloadService encService, string projectPath)
+    private HotReloadService(EncEditSession encService, string projectPath)
     {
         _encService = encService;
         _projectPath = projectPath;
@@ -126,9 +126,15 @@ internal sealed class HotReloadService
 
             var capabilities = ResolveCapabilities(project);
 
-            var service = new UnitTestingHotReloadService(workspace.Services);
-            await service.StartSessionAsync(
-                project.Solution, [.. capabilities], cancellationToken);
+            // The active statements come from whatever debug session is live at emit time, not
+            // from what was live when the edit session opened — a user typically starts the
+            // session, runs, hits a breakpoint, and only then edits.
+            var service = await EncEditSession.StartAsync(
+                workspace.Services,
+                project.Solution,
+                [.. capabilities],
+                EncActiveStatements.CollectAsync,
+                cancellationToken);
 
             var session = new HotReloadService(service, projectPath);
             session.RecordStamps(project.Solution);
@@ -174,34 +180,73 @@ internal sealed class HotReloadService
         // Without this, Roslyn diffs the loaded solution against itself and emits nothing.
         var solution = RefreshFromDisk(project.Solution);
 
-        var (updates, diagnostics) = await _encService.EmitSolutionUpdateAsync(
-            solution, commitUpdates: true, cancellationToken);
+        // Emitted without committing. What the running process did with the delta is not known
+        // yet, and the baseline must not move until it is — see EncEditSession.
+        // Whether anything is stopped decides whether Roslyn reads the debuggee's active statements
+        // at all, and therefore whether it can refuse an edit to a method that is on a stack.
+        bool stopped = DebugSessionManager.GetSession()?.CurrentFrame is not null;
 
-        var reported = diagnostics.Select(Describe).ToList();
+        var emit = await _encService.EmitAsync(solution, stopped, cancellationToken);
 
-        if (updates.IsDefaultOrEmpty)
+        var reported = emit.Diagnostics.Select(Describe).ToList();
+
+        if (emit.Updates.IsDefaultOrEmpty)
         {
             // Errors and rude edits both land here: Roslyn emits nothing rather than something
             // wrong, so "no updates" plus diagnostics is a refusal, not a no-op.
-            return reported.Any(d => d.Severity == "error")
+            return reported.Any(d => d.Severity == "error") || emit.Blocked
                 ? new HotReloadOutcome(false, "The edit cannot be applied to the running process.", reported, [], [])
                 : new HotReloadOutcome(true, "No changes to apply.", reported, [], []);
         }
 
-        var deltas = updates.Select(u => new HotReloadDelta(
-            u.ModuleId,
+        var deltas = emit.Updates.Select(u => new HotReloadDelta(
+            u.Module,
             [.. u.MetadataDelta],
             [.. u.ILDelta],
             [.. u.PdbDelta],
-            [.. u.UpdatedTypes])).ToList();
+            [.. u.UpdatedTypes],
+            [.. u.UpdatedMethods],
+            [.. u.SequencePoints.Select(s => new HotReloadLineMap(
+                s.FileName,
+                [.. s.LineUpdates.Select(l => new HotReloadLineShift(l.OldLine, l.NewLine))]))])).ToList();
 
-        var (applied, errors) = await HotReloadAgentServer.Instance.ApplyAsync(deltas, cancellationToken);
+        IReadOnlyList<string> applied;
+        IReadOnlyList<string> errors;
+        IReadOnlyList<string> queued;
+        try
+        {
+            (applied, errors) = await HotReloadAgentServer.Instance.ApplyAsync(deltas, cancellationToken);
 
-        var (frameworkApplied, queued, frameworkErrors) = await ApplyToFrameworkSessionAsync(
-            solution, deltas, cancellationToken);
+            var (frameworkApplied, frameworkQueued, frameworkErrors) = await ApplyToFrameworkSessionAsync(
+                solution, deltas, cancellationToken);
 
-        applied = [.. applied, .. frameworkApplied];
-        errors = [.. errors, .. frameworkErrors];
+            applied = [.. applied, .. frameworkApplied];
+            errors = [.. errors, .. frameworkErrors];
+            queued = frameworkQueued;
+        }
+        catch
+        {
+            // The delta never reached anything, so the baseline stays where it was and the edit
+            // is still an edit — the next apply recomputes it rather than reporting no changes.
+            _encService.Discard();
+            throw;
+        }
+
+        // A queued edit counts as committed: the engine holds the delta and lands it at the next
+        // breakpoint, so it will be applied exactly once, and the next edit must diff against it.
+        // Nothing accepted it at all is the case the baseline must not move for. A queued edit that
+        // later fails to land is not recoverable here — by then this call has long returned — so the
+        // engine refuses every subsequent edit instead of letting them diff against a generation the
+        // debuggee never received.
+        //
+        // Roslyn commits the whole solution or none of it, so a multi-project edit where one module
+        // applied and another was refused moves the baseline for both. Deliberate: the alternative
+        // is a debugging session per project, and the refusal is reported in the outcome, whereas
+        // discarding would throw away the update that did land.
+        if (applied.Count > 0 || queued.Count > 0)
+            _encService.Commit();
+        else
+            _encService.Discard();
 
         // A queued edit is a success with a different tense: the debuggee could not take it
         // safely right now (nothing of the user's is stopped in it), so the debug engine holds
@@ -264,10 +309,13 @@ internal sealed class HotReloadService
             if (!names.TryGetValue(delta.ModuleId, out string? assemblyName))
                 continue;
 
+            string? symbolMap = SymbolMapOf(delta);
+
             if (icor is not null)
             {
                 var (ok, error) = await icor.ApplyDeltaAsync(
-                    assemblyName, delta.MetadataDelta, delta.IlDelta, delta.PdbDelta, cancellationToken);
+                    assemblyName, delta.MetadataDelta, delta.IlDelta, delta.PdbDelta, symbolMap,
+                    cancellationToken);
                 Record(assemblyName, ok, error);
                 continue;
             }
@@ -279,7 +327,8 @@ internal sealed class HotReloadService
                     AssemblyName: assemblyName,
                     MetadataDelta: Convert.ToBase64String(delta.MetadataDelta),
                     IlDelta: Convert.ToBase64String(delta.IlDelta),
-                    PdbDelta: Convert.ToBase64String(delta.PdbDelta)), cancellationToken);
+                    PdbDelta: Convert.ToBase64String(delta.PdbDelta),
+                    SymbolMap: symbolMap), cancellationToken);
 
                 Record(assemblyName, response.Ok && response.Result?.StartsWith("Error") != true,
                     response.Error ?? response.Result ?? "");
@@ -302,6 +351,35 @@ internal sealed class HotReloadService
                 errors.Add($"{assemblyName}: {error}");
             }
         }
+    }
+
+    /// <summary>
+    /// The part of a delta that only the debugger's symbol store can use, as JSON.
+    /// </summary>
+    /// <remarks>
+    /// The runtime takes metadata and IL and nothing else, but the debugger also has to know where
+    /// the edit moved the source — otherwise only the methods the delta describes report the right
+    /// lines and everything below them in the same file drifts a little further with every edit.
+    /// Null when the compiler reported no movement, so nothing is sent for an edit that moved
+    /// nothing.
+    /// </remarks>
+    private static string? SymbolMapOf(HotReloadDelta delta)
+    {
+        var files = (delta.LineMaps ?? [])
+            .Where(m => m.FilePath.Length > 0 && m.Shifts.Count > 0)
+            .Select(m => new Debugger.EncFileLineMap(
+                m.FilePath,
+                [.. m.Shifts.Select(s => new Debugger.EncLineShift(s.OldLine, s.NewLine))]))
+            .ToArray();
+
+        if (files.Length == 0)
+            return null;
+
+        return new Debugger.EncSymbolMap
+        {
+            UpdatedMethods = delta.UpdatedMethods ?? [],
+            Files = files,
+        }.ToJson();
     }
 
     public void Stop()

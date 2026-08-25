@@ -61,7 +61,7 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
     /// radius is one disposable worker, so that is the only path allowed to make it.
     /// </remarks>
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(
-        string assemblyName, byte[] metadata, byte[] il, byte[] pdb) =>
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb, string? symbolMap = null) =>
         Task.FromResult((false,
             "Hot reload on .NET Framework is applied out of process. ICorDebug's ApplyChanges " +
             "faults on a malformed delta instead of failing, which would take this process with " +

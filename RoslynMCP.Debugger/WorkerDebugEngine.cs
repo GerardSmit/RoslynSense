@@ -392,7 +392,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
     }
 
     public async Task<(bool Ok, string Error)> ApplyDeltaAsync(
-        string assemblyName, byte[] metadata, byte[] il, byte[] pdb)
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb, string? symbolMap = null)
     {
         try
         {
@@ -403,6 +403,7 @@ public sealed class WorkerDebugEngine : IDebugEngine
                 MetadataDelta = Convert.ToBase64String(metadata),
                 IlDelta = Convert.ToBase64String(il),
                 PdbDelta = Convert.ToBase64String(pdb),
+                SymbolMap = symbolMap,
             });
 
             // A successful response still carries a message when the edit was queued rather

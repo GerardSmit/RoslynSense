@@ -170,6 +170,74 @@ public class HotReloadTests
         Assert.Contains(errors, e => e.Contains("refused the update"));
     }
 
+    // === The line map that travels beside a delta ===
+
+    [Fact]
+    public void ALineBeforeTheEditHasNotMoved()
+    {
+        // The compiler reports movement from the edit downwards; everything above it is untouched,
+        // and shifting it would move code the user never edited.
+        var file = new RoslynMCP.Debugger.EncFileLineMap("A.cs", [new(10, 13)]);
+
+        Assert.Equal(0, file.ShiftAt(9));
+        Assert.Equal(3, file.ShiftAt(10));
+        Assert.Equal(3, file.ShiftAt(500));
+    }
+
+    [Fact]
+    public void EachRunTakesOverFromTheOneBeforeIt()
+    {
+        // Two edits in one file: three lines added at the top, two removed further down. A method
+        // below both moved by the sum, which is what only the later run can say.
+        var file = new RoslynMCP.Debugger.EncFileLineMap("A.cs", [new(10, 13), new(40, 41)]);
+
+        Assert.Equal(3, file.ShiftAt(20));
+        Assert.Equal(1, file.ShiftAt(40));
+        Assert.Equal(1, file.ShiftAt(90));
+    }
+
+    [Fact]
+    public void RunsOutOfOrderStillReadTheSameWay()
+    {
+        // Reading them in arrival order would answer 3 for line 90 instead of 1 — no failure, just
+        // a breakpoint two lines off, discovered much later.
+        var file = new RoslynMCP.Debugger.EncFileLineMap("A.cs", [new(40, 41), new(10, 13)]);
+
+        Assert.Equal(1, file.ShiftAt(90));
+    }
+
+    [Fact]
+    public void ASymbolMapSurvivesTheTripThroughJson()
+    {
+        // It crosses two process boundaries on its way to the debuggee, so the round trip is the
+        // part that has to hold.
+        var map = new RoslynMCP.Debugger.EncSymbolMap
+        {
+            UpdatedMethods = [0x06000001, 0x06000002],
+            Files = [new RoslynMCP.Debugger.EncFileLineMap(@"C:\src\A.cs", [new(10, 13)])],
+        };
+
+        var back = RoslynMCP.Debugger.EncSymbolMap.Parse(map.ToJson());
+
+        Assert.NotNull(back);
+        Assert.Equal(map.UpdatedMethods, back.UpdatedMethods);
+        Assert.Equal(@"C:\src\A.cs", back.Files.Single().File);
+        Assert.Equal(3, back.Files.Single().ShiftAt(10));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("{not json")]
+    [InlineData("{}")]
+    public void AnUnreadableSymbolMapReadsAsNoInformation(string? json)
+    {
+        // The edit is already in the runtime by the time this is read. Failing here would report a
+        // successful apply as a failure; answering "nothing moved" costs only the line accuracy
+        // that was missing before the map existed at all.
+        Assert.Null(RoslynMCP.Debugger.EncSymbolMap.Parse(json));
+    }
+
     private static async Task<NamedPipeClientStream> ConnectAgentAsync(
         string pipeName, string name, string capabilities)
     {

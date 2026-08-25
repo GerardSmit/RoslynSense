@@ -25,7 +25,8 @@ internal sealed record DebugPipeRequest(
     string? AssemblyName = null,
     string? MetadataDelta = null,
     string? IlDelta = null,
-    string? PdbDelta = null);
+    string? PdbDelta = null,
+    string? SymbolMap = null);
 
 internal sealed record DebugPipeResponse(bool Ok, string? Result, string? Error);
 
@@ -188,6 +189,7 @@ internal sealed class DebugCommandPipeServer : IDisposable
             Convert.FromBase64String(request.MetadataDelta ?? ""),
             Convert.FromBase64String(request.IlDelta ?? ""),
             Convert.FromBase64String(request.PdbDelta ?? ""),
+            request.SymbolMap,
             ct);
 
         if (!ok)

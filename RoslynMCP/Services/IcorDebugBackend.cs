@@ -454,7 +454,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                     ModulePath: f.ModulePath,
                     MethodToken: f.MethodToken,
                     IlOffset: f.IlOffset,
-                    IsNonUserCode: f.IsNonUserCode))
+                    IsNonUserCode: f.IsNonUserCode,
+                    EndLine: (int)f.EndLine,
+                    EndColumn: (int)f.EndColumn))
                 .ToList();
             return await ExternalFrameResolver.EnrichAsync(mapped, cancellationToken);
         }
@@ -798,6 +800,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     /// </remarks>
     public async Task<(bool Ok, string Error)> ApplyDeltaAsync(
         string assemblyName, byte[] metadata, byte[] il, byte[] pdb,
+        string? symbolMap = null,
         CancellationToken cancellationToken = default)
     {
         if (_engine is null)
@@ -818,7 +821,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 
         try
         {
-            return await _engine.ApplyDeltaAsync(assemblyName, metadata, il, pdb);
+            return await _engine.ApplyDeltaAsync(assemblyName, metadata, il, pdb, symbolMap);
         }
         finally
         {

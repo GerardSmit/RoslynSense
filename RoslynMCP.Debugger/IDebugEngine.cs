@@ -86,8 +86,12 @@ public interface IDebugEngine : IDisposable
     /// <param name="pdb">The PDB delta. The runtime never sees it — <c>ApplyChanges</c> takes
     /// metadata and IL only — but the debugger's own symbol reader has to be updated with it or
     /// every line number in the edited method is stale from that point on.</param>
+    /// <param name="symbolMap">A serialized <see cref="EncSymbolMap"/>: which methods the delta
+    /// describes and how the edit moved the lines around them. The PDB delta alone fixes only the
+    /// methods that changed, so without this the rest of each edited file drifts further out of
+    /// step with every edit.</param>
     Task<(bool Ok, string Error)> ApplyDeltaAsync(
-        string assemblyName, byte[] metadata, byte[] il, byte[] pdb);
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb, string? symbolMap = null);
 
     /// <summary>Runs to a source location without leaving a breakpoint behind — "Run to Cursor".</summary>
     Task<RunToLocationResponse> RunToLocationAsync(RunToLocationRequest request);

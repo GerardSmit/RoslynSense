@@ -23,7 +23,7 @@ public sealed partial class DebugSession : IDebugSession
     private readonly List<BreakpointSpec> _specs = new();
     private readonly object _specLock = new();
     /// Active bound breakpoints keyed by "file|line" (source) or "type.method" (entry).
-    private readonly ConcurrentDictionary<string, CorDebugFunctionBreakpoint> _bound = new();
+    private readonly ConcurrentDictionary<string, BoundBreakpoint> _bound = new();
     /// Source specs keyed by the ACTUAL bound line's SourceKey, for hit-count/condition checks
     /// (the bound line can differ from the requested line when it snapped to a later sequence
     /// point). Hit counters live beside them.
@@ -33,6 +33,10 @@ public sealed partial class DebugSession : IDebugSession
     /// snaps to the next sequence point and rewrites the spec's line, so a removal issued for the
     /// line the client asked about would otherwise match nothing and leave the breakpoint armed.
     private readonly ConcurrentDictionary<string, string> _boundKeyByRequest = new();
+    /// <summary>Local directory prefix mapped to the prefix the PDBs use for the same place,
+    /// learned from the first source file whose checksum confirmed the pair. Applied to its
+    /// siblings so the hashing is paid once per build root rather than once per file.</summary>
+    private readonly ConcurrentDictionary<string, string> _pathRewrites = new(StringComparer.OrdinalIgnoreCase);
     private readonly BlockingCollection<Action> _commands = new();
     private readonly ManualResetEventSlim _ready = new();
     /// PDB readers are expensive to create; one per module path, session-thread only.
@@ -248,16 +252,30 @@ public sealed partial class DebugSession : IDebugSession
         _boundSpecs.TryRemove(key, out _);
         _boundModule.TryRemove(key, out _);
         _hitCounts.TryRemove(key, out _);
-        if (!_bound.TryRemove(key, out var breakpoint))
+
+        // Both keys, because one line can bind to two. A module whose sequence point sits below the
+        // requested line arms under the moved-to key while another module — a different build, or a
+        // second project compiling the same file — arms at the line as asked; disarming only the one
+        // the last bind reported would leave the other standing in the debuggee.
+        var homes = new List<BoundBreakpoint>();
+        if (_bound.TryRemove(key, out var bound))
+            homes.Add(bound);
+        if (key != requestedKey && _bound.TryRemove(requestedKey, out var atRequested))
+            homes.Add(atRequested);
+        if (homes.Count == 0)
             return false;
+
         Enqueue(() => WhileSynchronized("remove a breakpoint", () =>
         {
-            try { breakpoint?.Activate(false); }
-            catch (Exception ex)
+            foreach (var home in homes)
             {
-                Emit(DebugEventKind.Diagnostic,
-                    $"a removed breakpoint could not be disarmed and may still stop the target: {ex.Message}",
-                    string.Empty, 0);
+                try { home.DeactivateAll(); }
+                catch (Exception ex)
+                {
+                    Emit(DebugEventKind.Diagnostic,
+                        $"a removed breakpoint could not be disarmed and may still stop the target: {ex.Message}",
+                        string.Empty, 0);
+                }
             }
         }));
         return true;
@@ -2138,10 +2156,8 @@ public sealed partial class DebugSession : IDebugSession
                     // shutting down under a cancellation can legitimately end on.
                     _exceptionPolicy = new ExceptionPolicy { Unhandled = new ExceptionRule() };
 
-                    foreach (var breakpoint in _bound.Values)
-                    {
-                        try { breakpoint?.Activate(false); } catch { }
-                    }
+                    foreach (var bound in _bound.Values)
+                        bound.DeactivateAll();
                     _bound.Clear();
                     _boundSpecs.Clear();
                     DeactivateSteppers();
@@ -2282,10 +2298,8 @@ public sealed partial class DebugSession : IDebugSession
         try
         {
             try { process.Stop(5000); } catch { }
-            foreach (var breakpoint in _bound.Values)
-            {
-                try { breakpoint?.Activate(false); } catch { }
-            }
+            foreach (var bound in _bound.Values)
+                bound.DeactivateAll();
             _bound.Clear();
             _boundSpecs.Clear();
             DeactivateSteppers();
@@ -2428,7 +2442,7 @@ public sealed partial class DebugSession : IDebugSession
                 // to pending; the specs stay, so the next LoadModule rebinds them.
                 var moduleName = Safe(() => e.Module.Name) ?? string.Empty;
                 if (moduleName.Length > 0)
-                    OnModuleUnloaded(moduleName);
+                    OnModuleUnloaded(e.Module, moduleName);
             };
             callback.OnBreakpoint += (_, e) =>
             {
@@ -3164,8 +3178,9 @@ public sealed partial class DebugSession : IDebugSession
         return buffer.ToArray();
     }
 
-    private void OnModuleUnloaded(string moduleName)
+    private void OnModuleUnloaded(CorDebugModule module, string moduleName)
     {
+        var instanceKey = Safe(() => InstanceKey(module)) ?? string.Empty;
         var assemblyName = Path.GetFileNameWithoutExtension(moduleName);
         if (assemblyName.Length > 0)
             _encModules.TryRemove(assemblyName, out _);
@@ -3184,20 +3199,27 @@ public sealed partial class DebugSession : IDebugSession
         lock (_noSymbolsReported)
             _noSymbolsReported.Remove(moduleName);
 
-        foreach (var pair in _boundModule)
+        // Only the placements that lived in this image. The same breakpoint can be armed in the
+        // same assembly loaded into another app domain, and that one is still standing — reporting
+        // the breakpoint as unbound would grey out a gutter marker that still stops the target.
+        foreach (var (key, bound) in _bound.ToArray())
         {
-            if (!string.Equals(pair.Value, moduleName, StringComparison.OrdinalIgnoreCase))
+            bool removed = instanceKey.Length > 0
+                ? bound.RemoveInstance(instanceKey, out bool nowEmpty)
+                : bound.RemoveModule(moduleName, out nowEmpty);
+            if (!removed || !nowEmpty)
                 continue;
-            _boundModule.TryRemove(pair.Key, out _);
-            _bound.TryRemove(pair.Key, out _);
-            _boundSpecs.TryRemove(pair.Key, out var spec);
+
+            _bound.TryRemove(key, out _);
+            _boundModule.TryRemove(key, out _);
+            _boundSpecs.TryRemove(key, out var spec);
             // Source keys are "path|line"; entry keys have no separator (no gutter echo needed).
-            var sep = pair.Key.LastIndexOf('|');
-            if (sep > 0 && int.TryParse(pair.Key.AsSpan(sep + 1), out var line))
+            var sep = key.LastIndexOf('|');
+            if (sep > 0 && int.TryParse(key.AsSpan(sep + 1), out var line))
                 Emit(
                     DebugEventKind.BreakpointUnbound,
                     $"module unloaded: {Path.GetFileName(moduleName)}",
-                    string.Empty, 0, pair.Key[..sep], line,
+                    string.Empty, 0, key[..sep], line,
                     breakpointId: spec?.Id ?? string.Empty);
         }
     }
@@ -3856,36 +3878,32 @@ public sealed partial class DebugSession : IDebugSession
         // bindings made against the old one would resolve to it. Dropping them returns the
         // affected breakpoints to pending, and the specs survive, so they rebind.
         var dropped = false;
-        foreach (var pair in _boundModule.ToArray())
+        foreach (var (key, bound) in _bound.ToArray())
         {
-            if (!string.Equals(
-                    Path.GetFileNameWithoutExtension(pair.Value), assemblyName,
-                    StringComparison.OrdinalIgnoreCase))
-            {
+            // Every placement, in every app domain: the edit went to all of them, so a binding
+            // anywhere in this assembly names a method version that no longer exists.
+            if (!bound.InAssembly(assemblyName))
                 continue;
-            }
 
-            _boundModule.TryRemove(pair.Key, out _);
+            _boundModule.TryRemove(key, out _);
             // Dropping the reference without deactivating leaks a live native breakpoint into the
             // runtime, and a leaked breakpoint is what later makes detach fail.
-            if (_bound.TryRemove(pair.Key, out var breakpoint))
-            {
-                try { breakpoint?.Activate(false); } catch { }
-            }
-            _boundSpecs.TryRemove(pair.Key, out var unbound);
+            if (_bound.TryRemove(key, out _))
+                bound.DeactivateAll();
+            _boundSpecs.TryRemove(key, out var unbound);
             dropped = true;
 
             // The rebind below usually puts these straight back, but it is allowed to fail — that
             // is what the stale-symbols warning above is about. Announcing the unbind means a
             // breakpoint that does not come back is drawn as pending rather than left looking
             // armed, which is the one state the client cannot recover on its own.
-            var sep = pair.Key.LastIndexOf('|');
-            if (sep > 0 && int.TryParse(pair.Key.AsSpan(sep + 1), out var line))
+            var sep = key.LastIndexOf('|');
+            if (sep > 0 && int.TryParse(key.AsSpan(sep + 1), out var line))
             {
                 Emit(
                     DebugEventKind.BreakpointUnbound,
                     $"rebinding after an edit to {assemblyName}",
-                    string.Empty, 0, pair.Key[..sep], line,
+                    string.Empty, 0, key[..sep], line,
                     breakpointId: unbound?.Id ?? string.Empty);
             }
         }
@@ -4115,7 +4133,19 @@ public sealed partial class DebugSession : IDebugSession
 
     private readonly record struct ResolvedSequencePoint(mdMethodDef MethodToken, SequencePointMatch Match);
 
-    private readonly record struct SymbolDocument(string FilePath, SymUnmanagedDocument? Unmanaged, DocumentHandle Portable);
+    /// <summary>One source document a PDB describes, from either reader.</summary>
+    /// <param name="Url">The path as the PDB spells it, which is the build machine's path and not
+    /// necessarily one that exists here.</param>
+    /// <param name="ChecksumAlgorithm">Which hash <paramref name="Checksum"/> is; empty when the
+    /// PDB did not say.</param>
+    /// <param name="Checksum">The hash of the source the build compiled — the only evidence that a
+    /// local file with a different path is the same file.</param>
+    private readonly record struct SymbolDocument(
+        string Url,
+        SymUnmanagedDocument? Unmanaged,
+        DocumentHandle Portable,
+        Guid ChecksumAlgorithm = default,
+        byte[]? Checksum = null);
 
     /// <summary>What was found when a module's symbols were looked for, for reporting.</summary>
     /// <param name="Status">One of <see cref="SymbolStatuses"/>.</param>
@@ -4993,7 +5023,7 @@ public sealed partial class DebugSession : IDebugSession
 
             var file = PortableSequencePointFile(reader, method, point);
             if (file.Length == 0)
-                file = document.FilePath;
+                file = document.Url;
             var actual = SourceRangeOf(file, point.StartLine, point.StartColumn, point.EndLine, point.EndColumn);
             yield return new BreakpointLocation
             {
@@ -5053,6 +5083,221 @@ public sealed partial class DebugSession : IDebugSession
                     yield return module;
     }
 
+    /// <summary>
+    /// Every native breakpoint standing for one breakpoint the user set.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// One source line is not one place in the process. A hosted application loads the same
+    /// assembly into every app domain it serves, and each of those is a separate module with a
+    /// separate breakpoint to arm; a source file compiled into two projects is two methods. Placing
+    /// one and stopping — which is what a single breakpoint per line amounts to — makes a
+    /// breakpoint that works in the first request's app domain and silently does nothing in the
+    /// second.
+    /// </para>
+    /// <para>
+    /// The user still sees one breakpoint: the placements are an implementation detail, and every
+    /// report, condition and hit count is keyed by the source line as before.
+    /// </para>
+    /// </remarks>
+    private sealed class BoundBreakpoint
+    {
+        private readonly object _gate = new();
+
+        /// <summary>Keyed by module instance — the same image in two app domains is two of
+        /// them.</summary>
+        private readonly Dictionary<string, Placement> _placements =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>A breakpoint of null is a reservation: a bind is in flight for this instance
+        /// and has not armed anything yet.</summary>
+        private readonly record struct Placement(string ModulePath, CorDebugFunctionBreakpoint? Breakpoint);
+
+        /// <summary>Set once this has been torn down, so a bind that was already in flight arms
+        /// nothing that nobody is left holding.</summary>
+        private bool _abandoned;
+
+        /// <summary>
+        /// Claims this instance for a bind that is about to run.
+        /// </summary>
+        /// <remarks>
+        /// Test and claim in one step. Two threads reach a bind for the same module — the session
+        /// thread's sweep and the runtime's module-load callback both do — and checking first,
+        /// arming second would let both arm, with only the second one remembered and the first left
+        /// armed in the debuggee with nothing tracking it.
+        /// </remarks>
+        public bool TryReserve(string instanceKey, string modulePath)
+        {
+            lock (_gate)
+            {
+                if (_abandoned || _placements.ContainsKey(instanceKey))
+                    return false;
+                _placements[instanceKey] = new Placement(modulePath, null);
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Records what the bind armed.
+        /// </summary>
+        /// <returns>How many instances this breakpoint is now armed in, so the caller can tell the
+        /// first placement — which the client should hear about — from the rest, which are the same
+        /// breakpoint in another app domain. Zero when the session tore down mid-bind, in which case
+        /// the breakpoint has been disarmed again rather than left behind.</returns>
+        public int Complete(string instanceKey, CorDebugFunctionBreakpoint breakpoint)
+        {
+            lock (_gate)
+            {
+                if (_abandoned || !_placements.TryGetValue(instanceKey, out var reservation))
+                {
+                    Disarm(breakpoint);
+                    return 0;
+                }
+
+                _placements[instanceKey] = reservation with { Breakpoint = breakpoint };
+                return _placements.Values.Count(p => p.Breakpoint is not null);
+            }
+        }
+
+        /// <summary>Gives up a reservation whose bind did not arm anything.</summary>
+        public void Release(string instanceKey)
+        {
+            lock (_gate)
+            {
+                if (_placements.TryGetValue(instanceKey, out var placement) && placement.Breakpoint is null)
+                    _placements.Remove(instanceKey);
+            }
+        }
+
+        /// <summary>Whether anything is armed here, as opposed to merely reserved.</summary>
+        public bool IsArmed
+        {
+            get
+            {
+                lock (_gate)
+                    return _placements.Values.Any(p => p.Breakpoint is not null);
+            }
+        }
+
+        /// <summary>Whether any placement lives in a module of this simple assembly name.</summary>
+        public bool InAssembly(string assemblyName)
+        {
+            lock (_gate)
+            {
+                return _placements.Values.Any(p => string.Equals(
+                    Path.GetFileNameWithoutExtension(p.ModulePath), assemblyName,
+                    StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        /// <summary>
+        /// Disarms and forgets the placement in one module instance.
+        /// </summary>
+        /// <remarks>
+        /// By instance, not by image. The same assembly in two app domains is the case this whole
+        /// type exists for, and both have the same path — removing by path on one domain's unload
+        /// would disarm the breakpoint the other domain is still stopping at, and report the user's
+        /// breakpoint as unbound while it is armed.
+        /// </remarks>
+        /// <param name="nowEmpty">Whether nothing is left, which is when the user's breakpoint has
+        /// genuinely gone back to pending rather than merely losing one of its homes.</param>
+        /// <returns>Whether this breakpoint was placed in that instance at all.</returns>
+        public bool RemoveInstance(string instanceKey, out bool nowEmpty)
+        {
+            lock (_gate)
+            {
+                bool removed = _placements.Remove(instanceKey, out var placement);
+                if (removed && placement.Breakpoint is { } breakpoint)
+                    Disarm(breakpoint);
+
+                nowEmpty = _placements.Count == 0;
+                return removed;
+            }
+        }
+
+        /// <summary>
+        /// Disarms and forgets every placement that came from this image, whichever domain it was
+        /// loaded into.
+        /// </summary>
+        /// <remarks>
+        /// The fallback for an unload whose module can no longer be identified — by then the
+        /// runtime may refuse to hand back anything about it. Coarser than
+        /// <see cref="RemoveInstance"/> and wrong in the two-app-domain case, but the alternative is
+        /// leaving a breakpoint armed in an image that is gone, which is what makes a later detach
+        /// fail.
+        /// </remarks>
+        public bool RemoveModule(string modulePath, out bool nowEmpty)
+        {
+            lock (_gate)
+            {
+                var gone = _placements
+                    .Where(p => string.Equals(p.Value.ModulePath, modulePath, StringComparison.OrdinalIgnoreCase))
+                    .Select(p => p.Key)
+                    .ToList();
+
+                foreach (var instanceKey in gone)
+                {
+                    if (_placements.Remove(instanceKey, out var placement) &&
+                        placement.Breakpoint is { } breakpoint)
+                    {
+                        Disarm(breakpoint);
+                    }
+                }
+
+                nowEmpty = _placements.Count == 0;
+                return gone.Count > 0;
+            }
+        }
+
+        public void DeactivateAll()
+        {
+            lock (_gate)
+            {
+                _abandoned = true;
+                foreach (var placement in _placements.Values)
+                {
+                    if (placement.Breakpoint is { } breakpoint)
+                        Disarm(breakpoint);
+                }
+                _placements.Clear();
+            }
+        }
+
+        /// <remarks>Left armed, a removed breakpoint keeps stopping the target, and a leaked native
+        /// breakpoint is what later makes detach fail.</remarks>
+        private static void Disarm(CorDebugFunctionBreakpoint breakpoint)
+        {
+            try { breakpoint.Activate(false); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Claims one module instance for a bind, creating the breakpoint's home if it has none yet.
+    /// </summary>
+    /// <returns>Null when this instance is already taken — bound, or being bound right now.</returns>
+    private BoundBreakpoint? Reserve(string key, string instanceKey, string modulePath)
+    {
+        var bound = _bound.GetOrAdd(key, _ => new BoundBreakpoint());
+        return bound.TryReserve(instanceKey, modulePath) ? bound : null;
+    }
+
+    /// <summary>
+    /// Gives up a reservation, and the whole entry with it when nothing else claimed it.
+    /// </summary>
+    /// <remarks>
+    /// An entry left behind with nothing armed in it is not merely untidy: a later bind sweep would
+    /// find it and take it for a breakpoint that is already placed.
+    /// </remarks>
+    private void ReleaseReservation(string key, string instanceKey)
+    {
+        if (!_bound.TryGetValue(key, out var bound))
+            return;
+
+        bound.Release(instanceKey);
+        if (!bound.IsArmed)
+            _bound.TryRemove(new KeyValuePair<string, BoundBreakpoint>(key, bound));
+    }
+
     private void TryBindBreakpoint(CorDebugModule module, BreakpointSpec spec)
     {
         // A generated App_Web_*.dll can only satisfy a markup breakpoint; probing its PDB for
@@ -5079,9 +5324,12 @@ public sealed partial class DebugSession : IDebugSession
     private void TryBindIlBreakpoint(CorDebugModule module, BreakpointSpec spec)
     {
         var key = SourceKey(spec.FilePath, (int)spec.Line);
-        if (_bound.ContainsKey(key))
-            return;
         var moduleName = Safe(() => module.Name) ?? string.Empty;
+        var instanceKey = Safe(() => InstanceKey(module)) ?? string.Empty;
+        if (instanceKey.Length == 0 || Reserve(key, instanceKey, moduleName) is not { } bound)
+            return;
+
+        var armed = false;
         try
         {
             if (!ModuleMatchesSpec(moduleName, spec.ModulePath))
@@ -5090,12 +5338,21 @@ public sealed partial class DebugSession : IDebugSession
             var function = module.GetFunctionFromToken((mdMethodDef)spec.MethodToken);
             var breakpoint = function.ILCode.CreateBreakpoint(spec.IlOffset);
             breakpoint.Activate(true);
+            int placements = bound.Complete(instanceKey, breakpoint);
+            armed = placements > 0;
+            if (!armed)
+                return;
+
             spec.Kind = spec.Kind == BreakpointKind.Unspecified ? BreakpointKind.Source : spec.Kind;
             var location = SourceRangeOf(spec.FilePath, (int)spec.Line, (int)spec.Column);
-            _bound[key] = breakpoint;
             _boundModule[key] = moduleName;
             _boundSpecs[key] = spec;
             _boundKeyByRequest[key] = key;
+            // Only the first placement is news. The rest are the same breakpoint in another app
+            // domain, and reporting each one would draw the gutter as though the user had set
+            // several.
+            if (placements > 1)
+                return;
             Emit(
                 DebugEventKind.BreakpointBound,
                 $"bound at IL offset 0x{spec.IlOffset:X} in {Path.GetFileName(moduleName)}",
@@ -5113,6 +5370,11 @@ public sealed partial class DebugSession : IDebugSession
             // The module name already matched the spec, so this is the named module failing to
             // take the breakpoint rather than an unrelated one being skipped.
             ReportBindFailure(spec, moduleName, DescribeBindFailure(ex));
+        }
+        finally
+        {
+            if (!armed)
+                ReleaseReservation(key, instanceKey);
         }
     }
 
@@ -5138,9 +5400,12 @@ public sealed partial class DebugSession : IDebugSession
         var requestedColumn = (int)spec.Column;
         var requested = SourceRangeOf(spec.FilePath, requestedLine, requestedColumn);
         var requestedKey = SourceKey(spec.FilePath, requestedLine);
-        if (_bound.ContainsKey(requestedKey))
-            return;
         var moduleName = Safe(() => module.Name) ?? string.Empty;
+        var instanceKey = Safe(() => InstanceKey(module)) ?? string.Empty;
+        if (instanceKey.Length == 0 || Reserve(requestedKey, instanceKey, moduleName) is not { } reserved)
+            return;
+
+        string armedKey = string.Empty;
         try
         {
             if (moduleName.Length == 0)
@@ -5152,9 +5417,13 @@ public sealed partial class DebugSession : IDebugSession
             // Not finding the document is the ordinary case — most loaded modules have nothing to
             // do with this file — so it stays silent. Everything past this point is a module that
             // does own the file, where a failure is worth explaining.
-            var document = FindDocument(reader, spec.FilePath);
+            var document = FindDocument(reader, spec.FilePath, out string mismatch);
             if (document is null)
+            {
+                if (mismatch.Length > 0)
+                    ReportBindFailure(spec, moduleName, mismatch);
                 return;
+            }
 
             var resolved = BestSequencePointInDocument(reader, document.Value, requestedLine, requestedColumn);
             if (resolved is null)
@@ -5171,24 +5440,46 @@ public sealed partial class DebugSession : IDebugSession
                 match.Column,
                 match.EndLine,
                 match.EndColumn);
+            // The sequence point can sit below the requested line, in which case the breakpoint
+            // lives under a different key than the one reserved above.
             var actualKey = SourceKey(spec.FilePath, match.Line);
-            if (_bound.ContainsKey(actualKey))
+            BoundBreakpoint bound;
+            if (actualKey == requestedKey)
+            {
+                bound = reserved;
+            }
+            else if (Reserve(actualKey, instanceKey, moduleName) is { } moved)
+            {
+                bound = moved;
+            }
+            else
+            {
                 return;
+            }
 
             var function = module.GetFunctionFromToken(resolved.Value.MethodToken);
             var breakpoint = function.ILCode.CreateBreakpoint(match.Offset);
             breakpoint.Activate(true);
+            int placements = bound.Complete(instanceKey, breakpoint);
+            if (placements == 0)
+            {
+                if (actualKey != requestedKey)
+                    ReleaseReservation(actualKey, instanceKey);
+                return;
+            }
+
+            armedKey = actualKey;
             spec.Line = (uint)match.Line;
             spec.Column = (uint)match.Column;
             spec.EndLine = (uint)match.EndLine;
             spec.EndColumn = (uint)match.EndColumn;
             spec.Kind = spec.Kind == BreakpointKind.Unspecified ? BreakpointKind.Source : spec.Kind;
-            _bound[actualKey] = breakpoint;
             _boundModule[actualKey] = moduleName;
             _boundSpecs[actualKey] = spec;
             _boundKeyByRequest[requestedKey] = actualKey;
-            if (requestedKey != actualKey)
-                _bound.TryRemove(requestedKey, out _);
+            // Every placement past the first is the same breakpoint in another app domain.
+            if (placements > 1)
+                return;
             Emit(
                 DebugEventKind.BreakpointBound,
                 requested.Line == actual.Line
@@ -5208,6 +5499,13 @@ public sealed partial class DebugSession : IDebugSession
             // The module owned the document, so this is a real failure rather than the usual
             // "wrong module" case — say why instead of leaving the breakpoint silently grey.
             ReportBindFailure(spec, moduleName, DescribeBindFailure(ex));
+        }
+        finally
+        {
+            // The requested key holds a reservation that only the requested line ever redeems; when
+            // the breakpoint landed elsewhere — or nowhere — it has to be given back.
+            if (armedKey != requestedKey)
+                ReleaseReservation(requestedKey, instanceKey);
         }
     }
 
@@ -5253,8 +5551,11 @@ public sealed partial class DebugSession : IDebugSession
     {
         var moduleName = Safe(() => module.Name) ?? string.Empty;
         var key = $"{moduleName}!{spec.TypeName}.{spec.MethodName}";
-        // The key is reserved before the search so two modules cannot bind the same entry point.
-        if (!_bound.TryAdd(key, null!))
+        var instanceKey = Safe(() => InstanceKey(module)) ?? moduleName;
+        // The place is reserved before the search so the same module instance cannot bind this
+        // entry point twice. Another instance of the same module — a second app domain — reserves
+        // its own place under the same key and gets its own breakpoint.
+        if (Reserve(key, instanceKey, moduleName) is not { } bound)
             return;
         var created = false;
         try
@@ -5274,10 +5575,14 @@ public sealed partial class DebugSession : IDebugSession
                     var function = module.GetFunctionFromToken(methodDef);
                     var breakpoint = function.CreateBreakpoint();
                     breakpoint.Activate(true);
-                    _bound[key] = breakpoint;
+                    int placements = bound.Complete(instanceKey, breakpoint);
+                    if (placements == 0)
+                        return;
                     _boundModule[key] = moduleName;
                     created = true;
-                    Emit(DebugEventKind.Diagnostic, $"bound breakpoint {typeProps.szTypeDef}.{methodProps.szMethod}", methodProps.szMethod, 0);
+                    // Every placement past the first is the same entry point in another app domain.
+                    if (placements == 1)
+                        Emit(DebugEventKind.Diagnostic, $"bound breakpoint {typeProps.szTypeDef}.{methodProps.szMethod}", methodProps.szMethod, 0);
                     return;
                 }
             }
@@ -5291,7 +5596,7 @@ public sealed partial class DebugSession : IDebugSession
             // A reservation left behind blocks every later attempt at this key and hands removal
             // a null breakpoint.
             if (!created)
-                _bound.TryRemove(key, out _);
+                ReleaseReservation(key, instanceKey);
         }
     }
 
@@ -5450,45 +5755,208 @@ public sealed partial class DebugSession : IDebugSession
             : null;
     }
 
-    private static SymbolDocument? FindDocument(SymbolReader reader, string filePath)
+    /// <summary>
+    /// The PDB document that describes a local source file.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Path equality answers this whenever the binary was built on this machine, and never
+    /// otherwise. A build on CI, in a container, or with mapped source roots writes document paths
+    /// that do not exist here, so comparing paths says "this module has nothing to do with that
+    /// file" about the module that owns it — and a breakpoint that never binds, with nothing said
+    /// about why, is the whole of the symptom.
+    /// </para>
+    /// <para>
+    /// So the fallback matches by file name and confirms with the hash the PDB recorded, which is
+    /// the only evidence that two differently-spelled paths are the same file. What it learns from
+    /// the first confirmed file — that one directory prefix stands for another — is remembered and
+    /// tried first for the rest, so the cost is paid once per build root rather than per file.
+    /// </para>
+    /// </remarks>
+    private SymbolDocument? FindDocument(SymbolReader reader, string filePath) =>
+        FindDocument(reader, filePath, out _);
+
+    /// <param name="mismatch">Empty unless the module has a document with this file's name that the
+    /// checksum ruled out. That is the one failure worth telling the user about — it means the
+    /// binary was built from a different copy of the file they are looking at — and it is
+    /// indistinguishable from "wrong module" without saying so.</param>
+    /// <inheritdoc cref="FindDocument(SymbolReader, string)"/>
+    private SymbolDocument? FindDocument(SymbolReader reader, string filePath, out string mismatch)
     {
-        if (reader.Unmanaged is not null)
+        mismatch = string.Empty;
+
+        string full;
+        try { full = Path.GetFullPath(filePath); }
+        catch { return null; }
+
+        var name = Path.GetFileName(full);
+        var candidates = new List<(SymbolDocument Document, int Shared)>();
+
+        foreach (var candidate in DocumentsOf(reader))
         {
-            try
-            {
-                var full = Path.GetFullPath(filePath);
-                foreach (var document in reader.Unmanaged.Documents)
-                {
-                    var url = Safe(() => document.URL);
-                    if (url is not null && string.Equals(Path.GetFullPath(url), full, StringComparison.OrdinalIgnoreCase))
-                        return new SymbolDocument(url, document, default);
-                }
-            }
-            catch
-            {
-            }
+            if (candidate.Url.Length == 0)
+                continue;
+
+            if (SamePath(candidate.Url, full))
+                return candidate;
+
+            // A rewrite this session already confirmed, applied before anything is hashed.
+            if (RewrittenMatches(candidate.Url, full))
+                return candidate;
+
+            if (string.Equals(Path.GetFileName(candidate.Url), name, StringComparison.OrdinalIgnoreCase))
+                candidates.Add((candidate, SharedSuffixLength(candidate.Url, full)));
         }
 
-        if (reader.Portable is not null)
+        if (candidates.Count == 0)
+            return null;
+
+        // Longest shared tail first: "src/App/Program.cs" is a better guess than a bare "Program.cs"
+        // from some unrelated corner of the build. But it is only an ordering — a project that
+        // compiles a linked file from a sibling directory puts the right document lower down the
+        // list, so every candidate gets its hash read rather than just the best-looking one.
+        var refuted = string.Empty;
+        foreach (var (document, _) in candidates.OrderByDescending(c => c.Shared))
         {
-            try
+            if (SourceChecksum.Matches(full, document.ChecksumAlgorithm, document.Checksum))
             {
-                var full = Path.GetFullPath(filePath);
-                foreach (var handle in reader.Portable.Reader.Documents)
-                {
-                    var document = reader.Portable.Reader.GetDocument(handle);
-                    var url = reader.Portable.Reader.GetString(document.Name);
-                    if (url.Length > 0 && string.Equals(Path.GetFullPath(url), full, StringComparison.OrdinalIgnoreCase))
-                        return new SymbolDocument(url, null, handle);
-                }
+                LearnPathRewrite(document.Url, full);
+                return document;
             }
-            catch
-            {
-            }
+
+            if (refuted.Length == 0 && document.Checksum is { Length: > 0 })
+                refuted = document.Url;
         }
+
+        // Only a hash that disagreed is worth reporting. A PDB that recorded none says nothing about
+        // this file either way, and saying so once per module would bury the real failures.
+        if (refuted.Length > 0)
+            mismatch = $"it was built from a different copy of {name} ({refuted})";
 
         return null;
     }
+
+    /// <summary>Both readers' documents behind one shape, so the matching is written once.</summary>
+    private static IEnumerable<SymbolDocument> DocumentsOf(SymbolReader reader)
+    {
+        if (reader.Unmanaged is not null)
+        {
+            SymbolDocument[] documents;
+            try
+            {
+                documents = [.. reader.Unmanaged.Documents.Select(d => new SymbolDocument(
+                    Safe(() => d.URL) ?? string.Empty,
+                    d,
+                    default,
+                    Safe(() => (Guid?)d.CheckSumAlgorithmId) ?? Guid.Empty,
+                    Safe(() => d.CheckSum)))];
+            }
+            catch
+            {
+                documents = [];
+            }
+
+            foreach (var document in documents)
+                yield return document;
+        }
+
+        if (reader.Portable is null)
+            yield break;
+
+        SymbolDocument[] portable;
+        try
+        {
+            var metadata = reader.Portable.Reader;
+            portable = [.. metadata.Documents.Select(handle =>
+            {
+                var document = metadata.GetDocument(handle);
+                return new SymbolDocument(
+                    metadata.GetString(document.Name),
+                    null,
+                    handle,
+                    document.HashAlgorithm.IsNil ? Guid.Empty : metadata.GetGuid(document.HashAlgorithm),
+                    document.Hash.IsNil ? null : metadata.GetBlobBytes(document.Hash));
+            })];
+        }
+        catch
+        {
+            portable = [];
+        }
+
+        foreach (var document in portable)
+            yield return document;
+    }
+
+    private static bool SamePath(string url, string fullPath)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(url), fullPath, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // A document path that is not a path this platform can express — a Linux build read on
+            // Windows — is exactly the case the suffix match below exists for.
+            return false;
+        }
+    }
+
+    private bool RewrittenMatches(string url, string fullPath)
+    {
+        var local = SourcePaths.Normalize(fullPath);
+        foreach (var (localPrefix, pdbPrefix) in _pathRewrites)
+        {
+            if (!local.StartsWith(SourcePaths.Normalize(localPrefix), StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (SameTail(url, pdbPrefix, local[localPrefix.Length..]))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool SameTail(string url, string pdbPrefix, string tail)
+    {
+        if (url.Length != pdbPrefix.Length + tail.Length)
+            return false;
+
+        var normalized = SourcePaths.Normalize(url);
+        return normalized.StartsWith(SourcePaths.Normalize(pdbPrefix), StringComparison.OrdinalIgnoreCase) &&
+            normalized[pdbPrefix.Length..].Equals(
+                SourcePaths.Normalize(tail), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Records that one directory prefix stands for another, having just seen a file confirm it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The prefixes are whatever is left once the shared tail is removed, which is why this is only
+    /// called after a checksum agreed: a guess here would silently redirect every other file in the
+    /// project to the wrong place.
+    /// </para>
+    /// <para>
+    /// Both are stored with their trailing separator, so a prefix is only ever matched at a
+    /// directory boundary. Without it <c>D:\work</c> would prefix <c>D:\workspace\...</c> too, and
+    /// an unrelated tree would be rewritten into this build's.
+    /// </para>
+    /// </remarks>
+    private void LearnPathRewrite(string url, string fullPath)
+    {
+        int shared = SharedSuffixLength(url, fullPath);
+        if (shared <= 1 || shared >= url.Length || shared >= fullPath.Length)
+            return;
+
+        // The shared tail starts at the separator, except where one path was consumed whole — and
+        // there there is no prefix left to learn anything about.
+        if (fullPath[^shared] is not ('/' or '\\') || url[^shared] is not ('/' or '\\'))
+            return;
+
+        _pathRewrites[fullPath[..^(shared - 1)]] = url[..^(shared - 1)];
+    }
+
+    private static int SharedSuffixLength(string url, string fullPath) =>
+        SourcePaths.SharedSuffixLength(url, fullPath);
 
     // --- stop-state inspection --------------------------------------------------------------
 

@@ -16,6 +16,31 @@ namespace RoslynMCP.Debugger;
 /// </remarks>
 public sealed class WorkerDebugEngine : IDebugEngine
 {
+    /// <summary>
+    /// How long a request that runs against an already-stopped target may take.
+    /// </summary>
+    /// <remarks>
+    /// Reading a stack, listing variables or expanding a value happens inside a suspend, with no
+    /// debuggee code running: a second is generous and ten is already a worker that has stopped
+    /// answering. The old shared budget meant every one of these could hang the caller for a full
+    /// minute before admitting the worker was gone — a minute in which the editor's Variables
+    /// view is simply frozen. An evaluation is not in this class: it resumes the debuggee to make
+    /// a call, and how long that takes is the user's own code's business.
+    /// </remarks>
+    private static readonly TimeSpan InteractiveTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// How long starting or stopping a session may take.
+    /// </summary>
+    /// <remarks>
+    /// Launching a process, waiting for the CLR to load, and binding the first breakpoints is
+    /// slow on a cold machine and slower again for a Framework web app; a budget tuned for reading
+    /// a stack would abandon an attach that was going to succeed.
+    /// </remarks>
+    private static readonly TimeSpan SessionTimeout = TimeSpan.FromSeconds(120);
+
+    /// <summary>The budget for anything that resumes the debuggee, where the time belongs to the
+    /// user's own code rather than to the worker.</summary>
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(60);
 
     private readonly Process _worker;
@@ -25,6 +50,11 @@ public sealed class WorkerDebugEngine : IDebugEngine
     private int _nextId;
     private int _disposed;
     private int _detached;
+
+    /// How many requests are in flight that were given more than the interactive budget. The
+    /// worker serves one request at a time, so while this is non-zero a quick request is queued
+    /// behind slow work rather than being ignored, and its clock must not run.
+    private int _slowInFlight;
 
     public ChannelReader<DebugEvent> Events => _events.Reader;
 
@@ -134,7 +164,31 @@ public sealed class WorkerDebugEngine : IDebugEngine
     }
 
     private Task<WorkerResponse> SendAsync(WorkerRequest request) =>
-        SendAsync(request, RequestTimeout);
+        SendAsync(request, BudgetFor(request.Op));
+
+    /// <summary>
+    /// How long an operation is given, by what it actually has to wait for.
+    /// </summary>
+    /// <remarks>
+    /// Chosen from the op here rather than at each call site so that an operation added later gets
+    /// a considered budget by default instead of whichever one its author happened to copy.
+    /// </remarks>
+    private static TimeSpan BudgetFor(string op) => op switch
+    {
+        // Starting or ending a session: a process has to come up or go down, and a cold machine
+        // makes that slow without making it wrong.
+        "attach" or "launch" or "shutdown" or "terminate" or "detach" => SessionTimeout,
+
+        // Reading state inside a suspend. Nothing in the debuggee runs, so a slow answer means the
+        // worker is not answering — and the caller should find that out quickly.
+        "stackTrace" or "threads" or "variables" or "expand" or "modules" or
+        "addBreakpoint" or "removeBreakpoint" or "displayOptions" or "exceptionPolicy" =>
+            InteractiveTimeout,
+
+        // Everything else resumes the debuggee — evaluation, stepping, run-to-location, applying
+        // an edit — and the time is the user's own code's.
+        _ => RequestTimeout,
+    };
 
     private async Task<WorkerResponse> SendAsync(WorkerRequest request, TimeSpan timeout)
     {
@@ -153,9 +207,16 @@ public sealed class WorkerDebugEngine : IDebugEngine
             _worker.StandardInput.Flush();
         }
 
+        bool slow = timeout > InteractiveTimeout;
+        if (slow)
+            Interlocked.Increment(ref _slowInFlight);
+
         try
         {
-            var response = await waiter.Task.WaitAsync(timeout);
+            // Its own registration does not count as something to wait behind, or a slow request
+            // would re-arm its budget forever.
+            var response = await AwaitWithinBudgetAsync(
+                waiter.Task, timeout, request.Op, othersBusy: slow ? 1 : 0);
             return response.Ok
                 ? response
                 : throw new InvalidOperationException(
@@ -163,8 +224,46 @@ public sealed class WorkerDebugEngine : IDebugEngine
         }
         finally
         {
+            if (slow)
+                Interlocked.Decrement(ref _slowInFlight);
+
             // A timed-out request is never answered, so nothing else would ever drop its waiter.
             _pending.TryRemove(request.Id, out _);
+        }
+    }
+
+    /// <summary>
+    /// Waits for a reply, giving up only when the worker had a chance to answer and did not.
+    /// </summary>
+    /// <remarks>
+    /// The worker serves one request at a time, and so does the session thread behind it. A budget
+    /// measured from the moment of sending therefore charges a quick request for whatever slow work
+    /// it happens to be queued behind: set a breakpoint while a func-eval or a run-to-cursor is in
+    /// flight, and the ten seconds a stack read is allowed expire before the worker has even read
+    /// the request. The budget is re-armed instead for as long as something slower is outstanding,
+    /// so it measures "the worker stopped answering" rather than "the worker was busy".
+    /// </remarks>
+    /// <param name="othersBusy">The count of in-flight slow requests above which someone else is
+    /// holding the worker — 1 for a request that registered itself as slow, 0 otherwise.</param>
+    private async Task<WorkerResponse> AwaitWithinBudgetAsync(
+        Task<WorkerResponse> reply, TimeSpan budget, string op, int othersBusy)
+    {
+        while (true)
+        {
+            try
+            {
+                return await reply.WaitAsync(budget);
+            }
+            catch (TimeoutException) when (Volatile.Read(ref _slowInFlight) > othersBusy)
+            {
+                // Something that resumes the debuggee still holds the worker; this request has not
+                // been refused, it has not been reached. Wait again.
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException(
+                    $"the debug worker did not answer '{op}' within {budget.TotalSeconds:0}s");
+            }
         }
     }
 
@@ -231,8 +330,11 @@ public sealed class WorkerDebugEngine : IDebugEngine
 
     public void Step(StepKind kind) => Send(new WorkerRequest { Op = "step", Step = kind });
 
-    public async Task<List<StackFrame>> StackTraceAsync() =>
-        (await SendAsync(new WorkerRequest { Op = "stackTrace" })).Frames ?? [];
+    public async Task<List<StackFrame>> StackTraceAsync(int threadId = 0) =>
+        (await SendAsync(new WorkerRequest { Op = "stackTrace", ThreadId = threadId })).Frames ?? [];
+
+    public async Task<List<DebugThread>> ThreadsAsync() =>
+        (await SendAsync(new WorkerRequest { Op = "threads" })).Threads ?? [];
 
     public async Task<List<DebugVariable>> VariablesAsync(uint frameIndex) =>
         (await SendAsync(new WorkerRequest { Op = "variables", FrameIndex = frameIndex })).Variables ?? [];
@@ -375,8 +477,8 @@ public sealed class WorkerDebugEngine : IDebugEngine
         }
     }
 
-    public void SetExceptionPolicy(bool breakOnFirstChance) =>
-        Send(new WorkerRequest { Op = "exceptionPolicy", Flag = breakOnFirstChance });
+    public void SetExceptionPolicy(ExceptionPolicy policy) =>
+        Send(new WorkerRequest { Op = "exceptionPolicy", ExceptionPolicy = policy });
 
     public async Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout)
     {

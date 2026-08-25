@@ -27,12 +27,15 @@ public sealed class WorkerRequest
     public int Id { get; set; }
 
     /// <summary>One of: attach, launch, addBreakpoint, removeBreakpoint, continue, pause, step,
-    /// stackTrace, variables, expand, displayOptions, evaluate, setVariable, applyDelta,
+    /// stackTrace, threads, variables, expand, displayOptions, evaluate, setVariable, applyDelta,
     /// runToLocation, setNextStatement, modules, detach, exceptionPolicy, shutdown,
     /// terminate.</summary>
     public string Op { get; set; } = "";
 
     public int Pid { get; set; }
+
+    /// <summary>Which thread 'stackTrace' should walk; 0 means the stopped one.</summary>
+    public int ThreadId { get; set; }
     public DebugRuntime Runtime { get; set; }
     public List<BreakpointSpec>? Breakpoints { get; set; }
     public BreakpointSpec? Breakpoint { get; set; }
@@ -61,6 +64,9 @@ public sealed class WorkerRequest
     public string? IlDelta { get; set; }
     public string? PdbDelta { get; set; }
 
+    /// <summary>The exception stop policy, sent by 'exceptionPolicy'.</summary>
+    public ExceptionPolicy? ExceptionPolicy { get; set; }
+
     public bool Flag { get; set; }
     public bool Force { get; set; }
 
@@ -84,6 +90,7 @@ public sealed class WorkerResponse
     public DebugEvent? Event { get; set; }
 
     public List<StackFrame>? Frames { get; set; }
+    public List<DebugThread>? Threads { get; set; }
     public List<DebugVariable>? Variables { get; set; }
     public DebugVariable? Variable { get; set; }
     public string? Value { get; set; }

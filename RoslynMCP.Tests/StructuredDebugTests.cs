@@ -134,6 +134,19 @@ public class StructuredDebugTests
         Assert.True(PublishingDebugBackend.HitConditionMet(">= 0", 1));
     }
 
+    [Fact]
+    public void AnOperatorNobodySupportsIsIgnoredRatherThanReadAsAnotherOne()
+    {
+        // "!= 3" used to fall through to ">=", so a rule meant to skip one hit stopped on every
+        // hit from the third onwards — a reinterpretation the user had no way to see.
+        Assert.True(PublishingDebugBackend.HitConditionMet("!= 3", 1));
+        Assert.True(PublishingDebugBackend.HitConditionMet("!= 3", 3));
+
+        // The bare-count form still means ">= n", which is what every editor writes it for.
+        Assert.False(PublishingDebugBackend.HitConditionMet("3", 2));
+        Assert.True(PublishingDebugBackend.HitConditionMet("3", 3));
+    }
+
     // === Emulated breakpoints ===
 
     [Fact]
@@ -229,6 +242,25 @@ public class StructuredDebugTests
         var filters = ExceptionFilters.FromIds(["always", "uncaught"]);
 
         Assert.Equal(ExceptionFilters.None, filters);
+    }
+
+    [Fact]
+    public void AConditionStaysOnTheFilterItWasWrittenOn()
+    {
+        // Merged into one list, a type named under "All Exceptions" also decided which unhandled
+        // exceptions stop — so every other type crashed the process with no stop at all.
+        var filters = ExceptionFilters.FromIds(
+            ["all", "user-unhandled"],
+            new Dictionary<string, string>
+            {
+                ["all"] = "System.IO.IOException, !System.OperationCanceledException",
+                ["user-unhandled"] = "System.InvalidOperationException",
+            });
+
+        Assert.Equal(["System.IO.IOException"], filters.IncludeTypes);
+        Assert.Equal(["System.OperationCanceledException"], filters.ExcludeTypes);
+        Assert.Equal(["System.InvalidOperationException"], filters.UnhandledIncludeTypes);
+        Assert.Null(filters.UnhandledExcludeTypes);
     }
 
     // === Variable handles ===

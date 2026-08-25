@@ -36,8 +36,9 @@ public interface IDebugSession
     void Continue();
     void Pause();
     void Step(StepKind kind);
-    void SetExceptionPolicy(bool breakOnFirstChance);
-    Task<List<StackFrame>> StackTraceAsync();
+    void SetExceptionPolicy(ExceptionPolicy policy);
+    /// <param name="threadId">Which thread to walk; <c>0</c> means the one the stop landed on.</param>
+    Task<List<StackFrame>> StackTraceAsync(int threadId = 0);
     Task<List<DebugThread>> ThreadsAsync();
     Task<List<DebugModule>> ModulesAsync();
     Task<List<DebugVariable>> VariablesAsync(uint frameIndex);

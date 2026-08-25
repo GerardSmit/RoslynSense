@@ -185,13 +185,20 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         return sb.ToString();
     }
 
+    /// <inheritdoc />
+    /// <remarks>The engine applies both on the runtime's callback thread, so a hit that the rule
+    /// excludes never becomes a stop and never leaves the debuggee's process.</remarks>
+    public bool AppliesBreakpointRulesInEngine => true;
+
+    /// <inheritdoc />
+    /// <remarks>The type lists are matched against the thrown value inside the callback, before
+    /// the stop is raised, so an excluded exception costs a comparison rather than a suspend.</remarks>
+    public bool AppliesExceptionTypeFiltersInEngine => true;
+
     public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
         string filePath, int line, string? condition = null, string? hitCondition = null,
         string? logMessage = null, CancellationToken cancellationToken = default)
     {
-        // Emulated a layer up, in PublishingDebugBackend.
-        _ = (hitCondition, logMessage);
-
         if (_state == DebuggerService.DebugState.NotStarted)
             return ("Error: No debug session is active.", null);
 
@@ -202,6 +209,8 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             FilePath = PathHelper.NormalizePath(filePath),
             Line = (uint)line,
             Condition = condition ?? "",
+            HitCondition = hitCondition ?? "",
+            LogMessage = logMessage ?? "",
             Enabled = true,
         };
 
@@ -421,15 +430,19 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 
     // --- Structured views ---
 
+    public Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
+        CancellationToken cancellationToken = default) =>
+        GetStackFramesAsync(0, cancellationToken);
+
     public async Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
-        CancellationToken cancellationToken = default)
+        int threadId, CancellationToken cancellationToken = default)
     {
         if (CurrentFrame is null)
             return [];
 
         try
         {
-            var frames = await Engine.StackTraceAsync();
+            var frames = await Engine.StackTraceAsync(threadId);
             var mapped = frames
                 .Select(f => new StackFrameInfo(
                     (int)f.Index,
@@ -440,7 +453,8 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                     IsExternal: string.IsNullOrEmpty(f.FilePath),
                     ModulePath: f.ModulePath,
                     MethodToken: f.MethodToken,
-                    IlOffset: f.IlOffset))
+                    IlOffset: f.IlOffset,
+                    IsNonUserCode: f.IsNonUserCode))
                 .ToList();
             return await ExternalFrameResolver.EnrichAsync(mapped, cancellationToken);
         }
@@ -558,16 +572,48 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     }
 
     /// <summary>
-    /// One thread, the stopped one. The engine surface exposes no thread list, and inventing ids
-    /// for threads the tools cannot then select would be worse than reporting only what works.
+    /// Every managed thread in the target, with the OS thread id each is addressed by.
     /// </summary>
-    public Task<IReadOnlyList<ThreadInfo>> GetThreadsAsync(CancellationToken cancellationToken = default)
+    /// <remarks>
+    /// Only readable while the target is stopped — enumerating app domains and threads means
+    /// calling into a suspended process. While it runs there is nothing coherent to report, so the
+    /// stopped thread is not guessed at: the list is empty and the caller sees "running".
+    /// </remarks>
+    public async Task<IReadOnlyList<ThreadInfo>> GetThreadsAsync(CancellationToken cancellationToken = default)
     {
         if (_state is DebuggerService.DebugState.NotStarted or DebuggerService.DebugState.Exited)
-            return Task.FromResult<IReadOnlyList<ThreadInfo>>([]);
+            return [];
 
-        string state = CurrentFrame is null ? "running" : "stopped";
-        return Task.FromResult<IReadOnlyList<ThreadInfo>>([new ThreadInfo(1, "Main Thread", state)]);
+        if (CurrentFrame is null || _engine is null)
+            return [];
+
+        try
+        {
+            var threads = await Engine.ThreadsAsync();
+            return [.. threads.Select(t => new ThreadInfo(t.Id, ThreadLabel(t), t.Stopped ? "stopped" : "paused"))];
+        }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not list the target's threads: {ex.Message}", key: "debug-threads");
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// How one thread reads in the editor's thread list.
+    /// </summary>
+    /// <remarks>
+    /// ICorDebug has no managed thread name to ask for — <c>Thread.Name</c> is a field on a managed
+    /// object, readable only by evaluating in the target, which is far too much to spend on a list.
+    /// Where the thread currently is says more than a name would anyway, so that is what is shown
+    /// when it is known.
+    /// </remarks>
+    private static string ThreadLabel(RoslynMCP.Debugger.DebugThread thread)
+    {
+        if (thread.Name.Length > 0)
+            return thread.Name;
+        return thread.Location.Length > 0 ? $"Thread {thread.Id} — {thread.Location}" : $"Thread {thread.Id}";
     }
 
     public Task<ExceptionDetail?> GetExceptionInfoAsync(CancellationToken cancellationToken = default)
@@ -575,25 +621,73 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (CurrentFrame?.ExceptionName is not { Length: > 0 } typeName)
             return Task.FromResult<ExceptionDetail?>(null);
 
+        // The break mode is what the editor's exception popup titles itself with — "Exception has
+        // occurred" against "Exception was unhandled" — so reporting the real one is the
+        // difference between a popup that tells the user something and one that does not.
         return Task.FromResult<ExceptionDetail?>(new ExceptionDetail(
-            typeName, CurrentFrame.ExceptionMessage ?? "", StackTrace: null, BreakMode: "always"));
+            typeName,
+            CurrentFrame.ExceptionMessage ?? "",
+            StackTrace: null,
+            BreakMode: CurrentFrame.ExceptionStage == "unhandled" ? "unhandled" : "always"));
     }
 
     /// <summary>
-    /// Applies the exception filters. Unhandled exceptions always stop; the choice is whether
-    /// first-chance ones do too, which is what the <c>all</c> filter means here.
+    /// Applies the exception filters. The <c>all</c> filter means "stop the moment it is thrown";
+    /// without it only exceptions no handler was found for stop.
     /// </summary>
+    /// <remarks>
+    /// The type lists go down with the policy rather than being applied to stops after the fact.
+    /// That is the whole point of them: a framework that throws internally on a hot path turns
+    /// "break on all exceptions" into an unusable session, and a filter only fixes that if the
+    /// exceptions it rejects never suspend the process at all.
+    /// </remarks>
     public Task<string> SetExceptionFiltersAsync(
         ExceptionFilters filters, CancellationToken cancellationToken = default)
     {
         if (_engine is null)
             return Task.FromResult("Error: No debug session is active.");
 
-        _engine.SetExceptionPolicy(filters.All);
+        var include = filters.IncludeTypes ?? [];
+        var exclude = filters.ExcludeTypes ?? [];
+        var unhandledInclude = filters.UnhandledIncludeTypes ?? [];
+        var unhandledExclude = filters.UnhandledExcludeTypes ?? [];
 
-        return Task.FromResult(filters.All
-            ? "Breaking on every thrown exception, handled or not."
-            : "Breaking on unhandled exceptions only.");
+        _engine.SetExceptionPolicy(new RoslynMCP.Debugger.ExceptionPolicy
+        {
+            // The filter list is authoritative, including when it turns the unhandled stop off:
+            // a session attached only to watch should not suspend a process at the end of its
+            // life. Each rule keeps its own types, so one cannot silence the other.
+            Unhandled = new RoslynMCP.Debugger.ExceptionRule
+            {
+                Enabled = filters.UserUnhandled,
+                IncludeTypes = [.. unhandledInclude],
+                ExcludeTypes = [.. unhandledExclude],
+            },
+            Caught = new RoslynMCP.Debugger.ExceptionRule
+            {
+                Enabled = filters.All,
+                IncludeTypes = [.. include],
+                ExcludeTypes = [.. exclude],
+            },
+        });
+
+        var scope = (filters.All, filters.UserUnhandled) switch
+        {
+            (true, _) => "Breaking on every thrown exception, handled or not.",
+            (false, true) => "Breaking on unhandled exceptions only.",
+            _ => "Not breaking on exceptions at all.",
+        };
+
+        if (include.Count > 0)
+            scope += $" Thrown exceptions limited to {string.Join(", ", include)}.";
+        if (exclude.Count > 0)
+            scope += $" Ignoring thrown {string.Join(", ", exclude)}.";
+        if (unhandledInclude.Count > 0)
+            scope += $" Unhandled limited to {string.Join(", ", unhandledInclude)}.";
+        if (unhandledExclude.Count > 0)
+            scope += $" Ignoring unhandled {string.Join(", ", unhandledExclude)}.";
+
+        return Task.FromResult(scope);
     }
 
     public async Task<string> RunToLocationAsync(
@@ -668,7 +762,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             return [];
 
         return [.. (await Engine.ModulesAsync()).Select(m =>
-            new ModuleInfo(m.Name, m.Path, m.SymbolsLoaded, m.SymbolPath, m.Runtime))];
+            new ModuleInfo(
+                m.Name, m.Path, m.SymbolsLoaded, m.SymbolPath, m.Runtime,
+                m.SymbolStatus, m.SymbolOrigin, m.SymbolDetail))];
     }
 
     public async Task<string> DetachAsync(CancellationToken cancellationToken = default)
@@ -734,6 +830,20 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     }
 
     /// <summary>Reads the type out of a <c>Type: message</c> event line.</summary>
+    /// <summary>The engine appends the stage to the exception message; these read it back off.</summary>
+    private static bool IsUnhandled(string message) =>
+        message.EndsWith("(unhandled)", StringComparison.Ordinal);
+
+    private static string StripStage(string message)
+    {
+        foreach (var suffix in new[] { " (unhandled)", " (first chance)" })
+        {
+            if (message.EndsWith(suffix, StringComparison.Ordinal))
+                return message[..^suffix.Length];
+        }
+        return message;
+    }
+
     private static string ExceptionTypeOf(string message)
     {
         int colon = message.IndexOf(':');
@@ -897,13 +1007,17 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                                 FilePath: e.FilePath,
                                 Line: (int)e.Line,
                                 BreakpointNumber: int.TryParse(e.BreakpointId, out var id) ? id : 0,
-                                // The engine reports the exception as the event message; a
-                                // "Type: message" prefix is the only type information available.
+                                // The engine reports the exception as "Type: message (stage)".
                                 ExceptionName: e.Kind == DebugEventKind.Exception
-                                    ? ExceptionTypeOf(e.Message)
+                                    ? ExceptionTypeOf(StripStage(e.Message))
                                     : null,
-                                ExceptionMessage: e.Kind == DebugEventKind.Exception ? e.Message : null,
-                                ExceptionStage: e.Kind == DebugEventKind.Exception ? "throw" : null);
+                                ExceptionMessage: e.Kind == DebugEventKind.Exception
+                                    ? StripStage(e.Message)
+                                    : null,
+                                ExceptionStage: e.Kind == DebugEventKind.Exception
+                                    ? (IsUnhandled(e.Message) ? "unhandled" : "throw")
+                                    : null,
+                                ThreadId: e.ThreadId);
                         }
                         _selectedFrame = 0;
                         _state = DebuggerService.DebugState.Stopped;
@@ -930,6 +1044,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                     case DebugEventKind.Diagnostic:
                         Remember(e.Message);
                         Raise(DebugNoticeKind.Diagnostic, e);
+                        break;
+
+                    case DebugEventKind.Logpoint:
+                        Remember(e.Message);
+                        Raise(DebugNoticeKind.Logpoint, e);
                         break;
 
                     case DebugEventKind.Module:

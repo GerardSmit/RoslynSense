@@ -40,7 +40,17 @@ public interface IDebugEngine : IDisposable
 
     void Step(StepKind kind);
 
-    Task<List<StackFrame>> StackTraceAsync();
+    /// <summary>
+    /// The call stack of one thread, top-first.
+    /// </summary>
+    /// <param name="threadId">Which thread to walk; <c>0</c> means whichever one the stop landed
+    /// on. Naming another suspended thread is the only way to see what the rest of the process was
+    /// doing — on a server, that is every other in-flight request.</param>
+    Task<List<StackFrame>> StackTraceAsync(int threadId = 0);
+
+    /// <summary>Every managed thread in the target, and which one the stop landed on.</summary>
+    Task<List<DebugThread>> ThreadsAsync();
+
     Task<List<DebugVariable>> VariablesAsync(uint frameIndex);
 
     /// <summary>
@@ -100,8 +110,15 @@ public interface IDebugEngine : IDisposable
     /// only being inspected.</summary>
     Task<(bool Ok, string Error)> DetachAsync();
 
-    /// <summary>Whether first-chance exceptions stop. Unhandled ones always do.</summary>
-    void SetExceptionPolicy(bool breakOnFirstChance);
+    /// <summary>
+    /// Replaces the policy deciding which exceptions suspend the target.
+    /// </summary>
+    /// <remarks>
+    /// Applied inside the engine rather than by resuming through unwanted stops: a framework that
+    /// throws internally on a hot path makes "break on all exceptions" unusable otherwise, and a
+    /// type filter is only cheap if the exception it rejects never becomes a stop.
+    /// </remarks>
+    void SetExceptionPolicy(ExceptionPolicy policy);
 
     /// <summary>
     /// Ends the session by letting the debuggee shut itself down, terminating it only if that

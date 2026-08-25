@@ -16,6 +16,10 @@ internal static class DebugJson
 /// <param name="Id">Frame index, 0 being the innermost. Doubles as the DAP frame id.</param>
 /// <param name="IsExternal">Framework, native, or symbol-less code — rendered subtly and
 /// collapsed in the markdown surface.</param>
+/// <param name="IsNonUserCode">A frame the engine identified as plumbing: a
+/// <c>DebuggerHidden</c> or <c>DebuggerNonUserCode</c> method, or a module outside the user's own
+/// output. Distinct from <paramref name="IsExternal"/>, which is about having no source to show —
+/// a hidden method in the user's own assembly has source and still should not be read past.</param>
 /// <param name="ModulePath">The module the frame executes in — carried for frames without
 /// source, so external-source resolution can find the method behind them.</param>
 /// <param name="MethodToken">The frame's MethodDef token in <paramref name="ModulePath"/>;
@@ -34,7 +38,8 @@ public sealed record StackFrameInfo(
     string ModulePath = "",
     int MethodToken = 0,
     int IlOffset = -1,
-    string SourceOrigin = "");
+    string SourceOrigin = "",
+    bool IsNonUserCode = false);
 
 /// <summary>
 /// One variable in scope, or one child of an expandable one.
@@ -64,24 +69,135 @@ public sealed record ExceptionDetail(
     string BreakMode);
 
 /// <summary>Which exceptions should suspend the target.</summary>
-/// <remarks>netcoredbg advertises exactly two filters, <c>all</c> and <c>user-unhandled</c>,
-/// so anything richer would be a promise we cannot keep.</remarks>
-public sealed record ExceptionFilters(bool All, bool UserUnhandled)
+/// <remarks>
+/// The two filter ids are the ones netcoredbg advertises, <c>all</c> and <c>user-unhandled</c>, so
+/// the vocabulary is the same on both runtimes. The type lists are honoured only by the ICorDebug
+/// engine, which applies them in the debuggee's own suspend; netcoredbg ignores them rather than
+/// pretending, because filtering after the stop has already happened would not save the cost the
+/// filter exists for.
+/// </remarks>
+/// <param name="IncludeTypes">When non-empty, only these exception types stop under
+/// <paramref name="All"/>. Matched by full or simple name, against the thrown type and its base
+/// types.</param>
+/// <param name="ExcludeTypes">Types that never stop under <paramref name="All"/>. Applied after
+/// <paramref name="IncludeTypes"/>.</param>
+/// <param name="UnhandledIncludeTypes">The same, for <paramref name="UserUnhandled"/>. Kept apart
+/// from the caught lists because DAP scopes a condition to the filter it was written on: narrowing
+/// "All Exceptions" to one type says nothing about which unhandled crashes should stop, and reusing
+/// the list there would let every other type die unseen.</param>
+/// <param name="UnhandledExcludeTypes">The same, for <paramref name="UserUnhandled"/>.</param>
+public sealed record ExceptionFilters(
+    bool All,
+    bool UserUnhandled,
+    IReadOnlyList<string>? IncludeTypes = null,
+    IReadOnlyList<string>? ExcludeTypes = null,
+    IReadOnlyList<string>? UnhandledIncludeTypes = null,
+    IReadOnlyList<string>? UnhandledExcludeTypes = null)
 {
     public static ExceptionFilters None { get; } = new(false, false);
 
-    public static ExceptionFilters FromIds(IEnumerable<string> ids)
+    public static ExceptionFilters FromIds(IEnumerable<string> ids) => FromIds(ids, null);
+
+    /// <summary>
+    /// Compares the type lists by content.
+    /// </summary>
+    /// <remarks>
+    /// A record compares list members by reference, which would report two settings naming exactly
+    /// the same exception types as different. Every use of this type treats it as a value, so it
+    /// has to compare like one.
+    /// </remarks>
+    public bool Equals(ExceptionFilters? other) =>
+        other is not null &&
+        All == other.All &&
+        UserUnhandled == other.UserUnhandled &&
+        SameTypes(IncludeTypes, other.IncludeTypes) &&
+        SameTypes(ExcludeTypes, other.ExcludeTypes) &&
+        SameTypes(UnhandledIncludeTypes, other.UnhandledIncludeTypes) &&
+        SameTypes(UnhandledExcludeTypes, other.UnhandledExcludeTypes);
+
+    public override int GetHashCode() =>
+        HashCode.Combine(
+            All, UserUnhandled,
+            IncludeTypes?.Count ?? 0, ExcludeTypes?.Count ?? 0,
+            UnhandledIncludeTypes?.Count ?? 0, UnhandledExcludeTypes?.Count ?? 0);
+
+    private static bool SameTypes(IReadOnlyList<string>? left, IReadOnlyList<string>? right) =>
+        (left ?? []).SequenceEqual(right ?? [], StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Reads DAP's <c>setExceptionBreakpoints</c> arguments.
+    /// </summary>
+    /// <param name="conditions">The <c>condition</c> string of each <c>filterOptions</c> entry,
+    /// keyed by its <c>filterId</c>: a comma-separated list of type names, each optionally prefixed
+    /// with <c>!</c> to exclude it. This is the vocabulary the editor's own exception settings
+    /// already use, so a user who knows one knows the other. Keyed rather than merged because DAP
+    /// scopes a condition to the filter it was written on.</param>
+    public static ExceptionFilters FromIds(
+        IEnumerable<string> ids, IReadOnlyDictionary<string, string>? conditions)
     {
         bool all = false, userUnhandled = false;
         foreach (string id in ids)
         {
-            if (id.Equals("all", StringComparison.OrdinalIgnoreCase))
+            if (IsAll(id))
                 all = true;
-            else if (id.Equals("user-unhandled", StringComparison.OrdinalIgnoreCase) ||
-                     id.Equals("userUnhandled", StringComparison.OrdinalIgnoreCase))
+            else if (IsUserUnhandled(id))
                 userUnhandled = true;
         }
-        return new ExceptionFilters(all, userUnhandled);
+
+        var (caughtInclude, caughtExclude) = ParseCondition(Condition(conditions, IsAll));
+        var (unhandledInclude, unhandledExclude) =
+            ParseCondition(Condition(conditions, IsUserUnhandled));
+
+        return new ExceptionFilters(
+            all, userUnhandled,
+            caughtInclude, caughtExclude,
+            unhandledInclude, unhandledExclude);
+    }
+
+    private static bool IsAll(string id) => id.Equals("all", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsUserUnhandled(string id) =>
+        id.Equals("user-unhandled", StringComparison.OrdinalIgnoreCase) ||
+        id.Equals("userUnhandled", StringComparison.OrdinalIgnoreCase);
+
+    private static string? Condition(
+        IReadOnlyDictionary<string, string>? conditions, Func<string, bool> matches)
+    {
+        foreach (var (id, condition) in conditions ?? new Dictionary<string, string>())
+        {
+            if (matches(id))
+                return condition;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Splits one condition string into the types it admits and the types it rejects.
+    /// </summary>
+    /// <remarks>
+    /// Both come back null rather than empty when nothing was named, so "no type filter" is one
+    /// value however it was arrived at — the difference is invisible to every reader, and record
+    /// equality would otherwise report two identical settings as different.
+    /// </remarks>
+    private static (List<string>? Include, List<string>? Exclude) ParseCondition(string? condition)
+    {
+        List<string> include = [], exclude = [];
+        foreach (string part in (condition ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string name = part.Trim();
+            if (name.StartsWith('!'))
+            {
+                name = name[1..].Trim();
+                if (name.Length > 0)
+                    exclude.Add(name);
+            }
+            else if (name.Length > 0)
+            {
+                include.Add(name);
+            }
+        }
+
+        return (include.Count > 0 ? include : null, exclude.Count > 0 ? exclude : null);
     }
 }
 

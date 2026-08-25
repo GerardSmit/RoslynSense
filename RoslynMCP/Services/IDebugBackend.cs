@@ -56,14 +56,40 @@ internal interface IDebugBackend : IDisposable
     /// <param name="logMessage">A message to log instead of stopping, with <c>{expression}</c>
     /// placeholders evaluated at the stop.</param>
     /// <remarks>
-    /// Neither engine supports the last two arguments — netcoredbg advertises neither
-    /// <c>supportsHitConditionalBreakpoints</c> nor <c>supportsLogPoints</c> — so they are
-    /// recorded here and enforced by <see cref="Debugging.PublishingDebugBackend"/>, which sees
-    /// every stop and can auto-resume through the ones that should not surface.
+    /// netcoredbg advertises neither <c>supportsHitConditionalBreakpoints</c> nor
+    /// <c>supportsLogPoints</c>, so for that engine the last two arguments are recorded here and
+    /// enforced by <see cref="Debugging.PublishingDebugBackend"/>, which sees every stop and can
+    /// auto-resume through the ones that should not surface. A backend that reports
+    /// <see cref="AppliesBreakpointRulesInEngine"/> enforces them itself instead.
     /// </remarks>
     Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
         string filePath, int line, string? condition = null, string? hitCondition = null,
         string? logMessage = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Whether hit counts and logpoints are applied inside the engine rather than emulated by
+    /// resuming through unwanted stops.
+    /// </summary>
+    /// <remarks>
+    /// The emulation costs a full suspend, a round trip and a resume for every hit that should not
+    /// have surfaced — which for a logpoint in a loop is not a slow debugger but a stopped
+    /// application. An engine that can decide inside the debuggee's own suspend pays a comparison
+    /// instead, and says so here so the emulation stands aside rather than counting every hit
+    /// twice.
+    /// </remarks>
+    bool AppliesBreakpointRulesInEngine => false;
+
+    /// <summary>
+    /// Whether the exception type lists on <see cref="SetExceptionFiltersAsync"/> are honoured.
+    /// </summary>
+    /// <remarks>
+    /// Filtering by type has to happen before the stop, inside the debuggee's own suspend, or it
+    /// does not save the cost the filter exists for — so an engine that cannot do it there ignores
+    /// the lists rather than pretending. Reported here so the adapter does not advertise
+    /// <c>supportsExceptionFilterOptions</c> to a client whose typed conditions would be accepted
+    /// and then quietly do nothing.
+    /// </remarks>
+    bool AppliesExceptionTypeFiltersInEngine => false;
 
     Task<string> RemoveBreakpointAsync(int breakpointId, CancellationToken cancellationToken = default);
 
@@ -87,6 +113,18 @@ internal interface IDebugBackend : IDisposable
     // expandable objects instead of a regex reading formatted text back apart.
 
     Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The stack of one named thread rather than the one the stop landed on.
+    /// </summary>
+    /// <remarks>
+    /// Default-implemented as "ignore the id and answer for the stopped thread", because a backend
+    /// that cannot enumerate threads reports a single one anyway — so the id it is asked about is
+    /// the only one it ever handed out. Backends that do enumerate override this.
+    /// </remarks>
+    Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
+        int threadId, CancellationToken cancellationToken = default) =>
+        GetStackFramesAsync(cancellationToken);
 
     /// <summary>Arguments and locals of <paramref name="frameId"/> (0 = innermost).</summary>
     Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(

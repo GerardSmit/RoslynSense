@@ -1363,6 +1363,9 @@ internal sealed partial class DebuggerService : IDebugBackend
     /// <param name="SourceOrigin">Set when <paramref name="FilePath"/> was resolved from
     /// external source rather than reported by the engine: <c>embedded</c>, <c>source link</c>,
     /// <c>reference source</c> or <c>decompiled</c>.</param>
+    /// <param name="ThreadId">The OS id of the thread the stop landed on; 0 when the engine does
+    /// not distinguish threads. Everything the stop can be asked about — locals, evaluation,
+    /// stepping — is this thread's, so a client that shows several has to be told which.</param>
     public sealed record StoppedFrame(
         string Reason,
         string Function,
@@ -1375,5 +1378,6 @@ internal sealed partial class DebuggerService : IDebugBackend
         string ModuleId = "",
         int MethodToken = 0,
         int IlOffset = -1,
-        string SourceOrigin = "");
+        string SourceOrigin = "",
+        int ThreadId = 0);
 }

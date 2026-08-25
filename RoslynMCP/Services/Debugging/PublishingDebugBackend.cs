@@ -44,6 +44,18 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     {
         _inner = inner;
         _watcher = new DataBreakpointWatcher(inner);
+
+        // An engine that fires its own logpoints reports them as notices and never stops, so the
+        // emulation below never sees them. Buffering them here keeps DrainLog the one place a
+        // polling client has to read, whichever side actually did the logging.
+        if (inner is IDebugNoticeSource source)
+        {
+            source.Notice += notice =>
+            {
+                if (notice.Kind == DebugNoticeKind.Logpoint)
+                    Log(notice.Message);
+            };
+        }
     }
 
     /// <summary>The wrapped engine — for engine-selection assertions and diagnostics.</summary>
@@ -155,10 +167,19 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
             }
 
             _hits.TryRemove(id, out _);
-            if (hitCondition is { Length: > 0 } || logMessage is { Length: > 0 })
+
+            // An engine that applies the rules itself has already been handed them; recording them
+            // here as well would count every hit twice and swallow the stop the engine decided to
+            // surface.
+            if (!_inner.AppliesBreakpointRulesInEngine &&
+                (hitCondition is { Length: > 0 } || logMessage is { Length: > 0 }))
+            {
                 _emulated[id] = new EmulatedBreakpoint(hitCondition, logMessage);
+            }
             else
+            {
                 _emulated.TryRemove(id, out _);
+            }
         }
         Publish();
         return result;
@@ -230,6 +251,16 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(CancellationToken cancellationToken = default) =>
         _inner.GetStackFramesAsync(cancellationToken);
 
+    /// <remarks>
+    /// Forwarded explicitly rather than left to the interface's default. A decorator that declares
+    /// only the parameterless overload takes the default for this one, which discards the thread id
+    /// — so every request for another thread's stack would come back as the stopped thread's
+    /// frames, labelled as the thread that was asked about.
+    /// </remarks>
+    public Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
+        int threadId, CancellationToken cancellationToken = default) =>
+        _inner.GetStackFramesAsync(threadId, cancellationToken);
+
     public Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(
         int frameId, CancellationToken cancellationToken = default) =>
         _inner.GetVariablesAsync(frameId, cancellationToken);
@@ -254,6 +285,11 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<string> SetExceptionFiltersAsync(
         ExceptionFilters filters, CancellationToken cancellationToken = default) =>
         _inner.SetExceptionFiltersAsync(filters, cancellationToken);
+
+    /// <inheritdoc />
+    /// <remarks>Forwarded rather than emulated: filtering by type is only worth anything before
+    /// the stop, and this decorator only ever sees stops that already happened.</remarks>
+    public bool AppliesExceptionTypeFiltersInEngine => _inner.AppliesExceptionTypeFiltersInEngine;
 
     public Task<string> RunToLocationAsync(
         string filePath, int line, CancellationToken cancellationToken = default) =>
@@ -469,42 +505,15 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     }
 
     /// <summary>
-    /// Applies VS Code's hit-count vocabulary: <c>&gt; n</c>, <c>&gt;= n</c>, <c>&lt; n</c>,
-    /// <c>&lt;= n</c>, <c>= n</c>, <c>% n</c>, and a bare count meaning "on hit n and after".
+    /// Applies the editor's hit-count vocabulary, through the same implementation the engine uses.
     /// </summary>
-    internal static bool HitConditionMet(string condition, int hits)
-    {
-        string text = condition.Trim();
-
-        int split = 0;
-        while (split < text.Length && !char.IsAsciiDigit(text[split]))
-            split++;
-
-        string @operator = text[..split].Trim() switch
-        {
-            ">=" => ">=",
-            "<=" => "<=",
-            "==" or "=" => "=",
-            ">" => ">",
-            "<" => "<",
-            "%" => "%",
-            _ => ">=",
-        };
-
-        if (!int.TryParse(text[split..].Trim(), out int target) || target <= 0)
-            return true; // an unparseable rule must not silently swallow every stop
-
-        return @operator switch
-        {
-            ">" => hits > target,
-            ">=" => hits >= target,
-            "<" => hits < target,
-            "<=" => hits <= target,
-            "=" => hits == target,
-            "%" => hits % target == 0,
-            _ => true,
-        };
-    }
+    /// <remarks>
+    /// One implementation on purpose. This path and the engine's are two ways of enforcing the
+    /// same user-visible rule on two runtimes, and a second copy of the parsing is how they would
+    /// quietly drift apart.
+    /// </remarks>
+    internal static bool HitConditionMet(string condition, int hits) =>
+        RoslynMCP.Debugger.BreakpointRules.HitConditionMet(condition, hits);
 
     private async Task<T> PublishAfter<T>(Task<T> operation)
     {

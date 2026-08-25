@@ -21,13 +21,27 @@ internal sealed partial class DebuggerService
     /// whether it can be expanded; a runaway frame must not stall the Variables view.</summary>
     private const int MaxProbedVariables = 100;
 
+    public Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
+        CancellationToken cancellationToken = default) =>
+        GetStackFramesAsync(0, cancellationToken);
+
+    /// <summary>
+    /// The stack of one thread, or of the stopped one when <paramref name="threadId"/> is 0.
+    /// </summary>
+    /// <remarks>
+    /// Overridden rather than left to the interface default, which answers every thread with the
+    /// stopped thread's frames. This backend does enumerate threads, so that default would hand
+    /// the editor one thread's stack under another thread's name.
+    /// </remarks>
     public async Task<IReadOnlyList<StackFrameInfo>> GetStackFramesAsync(
-        CancellationToken cancellationToken = default)
+        int threadId, CancellationToken cancellationToken = default)
     {
         if (_state != DebugState.Stopped)
             return [];
 
-        var response = await SendCommandAsync("-stack-list-frames", cancellationToken);
+        var response = await SendCommandAsync(
+            threadId > 0 ? $"-stack-list-frames --thread {threadId}" : "-stack-list-frames",
+            cancellationToken);
         var frames = ParseStackFrames(response, ModulePathForId);
 
         // A frame naming a module this session has not mapped yet — a newly loaded assembly, or
@@ -314,9 +328,14 @@ internal sealed partial class DebuggerService
             bool symbols = ExtractMiField(entry, "symbols-loaded")
                 ?.StartsWith("y", StringComparison.OrdinalIgnoreCase) ?? false;
 
+            // netcoredbg answers loaded-or-not and nothing more, so the status says only what it
+            // said. The detail stays empty rather than inventing a cause it never reported.
             modules.Add(new ModuleInfo(
                 Path.GetFileName(path), path, symbols,
-                ExtractMiField(entry, "symbols-path") ?? "", "CoreCLR"));
+                ExtractMiField(entry, "symbols-path") ?? "", "CoreCLR",
+                symbols
+                    ? RoslynMCP.Debugger.SymbolStatuses.Loaded
+                    : RoslynMCP.Debugger.SymbolStatuses.NotFound));
         }
 
         return modules;

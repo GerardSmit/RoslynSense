@@ -35,8 +35,15 @@ public sealed partial class DebugSession
     /// <summary>Path segment that expands a type's static state — the "Static members" node.</summary>
     internal const string StaticsMarker = "$statics";
 
-    /// <summary>Path segment prefix (<c>$more:N</c>) that continues an element listing from
-    /// element N — the "..." row of a long array.</summary>
+    /// <summary>
+    /// Path segment prefix naming a span of elements: <c>$more:N</c> from element N to the end,
+    /// or <c>$more:N:M</c> for the half-open range <c>[N, M)</c>.
+    /// </summary>
+    /// <remarks>
+    /// The closed form is what makes a long array navigable. Listing a hundred thousand elements
+    /// a page at a time means a page press per page; listing them as a tree of ranges reaches any
+    /// element in a handful of expansions.
+    /// </remarks>
     internal const string MoreMarker = "$more";
 
     private DebugDisplayOptions _display = new();
@@ -94,14 +101,23 @@ public sealed partial class DebugSession
     {
         var children = new List<DebugVariable>();
 
-        // A "..." continuation names the same value with an element offset to resume from.
+        // An index-range row names the same value with the span it stands for. The open form
+        // ($more:N) continues to the end; the closed form ($more:N:M) is one node of the range
+        // tree a long array is listed through.
         var offset = 0;
+        var limit = int.MaxValue;
         var basePath = path;
         var moreAt = path.LastIndexOf($".{MoreMarker}:", StringComparison.Ordinal);
-        if (moreAt >= 0 && int.TryParse(path[(moreAt + MoreMarker.Length + 2)..], out var parsed))
+        if (moreAt >= 0)
         {
-            offset = parsed;
-            basePath = path[..moreAt];
+            var span = path[(moreAt + MoreMarker.Length + 2)..].Split(':');
+            if (int.TryParse(span[0], out var parsed))
+            {
+                offset = parsed;
+                basePath = path[..moreAt];
+                if (span.Length > 1 && int.TryParse(span[1], out var parsedEnd))
+                    limit = parsedEnd;
+            }
         }
 
         var target = Safe(() => Dereference(value));
@@ -110,7 +126,7 @@ public sealed partial class DebugSession
 
         if (target is CorDebugArrayValue array)
         {
-            AppendElements(children, array, basePath, offset);
+            AppendElements(children, array, basePath, offset, limit);
             return children;
         }
 
@@ -156,7 +172,7 @@ public sealed partial class DebugSession
             children.Add(new DebugVariable
             {
                 Name = "Results View",
-                Value = "expanding this enumerates the IEnumerable",
+                Value = $"expanding this runs the sequence, up to {MaxMaterializedElements} elements",
                 Kind = "results",
                 Type = string.Empty,
                 VariablesReference = $"{basePath}.{ResultsMarker}",
@@ -334,10 +350,13 @@ public sealed partial class DebugSession
     {
         error = string.Empty;
 
-        var viewType = FindTypeDef(value, "System.Linq.SystemCore_EnumerableDebugView");
+        var viewType = EnumerableViewNames
+            .Select(name => FindTypeDef(value, name))
+            .FirstOrDefault(found => found is not null);
         if (viewType is null)
         {
-            error = "the enumerable view type was not found (System.Core is not loaded)";
+            error = "no enumerable debug view type is loaded in the target, so the elements " +
+                    "cannot be materialized without running the query by hand";
             return null;
         }
 
@@ -355,8 +374,128 @@ public sealed partial class DebugSession
             return null;
         }
 
-        var view = RunEval(eval => eval.NewObject(ctor.Raw, 1, [value.Raw]), out error);
+        // Bound the sequence before materializing it where the element type is known. Without
+        // this, expanding an infinite iterator enumerates until the debuggee runs out of memory —
+        // and the user asked to look at a value, not to run their program to destruction.
+        var source = BoundedSequence(value) ?? value;
+
+        var view = RunEval(eval => eval.NewObject(ctor.Raw, 1, [source.Raw]), out error);
         return view is null ? null : MemberValue(view, "Items", callOnly: false, out error);
+    }
+
+    /// <summary>
+    /// The debug view types that materialize an <c>IEnumerable</c>, in the names the various
+    /// runtimes give them.
+    /// </summary>
+    /// <remarks>
+    /// The original name is a .NET Framework one, declared in System.Core. Looking only for that
+    /// meant the Results View was silently missing on every modern runtime — the node offered
+    /// itself and then reported that System.Core was not loaded, which on .NET it never is.
+    /// </remarks>
+    private static readonly string[] EnumerableViewNames =
+    [
+        "System.Linq.SystemCore_EnumerableDebugView",
+        "System.Linq.EnumerableDebugView",
+        "System.Collections.Generic.CollectionDebugView",
+    ];
+
+    /// <summary>
+    /// How many elements a Results View materializes at most.
+    /// </summary>
+    /// <remarks>
+    /// Larger than a page so the listing has something to page through, and small enough that
+    /// expanding the node is never itself the expensive operation.
+    /// </remarks>
+    private const int MaxMaterializedElements = 1000;
+
+    /// <summary>
+    /// <c>Enumerable.Take(source, n)</c> over the value, or null when the element type cannot be
+    /// determined and the sequence has to be taken whole.
+    /// </summary>
+    /// <remarks>
+    /// The element type comes from the runtime's own instantiation rather than from decoding a
+    /// metadata signature, and only the unambiguous case is used: exactly one type argument, which
+    /// is what <c>List&lt;T&gt;</c>, <c>HashSet&lt;T&gt;</c> and a plain <c>IEnumerable&lt;T&gt;</c>
+    /// all are. A multi-parameter iterator would need a convention about which parameter is the
+    /// element, and guessing wrong there produces a <c>TypeLoadException</c> inside the evaluation
+    /// rather than a wrong answer — so those fall back to the unbounded path instead.
+    /// </remarks>
+    private CorDebugValue? BoundedSequence(CorDebugValue value)
+    {
+        var typeArguments = TypeArgumentsOf(value);
+        if (typeArguments is not { Length: 1 })
+            return null;
+
+        var enumerable = FindTypeDef(value, "System.Linq.Enumerable");
+        if (enumerable is not { } found)
+            return null;
+
+        var (module, typeDef) = found;
+        var metadata = Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(module));
+        if (metadata is null)
+            return null;
+
+        var takeToken = FindTakeCount(metadata, typeDef);
+        var take = takeToken is { } token ? Safe(() => module.GetFunctionFromToken(token)) : null;
+        if (take is null)
+            return null;
+
+        var ignored = string.Empty;
+        var limit = CreateIntValue(MaxMaterializedElements, ref ignored);
+        if (limit is null)
+            return null;
+
+        return RunEval(
+            eval => eval.CallParameterizedFunction(
+                take.Raw, typeArguments.Length, typeArguments, 2, [value.Raw, limit.Raw]),
+            out _);
+    }
+
+    /// <summary>
+    /// The token of <c>Enumerable.Take&lt;T&gt;(IEnumerable&lt;T&gt;, int)</c> specifically.
+    /// </summary>
+    /// <remarks>
+    /// Asking for "Take" by name alone returns whichever overload the metadata enumerates first,
+    /// and since .NET 6 there are two: the count one and <c>Take(source, Range)</c>. Picking the
+    /// Range overload makes the evaluation fault, the error is discarded, and the caller falls back
+    /// to materializing the sequence whole — so the guard against an infinite iterator would
+    /// silently stop existing, on some runtimes and not others. The last byte of the signature is
+    /// the parameter type, which is what tells them apart.
+    /// </remarks>
+    private static mdMethodDef? FindTakeCount(MetaDataImport metadata, mdTypeDef typeDef)
+    {
+        const byte ElementTypeI4 = 0x08;
+
+        var handle = IntPtr.Zero;
+        try
+        {
+            var candidates = new mdMethodDef[16];
+            int found = Safe(() => (int?)metadata.EnumMethodsWithName(
+                ref handle, typeDef, "Take", candidates)) ?? 0;
+
+            for (int i = 0; i < found; i++)
+            {
+                var props = Safe(() => metadata.GetMethodProps(candidates[i]));
+                if (props is not { pcbSigBlob: > 0 } signature || signature.ppvSigBlob == IntPtr.Zero)
+                    continue;
+
+                if (Marshal.ReadByte(signature.ppvSigBlob, signature.pcbSigBlob - 1) == ElementTypeI4)
+                    return candidates[i];
+            }
+        }
+        catch
+        {
+            // No usable overload; the caller materializes the sequence whole instead.
+        }
+        finally
+        {
+            if (handle != IntPtr.Zero)
+            {
+                try { metadata.CloseEnum(handle); } catch { }
+            }
+        }
+
+        return null;
     }
 
     private DebugVariable RawViewRow(string path) => new()
@@ -368,33 +507,79 @@ public sealed partial class DebugSession
         VariablesReference = $"{path}.{RawMarker}",
     };
 
-    private void AppendElements(List<DebugVariable> into, CorDebugArrayValue array, string path, int from)
+    /// <summary>
+    /// Lists an array's elements from <paramref name="from"/>, one page at a time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Past a threshold the listing becomes a tree of index ranges instead of a flat page with a
+    /// "..." row. A flat listing is fine for a hundred elements and unusable for a hundred
+    /// thousand: continuing the page is the only way forward, so reaching element 90,000 means
+    /// nine hundred expansions. Ranges get there in three.
+    /// </para>
+    /// <para>
+    /// The ranges are chosen so no level ever has more rows than one page holds, which is what
+    /// keeps the depth logarithmic rather than the width linear.
+    /// </para>
+    /// </remarks>
+    private void AppendElements(
+        List<DebugVariable> into, CorDebugArrayValue array, string path,
+        int from, int to = int.MaxValue)
     {
         var count = Safe(() => (int?)array.Count) ?? 0;
         var rank = Safe(() => (int?)array.Rank) ?? 1;
         var dimensions = rank > 1 ? Safe(() => array.GetDimensions(rank)) : null;
-        var end = Math.Min(count, from + Math.Max(1, _display.MaxChildren));
+        var page = Math.Max(1, _display.MaxChildren);
 
-        for (var i = from; i < end; i++)
+        // The array may have been reallocated since the range row was handed out, so the span is
+        // clamped to what is actually there rather than trusted.
+        AppendElementRange(into, array, path, Math.Min(from, count), Math.Min(to, count), page, dimensions);
+    }
+
+    /// <summary>Lists elements <c>[from, to)</c>, as values when they fit on one page and as
+    /// sub-ranges when they do not.</summary>
+    private void AppendElementRange(
+        List<DebugVariable> into, CorDebugArrayValue array, string path,
+        int from, int to, int page, int[]? dimensions)
+    {
+        var total = to - from;
+        if (total <= 0)
+            return;
+
+        if (total <= page)
         {
-            var element = Safe(() => array.GetElementAtPosition(i));
-            if (element is null)
-                continue;
-            var name = dimensions is null
-                ? $"[{i}]"
-                : $"[{string.Join(",", IndicesOf(i, dimensions))}]";
-            into.Add(Row(name, element, "element", $"{path}{name}"));
+            for (var i = from; i < to; i++)
+            {
+                var element = Safe(() => array.GetElementAtPosition(i));
+                if (element is null)
+                    continue;
+                var name = dimensions is null
+                    ? $"[{i}]"
+                    : $"[{string.Join(",", IndicesOf(i, dimensions))}]";
+                into.Add(Row(name, element, "element", $"{path}{name}"));
+            }
+            return;
         }
 
-        if (end < count)
+        // The largest power-of-page step that still splits this span into at most one page of
+        // rows. Whole powers keep the boundaries at round numbers, so [1000..1999] rather than
+        // [937..1836] — a range the user can predict is a range they can navigate.
+        var step = page;
+        while (total / step > page)
+            step *= page;
+
+        for (var start = from; start < to; start += step)
+        {
+            var end = Math.Min(to, start + step);
             into.Add(new DebugVariable
             {
-                Name = "...",
-                Value = $"{count - end} more of {count}",
+                Name = $"[{start}..{end - 1}]",
+                Value = $"{end - start} elements",
                 Kind = "element",
-                // Expanding the row continues the listing from where this page stopped.
-                VariablesReference = $"{path}.{MoreMarker}:{end}",
+                Type = string.Empty,
+                VariablesReference = $"{path}.{MoreMarker}:{start}:{end}",
             });
+        }
     }
 
     /// <summary>A linear element position as the per-dimension indices C# would write, row-major
@@ -1331,8 +1516,14 @@ public sealed partial class DebugSession
 
             var declaringType = Safe(() =>
                 methodToken is { } m ? (mdTypeDef?)metadata.GetMethodProps(m).pClass : null);
-            if (declaringType is { } type && IsMarkedNonUser(metadata, type))
-                return false;
+            if (declaringType is { } type)
+            {
+                if (IsMarkedNonUser(metadata, type))
+                    return false;
+
+                if (IsAwaitPlumbing(Safe(() => metadata.GetTypeDefProps(type).szTypeDef)))
+                    return false;
+            }
 
             return true;
         }
@@ -1343,9 +1534,101 @@ public sealed partial class DebugSession
         }
     }
 
+    /// <summary>
+    /// Namespaces that exist only to make <c>await</c> and <c>yield</c> work.
+    /// </summary>
+    /// <remarks>
+    /// Matched by namespace rather than by a list of type names because the set is not fixed:
+    /// the builders differ between <c>Task</c>, <c>ValueTask</c>, <c>IAsyncEnumerable</c> and every
+    /// custom builder a library defines, and a list would be out of date the first time one of
+    /// them changed.
+    /// </remarks>
+    private static readonly string[] AwaitPlumbingNamespaces =
+    [
+        "System.Runtime.CompilerServices.",
+        "System.Threading.Tasks.",
+        "System.Runtime.ExceptionServices.",
+    ];
+
+    /// <summary>
+    /// Whether a type is await machinery rather than anybody's code.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stepping over an <c>await</c> otherwise walks the user through the builder, the awaiter and
+    /// the continuation before it reaches the next line they wrote — several presses of Step Over
+    /// that land nowhere they recognise. This is what makes a single press do what it looks like
+    /// it should.
+    /// </para>
+    /// <para>
+    /// Deliberately does not match the compiler-generated <c>&lt;Method&gt;d__N</c> state machine
+    /// in the user's own assembly. That type carries the user's method body, with their sequence
+    /// points, and skipping it would mean an async method could not be stepped through at all.
+    /// </para>
+    /// </remarks>
+    private static bool IsAwaitPlumbing(string? typeName)
+    {
+        if (typeName is not { Length: > 0 })
+            return false;
+
+        return AwaitPlumbingNamespaces.Any(
+            ns => typeName.StartsWith(ns, StringComparison.Ordinal));
+    }
+
     private static bool IsMarkedNonUser(MetaDataImport metadata, mdToken token) =>
-        DebuggerAttributes.StepOverMarkers.Any(
-            marker => Safe(() => DebuggerAttributes.Has(metadata, token, marker)) == true);
+        IsMarkedWith(metadata, token, DebuggerAttributes.StepOverMarkers);
+
+    private static bool IsMarkedWith(MetaDataImport metadata, mdToken token, string[] markers) =>
+        markers.Any(marker => Safe(() => DebuggerAttributes.Has(metadata, token, marker)) == true);
+
+    /// <summary>
+    /// Whether a stack frame is plumbing the user should not have to read past.
+    /// </summary>
+    /// <remarks>
+    /// A narrower question than <see cref="IsUserFrame"/> asks. Stepping declines to stop in
+    /// anything marked <c>DebuggerStepThrough</c>; a call stack still has to show it, because a
+    /// breakpoint set inside such a method does stop and the user then needs to see where they
+    /// are. Only <c>DebuggerHidden</c> and <c>DebuggerNonUserCode</c> — and modules that are not
+    /// the user's at all — are frames worth folding away.
+    /// </remarks>
+    private bool IsNonUserFrame(CorDebugFrame frame)
+    {
+        try
+        {
+            var function = Safe(() => frame.Function);
+            var module = Safe(() => function?.Module);
+            var moduleName = Safe(() => module?.Name) ?? string.Empty;
+            if (moduleName.Length == 0 || !IsUserModule(moduleName))
+                return true;
+
+            if (module is null)
+                return false;
+
+            var metadata = Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(module));
+            if (metadata is null)
+                return false;
+
+            var methodToken = Safe(() => (mdToken?)function!.Token);
+            if (methodToken is not { } method)
+                return false;
+
+            if (IsMarkedWith(metadata, method, DebuggerAttributes.HiddenMarkers))
+                return true;
+
+            var declaringType = Safe(() => (mdToken?)metadata.GetMethodProps(new mdMethodDef(method.Value)).pClass);
+            if (declaringType is not { } type)
+                return false;
+
+            return IsMarkedWith(metadata, type, DebuggerAttributes.HiddenMarkers) ||
+                   IsAwaitPlumbing(Safe(() => metadata.GetTypeDefProps(new mdTypeDef(type.Value)).szTypeDef));
+        }
+        catch
+        {
+            // A frame that cannot be read is not one to hide — the user would be left with a gap
+            // and no way to find out what was in it.
+            return false;
+        }
+    }
 
     /// <summary>
     /// Steps back out of a frame the user did not write, on the runtime's callback thread.
@@ -1378,6 +1661,88 @@ public sealed partial class DebugSession
     private readonly Lock _stepperLock = new();
 
     /// <summary>
+    /// The statement a step started from: its thread, its method, the IL range the statement
+    /// occupies, and whether the user asked to step into calls.
+    /// </summary>
+    /// <param name="FrameStart">The stack address the origin frame began at, which distinguishes
+    /// one activation of a method from another. 0 when the runtime would not say, in which case
+    /// the frame check is skipped rather than guessed at.</param>
+    private sealed record StepOrigin(
+        int ThreadId, int MethodToken, ulong FrameStart, COR_DEBUG_STEP_RANGE Range, bool StepInto);
+
+    /// <summary>Where the in-flight step began, or null when no range step is outstanding.</summary>
+    /// <remarks>Volatile because it is written by the session thread arming the step and read by
+    /// the runtime's callback thread completing it.</remarks>
+    private volatile StepOrigin? _stepOrigin;
+
+    /// <summary>
+    /// Re-arms the step that is in flight when stepping out of somebody else's code has landed
+    /// back on the statement it started from.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the difference between a Step Into that works and one that looks broken. Stepping
+    /// into a helper marked <c>DebuggerStepThrough</c> lands in code the user did not write; the
+    /// Just My Code path steps out of it; and the step-out lands on the very line the step began
+    /// on. Reported as-is, the user pressed Step Into and the debugger did not move.
+    /// </para>
+    /// <para>
+    /// Re-issuing the original range step continues past the call instead. It shares the step-out
+    /// budget, so a line calling twenty hidden helpers still terminates rather than looping.
+    /// </para>
+    /// </remarks>
+    private bool TryResumeStepOverOrigin(CorDebugThread thread)
+    {
+        if (_stepOrigin is not { } origin)
+            return false;
+        if (_stepOutBudget <= 0)
+            return false;
+        if (ThreadId(thread) != origin.ThreadId)
+            return false;
+
+        try
+        {
+            if (thread.ActiveFrame is not CorDebugILFrame frame)
+                return false;
+
+            // A different method means real progress was made; only landing back inside the
+            // original statement is the case this exists for.
+            if ((Safe(() => (int?)frame.FunctionToken) ?? 0) != origin.MethodToken)
+                return false;
+
+            // And a different activation of the same method is progress too. A recursive call
+            // enters the same method at an IL offset inside the caller's own statement range —
+            // for a single-expression body, at offset 0 of the one range there is — so without
+            // this a Step Into recursion reads as "did not move" and re-arms in the callee,
+            // walking one level deeper per re-arm until the budget runs out.
+            var frameStart = Safe(() => (ulong?)frame.StackRange.pStart) ?? 0;
+            if (origin.FrameStart != 0 && frameStart != 0 && frameStart != origin.FrameStart)
+                return false;
+
+            var offset = Safe(() => (int?)frame.IP.pnOffset);
+            if (offset is not { } ip || ip < origin.Range.startOffset || ip >= origin.Range.endOffset)
+                return false;
+
+            _stepOutBudget--;
+
+            var stepper = frame.CreateStepper();
+            stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
+            stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            stepper.SetRangeIL(true);
+            stepper.StepRange(origin.StepInto, [origin.Range], 1);
+
+            // Still the same logical step, so the stepping thread is left as it was.
+            lock (_stepperLock)
+                _steppers.Add((origin.ThreadId, stepper));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// The thread the in-flight step was armed on, or 0 when no step is outstanding.
     /// </summary>
     private int _steppingThreadId;
@@ -1407,5 +1772,9 @@ public sealed partial class DebugSession
             _steppers.Clear();
         }
         _steppingThreadId = 0;
+
+        // The step this origin belonged to is over, however it ended. Left set, it would let a
+        // later stop be mistaken for that step landing back where it began.
+        _stepOrigin = null;
     }
 }

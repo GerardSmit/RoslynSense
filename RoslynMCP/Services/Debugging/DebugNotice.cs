@@ -10,6 +10,10 @@ internal enum DebugNoticeKind
     /// the runtime refused.</summary>
     Diagnostic,
 
+    /// <summary>A logpoint fired and the target kept running. <see cref="DebugNotice.Message"/>
+    /// carries the message with its placeholders already filled in.</summary>
+    Logpoint,
+
     /// <summary>A module loaded into the debuggee.</summary>
     Module,
 

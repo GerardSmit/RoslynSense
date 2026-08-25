@@ -21,12 +21,25 @@ internal sealed record DataBreakpointSpec(
 /// <summary>One module loaded in the debuggee.</summary>
 /// <param name="SymbolsLoaded">Whether a PDB was found. Without one, breakpoints in this module
 /// never bind — which is the question this record exists to answer.</param>
+/// <param name="SymbolPath">The file the symbols were read from. Empty when they never were a
+/// file — embedded in the module, or handed over by the runtime — as well as when there are
+/// none.</param>
+/// <param name="SymbolStatus">One word for the outcome: <c>loaded</c>, <c>excluded</c>,
+/// <c>not found</c>, <c>rejected</c>, <c>not probed</c>. Empty from engines that do not say.</param>
+/// <param name="SymbolOrigin">Which kind of symbols answered: <c>portable pdb</c>,
+/// <c>embedded pdb</c>, <c>windows pdb</c>, <c>supplied at run time</c>.</param>
+/// <param name="SymbolDetail">Why, in a sentence, when <paramref name="SymbolStatus"/> is not
+/// <c>loaded</c>. This is the difference between "rebuild and it will work" and "this module
+/// was never going to have symbols".</param>
 internal sealed record ModuleInfo(
     string Name,
     string Path,
     bool SymbolsLoaded,
     string SymbolPath,
-    string Runtime);
+    string Runtime,
+    string SymbolStatus = "",
+    string SymbolOrigin = "",
+    string SymbolDetail = "");
 
 /// <summary>Whether a requested watch could be armed, and why not when it could not.</summary>
 internal sealed record DataBreakpointStatus(string DataId, bool Verified, string Message);

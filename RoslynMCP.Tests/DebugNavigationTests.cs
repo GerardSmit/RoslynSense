@@ -111,6 +111,43 @@ public class DebugNavigationTests
         Assert.DoesNotContain("cannot", result);
     }
 
+    [Fact]
+    public async Task ATypeConditionOnThrownExceptionsDoesNotSilenceUnhandledOnes()
+    {
+        // Merging the two filters' conditions made an unhandled NullReferenceException fail the
+        // include list written for "All Exceptions", so the process died without ever stopping.
+        var engine = new RecordingEngine();
+        var backend = new IcorDebugBackend();
+        backend.GetType().GetField("_engine", System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance)!.SetValue(backend, engine);
+
+        var filters = ExceptionFilters.FromIds(
+            ["all", "user-unhandled"],
+            new Dictionary<string, string> { ["all"] = "System.IO.IOException" });
+
+        await backend.SetExceptionFiltersAsync(filters);
+
+        Assert.Equal(["System.IO.IOException"], engine.Policy!.Caught.IncludeTypes);
+        Assert.True(engine.Policy.Unhandled.Enabled);
+        Assert.Empty(engine.Policy.Unhandled.IncludeTypes);
+    }
+
+    [Fact]
+    public async Task UntickingUnhandledExceptionsTurnsTheUnhandledStopOff()
+    {
+        // The filter list is what the user set; hardcoding the unhandled stop to on made the
+        // checkbox do nothing.
+        var engine = new RecordingEngine();
+        var backend = new IcorDebugBackend();
+        backend.GetType().GetField("_engine", System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance)!.SetValue(backend, engine);
+
+        await backend.SetExceptionFiltersAsync(ExceptionFilters.FromIds(["all"]));
+
+        Assert.False(engine.Policy!.Unhandled.Enabled);
+        Assert.True(engine.Policy.Caught.Enabled);
+    }
+
     private sealed class RecordingEngine : RoslynMCP.Debugger.IDebugEngine
     {
         public bool BreakOnFirstChance;
@@ -118,7 +155,13 @@ public class DebugNavigationTests
         public System.Threading.Channels.ChannelReader<RoslynMCP.Debugger.DebugEvent> Events =>
             System.Threading.Channels.Channel.CreateUnbounded<RoslynMCP.Debugger.DebugEvent>().Reader;
 
-        public void SetExceptionPolicy(bool breakOnFirstChance) => BreakOnFirstChance = breakOnFirstChance;
+        public RoslynMCP.Debugger.ExceptionPolicy? Policy;
+
+        public void SetExceptionPolicy(RoslynMCP.Debugger.ExceptionPolicy policy)
+        {
+            Policy = policy;
+            BreakOnFirstChance = policy.Caught.Enabled;
+        }
 
         public void Attach(int pid, IEnumerable<RoslynMCP.Debugger.BreakpointSpec> breakpoints,
             RoslynMCP.Debugger.DebugRuntime runtime) { }
@@ -133,7 +176,9 @@ public class DebugNavigationTests
             Task.FromResult((true, ""));
         public void Pause() { }
         public void Step(RoslynMCP.Debugger.StepKind kind) { }
-        public Task<List<RoslynMCP.Debugger.StackFrame>> StackTraceAsync() => Task.FromResult(new List<RoslynMCP.Debugger.StackFrame>());
+        public Task<List<RoslynMCP.Debugger.StackFrame>> StackTraceAsync(int threadId = 0) => Task.FromResult(new List<RoslynMCP.Debugger.StackFrame>());
+
+        public Task<List<RoslynMCP.Debugger.DebugThread>> ThreadsAsync() => Task.FromResult(new List<RoslynMCP.Debugger.DebugThread>());
         public Task<List<RoslynMCP.Debugger.DebugVariable>> VariablesAsync(uint frameIndex) =>
             Task.FromResult(new List<RoslynMCP.Debugger.DebugVariable>());
         public Task<List<RoslynMCP.Debugger.DebugVariable>> ExpandAsync(uint frameIndex, string path) =>

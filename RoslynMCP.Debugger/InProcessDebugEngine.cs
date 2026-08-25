@@ -30,7 +30,9 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
 
     public void Step(StepKind kind) => _session.Step(kind);
 
-    public Task<List<StackFrame>> StackTraceAsync() => _session.StackTraceAsync();
+    public Task<List<StackFrame>> StackTraceAsync(int threadId = 0) => _session.StackTraceAsync(threadId);
+
+    public Task<List<DebugThread>> ThreadsAsync() => _session.ThreadsAsync();
 
     public Task<List<DebugVariable>> VariablesAsync(uint frameIndex) => _session.VariablesAsync(frameIndex);
 
@@ -75,8 +77,8 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
 
     public Task<(bool Ok, string Error)> DetachAsync() => _session.DetachAsync();
 
-    public void SetExceptionPolicy(bool breakOnFirstChance) =>
-        _session.SetExceptionPolicy(breakOnFirstChance);
+    public void SetExceptionPolicy(ExceptionPolicy policy) =>
+        _session.SetExceptionPolicy(policy);
 
     public Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout) =>
         _session.ShutdownAsync(timeout);

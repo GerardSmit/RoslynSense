@@ -48,6 +48,16 @@ public enum DebugEventKind
     /// not bind, an edit the runtime refused. Split from <see cref="Output"/>, which is the
     /// debuggee's own console, so a client can route the two to different places.</summary>
     Diagnostic,
+
+    /// <summary>
+    /// A logpoint fired: its message, already interpolated, with no stop attached.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="Output"/> because it is not the debuggee talking — the debuggee
+    /// never ran a print statement — and a client that buffers logpoint output separately from
+    /// console output needs to be able to tell them apart.
+    /// </remarks>
+    Logpoint,
 }
 
 /// <summary>A span of source, used to report where a breakpoint was requested versus where it bound.</summary>
@@ -119,6 +129,25 @@ public sealed class BreakpointSpec
     /// <summary>Stop only on hit number <c>SkipHits + 1</c> and later.</summary>
     public uint SkipHits { get; set; }
 
+    /// <summary>
+    /// A hit-count rule in the editor's vocabulary — <c>&gt; n</c>, <c>&gt;= n</c>, <c>&lt; n</c>,
+    /// <c>&lt;= n</c>, <c>= n</c>, <c>% n</c>, or a bare count meaning "on hit n and after".
+    /// Empty means every hit counts.
+    /// </summary>
+    /// <remarks>
+    /// Applied in the engine, on the runtime's own callback thread, so a hit that does not satisfy
+    /// it is never a stop at all. Emulating it in the host instead costs a full suspend and a
+    /// cross-process round trip per ignored hit, which in a loop is the difference between a
+    /// breakpoint and a hang.
+    /// </remarks>
+    public string HitCondition { get; set; } = "";
+
+    /// <summary>
+    /// A logpoint message with <c>{expression}</c> placeholders. When set, the breakpoint logs and
+    /// resumes instead of stopping.
+    /// </summary>
+    public string LogMessage { get; set; } = "";
+
     /// <summary>Optional <c>name == literal</c> / <c>name != literal</c> compared against the
     /// stringified value of an argument, local, or dotted member path. Empty means always stop.</summary>
     public string Condition { get; set; } = "";
@@ -176,6 +205,64 @@ public sealed class StackFrame
 
     /// <summary>The IP within the method's IL; -1 when unknown.</summary>
     public int IlOffset { get; set; } = -1;
+
+    /// <summary>
+    /// Whether this frame is plumbing rather than something the user wrote — a
+    /// <c>DebuggerHidden</c> or <c>DebuggerNonUserCode</c> method, or a module outside the
+    /// solution's own output.
+    /// </summary>
+    /// <remarks>
+    /// Reported rather than removed. Frames are addressed by index everywhere else in the
+    /// protocol, so dropping one would silently shift every variable lookup above it; the client
+    /// folds them away instead.
+    /// </remarks>
+    public bool IsNonUserCode { get; set; }
+}
+
+/// <summary>
+/// Which exceptions suspend the target.
+/// </summary>
+/// <remarks>
+/// Decided inside the engine, on the runtime's callback thread, for the same reason hit counts
+/// are: an exception the user does not want to see should never become a stop. A framework that
+/// throws internally on a hot path — and several do — turns "break on all exceptions" into an
+/// unusable session otherwise, which is why the type filter matters more than it looks.
+/// </remarks>
+public sealed class ExceptionPolicy
+{
+    /// <summary>
+    /// Exceptions no handler was found for. Enabled by default: without a stop here the process
+    /// simply dies, and the one moment worth looking at is gone.
+    /// </summary>
+    public ExceptionRule Unhandled { get; set; } = new() { Enabled = true };
+
+    /// <summary>Exceptions the moment they are thrown, before any handler runs.</summary>
+    public ExceptionRule Caught { get; set; } = new();
+
+    /// <summary>The default: unhandled exceptions stop, nothing else does.</summary>
+    public static ExceptionPolicy Default => new();
+}
+
+/// <summary>
+/// One class of exception and the types within it that are worth stopping for.
+/// </summary>
+/// <remarks>
+/// The type lists belong to the rule rather than to the policy because the two rules are set
+/// independently. A user who limits "break on every throw" to one type is saying nothing about
+/// which unhandled exceptions should stop the process — and applying that limit to both would
+/// let an unhandled crash of any other type run straight past the debugger.
+/// </remarks>
+public sealed class ExceptionRule
+{
+    public bool Enabled { get; set; }
+
+    /// <summary>When non-empty, only these types stop. Matched against the thrown type and every
+    /// base type, by full name or by simple name.</summary>
+    public List<string> IncludeTypes { get; set; } = [];
+
+    /// <summary>These types never stop, even when <see cref="IncludeTypes"/> would admit them.
+    /// Matched the same way, and applied after it.</summary>
+    public List<string> ExcludeTypes { get; set; } = [];
 }
 
 public sealed class DebugThread
@@ -196,6 +283,54 @@ public sealed class DebugModule
 
     public string SymbolPath { get; set; } = "";
     public string Runtime { get; set; } = "";
+
+    /// <summary>
+    /// One word for what happened when symbols were looked for: <see cref="SymbolStatuses"/>.
+    /// </summary>
+    /// <remarks>
+    /// A bare "no symbols" is the same answer for four situations with four different fixes —
+    /// the module was deliberately excluded, nothing was found, something was found and refused,
+    /// or nobody has looked yet. Telling them apart is the first question when a breakpoint
+    /// misbehaves, and it is the one thing the debugger knows and the user cannot.
+    /// </remarks>
+    public string SymbolStatus { get; set; } = "";
+
+    /// <summary>Which kind of symbols answered, when they did: see <see cref="SymbolOrigins"/>.</summary>
+    public string SymbolOrigin { get; set; } = "";
+
+    /// <summary>What was observed, in a sentence — the reason behind <see cref="SymbolStatus"/>.
+    /// Empty when the status says everything there is to say.</summary>
+    public string SymbolDetail { get; set; } = "";
+}
+
+/// <summary>The vocabulary of <see cref="DebugModule.SymbolStatus"/>.</summary>
+public static class SymbolStatuses
+{
+    /// <summary>Symbols are open and breakpoints in this module can bind.</summary>
+    public const string Loaded = "loaded";
+
+    /// <summary>The symbol globs exclude this module, so no PDB was looked for.</summary>
+    public const string Excluded = "excluded";
+
+    /// <summary>Looked for and not found — no debug directory entry, no embedded PDB, no file.</summary>
+    public const string NotFound = "not found";
+
+    /// <summary>A PDB was found and could not be used for this module.</summary>
+    public const string Rejected = "rejected";
+
+    /// <summary>Nothing has needed this module's symbols yet, so none were opened.</summary>
+    public const string NotProbed = "not probed";
+}
+
+/// <summary>The vocabulary of <see cref="DebugModule.SymbolOrigin"/>.</summary>
+public static class SymbolOrigins
+{
+    public const string PortablePdb = "portable pdb";
+    public const string EmbeddedPdb = "embedded pdb";
+    public const string WindowsPdb = "windows pdb";
+
+    /// <summary>Symbols the runtime handed over for a module built at run time.</summary>
+    public const string Runtime = "supplied at run time";
 }
 
 public sealed class DebugVariable

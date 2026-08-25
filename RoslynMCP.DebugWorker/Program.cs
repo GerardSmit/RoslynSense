@@ -153,7 +153,11 @@ internal static class Program
                     break;
 
                 case "stackTrace":
-                    response.Frames = await session.StackTraceAsync();
+                    response.Frames = await session.StackTraceAsync(request.ThreadId);
+                    break;
+
+                case "threads":
+                    response.Threads = await session.ThreadsAsync();
                     break;
 
                 case "variables":
@@ -241,7 +245,7 @@ internal static class Program
                 }
 
                 case "exceptionPolicy":
-                    session.SetExceptionPolicy(request.Flag);
+                    session.SetExceptionPolicy(request.ExceptionPolicy ?? ExceptionPolicy.Default);
                     break;
 
                 case "shutdown":

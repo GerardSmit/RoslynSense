@@ -92,6 +92,55 @@ internal sealed class DapServer
     internal const int ScopeBase = 1;
     internal const int ScopeLimit = 1000;
 
+    /// <summary>
+    /// Frame ids of a thread other than the stopped one start here.
+    /// </summary>
+    /// <remarks>
+    /// Their stacks can be read, but nothing else about them can: locals, evaluation and stepping
+    /// all go through the frame the stop established, so a frame id from another thread reaching
+    /// the variables path would silently answer with the stopped thread's locals. Putting them in
+    /// their own band makes that case recognisable, and <c>scopes</c> hands out no reference for
+    /// it rather than the wrong one.
+    /// </remarks>
+    private const int ForeignFrameBase = 100_000;
+
+    /// <summary>How many frame ids each foreign thread is given inside that band.</summary>
+    private const int ForeignFrameStride = 1_000;
+
+    /// <summary>
+    /// The band each foreign thread's frame ids were allocated from during this stop.
+    /// </summary>
+    /// <remarks>
+    /// DAP requires frame ids to be unique across every frame reported for one stop, and the Call
+    /// Stack view expands several threads at once — so a flat <c>base + index</c> would give two
+    /// threads' innermost frames the same id, and any id-keyed client behaviour would cross them.
+    /// Cleared on each stop, because the frames it numbers do not survive one.
+    /// </remarks>
+    private readonly Dictionary<int, int> _foreignFrameBands = [];
+    private int _nextForeignBand;
+
+    /// <summary>The DAP frame id for a frame of a thread the stop did not land on.</summary>
+    private int ForeignFrameId(int threadId, int frameIndex)
+    {
+        lock (_foreignFrameBands)
+        {
+            if (!_foreignFrameBands.TryGetValue(threadId, out int band))
+            {
+                band = _nextForeignBand++;
+                _foreignFrameBands[threadId] = band;
+            }
+
+            // A stack deeper than the stride would wrap into the next thread's band; clamping
+            // keeps the id inside this thread's own range, and the frame is unreadable either way.
+            return ForeignFrameBase + (band * ForeignFrameStride) +
+                   Math.Min(frameIndex, ForeignFrameStride - 1);
+        }
+    }
+
+    /// <summary>The thread the stop landed on, under the id the editor was told about.</summary>
+    private int StoppedThreadId =>
+        _backend.CurrentFrame is { ThreadId: > 0 } frame ? frame.ThreadId : 1;
+
     public DapServer(IDebugBackend backend, Stream input, Stream output)
     {
         _backend = backend;
@@ -357,7 +406,26 @@ internal sealed class DapServer
                     var ids = (arguments?["filters"]?.AsArray() ?? [])
                         .Select(f => f?.GetValue<string>() ?? "")
                         .ToList();
-                    await _backend.SetExceptionFiltersAsync(ExceptionFilters.FromIds(ids), ct);
+
+                    // filterOptions repeats the enabled filters with a condition attached, which
+                    // is where the editor puts the type list. A client that does not send it still
+                    // gets the plain filters above.
+                    // Kept per filter id, not merged: a condition belongs to the filter it was
+                    // written on. Merged, a type list typed under "All Exceptions" would also
+                    // narrow which unhandled exceptions stop, and every other type would crash
+                    // the process without the debugger ever suspending it.
+                    var conditions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var option in arguments?["filterOptions"]?.AsArray() ?? [])
+                    {
+                        if (option?["filterId"]?.GetValue<string>() is not { Length: > 0 } filterId)
+                            continue;
+                        if (!ids.Contains(filterId, StringComparer.OrdinalIgnoreCase))
+                            ids.Add(filterId);
+                        if (option["condition"]?.GetValue<string>() is { Length: > 0 } condition)
+                            conditions[filterId] = condition;
+                    }
+
+                    await _backend.SetExceptionFiltersAsync(ExceptionFilters.FromIds(ids, conditions), ct);
                     await RespondAsync(message, null);
                     break;
                 }
@@ -368,8 +436,12 @@ internal sealed class DapServer
                     var array = new JsonArray();
                     foreach (var thread in threads)
                         array.Add(new JsonObject { ["id"] = thread.Id, ["name"] = thread.Name });
+
+                    // While the target runs there is no coherent thread list to read, and the
+                    // editor still needs an id to hang the session off. Report the stopped one
+                    // under the id the stop event used, so the two agree.
                     if (array.Count == 0)
-                        array.Add(new JsonObject { ["id"] = 1, ["name"] = "Main Thread" });
+                        array.Add(new JsonObject { ["id"] = StoppedThreadId, ["name"] = "Main Thread" });
 
                     await RespondAsync(message, new JsonObject { ["threads"] = array });
                     break;
@@ -377,13 +449,19 @@ internal sealed class DapServer
 
                 case "stackTrace":
                 {
-                    var frames = await _backend.GetStackFramesAsync(ct);
+                    // Naming a thread other than the stopped one is how the editor's Call Stack
+                    // view shows what the rest of the process was doing.
+                    var requestedThread = arguments?["threadId"]?.GetValue<int>() ?? 0;
+                    var foreign = requestedThread != 0 && requestedThread != StoppedThreadId;
+                    var frames = foreign
+                        ? await _backend.GetStackFramesAsync(requestedThread, ct)
+                        : await _backend.GetStackFramesAsync(ct);
                     var array = new JsonArray();
                     foreach (var frame in frames)
                     {
                         var entry = new JsonObject
                         {
-                            ["id"] = frame.Id,
+                            ["id"] = foreign ? ForeignFrameId(requestedThread, frame.Id) : frame.Id,
                             ["name"] = frame.Name,
                             ["line"] = frame.Line,
                             ["column"] = frame.Column == 0 ? 1 : frame.Column,
@@ -401,7 +479,9 @@ internal sealed class DapServer
                                 source["origin"] = frame.SourceOrigin;
                             entry["source"] = source;
                         }
-                        if (frame.IsExternal)
+                        // "subtle" is how the editor greys a frame out. Both reasons earn it:
+                        // nothing to show, and nothing the user wrote.
+                        if (frame.IsExternal || frame.IsNonUserCode)
                             entry["presentationHint"] = "subtle";
                         array.Add(entry);
                     }
@@ -417,6 +497,10 @@ internal sealed class DapServer
                 case "scopes":
                 {
                     int frameId = arguments?["frameId"]?.GetValue<int>() ?? 0;
+
+                    // A frame belonging to a thread the stop did not land on has no readable
+                    // locals — reference 0 is DAP's way of saying "nothing to expand here",
+                    // which is the truth rather than another thread's variables.
                     await RespondAsync(message, new JsonObject
                     {
                         ["scopes"] = new JsonArray
@@ -424,7 +508,9 @@ internal sealed class DapServer
                             new JsonObject
                             {
                                 ["name"] = "Locals",
-                                ["variablesReference"] = ScopeBase + frameId,
+                                ["variablesReference"] = frameId >= ForeignFrameBase
+                                    ? 0
+                                    : ScopeBase + frameId,
                                 ["expensive"] = false,
                             },
                         },
@@ -484,6 +570,20 @@ internal sealed class DapServer
 
                 case "evaluate":
                 {
+                    // Evaluation runs in the frame the stop established. Asked about a frame of
+                    // another thread it would answer from the stopped one — a plausible value for
+                    // the wrong frame, which is worse than saying it cannot be read.
+                    if ((arguments?["frameId"]?.GetValue<int>() ?? 0) >= ForeignFrameBase)
+                    {
+                        const string unavailable =
+                            "Only the stopped thread's frames can be evaluated in.";
+                        await RespondAsync(
+                            message,
+                            new JsonObject { ["result"] = unavailable, ["variablesReference"] = 0 },
+                            success: false, unavailable);
+                        break;
+                    }
+
                     string result = await _backend.EvaluateAsync(
                         arguments?["expression"]?.GetValue<string>() ?? "", ct);
                     bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
@@ -501,7 +601,7 @@ internal sealed class DapServer
                 {
                     await EventAsync("continued", new JsonObject
                     {
-                        ["threadId"] = 1,
+                        ["threadId"] = StoppedThreadId,
                         ["allThreadsContinued"] = true,
                     });
 
@@ -774,6 +874,9 @@ internal sealed class DapServer
     {
         DebugNoticeKind.Output => OutputAsync("stdout", notice.Message),
         DebugNoticeKind.Diagnostic => OutputAsync("console", notice.Message),
+        // A logpoint is the user's own message, not the engine's commentary — it belongs in the
+        // same place a Console.WriteLine at that line would have gone.
+        DebugNoticeKind.Logpoint => OutputAsync("stdout", notice.Message),
         DebugNoticeKind.Module => OutputAsync("console", $"Loaded '{notice.Message}'."),
         DebugNoticeKind.Stopped => ReportUnaskedStopAsync(notice),
         DebugNoticeKind.Resumed => ReportUnaskedResumeAsync(),
@@ -829,7 +932,7 @@ internal sealed class DapServer
 
         await EventAsync("continued", new JsonObject
         {
-            ["threadId"] = 1,
+            ["threadId"] = StoppedThreadId,
             ["allThreadsContinued"] = true,
         });
     }
@@ -1040,7 +1143,14 @@ internal sealed class DapServer
         });
     }
 
-    private static JsonObject Capabilities() => new()
+    private JsonObject Capabilities()
+    {
+        // Only advertised when the engine behind this session actually applies the type lists.
+        // Advertised regardless, the editor would offer a condition box on each filter, accept
+        // what the user typed, and silently break on everything anyway.
+        bool typedFilters = _backend.AppliesExceptionTypeFiltersInEngine;
+
+        return new JsonObject
     {
         ["supportsConfigurationDoneRequest"] = true,
         ["supportsSetVariable"] = true,
@@ -1051,18 +1161,45 @@ internal sealed class DapServer
         // rather than leaving the adapter to guess it from how the session started.
         ["supportTerminateDebuggee"] = true,
         ["supportsEvaluateForHovers"] = true,
-        // These three are emulated by PublishingDebugBackend rather than by the engine.
+        // Hit counts and logpoints are applied by the ICorDebug engine itself, and emulated by
+        // PublishingDebugBackend for the engine that cannot. Data breakpoints are emulated either
+        // way — neither runtime has hardware watchpoints to offer.
         ["supportsHitConditionalBreakpoints"] = true,
         ["supportsLogPoints"] = true,
         ["supportsDataBreakpoints"] = true,
         // Set Next Statement and Run to Cursor, which the ICorDebug engine has always had.
         ["supportsGotoTargetsRequest"] = true,
         ["supportsStepBack"] = false,
+        // Each filter takes a condition, which is where the type list goes: a comma-separated list
+        // of exception type names, each optionally prefixed with '!' to exclude it. Without that,
+        // "All Exceptions" against a framework that throws internally on a hot path is a setting
+        // nobody can leave on.
+        ["supportsExceptionFilterOptions"] = typedFilters,
         ["exceptionBreakpointFilters"] = new JsonArray
         {
-            new JsonObject { ["filter"] = "all", ["label"] = "All Exceptions" },
+            new JsonObject
+            {
+                ["filter"] = "all",
+                ["label"] = "All Exceptions",
+                ["description"] = "Break as soon as an exception is thrown, before any handler runs.",
+                ["supportsCondition"] = typedFilters,
+                ["conditionDescription"] =
+                    "Comma-separated exception type names to break on; prefix one with '!' to ignore it. " +
+                    "Base type names match derived exceptions. Empty means every type.",
+            },
+            new JsonObject
+            {
+                ["filter"] = "user-unhandled",
+                ["label"] = "Unhandled Exceptions",
+                ["description"] = "Break only when no handler was found.",
+                ["default"] = true,
+                ["supportsCondition"] = typedFilters,
+                ["conditionDescription"] =
+                    "Comma-separated exception type names to break on; prefix one with '!' to ignore it.",
+            },
         },
-    };
+        };
+    }
 
     private async Task ReportStopAsync(string defaultReason)
     {
@@ -1084,6 +1221,13 @@ internal sealed class DapServer
         if (!ClaimStop())
             return;
 
+        // Frame ids do not survive a stop, so neither do the bands they were numbered from.
+        lock (_foreignFrameBands)
+        {
+            _foreignFrameBands.Clear();
+            _nextForeignBand = 0;
+        }
+
         // A value change outranks the reason the resume was started with: the user pressed
         // Continue, but what actually stopped them is the watch.
         var dataHit = (_backend as PublishingDebugBackend)?.DataBreakpoints.LastHit;
@@ -1093,7 +1237,7 @@ internal sealed class DapServer
             ["reason"] = dataHit is not null ? "data breakpoint"
                 : frame.ExceptionName is { Length: > 0 } ? "exception"
                 : defaultReason,
-            ["threadId"] = 1,
+            ["threadId"] = StoppedThreadId,
             ["allThreadsStopped"] = true,
             ["description"] = dataHit?.Description,
             ["text"] = dataHit?.Description ?? frame.ExceptionMessage,

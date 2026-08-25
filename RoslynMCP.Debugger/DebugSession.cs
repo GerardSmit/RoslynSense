@@ -3,6 +3,7 @@ using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Channels;
 using ClrDebug;
 
@@ -44,6 +45,24 @@ public sealed partial class DebugSession : IDebugSession
     private bool _encPoisoned;
 
     private readonly Dictionary<string, SymbolReader?> _readers = new(StringComparer.OrdinalIgnoreCase);
+    /// Temporary PDBs written out for symbols the runtime handed us in memory: a Windows-format
+    /// reader only takes a path, so the bytes have to live on disk for as long as the reader does.
+    /// Deleted when the session ends. Concurrent because symbol updates arrive on mscordbi's
+    /// callback thread while the session thread is free to be tearing down.
+    private readonly ConcurrentBag<string> _spilledSymbolFiles = new();
+    /// What the last attempt at a module's symbols found, keyed by module path. Kept beside the
+    /// readers rather than derived from them, because the interesting cases are the ones where
+    /// there is no reader to ask.
+    private readonly ConcurrentDictionary<string, SymbolStatusEntry> _symbolStatus =
+        new(StringComparer.OrdinalIgnoreCase);
+    /// Readers that have been replaced or whose module unloaded, kept until the session ends.
+    /// They are dropped on the runtime's callback thread while the session thread may still be
+    /// reading sequence points through them, and closing a COM reader out from under that reader
+    /// is a crash rather than a stale answer. A session sees a handful of these at most.
+    private readonly ConcurrentBag<SymbolReader> _retiredReaders = new();
+    /// Set once the readers have been closed for good, so a symbol update arriving during teardown
+    /// does not open a reader nothing will ever close. Guarded by <c>_readers</c>.
+    private bool _symbolsClosed;
     /// Steppers armed but not yet completed, each tagged with the thread it was armed on so a
     /// completion arriving for a different thread can be told apart from the user's own step.
     private readonly List<(int ThreadId, CorDebugStepper Stepper)> _steppers = new();
@@ -64,9 +83,9 @@ public sealed partial class DebugSession : IDebugSession
     private IntPtr _coreClrStartupCookie;
     /// Non-zero for attach sessions: drives CLR version discovery from the live target.
     private int _attachPid;
-    /// Exception stop policy: unhandled exceptions always stop; first-chance stops only when
-    /// this is set (default report-and-continue).
-    private volatile bool _breakOnFirstChance;
+    /// <summary>Which exceptions suspend the target. Replaced wholesale rather than mutated, so
+    /// the callback thread always reads one coherent policy.</summary>
+    private volatile ExceptionPolicy _exceptionPolicy = ExceptionPolicy.Default;
 
     /// <summary>Whether the current stop is an exception stop — the only time the frame list
     /// carries a <c>$exception</c> row, exactly as VS's Locals window does.</summary>
@@ -345,9 +364,9 @@ public sealed partial class DebugSession : IDebugSession
                     };
                 try
                 {
-                    var ilHr = frame.TryCanSetIP(request.IlOffset);
+                    var ilHr = TryPrepareSetIP(thread, frame, request.IlOffset);
                     if (ilHr != HRESULT.S_OK)
-                        return new SetNextStatementResponse { Ok = false, Error = $"Set Next Statement rejected: {ilHr}" };
+                        return new SetNextStatementResponse { Ok = false, Error = DescribeSetIpFailure(ilHr) };
                     frame.SetIP(request.IlOffset);
                     var moved = SourceRangeOf(location.FilePath, (int)location.Line, (int)location.Column);
                     Emit(
@@ -376,9 +395,9 @@ public sealed partial class DebugSession : IDebugSession
                 };
             try
             {
-                var hr = frame.TryCanSetIP(target.Value.Offset);
+                var hr = TryPrepareSetIP(thread, frame, target.Value.Offset);
                 if (hr != HRESULT.S_OK)
-                    return new SetNextStatementResponse { Ok = false, Error = $"Set Next Statement rejected: {hr}" };
+                    return new SetNextStatementResponse { Ok = false, Error = DescribeSetIpFailure(hr) };
                 frame.SetIP(target.Value.Offset);
                 var actual = target.Value.Location.Actual?.Clone();
                 if (actual is not null)
@@ -398,6 +417,89 @@ public sealed partial class DebugSession : IDebugSession
                 return new SetNextStatementResponse { Ok = false, Error = ex.Message };
             }
         });
+
+    /// <summary>
+    /// Asks whether the IP can move to <paramref name="offset"/>, clearing an in-flight exception
+    /// out of the way first when that is the only thing blocking it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Moving the instruction pointer is refused outright while an exception is unwinding, and
+    /// that is exactly when it is most wanted: the user is stopped on a throw, has fixed the
+    /// input, and wants to re-run the line. The runtime's own way out is
+    /// <c>InterceptCurrentException</c> — stop the unwind at this frame and put the thread back on
+    /// ordinary execution — after which the move is a normal one.
+    /// </para>
+    /// <para>
+    /// Only attempted when the refusal was specifically about the exception, and only ever as a
+    /// prelude to a move the runtime then agrees to: if the second answer is still no, the
+    /// interception has changed nothing the user can see, because the thread was going to be
+    /// resumed from this frame either way.
+    /// </para>
+    /// </remarks>
+    private HRESULT TryPrepareSetIP(CorDebugThread thread, CorDebugILFrame frame, int offset)
+    {
+        var hr = frame.TryCanSetIP(offset);
+        if (hr != HRESULT.CORDBG_E_SET_IP_NOT_ALLOWED_ON_EXCEPTION)
+            return hr;
+
+        var intercepted = Safe(() => thread.TryInterceptCurrentException(frame.Raw));
+        if (intercepted is not HRESULT.S_OK)
+        {
+            // Nothing was changed, so report the original refusal rather than the one from the
+            // rescue attempt — the user asked to move the IP, not to intercept an exception.
+            return hr;
+        }
+
+        _stoppedOnException = false;
+        return frame.TryCanSetIP(offset);
+    }
+
+    /// <summary>
+    /// Turns the runtime's refusal to move the instruction pointer into a sentence that names the
+    /// rule being broken.
+    /// </summary>
+    /// <remarks>
+    /// The raw HRESULT names are close enough to English to look like an explanation and are not
+    /// one — <c>CORDBG_E_CANT_SET_IP_OUT_OF_FINALLY_ON_WIN64</c> tells a user who already knows the
+    /// answer that they were right. Each of these is a rule with a reason, and the reason is what
+    /// makes the refusal actionable.
+    /// </remarks>
+    private static string DescribeSetIpFailure(HRESULT hr) => hr switch
+    {
+        HRESULT.CORDBG_E_SET_IP_NOT_ALLOWED_ON_EXCEPTION =>
+            "the thread is unwinding an exception, and the runtime refused to stop the unwind at " +
+            "this frame — move to a frame the exception is still passing through, or let it finish",
+        HRESULT.CORDBG_E_SET_IP_NOT_ALLOWED_ON_NONLEAF_FRAME =>
+            "the instruction pointer can only be moved in the frame on top of the stack; select " +
+            "the innermost frame first",
+        HRESULT.CORDBG_E_CANT_SET_IP_INTO_CATCH =>
+            "the target is inside a catch block, which can only be entered by an exception",
+        HRESULT.CORDBG_E_CANT_SET_IP_INTO_FINALLY =>
+            "the target is inside a finally block, which can only be entered by leaving the try",
+        HRESULT.CORDBG_E_CANT_SET_IP_OUT_OF_FINALLY or
+        HRESULT.CORDBG_E_CANT_SET_IP_OUT_OF_FINALLY_ON_WIN64 =>
+            "the instruction pointer is inside a finally block and cannot leave it — the runtime " +
+            "would have no way to complete the unwind it is part of",
+        HRESULT.CORDBG_E_CANT_SET_IP_OUT_OF_CATCH_ON_WIN64 =>
+            "the instruction pointer is inside a catch block and cannot leave it on 64-bit",
+        HRESULT.CORDBG_E_CANT_SETIP_INTO_OR_OUT_OF_FILTER =>
+            "exception filters run in their own context; the instruction pointer cannot cross into " +
+            "or out of one",
+        HRESULT.CORDBG_E_SET_IP_IMPOSSIBLE =>
+            "the runtime cannot construct a valid state at the target — the two positions do not " +
+            "agree on what is on the stack",
+        HRESULT.CORDBG_E_ILLEGAL_IN_OPTIMIZED_CODE =>
+            "the method was JIT-optimized, and an optimized frame has no reliable mapping between " +
+            "IL offsets and machine code; rebuild without optimization to move the pointer here",
+        HRESULT.CORDBG_E_FUNCTION_NOT_IL =>
+            "the frame is native code, which has no IL offsets to move between",
+        HRESULT.CORDBG_S_INSUFFICIENT_INFO_FOR_SET_IP =>
+            "the runtime has too little information about this method to move the pointer safely",
+        HRESULT.CORDBG_E_PROCESS_TERMINATED =>
+            "the process has exited",
+        _ => $"the runtime refused the move ({hr})",
+    };
 
     public void Continue() => Enqueue(() =>
     {
@@ -499,8 +601,9 @@ public sealed partial class DebugSession : IDebugSession
         return fallback;
     }
 
-    /// First-chance exception stop policy (unhandled exceptions always stop).
-    public void SetExceptionPolicy(bool breakOnFirstChance) => _breakOnFirstChance = breakOnFirstChance;
+    /// <summary>Replaces the exception stop policy.</summary>
+    public void SetExceptionPolicy(ExceptionPolicy policy) =>
+        _exceptionPolicy = policy ?? ExceptionPolicy.Default;
 
     public void Step(StepKind kind) => Enqueue(() =>
     {
@@ -520,6 +623,17 @@ public sealed partial class DebugSession : IDebugSession
             _steppingThreadId = steppingThread;
             var source = frame is CorDebugILFrame ilFrame && TryGetSourceStepRange(ilFrame, out var range)
                 ? (COR_DEBUG_STEP_RANGE?)range
+                : null;
+            _stepOrigin = source is { } origin && kind is not StepKind.Out
+                ? new StepOrigin(
+                    steppingThread,
+                    Safe(() => (int?)frame.FunctionToken) ?? 0,
+                    // The frame's own stack range, so "landed back where we started" means this
+                    // activation and not merely this method. Without it a recursive call reads as
+                    // no progress and the step walks down the recursion.
+                    Safe(() => (ulong?)frame.StackRange.pStart) ?? 0,
+                    origin,
+                    kind == StepKind.Into)
                 : null;
             switch (kind)
             {
@@ -554,10 +668,16 @@ public sealed partial class DebugSession : IDebugSession
     });
 
     /// The stopped thread's call stack, top-first. Empty when running.
-    public Task<List<StackFrame>> StackTraceAsync() => InvokeAsync(() =>
+    /// <summary>
+    /// The call stack of one thread, top-first. Empty while running.
+    /// </summary>
+    /// <param name="threadId">Which thread to walk; <c>0</c> means the one the stop landed on.
+    /// Any other suspended thread can be asked, which is the only way to see what the rest of a
+    /// server was doing when a request stopped.</param>
+    public Task<List<StackFrame>> StackTraceAsync(int threadId = 0) => InvokeAsync(() =>
     {
         var frames = new List<StackFrame>();
-        var thread = _stoppedThread;
+        var thread = threadId == 0 ? _stoppedThread : FindThreadById(threadId);
         if (thread is null)
             return frames;
         var index = 0u;
@@ -580,6 +700,7 @@ public sealed partial class DebugSession : IDebugSession
                     ModulePath = modulePath,
                     MethodToken = methodToken,
                     IlOffset = ilOffset,
+                    IsNonUserCode = IsNonUserFrame(frame),
                 });
                 if (index >= 128)
                     return frames;
@@ -588,21 +709,40 @@ public sealed partial class DebugSession : IDebugSession
         return frames;
     });
 
+    /// <summary>Finds a suspended thread by its runtime id.</summary>
+    private CorDebugThread? FindThreadById(int threadId)
+    {
+        var process = _process;
+        if (process is null)
+            return null;
+        foreach (var appDomain in Safe(() => process.AppDomains) ?? Array.Empty<CorDebugAppDomain>())
+        {
+            foreach (var thread in Safe(() => appDomain.Threads) ?? Array.Empty<CorDebugThread>())
+            {
+                if (ThreadId(thread) == threadId)
+                    return thread;
+            }
+        }
+        return null;
+    }
+
     public Task<List<DebugThread>> ThreadsAsync() => InvokeAsync(() =>
     {
         var threads = new List<DebugThread>();
         var process = _process;
         if (process is null)
             return threads;
+        var stoppedId = _stoppedThread is { } stopped ? ThreadId(stopped) : 0;
         foreach (var appDomain in Safe(() => process.AppDomains) ?? Array.Empty<CorDebugAppDomain>())
         {
             foreach (var thread in Safe(() => appDomain.Threads) ?? Array.Empty<CorDebugThread>())
             {
                 var (file, line, _) = ThreadLocation(thread);
+                var id = ThreadId(thread);
                 threads.Add(new DebugThread
                 {
-                    Id = ThreadId(thread),
-                    Stopped = _stoppedThread is not null && ThreadId(thread) == ThreadId(_stoppedThread),
+                    Id = id,
+                    Stopped = stoppedId != 0 && id == stoppedId,
                     Location = file.Length > 0 && line > 0
                         ? $"{Path.GetFileName(file)}:{line}"
                         : MethodOf(thread),
@@ -620,13 +760,24 @@ public sealed partial class DebugSession : IDebugSession
             var path = Safe(() => module.Name) ?? string.Empty;
             if (path.Length == 0)
                 continue;
+            // Asking for the reader is what probes the symbols, so listing modules also answers
+            // the question for every module that nothing has needed yet.
             var reader = ReaderFor(module, path);
+            var status = _symbolStatus.TryGetValue(path, out var recorded)
+                ? recorded
+                : new SymbolStatusEntry(SymbolStatuses.NotProbed, "", "", "");
+
             modules.Add(new DebugModule
             {
                 Name = Path.GetFileName(path),
                 Path = path,
                 SymbolsLoaded = reader is not null,
-                SymbolPath = reader is null ? string.Empty : Path.ChangeExtension(path, ".pdb"),
+                // The file the symbols were really read from, which is not always the sibling the
+                // name suggests — embedded and runtime-supplied symbols have no file at all.
+                SymbolPath = status.Path,
+                SymbolStatus = status.Status,
+                SymbolOrigin = status.Origin,
+                SymbolDetail = status.Detail,
                 Runtime = _runtime == DebugRuntime.CoreClr ? ".NET" : ".NET Framework",
             });
         }
@@ -784,23 +935,117 @@ public sealed partial class DebugSession : IDebugSession
         if (!_boundSpecs.TryGetValue(SourceKey(file, line), out var spec))
             return true;
 
+        if (spec.Condition.Length > 0)
+        {
+            bool stop;
+            try
+            {
+                stop = EvaluateCondition(thread, spec.Condition, out var problem);
+                if (problem.Length > 0)
+                    ReportConditionProblem(spec, problem);
+            }
+            catch (Exception ex)
+            {
+                ReportConditionProblem(spec, ex.Message);
+                stop = true;
+            }
+
+            if (!stop)
+                return false;
+        }
+
+        // Counted after the condition, not before. Every editor's hit count means "times the
+        // condition was true", and so does the netcoredbg emulation, which only ever sees stops
+        // the condition already admitted. Counting arrivals here instead made the same breakpoint
+        // behave differently on the two engines: a condition true on even iterations with a hit
+        // condition of "= 3" needs the 3rd arrival and a true condition to coincide, which they
+        // never do — so the breakpoint silently never fires.
         var hits = _hitCounts.AddOrUpdate(SourceKey(file, line), 1, (_, c) => c + 1);
         if (hits <= spec.SkipHits)
             return false;
 
-        if (spec.Condition.Length == 0)
-            return true;
+        // A hit the rule excludes is not a stop the user ever sees, and deciding that here — on
+        // the runtime's callback thread, inside the debuggee's suspend — costs one comparison.
+        // The same decision made by the host costs a suspend, a round trip and a resume per hit.
+        if (spec.HitCondition.Length > 0 && !BreakpointRules.HitConditionMet(spec.HitCondition, (int)hits))
+            return false;
+
+        if (spec.LogMessage.Length > 0)
+        {
+            Emit(
+                DebugEventKind.Logpoint,
+                InterpolateLogMessage(thread, spec.LogMessage),
+                string.Empty, ThreadId(thread),
+                spec.FilePath, (int)spec.Line);
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Replaces <c>{expression}</c> placeholders in a logpoint message with the values they name
+    /// in the frame the breakpoint fired in.
+    /// </summary>
+    /// <remarks>
+    /// Resolved through the same path walker a condition uses, so it reads fields, array elements
+    /// and locals without ever calling into the debuggee. That is deliberate: a logpoint runs on
+    /// every hit, and a func-eval per hit would have to resume the target to make the call — which
+    /// is exactly the cost this whole path exists to avoid. An expression it cannot read shows the
+    /// reason in place rather than dropping the line.
+    /// </remarks>
+    private string InterpolateLogMessage(CorDebugThread thread, string message)
+    {
+        var ilFrame = Safe(() => thread.ActiveFrame) as CorDebugILFrame;
+        var sb = new StringBuilder(message.Length);
+
+        for (var i = 0; i < message.Length; i++)
+        {
+            // "{{" and "}}" are literal braces, as they are in every other message the editor
+            // interpolates — without them a logpoint cannot print a brace at all.
+            if (message[i] is '{' or '}' && i + 1 < message.Length && message[i + 1] == message[i])
+            {
+                sb.Append(message[i]);
+                i++;
+                continue;
+            }
+
+            if (message[i] != '{')
+            {
+                sb.Append(message[i]);
+                continue;
+            }
+
+            var end = message.IndexOf('}', i + 1);
+            if (end < 0)
+            {
+                sb.Append(message[i..]);
+                break;
+            }
+
+            var expression = message[(i + 1)..end];
+            sb.Append(ReadForLog(ilFrame, expression));
+            i = end;
+        }
+
+        return sb.ToString();
+    }
+
+    private string ReadForLog(CorDebugILFrame? ilFrame, string expression)
+    {
+        if (ilFrame is null)
+            return "<no managed frame>";
+
         try
         {
-            var stop = EvaluateCondition(thread, spec.Condition, out var problem);
-            if (problem.Length > 0)
-                ReportConditionProblem(spec, problem);
-            return stop;
+            var value = ResolvePath(ilFrame, expression, out var error);
+            return value is null
+                ? $"<{(error.Length > 0 ? error : $"'{expression}' could not be resolved here")}>"
+                : DescribeValue(value, applyDisplay: false);
         }
         catch (Exception ex)
         {
-            ReportConditionProblem(spec, ex.Message);
-            return true;
+            return $"<{ex.Message}>";
         }
     }
 
@@ -1550,6 +1795,115 @@ public sealed partial class DebugSession : IDebugSession
 #pragma warning restore CA1416
     }
 
+    /// <summary>
+    /// Whether an exception the runtime just reported is one the session should stop on.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The caught/uncaught split comes from the runtime's own <c>unhandled</c> flag rather than
+    /// from the richer v2 exception callback. The v2 callback names four event types and would
+    /// distinguish "a handler was found" from "thrown, outcome unknown" — but it also fires once
+    /// per frame the exception unwinds through, and the ordering between it and the v1 callback is
+    /// not something to build a stop decision on. One callback, fired once per throw, with a flag
+    /// that is already correct at second chance, is the version that cannot double-stop.
+    /// </para>
+    /// <para>
+    /// Fails open on a type that cannot be read: an exception whose type is unknown is admitted by
+    /// an include list rather than silently dropped, because the failure mode of the other choice
+    /// is a breakpoint-shaped hole the user cannot see.
+    /// </para>
+    /// </remarks>
+    private bool ShouldStopOnException(bool unhandled, CorDebugValue? thrown)
+    {
+        // Each class of exception carries its own type lists: narrowing "break on every throw" to
+        // one type must not also narrow which unhandled exceptions stop the process.
+        var rule = unhandled ? _exceptionPolicy.Unhandled : _exceptionPolicy.Caught;
+
+        if (!rule.Enabled)
+            return false;
+
+        if (rule.IncludeTypes.Count == 0 && rule.ExcludeTypes.Count == 0)
+            return true;
+
+        var names = ExceptionTypeNames(thrown);
+        if (names.Count == 0)
+            return true;
+
+        if (rule.ExcludeTypes.Count > 0 && rule.ExcludeTypes.Any(f => MatchesAnyType(names, f)))
+            return false;
+
+        return rule.IncludeTypes.Count == 0 || rule.IncludeTypes.Any(f => MatchesAnyType(names, f));
+    }
+
+    /// <summary>
+    /// The thrown value's type and every base type above it, so a filter naming a base class
+    /// catches the derived ones — which is what "break on IOException" is normally asking for.
+    /// </summary>
+    private static List<string> ExceptionTypeNames(CorDebugValue? thrown)
+    {
+        var names = new List<string>();
+        if (thrown is null)
+            return names;
+
+        foreach (var (_, metadata, typeDef) in TypeChain(thrown))
+        {
+            var name = Safe(() => metadata.GetTypeDefProps(typeDef).szTypeDef);
+            if (name is { Length: > 0 })
+                names.Add(name);
+        }
+
+        return names;
+    }
+
+    /// <summary>Matches a filter against a type name by full name or by simple name, so both
+    /// <c>System.IO.IOException</c> and <c>IOException</c> work.</summary>
+    private static bool MatchesAnyType(List<string> names, string filter)
+    {
+        var wanted = filter.Trim();
+        if (wanted.Length == 0)
+            return false;
+
+        foreach (var name in names)
+        {
+            if (string.Equals(name, wanted, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var dot = name.LastIndexOf('.');
+            if (dot >= 0 && string.Equals(name[(dot + 1)..], wanted, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// How a thrown exception should read: its type and message, with the stage appended.
+    /// </summary>
+    /// <remarks>
+    /// The type has to lead. The host parses the type back out of this message to fill the
+    /// editor's exception popup, and before this it was parsing a fixed string — so every
+    /// exception, whatever it was, was reported to the user as "exception (unhandled)".
+    /// </remarks>
+    private string DescribeThrownException(CorDebugValue? thrown, bool unhandled)
+    {
+        var stage = unhandled ? "unhandled" : "first chance";
+
+        if (thrown is null)
+            return $"exception ({stage})";
+
+        var type = Safe(() => TypeNameOf(thrown)) ?? string.Empty;
+        if (type.Length == 0)
+            return $"exception ({stage})";
+
+        var message = Safe(() => FieldValue(thrown, "_message")) is { } messageField
+            ? Safe(() => DescribeValue(messageField, applyDisplay: false))
+            : null;
+
+        return message is { Length: > 0 } and not "null"
+            ? $"{type}: {message.Trim('"')} ({stage})"
+            : $"{type} ({stage})";
+    }
+
     /// <summary>What a faulted evaluation should report: the thrown exception's type and message
     /// when they can be read, rather than the fact that something somewhere threw.</summary>
     private string DescribeEvalFault(CorDebugValue? exception)
@@ -1628,6 +1982,14 @@ public sealed partial class DebugSession : IDebugSession
                 return metadata.GetMethodProps(found.Function.Token).pdwAttr.HasFlag(CorMethodAttr.mdStatic);
             }) == true;
 
+            // A getter that only returns a field can be read rather than run. Worth checking
+            // first because the alternative is not merely slower: every func-eval resumes the
+            // debuggee, and expanding one object with twenty such properties means twenty
+            // resumes, each of which can hit a breakpoint, deadlock on a lock the stopped thread
+            // holds, or time out.
+            if (!isStatic && InterpretFieldGetter(found.Instance, found.Function) is { } interpreted)
+                return interpreted;
+
             var result = InvokeFunction(found.Function, isStatic ? [] : [found.Instance], out error);
             if (result is not null)
                 return result;
@@ -1640,6 +2002,78 @@ public sealed partial class DebugSession : IDebugSession
         error = callOnly
             ? $"no parameterless method '{name}' was found"
             : $"member '{name}' was not found";
+        return null;
+    }
+
+    /// <summary>
+    /// Reads the field a trivial getter would have returned, without running it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Only two IL shapes are recognised, both of them exactly "return this field": the release
+    /// form the compiler emits for an auto-property or a one-line getter, and the debug form,
+    /// which stores to a local and branches to a return so a breakpoint on the closing brace has
+    /// somewhere to land. Anything else — a null check, a lazy initializer, a computed
+    /// expression — falls through to a real call, because interpreting it would mean guessing at
+    /// what the method does.
+    /// </para>
+    /// <para>
+    /// Reading the field is not just faster than calling the getter, it is safer. A func-eval has
+    /// to resume the debuggee to make the call, which means every property expansion is a chance
+    /// to hit a breakpoint, block on a lock the stopped thread is holding, or run a side effect
+    /// the user did not ask for.
+    /// </para>
+    /// </remarks>
+    private CorDebugValue? InterpretFieldGetter(CorDebugValue instance, CorDebugFunction getter)
+    {
+        var il = Safe(() =>
+        {
+            var code = getter.ILCode;
+            return code.GetCode(0, code.Size, code.Size);
+        });
+
+        if (il is null || FieldTokenOfTrivialGetter(il) is not { } fieldToken)
+            return null;
+
+        // The field is read on the type that declares the getter, which is not necessarily the
+        // value's most-derived type when the property was inherited.
+        var declaring = Safe(() => getter.Class);
+        if (declaring is null)
+            return null;
+
+        return Safe(() => Dereference(instance) is CorDebugObjectValue obj
+            ? obj.GetFieldValue(declaring.Raw, new mdFieldDef(fieldToken))
+            : null);
+    }
+
+    /// <summary>
+    /// The <c>ldfld</c> token of a method body that does nothing but return an instance field, or
+    /// null when the body is anything else.
+    /// </summary>
+    /// <remarks>
+    /// <c>ICorDebugCode::GetCode</c> addresses IL by IL offset, so what comes back is the bare
+    /// instruction stream with no method header in front of it. The match is written against
+    /// exact lengths rather than a prefix so that a longer body — a getter that does anything
+    /// else at all — cannot pass by looking like one of these at the start.
+    /// </remarks>
+    private static int? FieldTokenOfTrivialGetter(byte[] il)
+    {
+        const byte Ldarg0 = 0x02, Ldfld = 0x7B, Ret = 0x2A;
+        const byte Nop = 0x00, Stloc0 = 0x0A, BrS = 0x2B, Ldloc0 = 0x06;
+
+        // Release: ldarg.0; ldfld <field>; ret
+        if (il.Length == 7 && il[0] == Ldarg0 && il[1] == Ldfld && il[6] == Ret)
+            return BitConverter.ToInt32(il, 2);
+
+        // Debug: nop; ldarg.0; ldfld <field>; stloc.0; br.s +0; ldloc.0; ret — the local and the
+        // branch exist so a breakpoint on the closing brace has an instruction to bind to.
+        if (il.Length == 12 && il[0] == Nop && il[1] == Ldarg0 && il[2] == Ldfld &&
+            il[7] == Stloc0 && il[8] == BrS && il[9] == 0x00 &&
+            il[10] == Ldloc0 && il[11] == Ret)
+        {
+            return BitConverter.ToInt32(il, 3);
+        }
+
         return null;
     }
 
@@ -1697,7 +2131,9 @@ public sealed partial class DebugSession : IDebugSession
             {
                 await InvokeAsync(() =>
                 {
-                    _breakOnFirstChance = false;
+                    // Nothing may trap on the way out — including the unhandled exception a host
+                    // shutting down under a cancellation can legitimately end on.
+                    _exceptionPolicy = new ExceptionPolicy { Unhandled = new ExceptionRule() };
 
                     foreach (var breakpoint in _bound.Values)
                     {
@@ -1787,10 +2223,48 @@ public sealed partial class DebugSession : IDebugSession
         _process = null;
         _stoppedThread = null;
 
+        // After the readers are closed, not before: diasymreader keeps the file open for as long as
+        // the reader lives, so deleting first would fail and leave the file behind for good.
+        DisposeSymbolReaders();
+
         if (corDebug is null)
             return;
 
         try { corDebug.Terminate(); } catch { }
+    }
+
+    /// <summary>
+    /// Closes every symbol reader and removes the PDBs that were spilled to disk for them.
+    /// </summary>
+    /// <remarks>
+    /// The spilled files are the ones the runtime handed over in memory — a dynamic or edited
+    /// module's symbols, which exist nowhere on disk of their own accord. Without this, every
+    /// debug session of a hot-reloading target leaves a PDB in the temp directory forever.
+    /// </remarks>
+    private void DisposeSymbolReaders()
+    {
+        SymbolReader?[] readers;
+        lock (_readers)
+        {
+            readers = [.. _readers.Values];
+            _readers.Clear();
+            _symbolsClosed = true;
+        }
+
+        foreach (var reader in readers)
+        {
+            try { reader?.Dispose(); } catch { }
+        }
+
+        while (_retiredReaders.TryTake(out var retired))
+        {
+            try { retired.Dispose(); } catch { }
+        }
+
+        // After the readers, never before: diasymreader holds the file open until its reader is
+        // destroyed, so deleting first would silently fail and leave the PDB behind for good.
+        while (_spilledSymbolFiles.TryTake(out var path))
+            SymbolReader.TryDelete(path);
     }
 
     /// Detach without killing the debuggee — the safe teardown for attached IIS Express / w3wp
@@ -1938,6 +2412,13 @@ public sealed partial class DebugSession : IDebugSession
                 if (!generated)
                     ReportMissingSymbols(e.Module, moduleName);
             };
+            callback.OnUpdateModuleSymbols += (_, e) =>
+            {
+                // Symbols the runtime is handing over for a module that has none on disk. This is
+                // the only route to source-level debugging of anything generated at runtime, so
+                // the reader is replaced and every pending breakpoint is offered the module again.
+                OnSymbolsUpdated(e.Module, e.SymbolStream);
+            };
             callback.OnUnloadModule += (_, e) =>
             {
                 // App-domain recycle / plugin unload: bound breakpoints in this module go back
@@ -1965,7 +2446,9 @@ public sealed partial class DebugSession : IDebugSession
                 var (file, line, column) = ThreadLocation(e.Thread);
                 if (!ShouldStopAt(e.Thread, file, line))
                 {
-                    // Skipped by hit count / condition: resume before OnAnyEvent sees the stop.
+                    // Swallowed by a condition, a hit count, or a logpoint that has already
+                    // logged: resume before OnAnyEvent sees the stop, so nothing outside this
+                    // process ever learns the target suspended.
                     try { e.Controller.Continue(false); } catch { }
                     return;
                 }
@@ -2055,7 +2538,20 @@ public sealed partial class DebugSession : IDebugSession
                     return;
                 }
 
+                // Stepping out of somebody else's code lands back on the line the step started
+                // from, which is not progress — it is the step appearing to do nothing. Re-arm the
+                // original range so it carries on past the call instead of reporting a stop where
+                // the user already was.
+                if (TryResumeStepOverOrigin(e.Thread))
+                {
+                    _stoppedThread = null;
+                    try { e.Controller.Continue(false); }
+                    catch { /* already continued / terminated */ }
+                    return;
+                }
+
                 // The step is over. Drop the steppers it armed so none of them can complete again.
+                _stepOrigin = null;
                 DeactivateSteppers();
                 _stoppedOnException = false;
                 _stoppedThread = e.Thread;
@@ -2074,11 +2570,14 @@ public sealed partial class DebugSession : IDebugSession
                     return;
                 }
 
-                // Unhandled (second-chance) exceptions always stop; first-chance stops only
-                // under the session policy. Auto-continued first-chance exceptions are reported
-                // as Output so the UI never treats a running process as stopped.
+                // Whether this exception is one the user asked to see is decided here, on the
+                // callback thread, while the process is already suspended. An exception the
+                // policy rejects is reported and resumed without ever becoming a stop.
                 var unhandled = e.Unhandled != 0;
-                if (unhandled || _breakOnFirstChance)
+                var thrown = Safe(() => e.Thread.CurrentException);
+                var described = DescribeThrownException(thrown, unhandled);
+
+                if (ShouldStopOnException(unhandled, thrown))
                 {
                     // As on a breakpoint: the exception decided this stop, so an in-flight step is
                     // abandoned and its stepper must not survive to fire later.
@@ -2089,12 +2588,15 @@ public sealed partial class DebugSession : IDebugSession
                     var (file, line, column) = ThreadLocation(e.Thread);
                     Emit(
                         DebugEventKind.Exception,
-                        unhandled ? "exception (unhandled)" : "exception (first chance)",
+                        described,
                         MethodOf(e.Thread), ThreadId(e.Thread), file, line, column);
                 }
                 else
                 {
-                    Emit(DebugEventKind.Diagnostic, $"first-chance exception in {MethodOf(e.Thread)}", string.Empty, 0);
+                    Emit(
+                        DebugEventKind.Diagnostic,
+                        $"{described} in {MethodOf(e.Thread)}",
+                        string.Empty, 0);
                 }
             };
             callback.OnExitProcess += (_, _) =>
@@ -2456,9 +2958,10 @@ public sealed partial class DebugSession : IDebugSession
     /// JIT-flag a freshly loaded module for EnC (only valid during the LoadModule callback)
     /// and, for user modules, remember it by simple assembly name as an ApplyHotReload target.
     /// <remarks>
-    /// Every module gets the flag attempt, not just the user's — this is what Rider's engine
-    /// does, and an unflagged module anywhere in the process is a way for <c>ApplyChanges</c> to
-    /// fault later. NGen'd framework images refuse the flag; that refusal is expected and only
+    /// Every module gets the flag attempt, not just the user's: an unflagged module anywhere in
+    /// the process is a way for <c>ApplyChanges</c> to fault later, and the flag is only valid
+    /// during the load callback, so there is no second chance to decide it was needed after all.
+    /// NGen'd framework images refuse the flag; that refusal is expected and only
     /// narrated for modules the user could actually edit.
     /// </remarks>
     private void RegisterEncModule(CorDebugModule module, string moduleName, bool generated = false)
@@ -2532,6 +3035,129 @@ public sealed partial class DebugSession : IDebugSession
     /// Module unload (app-domain recycle, plugin unload): its bound breakpoints return to
     /// pending — the specs survive, so the next LoadModule rebinds them — and the client's
     /// gutter dots go hollow again via BreakpointUnbound events.
+    /// <summary>
+    /// Takes symbols the runtime delivered for a module and rebinds against them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Fired for modules whose symbols exist only in the debuggee: <c>Reflection.Emit</c> output,
+    /// generated serializer assemblies, in-memory view and Razor compilation. They have no PDB
+    /// beside them on disk, so the ordinary open finds nothing and the module is reported as
+    /// having no symbols — which, until this handler existed, was the end of it. A breakpoint in
+    /// generated code could never bind, and a stop inside one showed a call stack with no source.
+    /// </para>
+    /// <para>
+    /// The reader is replaced rather than added to. The runtime may send symbols more than once
+    /// for the same module as more code is emitted into it, and the latest stream is the complete
+    /// one — keeping the earlier reader would pin an older view of a module that has since grown.
+    /// </para>
+    /// </remarks>
+    private void OnSymbolsUpdated(CorDebugModule module, ComStream stream)
+    {
+        var moduleName = Safe(() => module.Name) ?? string.Empty;
+        if (moduleName.Length == 0)
+            return;
+
+        var metadata = Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(module));
+        if (metadata is null)
+            return;
+
+        var pdb = Safe(() => ReadAll(stream));
+
+        var opened = pdb is { Length: > 0 }
+            ? SymbolReader.FromBytes(pdb, moduleName, metadata)
+            : null;
+
+        if (opened is not { } supplied)
+        {
+            Emit(
+                DebugEventKind.Diagnostic,
+                $"the runtime sent symbols for {Path.GetFileName(moduleName)} that could not be " +
+                "read, so code generated into it stays without source",
+                string.Empty, 0);
+            return;
+        }
+
+        lock (_readers)
+        {
+            // Teardown has already closed the readers; opening another here would leak it and its
+            // spilled file, since nothing runs after the drain to close them.
+            if (_symbolsClosed)
+            {
+                supplied.Reader.Dispose();
+                if (supplied.TempFile is { } orphan)
+                    SymbolReader.TryDelete(orphan);
+                return;
+            }
+
+            // Retired rather than disposed: the session thread may be reading through the reader
+            // being replaced, and this runs on the runtime's callback thread.
+            if (_readers.Remove(moduleName, out var previous) && previous is not null)
+                _retiredReaders.Add(previous);
+            _readers[moduleName] = supplied.Reader;
+        }
+
+        if (supplied.TempFile is { } spilled)
+            _spilledSymbolFiles.Add(spilled);
+
+        _symbolStatus[moduleName] = new SymbolStatusEntry(
+            SymbolStatuses.Loaded, supplied.Reader.Origin, supplied.Reader.SymbolPath, string.Empty);
+
+        // The module previously had no symbols, so it was reported as such and its breakpoints
+        // were left pending. Both facts are now stale.
+        lock (_noSymbolsReported)
+            _noSymbolsReported.Remove(moduleName);
+
+        Emit(
+            DebugEventKind.Diagnostic,
+            $"the runtime supplied symbols for {Path.GetFileName(moduleName)} at run time",
+            string.Empty, 0);
+
+        foreach (var spec in SpecsSnapshot())
+            TryBindBreakpoint(module, spec);
+    }
+
+    /// <summary>
+    /// Drains an <c>IStream</c> the runtime handed over into a byte array.
+    /// </summary>
+    /// <remarks>
+    /// The COM stream reads into unmanaged memory and gives no managed overload, so a native
+    /// buffer is unavoidable. It is also read from wherever the runtime left the pointer, so the
+    /// seek to the start is what makes the result the whole PDB rather than its tail. The declared
+    /// size is treated as a hint: reading until <c>Read</c> returns nothing is what actually
+    /// decides the length, because a stream that reports more than it has would otherwise pad the
+    /// PDB with whatever the buffer held.
+    /// </remarks>
+    private static byte[] ReadAll(ComStream stream)
+    {
+        stream.Seek(0L, STREAM_SEEK.STREAM_SEEK_SET);
+
+        long declared = (long)stream.Stat(STATFLAG.STATFLAG_NONAME).cbSize;
+        const int ChunkSize = 64 * 1024;
+        int chunk = declared is > 0 and < ChunkSize ? (int)declared : ChunkSize;
+
+        using var buffer = new MemoryStream(declared is > 0 and <= int.MaxValue ? (int)declared : 0);
+        var native = Marshal.AllocHGlobal(chunk);
+        try
+        {
+            var managed = new byte[chunk];
+            while (true)
+            {
+                int read = stream.Read(native, chunk);
+                if (read <= 0)
+                    break;
+                Marshal.Copy(native, managed, 0, read);
+                buffer.Write(managed, 0, read);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(native);
+        }
+
+        return buffer.ToArray();
+    }
+
     private void OnModuleUnloaded(string moduleName)
     {
         var assemblyName = Path.GetFileNameWithoutExtension(moduleName);
@@ -2543,9 +3169,12 @@ public sealed partial class DebugSession : IDebugSession
         // a module that reloads from the same path would be read through its predecessor's PDB.
         lock (_readers)
         {
-            if (_readers.Remove(moduleName, out var unloaded))
-                unloaded?.Dispose();
+            // Retired rather than disposed here too: this is the callback thread, and a stack walk
+            // on the session thread can be part-way through this very reader.
+            if (_readers.Remove(moduleName, out var unloaded) && unloaded is not null)
+                _retiredReaders.Add(unloaded);
         }
+        _symbolStatus.TryRemove(moduleName, out _);
         lock (_noSymbolsReported)
             _noSymbolsReported.Remove(moduleName);
 
@@ -3017,7 +3646,8 @@ public sealed partial class DebugSession : IDebugSession
             {
                 lock (_readers)
                     _readers.Remove(path);
-                reader?.Dispose();
+                if (reader is not null)
+                    _retiredReaders.Add(reader);
                 Emit(DebugEventKind.Diagnostic,
                     $"line information for {assemblyName} is stale after the edit; " +
                     "breakpoints in changed methods may bind to the wrong line.",
@@ -3113,6 +3743,14 @@ public sealed partial class DebugSession : IDebugSession
 
     private readonly record struct SymbolDocument(string FilePath, SymUnmanagedDocument? Unmanaged, DocumentHandle Portable);
 
+    /// <summary>What was found when a module's symbols were looked for, for reporting.</summary>
+    /// <param name="Status">One of <see cref="SymbolStatuses"/>.</param>
+    /// <param name="Origin">One of <see cref="SymbolOrigins"/>; empty unless symbols loaded.</param>
+    /// <param name="Path">The file the symbols were read from; empty when they were never a file.</param>
+    /// <param name="Detail">The reason behind <paramref name="Status"/>, in a sentence.</param>
+    private readonly record struct SymbolStatusEntry(
+        string Status, string Origin, string Path, string Detail);
+
     /// <summary>
     /// A portable PDB opened for a module, located the way the runtime itself would locate it.
     /// </summary>
@@ -3143,6 +3781,21 @@ public sealed partial class DebugSession : IDebugSession
 
         /// <summary>Where the symbols came from, for diagnostics.</summary>
         public string Path { get; }
+
+        /// <summary>A reader over portable-PDB bytes already in hand, rather than a file.</summary>
+        public static PortablePdbReader? FromBytes(byte[] pdb, string describedAs)
+        {
+            try
+            {
+                var provider = MetadataReaderProvider.FromPortablePdbStream(
+                    new MemoryStream(pdb, writable: false));
+                return new PortablePdbReader(null, provider, describedAs);
+            }
+            catch
+            {
+                return null;
+            }
+        }
 
         public static PortablePdbReader? Open(string modulePath)
         {
@@ -3205,37 +3858,206 @@ public sealed partial class DebugSession : IDebugSession
 
     private sealed class SymbolReader : IDisposable
     {
-        private SymbolReader(SymUnmanagedReader? unmanaged, PortablePdbReader? portable)
+        private SymbolReader(
+            SymUnmanagedReader? unmanaged, PortablePdbReader? portable, string origin, string path)
         {
             Unmanaged = unmanaged;
             Portable = portable;
+            Origin = origin;
+            SymbolPath = path;
         }
 
         public SymUnmanagedReader? Unmanaged { get; }
         public PortablePdbReader? Portable { get; }
 
-        public static SymbolReader? Open(string modulePath, MetaDataImport metadata)
+        /// <summary>Which kind of symbols these are — one of <see cref="SymbolOrigins"/>.</summary>
+        public string Origin { get; }
+
+        /// <summary>The file the symbols were actually read from. Empty when they never were a
+        /// file: embedded in the module, or handed over by the runtime.</summary>
+        public string SymbolPath { get; }
+
+        /// <summary>
+        /// Opens the symbols for a module, saying what happened when it cannot.
+        /// </summary>
+        /// <param name="status">One of <see cref="SymbolStatuses"/>, describing the outcome.</param>
+        /// <param name="detail">Why no reader came back, phrased for the user. Empty on success.
+        /// Reported rather than swallowed because "no symbols" has several causes with different
+        /// fixes, and the difference between them is only visible here.</param>
+        public static SymbolReader? Open(
+            string modulePath, MetaDataImport metadata, out string status, out string detail)
         {
+            status = SymbolStatuses.Loaded;
+            detail = string.Empty;
+            string? windowsProblem = null;
             try
             {
-                return new SymbolReader(CreateUnmanagedSymbolReader(modulePath, metadata), null);
+                var unmanaged = CreateUnmanagedSymbolReader(modulePath, metadata);
+                return new SymbolReader(
+                    unmanaged, null, SymbolOrigins.WindowsPdb, SiblingPdbIfPresent(modulePath));
             }
-            catch
+            catch (Exception ex)
             {
+                // Expected for every portable-PDB module, which is most of them — so it is only
+                // reported if the portable attempt below also comes up empty.
+                windowsProblem = ex.Message;
             }
 
             try
             {
                 var portable = PortablePdbReader.Open(modulePath);
-                return portable is null ? null : new SymbolReader(null, portable);
+                if (portable is not null)
+                {
+                    bool embedded = portable.Path.EndsWith("(embedded)", StringComparison.Ordinal);
+                    return new SymbolReader(
+                        null, portable,
+                        embedded ? SymbolOrigins.EmbeddedPdb : SymbolOrigins.PortablePdb,
+                        embedded ? string.Empty : portable.Path);
+                }
+            }
+            catch (Exception ex)
+            {
+                status = SymbolStatuses.Rejected;
+                detail = $"the module's portable PDB could not be read: {ex.Message}";
+                return null;
+            }
+
+            if (SiblingPdbIfPresent(modulePath) is { Length: > 0 } sibling)
+            {
+                status = SymbolStatuses.Rejected;
+                detail =
+                    $"{System.IO.Path.GetFileName(sibling)} sits beside the module but does not " +
+                    "belong to it — the usual cause is a PDB left from an earlier build, which a " +
+                    "rebuild fixes" +
+                    (windowsProblem is { Length: > 0 } ? $" ({windowsProblem})" : string.Empty);
+            }
+            else
+            {
+                status = SymbolStatuses.NotFound;
+                detail = "the module records no PDB, carries none embedded, and none was found " +
+                         "beside it";
+            }
+
+            return null;
+        }
+
+        /// <summary>The <c>.pdb</c> next to a module, when there is one. Only ever used to explain
+        /// a failure: the readers locate symbols properly, and this guess is what the user sees in
+        /// their output directory.</summary>
+        private static string SiblingPdbIfPresent(string modulePath)
+        {
+            try
+            {
+                var sibling = System.IO.Path.ChangeExtension(modulePath, ".pdb");
+                return File.Exists(sibling) ? sibling : string.Empty;
             }
             catch
             {
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// A reader over symbols the runtime handed over as bytes rather than as a file.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Dynamically emitted modules have no PDB on disk to open — the symbols exist only in the
+        /// debuggee and reach the debugger through the runtime's symbol-update callback. Without
+        /// this, nothing generated at run time is debuggable: expression trees, generated
+        /// serializer assemblies, in-memory view and Razor compilation, and anything else built
+        /// through <c>Reflection.Emit</c>.
+        /// </para>
+        /// <para>
+        /// Both PDB formats arrive here and they need different readers, told apart by the header
+        /// the format itself carries. Portable symbols are read straight from the bytes. A Windows
+        /// PDB has to go through diasymreader, which only opens files, so it is spilled to a
+        /// temporary one — the caller owns deleting it, which is why the path comes back with the
+        /// reader.
+        /// </para>
+        /// </remarks>
+        public static (SymbolReader Reader, string? TempFile)? FromBytes(
+            byte[] pdb, string moduleName, MetaDataImport metadata)
+        {
+            if (pdb.Length < 4)
+                return null;
+
+            // "BSJB": the metadata signature every portable PDB starts with.
+            if (pdb[0] == 0x42 && pdb[1] == 0x53 && pdb[2] == 0x4A && pdb[3] == 0x42)
+            {
+                var portable = PortablePdbReader.FromBytes(pdb, $"{moduleName} (supplied at run time)");
+                return portable is null
+                    ? null
+                    : (new SymbolReader(null, portable, SymbolOrigins.Runtime, string.Empty), null);
+            }
+
+            string? temp = null;
+            try
+            {
+                temp = System.IO.Path.Combine(
+                    System.IO.Path.GetTempPath(),
+                    $"roslyn-sense-dynamic-{Guid.NewGuid():N}.pdb");
+                File.WriteAllBytes(temp, pdb);
+
+                var reader = CreateUnmanagedSymbolReaderFromPdb(temp, metadata);
+                if (reader is null)
+                {
+                    TryDelete(temp);
+                    return null;
+                }
+
+                return (new SymbolReader(reader, null, SymbolOrigins.Runtime, temp), temp);
+            }
+            catch
+            {
+                if (temp is not null)
+                    TryDelete(temp);
                 return null;
             }
         }
 
-        public void Dispose() => Portable?.Dispose();
+        internal static void TryDelete(string path)
+        {
+            try { File.Delete(path); } catch { }
+        }
+
+        /// <summary>
+        /// Closes both kinds of reader, including the COM one.
+        /// </summary>
+        /// <remarks>
+        /// <c>ISymUnmanagedDispose::Destroy</c> is what actually makes diasymreader let go of the
+        /// PDB file; dropping the reference alone leaves it open until some later collection, and
+        /// possibly not even then. That matters beyond tidiness: a PDB spilled to a temporary file
+        /// for a runtime-supplied Windows symbol store cannot be deleted while the reader holds it,
+        /// so without this the session leaks one file per dynamic module — the exact leak the
+        /// spill-and-delete was written to avoid.
+        /// </remarks>
+        public void Dispose()
+        {
+            Portable?.Dispose();
+
+            if (Unmanaged is not { } unmanaged)
+                return;
+
+            try
+            {
+                if (unmanaged.Raw is ISymUnmanagedDispose disposable)
+                    disposable.Destroy();
+            }
+            catch
+            {
+                // A reader that refuses to close is not a reason to abandon the rest of teardown.
+            }
+
+            try
+            {
+                if (Marshal.IsComObject(unmanaged.Raw))
+                    Marshal.ReleaseComObject(unmanaged.Raw);
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static bool IsHiddenSequencePoint(int line) => line == 0xFEEFEE;
@@ -4105,7 +4927,12 @@ public sealed partial class DebugSession : IDebugSession
         // Checked before the cache and never stored in it: the globs can change mid-session,
         // and a cached null would pin the old policy until the module reloads.
         if (!SymbolGlobs.WantsSymbols(_display, moduleName))
+        {
+            _symbolStatus[moduleName] = new SymbolStatusEntry(
+                SymbolStatuses.Excluded, string.Empty, string.Empty,
+                "the symbol settings exclude this module, so no PDB was looked for");
             return null;
+        }
 
         lock (_readers)
         {
@@ -4113,15 +4940,22 @@ public sealed partial class DebugSession : IDebugSession
                 return cached;
         }
         SymbolReader? reader = null;
+        string status, detail;
         try
         {
             var metadata = Extensions.GetMetaDataInterface<MetaDataImport>(module);
-            reader = SymbolReader.Open(moduleName, metadata);
+            reader = SymbolReader.Open(moduleName, metadata, out status, out detail);
         }
-        catch
+        catch (Exception ex)
         {
-            // No PDB for this module.
+            status = SymbolStatuses.Rejected;
+            detail = $"the module's symbols could not be opened: {ex.Message}";
         }
+
+        _symbolStatus[moduleName] = reader is not null
+            ? new SymbolStatusEntry(
+                SymbolStatuses.Loaded, reader.Origin, reader.SymbolPath, string.Empty)
+            : new SymbolStatusEntry(status, string.Empty, string.Empty, detail);
 
         if (reader is null)
             ReportUnusablePdb(moduleName);
@@ -4193,6 +5027,42 @@ public sealed partial class DebugSession : IDebugSession
         var binder = new SymUnmanagedBinder(rawBinder);
         var searchPath = Path.GetDirectoryName(modulePath) ?? Environment.CurrentDirectory;
         return binder.GetReaderForFile(metadata.Raw, modulePath, searchPath);
+    }
+
+    /// <summary>
+    /// A Windows-PDB reader over a PDB file directly, rather than over the module beside it.
+    /// </summary>
+    /// <remarks>
+    /// Used for symbols that never had a module to sit beside — the runtime handed them over for
+    /// a dynamically emitted assembly, and the file they were spilled to is the only thing there
+    /// is to point the binder at.
+    /// </remarks>
+    private static SymUnmanagedReader? CreateUnmanagedSymbolReaderFromPdb(
+        string pdbPath, MetaDataImport metadata)
+    {
+        var clsidCorSymBinderSxs = new Guid("0A29FF9E-7F9C-4437-8B11-F424491E3931");
+        var binderType = Type.GetTypeFromCLSID(clsidCorSymBinderSxs, throwOnError: true)!;
+        var binderObject = Activator.CreateInstance(binderType)!;
+        var binderUnknown = Marshal.GetIUnknownForObject(binderObject);
+        ISymUnmanagedBinder rawBinder;
+        try
+        {
+            rawBinder = Extensions.GetObjectForIUnknown<ISymUnmanagedBinder>(binderUnknown);
+        }
+        finally
+        {
+            Marshal.Release(binderUnknown);
+        }
+
+        var binder = new SymUnmanagedBinder(rawBinder);
+        var directory = Path.GetDirectoryName(pdbPath) ?? Environment.CurrentDirectory;
+
+        // The binder matches a PDB to a module by name, so the module it is told about is the
+        // temporary file's own stem — which is what the PDB was written as.
+        var pretendModule = Path.ChangeExtension(pdbPath, ".dll");
+        return binder.TryGetReaderForFile(metadata.Raw, pretendModule, directory, out var reader) == HRESULT.S_OK
+            ? reader
+            : null;
     }
 
     private static SymbolDocument? FindDocument(SymbolReader reader, string filePath)

@@ -40,10 +40,38 @@ public static class DebugNavigationTool
             var sb = new StringBuilder();
             sb.AppendLine($"**{modules.Count} module(s)**");
             sb.AppendLine();
-            sb.AppendLine("| Module | Symbols | Path |");
-            sb.AppendLine("|--------|---------|------|");
+            sb.AppendLine("| Module | Symbols | Source | Path |");
+            sb.AppendLine("|--------|---------|--------|------|");
             foreach (var module in modules.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
-                sb.AppendLine($"| {module.Name} | {(module.SymbolsLoaded ? "yes" : "**no**")} | {module.Path} |");
+            {
+                // The status word when the engine gives one: "not found" and "rejected" have
+                // opposite fixes, and a bare "no" hides which of them this is.
+                string symbols = module.SymbolStatus is { Length: > 0 } status
+                    ? module.SymbolsLoaded ? status : $"**{status}**"
+                    : module.SymbolsLoaded ? "yes" : "**no**";
+                string origin = module.SymbolOrigin is { Length: > 0 } from
+                    ? from
+                    : module.SymbolPath;
+                sb.AppendLine($"| {module.Name} | {symbols} | {origin} | {module.Path} |");
+            }
+
+            // Only for what did not load, and only once per distinct reason: the same stale-PDB
+            // sentence repeated for forty modules buries the one that differs.
+            var reasons = modules
+                .Where(m => !m.SymbolsLoaded && m.SymbolDetail is { Length: > 0 })
+                .GroupBy(m => m.SymbolDetail, StringComparer.Ordinal)
+                .ToList();
+            if (reasons.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("**Why symbols are missing**");
+                sb.AppendLine();
+                foreach (var reason in reasons)
+                {
+                    var names = reason.Select(m => m.Name).OrderBy(n => n, StringComparer.OrdinalIgnoreCase);
+                    sb.AppendLine($"- {string.Join(", ", names)}: {reason.Key}");
+                }
+            }
 
             return sb.ToString();
         }

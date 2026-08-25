@@ -45,8 +45,22 @@ public static class DebuggerAttributes
     public const string Hidden = "System.Diagnostics.DebuggerHiddenAttribute";
     public const string NonUserCode = "System.Diagnostics.DebuggerNonUserCodeAttribute";
 
-    /// <summary>The attributes that mark a method as somebody else's code.</summary>
+    /// <summary>The attributes that mark a method as somebody else's code to step through.</summary>
+    /// <remarks>
+    /// All three mean "do not stop here while stepping", which is why they share one list. They do
+    /// not all mean "do not show this" — see <see cref="HiddenMarkers"/>.
+    /// </remarks>
     public static readonly string[] StepOverMarkers = [StepThrough, Hidden, NonUserCode];
+
+    /// <summary>The attributes that mark a frame as not worth showing in a call stack.</summary>
+    /// <remarks>
+    /// <c>DebuggerStepThrough</c> is deliberately absent. It says "do not step into this", not
+    /// "pretend it is not there": a breakpoint inside such a method still stops, and when it does,
+    /// the frame the user is standing in must appear in their call stack. <c>DebuggerHidden</c> and
+    /// <c>DebuggerNonUserCode</c> do mean the frame is plumbing, and folding them away is what
+    /// keeps a stack through generated or proxy code readable.
+    /// </remarks>
+    public static readonly string[] HiddenMarkers = [Hidden, NonUserCode];
 
     /// <summary>Whether <paramref name="token"/> carries the named attribute at all.</summary>
     public static bool Has(MetaDataImport metadata, mdToken token, string attributeName) =>

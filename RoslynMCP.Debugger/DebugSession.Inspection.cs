@@ -847,6 +847,8 @@ public sealed partial class DebugSession
         var variables = new List<DebugVariable>();
         if (CurrentExceptionValue() is { } exception)
             variables.Add(Row(ExceptionMarker, exception, "exception", ExceptionMarker));
+        if (ReturnValueRow(ilFrame) is { } returned)
+            variables.Add(returned);
 
         var (argNames, localNames) = FrameSymbolNames(ilFrame);
         var slots = new List<(string Name, CorDebugValue Value, string Kind)>();
@@ -1825,5 +1827,295 @@ public sealed partial class DebugSession
         // The step this origin belonged to is over, however it ended. Left set, it would let a
         // later stop be mistaken for that step landing back where it began.
         _stepOrigin = null;
+        DisarmReturnProbes();
     }
+
+    // --- return values --------------------------------------------------------------------------
+
+    /// <summary>Pseudo-variable naming what the call the step just went over returned.</summary>
+    internal const string ReturnMarker = "$return";
+
+    /// <summary>
+    /// How many calls on one line are worth watching.
+    /// </summary>
+    /// <remarks>
+    /// Each one costs breakpoints armed and disarmed around every step, and a line with more calls
+    /// than this is one where naming which return value is being shown stops being possible anyway.
+    /// </remarks>
+    private const int MaxReturnProbes = 8;
+
+    /// <summary>A breakpoint armed where a call's return value is still readable.</summary>
+    /// <param name="CallOffset">The IL offset of the call itself, which is what the runtime wants
+    /// back when asked for the value — not the offset the breakpoint sits at.</param>
+    private sealed record ReturnProbe(
+        int ThreadId,
+        int MethodToken,
+        string ModuleName,
+        int CallOffset,
+        string Callee,
+        CorDebugFunctionBreakpoint Breakpoint);
+
+    /// <summary>Guarded by <see cref="_stepperLock"/>, like the steppers they belong to.</summary>
+    private readonly List<ReturnProbe> _returnProbes = [];
+
+    /// <summary>What the last step's call returned, held until the next step replaces it.</summary>
+    private volatile CapturedReturn? _returnValue;
+
+    /// <param name="Handle">A strong handle, so the value survives the continue that takes the step
+    /// on to where it was going. Null for anything not on the heap.</param>
+    /// <param name="Text">Set instead of <paramref name="Handle"/> for a value that cannot be
+    /// handled — a primitive or a struct — read at the moment it was still live.</param>
+    private sealed record CapturedReturn(
+        int ThreadId, string Callee, CorDebugHandleValue? Handle, string Text, string Type);
+
+    /// <summary>
+    /// Arms a breakpoint wherever a call in this statement leaves its return value readable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The answer to "what did that just return?", which otherwise costs the user an edit to
+    /// introduce a local, a rebuild, and the loss of the state they were looking at.
+    /// </para>
+    /// <para>
+    /// Not a breakpoint at the callee's return: by the time the caller resumes, the value is in
+    /// whatever register or stack slot the calling convention chose and nothing can name it. The
+    /// runtime is asked instead — it knows where the value lives and for how long, and answers with
+    /// the native offsets at which it can still be read.
+    /// </para>
+    /// </remarks>
+    private void ArmReturnProbes(CorDebugFrame frame, int threadId, COR_DEBUG_STEP_RANGE range)
+    {
+        var function = Safe(() => frame.Function);
+        var ilCode = Safe(() => function?.ILCode);
+        var nativeCode = Safe(() => function?.NativeCode);
+        if (function is null || ilCode is null || nativeCode is null)
+            return;
+
+        var size = Safe(() => (int?)ilCode.Size) ?? 0;
+        if (size <= 0)
+            return;
+
+        var il = Safe(() => ilCode.GetCode(0, size, size));
+        if (il is not { Length: > 0 })
+            return;
+
+        var token = Safe(() => (int?)function.Token) ?? 0;
+        var moduleName = Safe(() => function.Module.Name) ?? string.Empty;
+        var metadata = Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(function.Module));
+
+        foreach (var call in IlCallSites.Between(il, (int)range.startOffset, (int)range.endOffset))
+        {
+            // newobj's result is the object it just made, which is on the stack and named by the
+            // expression — there is nothing here the user cannot already see.
+            if (call.ConstructsAnObject)
+                continue;
+
+            int[] offsets;
+            try
+            {
+                if (nativeCode.TryGetReturnValueLiveOffset(call.Offset, out offsets) != HRESULT.S_OK)
+                    continue;
+            }
+            catch
+            {
+                // A void call has no live offset, and neither does a call the JIT inlined. Both are
+                // ordinary and neither is worth narrating.
+                continue;
+            }
+
+            var callee = CalleeName(metadata, call.Token);
+            foreach (var native in offsets ?? [])
+            {
+                lock (_stepperLock)
+                {
+                    if (_returnProbes.Count >= MaxReturnProbes)
+                        return;
+                }
+
+                try
+                {
+                    var breakpoint = nativeCode.CreateBreakpoint(native);
+                    breakpoint.Activate(true);
+                    lock (_stepperLock)
+                    {
+                        _returnProbes.Add(new ReturnProbe(
+                            threadId, token, moduleName, call.Offset, callee, breakpoint));
+                    }
+                }
+                catch
+                {
+                    // Nothing armed is nothing to clean up, and a step with no return value is the
+                    // behaviour this replaced.
+                }
+            }
+        }
+    }
+
+    /// <summary>The name of the method a call token names, for labelling the value it returned.</summary>
+    private static string CalleeName(MetaDataImport? metadata, int token)
+    {
+        if (metadata is null || token == 0)
+            return string.Empty;
+
+        // MethodDef for a call within the module, MemberRef for one outside it — the two the C#
+        // compiler emits, and the two that carry a name to read.
+        var name = Safe(() => metadata.GetMethodProps(new mdMethodDef((uint)token)).szMethod)
+            ?? Safe(() => metadata.GetMemberRefProps(new mdMemberRef((uint)token)).szMember);
+
+        return name ?? string.Empty;
+    }
+
+    /// <summary>
+    /// Reads and keeps the return value if this stop is one of the step's own probes.
+    /// </summary>
+    /// <returns>Whether this was a probe, in which case the caller must resume rather than report a
+    /// stop — the user pressed Step, not Continue, and this breakpoint is the engine's own.</returns>
+    private bool TryCaptureReturnValue(CorDebugThread thread, CorDebugBreakpoint? breakpoint)
+    {
+        ReturnProbe[] probes;
+        lock (_stepperLock)
+            probes = [.. _returnProbes];
+
+        if (probes.Length == 0)
+            return false;
+
+        // By identity, and only against a breakpoint of the same kind — comparing across the
+        // breakpoint types is an invalid cast inside the wrapper's own equality, not a false.
+        if (breakpoint is not CorDebugFunctionBreakpoint hit)
+            return false;
+
+        if (probes.FirstOrDefault(p => p.Breakpoint.Equals(hit)) is not { } probe)
+            return false;
+
+        // A native breakpoint is armed in the code, not in a thread, so any thread running the same
+        // method hits it — which for a web application serving concurrent requests is routine. It is
+        // still the engine's own breakpoint and must still be resumed silently: reported as a stop
+        // it would be a breakpoint the user never set, at a line they were not looking at, and it
+        // would cancel the step they actually asked for.
+        var threadId = ThreadId(thread);
+        if (threadId != probe.ThreadId)
+            return true;
+
+        try
+        {
+            if (thread.ActiveFrame is CorDebugILFrame frame &&
+                frame.TryGetReturnValueForILOffset(probe.CallOffset, out var value) == HRESULT.S_OK &&
+                value is not null)
+            {
+                _returnValue = Capture(threadId, probe.Callee, value);
+            }
+        }
+        catch
+        {
+            // The value could not be read where the runtime said it would be. Nothing to report,
+            // and the step must still go on.
+        }
+
+        // Every probe for this step, not just this one: the value has been taken, and leaving the
+        // rest armed would stop the step again at the next call on the same line.
+        DisarmReturnProbes();
+        return true;
+    }
+
+    /// <summary>
+    /// Takes a value that is about to stop being readable and keeps what can be kept of it.
+    /// </summary>
+    /// <remarks>
+    /// A handle where one can be made, because that keeps the object itself — expandable in the
+    /// variables view like any other. Everything else is read to text on the spot, since a
+    /// primitive lives in a register the continue is about to reuse. The text is read without
+    /// display attributes: this runs on the runtime's callback thread in the middle of a step, and
+    /// a <c>DebuggerDisplay</c> getter evaluated there runs the debuggee's own code at a moment
+    /// nobody chose.
+    /// </remarks>
+    private CapturedReturn Capture(int threadId, string callee, CorDebugValue value)
+    {
+        var type = TypeNameOf(value);
+        var heap = value is CorDebugReferenceValue reference && Safe(() => (bool?)reference.IsNull) != true
+            ? Safe(() => reference.Dereference()) as CorDebugHeapValue
+            : value as CorDebugHeapValue;
+
+        if (heap is not null &&
+            Safe(() => heap.TryCreateHandle(CorDebugHandleType.HANDLE_STRONG, out var h) == HRESULT.S_OK ? h : null)
+                is { } handle)
+        {
+            return new CapturedReturn(threadId, callee, handle, string.Empty, type);
+        }
+
+        return new CapturedReturn(
+            threadId, callee, null, DescribeValue(value, applyDisplay: false), type);
+    }
+
+    /// <summary>Removes the step's probes from the target, whether or not one of them fired.</summary>
+    private void DisarmReturnProbes()
+    {
+        ReturnProbe[] probes;
+        lock (_stepperLock)
+        {
+            if (_returnProbes.Count == 0)
+                return;
+            probes = [.. _returnProbes];
+            _returnProbes.Clear();
+        }
+
+        foreach (var probe in probes)
+        {
+            try { probe.Breakpoint.Activate(false); }
+            catch { }
+        }
+    }
+
+    /// <summary>
+    /// Forgets the value the previous step captured, and releases the handle holding it alive.
+    /// </summary>
+    /// <remarks>
+    /// A strong handle is exactly as strong as it sounds: left behind, it keeps the returned object
+    /// out of the collector's reach for the rest of the session, once per step the user takes.
+    /// </remarks>
+    private void ReleaseReturnValue()
+    {
+        var captured = Interlocked.Exchange(ref _returnValue, null);
+        if (captured?.Handle is { } handle)
+        {
+            try { handle.Dispose(); }
+            catch { }
+        }
+    }
+
+    /// <summary>
+    /// The row for the value the step went over, or none when this frame did not make that call.
+    /// </summary>
+    /// <remarks>
+    /// Offered on the stepping thread's leaf frame only. It belongs to the statement the step just
+    /// finished, and showing it against a caller's frame — or against a frame in another thread the
+    /// user happened to select — would attach it to a line that never made the call.
+    /// </remarks>
+    private DebugVariable? ReturnValueRow(CorDebugILFrame frame)
+    {
+        if (_returnValue is not { } captured || captured.ThreadId != ThreadOf(frame))
+            return null;
+
+        // The leaf, not merely the right thread: the value belongs to the statement the step
+        // finished on, and a caller's frame is a line that never made the call.
+        if (Safe(() => frame.Chain.Thread.ActiveFrame) is { } leaf && !leaf.Equals(frame))
+            return null;
+
+        var name = captured.Callee.Length > 0 ? $"{ReturnMarker} ({captured.Callee})" : ReturnMarker;
+        if (captured.Handle is { } handle)
+            return Row(name, handle, "return", ReturnMarker);
+
+        return new DebugVariable
+        {
+            Name = name,
+            Value = captured.Text,
+            Kind = "return",
+            Type = captured.Type,
+            VariablesReference = string.Empty,
+            Settable = false,
+        };
+    }
+
+    /// <summary>Which thread a frame is on, by way of its chain — a frame does not name one.</summary>
+    private static int ThreadOf(CorDebugFrame frame) =>
+        Safe(() => (int?)ThreadId(frame.Chain.Thread)) ?? 0;
 }

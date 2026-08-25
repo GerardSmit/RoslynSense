@@ -38,6 +38,16 @@ public sealed partial class DebugSession : IDebugSession
     /// siblings so the hashing is paid once per build root rather than once per file.</summary>
     private readonly ConcurrentDictionary<string, string> _pathRewrites = new(StringComparer.OrdinalIgnoreCase);
     private readonly BlockingCollection<Action> _commands = new();
+
+    /// <summary>
+    /// Watches the thread every command below runs on.
+    /// </summary>
+    /// <remarks>
+    /// Everything a client asks of this session is marshalled onto that one thread, so one stuck
+    /// ICorDebug call stops the whole session with nothing to show for it. See
+    /// <see cref="SessionWatchdog"/>: it reports and takes a dump, and never intervenes.
+    /// </remarks>
+    private readonly SessionWatchdog _watchdog;
     private readonly ManualResetEventSlim _ready = new();
     /// PDB readers are expensive to create; one per module path, session-thread only.
     /// How long Break All waits for the CLR to reach a point where it can suspend. Zero would
@@ -103,7 +113,14 @@ public sealed partial class DebugSession : IDebugSession
     /// Modules already reported as symbol-less (one diagnostic per module, not per breakpoint).
     private readonly HashSet<string> _noSymbolsReported = new(StringComparer.OrdinalIgnoreCase);
 
-    public DebugSession(uint id) => Id = id;
+    public DebugSession(uint id)
+    {
+        Id = id;
+        // Narrated through the same event stream as everything else, so a wedged session says so
+        // where the user is already looking rather than in a log they would have to know to read.
+        _watchdog = new SessionWatchdog(message =>
+            Emit(DebugEventKind.Diagnostic, message, string.Empty, 0));
+    }
 
     public ChannelReader<DebugEvent> Events => _events.Reader;
 
@@ -198,6 +215,11 @@ public sealed partial class DebugSession : IDebugSession
     {
         if (_process is not { } process)
             return;
+
+        // Names the work for the watchdog. Every command reaching here already says what it is
+        // trying to do, so a report about a session that stopped responding can say what it stopped
+        // responding in the middle of rather than that something did.
+        _watchdog.Starting(what);
 
         if (_stoppedThread is not null)
         {
@@ -353,6 +375,7 @@ public sealed partial class DebugSession : IDebugSession
             foreach (var module in LoadedModules())
                 TryBindBreakpoint(module, spec);
             _stoppedThread = null;
+            ReleaseReturnValue();
             try { _process?.Continue(false); } catch { }
             return new RunToLocationResponse { Ok = true, Location = resolved };
         });
@@ -523,6 +546,10 @@ public sealed partial class DebugSession : IDebugSession
     {
         _stoppedOnException = false;
         _stoppedThread = null;
+        // The value the last step captured belongs to that step. Once the target runs on, the next
+        // stop is somewhere else entirely, and a row still labelled with the old call would be
+        // attached to a line that never made it.
+        ReleaseReturnValue();
         try { _process?.Continue(false); } catch { }
     });
 
@@ -631,6 +658,10 @@ public sealed partial class DebugSession : IDebugSession
         try
         {
             var frame = thread.ActiveFrame;
+            // Whatever the last step found out is about the last step. Released before this one is
+            // armed so the handle keeping that object alive is let go once per step, not once per
+            // session.
+            ReleaseReturnValue();
             var stepper = frame.CreateStepper();
             stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
             stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
@@ -679,6 +710,11 @@ public sealed partial class DebugSession : IDebugSession
             }
             lock (_stepperLock)
                 _steppers.Add((steppingThread, stepper));
+            // After the stepper, so a failure to arm the step leaves nothing watching for a value
+            // that is never going to be returned. Step Out is excluded: its statement is the
+            // caller's, and the call it is returning from has not finished making its value yet.
+            if (source is { } watched && kind is not StepKind.Out)
+                ArmReturnProbes(frame, steppingThread, watched);
             _stoppedOnException = false;
             _stoppedThread = null;
             _process?.Continue(false);
@@ -1223,8 +1259,8 @@ public sealed partial class DebugSession : IDebugSession
             var (name, indexes, isCall) = ParseSegment(segments[s]);
             if (s == 0)
             {
-                current = name == ExceptionMarker && CurrentExceptionValue() is { } thrown
-                    ? thrown
+                current = name == ExceptionMarker && CurrentExceptionValue() is { } thrown ? thrown
+                    : name == ReturnMarker && _returnValue?.Handle is { } returned ? returned
                     : isCall ? null : RootValue(ilFrame, name, argNames, localNames);
 
                 // Not an argument or local: it may be a member of `this`, which is how a member is
@@ -2201,6 +2237,10 @@ public sealed partial class DebugSession : IDebugSession
         Enqueue(() =>
         {
             var process = _process;
+            // Before the terminate, while the handle can still be disposed at all. A killed target
+            // makes this moot, but this path is also how a session that turns out to be detachable
+            // ends, and a handle released here can never be one left behind.
+            ReleaseReturnValue();
             try { process?.Terminate(0); } catch { }
 
             // A session almost always ends while stopped at a breakpoint. Terminating a stopped
@@ -2228,6 +2268,11 @@ public sealed partial class DebugSession : IDebugSession
         // ShutdownCorDebug for what a session that skips it does to the next one — and with the
         // session thread joined and the target gone, nothing is left to race here.
         ShutdownCorDebug();
+
+        // Last, because the thread it watches is only certainly finished once the join above has
+        // returned — and a watchdog disposed early would have nothing to say about a teardown that
+        // is itself where the session hung.
+        _watchdog.Dispose();
     }
 
     /// <summary>
@@ -2307,6 +2352,12 @@ public sealed partial class DebugSession : IDebugSession
             _bound.Clear();
             _boundSpecs.Clear();
             DeactivateSteppers();
+            // The handle keeping the last step's return value readable is a strong handle in the
+            // debuggee, and the debuggee survives this. Left behind it pins that object and
+            // everything it reaches for the life of the process — with the debugging interface
+            // gone, nothing can ever dispose it — and an outstanding handle is one more thing
+            // Detach itself can refuse over.
+            ReleaseReturnValue();
             _stoppedThread = null;
             process.Detach();
             _process = null;
@@ -2451,6 +2502,13 @@ public sealed partial class DebugSession : IDebugSession
             };
             callback.OnBreakpoint += (_, e) =>
             {
+                // The engine's own breakpoint, armed to read what a call returned before the value
+                // stops being readable. Not a stop: the user pressed Step, and the step goes on.
+                if (TryCaptureReturnValue(e.Thread, e.Breakpoint))
+                {
+                    try { e.Controller.Continue(false); } catch { }
+                    return;
+                }
                 // The runtime can deliver a breakpoint event whose thread has already run on —
                 // observed against IIS Express when a breakpoint arms while requests are in
                 // flight: the callback arrives after the response went out, and the thread's
@@ -2680,8 +2738,10 @@ public sealed partial class DebugSession : IDebugSession
         {
             foreach (var command in _commands.GetConsumingEnumerable())
             {
+                _watchdog.Starting("running a client command");
                 try { command(); }
                 catch (Exception ex) { Console.Error.WriteLine($"[debug] command failed: {ex.Message}"); }
+                finally { _watchdog.Finished(); }
             }
         }
         catch (InvalidOperationException)

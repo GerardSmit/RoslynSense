@@ -634,6 +634,10 @@ public sealed partial class DebugSession : IDebugSession
             var stepper = frame.CreateStepper();
             stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
             stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            // The user's step, so it is the one that may be filtered. When the runtime can do it,
+            // a step into a property that is twenty frames of framework code never surfaces as
+            // twenty step completes to reject — it lands where the user expected, once.
+            SetStepperJustMyCode(stepper, CanStepWithRuntimeJustMyCode(frame));
             _stepOutBudget = MaxStepOuts;
             // A stepper only ever completes on the thread it was armed on, so anything arriving
             // for another thread belongs to a stepper we no longer care about.
@@ -2424,6 +2428,7 @@ public sealed partial class DebugSession : IDebugSession
                 // JIT flag inside RegisterEncModule: ApplyChanges runs against the whole
                 // process, and an unflagged module is a way for it to fault rather than fail.
                 RegisterEncModule(e.Module, moduleName, generated);
+                MarkJustMyCode(e.Module, moduleName);
                 foreach (var spec in SpecsSnapshot())
                     TryBindBreakpoint(e.Module, spec);
                 if (!generated)
@@ -2946,19 +2951,6 @@ public sealed partial class DebugSession : IDebugSession
 
     // --- EnC / module lifecycle -----------------------------------------------------------------
 
-    /// True for the user's own assemblies (EnC/diagnostic targets): everything except framework/
-    /// GAC modules — but WebForms shadow copies under "Temporary ASP.NET Files" (which live
-    /// below the Framework directory) DO count.
-    internal static bool IsUserModule(string moduleName)
-    {
-        var lower = moduleName.ToLowerInvariant();
-        if (lower.Contains("temporary asp.net files"))
-            return true;
-        return !lower.Contains(@"\microsoft.net\framework")
-            && !lower.Contains(@"\windows\assembly\")
-            && !lower.Contains(@"\gac_");
-    }
-
     /// True for an App_Web_*.dll the ASP.NET page compiler generated. These hold nothing but
     /// markup-generated classes and inline &lt;% %&gt; code, so only a breakpoint in a markup
     /// file can ever bind in one — everything else the debugger would do per module (EnC
@@ -3024,6 +3016,131 @@ public sealed partial class DebugSession : IDebugSession
 
         _encModules[assemblyName] = module;
         QueueHistoryReplay(module, assemblyName);
+    }
+
+    // --- Just My Code, as the runtime sees it ---------------------------------------------------
+
+    /// <summary>
+    /// The modules the runtime accepted as <em>the user's</em>, by module path.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A set rather than a count, because the hazard it guards against is per-module. A JMC step
+    /// runs until a method marked as the user's executes, so arming one in a frame whose own module
+    /// was never accepted is not a filtered step — it is a continue. The thread runs on, no step
+    /// complete is ever delivered, and the engine's own filtering never gets a chance to help
+    /// because it only ever filters completes that arrive.
+    /// </para>
+    /// <para>
+    /// "Somewhere in the process is marked" does not rule that out: a solution that builds one
+    /// project in Debug and another optimized has exactly one of those modules in here, and a step
+    /// taken in the other is the case that hangs.
+    /// </para>
+    /// </remarks>
+    private readonly ConcurrentDictionary<string, byte> _jmcUserModules =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Tells the runtime whether a module is the user's, so its own Just My Code stepping has
+    /// something to filter on.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Marking is not advice the runtime can ignore or infer: an unmarked method is not the user's
+    /// as far as a JMC step is concerned, so every module has to be marked one way or the other
+    /// before any of it means anything.
+    /// </para>
+    /// <para>
+    /// Optimized and NGen'd images refuse it — their methods are not debuggable in the sense JMC
+    /// requires — and that refusal is expected rather than a failure. It is also why the engine's
+    /// own filtering of step completes stays: the runtime cannot filter what it was not allowed to
+    /// mark, and a step that lands in an optimized framework image still has to be stepped back out
+    /// of by hand.
+    /// </para>
+    /// </remarks>
+    private void MarkJustMyCode(CorDebugModule module, string moduleName)
+    {
+        if (moduleName.Length == 0)
+            return;
+
+        // Unknown is marked as the user's, matching what every other reading of it does: a module
+        // nothing could classify is one a step should be willing to stop in.
+        bool user = _userCode.Classify(moduleName) != UserCodeVerdict.External;
+
+        HRESULT marked;
+        try { marked = module.TrySetJMCStatus(user, 0, []); }
+        catch { marked = HRESULT.E_FAIL; }
+
+        // Only a clean acceptance counts. Anything else means at least some of the module's methods
+        // were not marked, and this set answers "could a step armed here ever complete" — which a
+        // partial answer does not settle.
+        if (user && marked == HRESULT.S_OK)
+            _jmcUserModules[moduleName] = 0;
+        else
+            _jmcUserModules.TryRemove(moduleName, out _);
+    }
+
+    /// <summary>
+    /// Re-marks every loaded module after the answer to "is this the user's" has changed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The solution arrives with the display options, which can be replaced mid-session — and by
+    /// then most of the process is already loaded and marked against whatever was known before.
+    /// The runtime keeps a marking until it is told otherwise, so without this a session that
+    /// opened its solution late would step by the old answer for the rest of its life.
+    /// </para>
+    /// <para>
+    /// Queued onto the session thread and taken through a stop, because the options are replaced by
+    /// whichever thread the settings change arrived on and say nothing about whether the target is
+    /// running. Enumerating a running process yields nothing at all — the failure is swallowed as a
+    /// missing module list rather than raised — so doing this inline would quietly re-mark nothing
+    /// while believing it had re-marked everything.
+    /// </para>
+    /// </remarks>
+    private void RemarkLoadedModules()
+    {
+        if (_process is null)
+            return;
+
+        Enqueue(() => WhileSynchronized("apply the user-code classification", () =>
+        {
+            var seen = new List<(CorDebugModule Module, string Name)>();
+            foreach (var module in LoadedModules())
+            {
+                if (Safe(() => module.Name) is { Length: > 0 } name)
+                    seen.Add((module, name));
+            }
+
+            // Nothing enumerated is not the same as nothing loaded. Rather than clear what is known
+            // and mark nothing in its place — which would leave the runtime holding the old answer
+            // while this believed it held the new one — leave the previous marking standing.
+            if (seen.Count == 0)
+                return;
+
+            _jmcUserModules.Clear();
+            foreach (var (module, name) in seen)
+                MarkJustMyCode(module, name);
+        }));
+    }
+
+    /// <summary>
+    /// Whether a step armed in this frame can be left to the runtime's own Just My Code.
+    /// </summary>
+    /// <remarks>
+    /// Three things have to hold, and any one of them missing makes a JMC stepper worse than no
+    /// stepper at all: the user wants the filtering, the solution said which assemblies are theirs
+    /// (without it nothing is marked as the user's, and a filtered step never finds anywhere to
+    /// stop), and <em>this frame's own module</em> was accepted — see <see cref="_jmcUserModules"/>
+    /// for why the last one is not a question about the process as a whole.
+    /// </remarks>
+    private bool CanStepWithRuntimeJustMyCode(CorDebugFrame frame)
+    {
+        if (!_display.JustMyCode || !_userCode.KnowsTheSolution)
+            return false;
+
+        var moduleName = Safe(() => frame.Function?.Module?.Name);
+        return moduleName is { Length: > 0 } && _jmcUserModules.ContainsKey(moduleName);
     }
 
     /// One-time "no symbols" diagnostic per user module, only when source breakpoints exist —

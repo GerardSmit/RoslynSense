@@ -103,7 +103,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         try
         {
             _engine = DebugEngineFactory.ForProcess(pid);
-            Engine.SetDisplayOptions(Config.DebuggerViewOptions.Current);
+            PushViewOptions(Config.DebuggerViewOptions.Current);
             StartPump();
             _state = DebuggerService.DebugState.Starting;
             Engine.Attach(pid, specs, EngineRuntime.NetFramework);
@@ -155,7 +155,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             // The engine has to match the *target's* bitness, and a Framework build can be x86
             // while this host is x64; the factory picks the worker from the executable itself.
             _engine = DebugEngineFactory.ForExecutable(executable);
-            Engine.SetDisplayOptions(Config.DebuggerViewOptions.Current);
+            PushViewOptions(Config.DebuggerViewOptions.Current);
             StartPump();
             _state = DebuggerService.DebugState.Starting;
             Engine.Launch(
@@ -421,11 +421,108 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (_engine is null)
             return;
 
-        _engine.SetDisplayOptions(options);
+        PushViewOptions(options);
 
         // The numbers already handed out describe values filtered under the old policy; a proxy
         // that just went away leaves paths that no longer resolve.
         _handles.Reset();
+    }
+
+    /// <summary>The assembly list the engine was last told about, so a re-push that would say the
+    /// same thing can be skipped.</summary>
+    private string[] _pushedUserAssemblies = [];
+
+    /// <summary>Sends a view policy to the engine with the solution's assemblies attached.</summary>
+    private void PushViewOptions(RoslynMCP.Debugger.DebugDisplayOptions options)
+    {
+        var full = WithUserAssemblies(options);
+        _pushedUserAssemblies = full.UserAssemblies;
+        Engine.SetDisplayOptions(full);
+    }
+
+    /// <summary>
+    /// Re-sends the view policy when the solution has come to say something different about which
+    /// assemblies are the user's.
+    /// </summary>
+    /// <remarks>
+    /// Called at every stop, because attaching to a process and opening the solution afterwards is
+    /// an ordinary order to do things in — and the only other things that push a policy are the
+    /// session starting and a settings change, neither of which the user has any reason to perform
+    /// just because a workspace finished loading. Skipped when the answer has not changed, so the
+    /// usual stop costs one list comparison.
+    /// </remarks>
+    private void RefreshUserAssemblies()
+    {
+        if (_engine is null)
+            return;
+
+        try
+        {
+            var options = WithUserAssemblies(Config.DebuggerViewOptions.Current);
+            if (SameAssemblies(options.UserAssemblies, _pushedUserAssemblies))
+                return;
+
+            _pushedUserAssemblies = options.UserAssemblies;
+            _engine.SetDisplayOptions(options);
+        }
+        catch
+        {
+            // A workspace that cannot be read is the case this already falls back to: the engine
+            // keeps the policy it has, which classifies by directory alone.
+        }
+    }
+
+    private static bool SameAssemblies(string[] left, string[] right)
+    {
+        if (left.Length != right.Length)
+            return false;
+
+        // By set, not by order: the projects come out of the workspace in whatever order it holds
+        // them, and a reordering is not a change worth re-marking every module for.
+        return left.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .SequenceEqual(
+                right.OrderBy(p => p, StringComparer.OrdinalIgnoreCase),
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Adds the open solution's output assemblies to a view policy, which is what turns Just My
+    /// Code from a guess about paths into a fact about this solution.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Read here rather than in the engine because the engine is often not in this process at all:
+    /// a 32-bit target is debugged from a worker that has no workspace, no MSBuild, and no way to
+    /// ask. Sending the names along with the rest of the policy is what makes a worker session
+    /// filter the same way an in-process one does.
+    /// </para>
+    /// <para>
+    /// No solution open leaves the list empty, which the engine reads as "nothing is known" rather
+    /// than "nothing is the user's" — the difference between filtering by fact and hiding
+    /// everything.
+    /// </para>
+    /// </remarks>
+    private static RoslynMCP.Debugger.DebugDisplayOptions WithUserAssemblies(
+        RoslynMCP.Debugger.DebugDisplayOptions options)
+    {
+        string[] assemblies;
+        try
+        {
+            assemblies = WorkspaceService.TryGetMostRecentSolution() is { } solution
+                ? [.. solution.Projects
+                    .Select(p => p.OutputFilePath)
+                    .Where(p => p is { Length: > 0 })
+                    .Select(p => p!)]
+                : [];
+        }
+        catch
+        {
+            assemblies = [];
+        }
+
+        var copy = options.Clone();
+        copy.UserAssemblies = assemblies;
+        return copy;
     }
 
     // --- Structured views ---
@@ -1024,6 +1121,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                         }
                         _selectedFrame = 0;
                         _state = DebuggerService.DebugState.Stopped;
+                        // The one moment the engine can safely re-mark modules, and the moment a
+                        // workspace opened since the attach first matters.
+                        RefreshUserAssemblies();
                         Interlocked.Increment(ref _stopSequence);
                         // Raised before the release so a listener sees the stop even when nothing
                         // was waiting for one — which is every breakpoint hit in a running app.

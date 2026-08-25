@@ -49,6 +49,12 @@ public sealed partial class DebugSession
     private DebugDisplayOptions _display = new();
 
     /// <summary>
+    /// Which modules hold the user's code, rebuilt whenever the options carrying the solution's
+    /// assemblies are replaced.
+    /// </summary>
+    private volatile UserCodeMap _userCode = UserCodeMap.None;
+
+    /// <summary>
     /// Which debugger attributes this session honours. Replaceable at any time, including while
     /// stopped, so a display string that looks wrong can be switched off and the raw fields read
     /// without restarting the target.
@@ -56,8 +62,20 @@ public sealed partial class DebugSession
     public DebugDisplayOptions DisplayOptions
     {
         get => _display;
-        set => _display = value ?? new DebugDisplayOptions();
+        set
+        {
+            _display = value ?? new DebugDisplayOptions();
+            _userCode = UserCodeMap.From(_display.UserAssemblies);
+            // Already-loaded modules were marked against the previous answer, and the runtime keeps
+            // that marking until it is told otherwise.
+            RemarkLoadedModules();
+        }
     }
+
+    /// <summary>Whether this module could hold code the user wrote.</summary>
+    /// <remarks>Instance rather than static because the answer depends on which solution is open.
+    /// Fail-open: a module nothing could classify counts as the user's.</remarks>
+    internal bool IsUserModule(string moduleName) => _userCode.CouldBeUserCode(moduleName);
 
     /// <summary>
     /// Guards against a <c>DebuggerDisplay</c> whose expressions describe values that are
@@ -1471,11 +1489,11 @@ public sealed partial class DebugSession
     /// </remarks>
     private const int MaxStepOuts = 32;
 
-    // Deliberately not ICorDebugStepper2::SetJMC. The runtime's own Just My Code needs every user
-    // module marked through SetJMCStatus first, and an unmarked process is one where *nothing* is
-    // user code — so a JMC step never finds anywhere to stop and simply never completes, which is
-    // exactly what it did here. Filtering the step completes ourselves needs no cooperation from
-    // the runtime and behaves the same on an optimized module, which cannot be marked at all.
+    // The runtime's own Just My Code is used when it can be — see MarkJustMyCode — but never
+    // relied on. It needs every module marked through SetJMCStatus first, and an optimized or
+    // NGen'd image cannot be marked at all, so a process always has some code the runtime will
+    // happily stop in. Filtering the step completes here as well is what covers that, and it is
+    // also the whole of the behaviour when no solution says which assemblies are the user's.
 
     private int _stepOutBudget;
 
@@ -1645,6 +1663,10 @@ public sealed partial class DebugSession
             var stepper = thread.ActiveFrame.CreateStepper();
             stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
             stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            // Explicitly not a Just My Code stepper. This step exists precisely because the thread
+            // is somewhere the user did not write, and a JMC step out of non-user code is a step
+            // whose stopping condition is already false where it starts.
+            SetStepperJustMyCode(stepper, false);
             stepper.StepOut();
             // Still the same logical step, so _steppingThreadId is left alone: this step-out is
             // how the original step continues, not a new one.
@@ -1659,6 +1681,29 @@ public sealed partial class DebugSession
     }
 
     private readonly Lock _stepperLock = new();
+
+    /// <summary>
+    /// Says whether a stepper is filtering to the user's code.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Always said, never left to the default, and that is the point of it. A process has two kinds
+    /// of step in flight — the one the user asked for and the one the engine issues to get back out
+    /// of somebody else's code — and they want opposite answers. Setting only the first would leave
+    /// the second on whatever the runtime happened to default to, which is the difference between a
+    /// step-out that completes and one that does not.
+    /// </para>
+    /// <para>
+    /// A refusal is not worth reporting: an older runtime without
+    /// <c>ICorDebugStepper2</c> simply steps unfiltered, and the engine's own filtering of step
+    /// completes is still there to do the same work more slowly.
+    /// </para>
+    /// </remarks>
+    private static void SetStepperJustMyCode(CorDebugStepper stepper, bool justMyCode)
+    {
+        try { stepper.TrySetJMC(justMyCode); }
+        catch { }
+    }
 
     /// <summary>
     /// The statement a step started from: its thread, its method, the IL range the statement
@@ -1728,6 +1773,10 @@ public sealed partial class DebugSession
             var stepper = frame.CreateStepper();
             stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_NONE);
             stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
+            // The user's step continuing, not an internal one, so it is filtered exactly as the
+            // step it re-arms was. Asked again rather than remembered: the re-arm happens in the
+            // origin frame, which is the frame the answer is about.
+            SetStepperJustMyCode(stepper, CanStepWithRuntimeJustMyCode(frame));
             stepper.SetRangeIL(true);
             stepper.StepRange(origin.StepInto, [origin.Range], 1);
 

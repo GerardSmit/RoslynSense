@@ -66,6 +66,14 @@ public sealed class DebugDisplayOptions
     /// </summary>
     public string[] SymbolExclude { get; set; } = [];
 
+    /// <summary>
+    /// The assemblies the open solution builds, which is what makes <see cref="JustMyCode"/> mean
+    /// something: a module the solution does not build is not the user's, however its path is
+    /// spelled. Empty when no solution is open — see <see cref="UserCodeMap"/> for what that
+    /// leaves.
+    /// </summary>
+    public string[] UserAssemblies { get; set; } = [];
+
     /// <summary>Everything off — the unfiltered view of what is actually in memory.</summary>
     public static DebugDisplayOptions Raw => new()
     {
@@ -88,5 +96,6 @@ public sealed class DebugDisplayOptions
         MaxChildren = MaxChildren,
         SymbolInclude = SymbolInclude,
         SymbolExclude = SymbolExclude,
+        UserAssemblies = UserAssemblies,
     };
 }

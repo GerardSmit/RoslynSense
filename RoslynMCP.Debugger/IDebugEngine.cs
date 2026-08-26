@@ -82,6 +82,22 @@ public interface IDebugEngine : IDisposable
     /// its types as the session visits them.
     /// </remarks>
     void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map);
+
+    /// <summary>
+    /// Loads an assembly into the debuggee and calls a static method on it.
+    /// </summary>
+    /// <remarks>
+    /// An attach is a way to get code into a process, not only a way to watch one. It is how hot
+    /// reload can be offered for an app that is already running: the runtime reads
+    /// <c>DOTNET_STARTUP_HOOKS</c> once before any managed code runs, so the agent cannot be
+    /// loaded the ordinary way afterwards, but a debugger can still call
+    /// <c>Assembly.LoadFrom</c> in the target.
+    /// </remarks>
+    /// <param name="argument">The one string argument the method takes, or null for none.</param>
+    /// <returns>Whether it started, and why not when it did not — including a refusal the injected
+    /// code itself reported, which is the only place some of them can be known.</returns>
+    Task<(bool Ok, string Detail)> InjectAgentAsync(
+        string assemblyPath, string typeName, string methodName, string? argument);
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(
         uint frameIndex, string name, string value);

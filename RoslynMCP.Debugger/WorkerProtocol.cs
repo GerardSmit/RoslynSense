@@ -72,6 +72,11 @@ public sealed class WorkerRequest
     /// module named by <see cref="ModulePath"/>. JSON for the same reason: it is text already.</summary>
     public string? DecompiledSymbols { get; set; }
 
+    /// <summary>What 'injectAgent' loads and calls: the assembly is <see cref="ModulePath"/>, the
+    /// type and method are these, and the argument is <see cref="Value"/>.</summary>
+    public string? TypeName { get; set; }
+    public string? MethodName { get; set; }
+
     /// <summary>The exception stop policy, sent by 'exceptionPolicy'.</summary>
     public ExceptionPolicy? ExceptionPolicy { get; set; }
 

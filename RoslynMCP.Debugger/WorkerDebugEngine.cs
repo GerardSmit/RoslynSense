@@ -356,6 +356,35 @@ public sealed class WorkerDebugEngine : IDebugEngine
     /// Forwards decompiled symbols to the worker's engine. Fire-and-forget: they are a fallback for
     /// a module that had none, so a dropped one costs the fallback, not correctness.
     /// </summary>
+    /// <summary>
+    /// Asks the worker to inject. Waited on, unlike the other fire-and-forget commands: the caller
+    /// has to know whether hot reload is actually available before it offers it.
+    /// </summary>
+    public async Task<(bool Ok, string Detail)> InjectAgentAsync(
+        string assemblyPath, string typeName, string methodName, string? argument)
+    {
+        try
+        {
+            var response = await SendAsync(new WorkerRequest
+            {
+                Op = "injectAgent",
+                ModulePath = assemblyPath,
+                TypeName = typeName,
+                MethodName = methodName,
+                Value = argument,
+            });
+
+            // A refusal is not a protocol failure — the worker answers normally and puts the
+            // reason in the value, so an empty one is the only thing that means it started.
+            var detail = response.Value ?? "";
+            return (detail.Length == 0, detail);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
     public void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map) =>
         Send(new WorkerRequest
         {

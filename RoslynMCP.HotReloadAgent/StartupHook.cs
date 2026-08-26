@@ -1,3 +1,4 @@
+using System.Reflection.Metadata;
 using RoslynMCP.HotReloadAgent;
 
 /// <summary>
@@ -37,11 +38,90 @@ internal static class StartupHook
             return;
         }
 
-        var thread = new Thread(() => HotReloadAgent.Listen(pipeName!))
+        Start(pipeName!);
+    }
+
+    /// <summary>
+    /// Starts the agent in a process the runtime never loaded this assembly into — one a debugger
+    /// attached to and injected it after the fact.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The startup-hook contract cannot be used for that: the runtime reads
+    /// <c>DOTNET_STARTUP_HOOKS</c> once, before any managed code runs, so an app already running is
+    /// past the only moment it would have been honoured. A debugger, though, can call any static
+    /// method in the target, and this is one. Everything the hook would have taken from the
+    /// environment is passed in instead, because the environment of a process that was not
+    /// launched for this says nothing about it.
+    /// </para>
+    /// <para>
+    /// Returns its refusal rather than writing it anywhere, so the debugger can put it in front of
+    /// the person who asked instead of in the application's own error stream, where it would look
+    /// like the application complaining about itself.
+    /// </para>
+    /// </remarks>
+    /// <returns>Empty once the listener is running; otherwise why it is not.</returns>
+    public static string Attach(string pipeName)
+    {
+        if (string.IsNullOrEmpty(pipeName))
+            return "no agent pipe was named";
+
+        // The authoritative form of the question the hook asks the environment. A process not
+        // started with DOTNET_MODIFIABLE_ASSEMBLIES=debug loads its assemblies in a shape no
+        // update can be applied to, and every apply would be accepted and silently do nothing —
+        // which is worse than not offering hot reload at all.
+        if (!MetadataUpdater.IsSupported)
+        {
+            return "this process was not started with DOTNET_MODIFIABLE_ASSEMBLIES=debug, " +
+                "so the runtime cannot apply an update to it";
+        }
+
+        try
+        {
+            // Already listening is success, not a failure: the caller wanted hot reload on, and it
+            // is. Saying otherwise would make asking twice look like something went wrong.
+            Start(pipeName);
+            return string.Empty;
+        }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    /// <summary>Whether a listener has been started, so that a second attempt does nothing.</summary>
+    private static int s_started;
+
+    /// <summary>
+    /// Starts the listener, once per process.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Once, because a second listener is not a harmless duplicate. Each one is a separate
+    /// connection to the agent server, the server sends every delta to every connection it holds,
+    /// and the second application of a delta fails on the generation it has already consumed — so
+    /// from then on every edit is reported as failing against a process that in fact took it. The
+    /// ways in are easy to reach: an app launched with hot reload and then injected into as well,
+    /// the same injection asked for twice, or this assembly listed twice in the hook variable.
+    /// </para>
+    /// <para>
+    /// On its own thread because the caller must not be held: as a startup hook this runs before
+    /// <c>Main</c>, and as an injection it runs inside a debugger evaluation that is on a clock.
+    /// Either way the connect is allowed to take as long as it takes.
+    /// </para>
+    /// </remarks>
+    /// <returns>Whether this call is the one that started it.</returns>
+    private static bool Start(string pipeName)
+    {
+        if (Interlocked.Exchange(ref s_started, 1) != 0)
+            return false;
+
+        var thread = new Thread(() => HotReloadAgent.Listen(pipeName))
         {
             IsBackground = true,
             Name = "roslyn-sense hot reload",
         };
         thread.Start();
+        return true;
     }
 }

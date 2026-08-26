@@ -187,6 +187,10 @@ public class DebugNavigationTests
 
         public void AddDecompiledSymbols(
             string modulePath, RoslynMCP.Debugger.DecompiledSymbolMap map) { }
+
+        public Task<(bool Ok, string Detail)> InjectAgentAsync(
+            string assemblyPath, string typeName, string methodName, string? argument) =>
+            Task.FromResult((false, "no engine"));
         public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
             Task.FromResult((true, "", ""));
         public Task<(bool Ok, RoslynMCP.Debugger.DebugVariable? Variable, string Error)> SetVariableAsync(

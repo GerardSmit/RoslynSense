@@ -44,6 +44,11 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
     public void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map) =>
         _session.AddDecompiledSymbols(modulePath, map);
 
+    public Task<(bool Ok, string Detail)> InjectAgentAsync(
+        string assemblyPath, string typeName, string methodName, string? argument) =>
+        _session.InjectAgentAsync(
+            new DebugSession.AgentInjection(assemblyPath, typeName, methodName, argument));
+
     public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
         _session.EvaluateAsync(frameIndex, expression);
 

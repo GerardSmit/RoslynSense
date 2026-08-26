@@ -1148,8 +1148,30 @@ Three pieces:
    through `DOTNET_STARTUP_HOOKS`, connecting back over a named pipe and calling `ApplyUpdate`.
    Deltas are addressed by MVID, not assembly name, so a name loaded into two contexts cannot be
    corrupted by applying to the wrong one. `DOTNET_MODIFIABLE_ASSEMBLIES=debug` and the hook list
-   are both start-time only, which is why hot reload is a launch option (`RunProject hotReload=true`,
-   or automatically for a `roslynsense` F5 session) rather than something switchable later.
+   are both start-time only, which is why hot reload is normally a launch option
+   (`RunProject hotReload=true`, or automatically for a `roslynsense` F5 session).
+
+   The hook list need not be the last word. A debugger can call a static method in the process it is
+   attached to, so an attach is a way to load the agent into an app that is already running, and the
+   engine can now do it: `IDebugEngine.InjectAgentAsync` calls `Assembly.LoadFrom` in the target and
+   then a static method on what it loaded. `StartupHook.Attach(pipeName)` is the agent's side of
+   that — the same listener the hook would have started, with the pipe passed in rather than read
+   from an environment the process never had. It needs the process stopped, because an evaluation
+   needs a thread parked somewhere the runtime will run code, which a breakpoint gives and an
+   arbitrary interrupt usually does not.
+
+   **This is a capability, not yet a feature**, and the gap is routing rather than mechanism.
+   `DebugSessionManager.CreateSession` sends `NetFramework` targets to `IcorDebugBackend` (this
+   engine, which can inject) and everything else to `DebuggerService` (netcoredbg over MI, which
+   cannot), so no CoreCLR session reaches the engine that has the capability — and the agent is
+   `net6.0`, so injecting it into the Framework sessions that do reach it would not load. Closing it
+   means letting a CoreCLR attach use the ICorDebug engine, which changes the debugger under every
+   CoreCLR user and wants deciding on its own merits, not as a side effect of hot reload.
+
+   `DOTNET_MODIFIABLE_ASSEMBLIES` stays the last word regardless, and is why that path must be able
+   to refuse: assemblies loaded without it accept every update and silently apply none. Only code
+   inside the process can tell, so `Attach` asks `MetadataUpdater.IsSupported` and returns its
+   refusal for the debugger to report — a clear no rather than a hot reload that appears to work.
 
 3. **.NET Framework apply — `ICorDebugModule2::ApplyChanges`, from a break state only.** The
    desktop runtime has no in-process updater, so the app must be under the debugger. The delta

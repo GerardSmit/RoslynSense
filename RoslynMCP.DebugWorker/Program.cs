@@ -172,6 +172,20 @@ internal static class Program
                     session.DisplayOptions = request.DisplayOptions ?? new DebugDisplayOptions();
                     break;
 
+                case "injectAgent":
+                {
+                    var (ok, detail) = await session.InjectAgentAsync(new DebugSession.AgentInjection(
+                        request.ModulePath ?? "",
+                        request.TypeName ?? "",
+                        request.MethodName ?? "",
+                        request.Value));
+                    // Empty means it started; anything else is why it did not. Reported as a
+                    // normal answer, because a process that cannot take the agent is an outcome,
+                    // not a broken request.
+                    response.Value = ok ? "" : detail.Length > 0 ? detail : "the agent did not start";
+                    break;
+                }
+
                 case "decompiledSymbols":
                     if (DecompiledSymbolMap.Parse(request.DecompiledSymbols) is { } decompiled)
                         session.AddDecompiledSymbols(request.ModulePath ?? "", decompiled);

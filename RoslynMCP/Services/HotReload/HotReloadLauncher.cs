@@ -6,11 +6,20 @@ namespace RoslynMCP.Services.HotReload;
 /// Prepares a process to accept hot reload, which has to happen before it starts.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Both settings are start-time only. <c>DOTNET_MODIFIABLE_ASSEMBLIES</c> tells the runtime to
 /// load assemblies in a form that can be updated at all — set it afterwards and every apply is
 /// accepted and silently does nothing. <c>DOTNET_STARTUP_HOOKS</c> is read once during startup, so
-/// the agent has to be listed there rather than injected later. This is the whole reason hot
-/// reload is a launch option and not something that can be switched on for a running app.
+/// the agent has to be listed there rather than loaded later.
+/// </para>
+/// <para>
+/// The second of those has a way around it that this is not: a debugger attached to a running app
+/// can load the agent itself and call <c>StartupHook.Attach</c>, which the engine supports through
+/// <c>IDebugEngine.InjectAgentAsync</c>. It is unreachable for now — CoreCLR sessions are routed to
+/// netcoredbg, which cannot inject — so this remains the only way in practice. The first has no way
+/// around it at all, which is why the injection path asks the process whether it can be updated
+/// rather than assuming it.
+/// </para>
 /// </remarks>
 internal static class HotReloadLauncher
 {

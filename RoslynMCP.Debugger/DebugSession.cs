@@ -2518,6 +2518,19 @@ public sealed partial class DebugSession : IDebugSession
                     try { e.Controller.Continue(false); } catch { }
                     return;
                 }
+
+                // An evaluation is in flight, and it runs the whole process to get its answer. Any
+                // other thread reaching a breakpoint meanwhile is not a stop the user asked for,
+                // and recording it would be fatal rather than merely wrong: the stop leaves the
+                // process suspended, the evaluation's completion can then never arrive, and the
+                // abort that follows the timeout cannot land in a suspended process either — which
+                // ends with evaluation disabled for the rest of the session. The breakpoint stays
+                // armed, so the next genuine hit stops normally.
+                if (_pendingEval is not null)
+                {
+                    try { e.Controller.Continue(false); } catch { }
+                    return;
+                }
                 // The runtime can deliver a breakpoint event whose thread has already run on —
                 // observed against IIS Express when a breakpoint arms while requests are in
                 // flight: the callback arrives after the response went out, and the thread's

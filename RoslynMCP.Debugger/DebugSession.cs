@@ -2846,8 +2846,8 @@ public sealed partial class DebugSession : IDebugSession
 
         // Prefer JIT over NGen images, with EnC enabled, for everything the runtime is about to
         // load — the per-module flag in RegisterEncModule cannot reach code that loads from a
-        // native image. Best effort: the window for this call is narrow and Rider tolerates the
-        // same failure on attach.
+        // native image. Best effort: the window for this call is narrow, and a debugger that
+        // misses it still attaches — it only loses EnC for whatever was already mapped.
         try { _process.TrySetDesiredNGENCompilerFlags(CorDebugJITCompilerFlags.CORDEBUG_JIT_ENABLE_ENC); }
         catch { }
 

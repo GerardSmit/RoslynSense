@@ -357,7 +357,7 @@ public class IisExpressHotReloadTests : IDisposable
     /// <remarks>
     /// This is the experiment that splits the crash's two candidate causes. At a breakpoint in
     /// <c>Compute</c> the stopped thread is deep in user code — the stop shape the console tests
-    /// always had, and the one Visual Studio and Rider require before allowing an apply. If the
+    /// always had, and the one every shipping .NET debugger requires before allowing an apply. If the
     /// apply survives here but faults from an idle Break All, the bug is the stop context the
     /// engine synthesises when no user-code thread exists; if it faults here too, the problem is
     /// the hosted CLR itself (shadow copy, secondary AppDomain).

@@ -1227,7 +1227,7 @@ Three pieces:
 
    `FunctionRemapOpportunity` / `ICorDebugILFrame2::RemapFunction` is handled: a frame stopped
    inside an edited method jumps to the edited version at the mapped sequence point instead of
-   finishing on the old code — the Rider/Visual Studio behaviour. If the remap fails the frame
+   finishing on the old code — what a user editing a running method expects. If the remap fails the frame
    falls back to finishing the old version, which is the documented default. Applies are also
    MVID-keyed across app domains: every loaded instance of the edited module with the same MVID
    receives the delta, provided its domain has a safely-stopped user-code thread.

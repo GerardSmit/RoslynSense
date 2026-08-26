@@ -71,6 +71,17 @@ public interface IDebugEngine : IDisposable
     /// settings live in the host's process and the engine runs in another one.
     /// </remarks>
     void SetDisplayOptions(DebugDisplayOptions options);
+
+    /// <summary>
+    /// Hands the engine decompiled source for one type in a module that has no PDB, so that the
+    /// engine can locate, step and bind inside it the way it does with real symbols.
+    /// </summary>
+    /// <remarks>
+    /// Pushed from the host because the decompiler lives there and the engine may be another
+    /// process. Additive and idempotent: a type sent twice replaces itself, and a module accretes
+    /// its types as the session visits them.
+    /// </remarks>
+    void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map);
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(
         uint frameIndex, string name, string value);

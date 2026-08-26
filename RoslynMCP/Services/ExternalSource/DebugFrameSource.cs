@@ -13,7 +13,12 @@ namespace RoslynMCP.Services.ExternalSource;
 /// <param name="Origin">How the source was obtained: <c>embedded</c>, <c>source link</c>,
 /// <c>reference source</c> or <c>decompiled</c>. Shown beside the location so a reader can judge
 /// how exactly the line can be trusted.</param>
-public sealed record FrameSourceResult(string FilePath, int Line, int Column, string Origin);
+/// <param name="DecompiledType">The reflection name of the type that was decompiled, set only when
+/// <paramref name="Origin"/> is <c>decompiled</c>. Carried out because the same decompilation is
+/// also the module's symbols, and the caller that hands them to the engine would otherwise have to
+/// work the type name out a second time.</param>
+public sealed record FrameSourceResult(
+    string FilePath, int Line, int Column, string Origin, string DecompiledType = "");
 
 /// <summary>
 /// Resolves a stack frame that has no source — a module, a method token and an IL offset — to a
@@ -151,7 +156,7 @@ internal static class DebugFrameSource
 
         return decompiled is not { } d
             ? null
-            : new FrameSourceResult(d.FilePath, d.Line, d.Column, "decompiled");
+            : new FrameSourceResult(d.FilePath, d.Line, d.Column, "decompiled", reflectionTypeName);
     }
 
     /// <summary>

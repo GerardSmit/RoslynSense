@@ -184,6 +184,9 @@ public class DebugNavigationTests
         public Task<List<RoslynMCP.Debugger.DebugVariable>> ExpandAsync(uint frameIndex, string path) =>
             Task.FromResult(new List<RoslynMCP.Debugger.DebugVariable>());
         public void SetDisplayOptions(RoslynMCP.Debugger.DebugDisplayOptions options) { }
+
+        public void AddDecompiledSymbols(
+            string modulePath, RoslynMCP.Debugger.DecompiledSymbolMap map) { }
         public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
             Task.FromResult((true, "", ""));
         public Task<(bool Ok, RoslynMCP.Debugger.DebugVariable? Variable, string Error)> SetVariableAsync(

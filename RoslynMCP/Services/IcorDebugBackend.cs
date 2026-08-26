@@ -472,6 +472,67 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         }
     }
 
+    /// <summary>Which decompiled types this session has already given the engine.</summary>
+    private readonly HashSet<(string Module, long Stamp, string Type)> _pushedDecompiled = [];
+
+    /// <summary>
+    /// Gives the engine one decompiled type as its module's symbols, once.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Once, because both halves cost: building the map copies every sequence point of every method
+    /// in the type, and sending it to a worker-hosted engine serializes the lot and waits for the
+    /// answer. The caller cannot skip it on its own — a frame the pushed symbols cannot answer (an
+    /// IP before the type's first sequence point, say) keeps arriving without a file, because the
+    /// decompiler still answers it from the type declaration — so without this the same type would
+    /// be rebuilt and resent at every stop, which while stepping is once per keypress.
+    /// </para>
+    /// <para>
+    /// Keyed by the module's write time as well as its path, so a rebuilt binary at the same path
+    /// is a different key and is sent again — the same key the decompiler caches the map under.
+    /// </para>
+    /// </remarks>
+    private async Task ShareDecompiledSymbolsAsync(
+        string modulePath, string reflectionTypeName, CancellationToken cancellationToken)
+    {
+        if (_engine is not { } engine)
+            return;
+
+        long stamp;
+        try { stamp = File.GetLastWriteTimeUtc(modulePath).Ticks; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { stamp = 0; }
+
+        var key = (modulePath, stamp, reflectionTypeName);
+        lock (_pushedDecompiled)
+        {
+            // Claimed before the work rather than after it, so two stack walks over the same stop
+            // do not both build the same map.
+            if (!_pushedDecompiled.Add(key))
+                return;
+        }
+
+        var sent = false;
+        try
+        {
+            if (await DecompiledSourceService.TrySymbolsForAsync(
+                    modulePath, reflectionTypeName, cancellationToken) is { } map)
+            {
+                engine.AddDecompiledSymbols(modulePath, map);
+                sent = true;
+            }
+        }
+        finally
+        {
+            // A claim that produced nothing is given back — a decompilation that failed or was
+            // cancelled must not mark the type as delivered for the rest of the session.
+            if (!sent)
+            {
+                lock (_pushedDecompiled)
+                    _pushedDecompiled.Remove(key);
+            }
+        }
+    }
+
     private static bool SameAssemblies(string[] left, string[] right)
     {
         if (left.Length != right.Length)
@@ -555,7 +616,8 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                     EndLine: (int)f.EndLine,
                     EndColumn: (int)f.EndColumn))
                 .ToList();
-            return await ExternalFrameResolver.EnrichAsync(mapped, cancellationToken);
+            return await ExternalFrameResolver.EnrichAsync(
+                mapped, cancellationToken, ShareDecompiledSymbolsAsync);
         }
         catch
         {

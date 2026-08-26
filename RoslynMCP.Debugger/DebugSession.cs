@@ -69,6 +69,15 @@ public sealed partial class DebugSession : IDebugSession
     /// there is no reader to ask.
     private readonly ConcurrentDictionary<string, SymbolStatusEntry> _symbolStatus =
         new(StringComparer.OrdinalIgnoreCase);
+    /// Decompiled source the host has handed over, per module: the symbols for modules that have
+    /// none. Written from whichever thread the host pushes on and read on the session and callback
+    /// threads, so both this and the sets inside it are concurrent.
+    private readonly ConcurrentDictionary<string, DecompiledSymbolSet> _decompiledSymbols =
+        new(StringComparer.OrdinalIgnoreCase);
+    /// One reader per module over the sets above. Kept apart from <see cref="_readers"/>, which
+    /// caches the answer to "does this module have a PDB" and must keep saying no.
+    private readonly ConcurrentDictionary<string, SymbolReader> _decompiledReaders =
+        new(StringComparer.OrdinalIgnoreCase);
     /// Readers that have been replaced or whose module unloaded, kept until the session ends.
     /// They are dropped on the runtime's callback thread while the session thread may still be
     /// reading sequence points through them, and closing a COM reader out from under that reader
@@ -3373,6 +3382,7 @@ public sealed partial class DebugSession : IDebugSession
                 _retiredReaders.Add(unloaded);
         }
         _symbolStatus.TryRemove(moduleName, out _);
+        ForgetDecompiledSymbols(moduleName);
         lock (_noSymbolsReported)
             _noSymbolsReported.Remove(moduleName);
 
@@ -4045,6 +4055,10 @@ public sealed partial class DebugSession : IDebugSession
             lock (_readers)
                 _readers.Remove(path);
             _retiredReaders.Add(reader);
+            // The decompilation was of the pre-edit IL, so it is stale for the same reason and by
+            // the same amount. Left standing it would become this module's symbols the moment the
+            // PDB reader is gone, which is the opposite of what dropping the reader was for.
+            ForgetDecompiledSymbols(path);
             Emit(DebugEventKind.Diagnostic,
                 $"line information for {assemblyName} is stale after the edit; " +
                 "breakpoints in changed methods may bind to the wrong line.",
@@ -4440,16 +4454,37 @@ public sealed partial class DebugSession : IDebugSession
     private sealed class SymbolReader : IDisposable
     {
         private SymbolReader(
-            SymUnmanagedReader? unmanaged, PortablePdbReader? portable, string origin, string path)
+            SymUnmanagedReader? unmanaged,
+            PortablePdbReader? portable,
+            string origin,
+            string path,
+            DecompiledSymbolSet? decompiled = null)
         {
             Unmanaged = unmanaged;
             Portable = portable;
             Origin = origin;
             SymbolPath = path;
+            Decompiled = decompiled;
         }
 
         public SymUnmanagedReader? Unmanaged { get; }
         public PortablePdbReader? Portable { get; }
+
+        /// <summary>
+        /// Symbols recovered from the module itself rather than read from a PDB, for a module that
+        /// shipped without one. Set on this reader and not beside it so that every lookup asks the
+        /// same object it would have asked with a PDB present.
+        /// </summary>
+        /// <remarks>
+        /// The set is the session's live one, not a copy: it gains a type each time the host
+        /// decompiles one, and a reader holding a snapshot would answer for the frame that caused
+        /// it to be created and nothing after.
+        /// </remarks>
+        public DecompiledSymbolSet? Decompiled { get; }
+
+        /// <summary>Symbols for a module that has none, built from its own IL.</summary>
+        public static SymbolReader FromDecompiled(DecompiledSymbolSet decompiled) =>
+            new(null, null, SymbolOrigins.Decompiled, string.Empty, decompiled);
 
         /// <summary>
         /// Which edits this reader has already been told about, by their sequence number.
@@ -4697,6 +4732,26 @@ public sealed partial class DebugSession : IDebugSession
         int requestedLine,
         int requestedColumn)
     {
+        if (reader.Decompiled is { } decompiled)
+        {
+            // Every method decompiled into the file is asked, and the shared chooser picks between
+            // them — the same way the unmanaged path asks every method in a document.
+            var candidates = new List<ResolvedSequencePoint>();
+            foreach (var token in decompiled.MethodsIn(document.Url))
+            {
+                if (decompiled.BestPoint(token, requestedLine, requestedColumn) is not { } found)
+                    continue;
+                var (point, file) = found;
+                candidates.Add(new ResolvedSequencePoint(
+                    new mdMethodDef(token),
+                    new SequencePointMatch(
+                        point.Offset, point.Line, point.Column,
+                        point.EndLine, point.EndColumn, file)));
+            }
+
+            return BestCandidate(candidates, requestedLine);
+        }
+
         if (reader.Unmanaged is not null && document.Unmanaged is not null)
             return BestUnmanagedSequencePointInDocument(
                 reader.Unmanaged,
@@ -4947,6 +5002,23 @@ public sealed partial class DebugSession : IDebugSession
         int line,
         int column)
     {
+        if (reader.Decompiled is { } decompiled)
+        {
+            // The method has to be in the document that was asked about. A module accumulates a
+            // decompiled file per type it is stopped in, and this method's own file is one of
+            // several — matching a line number without checking would find the requested line in
+            // whatever file this method happens to live in, and report the answer against the file
+            // that was asked for. The caller is Set Next Statement, so a wrong answer moves the
+            // instruction pointer.
+            if (!SamePath(decompiled.FileOf((int)methodToken), document.Url))
+                return null;
+            if (decompiled.BestPoint((int)methodToken, line, column) is not { } found)
+                return null;
+            var (point, file) = found;
+            return new SequencePointMatch(
+                point.Offset, point.Line, point.Column, point.EndLine, point.EndColumn, file);
+        }
+
         if (reader.Unmanaged is not null && document.Unmanaged is not null)
         {
             try
@@ -5001,6 +5073,15 @@ public sealed partial class DebugSession : IDebugSession
         mdMethodDef methodToken,
         int ip)
     {
+        if (reader.Decompiled is { } decompiled)
+        {
+            if (decompiled.PointAt((int)methodToken, ip) is not { } found)
+                return null;
+            var (point, next, file) = found;
+            return new SequencePointMatch(
+                point.Offset, point.Line, point.Column, point.EndLine, point.EndColumn, file, next);
+        }
+
         if (reader.Unmanaged is not null)
         {
             try
@@ -5089,6 +5170,32 @@ public sealed partial class DebugSession : IDebugSession
         var document = FindDocument(reader, request.FilePath);
         if (document is null)
             yield break;
+
+        if (reader.Decompiled is { } decompiled)
+        {
+            var requested = SourceRangeOf(request.FilePath, (int)request.Line, (int)request.Column);
+            foreach (var (_, point) in decompiled.PointsIn(document.Value.Url))
+            {
+                if (point.Line > (int)request.Line ||
+                    (point.EndLine == 0 ? point.Line : point.EndLine) < (int)request.Line)
+                {
+                    continue;
+                }
+
+                yield return new BreakpointLocation
+                {
+                    Id = $"{Path.GetFullPath(request.FilePath).ToLowerInvariant()}:{point.Line}:{point.Column}",
+                    Requested = requested,
+                    Actual = SourceRangeOf(
+                        document.Value.Url, point.Line, point.Column, point.EndLine, point.EndColumn),
+                    Verified = true,
+                    Message = string.Empty,
+                    Label = point.Column > 0 ? $"column {point.Column}" : $"line {point.Line}",
+                    Kind = BreakpointKind.Source,
+                };
+            }
+            yield break;
+        }
 
         if (reader.Unmanaged is not null && document.Value.Unmanaged is not null)
         {
@@ -5804,7 +5911,7 @@ public sealed partial class DebugSession : IDebugSession
         lock (_readers)
         {
             if (_readers.TryGetValue(moduleName, out var cached))
-                return cached;
+                return cached ?? DecompiledReaderFor(moduleName);
         }
         SymbolReader? reader = null;
         string status, detail;
@@ -5834,12 +5941,94 @@ public sealed partial class DebugSession : IDebugSession
             if (_readers.TryGetValue(moduleName, out var raced))
             {
                 reader?.Dispose();
-                return raced;
+                return raced ?? DecompiledReaderFor(moduleName);
             }
 
             _readers[moduleName] = reader;
         }
+        return reader ?? DecompiledReaderFor(moduleName);
+    }
+
+    /// <summary>Decompiled source for a module the module names, if any has been handed over.</summary>
+    /// <remarks>
+    /// Reached only where a PDB was looked for and not found, so a real PDB always wins: symbols
+    /// the compiler wrote name the author's own file and the author's own lines, and decompiled
+    /// ones never can.
+    /// </remarks>
+    private SymbolReader? DecompiledReaderFor(string moduleName)
+    {
+        if (moduleName.Length == 0 || !_decompiledSymbols.TryGetValue(moduleName, out var symbols))
+            return null;
+        if (symbols.IsEmpty)
+            return null;
+
+        // One reader per module, cached because the set behind it is live — a new reader per call
+        // would answer identically and cost an allocation on every frame of every stop.
+        var reader = _decompiledReaders.GetOrAdd(moduleName, _ => SymbolReader.FromDecompiled(symbols));
+
+        // Unless it is over a set that has since been thrown away. A module that unloaded between
+        // the lookup above and this line leaves a reader behind whose set nothing writes to any
+        // more, and it would answer from the old build for the rest of the session.
+        if (!ReferenceEquals(reader.Decompiled, symbols))
+        {
+            reader = SymbolReader.FromDecompiled(symbols);
+            _decompiledReaders[moduleName] = reader;
+        }
+
+        _symbolStatus.AddOrUpdate(
+            moduleName,
+            new SymbolStatusEntry(
+                SymbolStatuses.Loaded, SymbolOrigins.Decompiled, string.Empty, string.Empty),
+            // The detail said why no PDB was found, which is still true and still the thing to fix
+            // if the user wants their own source back.
+            (_, previous) => previous with
+            {
+                Status = SymbolStatuses.Loaded,
+                Origin = SymbolOrigins.Decompiled,
+                Path = string.Empty,
+            });
+
         return reader;
+    }
+
+    /// <summary>
+    /// Takes in one decompiled type as symbols for a module.
+    /// </summary>
+    /// <remarks>
+    /// Pushed rather than pulled. The decompiler lives in the host — the engine may be a separate
+    /// process, and even in-process it has no business holding one — so the engine cannot ask for a
+    /// type at the moment it needs one, and a synchronous call back into the host from the callback
+    /// thread would be a deadlock waiting for a slow answer. The host already decompiles the frames
+    /// of every stop before the user can act on them, so by the time a step or a breakpoint needs
+    /// the symbols, they are here.
+    /// </remarks>
+    public void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map)
+    {
+        if (modulePath.Length == 0 || map.IsEmpty)
+            return;
+
+        _decompiledSymbols.GetOrAdd(modulePath, _ => new DecompiledSymbolSet()).Add(map);
+    }
+
+    /// <summary>
+    /// Drops a module's decompiled symbols, for a module that unloaded or whose IL has moved on.
+    /// </summary>
+    /// <remarks>
+    /// They describe one build of one file. A module reloaded from the same path — a plugin
+    /// rebuilt, an app domain recycled — is a different build behind the same name, and offsets
+    /// from the old one point into instructions that are no longer where they were. Nothing
+    /// replaces them by itself: the set merges per method, so a method the new build no longer has
+    /// would keep answering forever. Cheap to lose — the host decompiles again at the next stop.
+    /// </remarks>
+    private void ForgetDecompiledSymbols(string modulePath)
+    {
+        if (modulePath.Length == 0)
+            return;
+
+        // The reader goes first, so a caller that has just looked one up cannot get a live reader
+        // over a set that is about to be emptied.
+        _decompiledReaders.TryRemove(modulePath, out _);
+        _decompiledSymbols.TryRemove(modulePath, out _);
     }
 
     /// <summary>
@@ -6013,9 +6202,18 @@ public sealed partial class DebugSession : IDebugSession
         return null;
     }
 
-    /// <summary>Both readers' documents behind one shape, so the matching is written once.</summary>
+    /// <summary>Every reader's documents behind one shape, so the matching is written once.</summary>
     private static IEnumerable<SymbolDocument> DocumentsOf(SymbolReader reader)
     {
+        if (reader.Decompiled is { } decompiled)
+        {
+            // No checksum: this file was written here, from this module, moments ago. The path
+            // matches exactly, so none of the hash-based reconciliation below is reached.
+            foreach (var file in decompiled.Files)
+                yield return new SymbolDocument(file, null, default);
+            yield break;
+        }
+
         if (reader.Unmanaged is not null)
         {
             SymbolDocument[] documents;

@@ -11,6 +11,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Debugger;
 using RoslynMCP.Services.ExternalSource;
 using DecompilerFullTypeName = ICSharpCode.Decompiler.TypeSystem.FullTypeName;
 
@@ -382,7 +383,7 @@ internal static class DecompiledSourceService
             (int Token, int Offset, int Line, int Column)? best = null;
             foreach (var (token, points) in map.PointsByToken)
             {
-                foreach (var (offset, pointLine, column) in points)
+                foreach (var (offset, pointLine, column, _, _) in points)
                 {
                     if (pointLine < line)
                         continue;
@@ -404,6 +405,51 @@ internal static class DecompiledSourceService
                 $"Could not map line {line} of a decompiled file back into " +
                 $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
                 key: $"decompile-line:{assemblyPath}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The same decompiled type as symbols the debug engine can read, rather than as an answer for
+    /// one frame.
+    /// </summary>
+    /// <remarks>
+    /// The data is identical either way — this is the map that <see cref="TryDecompileFrameAsync"/>
+    /// already builds and caches. Handing it over means the engine can locate a frame, range a
+    /// step, and bind a breakpoint inside the type itself, instead of the engine giving up and the
+    /// host patching a file and line into the answer afterwards. The second of those covered the
+    /// stack and nothing else: stepping over a line in decompiled code had no statement to run to.
+    /// </remarks>
+    public static async Task<DecompiledSymbolMap?> TrySymbolsForAsync(
+        string assemblyPath,
+        string reflectionTypeName,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        try
+        {
+            var map = await Task.Run(
+                () => FrameMapFor(assemblyPath, reflectionTypeName, cancellationToken),
+                cancellationToken);
+
+            var symbols = new DecompiledSymbolMap { FilePath = map.FilePath };
+            foreach (var (token, points) in map.PointsByToken)
+            {
+                symbols.Methods[token] =
+                    [.. points.Select(p => new DecompiledPoint(
+                        p.Offset, p.Line, p.Column, p.EndLine, p.EndColumn))];
+            }
+
+            return symbols.IsEmpty ? null : symbols;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not build symbols for '{reflectionTypeName}' from " +
+                $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
+                key: $"decompile-symbols:{assemblyPath}:{reflectionTypeName}");
             return null;
         }
     }
@@ -434,7 +480,7 @@ internal static class DecompiledSourceService
     private sealed record DecompiledFrameMap(
         string FilePath,
         string SourceText,
-        IReadOnlyDictionary<int, List<(int Offset, int Line, int Column)>> PointsByToken);
+        IReadOnlyDictionary<int, List<(int Offset, int Line, int Column, int EndLine, int EndColumn)>> PointsByToken);
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<
         (string Assembly, long Stamp, string Type), DecompiledFrameMap> s_frameMaps = new();
@@ -482,16 +528,21 @@ internal static class DecompiledSourceService
             tokenWriter, settings.CSharpFormattingOptions));
         string sourceText = writer.ToString();
 
-        var pointsByToken = new Dictionary<int, List<(int Offset, int Line, int Column)>>();
+        var pointsByToken =
+            new Dictionary<int, List<(int Offset, int Line, int Column, int EndLine, int EndColumn)>>();
         foreach (var (function, points) in decompiler.CreateSequencePoints(tree))
         {
             if (function?.Method is not { MetadataToken.IsNil: false } method)
                 continue;
 
             int token = System.Reflection.Metadata.Ecma335.MetadataTokens.GetToken(method.MetadataToken);
+            // The end of each point as well as its start: a statement's span is what an active
+            // statement is reported as and what a step has to run to, and neither can be recovered
+            // from the start alone.
             var mapped = points
                 .Where(p => !p.IsHidden)
-                .Select(p => (p.Offset, p.StartLine, p.StartColumn))
+                .Select(p => (p.Offset, p.StartLine, p.StartColumn,
+                    p.EndLine == 0 ? p.StartLine : p.EndLine, p.EndColumn))
                 .OrderBy(p => p.Offset)
                 .ToList();
 

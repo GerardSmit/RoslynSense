@@ -182,7 +182,8 @@ public sealed class WorkerDebugEngine : IDebugEngine
         // Reading state inside a suspend. Nothing in the debuggee runs, so a slow answer means the
         // worker is not answering — and the caller should find that out quickly.
         "stackTrace" or "threads" or "variables" or "expand" or "modules" or
-        "addBreakpoint" or "removeBreakpoint" or "displayOptions" or "exceptionPolicy" =>
+        "addBreakpoint" or "removeBreakpoint" or "displayOptions" or "exceptionPolicy" or
+        "decompiledSymbols" =>
             InteractiveTimeout,
 
         // Everything else resumes the debuggee — evaluation, stepping, run-to-location, applying
@@ -350,6 +351,18 @@ public sealed class WorkerDebugEngine : IDebugEngine
     /// </summary>
     public void SetDisplayOptions(DebugDisplayOptions options) =>
         Send(new WorkerRequest { Op = "displayOptions", DisplayOptions = options });
+
+    /// <summary>
+    /// Forwards decompiled symbols to the worker's engine. Fire-and-forget: they are a fallback for
+    /// a module that had none, so a dropped one costs the fallback, not correctness.
+    /// </summary>
+    public void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map) =>
+        Send(new WorkerRequest
+        {
+            Op = "decompiledSymbols",
+            ModulePath = modulePath,
+            DecompiledSymbols = map.ToJson(),
+        });
 
     public async Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression)
     {

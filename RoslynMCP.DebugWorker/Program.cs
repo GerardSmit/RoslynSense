@@ -172,6 +172,11 @@ internal static class Program
                     session.DisplayOptions = request.DisplayOptions ?? new DebugDisplayOptions();
                     break;
 
+                case "decompiledSymbols":
+                    if (DecompiledSymbolMap.Parse(request.DecompiledSymbols) is { } decompiled)
+                        session.AddDecompiledSymbols(request.ModulePath ?? "", decompiled);
+                    break;
+
                 case "evaluate":
                 {
                     var (ok, value, error) = await session.EvaluateAsync(request.FrameIndex, request.Expression ?? "");

@@ -41,6 +41,9 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
 
     public void SetDisplayOptions(DebugDisplayOptions options) => _session.DisplayOptions = options;
 
+    public void AddDecompiledSymbols(string modulePath, DecompiledSymbolMap map) =>
+        _session.AddDecompiledSymbols(modulePath, map);
+
     public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
         _session.EvaluateAsync(frameIndex, expression);
 

@@ -345,6 +345,10 @@ public static class SymbolOrigins
 
     /// <summary>Symbols the runtime handed over for a module built at run time.</summary>
     public const string Runtime = "supplied at run time";
+
+    /// <summary>Symbols recovered by decompiling a module that shipped without a PDB. Real enough
+    /// to stop, step and bind against, but the source is the decompiler's, not the author's.</summary>
+    public const string Decompiled = "decompiled from il";
 }
 
 public sealed class DebugVariable

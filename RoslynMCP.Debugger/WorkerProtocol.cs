@@ -68,6 +68,10 @@ public sealed class WorkerRequest
     /// the delta itself cannot express. Plain JSON rather than base64 — it is text already.</summary>
     public string? SymbolMap { get; set; }
 
+    /// <summary>A serialized <see cref="DecompiledSymbolMap"/>, sent by 'decompiledSymbols' for the
+    /// module named by <see cref="ModulePath"/>. JSON for the same reason: it is text already.</summary>
+    public string? DecompiledSymbols { get; set; }
+
     /// <summary>The exception stop policy, sent by 'exceptionPolicy'.</summary>
     public ExceptionPolicy? ExceptionPolicy { get; set; }
 

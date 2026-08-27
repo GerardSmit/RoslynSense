@@ -28,3 +28,20 @@ export function isUnder(path: string, directory: string): boolean {
     const parent = normalisePath(directory).replace(/\/$/, '');
     return normalisePath(path).startsWith(parent + '/');
 }
+
+/**
+ * The glob claiming the source the server fetched or decompiled, under its cache in
+ * `tempDirectory`.
+ *
+ * Spelled the way a document's own path is spelled, or the filter never matches and the file is
+ * silently served nothing: `Uri.fsPath` lower-cases the drive letter, `os.tmpdir()` reports it the
+ * way the environment variable has it, and VS Code's glob matcher compares the two literally.
+ */
+export function externalSourceGlob(tempDirectory: string): string {
+    const root = `${normaliseSeparators(tempDirectory).replace(/\/$/, '')}/RoslynMCP`;
+    return `${/^[A-Za-z]:/.test(root) ? root[0].toLowerCase() + root.slice(1) : root}/**/*`;
+}
+
+function normaliseSeparators(value: string): string {
+    return value.split('\\').join('/');
+}

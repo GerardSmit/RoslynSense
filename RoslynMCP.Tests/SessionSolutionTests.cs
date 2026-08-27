@@ -95,7 +95,15 @@ public class SessionSolutionTests
 
         using var _ = WorkspaceService.BindSolutionForTesting(FixturePaths.UnloadedSolutionFile);
 
-        Assert.Null(WorkspaceService.TryGetSessionSolution());
+        var answer = WorkspaceService.TryGetSessionSolution();
+
+        // Nothing at all in a process holding only this fixture. A loose .csproj another test left
+        // in the cache is not a competing solution and does still answer — that is the fallback's
+        // whole purpose — so what is pinned here is that Beta never does, however the run is
+        // ordered.
+        Assert.True(
+            answer is null || answer.Projects.All(p => p.Name != BetaOnly),
+            "a session bound to one solution answered from another");
     }
 
     /// <summary>With no solution bound at all, the most-recently-used guess still stands.</summary>

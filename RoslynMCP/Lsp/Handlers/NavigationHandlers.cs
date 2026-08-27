@@ -241,11 +241,22 @@ internal static class NavigationHandlers
         if (symbol is null)
             return Array.Empty<LspLocation>();
 
+        // A caret in decompiled or downloaded source is asking about the assembly's member, and
+        // the project behind such a file holds nothing but that file — so the search runs against
+        // the solution the session belongs to, on the symbol as it sees it. Nothing to map for a
+        // file the user owns, and nothing to map for a caret on a local either, which leaves the
+        // search where it started.
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            symbol, document, Services.WorkspaceService.TryGetSessionSolution(), ct);
+
+        var searchedSymbol = mapped?.Symbol ?? symbol;
+        var searchedProject = mapped?.Project ?? document.Project;
+
         // The one caller that may wait: a user pressed Shift+F12 and is looking at a progress
         // indicator, so a pack whose complete answer needs projects the workspace has not loaded
         // may go and load them.
         return await AllReferencesAsync(
-            symbol, document.Project, p.Context.IncludeDeclaration, ct, languages,
+            searchedSymbol, searchedProject, p.Context.IncludeDeclaration, ct, languages,
             waitForCompleteScope: true);
     }
 

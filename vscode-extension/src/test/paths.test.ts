@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import { describe, it } from 'node:test';
 
-import { isUnder } from '../paths';
+import { externalSourceGlob, isUnder } from '../paths';
 
 /**
  * The path containment rule, which decides whether a saved file belongs to a project.
@@ -56,5 +56,30 @@ describe('isUnder', () => {
             isUnder('C:\\Sources\\Bar.Tests\\OrderTests.cs', 'C:\\Sources\\Foo.Tests'),
             false
         );
+    });
+});
+
+/**
+ * The glob that claims decompiled and downloaded source for the language client.
+ *
+ * A document is matched against it by its `Uri.fsPath`, which lower-cases the drive letter and
+ * nothing else, and VS Code's matcher compares literally — so a glob that keeps the casing
+ * `os.tmpdir()` reports matches no file at all, and every feature in a decompiled buffer answers
+ * nothing with no error anywhere to say why.
+ */
+describe('externalSourceGlob', () => {
+    it('spells the drive letter the way a document URI does', () => {
+        assert.strictEqual(
+            externalSourceGlob('C:\\Users\\dev\\AppData\\Local\\Temp'),
+            'c:/Users/dev/AppData/Local/Temp/RoslynMCP/**/*'
+        );
+    });
+
+    it('takes the temp directory with or without a trailing separator', () => {
+        assert.strictEqual(
+            externalSourceGlob('/tmp/'),
+            '/tmp/RoslynMCP/**/*'
+        );
+        assert.strictEqual(externalSourceGlob('/tmp'), '/tmp/RoslynMCP/**/*');
     });
 });

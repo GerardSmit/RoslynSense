@@ -20,6 +20,7 @@ import { registerTestController, runTestById } from './testController';
 import { registerImpactedTests } from './impactedTests';
 import { registerCoverageMapProgress } from './coverageMapProgress';
 import { registerProjectSet } from './projectSet';
+import { externalSourceGlob } from './paths';
 import { registerSolutionReady } from './solutionReady';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerChangedMembers } from './changedMembers';
@@ -780,6 +781,12 @@ async function startClient(
             // Not folder-scoped: a generated document has no path under any root, and only one
             // client can serve the scheme, so it belongs to whichever client came first.
             ...(ownsCommands ? [{ scheme: 'roslynsense-generated', language: 'csharp' }] : []),
+            // Nor is decompiled or downloaded source, which is a real file — under the server's
+            // cache, which is under no workspace root. The folder-scoped filter above therefore
+            // never claims it, and F12 into a dependency opened a buffer VS Code sent the server
+            // nothing about: no hover, no navigation, and no find-references. Claimed by the same
+            // client as the generated scheme and for the same reason.
+            ...(ownsCommands ? [externalSourceFilter()] : []),
             // The other languages the same server serves — WebForms markup, whose controls,
             // properties and event handlers are C# symbols, and whose <% %> blocks are C#.
             // A language switched off still highlights, it just answers nothing.
@@ -938,6 +945,17 @@ function fileFilter(language: string, folder: vscode.WorkspaceFolder | undefined
     return folder
         ? { scheme: 'file', language, pattern: `${folder.uri.fsPath.replace(/\\/g, '/')}/**/*` }
         : { scheme: 'file', language };
+}
+
+/**
+ * A filter for the source the server fetched or decompiled on the user's behalf.
+ *
+ * The root is the server's own cache — `%TEMP%\RoslynMCP` — reached the same way it reaches it,
+ * since the two run as the same user on the same machine. Every kind lives under it: decompiled
+ * output, Source Link downloads, sources extracted from a PDB, and reference source.
+ */
+function externalSourceFilter(): { scheme: string; language: string; pattern: string } {
+    return { scheme: 'file', language: 'csharp', pattern: externalSourceGlob(os.tmpdir()) };
 }
 
 /**

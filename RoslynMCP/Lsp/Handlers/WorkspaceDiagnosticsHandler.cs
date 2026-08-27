@@ -442,8 +442,16 @@ internal static class WorkspaceDiagnosticsHandler
             : new WorkspaceFullDocumentDiagnosticReport("full", uri, diagnostics) { ResultId = resultId };
     }
 
-    /// <summary>A result id that stands for exactly this set of diagnostics.</summary>
-    private static string ResultIdOf(IReadOnlyList<Protocol.Diagnostic> diagnostics)
+    /// <summary>
+    /// A result id that stands for exactly this set of diagnostics.
+    /// </summary>
+    /// <remarks>
+    /// Shared with the document pull rather than duplicated there, because the client hands the
+    /// pull's id back to the sweep as the sweep's own previous id: the two must compose the same
+    /// string for the same findings, or the file is re-reported on every pass forever. See
+    /// <see cref="DiagnosticsHandler.Answer"/>.
+    /// </remarks>
+    internal static string ResultIdOf(IReadOnlyList<Protocol.Diagnostic> diagnostics)
     {
         var lines = diagnostics
             .Select(d => string.Join(

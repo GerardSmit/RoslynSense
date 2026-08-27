@@ -83,6 +83,17 @@ internal sealed partial class DbmlLanguage : ILanguageWorkspaceDiagnosticContrib
         return reports;
     }
 
+    /// <inheritdoc/>
+    public async Task<string?> DocumentResultIdAsync(string filePath, CancellationToken ct)
+    {
+        // A model with no project is one the sweep never reaches — it walks Project.Documents to
+        // find models at all — so there is no sweep id to agree with and nothing to compose.
+        if (await DbmlWorkspace.ProjectForAsync(filePath, ct) is not { } project)
+            return null;
+
+        return ResultId(filePath, await project.GetDependentSemanticVersionAsync(ct));
+    }
+
     /// <summary>
     /// The version the client hands back on the next sweep, or null when the file could not be read —
     /// in which case the report is sent in full rather than claimed unchanged.

@@ -71,6 +71,21 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
         return reports;
     }
 
+    /// <inheritdoc/>
+    public async Task<string?> DocumentResultIdAsync(string filePath, CancellationToken ct)
+    {
+        // Through the same document service the pull's own diagnostics go through, so the project
+        // this resolves is the project the sweep swept it as.
+        var document = await AspxDocumentService.GetAsync(filePath, ct);
+        if (document is null)
+            return null;
+
+        return ResultId(
+            document.FilePath,
+            await CodeBehindVersionsAsync(document.Project, ct, only: document.FilePath),
+            AspxIncludeService.GetGraph(document.Project));
+    }
+
     /// <summary>
     /// Each markup file's own code-behind and designer, by the version that moves when their
     /// declarations do.
@@ -80,8 +95,14 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
     /// a method body cannot change what markup binds to, and a page whose handler set is unchanged
     /// should not be re-diagnosed for it.
     /// </remarks>
+    /// <param name="only">
+    /// When given, the one markup file whose code-behind is wanted — for the document pull, which
+    /// asks about a single file and must not walk the project's documents per keystroke to do it.
+    /// The answer for that file is identical either way, which is the point: the pull's id and the
+    /// sweep's id have to be the same string.
+    /// </param>
     private static async Task<IReadOnlyDictionary<string, VersionStamp>> CodeBehindVersionsAsync(
-        Project project, CancellationToken ct)
+        Project project, CancellationToken ct, string? only = null)
     {
         var versions = new Dictionary<string, VersionStamp>(StringComparer.OrdinalIgnoreCase);
 
@@ -98,6 +119,9 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
                     : "";
 
             if (owner.Length == 0 || !AspxDocumentService.IsAspxFile(owner))
+                continue;
+
+            if (only is not null && !string.Equals(owner, only, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var version = await document.GetTopLevelChangeTextVersionAsync(ct);

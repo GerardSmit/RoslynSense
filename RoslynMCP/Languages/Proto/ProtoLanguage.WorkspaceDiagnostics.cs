@@ -78,6 +78,33 @@ internal sealed partial class ProtoLanguage : ILanguageWorkspaceDiagnosticContri
         return reports;
     }
 
+    /// <inheritdoc/>
+    public async Task<string?> DocumentResultIdAsync(string filePath, CancellationToken ct)
+    {
+        if (await ProtoWorkspace.GetAsync(filePath, ct) is not { Project: { } project } view)
+            return null;
+
+        // The whole project's protos again, because the digest is over all of them: a file's id
+        // moves when any proto it could import does, and an id built from this file alone would not
+        // be the string the sweep composed. Both halves are memoized reads.
+        var files = await ProtoWorkspace.ProtoFilesAsync(project, ct);
+        if (files.IsDefaultOrEmpty)
+            return null;
+
+        var contents = new List<(string Path, byte[]? Content)>(files.Length);
+        foreach (string file in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            contents.Add((file, ReadBytes(file)));
+        }
+
+        var own = contents.FirstOrDefault(
+            c => string.Equals(c.Path, view.FilePath, StringComparison.OrdinalIgnoreCase));
+
+        return ResultId(
+            own.Content, Digest(contents), await project.GetDependentSemanticVersionAsync(ct));
+    }
+
     /// <summary>
     /// The version the client hands back on the next sweep, or null when the file could not be read
     /// — in which case the report is sent in full rather than claimed unchanged.

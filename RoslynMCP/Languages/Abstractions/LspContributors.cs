@@ -315,6 +315,28 @@ internal interface ILanguageWorkspaceDiagnosticContributor
         Project project,
         IReadOnlyDictionary<string, string> previousResultIds,
         CancellationToken ct);
+
+    /// <summary>
+    /// The very same id <see cref="DiagnoseProjectAsync"/> would compose for this one file, for the
+    /// document pull to stamp its report with — or null when the file cannot be read, which is what
+    /// the sweep also answers and means "send it in full".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Not an optional nicety, and it has to be the identical id rather than merely a valid one. The
+    /// client keeps a result id per URI per kind and, in <c>getAllResultIds</c>, hands the sweep back
+    /// the <em>document pull's</em> id for any URI it is tracking as an open document — and skips
+    /// the URI entirely when that id is absent. A pull that answers without one therefore erases the
+    /// sweep's own id for that file from the moment it is opened: every later sweep sees no previous
+    /// id, re-reports the file in full, and does so every two seconds for the rest of the session.
+    /// </para>
+    /// <para>
+    /// It is a real bug with a quiet symptom, which is why it went unnoticed: the diagnostics are
+    /// correct throughout, the panel merely never settles, and the file is re-parsed forever. See
+    /// <c>DiagnosticsHandler.PullAsync</c>, which is the other half of this contract.
+    /// </para>
+    /// </remarks>
+    Task<string?> DocumentResultIdAsync(string filePath, CancellationToken ct);
 }
 
 /// <summary>

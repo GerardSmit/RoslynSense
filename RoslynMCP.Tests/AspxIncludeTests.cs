@@ -479,4 +479,37 @@ public class AspxIncludeLspTests
                 Assert.Empty(Full(second, "IncludeHost.aspx").Items);
             });
     }
+
+    [Fact]
+    public async Task ThePullStampsMarkupWithTheSameIdTheSweepDoes()
+    {
+        // Load-bearing, and the failure it guards against is silent. VS Code keeps one result id
+        // per URI per kind, and what it hands the sweep back as previousResultIds is the *document
+        // pull's* id for any file it has open — dropping the file from that list altogether when
+        // the pull answered without one. A pull whose id is absent, or merely composed differently
+        // from the sweep's, therefore makes the sweep re-report that file in full on every pass for
+        // the rest of the session: correct diagnostics, a Problems panel that never settles, and
+        // the file re-parsed every two seconds. Equality here is the whole contract.
+        await WithPageAndFragmentAsync(
+            """
+            <%@ Page Language="C#" %>
+            <!--#include file="IncludeFragment.ascx" -->
+            """,
+            """<asp:Label runat="server" />""",
+            async (page, fragment) =>
+            {
+                var project = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.AspxProjectFile);
+                var pack = new WebFormsLanguage(new MarkdownFormatter());
+                var swept = ResultIds(await SweepAsync(project));
+
+                foreach (string file in new[] { page, fragment })
+                {
+                    string uri = RoslynMCP.Lsp.LspConverters.PathToUri(file);
+                    string? pulled = await pack.DocumentResultIdAsync(file, default);
+
+                    Assert.NotNull(pulled);
+                    Assert.Equal(swept[uri], pulled);
+                }
+            });
+    }
 }

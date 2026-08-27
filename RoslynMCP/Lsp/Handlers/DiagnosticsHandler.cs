@@ -265,16 +265,34 @@ internal static class DiagnosticsHandler
         // have had this branch all along, but LspServer gates every Schedule call on the client not
         // supporting pull — so for VS Code, which does, those branches are unreachable and opening
         // a web.config silently cleared its binding-redirect squiggles for as long as it stayed
-        // open. No ResultId: the report is a function of bin and packages, which nothing here
-        // versions, and the client tolerates its absence by treating every report as fresh.
+        // open.
+        //
+        // Stamped with a hash of the findings themselves, which is exactly what the sweep stamps
+        // this file with — see WorkspaceDiagnosticsHandler.DiagnoseBindingRedirectsAsync, whose id
+        // is the same function of the same report. Nothing here versions bin or the package folders
+        // the analysis walks, so no other basis for an id would be honest; a hash of the payload the
+        // "unchanged" answer stands in for cannot outlive it. See ResultIdMustMatchTheSweep below
+        // for why an absent id is not a neutral choice.
         if (BindingRedirectHandler.IsConfigPath(path))
-            return new FullDocumentDiagnosticReport(
-                "full", await BindingRedirectHandler.CachedDiagnosticsAsync(path, ct));
+        {
+            var findings = await BindingRedirectHandler.CachedDiagnosticsAsync(path, ct);
+            return Answer(p, findings, WorkspaceDiagnosticsHandler.ResultIdOf(findings));
+        }
 
         // A pack's diagnostics come from its own parser and are cheap enough to answer in full
-        // every time; there is no analyzer phase behind them to version against.
+        // every time; there is no analyzer phase behind them to version against — but the id still
+        // has to be composed, and composed the pack's own way.
         if (LanguageScope.Of(languages).Resolve<ILanguageDiagnosticProvider>(p.TextDocument.Uri) is { } pack)
-            return new FullDocumentDiagnosticReport("full", await pack.DiagnosticsAsync(path, ct));
+        {
+            string? packId = pack is ILanguageWorkspaceDiagnosticContributor contributor
+                ? await contributor.DocumentResultIdAsync(path, ct)
+                : null;
+
+            if (packId is not null && p.PreviousResultId == packId)
+                return new UnchangedDocumentDiagnosticReport("unchanged", packId);
+
+            return Answer(p, await pack.DiagnosticsAsync(path, ct), packId);
+        }
 
         var document = await LspDocumentResolver.ResolveAsync(path, ct);
         if (document is null)
@@ -330,6 +348,35 @@ internal static class DiagnosticsHandler
             ResultId = reportId,
         };
     }
+
+    /// <summary>
+    /// One report for a file the C# path never reaches — a config file or a pack's own — under an
+    /// id the workspace sweep composes identically.
+    /// </summary>
+    /// <remarks>
+    /// <para id="ResultIdMustMatchTheSweep">
+    /// The id is not optional, and this is the part that is easy to get wrong twice. The client
+    /// keeps a result id per URI per kind, and <c>getAllResultIds</c> — what it sends the sweep as
+    /// <c>previousResultIds</c> — prefers the <em>document pull's</em> id for any URI it is tracking
+    /// as an open document, dropping the URI from the list entirely when that id is absent. So a
+    /// pull that answers with no id does not merely decline to help: it erases the sweep's id for
+    /// that file from the moment it is first opened. Every sweep after that sees no previous id for
+    /// it, re-reports it in full, and keeps doing so every two seconds for the rest of the session —
+    /// with correct diagnostics throughout, which is why it shows up as nothing worse than a
+    /// Problems panel that never settles and a file re-parsed forever.
+    /// </para>
+    /// <para>
+    /// Nor is any id enough. Because the client substitutes this one for the sweep's, an id composed
+    /// on a different basis mismatches the sweep's every time and produces the same treadmill. Each
+    /// branch above therefore delegates to whatever composes the sweep's id for that kind of file
+    /// rather than inventing its own.
+    /// </para>
+    /// </remarks>
+    private static object Answer(
+        DocumentDiagnosticParams p, Protocol.Diagnostic[] items, string? resultId) =>
+        resultId is not null && p.PreviousResultId == resultId
+            ? new UnchangedDocumentDiagnosticReport("unchanged", resultId)
+            : new FullDocumentDiagnosticReport("full", items) { ResultId = resultId };
 
     /// <summary>At most one pass per document, and only so many at once.</summary>
     /// <remarks>

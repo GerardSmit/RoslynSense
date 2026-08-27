@@ -166,6 +166,20 @@ public static class RoslynSenseConfigLoader
                 MergedJson = merged,
             };
         }
+        catch (Exception ex)
+        {
+            // Deliberately everything else. Binding runs this project's own converters, and a
+            // converter does more than shape-check: resolving a connection string reads a file, so
+            // it can fail with anything the filesystem raises. Every caller here is a host reading
+            // its settings at start-up or re-reading them after an edit, and for both of those a
+            // broken config file has to mean "run on defaults and say so" — an escaping exception
+            // means no language server at all, which is the loudest possible way to report the
+            // smallest possible problem.
+            return new LayeredConfig(null, layers, primaryPath, $"{primaryPath}: {ex.Message}")
+            {
+                MergedJson = merged,
+            };
+        }
     }
 
     /// <summary>Writes <paramref name="overlay"/> over <paramref name="target"/>, in place.</summary>

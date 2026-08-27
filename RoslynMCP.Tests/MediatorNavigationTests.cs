@@ -110,6 +110,29 @@ public class MediatorNavigationTests
     }
 
     [Fact]
+    public async Task DefinitionAtTheEndOfTheNameLandsOnTheHandler()
+    {
+        // The caret between the last letter and the paren, which is where it sits after
+        // double-clicking the name or pressing End on a one-call line.
+        var locations = await DefinitionAsync(
+            FixturePaths.MediatorControllerFile,
+            "zapto.GetOrderQueryAsync(query)", "zapto.GetOrderQueryAsync".Length);
+
+        AssertLandsOn(locations, FixturePaths.MediatorOrdersFile, "public ValueTask<OrderDto> Handle(");
+    }
+
+    [Fact]
+    public async Task DefinitionAtTheEndOfASendLandsOnTheHandler()
+    {
+        var locations = await DefinitionAsync(
+            FixturePaths.MediatorControllerFile,
+            "mediatr.Send(new GetOrderQuery(id))", "mediatr.Send".Length);
+
+        AssertLandsOn(locations, FixturePaths.MediatorOrdersFile, "public ValueTask<OrderDto> Handle(");
+        Assert.DoesNotContain(locations, l => IsFile(l, FixturePaths.MediatRStubsFile));
+    }
+
+    [Fact]
     public async Task DefinitionOnAHandlerReachedThroughItsBaseLandsOnTheOverride()
     {
         var locations = await DefinitionAsync(
@@ -146,6 +169,19 @@ public class MediatorNavigationTests
             FixturePaths.MediatorDecoysFile, "_transport.Send(payload)", "_transport.".Length);
 
         AssertLandsOn(locations, FixturePaths.MediatorDecoysFile, "public void Send(byte[] payload)");
+    }
+
+    [Fact]
+    public async Task ACaretAtTheEndOfTheRequestTypeStillReachesTheRequest()
+    {
+        // The token to the left is only read as the call when it is the name being invoked: here it
+        // names the request being constructed, so the answer stays Roslyn's.
+        var locations = await DefinitionAsync(
+            FixturePaths.MediatorControllerFile,
+            "mediatr.Send(new GetOrderQuery(id))", "mediatr.Send(new GetOrderQuery".Length);
+
+        Assert.All(locations, l => Assert.False(IsFile(l, FixturePaths.MediatorOrdersFile)
+            && LineAt(l).Contains("Handle(", StringComparison.Ordinal)));
     }
 
     [Fact]

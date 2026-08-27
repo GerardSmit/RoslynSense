@@ -5,6 +5,10 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>Launch targets, debugger provisioning, and the structured build behind F5.</summary>
+/// <remarks>
+/// Serialized: these open workspaces, and one of them writes the process-wide debug engine choice.
+/// </remarks>
+[Collection(SharedState.Name)]
 public class LaunchHandlerTests
 {
     [Fact]
@@ -19,6 +23,44 @@ public class LaunchHandlerTests
             string.Equals(t.ProjectPath, FixturePaths.SampleProjectFile, StringComparison.OrdinalIgnoreCase));
         Assert.Equal("SampleProject", sample.ProjectName);
         Assert.NotNull(sample.TargetFramework);
+    }
+
+    [Fact]
+    public async Task ATargetSaysWhetherItNeedsTheAdapterTheServerShips()
+    {
+        // The client cannot work this out for itself: the engine setting lives here, and a value
+        // set in roslynsense.json never reaches the editor's own configuration at all.
+        var restore = RoslynMCP.Config.DebugEngineOptions.CoreClr;
+        try
+        {
+            await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
+
+            RoslynMCP.Config.DebugEngineOptions.CoreClr =
+                RoslynMCP.Config.CoreClrDebugEngine.NetCoreDbg;
+            var byDefault = Sample(
+                await LaunchHandler.LaunchTargetsAsync(new LaunchTargetsParams(), default));
+
+            // The fixture is .NET, so by default it is netcoredbg's — the flip below is what
+            // carries this test, since "false for every target" would also hold if the field were
+            // never stamped at all.
+            Assert.False(byDefault.IsNetFramework);
+            Assert.False(byDefault.ServerDebugAdapter);
+
+            RoslynMCP.Config.DebugEngineOptions.CoreClr =
+                RoslynMCP.Config.CoreClrDebugEngine.IcorDebug;
+            var optedIn = Sample(
+                await LaunchHandler.LaunchTargetsAsync(new LaunchTargetsParams(), default));
+
+            Assert.True(optedIn.ServerDebugAdapter);
+
+            static LaunchTarget Sample(IReadOnlyList<LaunchTarget> targets) =>
+                targets.First(t => string.Equals(
+                    t.ProjectPath, FixturePaths.SampleProjectFile, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            RoslynMCP.Config.DebugEngineOptions.CoreClr = restore;
+        }
     }
 
     [Fact]

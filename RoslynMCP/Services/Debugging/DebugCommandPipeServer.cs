@@ -182,7 +182,7 @@ internal sealed class DebugCommandPipeServer : IDisposable
     {
         var engine = (session as PublishingDebugBackend)?.Inner ?? session;
         if (engine is not IcorDebugBackend icor)
-            return "Error: this session does not debug .NET Framework, so it cannot apply a delta.";
+            return $"Error: {IcorDebugBackend.NotADeltaTarget}.";
 
         var (ok, error) = await icor.ApplyDeltaAsync(
             request.AssemblyName!,

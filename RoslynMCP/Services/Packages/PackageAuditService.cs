@@ -80,7 +80,7 @@ public static class PackageAuditService
 
     private static async Task<PackageAudit> RunAsync(CancellationToken ct)
     {
-        string? target = WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        string? target = WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (target is not { Length: > 0 })
             return new PackageAudit([], [], "No solution is loaded.");
 

@@ -177,7 +177,7 @@ internal static class SymbolHandlers
         // half-loaded solution looks like a missing symbol rather than an unfinished load.
         await SolutionWarmup.WaitAsync(ct);
 
-        var solution = WorkspaceService.TryGetMostRecentSolution();
+        var solution = WorkspaceService.TryGetSessionSolution();
         if (solution is null)
             return Array.Empty<SymbolInformation>();
 

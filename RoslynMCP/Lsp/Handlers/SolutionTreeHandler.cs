@@ -1,4 +1,5 @@
-﻿using RoslynMCP.Lsp.Protocol;
+﻿using RoslynMCP.Languages;
+using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using RoslynMCP.Services.Packages;
 using RoslynMCP.Services.ProjectModel;
@@ -19,13 +20,13 @@ internal static class SolutionTreeHandler
     private const string DependenciesSuffix = "!deps";
 
     public static async Task<SolutionTreeNode[]> ChildrenAsync(
-        SolutionTreeParams p, CancellationToken ct)
+        SolutionTreeParams p, CancellationToken ct, LanguageSession? languages = null)
     {
         // The binding first: the tree reads the .sln from disk and needs only its path, which is
         // known from startup. Waiting for a loaded workspace meant an empty Explorer until the
         // user opened a file — and the daemon starts with nothing loaded at all.
         string? solutionPath =
-            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetSessionSolution()?.FilePath;
 
         SolutionTreeNode[] nodes;
         try
@@ -53,9 +54,15 @@ internal static class SolutionTreeHandler
                 var id when id.StartsWith("slnfolder:", StringComparison.Ordinal) =>
                     SolutionFolderChildren(solutionPath, id["slnfolder:".Length..], p),
                 var id when id.StartsWith("solution:", StringComparison.Ordinal) =>
-                    SolutionChildren(id["solution:".Length..], p),
+                    await SolutionChildrenAsync(id["solution:".Length..], p, ct, languages),
                 var id when id.StartsWith("file:", StringComparison.Ordinal) =>
                     await NestedChildrenAsync(id["file:".Length..], p, ct),
+
+                // Last, so no pack's prefix can shadow one of the tree's own. A contributor is
+                // asked only about ids it minted, which is what its prefix is for.
+                var id when Contributor(languages, id) is { } contributor =>
+                    await contributor.ChildrenAsync(id, p, ct),
+
                 _ => [],
             };
         }
@@ -146,7 +153,8 @@ internal static class SolutionTreeHandler
             .OrderBy(n => n.IsFolder ? 0 : 1)
             .ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase);
 
-    private static SolutionTreeNode[] SolutionChildren(string solutionPath, SolutionTreeParams p)
+    private static async Task<SolutionTreeNode[]> SolutionChildrenAsync(
+        string solutionPath, SolutionTreeParams p, CancellationToken ct, LanguageSession? languages)
     {
         var all = SolutionFileService.Read(solutionPath);
         var roots = all.Where(n => n.ParentId is null).ToList();
@@ -155,8 +163,56 @@ internal static class SolutionTreeHandler
         if (roots.Count == 0)
             roots = all.ToList();
 
-        return Ordered(roots).Select(node => ToNode(node, all, p)).ToArray();
+        var nodes = Ordered(roots).Select(node => ToNode(node, all, p)).ToList();
+
+        // After the structure rather than mixed into it, which leaves Ordered's alphabetical run
+        // intact — the same choice ProjectChildrenAsync makes for its pinned rows. A section is
+        // not another folder and sorting it in among them would read as one.
+        nodes.AddRange(await SectionsAsync(solutionPath, ct, languages));
+        return [.. nodes];
     }
+
+    /// <summary>
+    /// The sections language packs hang under the solution, in registration order.
+    /// </summary>
+    /// <remarks>
+    /// On the hot path: this runs every time the solution node is drawn, so a contributor that has
+    /// nothing to say has to say so without evaluating a project. One that throws costs its own
+    /// section and nothing else — a pack must not be able to empty the Explorer.
+    /// </remarks>
+    private static async Task<List<SolutionTreeNode>> SectionsAsync(
+        string solutionPath, CancellationToken ct, LanguageSession? languages)
+    {
+        var sections = new List<SolutionTreeNode>();
+
+        foreach (var contributor in
+            LanguageScope.Of(languages).Contributors<ILanguageSolutionTreeContributor>())
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                if (await contributor.SectionAsync(solutionPath, ct) is { } section)
+                    sections.Add(section);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn(
+                    $"Could not list the '{contributor.NodeIdPrefix}' section: {ex.Message}",
+                    key: $"solution-tree-section:{contributor.NodeIdPrefix}");
+            }
+        }
+
+        return sections;
+    }
+
+    /// <summary>The pack that minted <paramref name="nodeId"/>, if any did.</summary>
+    private static ILanguageSolutionTreeContributor? Contributor(
+        LanguageSession? languages, string nodeId) =>
+        LanguageScope.Of(languages)
+            .Contributors<ILanguageSolutionTreeContributor>()
+            .FirstOrDefault(c => nodeId.StartsWith(c.NodeIdPrefix, StringComparison.Ordinal));
 
     private static SolutionTreeNode[] SolutionFolderChildren(
         string? solutionPath, string folderId, SolutionTreeParams p)
@@ -250,7 +306,7 @@ internal static class SolutionTreeHandler
     /// </remarks>
     private static bool IsLoaded(string projectPath)
     {
-        if (WorkspaceService.TryGetMostRecentSolution() is not { } solution)
+        if (WorkspaceService.TryGetSessionSolution() is not { } solution)
             return false;
 
         foreach (var project in solution.Projects)

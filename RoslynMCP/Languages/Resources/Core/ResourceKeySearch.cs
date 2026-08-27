@@ -932,9 +932,13 @@ internal static class ResourceKeySearch
         if (await document.GetSyntaxRootAsync(ct) is not { } root)
             return null;
 
-        var token = root.FindToken(offset);
-        if (!token.IsKind(SyntaxKind.StringLiteralToken) || !Touches(token.Span, offset))
+        // Touching, to match the end-inclusive reading every other caret in this file gets: just
+        // past the closing quote the user is still on the key.
+        if (CaretTokens.Touching(root, offset, t => t.IsKind(SyntaxKind.StringLiteralToken))
+            is not { } token)
+        {
             return null;
+        }
 
         // Whether the literal is a key at all is answered before the catalog is asked for, because
         // asking for one walks the project's directories and every prepareRename on any string in

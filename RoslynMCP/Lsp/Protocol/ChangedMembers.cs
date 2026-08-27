@@ -46,7 +46,10 @@ public sealed record ChangedMembersFileInfo(
     [property: JsonPropertyName("firstChangedLine")] int FirstChangedLine,
     /// <summary>Whether the file's whole change is staged. Always false outside the
     /// uncommitted scope, where staging says nothing about what a diff contains.</summary>
-    [property: JsonPropertyName("staged")] bool Staged);
+    [property: JsonPropertyName("staged")] bool Staged,
+    /// <summary>How many lines the diff touched in the file; zero for a whole-file change.
+    /// Enough for a client to tell a file it ticked off from the same file changed again.</summary>
+    [property: JsonPropertyName("changedLineCount")] int ChangedLineCount);
 
 /// <summary>
 /// The Changed Members view's data: each changed source file with the members the diff touched.

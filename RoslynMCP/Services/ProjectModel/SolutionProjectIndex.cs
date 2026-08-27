@@ -6,7 +6,7 @@ namespace RoslynMCP.Services.ProjectModel;
 /// <remarks>
 /// <para>
 /// "The projects in this solution" has two answers and they differ for a long time after a
-/// folder is opened. <see cref="WorkspaceService.TryGetMostRecentSolution"/> knows what Roslyn
+/// folder is opened. <see cref="WorkspaceService.TryGetSessionSolution"/> knows what Roslyn
 /// has actually loaded — nothing, until a document is opened, and never a legacy project that
 /// needs the out-of-process build host. The <c>.sln</c> on disk knows the rest immediately.
 /// </para>
@@ -33,7 +33,7 @@ public static class SolutionProjectIndex
 
         // A project loaded without a solution — someone opened a single file — is not in any
         // .sln, so the loaded set is a supplement rather than a fallback.
-        foreach (var project in WorkspaceService.TryGetMostRecentSolution()?.Projects ?? [])
+        foreach (var project in WorkspaceService.TryGetSessionSolution()?.Projects ?? [])
         {
             if (project.FilePath is { Length: > 0 } path)
                 paths.Add(path);
@@ -59,7 +59,7 @@ public static class SolutionProjectIndex
 
         string normalized = PathHelper.NormalizePath(filePath);
 
-        foreach (var project in WorkspaceService.TryGetMostRecentSolution()?.Projects ?? [])
+        foreach (var project in WorkspaceService.TryGetSessionSolution()?.Projects ?? [])
         {
             if (project.FilePath is not { Length: > 0 } projectPath)
                 continue;

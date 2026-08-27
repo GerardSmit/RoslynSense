@@ -665,7 +665,7 @@ public static class ProjectMutationService
         var message = new StringBuilder($"Created {name} from the '{template}' template.");
 
         if (addToSolution && created is not null &&
-            WorkspaceService.TryGetMostRecentSolution()?.FilePath is { Length: > 0 } solution)
+            WorkspaceService.TryGetSessionSolution()?.FilePath is { Length: > 0 } solution)
         {
             var added = await AddProjectToSolutionAsync(created, solution, ct);
             message.Append(' ').Append(added.Message);
@@ -678,7 +678,7 @@ public static class ProjectMutationService
     public static async Task<MutationResult> AddProjectToSolutionAsync(
         string projectPath, string? solutionPath = null, CancellationToken ct = default)
     {
-        solutionPath ??= WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        solutionPath ??= WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (string.IsNullOrEmpty(solutionPath) || !File.Exists(solutionPath))
             return new MutationResult(false, "No solution is open.");
         if (!File.Exists(projectPath))
@@ -699,7 +699,7 @@ public static class ProjectMutationService
     public static async Task<MutationResult> RemoveProjectFromSolutionAsync(
         string projectPath, string? solutionPath = null, CancellationToken ct = default)
     {
-        solutionPath ??= WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        solutionPath ??= WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (string.IsNullOrEmpty(solutionPath) || !File.Exists(solutionPath))
             return new MutationResult(false, "No solution is open.");
 

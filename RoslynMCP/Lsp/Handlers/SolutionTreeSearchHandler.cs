@@ -27,7 +27,7 @@ internal static class SolutionTreeSearchHandler
         // *loaded* solution meant search found nothing until Roslyn had opened one, so a
         // freshly opened folder showed its projects in the tree and matched none of them.
         string? solutionPath =
-            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (solutionPath is null)
             return Task.FromResult<SolutionTreeNode[]>([]);
 
@@ -108,7 +108,7 @@ internal static class SolutionTreeSearchHandler
     {
         string? path = LspConverters.UriToPath(p.Uri);
         string? solutionPath =
-            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+            WorkspaceService.BoundSolutionPath ?? WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (path is null || solutionPath is null)
             return Task.FromResult(new SolutionTreeRevealResult([]));
 

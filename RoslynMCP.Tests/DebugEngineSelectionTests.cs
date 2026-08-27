@@ -43,6 +43,70 @@ public class DebugEngineSelectionTests
     }
 
     [Fact]
+    public void WhenTheCoreClrEngineIsOptedIntoThenTheIcorDebugBackendIsUsed()
+    {
+        var restore = Config.DebugEngineOptions.CoreClr;
+        try
+        {
+            Config.DebugEngineOptions.CoreClr = Config.CoreClrDebugEngine.IcorDebug;
+
+            var modern = DebugSessionManager.CreateSessionForProject(FixturePaths.SampleProjectFile);
+            Assert.IsType<IcorDebugBackend>(Unwrap(modern));
+        }
+        finally
+        {
+            Config.DebugEngineOptions.CoreClr = restore;
+            DebugSessionManager.DisposeSession();
+        }
+    }
+
+    [Fact]
+    public void TheOptInDoesNotReachNetFramework()
+    {
+        // .NET Framework is on this engine either way. Asserted because the setting is scoped to
+        // the one runtime where a choice exists, and a routing change that read it unconditionally
+        // would still pass every other test here.
+        var restore = Config.DebugEngineOptions.CoreClr;
+        try
+        {
+            foreach (var choice in Enum.GetValues<Config.CoreClrDebugEngine>())
+            {
+                Config.DebugEngineOptions.CoreClr = choice;
+                var legacy = DebugSessionManager.CreateSessionForProject(FixturePaths.LegacyProjectFile);
+                Assert.IsType<IcorDebugBackend>(Unwrap(legacy));
+            }
+        }
+        finally
+        {
+            Config.DebugEngineOptions.CoreClr = restore;
+            DebugSessionManager.DisposeSession();
+        }
+    }
+
+    [Fact]
+    public void TheEngineIsReadWhenTheSessionStartsRatherThanHeldFromAnEarlierOne()
+    {
+        // A session already exists when the setting changes — the ordinary case, since the setting
+        // is meant to be flipped while the tool is running. The next session has to see it.
+        var restore = Config.DebugEngineOptions.CoreClr;
+        try
+        {
+            Config.DebugEngineOptions.CoreClr = Config.CoreClrDebugEngine.NetCoreDbg;
+            Assert.IsType<DebuggerService>(
+                Unwrap(DebugSessionManager.CreateSessionForProject(FixturePaths.SampleProjectFile)));
+
+            Config.DebugEngineOptions.CoreClr = Config.CoreClrDebugEngine.IcorDebug;
+            Assert.IsType<IcorDebugBackend>(
+                Unwrap(DebugSessionManager.CreateSessionForProject(FixturePaths.SampleProjectFile)));
+        }
+        finally
+        {
+            Config.DebugEngineOptions.CoreClr = restore;
+            DebugSessionManager.DisposeSession();
+        }
+    }
+
+    [Fact]
     public void WhenInspectingThisProcessThenCoreClrIsDetected()
     {
         // The test host itself runs on CoreCLR, so module-based detection must say so.

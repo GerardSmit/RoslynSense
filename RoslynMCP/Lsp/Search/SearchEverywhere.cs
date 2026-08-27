@@ -122,11 +122,57 @@ public static class SearchEverywhere
             hits.AddRange(await FindSymbolsAsync(solution, request, ct));
 
         if (request.IncludesFiles)
-            hits.AddRange(await FindFilesAsync(solution, request, ct));
+            hits.AddRange(FindFiles(await SolutionFileIndex.FilesAsync(solution, ct), request, ct));
 
         if (includeMetadata && request.IncludesTypes)
             hits.AddRange(await Task.Run(() => FindMetadataTypes(solution, request, ct), ct));
 
+        return Rank(hits, maxResults);
+    }
+
+    /// <summary>
+    /// The same search, against the names read off disk before the solution was loaded.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// What the panel is answered from during the few seconds between an editor connecting and
+    /// <c>SolutionWarmup</c> finishing — see <see cref="NameIndex"/> for why that corpus exists.
+    /// Same query grammar, same tiers, same score arithmetic, and the declarations were extracted
+    /// through the same Roslyn index, so a result list here and a result list from the loaded
+    /// solution differ in exactly one way: this one cannot know about referenced assemblies, having
+    /// never resolved a reference. Metadata types are the one thing a query cannot ask this corpus
+    /// for, and the tab that offers them is off by default.
+    /// </para>
+    /// <para>
+    /// Synchronous over the corpus rather than parallel like the document sweep it stands in for.
+    /// The expensive half of that sweep is building each document's index; here the declarations
+    /// are already in memory, and running the matcher over every name in a large solution is about
+    /// a hundred milliseconds on one core — a thread pool's worth of scheduling for a cost the user
+    /// cannot perceive.
+    /// </para>
+    /// </remarks>
+    public static IReadOnlyList<SearchHit> SearchNames(
+        NameIndexSnapshot index, string query, int maxResults, CancellationToken ct,
+        bool includeFiles = true, SearchItemKind? only = null)
+    {
+        var request = SearchQuery.Parse(query, includeFiles, only);
+        if (request is null)
+            return [];
+
+        var hits = new List<SearchHit>();
+
+        if (request.IncludesSymbols)
+            hits.AddRange(FindNames(index, request, ct));
+
+        if (request.IncludesFiles)
+            hits.AddRange(FindFiles(index.Files, request, ct));
+
+        return Rank(hits, maxResults);
+    }
+
+    /// <summary>Sorted, deduplicated and cut to length — the tail every search shares.</summary>
+    private static IReadOnlyList<SearchHit> Rank(List<SearchHit> hits, int maxResults)
+    {
         hits.Sort(Compare);
 
         // Linked documents (one file in several target frameworks) declare the same symbol once
@@ -146,6 +192,54 @@ public static class SearchEverywhere
         }
 
         return deduped;
+    }
+
+    /// <summary>The declaration half of <see cref="SearchNames"/>.</summary>
+    private static List<SearchHit> FindNames(
+        NameIndexSnapshot index, SearchQuery request, CancellationToken ct)
+    {
+        var matcher = request.NameMatcher;
+        var hits = new List<SearchHit>();
+
+        foreach (var source in index.Sources)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            bool isGenerated = SearchFileRules.IsGenerated(source.Path);
+
+            foreach (var declaration in source.Declarations)
+            {
+                if (KindOf(declaration.Kind) is not { } kind)
+                    continue;
+
+                if (kind == SearchItemKind.Type ? !request.IncludesTypes : !request.IncludesMembers)
+                    continue;
+
+                if (matcher.Match(declaration.Name) is not { } match)
+                    continue;
+
+                if (!request.TryScoreContainer(declaration.Container, out int containerScore))
+                    continue;
+
+                hits.Add(new SearchHit(
+                    kind,
+                    declaration.Name,
+                    declaration.Container.Length == 0 ? null : declaration.Container,
+                    source.Path,
+                    declaration.Line,
+                    declaration.Character,
+                    declaration.EndLine,
+                    declaration.EndCharacter,
+                    ToLspSymbolKind(declaration.Kind),
+                    Score(
+                        match.Score,
+                        Tier(declaration.Kind, kind, match.Score),
+                        containerScore,
+                        isGenerated)));
+            }
+        }
+
+        return hits;
     }
 
     /// <summary>
@@ -477,13 +571,18 @@ public static class SearchEverywhere
     /// <c>.json</c> or a <c>.md</c> is not a Roslyn document, and a search that only knew about
     /// documents could never find one.
     /// </summary>
-    private static async Task<IEnumerable<SearchHit>> FindFilesAsync(
-        Solution solution, SearchQuery request, CancellationToken ct)
+    /// <remarks>
+    /// Takes the file list rather than the <see cref="Solution"/> it usually comes from, because
+    /// the same matching serves <see cref="SearchNames"/>, whose corpus was walked before any
+    /// solution existed. A file hit never needed more than a path.
+    /// </remarks>
+    private static List<SearchHit> FindFiles(
+        IReadOnlyList<string> files, SearchQuery request, CancellationToken ct)
     {
         var matcher = request.NameMatcher;
         var hits = new List<SearchHit>();
 
-        foreach (string path in await SolutionFileIndex.FilesAsync(solution, ct))
+        foreach (string path in files)
         {
             ct.ThrowIfCancellationRequested();
 

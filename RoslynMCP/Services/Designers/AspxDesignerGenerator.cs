@@ -70,7 +70,10 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
             parseResult, filePath, compilation, projectDir, cancellationToken);
 
         return new DesignerResult(
-            designerPath, Render(codeBehind, KeepExistingOrder(fields, style), masterType, style), []);
+            designerPath, Render(codeBehind, KeepExistingOrder(fields, style), masterType, style), [])
+        {
+            DeclaresNoMembers = fields.Count == 0 && masterType is null,
+        };
     }
 
     /// <summary>
@@ -98,6 +101,7 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         {
             return new DesignerResult(designerPath, Render(codeBehind, [], masterType: null, style), [])
             {
+                DeclaresNoMembers = true,
                 RelatedSources = [canonicalPath],
             };
         }
@@ -115,6 +119,7 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
             Render(codeBehind, KeepExistingOrder(fields, style), masterType, style, nullableDirective: true),
             [])
         {
+            DeclaresNoMembers = fields.Count == 0 && masterType is null,
             RelatedSources = [.. group.Select(file => file.Path).Where(path => !PathsEqual(path, filePath))],
         };
     }

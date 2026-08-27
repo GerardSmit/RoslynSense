@@ -35,9 +35,16 @@ internal static class LinkedEditingHandler
         if (root is null || model is null)
             return null;
 
-        var token = root.FindToken(LspConverters.ToOffset(text, p.Position));
-        if (!token.IsKind(SyntaxKind.IdentifierToken) || token.Parent is null)
+        // Touching rather than containing: while typing, the caret sits against the end of the
+        // name being typed, which is the position the feature exists to answer.
+        if (CaretTokens.Touching(
+                root,
+                LspConverters.ToOffset(text, p.Position),
+                t => t.IsKind(SyntaxKind.IdentifierToken))
+            is not { } token || token.Parent is null)
+        {
             return null;
+        }
 
         var symbol = model.GetDeclaredSymbol(token.Parent, ct)
             ?? model.GetSymbolInfo(token.Parent, ct).Symbol;

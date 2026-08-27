@@ -44,6 +44,10 @@ Languages/
                        files, and narrows the answers to requests about other files instead
     Core/              the engine: unescape, parse, stack the layers, resolve the four keys
     DotSettingsLanguage.cs
+  Cron/                Hangfire and Quartz schedules — no files of its own, and the first pack to
+                       put a section in the Solution Explorer
+    Core/              the engine: the grammar, the call sites, and the per-compilation job index
+    CronLanguage.*.cs
 ```
 
 `DotSettings/` is the other kind of exception, and the opposite one. It owns two extensions and
@@ -67,6 +71,15 @@ and does it own spans inside someone else's".
 `Values/` is the same kind again, and the one that shows what the kind is for. Its definition is
 not even in the repository — it is rows in a lookup table — so what the pack contributes is a way
 of reaching something the compilation cannot see at all, hung off the same seam.
+
+`Cron/` is the one pack that adds a row to the tree rather than an answer to a request. It is the
+same problem `Mediator/` has, one level up: a recurring job is registered by an ordinary call in a
+startup method, so the job's own method looks uncalled and the question "what runs on this system,
+and when" is answered nowhere in the editor. Answering it needed a seam that did not exist —
+`ILanguageSolutionTreeContributor`, whose two methods split along the tree's own promise that
+drawing the solution root evaluates no project: `SectionAsync` runs there and may only read cheap
+evidence, while `ChildrenAsync` runs after a click and can afford a compilation. A pack's node ids
+are prefixed and routed last, so no prefix it chooses can shadow `project:` or `file:`.
 
 Not every pack is a file type. `Mediator/` owns no extension at all: a request, its handler and the
 call joining them are ordinary C#, and what is missing is the *edge* between them, which Roslyn

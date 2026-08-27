@@ -721,6 +721,11 @@
         "category": "RoslynSense"
       },
       {
+        "command": "roslynSense.solutionExplorer.goToJobMethod",
+        "title": "Go to Job Method",
+        "category": "RoslynSense"
+      },
+      {
         "command": "roslynSense.solutionExplorer.addProjectReference",
         "title": "Add Project Reference…",
         "category": "RoslynSense",
@@ -1090,6 +1095,10 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.solutionExplorer.goToJobMethod",
+          "when": "false"
+        },
+        {
           "command": "roslynSense.solutionExplorer.copy",
           "when": "false"
         },
@@ -1137,6 +1146,11 @@
         {
           "command": "roslynSense.solutionExplorer.goToProject",
           "when": "view == roslynSense.solutionExplorer && viewItem == projectRef",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToJobMethod",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^cronJob.*Method$/",
           "group": "1_edit@1"
         },
         {
@@ -1367,22 +1381,22 @@
       "view/item/context": [
         {
           "command": "roslynSense.changedMembers.openDiff",
-          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|MemberReviewed|Block|OtherFile)$/",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|Block|OtherFile)(Reviewed|Staged)?$/",
           "group": "inline@1"
         },
         {
           "command": "roslynSense.changedMembers.openFile",
-          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|MemberReviewed|Block|OtherFile)$/",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|Block|OtherFile)(Reviewed|Staged)?$/",
           "group": "inline@2"
         },
         {
           "command": "roslynSense.changedMembers.markReviewed",
-          "when": "view == roslynSense.changedMembers && viewItem == changedMember",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^(changedMember|changedFile|changedOtherFile|namespace|type)$/",
           "group": "inline@3"
         },
         {
           "command": "roslynSense.changedMembers.unmarkReviewed",
-          "when": "view == roslynSense.changedMembers && viewItem == changedMemberReviewed",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^(changedMember|changedFile|changedOtherFile|namespace|type)Reviewed$/",
           "group": "inline@3"
         },
         {
@@ -1739,6 +1753,19 @@
           "default": [],
           "description": "Never load symbols for modules matching these globs, taking precedence over the include list. A module without symbols cannot bind source breakpoints. ASP.NET's generated App_Web_*.dll page assemblies are already skipped without configuration."
         },
+        "roslynSense.debugger.coreClrEngine": {
+          "type": "string",
+          "enum": [
+            "netcoredbg",
+            "icordebug"
+          ],
+          "enumDescriptions": [
+            "The external debugger used for .NET so far. Runs on every platform.",
+            "The engine .NET Framework already uses. Windows only, and newer on this runtime."
+          ],
+          "default": "netcoredbg",
+          "markdownDescription": "Which engine debugs .NET (CoreCLR) targets. .NET Framework always uses `icordebug`, the only engine that can attach to it.\n\n`icordebug` additionally brings Just My Code applied by the runtime, breakpoints that bind against binaries built on another machine, method return values after a step, and stepping through decompiled code with no PDB. It runs on Windows only, and has far less mileage on .NET than on .NET Framework.\n\nTakes effect the next time debugging starts."
+        },
         "roslynSense.hotReload.applyOnSave": {
           "type": "boolean",
           "default": false,
@@ -1820,6 +1847,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Resolve `Send`, `Publish` and the generated mediator extension methods to the handler that runs, and count those calls as usages of the handler. Supports MediatR and Zapto.Mediator. Off leaves them resolving to the mediator interface in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.cron": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Colour, explain and check the crontab expressions handed to Hangfire and Quartz — and any string passed to a parameter named `cronExpression` or close to it — and list every scheduled job in the solution under Cron Jobs. Off hides the section and leaves the strings plain in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.logging": {
           "type": "boolean",

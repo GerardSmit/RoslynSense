@@ -94,6 +94,11 @@ declare namespace SearchMsg {
               tab: Tab;
               items: SymbolItem[] | TextItem[] | ActionItem[];
               truncated: boolean;
+              /** The solution was still loading, so these rows came from the server's name index
+               * rather than from the workspace. The list is complete for solution source but knows
+               * nothing of referenced assemblies; the panel says so, and asks again by itself once
+               * the load lands. */
+              loading?: boolean;
           }
         | {
               type: 'previewText';

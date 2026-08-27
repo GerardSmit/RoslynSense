@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Config;
+using RoslynMCP.Lsp.Search;
 using RoslynMCP.Services;
 
 namespace RoslynMCP.Lsp;
@@ -15,7 +16,7 @@ namespace RoslynMCP.Lsp;
 /// named a file inside it. That is right for the per-file features — nobody wants thirty projects
 /// evaluated so one document can get its squiggles — and wrong for the solution-wide ones, which
 /// have no file to be driven by. Search Everywhere is the visible case: it searches
-/// <see cref="WorkspaceService.TryGetMostRecentSolution"/>, so before any file is opened it
+/// <see cref="WorkspaceService.TryGetSessionSolution"/>, so before any file is opened it
 /// searches an empty solution and finds nothing, and after one file is opened it finds that
 /// project's closure and nothing else. A search box whose answers depend on which tabs happen to
 /// be open is not a search box.
@@ -75,6 +76,11 @@ internal static class SolutionWarmup
             }
 
             s_solutionPath = solution;
+
+            // Before the load, not after it, and never awaited by it: reading the names off disk
+            // is what makes the first Ctrl+T answerable during the seconds MSBuild is busy. It
+            // needs the solution file and nothing the load produces. See Search.NameIndex.
+            _ = NameIndex.Start(solution);
 
             // Task.Run, not a bare async call: this runs from the initialized notification, and
             // the first thing the load does — reading the solution file — must not sit on the
@@ -165,6 +171,46 @@ internal static class SolutionWarmup
         await warm.WaitAsync(ct);
     }
 
+    /// <summary>
+    /// The load in progress, as a task — for a caller that wants to race it rather than wait for
+    /// it. Completed when nothing is loading.
+    /// </summary>
+    /// <remarks>
+    /// What lets a search answer from <see cref="Search.NameIndex"/> only for as long as that is
+    /// the better of the two available answers: the moment the real corpus exists, the race is
+    /// over and the search takes the real one.
+    /// </remarks>
+    public static Task Loading
+    {
+        get
+        {
+            lock (s_gate)
+                return s_warm;
+        }
+    }
+
+    private static bool s_loadedOnce;
+
+    /// <summary>
+    /// Whether the bound solution has finished loading at least once in this daemon.
+    /// </summary>
+    /// <remarks>
+    /// What separates the cold open from every later load. <see cref="Search.NameIndex"/> stands in
+    /// for the solution only before the first load lands: after that the workspace exists and is
+    /// kept current by the editor, while the index is a snapshot of the disk taken minutes or hours
+    /// ago. A reload — <see cref="EnsureLoaded"/> after a build evicted something — must not fall
+    /// back to it, because a build is exactly when the files it described have changed, and because
+    /// a language pack's claim on a query needs a solution that by then exists.
+    /// </remarks>
+    public static bool HasLoadedOnce
+    {
+        get
+        {
+            lock (s_gate)
+                return s_loadedOnce;
+        }
+    }
+
     private static async Task LoadAsync(string solutionPath)
     {
         try
@@ -197,6 +243,20 @@ internal static class SolutionWarmup
                 key: $"solution-warmup:{solutionPath}");
         }
 
+        lock (s_gate)
+            s_loadedOnce = true;
+
+        // The stand-in has done its job and is now only a few megabytes of declarations nobody
+        // will read again this session.
+        NameIndex.Retire();
+
+        // Whatever a client was told while this was running, it was told provisionally: a search
+        // answered from the name index carries "the solution is still loading", and the panel
+        // reruns its query when this arrives. Sent whether or not the load threw — a partial
+        // solution is still a better corpus than one read off disk, and a client left waiting for
+        // a signal that never comes shows a stale banner forever.
+        LspSessionRegistry.NotifySolutionReady();
+
         // Deliberately outside the try and outside anything a caller awaits: a solution that was
         // already loaded still needs this, and a search must never wait for it.
         var warm = Task.Run(WarmSymbolsAsync);
@@ -206,9 +266,11 @@ internal static class SolutionWarmup
 
     private static Task s_warmedSymbols = Task.CompletedTask;
 
-    /// <summary>How many index builds run at once. Two to three is the band the report names: high
+    /// <summary>How many index builds run at once while somebody is waiting on a request — high
     /// enough that a sweep of thousands of documents is not one core's worth of work, low enough
-    /// that a keystroke arriving mid-sweep still finds a free core to be answered on.</summary>
+    /// that a keystroke arriving mid-sweep still finds a free core to be answered on. With nothing
+    /// in flight the sweep runs wide instead; <see cref="ForegroundGate"/> moves it between the
+    /// two.</summary>
     private const int IndexConcurrency = 3;
 
     /// <summary>The pause taken between two projects' compilations. Long enough that queued
@@ -268,7 +330,7 @@ internal static class SolutionWarmup
     {
         try
         {
-            if (WorkspaceService.TryGetMostRecentSolution() is not { } solution)
+            if (WorkspaceService.TryGetSessionSolution() is not { } solution)
                 return;
 
             var order = WarmOrder(solution);
@@ -414,14 +476,18 @@ internal static class SolutionWarmup
             }
         }
 
+        // Wide, and narrowed per item by the gate: on a cold open there is nobody to yield to and
+        // the sweep should finish as early as it can, while a sweep still running when the user
+        // starts typing drops back to IndexConcurrency within one document's work.
         var options = new ParallelOptions
         {
-            MaxDegreeOfParallelism = IndexConcurrency,
+            MaxDegreeOfParallelism = Environment.ProcessorCount,
             CancellationToken = ct,
         };
 
         await Parallel.ForEachAsync(documents, options, async (document, token) =>
         {
+            using var admitted = await ForegroundGate.AdmitAsync(token).ConfigureAwait(false);
             await SyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
             await TopLevelSyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
             swept?.Invoke();
@@ -429,6 +495,7 @@ internal static class SolutionWarmup
 
         await Parallel.ForEachAsync(references, options, async (reference, token) =>
         {
+            using var admitted = await ForegroundGate.AdmitAsync(token).ConfigureAwait(false);
             var checksum = SymbolTreeInfo.GetMetadataChecksum(solution.Services, reference, token);
             await SymbolTreeInfo
                 .GetInfoForMetadataReferenceAsync(solution, reference, checksum, token)
@@ -449,11 +516,14 @@ internal static class SolutionWarmup
     /// <summary>Test seam: forgets that a solution was warmed, so the next start reloads it.</summary>
     internal static void Reset()
     {
+        NameIndex.Reset();
+
         lock (s_gate)
         {
             s_solutionPath = null;
             s_warm = Task.CompletedTask;
             s_warmedSymbols = Task.CompletedTask;
+            s_loadedOnce = false;
         }
     }
 }

@@ -73,6 +73,29 @@ internal static class LspSessionRegistry
         }
     }
 
+    /// <summary>
+    /// Tells every connected editor that the bound solution has finished loading, so a view that
+    /// was answered out of a stand-in can ask again for the real answer.
+    /// </summary>
+    /// <remarks>
+    /// Search Everywhere is the one view that needs this. While the solution loads it is answered
+    /// from the names read off disk (<see cref="Search.NameIndex"/>) and told the answer is
+    /// provisional; this is the moment that stops being true. Not folded into
+    /// <see cref="NotifyProjectSetChanged"/>, which fires on every project-set movement for the
+    /// lifetime of the session — a panel that reran its query on each of those would rerun it
+    /// through every build.
+    /// </remarks>
+    public static void NotifySolutionReady()
+    {
+        foreach (var rpc in s_sessions.Values)
+        {
+            try { _ = rpc.NotifyWithParameterObjectAsync("roslynSense/solutionReady", new { }); }
+            catch (Exception ex) when (ex is ConnectionLostException or ObjectDisposedException)
+            {
+            }
+        }
+    }
+
     /// <summary>Long enough to swallow a burst of analyzer passes, short enough that squiggles
     /// appear while the user is still looking at the line that produced them.</summary>
     private static readonly TimeSpan RefreshQuiet = TimeSpan.FromMilliseconds(750);

@@ -82,6 +82,7 @@ class Program
         var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
         startupWarnings.AddRange(settingsWarnings);
         DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
         IReadOnlyList<IDbProvider> dbProviders;
         IReadOnlyList<AutoConnectionStringDiscovery.DiscoveryWarning> autoDbWarnings = Array.Empty<AutoConnectionStringDiscovery.DiscoveryWarning>();

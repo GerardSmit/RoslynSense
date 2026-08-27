@@ -33,6 +33,7 @@ internal static class ChangedMembersHandler
                     IsTest: f.IsTest,
                     FirstChangedLine: f.FirstChangedLine,
                     Staged: f.Staged,
+                    ChangedLineCount: f.ChangedLineCount,
                     Members:
                     f.Members
                         .Select(m => new ChangedMemberInfo(

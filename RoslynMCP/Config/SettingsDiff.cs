@@ -27,6 +27,7 @@ internal static class SettingsDiff
         Toggle("dbml", old.Dbml, @new.Dbml);
         Toggle("appsettings", old.AppSettings, @new.AppSettings);
         Toggle("webconfig", old.WebConfig, @new.WebConfig);
+        Toggle("cron", old.Cron.Enabled, @new.Cron.Enabled);
         Toggle("debugger", old.Debugger, @new.Debugger);
         Toggle("profiling", old.Profiling, @new.Profiling);
         Toggle("database", old.Database, @new.Database);

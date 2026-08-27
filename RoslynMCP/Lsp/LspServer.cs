@@ -490,7 +490,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/solutionTree", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
-        Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
+        Handlers.SolutionTreeHandler.ChildrenAsync(p, ct, _languages);
 
     [JsonRpcMethod("roslynSense/solutionProjects")]
     public SolutionProjectInfo[] SolutionProjects() => Handlers.SolutionTreeHandler.Projects();

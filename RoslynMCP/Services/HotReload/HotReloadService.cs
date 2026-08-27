@@ -284,7 +284,14 @@ internal sealed class HotReloadService
             Solution solution, IReadOnlyList<HotReloadDelta> deltas, CancellationToken cancellationToken)
     {
         var local = DebugSessionManager.GetSession() as Debugging.PublishingDebugBackend;
-        var icor = local?.Inner as IcorDebugBackend;
+
+        // Only a .NET Framework session takes this route. A .NET one on the same engine refuses
+        // every delta — its updates go through the in-process updater — so treating it as the
+        // local applier would suppress the fan-out below and strand a Framework session running
+        // in another process.
+        var icor = local?.Inner is IcorDebugBackend backend && backend.AppliesDeltas
+            ? backend
+            : null;
 
         // The session can live in another process — the editor's F5 runs `--dap`, and an AI
         // session runs in its own MCP client — so a remote apply goes over the same command pipe
@@ -344,7 +351,7 @@ internal sealed class HotReloadService
             else if (ok)
                 applied.Add($"{assemblyName} (debuggee)");
             else if (!error.Contains("is not loaded", StringComparison.OrdinalIgnoreCase) &&
-                     !error.Contains("does not debug .NET Framework", StringComparison.OrdinalIgnoreCase))
+                     !error.Contains(IcorDebugBackend.NotADeltaTarget, StringComparison.OrdinalIgnoreCase))
             {
                 // A CoreCLR session refusing a Framework-only route is a skip, not a failure:
                 // the fan-out reaches every published session, related to this edit or not.

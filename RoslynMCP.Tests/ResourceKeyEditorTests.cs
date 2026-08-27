@@ -416,6 +416,26 @@ public class ResourceKeyEditorTests
         Assert.Null(await pack.PrepareAsync(path, offset, default));
     }
 
+    [Fact]
+    public async Task AKeyIsStillFoundWithTheCaretPastTheClosingQuote()
+    {
+        var pack = Publish();
+
+        string path = FixturePaths.LocalizedCodeBehindFile;
+        int inside = OffsetOf(path, "GetString(\"Heading\"", "GetString(\"".Length);
+        int past = OffsetOf(path, "GetString(\"Heading\"", "GetString(\"Heading\"".Length);
+
+        // The caret between the closing quote and whatever follows is still on the key, the same
+        // way it is on a name at the end of one. The literal is a token the offset is past.
+        var target = await ResourceKeySearch.LocateAsync(pack.Settings, path, past, project: null, default);
+        var reference = await ResourceKeySearch.LocateAsync(
+            pack.Settings, path, inside, project: null, default);
+
+        Assert.NotNull(target);
+        Assert.Equal(reference!.Key, target!.Key);
+        Assert.Equal(reference.Span, target.Span);
+    }
+
     // ---- Which overload carries the root -----------------------------------------------------
 
     [Fact]

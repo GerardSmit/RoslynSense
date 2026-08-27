@@ -83,7 +83,7 @@ namespace SE {
 
     // ---- Rendering -------------------------------------------------------------------
 
-    function render(placeholder?: string, truncated = false): void {
+    function render(placeholder?: string, truncated = false, loading = false): void {
         results.replaceChildren();
 
         if (placeholder !== undefined) {
@@ -91,6 +91,9 @@ namespace SE {
             li.className = 'placeholder';
             li.textContent = placeholder;
             results.append(li);
+            if (loading) {
+                results.append(note('The solution is still loading \u2014 these results will improve.'));
+            }
             return;
         }
 
@@ -109,11 +112,25 @@ namespace SE {
         });
 
         if (truncated) {
-            const li = document.createElement('li');
-            li.className = 'placeholder';
-            li.textContent = 'More results exist — keep typing to narrow the search.';
-            results.append(li);
+            results.append(note('More results exist — keep typing to narrow the search.'));
         }
+
+        // Said under the list rather than over it: the rows are the answer, and on a warm daemon
+        // this never appears at all. It goes away on its own — the host reruns the query when the
+        // server says the solution is loaded.
+        if (loading) {
+            results.append(note(
+                'The solution is still loading — searching names read from disk. '
+                + 'Results from referenced assemblies are not included yet.'));
+        }
+    }
+
+    /** A row that is not a result: a note under the list, never selectable. */
+    function note(text: string): HTMLLIElement {
+        const li = document.createElement('li');
+        li.className = 'placeholder';
+        li.textContent = text;
+        return li;
     }
 
     function renderRow(row: Row): HTMLElement[] {
@@ -516,7 +533,11 @@ namespace SE {
                         : message.tab === 'actions'
                           ? (items as SearchMsg.ActionItem[]).map((item) => ({ kind: 'action', item }) as Row)
                           : (items as SearchMsg.SymbolItem[]).map((item) => ({ kind: 'symbol', item }) as Row);
-                render(rows.length === 0 ? `No results for "${query.value.trim()}"` : undefined, message.truncated);
+                render(
+                    rows.length === 0 ? `No results for "${query.value.trim()}"` : undefined,
+                    message.truncated,
+                    message.loading === true
+                );
                 select(rows.length > 0 ? 0 : -1);
                 return;
             }

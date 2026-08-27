@@ -26,9 +26,13 @@ public sealed record SearchEverywhereItem(
     [property: JsonPropertyName("character")] int Character,
     [property: JsonPropertyName("symbolKind")] int SymbolKind);
 
+/// <param name="Loading">The bound solution was still being evaluated, so these rows came from the
+/// names read off disk rather than from the workspace. The client says so and asks again when
+/// <c>roslynSense/solutionReady</c> arrives — see <c>Lsp.Search.NameIndex</c>.</param>
 public sealed record SearchEverywhereResult(
     [property: JsonPropertyName("items")] SearchEverywhereItem[] Items,
-    [property: JsonPropertyName("truncated")] bool Truncated);
+    [property: JsonPropertyName("truncated")] bool Truncated,
+    [property: JsonPropertyName("loading")] bool Loading = false);
 
 /// <summary>
 /// roslynSense/resolveMetadataTarget — turns a <c>roslynsense-metadata:</c> search hit into the
@@ -62,4 +66,5 @@ public sealed record SearchTextItem(
 
 public sealed record SearchTextResult(
     [property: JsonPropertyName("items")] SearchTextItem[] Items,
-    [property: JsonPropertyName("truncated")] bool Truncated);
+    [property: JsonPropertyName("truncated")] bool Truncated,
+    [property: JsonPropertyName("loading")] bool Loading = false);

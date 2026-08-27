@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Operations;
+using RoslynMCP.Lsp;
 using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.Mediator.Core;
@@ -60,7 +61,20 @@ internal static class MediatorNavigationService
     /// </remarks>
     private static InvocationExpressionSyntax? InvocationAt(SyntaxNode root, int offset)
     {
-        if (root.FindToken(offset).Parent is not SimpleNameSyntax name)
+        // Touching rather than containing, because a caret at the end of the name belongs to the
+        // paren after it: F12 there is the same gesture as F12 in the middle of the name, and
+        // Roslyn's own symbol lookup already reads it that way. Nothing but the name is accepted,
+        // so a caret after an argument or a closing paren still finds nothing and the answer goes
+        // back to Roslyn.
+        return CaretTokens.Touching(root, offset, t => InvocationOf(t) is not null) is { } token
+            ? InvocationOf(token)
+            : null;
+    }
+
+    /// <summary>The invocation a token names, when the token is the name being invoked.</summary>
+    private static InvocationExpressionSyntax? InvocationOf(SyntaxToken token)
+    {
+        if (token.Parent is not SimpleNameSyntax name)
             return null;
 
         return name.Parent switch

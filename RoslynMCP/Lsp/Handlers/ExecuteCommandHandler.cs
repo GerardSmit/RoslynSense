@@ -172,7 +172,7 @@ internal static class ExecuteCommandHandler
         // Target: explicit argument (solution/project path from the client) or the loaded solution.
         string? target = p.Arguments is [{ ValueKind: System.Text.Json.JsonValueKind.String } arg, ..]
             ? arg.GetString()
-            : WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+            : WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (string.IsNullOrEmpty(target) || !File.Exists(target))
             return "No solution or project to restore. Pass a path or open a document first.";
 

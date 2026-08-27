@@ -14,6 +14,43 @@ internal static class LspConverters
     public static string PathToUri(string path) => new Uri(PathHelper.NormalizePath(path)).AbsoluteUri;
 
     /// <summary>
+    /// A URI the client sent, in the exact spelling this server produces for the same file.
+    /// </summary>
+    /// <remarks>
+    /// Only for comparing a client's URI against one of ours as a string — never for anything that
+    /// then goes back out, which should carry the client's own spelling. A file URI has many legal
+    /// spellings of one path: VS Code percent-encodes the drive colon, its <c>skipEncoding</c>
+    /// serialisation leaves a space in a file name raw where <see cref="Uri.AbsoluteUri"/> writes
+    /// <c>%20</c>, and the drive letter's case is free. Comparing the raw strings therefore reports
+    /// "different file" for a file whose name merely contains a space — which the workspace sweep
+    /// read as "the client is holding no result for this file", so it re-sent that file in full on
+    /// every pass for the life of the session. Routing both sides through the path collapses all of
+    /// those spellings onto one.
+    /// </remarks>
+    public static string NormalizeUri(string uri)
+    {
+        if (IsVirtual(uri))
+            return uri;
+
+        try
+        {
+            return PathToUri(UriToPath(uri));
+        }
+        catch (UriFormatException)
+        {
+            return uri;
+        }
+        catch (ArgumentException)
+        {
+            return uri;
+        }
+        catch (Exception ex) when (ex is IOException or NotSupportedException)
+        {
+            return uri;
+        }
+    }
+
+    /// <summary>
     /// The file behind a document URI — or the URI itself, when there is no file.
     /// </summary>
     /// <remarks>

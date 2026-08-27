@@ -43,6 +43,10 @@ interface LaunchTarget {
     launchProfile: string | null;
     browseUrl: string | null;
     launchBrowser: boolean | null;
+    // Whether this target needs the adapter the server ships rather than netcoredbg. Always true
+    // for .NET Framework; true for .NET when the engine setting says so. Decided by the server so
+    // a value set in roslynsense.json counts here too. Absent from a server that predates it.
+    serverDebugAdapter?: boolean;
 }
 
 interface DebuggerPathResult {
@@ -148,13 +152,21 @@ export function registerDebugLaunch(
         vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
             async createDebugAdapterDescriptor(session: vscode.DebugSession) {
                 // .NET Framework needs ICorDebug; netcoredbg only speaks to CoreCLR. The server
-                // ships that adapter itself, in --dap mode.
-                if (session.configuration.isNetFramework === true ||
-                    (await isFrameworkTarget(getClient(), session.configuration.projectPath))) {
+                // ships that adapter itself, in --dap mode — and a .NET target is sent there too
+                // when the engine setting asks for it.
+                const adapter = await adapterFor(
+                    getClient(),
+                    session.configuration.projectPath,
+                    session.configuration
+                );
+                if (adapter.server) {
                     return new vscode.DebugAdapterExecutable(
                         vscode.workspace.getConfiguration('roslynSense')
                             .get<string>('serverPath', 'roslyn-sense'),
-                        ['--dap']);
+                        // The adapter is one process per session and is told which runtime it is
+                        // getting, rather than reading the setting a second time and possibly
+                        // disagreeing with the answer that sent it here.
+                        adapter.framework ? ['--dap'] : ['--dap', '--coreclr']);
                 }
 
                 const configured = vscode.workspace
@@ -351,6 +363,13 @@ export function registerDebugLaunch(
                 config.cwd = config.cwd ?? target.cwd;
                 config.env = { ...target.env, ...(config.env ?? {}) };
 
+                // Recorded on the session so the adapter factory, which runs next, does not ask
+                // the server the same question again — and so the two cannot answer differently
+                // if the setting changes in between.
+                config.isNetFramework = config.isNetFramework ?? target.isNetFramework;
+                config.serverDebugAdapter =
+                    config.serverDebugAdapter ?? target.serverDebugAdapter ?? target.isNetFramework;
+
                 // Hot reload has to be decided before the process starts, and it costs nothing
                 // when unused, so it is on unless the configuration turns it off. .NET Framework
                 // needs no environment — its edits go through the debugger, not a startup hook —
@@ -389,15 +408,48 @@ export function registerDebugLaunch(
 }
 
 /** Whether a project targets .NET Framework, which decides the adapter. */
-async function isFrameworkTarget(
+/**
+ * Which adapter a session needs, and which runtime it is for.
+ *
+ * Both come from the server: it owns the engine setting, and reading it here would miss a value
+ * set in roslynsense.json rather than in the editor. A configuration that already carries the
+ * answer — one this extension resolved, or one the user wrote by hand — is believed without the
+ * round trip.
+ */
+async function adapterFor(
     client: LanguageClient | undefined,
-    projectPath: string | undefined
-): Promise<boolean> {
-    if (!client || !projectPath) {
-        return false;
+    projectPath: string | undefined,
+    configuration: vscode.DebugConfiguration
+): Promise<{ server: boolean; framework: boolean }> {
+    // Only the runtime is taken on the configuration's word. `serverDebugAdapter` alone is not
+    // enough to skip the lookup: it says which adapter, not which runtime, and an adapter told the
+    // wrong runtime waits for a CoreCLR startup in a .NET Framework process until it times out.
+    if (configuration.isNetFramework === true) {
+        return { server: true, framework: true };
     }
-    const targets = await fetchTargets(client);
-    return targets.some((t) => samePath(t.projectPath, projectPath) && t.isNetFramework);
+
+    const target =
+        client && projectPath
+            ? (await fetchTargets(client)).find((t) => samePath(t.projectPath, projectPath))
+            : undefined;
+
+    if (!target) {
+        // Nothing to ask. Believe the configuration if it claims our adapter, and treat it as
+        // .NET, since a .NET Framework configuration that reached here said nothing about being
+        // one and netcoredbg would have been chosen for it before this setting existed.
+        return {
+            server: configuration.serverDebugAdapter === true,
+            framework: false,
+        };
+    }
+
+    // A server too old to send serverDebugAdapter offers no .NET opt-in, so its .NET Framework
+    // targets are the only ones that belong to our adapter.
+    return {
+        server: configuration.serverDebugAdapter === true
+            || (target.serverDebugAdapter ?? target.isNetFramework),
+        framework: target.isNetFramework,
+    };
 }
 
 /**

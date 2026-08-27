@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace RoslynMCP.Config;
 
@@ -18,6 +18,8 @@ public sealed class RoslynSenseConfig
     /// <summary>The <c>valueSets</c> section: strings whose allowed values live somewhere the
     /// compiler cannot see.</summary>
     public ValueSetsConfig ValueSets { get; init; } = new();
+
+    public CronConfig Cron { get; init; } = new();
 
     /// <summary>The <c>webForms</c> section: which markup attributes carry data expressions.</summary>
     public WebFormsConfig WebForms { get; init; } = new();
@@ -59,6 +61,7 @@ public sealed class ToolsConfig
     public bool Logging { get; init; } = true;
     public bool Formatting { get; init; } = true;
     public bool ValueSets { get; init; } = true;
+    public bool Cron { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;
     public bool Database { get; init; } = true;
@@ -118,6 +121,78 @@ public sealed class LoggingConfig
     /// <summary>LOG0005 — an exception passed as a rendered value instead of as the call's
     /// first argument, which loses the stack trace.</summary>
     public bool? ExceptionPosition { get; init; }
+}
+
+/// <summary>
+/// The <c>cron</c> section of <c>roslynsense.json</c>: which methods take a crontab expression.
+/// </summary>
+/// <remarks>
+/// Separate from the <c>tools.cron</c> switch that turns the pack on, the same way
+/// <see cref="WebConfigConfig"/> is separate from <c>tools.webConfig</c>: one decides whether the
+/// pack runs, the other what it runs over.
+/// <para>
+/// Everything here is additive. Hangfire and Quartz are recognised without configuration, and so is
+/// any parameter named <c>cronExpression</c> or a close variant, so this section is for the
+/// in-house scheduler whose wrapper method nobody could have guessed the name of.
+/// </para>
+/// </remarks>
+public sealed class CronConfig
+{
+    /// <summary>Methods of the solution's own that take a schedule.</summary>
+    public IReadOnlyList<CronBindingEntry>? Bindings { get; init; }
+
+    /// <summary>
+    /// Parameter names, beyond the built-in ones, that mean a string argument is a schedule.
+    /// </summary>
+    /// <remarks>
+    /// Matched case-insensitively against any method's parameter, whoever declares it, so a name
+    /// this list makes common — <c>schedule</c>, say — claims every string passed under it.
+    /// </remarks>
+    public IReadOnlyList<string>? ParameterNames { get; init; }
+
+    /// <summary>Whether an expression the library would reject is reported. Null = true.</summary>
+    public bool? ExpressionDiagnostic { get; init; }
+
+    /// <summary>
+    /// How loudly: <c>error</c>, <c>warning</c>, <c>information</c> or <c>hint</c>. Null = warning.
+    /// </summary>
+    public string? Severity { get; init; }
+}
+
+/// <summary>
+/// One method whose string argument is a crontab expression.
+/// </summary>
+/// <remarks>
+/// The same vocabulary as <see cref="ValueBindingEntry"/>, so a reader who has configured one has
+/// configured the other.
+/// </remarks>
+public sealed class CronBindingEntry
+{
+    /// <summary>The full name of the class or interface declaring the member.</summary>
+    public string? ContainingType { get; init; }
+
+    /// <summary>The member's name.</summary>
+    public string? MemberName { get; init; }
+
+    /// <summary>One type name per parameter, <c>*</c> for any. Empty matches every overload.</summary>
+    public IReadOnlyList<string>? ParameterTypes { get; init; }
+
+    /// <summary>
+    /// Which parameter carries the expression, counted from 0. Omit to find it by name.
+    /// </summary>
+    public int? CronIndex { get; init; }
+
+    /// <summary>Which parameter names the job, counted from 0.</summary>
+    public int? IdIndex { get; init; }
+
+    /// <summary>Which parameter says what to run, counted from 0.</summary>
+    public int? MethodIndex { get; init; }
+
+    /// <summary>
+    /// How to read the expression: <c>hangfire</c>, <c>quartz</c> or <c>standard</c>. Omit to let
+    /// the project's own references decide, which is right whenever only one is referenced.
+    /// </summary>
+    public string? Dialect { get; init; }
 }
 
 /// <summary>

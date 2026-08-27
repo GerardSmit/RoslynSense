@@ -4,7 +4,7 @@ namespace RoslynMCP.Config;
 
 /// <summary>
 /// The <c>debugger</c> section of <c>roslynsense.json</c>: which <c>System.Diagnostics</c>
-/// debugger attributes the debug engines honour.
+/// debugger attributes the debug engines honour, and which engine debugs a CoreCLR target.
 /// </summary>
 /// <remarks>
 /// Nullable throughout so "absent" stays distinguishable from "explicitly false" — the resolver
@@ -43,6 +43,18 @@ public sealed class DebuggerConfig
 
     /// <summary>Globs for modules whose symbols never load, winning over the include list.</summary>
     public string[]? SymbolExclude { get; init; }
+
+    /// <summary>
+    /// Which engine debugs a CoreCLR target: <c>netcoredbg</c> (default) or <c>icordebug</c>.
+    /// </summary>
+    /// <remarks>
+    /// A string rather than the enum so an unreadable value warns and falls back instead of
+    /// failing the whole configuration load — the rest of the section is still usable, and a
+    /// debugger that will not start is a worse answer than one that starts on the default.
+    /// Read once per session by <see cref="DebugEngineOptions"/>; it is not part of the view
+    /// policy and never reaches a running session.
+    /// </remarks>
+    public string? CoreClrEngine { get; init; }
 }
 
 /// <summary>

@@ -1,4 +1,4 @@
-using System.Text.Encodings.Web;
+﻿using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Schema;
@@ -62,6 +62,7 @@ public static class ConfigSchema
             ["tools.logging"] = ("Logging templates", "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."),
             ["tools.formatting"] = ("Format strings", "The `{0:dd-MM-yyyy}` of a composite format string and the `yyyyMMdd` of an interpolation, coloured a component at a time and hovered with a worked example."),
             ["tools.valueSets"] = ("Allowed string values", "For a string that has to be one of a short list — an order status of `\"SHIPPED\"`, a document type, a country code. Completes the literal from the list, says on hover what the code means, and reports one the list does not have."),
+            ["tools.cron"] = ("Scheduled jobs", "The `\"0 22 * * 1-6\"` handed to Hangfire or Quartz, coloured a field at a time and hovered with what it means and when it next runs. Also lists every scheduled job in the solution."),
             ["tools.debugger"] = ("Debugger", "Launch, breakpoints, stepping and evaluation."),
             ["tools.profiling"] = ("Profiling", "CPU sampling, memory snapshots and coverage."),
             ["tools.database"] = ("Database", "Querying and describing the databases the solution connects to."),
@@ -85,6 +86,19 @@ public static class ConfigSchema
             ["webForms.dataExpressions[].source"] = ("Formats the value of", "For a format string, which sibling attribute names the value being formatted — `[ItemType].[Control.DataField]` reads this tag's `DataField` and resolves it against the bound item. That is what tells a `{0:dd-MM-yyyy}` it is formatting a date."),
             ["webForms.unknownMemberDiagnostic"] = ("Report unknown members", "WFB0001 — a name the bound item type does not have. Only ever reported when that type is known: a container with no `ItemType` whose `DataSource` cannot be traced says nothing rather than something wrong."),
             ["webForms.severity"] = ("Report them as", "How loudly WFB0001 is reported. A warning by default, because a path is resolved case-insensitively through `TypeDescriptor` and can be satisfied at runtime by a type this tool never sees."),
+            ["cron"] = ("Scheduled jobs", "A crontab expression is five or six numbers that decide when something runs on a server nobody is watching, and nothing in C# checks it — a transposed field is a job that quietly runs on the wrong day. Hangfire and Quartz are recognised already, and so is any parameter named `cronExpression` or close to it, so this section is only needed for an in-house scheduler whose method nobody could have guessed the name of."),
+            ["cron.parameterNames"] = ("Parameter names", "Extra parameter names that mean a string argument is a schedule. `cronExpression`, `cron`, `cronSchedule`, `crontab` and `cronString` are recognised already, whoever declares them."),
+            ["cron.expressionDiagnostic"] = ("Report bad schedules", "CRON0001 — an expression the library reading it would reject. Worth having because it is otherwise found at run time, by the job never running."),
+            ["cron.severity"] = ("Report them as", "How loudly CRON0001 is reported. A warning by default rather than an error: the string is read by a library at a version RoslynSense cannot see, so being wrong is possible and a red squiggle under working code is worse than a yellow one."),
+            ["cron.bindings"] = ("Methods", "The methods of your own that take a schedule — a `Scheduler.AddJob(name, cron, work)` wrapper, say. Every literal written at the call is then coloured, hovered and checked."),
+            ["cron.bindings[]"] = ("Method", "One method that takes a crontab expression."),
+            ["cron.bindings[].containingType"] = ("Class", "The full name of the class or interface declaring the member. Leave empty to match the member on any class."),
+            ["cron.bindings[].memberName"] = ("Member", "The method name."),
+            ["cron.bindings[].parameterTypes"] = ("Parameters", "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."),
+            ["cron.bindings[].cronIndex"] = ("Schedule is parameter", "Which parameter carries the expression, counted from 0. Leave empty to find it by name instead, which is what makes one entry cover every overload."),
+            ["cron.bindings[].idIndex"] = ("Job name is parameter", "Which parameter names the job, counted from 0. Used to label it in the Cron Jobs list."),
+            ["cron.bindings[].methodIndex"] = ("Work is parameter", "Which parameter says what to run, counted from 0."),
+            ["cron.bindings[].dialect"] = ("Read as", "`hangfire`, `quartz` or `standard`. Leave empty to let the project's own references decide, which is right whenever it references only one. It matters: Quartz numbers Sunday 1 and everyone else numbers it 0, so the same expression names days a day apart."),
             ["valueSets"] = ("Allowed string values", "Some strings are really codes: an order status, a document type, a country. The list of codes is in a database table or a spreadsheet somewhere, and nothing in C# knows it, so `\"SHIPED\"` compiles and fails at run time. Say where the list comes from under Sets, then name the methods and the properties that carry a code — those literals then complete from the list, hover with what each code means, and are reported when the list does not have them."),
             ["valueSets.unknownValueDiagnostic"] = ("Report unknown values", "VAL0001 — a string that is not one of its set's values. Only ever reported for a set that loaded completely: an unreachable database says nothing rather than something wrong."),
             ["valueSets.severity"] = ("Report them as", "How loudly VAL0001 is reported. An error by default, because a code the table does not have is a branch that can never be taken. Soften it while a codebase catches up."),
@@ -145,7 +159,7 @@ public static class ConfigSchema
             ["database.autoDiscovery"] = ("Auto-discovery", "Scan the tree for connection strings. Omitted runs the scan only when nothing is registered explicitly. Production-flavoured environment names are never loaded."),
             ["database.connections"] = ("Connections", "Explicit connections by alias. Either `provider:connectionString` or an object with `provider` and `connectionString`."),
 
-            ["debugger"] = ("Debugger view", "Which `System.Diagnostics` attributes the debug engines honour while inspecting and stepping."),
+            ["debugger"] = ("Debugger", "Which `System.Diagnostics` attributes the debug engines honour while inspecting and stepping, and which engine debugs a CoreCLR target."),
             ["debugger.debuggerDisplay"] = ("DebuggerDisplay", "Format values using their type's `DebuggerDisplayAttribute`."),
             ["debugger.typeProxy"] = ("DebuggerTypeProxy", "Expand values through their type's `DebuggerTypeProxyAttribute`."),
             ["debugger.browsable"] = ("DebuggerBrowsable", "Honour `DebuggerBrowsableAttribute` when listing members."),
@@ -155,6 +169,7 @@ public static class ConfigSchema
             ["debugger.maxChildren"] = ("Max children", "How many children of one value to list before truncating. Defaults to 100."),
             ["debugger.symbolInclude"] = ("Load symbols only for", "Globs for the only modules whose symbols load, when the list is non-empty. A glob without a path separator matches the module's file name (`MyCompany.*.dll`); with one, its full path (`**\\bin\\**`). Empty loads symbols for every module not excluded."),
             ["debugger.symbolExclude"] = ("Never load symbols for", "Globs for modules whose symbols never load, taking precedence over the include list. A module without symbols cannot bind source breakpoints — the same trade VS's \"Load all modules, unless excluded\" makes. ASP.NET's generated `App_Web_*.dll` page assemblies are already skipped without any configuration."),
+            ["debugger.coreClrEngine"] = ("CoreCLR engine", "Which engine debugs .NET (CoreCLR) targets: `netcoredbg` (default) or `icordebug`. .NET Framework always uses `icordebug`, which is the only engine that can attach to it. `icordebug` additionally brings Just My Code through the runtime, breakpoints that bind against binaries built elsewhere, method return values after a step, and stepping through decompiled code — but it runs on Windows only and is newer on this runtime. Takes effect the next time debugging starts."),
 
             ["tableFormat"] = ("Table format", "How tabular tool output is rendered: `markdown` (default) or `toon`."),
             ["preload"] = ("Preload", "Solutions or projects to load on startup. Omitted auto-discovers the first solution in the working directory; an empty list disables preloading."),
@@ -235,6 +250,7 @@ public static class ConfigSchema
                 ["argument", "typeArgument", "containingType", "containingFile", "constant", "none"],
             ["resources.lookups[].rootInterpretation"] =
                 ["virtualPath", "globalClassName", "typeName", "relativePath", "baseName"],
+            ["debugger.coreClrEngine"] = ["netcoredbg", "icordebug"],
             ["tableFormat"] = ["markdown", "toon"],
             ["valueSets.severity"] = ["error", "warning", "information"],
             ["webForms.severity"] = ["error", "warning", "information", "hidden"],

@@ -225,7 +225,7 @@ internal static class ProtoWorkspace
     private static async Task<(ImmutableArray<Project> Projects, ProtoGeneratedIndex Index)>
         ResolveOwnersAsync(string protoPath, Project? seed, CancellationToken ct)
     {
-        var solution = seed?.Solution ?? WorkspaceService.TryGetMostRecentSolution();
+        var solution = seed?.Solution ?? WorkspaceService.TryGetSessionSolution();
 
         if (solution is null)
         {

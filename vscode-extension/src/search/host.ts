@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { html } from './html';
+import { onSolutionReady } from '../solutionReady';
 import { tokenizePreview } from './textmate';
 
 /**
@@ -19,10 +20,27 @@ export function wire(
     // request that is already stale must not cancel the one that replaced it.
     let searchInFlight: vscode.CancellationTokenSource | undefined;
 
+    // The query the panel is currently showing an answer to, kept only while that answer was
+    // provisional. A search answered from the name index is a promise to ask again: the solution
+    // was still loading, so referenced assemblies were invisible to it and a file saved a second
+    // ago may not have been in the walk behind it.
+    let provisional: Extract<SearchMsg.ToHost, { type: 'search' }> | undefined;
+
     // The panel's own listeners die with the panel — parking them in context.subscriptions
     // would pile up a wrapper per open/close for the extension's lifetime.
     let disposed = false;
+
+    // Reusing the original request id is what makes this safe to fire at any moment: the webview
+    // drops results whose id is not the one it is waiting for, so a rerun that lands after the
+    // user has typed again is discarded rather than replacing their newer answer.
+    const ready = onSolutionReady(() => {
+        if (!disposed && provisional) {
+            void search(provisional);
+        }
+    });
+
     panel.onDidDispose(() => {
+        ready.dispose();
         // Escape while a search runs: the server must stop computing an answer nobody will
         // see, and a reply that still arrives must not touch the disposed webview.
         disposed = true;
@@ -124,6 +142,7 @@ export function wire(
         const token = searchInFlight.token;
 
         if (message.tab === 'actions') {
+            provisional = undefined;
             post({
                 type: 'results',
                 id: message.id,
@@ -145,8 +164,10 @@ export function wire(
                 const result = await client.sendRequest<{
                     items: SearchMsg.TextItem[];
                     truncated: boolean;
+                    loading?: boolean;
                 }>('roslynSense/searchText', { query: message.query, maxResults: 100 }, token);
                 if (!token.isCancellationRequested) {
+                    provisional = result.loading ? message : undefined;
                     post({ type: 'results', id: message.id, tab: 'text', ...result });
                 }
                 return;
@@ -161,6 +182,7 @@ export function wire(
             const result = await client.sendRequest<{
                 items: SearchMsg.SymbolItem[];
                 truncated: boolean;
+                loading?: boolean;
             }>(
                 'roslynSense/searchEverywhere',
                 {
@@ -172,6 +194,7 @@ export function wire(
                 token
             );
             if (!token.isCancellationRequested) {
+                provisional = result.loading ? message : undefined;
                 post({ type: 'results', id: message.id, tab: message.tab, ...result });
             }
         } catch (error) {

@@ -25,13 +25,19 @@ public static class TextSearch
     private const int MaxLineLength = 240;
 
     public static async Task<(IReadOnlyList<TextHit> Hits, bool Truncated)> SearchAsync(
-        Solution solution, string query, int maxResults, CancellationToken ct)
+        Solution solution, string query, int maxResults, CancellationToken ct) =>
+        await SearchAsync(await SolutionFileIndex.FilesAsync(solution, ct), query, maxResults, ct);
+
+    /// <summary>
+    /// The same scan over a file list the caller already has — the walk done before a solution
+    /// existed, which is what answers the Text tab while the solution is still loading.
+    /// </summary>
+    public static async Task<(IReadOnlyList<TextHit> Hits, bool Truncated)> SearchAsync(
+        IReadOnlyList<string> files, string query, int maxResults, CancellationToken ct)
     {
         query = query.Trim();
         if (query.Length == 0 || maxResults <= 0)
             return ([], false);
-
-        var files = await SolutionFileIndex.FilesAsync(solution, ct);
 
         // One extra hit distinguishes "exactly the cap" from "there were more".
         int budget = maxResults + 1;

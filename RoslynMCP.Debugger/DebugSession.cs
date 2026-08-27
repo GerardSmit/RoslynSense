@@ -17,7 +17,39 @@ namespace RoslynMCP.Debugger;
 public sealed partial class DebugSession : IDebugSession
 {
     public uint Id { get; }
-    public int Pid { get; private set; }
+
+    /// <summary>The debuggee's process id.</summary>
+    /// <remarks>
+    /// Setting it also takes a handle on the process, which is the only way its exit code can be
+    /// read afterwards — see <see cref="DescribeExit"/> for why that matters. Done here rather
+    /// than at each of the four places a session acquires its debuggee, so a fifth cannot forget.
+    /// </remarks>
+    public int Pid
+    {
+        get => _pid;
+        private set
+        {
+            _pid = value;
+
+            try
+            {
+                _debuggee?.Dispose();
+                _debuggee = value > 0 ? System.Diagnostics.Process.GetProcessById(value) : null;
+            }
+            catch
+            {
+                // Gone already, or not ours to open. The exit is still reported, just unnamed.
+                _debuggee = null;
+            }
+        }
+    }
+
+    private int _pid;
+
+    /// <summary>
+    /// A handle on the debuggee held for the life of the session, so its exit code survives it.
+    /// </summary>
+    private System.Diagnostics.Process? _debuggee;
 
     private readonly Channel<DebugEvent> _events = Channel.CreateUnbounded<DebugEvent>();
     private readonly List<BreakpointSpec> _specs = new();
@@ -2304,6 +2336,11 @@ public sealed partial class DebugSession : IDebugSession
         // the reader lives, so deleting first would fail and leave the file behind for good.
         DisposeSymbolReaders();
 
+        // The exit code has been read by now if it was ever going to be — the exit event is what
+        // brings a session here — so the handle held for it can go.
+        try { _debuggee?.Dispose(); } catch { }
+        _debuggee = null;
+
         if (corDebug is null)
             return;
 
@@ -2703,7 +2740,7 @@ public sealed partial class DebugSession : IDebugSession
             };
             callback.OnExitProcess += (_, _) =>
             {
-                Emit(DebugEventKind.Exited, "process exited", string.Empty, 0);
+                Emit(DebugEventKind.Exited, DescribeExit(), string.Empty, 0);
                 _exited.TrySetResult();
                 _events.Writer.TryComplete();
                 try { _commands.CompleteAdding(); } catch { }
@@ -2844,12 +2881,23 @@ public sealed partial class DebugSession : IDebugSession
         Pid = _child.ProcessId;
         _process = _corDebug!.DebugActiveProcess(Pid, false);
 
-        // Prefer JIT over NGen images, with EnC enabled, for everything the runtime is about to
-        // load — the per-module flag in RegisterEncModule cannot reach code that loads from a
-        // native image. Best effort: the window for this call is narrow, and a debugger that
-        // misses it still attaches — it only loses EnC for whatever was already mapped.
-        try { _process.TrySetDesiredNGENCompilerFlags(CorDebugJITCompilerFlags.CORDEBUG_JIT_ENABLE_ENC); }
-        catch { }
+        // Deliberately not asking for process-wide EnC here.
+        //
+        // SetDesiredNGENCompilerFlags(CORDEBUG_JIT_ENABLE_ENC) does not add edit-and-continue to
+        // the native images — it disqualifies them, so every framework assembly is rejected from
+        // its NGen image and JITted from scratch, unoptimized, for the life of the process. It was
+        // here to reach user code that loads from a native image, but user code is not NGen'd:
+        // a web application's assemblies are compiled into the ASP.NET temporary files, and an
+        // application's own build output is not run through ngen either. The modules it actually
+        // changed were the framework's.
+        //
+        // Two things came of that. Startup on a large site paid to JIT the whole framework, and
+        // unoptimized frames are much larger than optimized ones — deep enough recursion inside a
+        // framework assembly then overflows a stack it fits in when run normally, which kills the
+        // debuggee outright, with no exception anyone can catch or report.
+        //
+        // A user module that genuinely is NGen'd still gets its per-module attempt in
+        // RegisterEncModule, and says so plainly when the runtime refuses.
 
         _child.ResumeMainThread();
         Emit(DebugEventKind.Created, $"launched {Path.GetFileName(exe)}", string.Empty, 0);
@@ -3061,6 +3109,23 @@ public sealed partial class DebugSession : IDebugSession
             return;
         bool user = IsUserModule(moduleName) && !generated;
 
+        // Only the user's own modules are flagged, and the restriction is load-bearing.
+        //
+        // CORDEBUG_JIT_ENABLE_ENC is DISABLE_OPTIMIZATION with edit-and-continue on top, so every
+        // module it succeeds on is JITted unoptimized for the life of the process. This used to be
+        // attempted on all of them — the framework, the third-party stack, everything — defended
+        // on the grounds that an unflagged module anywhere is a way for ApplyChanges to fault
+        // later. It is not: ApplyChanges is only ever reached with a module out of _encModules,
+        // and the registration below already puts nothing but the user's modules in there.
+        //
+        // What flagging everything actually bought was an unoptimized process. Unoptimized frames
+        // are much larger than optimized ones, so recursion that fits its stack comfortably in a
+        // normal run can overflow it under the debugger — and a StackOverflowException can be
+        // neither caught nor reported, so the debuggee simply dies. A recursive directory walk
+        // inside a framework assembly is deep enough to do it.
+        if (!user)
+            return;
+
         // Whether this succeeded decides whether a later delta can be applied at all: a module
         // JITted without the flag is not updatable, and ApplyChanges faults on it rather than
         // failing. Swallowing the result is how that stays invisible until the crash, so it is
@@ -3069,28 +3134,19 @@ public sealed partial class DebugSession : IDebugSession
         try { flagged = module.TrySetJITCompilerFlags(CorDebugJITCompilerFlags.CORDEBUG_JIT_ENABLE_ENC); }
         catch (Exception ex)
         {
-            if (user)
-            {
-                Emit(DebugEventKind.Diagnostic,
-                    $"EnC could not be enabled for {Path.GetFileName(moduleName)}: {ex.Message}",
-                    string.Empty, 0);
-            }
+            Emit(DebugEventKind.Diagnostic,
+                $"EnC could not be enabled for {Path.GetFileName(moduleName)}: {ex.Message}",
+                string.Empty, 0);
         }
 
         if (flagged != HRESULT.S_OK)
         {
-            if (user)
-            {
-                Emit(DebugEventKind.Diagnostic,
-                    $"EnC is unavailable for {Path.GetFileName(moduleName)} ({flagged}); " +
-                    "hot reload cannot change it.",
-                    string.Empty, 0);
-            }
+            Emit(DebugEventKind.Diagnostic,
+                $"EnC is unavailable for {Path.GetFileName(moduleName)} ({flagged}); " +
+                "hot reload cannot change it.",
+                string.Empty, 0);
             return;
         }
-
-        if (!user)
-            return;
 
         var assemblyName = Path.GetFileNameWithoutExtension(moduleName);
         if (assemblyName.Length == 0)
@@ -6236,8 +6292,27 @@ public sealed partial class DebugSession : IDebugSession
                     Safe(() => d.URL) ?? string.Empty,
                     d,
                     default,
-                    Safe(() => (Guid?)d.CheckSumAlgorithmId) ?? Guid.Empty,
-                    Safe(() => d.CheckSum)))];
+                    // Left empty rather than read, and this is not an oversight to tidy up.
+                    //
+                    // ISymUnmanagedDocument's Guid out-parameters go through a marshaller whose
+                    // only registration is for every direction at once, and whose shape is a
+                    // pointer: an "out Guid" is handed to the callee as GuidNative**, while
+                    // diasymreader writes a plain GUID* into it. The sixteen bytes of the guid
+                    // land on the eight-byte slot holding the pointer, and the marshaller then
+                    // dereferences what it finds there as an address. A guid of all zeros — the
+                    // documented answer for "this document has no checksum" — dereferences null.
+                    //
+                    // The result is an access violation, which the Safe() around it could not
+                    // catch even if it were still here: it is a corrupted-state exception, so it
+                    // takes the whole worker down with the session on it. That is a debugger
+                    // that dies while attaching to a .NET Framework process, which is the one
+                    // target whose symbols come from this reader at all.
+                    //
+                    // Nothing is lost. The value's only consumer tells the three hash algorithms
+                    // apart by the length of the checksum, which it already does when a PDB
+                    // records a hash without naming one.
+                    ChecksumAlgorithm: Guid.Empty,
+                    Checksum: Safe(() => d.CheckSum)))];
             }
             catch
             {
@@ -7112,6 +7187,59 @@ public sealed partial class DebugSession : IDebugSession
         try { action(); }
         catch { }
     }
+
+    /// <summary>How the debuggee's run ended, naming the cause when the system killed it.</summary>
+    /// <remarks>
+    /// "process exited" on its own cannot tell a program that finished from one the operating
+    /// system tore down, and the loudest of those cannot report itself: a stack overflow leaves
+    /// the runtime no stack to raise an exception on, so it writes a single line to the debuggee's
+    /// own stderr and dies. A session that relays only managed events shows that as a clean exit,
+    /// and the user is left with a debugger that stopped for no stated reason. The exit code is
+    /// the durable record of it, and it can only be read through a handle taken while the process
+    /// was still alive — which is what <see cref="Pid"/>'s setter is for.
+    /// </remarks>
+    private string DescribeExit()
+    {
+        int? code = null;
+        try
+        {
+            if (_debuggee is { HasExited: true } debuggee)
+                code = debuggee.ExitCode;
+        }
+        catch
+        {
+            // No handle, no rights to it, or the exit has not settled. An unnamed exit is still
+            // an exit, and guessing at a cause would be worse than not naming one.
+        }
+
+        if (code is not { } value || value == 0)
+            return "process exited";
+
+        uint status = unchecked((uint)value);
+        return FatalExitName(status) is { } named
+            ? $"process exited: {named} (0x{status:X8})"
+            : $"process exited with code {value} (0x{status:X8})";
+    }
+
+    /// <summary>
+    /// The exit codes worth naming: the ones that mean the debuggee was killed rather than
+    /// finished, and that point at something the user can do something about.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately a short list. A code this does not recognise is still reported, in hex, which
+    /// is enough to look up — inventing a plausible name for an unknown status would make the
+    /// report less trustworthy, not more.
+    /// </remarks>
+    public static string? FatalExitName(uint code) => code switch
+    {
+        0xC00000FD => "stack overflow",
+        0xC0000005 => "access violation",
+        0xC0000374 => "heap corruption",
+        0xC000013A => "interrupted",
+        0xE0434352 => "an unhandled managed exception",
+        0x80131506 => "an execution engine error",
+        _ => null,
+    };
 
     private static T? Safe<T>(Func<T> f)
     {

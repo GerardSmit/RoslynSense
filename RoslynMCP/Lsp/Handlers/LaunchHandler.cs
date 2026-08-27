@@ -98,7 +98,27 @@ internal static partial class LaunchHandler
         return new ToolchainInfo(info.MsBuildPath, info.DesktopClr, info.PreferredIisExpress);
     }
 
+    /// <summary>
+    /// Describes a target and stamps it with which debug adapter it needs.
+    /// </summary>
+    /// <remarks>
+    /// Stamped once here rather than at each of the returns below, because the answer depends on
+    /// nothing those returns disagree about: the runtime, and a setting that is the same for all
+    /// of them.
+    /// </remarks>
     private static LaunchTarget Describe(
+        string projectPath, string configuration, string? launchProfile = null)
+    {
+        var target = DescribeTarget(projectPath, configuration, launchProfile);
+
+        return target with
+        {
+            ServerDebugAdapter = target.IsNetFramework
+                || Config.DebugEngineOptions.CoreClr == Config.CoreClrDebugEngine.IcorDebug,
+        };
+    }
+
+    private static LaunchTarget DescribeTarget(
         string projectPath, string configuration, string? launchProfile = null)
     {
         var classification = ProjectClassifier.Classify(projectPath);

@@ -80,7 +80,7 @@ public class SolutionWarmupTests
             await SolutionWarmup.Start();
             await SolutionWarmup.WarmedSymbols;
 
-            var solution = WorkspaceService.TryGetMostRecentSolution();
+            var solution = WorkspaceService.TryGetSessionSolution();
             Assert.NotNull(solution);
             Assert.NotEmpty(solution!.Projects);
 
@@ -158,7 +158,7 @@ public class SolutionWarmupTests
             // And the wait a search does must not block on a load that was never started.
             await SolutionWarmup.WaitAsync(default);
 
-            Assert.Null(WorkspaceService.TryGetMostRecentSolution());
+            Assert.Null(WorkspaceService.TryGetSessionSolution());
         }
         finally
         {

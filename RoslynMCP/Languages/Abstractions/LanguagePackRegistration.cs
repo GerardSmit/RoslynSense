@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Languages.AppSettings;
+using RoslynMCP.Languages.Cron;
 using RoslynMCP.Languages.Dbml;
 using RoslynMCP.Languages.DotSettings;
 using RoslynMCP.Languages.DotSettings.Core;
@@ -60,6 +61,14 @@ internal static class LanguagePackRegistration
             packs.Add(new FormattingLanguage());
         if (settings.ValueSets.Enabled)
             packs.Add(new ValuesLanguage(settings));
+
+        // After the two packs that claim a literal from the call around it, and it can stay
+        // anywhere after them: a schedule has no braces and no `format` parameter, so nothing
+        // above could claim one by accident. Below the value sets deliberately, so that a solution
+        // which has bound a schedule argument to a set of its own keeps that binding — the first
+        // claim wins, and an explicit configuration should beat a name this pack recognises.
+        if (settings.Cron.Enabled)
+            packs.Add(new CronLanguage(settings));
         if (settings.MsBuild)
             packs.Add(new MsBuildLanguage());
         if (settings.Dbml)
@@ -105,6 +114,10 @@ internal static class LanguagePackRegistration
             AddPack<FormattingLanguage>(services);
         if (settings.ValueSets.Enabled)
             AddPack<ValuesLanguage>(services);
+
+        // After the value sets — see Create for why.
+        if (settings.Cron.Enabled)
+            AddPack<CronLanguage>(services);
         if (settings.MsBuild)
             AddPack<MsBuildLanguage>(services);
         if (settings.Dbml)

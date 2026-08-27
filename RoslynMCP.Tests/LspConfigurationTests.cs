@@ -110,6 +110,65 @@ public class LspConfigurationTests
     }
 
     [Fact]
+    public void TheEditorCanChooseTheCoreClrEngine()
+    {
+        var restore = DebugEngineOptions.CoreClr;
+        try
+        {
+            ConfigurationHandler.Apply(Settings("""
+                {"roslynSense": {"debugger": {"coreClrEngine": "icordebug"}}}
+                """));
+
+            // Off Windows the setting is refused on the way in, the same as it is at startup —
+            // asserted here rather than skipped, because the refusal is the behaviour.
+            Assert.Equal(
+                OperatingSystem.IsWindows()
+                    ? CoreClrDebugEngine.IcorDebug
+                    : CoreClrDebugEngine.NetCoreDbg,
+                DebugEngineOptions.CoreClr);
+
+            ConfigurationHandler.Apply(Settings("""
+                {"roslynSense": {"debugger": {"coreClrEngine": "netcoredbg"}}}
+                """));
+            Assert.Equal(CoreClrDebugEngine.NetCoreDbg, DebugEngineOptions.CoreClr);
+        }
+        finally
+        {
+            DebugEngineOptions.CoreClr = restore;
+        }
+    }
+
+    [Fact]
+    public void ASettingsPushThatSaysNothingAboutTheEngineLeavesItAlone()
+    {
+        // Every push carries the whole section, so a client too old to send this property — or a
+        // user who set it in roslynsense.json and never in the editor — must not have the choice
+        // reset out from under them on the next keystroke that changes some other setting.
+        var restore = DebugEngineOptions.CoreClr;
+        var restoreView = DebuggerViewOptions.Current;
+        try
+        {
+            DebugEngineOptions.CoreClr = CoreClrDebugEngine.IcorDebug;
+
+            ConfigurationHandler.Apply(Settings("""
+                {"roslynSense": {"debugger": {"justMyCode": false}}}
+                """));
+            Assert.Equal(CoreClrDebugEngine.IcorDebug, DebugEngineOptions.CoreClr);
+
+            // Nor does a value nobody can read.
+            ConfigurationHandler.Apply(Settings("""
+                {"roslynSense": {"debugger": {"coreClrEngine": "vsdbg"}}}
+                """));
+            Assert.Equal(CoreClrDebugEngine.IcorDebug, DebugEngineOptions.CoreClr);
+        }
+        finally
+        {
+            DebugEngineOptions.CoreClr = restore;
+            DebuggerViewOptions.Current = restoreView;
+        }
+    }
+
+    [Fact]
     public void MalformedSettingsAreIgnored()
     {
         Assert.False(ConfigurationHandler.Apply(null));

@@ -77,7 +77,7 @@ public static class NuGetFeedContext
     public static ISettings Settings()
     {
         string root = SettingsRootOverride
-            ?? Path.GetDirectoryName(WorkspaceService.TryGetMostRecentSolution()?.FilePath)
+            ?? Path.GetDirectoryName(WorkspaceService.TryGetSessionSolution()?.FilePath)
             ?? Directory.GetCurrentDirectory();
 
         lock (s_gate)

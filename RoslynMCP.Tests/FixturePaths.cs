@@ -139,6 +139,26 @@ internal static class FixturePaths
     public static string DebugCalculatorFile => Path.Combine(DebugTestProjectDir, "Calculator.cs");
     public static string DebugCalculatorTestsFile => Path.Combine(DebugTestProjectDir, "CalculatorTests.cs");
 
+    /// <summary>
+    /// Two solutions in separate directories that both include one shared project, plus a third
+    /// that is never loaded. What a daemon looks like when a config preloads a second solution
+    /// alongside the bound one and the two overlap.
+    /// </summary>
+    public static string SharedProjectSolutionsDir => Path.Combine(s_fixturesRoot, "SharedProjectSolutions");
+    public static string AlphaSolutionFile => Path.Combine(SharedProjectSolutionsDir, "Alpha", "Alpha.sln");
+    public static string OnlyAlphaProjectFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Alpha", "OnlyAlpha", "OnlyAlpha.csproj");
+    public static string BetaSolutionFile => Path.Combine(SharedProjectSolutionsDir, "Beta", "Beta.sln");
+    public static string OnlyBetaProjectFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Beta", "OnlyBeta", "OnlyBeta.csproj");
+    public static string SharedProjectFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Shared", "Shared.csproj");
+
+    /// <summary>A real solution file that no test loads, so "bound but not loaded yet" is a state
+    /// a test can reach without depending on what ran before it.</summary>
+    public static string UnloadedSolutionFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Unloaded", "Unloaded.sln");
+
     public static string MultiSolutionDir => Path.Combine(s_fixturesRoot, "MultiSolution");
     public static string MultiSolutionFile => Path.Combine(MultiSolutionDir, "MultiSolution.sln");
     public static string MultiProjectAFile => Path.Combine(MultiSolutionDir, "ProjectA", "ProjectA.csproj");

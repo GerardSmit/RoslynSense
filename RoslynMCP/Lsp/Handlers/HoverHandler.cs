@@ -115,8 +115,15 @@ internal static class HoverHandler
         // Highlight the identifier token under the cursor when we can find it.
         Protocol.Range? range = null;
         var root = await document.GetSyntaxRootAsync(ct);
-        var token = root?.FindToken(Math.Min(offset, Math.Max(0, text.Length - 1)));
-        if (token is { } t && t.Span.Contains(Math.Min(offset, Math.Max(0, text.Length - 1))))
+        int at = Math.Min(offset, Math.Max(0, text.Length - 1));
+        // The name first, so a cursor resting against the end of one highlights it rather than the
+        // paren after it; anything else the cursor is inside — a keyword in a type name, say — is
+        // still worth highlighting, so it is the fallback rather than the other way round.
+        var token = root is null
+            ? null
+            : CaretTokens.Touching(root, at, t => t.IsKind(SyntaxKind.IdentifierToken))
+                ?? CaretTokens.Touching(root, at, t => t.Span.Contains(at));
+        if (token is { } t)
             range = LspConverters.ToRange(text.Lines, t.Span);
 
         // Crefs in the documentation are metadata ids; the compilation is what turns them back

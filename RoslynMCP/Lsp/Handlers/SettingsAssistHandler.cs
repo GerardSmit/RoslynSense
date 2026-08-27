@@ -199,7 +199,7 @@ internal static class SettingsAssistHandler
     /// </summary>
     public static Task<MemberShapeResult> MemberShapeAsync(
         MemberShapeParams p, CancellationToken ct) =>
-        WorkspaceService.TryGetMostRecentSolution() is { } solution
+        WorkspaceService.TryGetSessionSolution() is { } solution
             ? MemberShapeAsync(solution, p, ct)
             : Task.FromResult(
                 new MemberShapeResult([], [], [], Problem: "No solution is loaded yet."));

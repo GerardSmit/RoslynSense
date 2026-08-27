@@ -141,6 +141,37 @@ public class SourceResolutionTests
         }
     }
 
+    [Theory]
+    [InlineData(16)]
+    [InlineData(20)]
+    [InlineData(32)]
+    public void AnUnnamedAlgorithmIsRecognisedByTheLengthOfItsHash(int length)
+    {
+        // Load-bearing, not a nicety. A .NET Framework module's documents come from diasymreader,
+        // whose algorithm id cannot be read without crashing the process (see DocumentsOf), so
+        // every checksum from that reader arrives unnamed. If the length did not identify the
+        // algorithm, breakpoints in every Framework module would silently stop binding by
+        // checksum and fall back to matching on file name alone.
+        var file = Write("class C { }\n");
+        try
+        {
+            var content = File.ReadAllBytes(file);
+            byte[] hash = length switch
+            {
+                16 => MD5.HashData(content),
+                20 => SHA1.HashData(content),
+                _ => SHA256.HashData(content),
+            };
+
+            Assert.Equal(length, hash.Length);
+            Assert.True(SourceChecksum.Matches(file, Guid.Empty, hash));
+        }
+        finally
+        {
+            File.Delete(file);
+        }
+    }
+
     [Fact]
     public void AFileThatIsNotThereConfirmsNothing()
     {

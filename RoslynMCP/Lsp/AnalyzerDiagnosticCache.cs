@@ -778,7 +778,12 @@ internal static class AnalyzerDiagnosticCache
             s_trimmedSinceLogged = 0;
         }
 
-        foreach (var stale in s_entries.OrderBy(e => e.Value.Stamp).Take(trimming).ToList())
+        // ConcurrentDictionary's own ToArray() takes its snapshot under the table locks. Ordering
+        // the dictionary directly does not: LINQ's buffer sizes itself from an unlocked Count read
+        // and then copies, so a removal landing in between — a concurrent Trim, or Forget for a
+        // closed document — leaves default(KeyValuePair) holes at the tail that the key selector
+        // dereferences into a NullReferenceException.
+        foreach (var stale in s_entries.ToArray().OrderBy(e => e.Value.Stamp).Take(trimming))
         {
             s_entries.TryRemove(stale.Key, out _);
 

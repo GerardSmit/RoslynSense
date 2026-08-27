@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Rename;
 using RoslynMCP.Languages;
@@ -36,13 +37,22 @@ internal static class RenameHandler
         if (symbol is null || symbol.Locations.All(l => !l.IsInSource))
             return null; // metadata symbols can't be renamed
 
+        // The name, not whatever token the caret's offset happens to land in: with the caret at
+        // the end of a name the offset belongs to the token after it, and answering with that one
+        // opens the rename box over a paren, prefilled with it.
         var root = await document.GetSyntaxRootAsync(ct);
-        var token = root?.FindToken(offset);
-        if (token is not { } t || !t.Span.Contains(offset))
+        if (root is null || CaretTokens.Touching(root, offset, IsNameToken) is not { } t)
             return null;
 
         return new PrepareRenameResult(LspConverters.ToRange(text.Lines, t.Span), t.ValueText);
     }
+
+    /// <summary>
+    /// What a rename can be anchored to. Contextual keywords bind as identifiers, so this is a
+    /// kind check rather than a list of words.
+    /// </summary>
+    private static bool IsNameToken(SyntaxToken token) =>
+        token.IsKind(SyntaxKind.IdentifierToken);
 
     public static async Task<WorkspaceEdit?> RenameAsync(
         RenameParams p, CancellationToken ct, LanguageSession? languages = null)

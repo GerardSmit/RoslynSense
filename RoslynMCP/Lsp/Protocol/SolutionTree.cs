@@ -51,6 +51,36 @@ public static class SolutionNodeKind
     /// offers Unload everywhere else; the node kind stays <c>project</c>.
     /// </summary>
     public const string UnloadedProject = "projectUnloaded";
+
+    // The scheduled-jobs section, which a language pack contributes rather than the tree building
+    // it. Declared here anyway: the client maps kinds to icons and context menus, so the set is
+    // part of the protocol wherever it is produced.
+
+    /// <summary>The section under the solution node listing what runs on a schedule.</summary>
+    public const string CronJobs = "cronJobs";
+
+    /// <summary>One project inside that section.</summary>
+    public const string CronProject = "cronProject";
+
+    /// <summary>One scheduled job.</summary>
+    public const string CronJob = "cronJob";
+
+    /// <summary>
+    /// The context value of a job row, built from the base name and up to two suffixes:
+    /// <c>Dynamic</c> when something about the job is only knowable at run time, and
+    /// <c>Method</c> when its own method was named and can be opened. So a fully static job with a
+    /// resolved method is <c>cronJobMethod</c>, and a config-driven one with none is
+    /// <c>cronJobDynamic</c>.
+    /// </summary>
+    /// <remarks>
+    /// Composed rather than enumerated because the two facts are independent, and because a menu
+    /// item that opens the job's method must not appear on a row that has no method to open —
+    /// which the client can only decide from the context value it was given.
+    /// </remarks>
+    public const string CronJobDynamicSuffix = "Dynamic";
+
+    /// <summary>The job's own method was named and has a declaration to open.</summary>
+    public const string CronJobMethodSuffix = "Method";
 }
 
 public sealed record SolutionTreeParams(
@@ -80,7 +110,35 @@ public sealed record SolutionTreeNode(
     [property: JsonPropertyName("hasChildren")] bool HasChildren,
     [property: JsonPropertyName("contextValue")] string ContextValue,
     [property: JsonPropertyName("dimmed")] bool Dimmed = false,
-    [property: JsonPropertyName("highlights")] int[][]? Highlights = null);
+    [property: JsonPropertyName("highlights")] int[][]? Highlights = null,
+
+    /// <summary>
+    /// Where clicking this node should land, when that is somewhere other than the top of
+    /// <see cref="ResourceUri"/>.
+    /// </summary>
+    /// <remarks>
+    /// A file node opens its file and that is the whole story. A node standing for something
+    /// written <i>inside</i> a file — a job registered by one call among twenty in a startup
+    /// method — has to name the line, or clicking it lands at the top of a file and leaves the
+    /// reader to find what they clicked on.
+    /// <para>
+    /// Deliberately narrower than letting a pack name a client command: a range in a document is
+    /// a thing the client already knows how to open, and nothing a pack puts here can make the
+    /// tree run something.
+    /// </para>
+    /// </remarks>
+    [property: JsonPropertyName("goTo")] SolutionTreeNavigation? GoTo = null,
+
+    /// <summary>
+    /// A second place worth going, offered on the context menu rather than on click — the job's
+    /// method, where the registration is what the click opens.
+    /// </summary>
+    [property: JsonPropertyName("goToSecondary")] SolutionTreeNavigation? GoToSecondary = null);
+
+/// <summary>A place in a document a tree node can open.</summary>
+public sealed record SolutionTreeNavigation(
+    [property: JsonPropertyName("uri")] string Uri,
+    [property: JsonPropertyName("range")] Range Range);
 
 /// <summary>A project in the solution, for pickers that offer a choice of them.</summary>
 public sealed record SolutionProjectInfo(

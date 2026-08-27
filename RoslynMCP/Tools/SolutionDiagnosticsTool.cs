@@ -26,7 +26,7 @@ public static class SolutionDiagnosticsTool
         if (!PathHelper.TryParseSeverityFilter(severityFilter, out DiagnosticSeverity? filter))
             return $"Error: Invalid severity filter '{severityFilter}'. Use: error, warning, info, or all.";
 
-        var solution = WorkspaceService.TryGetMostRecentSolution();
+        var solution = WorkspaceService.TryGetSessionSolution();
         if (solution is null)
             return "No solution is loaded. Open a file or call OpenSolution first.";
 

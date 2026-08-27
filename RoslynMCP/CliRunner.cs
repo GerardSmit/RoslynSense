@@ -118,6 +118,7 @@ internal static class CliRunner
         foreach (var w in settingsWarnings)
             Console.Error.WriteLine($"Warning: {w}");
         DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         var fmt = useToon ? (IOutputFormatter)new ToonFormatter() : new MarkdownFormatter();

@@ -15,15 +15,10 @@ internal static class SearchEverywhereHandler
     public static async Task<SearchEverywhereResult> SearchAsync(
         SearchEverywhereParams p, CancellationToken ct, LanguageSession? languages = null)
     {
-        // A search that ran while the solution was still loading used to answer out of whatever
-        // subset happened to be loaded, which reads as "Ctrl+T does not find my type" rather than
-        // as "not yet". Waiting is cancelled along with the request, so a query the user has
-        // already retyped past stops waiting with it.
-        await SolutionWarmup.WaitAsync(ct);
+        var timer = SearchTimer.Start("Search Everywhere", p.Query);
 
-        var solution = WorkspaceService.TryGetMostRecentSolution();
-        if (solution is null)
-            return new SearchEverywhereResult([], false);
+        // Somebody is waiting on this: the background index sweep gives way for as long as it runs.
+        using var busy = ForegroundGate.Busy();
 
         int limit = p.MaxResults is > 0 and <= MaxResults ? p.MaxResults : 50;
 
@@ -35,6 +30,32 @@ internal static class SearchEverywhereHandler
             _ => null,
         };
 
+        // The solution is being evaluated for the first time: answer from the names read off disk
+        // instead of waiting for MSBuild. This is the cold-open case, and the whole of what used to
+        // make the first Ctrl+T of a session cost the better part of ten seconds — the matching
+        // underneath was always milliseconds. Only the first load, and only if the index wins the
+        // race; otherwise nothing here happened at all and the search below is the one that runs.
+        if (!SolutionWarmup.HasLoadedOnce
+            && await NameIndex.ReadyBeforeAsync(SolutionWarmup.Loading, ct) is { } names)
+        {
+            timer.CorpusReady();
+            var provisional = SearchEverywhere.SearchNames(names, p.Query, limit + 1, ct, only: only);
+            timer.Done(provisional.Count, "name index");
+            return Result(provisional, limit, loading: true);
+        }
+
+        // A search that ran while the solution was still loading used to answer out of whatever
+        // subset happened to be loaded, which reads as "Ctrl+T does not find my type" rather than
+        // as "not yet". Waiting is cancelled along with the request, so a query the user has
+        // already retyped past stops waiting with it.
+        await SolutionWarmup.WaitAsync(ct);
+
+        var solution = WorkspaceService.TryGetSessionSolution();
+        if (solution is null)
+            return new SearchEverywhereResult([], false, false);
+
+        timer.CorpusReady();
+
         // One extra result is asked for so the client can say "there are more" without the server
         // having to count everything it threw away.
         var hits = await ClaimedAsync(p.Query, solution, only, languages, ct)
@@ -42,7 +63,15 @@ internal static class SearchEverywhereHandler
                 solution, p.Query, limit + 1, ct,
                 only: only, includeMetadata: p.IncludeMetadata);
 
-        bool truncated = hits.Count > limit;
+        timer.Done(hits.Count, "solution");
+        return Result(hits, limit, loading: false);
+    }
+
+    /// <param name="loading">Whether this answer came from the stand-in corpus, so the client can
+    /// say so and ask again once <c>roslynSense/solutionReady</c> arrives.</param>
+    private static SearchEverywhereResult Result(
+        IReadOnlyList<SearchHit> hits, int limit, bool loading)
+    {
         var items = hits
             .Take(limit)
             .Select(hit => new SearchEverywhereItem(
@@ -56,7 +85,7 @@ internal static class SearchEverywhereHandler
                 hit.SymbolKind))
             .ToArray();
 
-        return new SearchEverywhereResult(items, truncated);
+        return new SearchEverywhereResult(items, hits.Count > limit, loading);
     }
 
     /// <summary>
@@ -125,14 +154,39 @@ internal static class SearchEverywhereHandler
 
     public static async Task<SearchTextResult> SearchTextAsync(SearchTextParams p, CancellationToken ct)
     {
-        await SolutionWarmup.WaitAsync(ct);
-
-        var solution = WorkspaceService.TryGetMostRecentSolution();
-        if (solution is null)
-            return new SearchTextResult([], false);
+        var timer = SearchTimer.Start("Text search", p.Query);
+        using var busy = ForegroundGate.Busy();
 
         int limit = p.MaxResults is > 0 and <= MaxTextResults ? p.MaxResults : 100;
-        var (hits, truncated) = await TextSearch.SearchAsync(solution, p.Query, limit, ct);
+
+        bool loading = false;
+        IReadOnlyList<TextHit> hits;
+        bool truncated;
+
+        // The Text tab scans files, so the only thing it ever needed from the solution was the
+        // list of them — and the name index walked exactly that list before the load started. It
+        // is the one tab whose provisional answer is not provisional at all; it is marked as one
+        // anyway, because the walk behind it predates any project the load might still add.
+        if (!SolutionWarmup.HasLoadedOnce
+            && await NameIndex.ReadyBeforeAsync(SolutionWarmup.Loading, ct) is { } names)
+        {
+            loading = true;
+            timer.CorpusReady();
+            (hits, truncated) = await TextSearch.SearchAsync(names.Files, p.Query, limit, ct);
+        }
+        else
+        {
+            await SolutionWarmup.WaitAsync(ct);
+
+            var solution = WorkspaceService.TryGetSessionSolution();
+            if (solution is null)
+                return new SearchTextResult([], false, false);
+
+            timer.CorpusReady();
+            (hits, truncated) = await TextSearch.SearchAsync(solution, p.Query, limit, ct);
+        }
+
+        timer.Done(hits.Count, loading ? "name index" : "solution");
 
         var items = hits
             .Select(hit => new SearchTextItem(
@@ -143,6 +197,6 @@ internal static class SearchEverywhereHandler
                 hit.LineText))
             .ToArray();
 
-        return new SearchTextResult(items, truncated);
+        return new SearchTextResult(items, truncated, loading);
     }
 }

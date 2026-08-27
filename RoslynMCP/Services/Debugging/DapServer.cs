@@ -160,7 +160,15 @@ internal sealed class DapServer
 
     public static async Task<int> RunAsync(string[] args, CancellationToken ct = default)
     {
-        using var backend = new PublishingDebugBackend(new IcorDebugBackend());
+        // Told by the caller rather than resolved from configuration here: this process is started
+        // by the editor for one session, and the editor already asked the server which adapter the
+        // target needs. Reading the setting again would let the two disagree, which would show up
+        // as an engine that cannot get into the target it was handed.
+        var runtime = args.Contains("--coreclr", StringComparer.OrdinalIgnoreCase)
+            ? RoslynMCP.Debugger.DebugRuntime.CoreClr
+            : RoslynMCP.Debugger.DebugRuntime.NetFramework;
+
+        using var backend = new PublishingDebugBackend(new IcorDebugBackend(runtime));
 
         // The same command pipe the AI-owned sessions expose. Hot reload needs it: the delta is
         // computed in the daemon, where the workspace lives, but only this process can apply it.
@@ -1052,21 +1060,31 @@ internal sealed class DapServer
         // Through the decorator, not around it: a launched session has to reach DebugStateStore
         // like any other, or the AI's debug tools cannot see what the user is debugging.
         if (_backend is not PublishingDebugBackend publishing)
-            return "Error: this adapter only debugs .NET Framework targets.";
+            return "Error: this adapter cannot launch — its session is not one that publishes state.";
 
         if (projectPath is { Length: > 0 })
         {
             var spec = Run.RunConfigResolver.Resolve(
                 projectPath,
-                arguments?["configuration"]?.GetValue<string>() ?? "Debug");
+                arguments?["configuration"]?.GetValue<string>() ?? "Debug",
+                arguments?["launchProfile"]?.GetValue<string>());
 
             if (!spec.CanRun)
                 return $"Error: {spec.Error}";
 
+            // The client's environment over the project's own. It is not a leftover of what the
+            // resolver already computed — the extension adds to it, and for a .NET target what it
+            // adds is what makes hot reload possible at all: the startup hook and the modifiable
+            // assemblies flag are both read once, while the process is starting. Dropping them
+            // here starts an app that accepts every later edit and applies none of it.
+            var environment = new Dictionary<string, string>(spec.Environment);
+            foreach (var entry in arguments?["env"]?.AsObject() ?? [])
+                environment[entry.Key] = entry.Value?.GetValue<string>() ?? "";
+
             string result = await publishing.LaunchAsync(
                 spec.Executable,
                 spec.Arguments,
-                spec.Environment,
+                environment,
                 spec.WorkingDirectory,
                 initialBreakpoints: null,
                 ct);

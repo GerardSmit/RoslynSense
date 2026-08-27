@@ -62,6 +62,64 @@ public class LspEditingFeatureTests
     }
 
     [Fact]
+    public async Task LinkedEditingFollowsTheCaretAtTheEndOfTheName()
+    {
+        string uri = LspConverters.PathToUri(FixturePaths.CalculatorFile);
+        string text = await File.ReadAllTextAsync(FixturePaths.CalculatorFile);
+
+        // Against the end of `a`, which is where the caret sits while the name is being typed —
+        // the position the feature exists for, and the one the token at the offset is not.
+        var (line, character) = PositionOf(text, "public Result Compute(int a");
+        int column = character + "public Result Compute(int a".Length;
+
+        var linked = await LinkedEditingHandler.RangesAsync(
+            new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(line, column)),
+            default);
+
+        Assert.NotNull(linked);
+        Assert.Equal(3, linked!.Ranges.Length);
+    }
+
+    [Fact]
+    public async Task PrepareRenameAtTheEndOfANameAnswersWithTheName()
+    {
+        string uri = LspConverters.PathToUri(FixturePaths.CalculatorFile);
+        string text = await File.ReadAllTextAsync(FixturePaths.CalculatorFile);
+
+        // `Add(` — the caret between the name and its paren, where the offset belongs to the paren.
+        var (line, character) = PositionOf(text, "return new Result(Add(a, b)");
+        int column = character + "return new Result(Add".Length;
+
+        var prepared = await RenameHandler.PrepareRenameAsync(
+            new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(line, column)),
+            default);
+
+        Assert.NotNull(prepared);
+
+        // The placeholder is what the editor prefills the box with, so answering with the paren is
+        // not a near miss — it is a rename box offering to call the method "(".
+        Assert.Equal("Add", prepared!.Placeholder);
+        Assert.Equal(column - "Add".Length, prepared.Range.Start.Character);
+        Assert.Equal(column, prepared.Range.End.Character);
+    }
+
+    [Fact]
+    public async Task PrepareRenameDeclinesAPositionThatNamesNothing()
+    {
+        string uri = LspConverters.PathToUri(FixturePaths.CalculatorFile);
+        string text = await File.ReadAllTextAsync(FixturePaths.CalculatorFile);
+
+        var (line, character) = PositionOf(text, "return new Result(Add(a, b)");
+        int column = character + "return new Result(Add(a, b)".Length;
+
+        var prepared = await RenameHandler.PrepareRenameAsync(
+            new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(line, column)),
+            default);
+
+        Assert.Null(prepared);
+    }
+
+    [Fact]
     public async Task LinkedEditingDeclinesSymbolsVisibleOutsideTheFile()
     {
         string uri = LspConverters.PathToUri(FixturePaths.CalculatorFile);

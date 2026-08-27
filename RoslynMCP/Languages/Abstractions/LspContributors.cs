@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Lsp.Search;
@@ -355,4 +355,49 @@ internal enum WatchedFileChange
     Created,
     Changed,
     Deleted,
+}
+
+/// <summary>
+/// A section of the Solution Explorer that a pack owns, hung under the solution node beside the
+/// projects.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The tree answers "what is in this solution" structurally — folders, projects, files — and there
+/// are facts about a solution that no structure holds. Which jobs run on a schedule is one: the
+/// registrations are ordinary calls in one startup file, so the tree has no row for them and the
+/// job methods look uncalled, and the answer to "what runs here, and when" exists nowhere in the
+/// editor. A section is where a pack puts an answer like that.
+/// </para>
+/// <para>
+/// Two methods rather than one, and the split is the whole contract.
+/// <see cref="SectionAsync"/> runs on the root listing, which is bound by the tree's promise that
+/// drawing the solution evaluates no project — so it answers from cheap evidence only: a manifest
+/// scan, a cached probe, configuration. <see cref="ChildrenAsync"/> runs after a click, which can
+/// afford a compilation.
+/// </para>
+/// </remarks>
+internal interface ILanguageSolutionTreeContributor
+{
+    /// <summary>
+    /// The prefix every node id this contributor mints begins with, colon included — <c>"cron:"</c>.
+    /// </summary>
+    /// <remarks>
+    /// How the handler routes a click back without knowing what the pack put in the tree, and why
+    /// the routing arm goes last: a prefix here can never shadow <c>project:</c> or <c>file:</c>.
+    /// </remarks>
+    string NodeIdPrefix { get; }
+
+    /// <summary>
+    /// This contributor's own node under the solution root, or null when the solution has nothing
+    /// for it — which is the answer in most solutions and has to stay the cheap one.
+    /// </summary>
+    Task<SolutionTreeNode?> SectionAsync(string solutionPath, CancellationToken ct);
+
+    /// <summary>
+    /// The children of one of its own nodes. Never called with an id outside
+    /// <see cref="NodeIdPrefix"/>.
+    /// </summary>
+    Task<SolutionTreeNode[]> ChildrenAsync(
+        string nodeId, SolutionTreeParams p, CancellationToken ct);
 }

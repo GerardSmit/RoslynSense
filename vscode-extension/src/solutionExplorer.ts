@@ -28,6 +28,26 @@ interface SolutionTreeNode {
     contextValue: string;
     dimmed: boolean;
     highlights: [number, number][] | null;
+
+    /**
+     * Where clicking this row should land, when that is somewhere other than the top of
+     * `resourceUri`. A row standing for something written inside a file — one registration among
+     * twenty in a startup method — has to name the line, or the click lands at the top and leaves
+     * the reader to find what they clicked on.
+     */
+    goTo?: TreeNavigation | null;
+
+    /** A second place worth going, offered on the context menu rather than on click. */
+    goToSecondary?: TreeNavigation | null;
+}
+
+/** A place in a document a tree row can open. */
+interface TreeNavigation {
+    uri: string;
+    range: {
+        start: { line: number; character: number };
+        end: { line: number; character: number };
+    };
 }
 
 const VIEW_ID = 'roslynSense.solutionExplorer';
@@ -247,6 +267,27 @@ export function registerSolutionExplorer(
                     command: 'roslynSense.solutionExplorer.goToProject',
                     title: 'Go to Project',
                     arguments: [node],
+                };
+            }
+            // A row that named a place goes there, rather than to the top of the file it is in.
+            // Preview so that clicking down a list of jobs reuses one tab instead of leaving a
+            // dozen open, which is how the rest of the tree opens a file too.
+            if (node.goTo) {
+                item.command = {
+                    command: 'vscode.open',
+                    title: 'Go to Registration',
+                    arguments: [
+                        vscode.Uri.parse(node.goTo.uri),
+                        {
+                            selection: new vscode.Range(
+                                node.goTo.range.start.line,
+                                node.goTo.range.start.character,
+                                node.goTo.range.end.line,
+                                node.goTo.range.end.character
+                            ),
+                            preview: true,
+                        },
+                    ],
                 };
             }
             if (node.kind === 'generatedFile' && node.resourceUri) {
@@ -1816,6 +1857,31 @@ export function registerSolutionExplorer(
                 }
             }
         ),
+        // Clicking a job opens its registration; this is the other half of the same question —
+        // where the work itself is written. Offered on the menu rather than on click because the
+        // registration is what a reader is looking for far more often, and because a job whose
+        // method is only knowable at run time has nowhere to go.
+        vscode.commands.registerCommand(
+            'roslynSense.solutionExplorer.goToJobMethod',
+            async (node?: SolutionTreeNode) => {
+                const target = node?.goToSecondary;
+                if (!target) {
+                    return;
+                }
+                await vscode.commands.executeCommand(
+                    'vscode.open',
+                    vscode.Uri.parse(target.uri),
+                    {
+                        selection: new vscode.Range(
+                            target.range.start.line,
+                            target.range.start.character,
+                            target.range.end.line,
+                            target.range.end.character
+                        ),
+                    }
+                );
+            }
+        ),
         onNode('roslynSense.solutionExplorer.unloadProject', async (_node, selected) => {
             const paths = selected.map(projectPathOf).filter((p): p is string => Boolean(p));
             await setUnloaded([...unloaded, ...paths]);
@@ -2271,8 +2337,28 @@ function parentIdOf(id: string): string | undefined {
     if (owner !== undefined) {
         return `group:projects|${owner}`;
     }
+    // A job id carries the project, the file and an offset, so the generic rule below would
+    // answer "cron:j|<project>|<file>" — a node that does not exist. Its parent is the project
+    // row inside the section.
+    const job = cronJobOwnerOf(id);
+    if (job !== undefined) {
+        return `cron:p|${job}`;
+    }
     const separator = id.lastIndexOf('|');
     return separator > 0 ? id.slice(0, separator) : undefined;
+}
+
+/**
+ * The project a scheduled job belongs to, read out of its id
+ * (`cron:j|<project>|<file>|<offset>`), or undefined for anything that is not one.
+ */
+function cronJobOwnerOf(id: string): string | undefined {
+    if (!id.startsWith('cron:j|')) {
+        return undefined;
+    }
+    const rest = id.slice('cron:j|'.length);
+    const separator = rest.indexOf('|');
+    return separator < 0 ? undefined : rest.slice(0, separator);
 }
 
 /**
@@ -2481,6 +2567,16 @@ function iconFor(
     extensionUri: vscode.Uri,
     fileIconsFromTheme: boolean
 ): NodeIcon {
+    // A scheduled job's context value is composed — "cronJobDynamicMethod" and friends — so it
+    // is read rather than matched, and only the one fact the icon is about is asked for.
+    if (node.kind === 'cronJob') {
+        // Marked rather than dimmed: dimming already means "the workspace cannot answer about
+        // this" in this tree, and an unloaded project and a config-driven schedule must not look
+        // the same.
+        return node.contextValue.includes('Dynamic')
+            ? tinted('question', 'charts.purple')
+            : tinted('watch', 'charts.purple');
+    }
     // A project's kind stays "project" whether it is runnable or unloaded; only its context
     // value says which, and an unloaded one is drawn greyed the way its label already is.
     switch (node.kind === 'project' ? node.contextValue : node.kind) {
@@ -2547,6 +2643,11 @@ function iconFor(
         case 'file':
         case 'solutionItem':
             return fileIcon(node.resourceUri, extensionUri, fileIconsFromTheme);
+        // A schedule is a clock, and the section and its projects carry the same one so the
+        // branch reads as one thing at every level.
+        case 'cronJobs':
+        case 'cronProject':
+            return tinted('watch', 'charts.purple');
         default:
             // An unknown kind is still a row, and a row still needs its slot filled.
             return node.hasChildren

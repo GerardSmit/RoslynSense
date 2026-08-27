@@ -57,6 +57,7 @@ internal sealed class DaemonServer
         foreach (string warning in configWarnings)
             Console.Error.WriteLine($"[Config] {warning}");
         DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
         // A daemon lives long enough to reload; standby hosts are what make those reloads meet
         // warm MSBuild processes instead of paying initialisation again.
@@ -80,6 +81,7 @@ internal sealed class DaemonServer
         }
 
         DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
         // A session that is stopped right now picks the new policy up on its next expansion,
         // which is the whole point of making these switchable rather than start-up only.
         Services.DebugSessionManager.GetSession()?.ApplyViewOptions(settings.DebugView);
@@ -186,6 +188,10 @@ internal sealed class DaemonServer
         // here, a roslynsense.json edit applied only at the next daemon start.
         DebuggerViewOptions.Current = settings.DebugView;
         Services.DebugSessionManager.GetSession()?.ApplyViewOptions(settings.DebugView);
+
+        // No counterpart for the running session: an engine cannot be swapped under a live
+        // debuggee, so this is read again when the next one starts.
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
         // Editors re-pull diagnostics, lenses and tokens so anything a toggle changed shows up
         // without a keystroke.

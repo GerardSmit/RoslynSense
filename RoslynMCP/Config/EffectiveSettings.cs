@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using RoslynMCP.Languages.Cron;
 using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Resources;
 using RoslynMCP.Languages.Values;
@@ -46,6 +47,10 @@ public sealed record EffectiveSettings(
     /// <see cref="Resources"/>.</summary>
     internal bool Formatting { get; init; } = true;
 
+    /// <summary>The scheduled-job pack's gate and the scheduling APIs it recognises. Init-only for
+    /// the same reason as <see cref="Resources"/>.</summary>
+    internal CronSettings Cron { get; init; } = CronSettings.Disabled;
+
     /// <summary>Which markup attributes are read as data expressions. Init-only for the same
     /// reason as <see cref="Resources"/>.</summary>
     internal MarkupBindingSettings MarkupBindings { get; init; } = MarkupBindingSettings.None;
@@ -90,6 +95,12 @@ public sealed record EffectiveSettings(
     /// </summary>
     public Debugger.DebugDisplayOptions DebugView { get; init; } = new();
 
+    /// <summary>
+    /// Which engine debugs a CoreCLR target. Init-only for the same reason as
+    /// <see cref="Resources"/>.
+    /// </summary>
+    public CoreClrDebugEngine CoreClrEngine { get; init; } = CoreClrDebugEngine.NetCoreDbg;
+
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {
         warnings = new List<string>();
@@ -132,6 +143,8 @@ public sealed record EffectiveSettings(
         var valueSets = ValueSettings.Resolve(
             !HasFlag("--no-valuesets") && tools.ValueSets, config?.ValueSets, warnings);
         bool formatting = !HasFlag("--no-formatting") && tools.Formatting;
+        var cron = CronSettings.Resolve(
+            !HasFlag("--no-cron") && tools.Cron, config?.Cron, warnings);
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -186,6 +199,7 @@ public sealed record EffectiveSettings(
             preload, sharedHost, hostIdleMinutes, maxWorkspaces)
         {
             DebugView = DebuggerViewOptions.Resolve(config?.Debugger, args),
+            CoreClrEngine = DebugEngineOptions.Resolve(config?.Debugger, warnings),
             Resources = resources,
             MsBuild = msBuild,
             Dbml = dbml,
@@ -196,6 +210,7 @@ public sealed record EffectiveSettings(
             Logging = logging,
             ValueSets = valueSets,
             Formatting = formatting,
+            Cron = cron,
             MarkupBindings = markupBindings,
         };
     }

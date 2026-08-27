@@ -108,6 +108,7 @@ internal static class ConfigurationHandler
         }
 
         ApplyDebuggerView(section);
+        ApplyDebugEngine(section);
 
         return analyzersChanged;
     }
@@ -150,6 +151,36 @@ internal static class ConfigurationHandler
 
         DebuggerViewOptions.Current = updated;
         DebugSessionManager.GetSession()?.ApplyViewOptions(updated);
+    }
+
+    /// <summary>
+    /// Applies <c>roslynSense.debugger.coreClrEngine</c> — which engine a .NET target is debugged
+    /// with.
+    /// </summary>
+    /// <remarks>
+    /// Separate from the view policy, and deliberately not pushed into the running session: an
+    /// engine cannot be swapped under a live debuggee, so this changes what the next session is
+    /// given and leaves the current one alone. An unreadable value is ignored rather than
+    /// defaulted, because a settings push that arrives mid-edit would otherwise reset a choice the
+    /// user had already made.
+    /// </remarks>
+    private static void ApplyDebugEngine(JsonElement section)
+    {
+        if (!section.TryGetProperty("debugger", out var debugger)
+            || debugger.ValueKind != JsonValueKind.Object
+            || !debugger.TryGetProperty("coreClrEngine", out var engine)
+            || engine.ValueKind != JsonValueKind.String)
+        {
+            return;
+        }
+
+        if (DebugEngineOptions.Parse(engine.GetString()) is not { } chosen)
+            return;
+
+        if (chosen == CoreClrDebugEngine.IcorDebug && !OperatingSystem.IsWindows())
+            return;
+
+        DebugEngineOptions.CoreClr = chosen;
     }
 
     /// <summary>

@@ -108,7 +108,7 @@ landed, and what shipped beyond it.
 | Item | State | Delivered as |
 | --- | --- | --- |
 | T1.1 analyzer diagnostics | Done | `AnalyzerService.RunDocumentAnalyzersAsync`, `AnalyzerDiagnosticCache`, two-phase `DiagnosticsPublisher`, IDE analyzers reflected out of the Features assemblies, and Roslyn's `IConfigurationFixProvider` exports for suppress/configure — with reserved lightbulb slots so they cannot be crowded out |
-| T1.2 native F5 | Done | `LaunchHandler` (`launchTargets`, `attachTargets`, `debuggerPath`), `debugLaunch.ts`; netcoredbg `--interpreter=vscode` for CoreCLR, `roslyn-sense --dap` for Framework |
+| T1.2 native F5 | Done | `LaunchHandler` (`launchTargets`, `attachTargets`, `debuggerPath`), `debugLaunch.ts`; netcoredbg `--interpreter=vscode` for CoreCLR, `roslyn-sense --dap` for Framework — and for CoreCLR too when `debugger.coreClrEngine` opts in, which the server reports per target so the client does not read the setting itself |
 | T1.3 Test Explorer | Done | `TestDiscoveryService`/`TrxParser`/`TestRunService` + `TestHandler` + `testController.ts`, with run, debug and coverage profiles; `roslynSense/testRunEvent` reports each test as it finishes and streams console output, `roslynSense/testCancel` kills the test host, and coverage carries branch counts |
 | T1.4 watched files | Done | `WatchedFilesHandler` with 500 ms coalescing, rename pairing, project/`.editorconfig` eviction; `synchronize.fileEvents` on the client. `workspace/didCreateFiles` scaffolds a file made through the editor's own explorer; `didDeleteFiles` drops it from its project |
 
@@ -229,6 +229,20 @@ the emulation in `PublishingDebugBackend` sits behind our own backend, which tha
 use. Closing it means either an adapter of our own in front of netcoredbg, or routing the CoreCLR
 F5 session through `PublishingDebugBackend` the way the Framework one already is. The other two
 columns are ours: `modules` and `gotoTargets` in the AI adapter are small, contained additions.
+
+That second route now exists as an opt-in. `debugger.coreClrEngine: icordebug` — or
+`roslynSense.debugger.coreClrEngine` in the editor, or `ROSLYNMCP_CORECLR_ENGINE` for one run —
+sends a .NET session to the ICorDebug engine instead, which puts it in the Framework column above
+and gives it everything that engine gained: Just My Code applied by the runtime, breakpoints that
+bind against binaries built elsewhere, return values after a step, decompiled-code stepping.
+`DebugSessionManager.EngineFor` reads it when a session starts, and `LaunchTarget.ServerDebugAdapter`
+tells the editor which adapter to launch so F5 and the MCP tools cannot disagree.
+
+It is off by default and should stay that way until it has mileage. What it costs: Windows only —
+the engine's CoreCLR bootstrap goes through dbgshim and throws anywhere else, so the setting is
+refused off Windows rather than attempted. Hot reload still goes through the in-process updater;
+`IcorDebugBackend.ApplyDeltaAsync` refuses a .NET delta so the same generation is not applied twice.
+And the engine has years of mileage on .NET Framework and almost none on .NET.
 
 ## Gaps against VS and Rider
 

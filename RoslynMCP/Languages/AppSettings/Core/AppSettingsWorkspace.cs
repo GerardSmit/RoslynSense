@@ -125,7 +125,7 @@ internal static class AppSettingsWorkspace
 
         return s_secretsProjects.GetOrAdd(id, static secretsId =>
         {
-            if (WorkspaceService.TryGetMostRecentSolution() is not { } solution)
+            if (WorkspaceService.TryGetSessionSolution() is not { } solution)
                 return null;
 
             foreach (var project in solution.Projects)

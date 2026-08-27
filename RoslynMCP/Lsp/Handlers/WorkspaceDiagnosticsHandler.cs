@@ -32,12 +32,17 @@ internal static class WorkspaceDiagnosticsHandler
         if (scope == "off")
             return new WorkspaceDiagnosticReport([]);
 
-        var solution = WorkspaceService.TryGetMostRecentSolution();
+        var solution = WorkspaceService.TryGetSessionSolution();
         if (solution is null)
             return new WorkspaceDiagnosticReport([]);
 
+        // Keyed by the URI as this server spells it, not as the client sent it — every lookup below
+        // is against a LspConverters.PathToUri of a real path. See LspConverters.NormalizeUri: the
+        // two spellings differ for any file whose name contains a character Uri.AbsoluteUri escapes
+        // and VS Code's serialiser does not, a space being the common one, and the mismatch reads
+        // as "no previous result" and re-sends that file in full on every sweep, forever.
         var previous = (p.PreviousResultIds ?? [])
-            .GroupBy(r => r.Uri, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(r => LspConverters.NormalizeUri(r.Uri), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.Last().Value, StringComparer.OrdinalIgnoreCase);
 
         // Grouped by project file. A multi-targeted project is several Projects over one document
@@ -145,7 +150,7 @@ internal static class WorkspaceDiagnosticsHandler
 
                 // Framework-independent: this reads the project file and the config beside it, so
                 // one framework's worth is the whole answer.
-                if (await DiagnoseBindingRedirectsAsync(group[0], token) is { } bindings)
+                if (await DiagnoseBindingRedirectsAsync(group[0], previous, token) is { } bindings)
                     reports.Add(bindings);
 
                 progress.Report(group[0].Name, (int)(100.0 * Interlocked.Increment(ref done) / groups.Count));
@@ -205,33 +210,60 @@ internal static class WorkspaceDiagnosticsHandler
         }
 
         int streak = Interlocked.Increment(ref s_consecutiveChurningSweeps);
+
+        // Which files, not merely how many. A steady count of full reports has two causes that
+        // want opposite responses, and the count alone cannot tell them apart: a cold solution
+        // working through its first analyzer pass reports a different handful every time and is
+        // converging, while a treadmill reports the same handful forever. Carried across passes
+        // whether or not this one logs, so the number is about the last pass rather than the last
+        // logged one.
+        var reported = full.Select(r => r.Uri).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var before = Interlocked.Exchange(ref s_lastFullyReported, reported);
+        int repeated = reported.Count(uri => before.Contains(uri));
+
         if (streak != 10 && streak % 100 != 0)
             return;
 
         var samples = full.Take(3).Select(report =>
         {
-            previous.TryGetValue(report.Uri, out string? before);
+            previous.TryGetValue(report.Uri, out string? was);
             return $"'{Path.GetFileName(LspConverters.UriToPath(report.Uri))}' "
-                + $"[{Abbreviate(before)} -> {Abbreviate(report.ResultId)}]";
+                + $"[{Abbreviate(was)} -> {Abbreviate(report.ResultId)}]";
         });
 
         Services.ServiceLog.Warn(
             $"The workspace sweep has re-reported files on {streak} consecutive passes "
-            + $"({full.Count} full / {merged.Count - full.Count} unchanged this pass) — result ids "
+            + $"({full.Count} full / {merged.Count - full.Count} unchanged this pass, "
+            + $"{repeated} of them full on the previous pass too) — result ids "
             + $"are churning instead of converging. E.g. {string.Join(", ", samples)}.",
             key: "sweep-not-converging");
     }
 
-    /// <summary>A result id short enough to read in a log line: ids are checksum:semanticVersion
-    /// :marker per owning project, joined by '|', and the head plus the trailing marker is what a
-    /// reader diffs — whether the content moved, and whether the analyzed state flipped.</summary>
+    /// <summary>The files the previous sweep sent in full, to tell a moving front from a treadmill.</summary>
+    private static HashSet<string> s_lastFullyReported = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A result id short enough to read in a log line: ids are checksum-semanticVersion:marker per
+    /// owning project, joined by '|'.
+    /// </summary>
+    /// <remarks>
+    /// Only the content checksum is elided, and everything after it is kept whole. Eliding the
+    /// middle instead dropped the dependent semantic version — the one field that separates the
+    /// three reasons an id moves. A moved checksum means the file's own text changed; a moved
+    /// semantic version means some other file's declarations did; a moved marker alone means
+    /// nothing changed at all and analyzers merely finished. Two of those are a converging session
+    /// and one is a bug, and a line that shows only the head and the marker cannot say which.
+    /// </remarks>
     private static string Abbreviate(string? resultId)
     {
         if (resultId is null)
             return "(none)";
 
         return string.Join('|', resultId.Split('|').Select(component =>
-            component.Length <= 24 ? component : $"{component[..12]}…{component[^4..]}"));
+        {
+            int checksum = component.IndexOfAny(['-', ':']);
+            return checksum is > 12 ? $"{component[..12]}…{component[checksum..]}" : component;
+        }));
     }
 
     /// <summary>Collapses reports that name the same document into one.</summary>
@@ -375,7 +407,8 @@ internal static class WorkspaceDiagnosticsHandler
     /// file to find out that a redirect went stale, and the redirect that is wrong is the one for a
     /// package they updated without thinking about it.
     /// </remarks>
-    private static async Task<object?> DiagnoseBindingRedirectsAsync(Project project, CancellationToken ct)
+    private static async Task<object?> DiagnoseBindingRedirectsAsync(
+        Project project, IReadOnlyDictionary<string, string> previous, CancellationToken ct)
     {
         if (project.FilePath is not { Length: > 0 } projectPath)
             return null;
@@ -387,13 +420,47 @@ internal static class WorkspaceDiagnosticsHandler
         // is held for minutes, so the sweep was queueing behind it.
         var report = await Services.Packages.BindingRedirectService.CachedAnalyzeAsync(
             projectPath, waitForEvaluation: false, ct);
-        if (report.ConfigPath is null || report.Findings.Count == 0)
+        if (report.ConfigPath is null)
             return null;
 
-        return new WorkspaceFullDocumentDiagnosticReport(
-            "full",
-            LspConverters.PathToUri(report.ConfigPath),
-            BindingRedirectHandler.ToDiagnostics(report));
+        // Reported even with nothing to say, and with an id. Both used to be otherwise, and each
+        // cost something. No report at all for a config whose redirects were just fixed leaves the
+        // client holding the findings it last saw, because LSP treats an absent report as "no news"
+        // — so the squiggles outlived the fix. And a full report with no id is one the client can
+        // never hand back, so this file was re-sent in full on every sweep for the life of the
+        // session, which is also what kept the convergence warning firing forever.
+        var diagnostics = BindingRedirectHandler.ToDiagnostics(report);
+        string uri = LspConverters.PathToUri(report.ConfigPath);
+        string resultId = ResultIdOf(diagnostics);
+
+        // Over the findings themselves rather than over what produced them: nothing here versions
+        // bin or the package folders the analysis walks, so an id claiming "unchanged" on any other
+        // basis could outlive an answer that had moved. This one cannot — it is a hash of the very
+        // payload the unchanged report is standing in for.
+        return previous.TryGetValue(uri, out string? previousId) && previousId == resultId
+            ? new WorkspaceUnchangedDocumentDiagnosticReport("unchanged", uri, resultId)
+            : new WorkspaceFullDocumentDiagnosticReport("full", uri, diagnostics) { ResultId = resultId };
+    }
+
+    /// <summary>A result id that stands for exactly this set of diagnostics.</summary>
+    private static string ResultIdOf(IReadOnlyList<Protocol.Diagnostic> diagnostics)
+    {
+        var lines = diagnostics
+            .Select(d => string.Join(
+                '',
+                d.Range.Start.Line,
+                d.Range.Start.Character,
+                d.Range.End.Line,
+                d.Range.End.Character,
+                d.Severity,
+                d.Code,
+                d.Message))
+            .OrderBy(line => line, StringComparer.Ordinal);
+
+        byte[] hash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(string.Join('', lines)));
+
+        return Convert.ToHexString(hash);
     }
 
     /// <summary>

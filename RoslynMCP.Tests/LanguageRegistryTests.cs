@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis;
 using RoslynMCP.Config;
 using RoslynMCP.Languages;
 using RoslynMCP.Languages.AppSettings;
+using RoslynMCP.Languages.Cron;
 using RoslynMCP.Languages.Dbml;
 using RoslynMCP.Languages.DotSettings;
 using RoslynMCP.Languages.Formatting;
@@ -143,6 +144,7 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ResourcesLanguage>(pack),
             pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<FormattingLanguage>(pack),
+            pack => Assert.IsType<CronLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),
@@ -219,6 +221,7 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ResourcesLanguage>(pack),
             pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<FormattingLanguage>(pack),
+            pack => Assert.IsType<CronLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),
@@ -265,6 +268,7 @@ public class LanguageRegistryTests
             pack => Assert.IsType<ResourcesLanguage>(pack),
             pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<FormattingLanguage>(pack),
+            pack => Assert.IsType<CronLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),

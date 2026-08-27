@@ -394,7 +394,7 @@ public static class PackageUpdateService
         IReadOnlyCollection<string> projects, CancellationToken ct)
     {
         // One solution-wide restore beats one per project, and it is what the CLI does anyway.
-        string? solution = WorkspaceService.TryGetMostRecentSolution()?.FilePath;
+        string? solution = WorkspaceService.TryGetSessionSolution()?.FilePath;
         if (solution is { Length: > 0 })
         {
             var (exitCode, output) = await NuGetService.RunDotnetAsync(["restore", solution], ct);

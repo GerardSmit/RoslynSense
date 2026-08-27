@@ -9,7 +9,7 @@ namespace RoslynMCP.Services;
 
 /// <summary>
 /// Backs the <c>Debug*</c> tools with the ICorDebug engine, which is the only way to debug
-/// .NET Framework targets (netcoredbg speaks to CoreCLR only).
+/// .NET Framework targets (netcoredbg speaks to CoreCLR only) and an opt-in for CoreCLR ones.
 /// </summary>
 /// <remarks>
 /// Adapts the engine's event-stream shape to the request/response shape the tools expect: the
@@ -18,6 +18,45 @@ namespace RoslynMCP.Services;
 /// </remarks>
 internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 {
+    /// <summary>
+    /// Which runtime the target carries, which decides how the engine gets into it: .NET Framework
+    /// through the CLR meta-host, CoreCLR through dbgshim.
+    /// </summary>
+    /// <remarks>
+    /// Defaulted to .NET Framework because that is the target this backend has always been given,
+    /// and because it is the only runtime for which the choice is forced.
+    /// </remarks>
+    private readonly EngineRuntime _runtime;
+
+    public IcorDebugBackend(EngineRuntime runtime = EngineRuntime.NetFramework) =>
+        _runtime = runtime == EngineRuntime.Unspecified ? EngineRuntime.NetFramework : runtime;
+
+    /// <summary>The runtime's name as it appears in messages to the user.</summary>
+    private string RuntimeName =>
+        _runtime == EngineRuntime.CoreClr ? ".NET" : ".NET Framework";
+
+    /// <summary>
+    /// Whether hot reload deltas go through this session rather than through the in-process
+    /// updater.
+    /// </summary>
+    /// <remarks>
+    /// Only .NET Framework, which has no updater of its own. Asked before a delta is routed here,
+    /// so a session that would refuse it is not mistaken for the one that will take it.
+    /// </remarks>
+    public bool AppliesDeltas => _runtime == EngineRuntime.NetFramework;
+
+    /// <summary>
+    /// The refusal a session that does not apply deltas answers with.
+    /// </summary>
+    /// <remarks>
+    /// A constant because two things have to agree on it: this backend produces it, and the hot
+    /// reload fan-out matches it to tell a skip from a failure. Worded apart, a working reload
+    /// would start reporting errors for every module while still applying every edit.
+    /// </remarks>
+    public const string NotADeltaTarget =
+        "this session does not debug .NET Framework, so it cannot apply a delta";
+
+
     /// <summary>How long to wait for the target to stop again after a resume.</summary>
     private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(60);
 
@@ -106,7 +145,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             PushViewOptions(Config.DebuggerViewOptions.Current);
             StartPump();
             _state = DebuggerService.DebugState.Starting;
-            Engine.Attach(pid, specs, EngineRuntime.NetFramework);
+            Engine.Attach(pid, specs, _runtime);
         }
         catch (Exception ex)
         {
@@ -118,7 +157,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         _state = DebuggerService.DebugState.Running;
 
         var sb = new StringBuilder();
-        sb.AppendLine($"Attached to process {pid} using the ICorDebug engine (.NET Framework).");
+        sb.AppendLine($"Attached to process {pid} using the ICorDebug engine ({RuntimeName}).");
         if (_breakpoints.Count > 0)
         {
             sb.AppendLine();
@@ -145,7 +184,12 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     {
         if (_state != DebuggerService.DebugState.NotStarted)
             return "Error: A debug session is already active. Call DebugStop first.";
-        if (!File.Exists(executable))
+        // A bare command name is left to the OS to find on PATH. A project built with
+        // UseAppHost=false has no executable of its own and is launched as `dotnet app.dll`, and
+        // reporting that as "dotnet does not exist, build the project first" diagnoses the wrong
+        // thing about a project that built perfectly well.
+        bool named = Path.GetFileName(executable) != executable;
+        if (named && !File.Exists(executable))
             return $"Error: '{executable}' does not exist. Build the project first.";
 
         var specs = BuildSpecs(initialBreakpoints);
@@ -161,7 +205,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             Engine.Launch(
                 executable, arguments, specs, environment,
                 workingDirectory ?? Path.GetDirectoryName(executable),
-                EngineRuntime.NetFramework);
+                _runtime);
         }
         catch (Exception ex)
         {
@@ -174,7 +218,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         await Task.CompletedTask;
 
         var sb = new StringBuilder();
-        sb.AppendLine($"Launched {Path.GetFileName(executable)} under the ICorDebug engine (.NET Framework).");
+        sb.AppendLine($"Launched {Path.GetFileName(executable)} under the ICorDebug engine ({RuntimeName}).");
         if (_breakpoints.Count > 0)
         {
             sb.AppendLine();
@@ -569,7 +613,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         string[] assemblies;
         try
         {
-            assemblies = WorkspaceService.TryGetMostRecentSolution() is { } solution
+            assemblies = WorkspaceService.TryGetSessionSolution() is { } solution
                 ? [.. solution.Projects
                     .Select(p => p.OutputFilePath)
                     .Where(p => p is { Length: > 0 })
@@ -952,18 +996,33 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     /// Applies one hot reload delta to a module loaded in the debuggee.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// This is the only route onto the desktop runtime: .NET Framework has no in-process metadata
     /// updater, so the edit has to go through the debugger that is already attached. The engine
     /// enabled EnC JIT flags on every module as it loaded, which is what makes the apply possible
     /// at all — a module JITted without them refuses the change.
+    /// </para>
+    /// <para>
+    /// A .NET target on this engine is refused rather than served. It has an in-process updater and
+    /// the agent has already applied the same generation, and a generation applied twice fails the
+    /// second time — which would leave every later edit diffing against one the debuggee never
+    /// took. The wording is the one the hot reload fan-out reads as a skip rather than a failure.
+    /// </para>
     /// </remarks>
     public async Task<(bool Ok, string Error)> ApplyDeltaAsync(
         string assemblyName, byte[] metadata, byte[] il, byte[] pdb,
         string? symbolMap = null,
         CancellationToken cancellationToken = default)
     {
+        if (!AppliesDeltas)
+        {
+            return (false,
+                $"{NotADeltaTarget} — a .NET target takes its updates through the in-process " +
+                "updater instead.");
+        }
+
         if (_engine is null)
-            return (false, "No .NET Framework debug session is attached.");
+            return (false, "No debug session is attached to this engine.");
 
         // An edit prefers the target stopped, so a running one is broken into first and resumed
         // afterwards — the user asked to apply an edit, not to be told to go and press pause.
@@ -1038,7 +1097,7 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     {
         var sb = new StringBuilder();
         sb.AppendLine($"**State:** {_state}");
-        sb.AppendLine("**Engine:** ICorDebug (.NET Framework)");
+        sb.AppendLine($"**Engine:** ICorDebug ({RuntimeName})");
 
         if (!_breakpoints.IsEmpty)
         {

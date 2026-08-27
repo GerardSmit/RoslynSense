@@ -151,7 +151,7 @@ internal static class WorkspaceService
     /// <summary>
     /// The cached workspaces. Concurrent so a reader that only wants to look at an entry does not
     /// have to take <see cref="s_cacheLock"/>, which a load holds while it caches its result — that
-    /// made <see cref="TryGetMostRecentSolution"/> block whichever request thread called it for as
+    /// made <see cref="TryGetSessionSolution"/> block whichever request thread called it for as
     /// long as the load took. The lock still guards mutations, because those maintain invariants
     /// across this dictionary and the two reverse indexes together.
     /// </summary>
@@ -672,11 +672,15 @@ internal static class WorkspaceService
                 // only for the bound solution's own workspace: SQLite holds the DB exclusively,
                 // so a second workspace given the same path would silently degrade to NoOp.
                 //
-                // Opt-in while it earns trust: setting the FilePath switches every index read and
-                // write in the process onto the SQLite storage service and its native library —
-                // a crash or wedge there takes the whole load down, which is a daemon that never
-                // answers and an editor that says the workspace is still loading.
-                if (Environment.GetEnvironmentVariable("ROSLYN_SENSE_PERSISTENT_INDEX") == "1"
+                // On by default, with an escape hatch. Setting the FilePath switches every index
+                // read and write in the process onto the SQLite storage service and its native
+                // library — a crash or wedge there takes the whole load down, which is a daemon
+                // that never answers and an editor that says the workspace is still loading. That
+                // risk is why this was opt-in; what settled it is what the opt-out costs, which is
+                // rebuilding every index on every daemon start, paid inside the first Ctrl+T,
+                // Shift+F12 and Ctrl+F12 of every session. Set the variable to "0" to go back to
+                // recomputing them.
+                if (Environment.GetEnvironmentVariable("ROSLYN_SENSE_PERSISTENT_INDEX") != "0"
                     && BoundSolutionPath is { Length: > 0 } boundSolution
                     && string.Equals(cacheKey, Path.GetFullPath(boundSolution),
                         StringComparison.OrdinalIgnoreCase))
@@ -1746,6 +1750,28 @@ internal static class WorkspaceService
     /// </remarks>
     public static string? BoundSolutionPath { get; private set; }
 
+    /// <summary>
+    /// Test seam: binds <paramref name="solutionPath"/> for the lifetime of the returned scope and
+    /// restores the previous binding when it is disposed.
+    /// </summary>
+    /// <remarks>
+    /// Without the start-up work <see cref="BindSolution"/> exists to kick off — a NuGet restore, a
+    /// MEF composition and a BuildHost warm — none of which a test wants, and all of which would
+    /// outlive it. The binding is process-wide state, so the restore matters: a test that left one
+    /// behind would decide what every later test in the run considers its solution.
+    /// </remarks>
+    internal static IDisposable BindSolutionForTesting(string? solutionPath)
+    {
+        string? previous = BoundSolutionPath;
+        BoundSolutionPath = solutionPath is { Length: > 0 } path ? Path.GetFullPath(path) : null;
+        return new BindingScope(previous);
+    }
+
+    private sealed class BindingScope(string? previous) : IDisposable
+    {
+        public void Dispose() => BoundSolutionPath = previous;
+    }
+
     public static void BindSolution(string? solutionPath)
     {
         if (solutionPath is { Length: > 0 } path && PathHelper.IsSolutionFile(path) && File.Exists(path))
@@ -1767,12 +1793,37 @@ internal static class WorkspaceService
     }
 
     /// <summary>
-    /// Returns the most-recently-used cached solution (with open-buffer overlays applied), or
-    /// null when nothing is loaded yet. Used by solution-wide queries that aren't anchored to
-    /// a file (LSP workspace/symbol).
+    /// Returns this session's solution — the one it was bound to, or failing that the
+    /// most-recently-used cached one — with open-buffer overlays applied, or null when nothing is
+    /// loaded yet. Used by solution-wide queries that aren't anchored to a file (LSP
+    /// workspace/symbol, the solution tree, the diagnostics sweep).
     /// </summary>
-    public static Solution? TryGetMostRecentSolution()
+    /// <remarks>
+    /// The bound solution first, because "most recently used" is only ever a guess at which
+    /// solution the caller means, and it is the wrong guess as soon as two loaded solutions share
+    /// projects. The same file is then a document in both workspaces, each with its own version
+    /// stamps, so which workspace answers decides what the file's result id says — and the answer
+    /// alternated with whatever was touched last. Consecutive diagnostic sweeps handed the client
+    /// two different ids for a file nobody had opened, each mismatching the one before it: every
+    /// shared file re-reported and re-bound on every pass, for the life of the session, with the
+    /// id flipping between two fixed values. A session that declared its solution is not guessing,
+    /// and the guess is kept only for callers that never declared one.
+    /// </remarks>
+    public static Solution? TryGetSessionSolution()
     {
+        string? bound = BoundSolutionPath is { Length: > 0 } b ? b : null;
+
+        if (bound is not null
+            && s_cache.TryGetValue(bound, out var boundEntry)
+            && boundEntry.Workspace.CurrentSolution is { } boundSnapshot
+            && boundSnapshot.ProjectIds.Count > 0)
+        {
+            var boundProject = boundSnapshot.GetProject(boundEntry.PrimaryProjectId);
+            return boundProject is null
+                ? boundSnapshot
+                : ApplyOpenDocumentOverlay(boundEntry, boundProject).Solution;
+        }
+
         CachedWorkspaceEntry? entry = null;
 
         // Deliberately lock-free. This is called from workspace/symbol, search-everywhere, the
@@ -1789,6 +1840,24 @@ internal static class WorkspaceService
         {
             if (ExternalSource.ExternalSourceCache.IsExternalSourcePath(key))
                 continue;
+
+            // Never a different solution than the one this session was started for. The fast path
+            // above already answered if the bound solution's workspace is loaded, so reaching here
+            // with a solution bound means it is not loaded *yet* — the seconds before its first
+            // project lands, which is also exactly when a second solution loading alongside it can
+            // be the most recently used entry. Answering from that one hands back a solution whose
+            // files are not this session's, and hands them back with version stamps that the bound
+            // solution will contradict the moment it finishes loading: the id churn this whole
+            // preference exists to stop, reintroduced through the fallback. "Not loaded yet" is a
+            // state the callers already handle — they answer empty and are re-asked — so saying so
+            // is both honest and self-correcting.
+            //
+            // A loose project is not a competing solution and still answers: a .csproj opened
+            // outside the bound solution is keyed by its own path, and serving it is the whole
+            // point of the fallback.
+            if (bound is not null && PathHelper.IsSolutionFile(key))
+                continue;
+
             if (entry is not null && e.LastAccessedUtc <= entry.LastAccessedUtc)
                 continue;
 
@@ -1869,7 +1938,7 @@ internal static class WorkspaceService
 
         var found = new Dictionary<string, Project>(StringComparer.OrdinalIgnoreCase);
 
-        // Lock-free for the same reason as TryGetMostRecentSolution: this runs on request threads,
+        // Lock-free for the same reason as TryGetSessionSolution: this runs on request threads,
         // and s_cacheLock is held across the end of a project load.
         foreach (var (key, entry) in s_cache)
         {
@@ -3317,24 +3386,55 @@ internal static class WorkspaceService
     {
         try
         {
+            // The session's own solution first, whenever it lists this project.
+            //
+            // The walk below finds whichever .sln sits nearest the .csproj on disk. For a
+            // repository that keeps a solution per project as well as one that spans them, that
+            // is the project's own sibling — never the one the session declared. The two keys
+            // then never meet: every project loads under its neighbour's solution while
+            // TryGetSessionSolution asks for the bound one, misses, and declines to answer from a
+            // solution this session did not declare, which is the right call for the reason
+            // written there and leaves it returning null for as long as the session lives.
+            //
+            // What that looks like from the outside is a Solution Explorer whose every row says
+            // "not loaded" and a Search Everywhere that finds nothing, while go-to-definition and
+            // find-references work perfectly — they reach the workspace through the project map
+            // rather than the session solution, so they never notice the disagreement. Restarting
+            // the host does not help, because both sides derive the same two keys again.
+            if (BoundSolutionPath is { Length: > 0 } bound
+                && SharedSolutionKey(bound, normalizedProjectPath) is { } boundKey)
+            {
+                return boundKey;
+            }
+
             string? sln = PathHelper.FindNearestSolution(normalizedProjectPath);
-            if (string.IsNullOrEmpty(sln))
-                return null;
-
-            var projects = PathHelper.GetProjectsFromSolution(sln);
-            if (projects.Count <= 1)
-                return null;  // single-project solution gains nothing from sharing
-
-            bool contains = projects.Any(p =>
-                string.Equals(Path.GetFullPath(p), normalizedProjectPath, StringComparison.OrdinalIgnoreCase));
-
-            return contains ? Path.GetFullPath(sln) : null;
+            return string.IsNullOrEmpty(sln) ? null : SharedSolutionKey(sln, normalizedProjectPath);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WorkspaceService] Solution discovery failed for '{normalizedProjectPath}': {ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// The normalized path of <paramref name="solutionPath"/> when it lists the project and is
+    /// worth sharing a workspace for, or <c>null</c> when it is neither.
+    /// </summary>
+    /// <remarks>
+    /// A solution that does not exist parses to nothing and answers null here, so a stale bound
+    /// path falls through to the walk rather than keying every load under a file that is gone.
+    /// </remarks>
+    private static string? SharedSolutionKey(string solutionPath, string normalizedProjectPath)
+    {
+        var projects = PathHelper.GetProjectsFromSolution(solutionPath);
+        if (projects.Count <= 1)
+            return null;  // single-project solution gains nothing from sharing
+
+        bool contains = projects.Any(p =>
+            string.Equals(Path.GetFullPath(p), normalizedProjectPath, StringComparison.OrdinalIgnoreCase));
+
+        return contains ? Path.GetFullPath(solutionPath) : null;
     }
 
     /// <summary>

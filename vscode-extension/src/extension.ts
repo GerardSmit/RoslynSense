@@ -20,6 +20,7 @@ import { registerTestController, runTestById } from './testController';
 import { registerImpactedTests } from './impactedTests';
 import { registerCoverageMapProgress } from './coverageMapProgress';
 import { registerProjectSet } from './projectSet';
+import { registerSolutionReady } from './solutionReady';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerChangedMembers } from './changedMembers';
 import { registerSolutionExplorer } from './solutionExplorer';
@@ -212,6 +213,13 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
         // Nor this one: a value set is a fact about a string literal, so the C# selector already
         // covers every file it has anything to say about.
         id: 'valuesets',
+        extensions: [],
+        breakpoints: false,
+    },
+    {
+        // Nor this one: a schedule is a fact about a string literal too, and the Cron Jobs section
+        // of the Solution Explorer hangs off the solution rather than off any file.
+        id: 'cron',
         extensions: [],
         breakpoints: false,
     },
@@ -448,6 +456,19 @@ async function pickSolution(): Promise<string | undefined> {
 function serverSettings(registerCommands = true): Record<string, unknown> {
     const config = vscode.workspace.getConfiguration('roslynSense');
     const enabled = enabledLanguages();
+
+    /**
+     * A setting's value only when somebody actually set it, otherwise undefined.
+     *
+     * `get` cannot tell those apart — it answers with the contributed default, so a push would
+     * carry a value the user never chose. For a setting that also lives in roslynsense.json that
+     * is not harmless: the push would overwrite the file's value with the editor's default every
+     * time any setting in the section changed.
+     */
+    const chosen = <T>(key: string): T | undefined => {
+        const values = config.inspect<T>(key);
+        return values?.workspaceFolderValue ?? values?.workspaceValue ?? values?.globalValue;
+    };
     return {
         // Whether this connection may advertise the server's executeCommand ids. Exactly one
         // client per window may: vscode-languageclient turns every id the server advertises into
@@ -485,6 +506,9 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
             maxChildren: config.get('debugger.maxChildren'),
             symbolInclude: config.get('debugger.symbolInclude'),
             symbolExclude: config.get('debugger.symbolExclude'),
+            // Only when set in the editor: this one also lives in roslynsense.json, and sending
+            // the contributed default would reset a choice made there on every push.
+            coreClrEngine: chosen<string>('debugger.coreClrEngine'),
         },
         // Which language packs this connection wants. Per connection on the server too: the
         // daemon is shared, so another window — or an AI session on the same daemon — keeps
@@ -3318,6 +3342,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerTestController(context, () => client);
     registerCoverageMapProgress(context, () => client);
     registerProjectSet(context, () => client);
+    registerSolutionReady(context, () => client);
     registerImpactedTests(context, () => client);
     registerCoverageExplorer(context, () => client);
     registerChangedMembers(context, () => client);

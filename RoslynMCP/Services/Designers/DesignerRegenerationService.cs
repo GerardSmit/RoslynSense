@@ -19,6 +19,12 @@ public enum DesignerOutcome
     /// <summary>Generation failed; any existing designer file was left untouched.</summary>
     Failed,
 
+    /// <summary>
+    /// The designer would have been an empty partial class and no file exists yet, so none was
+    /// created.
+    /// </summary>
+    NotNeeded,
+
     /// <summary>No generator claimed the source file.</summary>
     Skipped,
 }
@@ -102,6 +108,16 @@ public sealed class DesignerRegenerationService(IEnumerable<IDesignerGenerator> 
             return new DesignerRegeneration(sourcePath, result.DesignerPath, DesignerOutcome.Failed, result.Errors);
 
         var content = MatchLineEndings(rawContent, result.DesignerPath);
+
+        // An empty partial class adds nothing: either the markup declares no server IDs, or the
+        // fields live in the shared designer of the group this file belongs to. Creating the file
+        // just to say so leaves an untracked artefact in the source tree, so only an existing
+        // designer — one Visual Studio or an earlier pass wrote — is kept up to date.
+        if (result.DeclaresNoMembers && !File.Exists(result.DesignerPath))
+        {
+            await RegenerateRelatedAsync(result, sourcePath, dryRun, cascade, cancellationToken);
+            return new DesignerRegeneration(sourcePath, result.DesignerPath, DesignerOutcome.NotNeeded, []);
+        }
 
         if (await MatchesExistingAsync(result.DesignerPath, content, cancellationToken))
         {

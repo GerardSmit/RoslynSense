@@ -117,6 +117,72 @@ public class WorkspaceDiagnosticsTests : IDisposable
         Assert.Contains(second.Items, item => item is WorkspaceUnchangedDocumentDiagnosticReport);
     }
 
+    /// <summary>
+    /// The client's spelling of a URI does not have to be this server's spelling for its result id
+    /// to count.
+    /// </summary>
+    /// <remarks>
+    /// One path has many legal <c>file:</c> spellings, and clients differ: VS Code percent-encodes
+    /// the drive colon, and the <c>skipEncoding</c> serialisation its converters use writes a space
+    /// in a file name raw where <see cref="Uri.AbsoluteUri"/> writes <c>%20</c>. Compared as raw
+    /// strings, the id such a client hands back belongs to no file the sweep knows — so the sweep
+    /// read it as "the client holds nothing for this file" and re-sent that file in full on every
+    /// pass, for the life of the session. It presented as a handful of files, all of them with a
+    /// space in the name, that the convergence warning named forever.
+    /// </remarks>
+    [Fact]
+    public async Task AClientsOwnUriSpellingStillMatchesItsResultId()
+    {
+        LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
+        await RoslynTestHelpers.OpenProjectAsync(FixturePaths.BrokenProjectFile);
+
+        string path = FixturePaths.BrokenSemanticFile;
+        OpenDocumentStore.Open(_session, path, SourceText.From(await File.ReadAllTextAsync(path)), 1);
+
+        var first = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(), default);
+
+        var previous = first.Items
+            .OfType<WorkspaceFullDocumentDiagnosticReport>()
+            .Where(r => r.ResultId is not null)
+            .Select(r => new PreviousResultId(AsAnotherClientWouldSpellIt(r.Uri), r.ResultId!))
+            .ToArray();
+        Assert.NotEmpty(previous);
+
+        var second = await WorkspaceDiagnosticsHandler.DiagnoseAsync(
+            new WorkspaceDiagnosticParams(previous), default);
+
+        Assert.Contains(second.Items, item => item is WorkspaceUnchangedDocumentDiagnosticReport);
+    }
+
+    /// <summary>The same file, spelled as VS Code's converters serialise it.</summary>
+    private static string AsAnotherClientWouldSpellIt(string uri) =>
+        System.Text.RegularExpressions.Regex.Replace(
+            uri.Replace("%20", " ", StringComparison.Ordinal),
+            "^file:///([A-Za-z]):",
+            m => $"file:///{char.ToLowerInvariant(m.Groups[1].Value[0])}%3A");
+
+    [Theory]
+    // The drive colon percent-encoded, and the drive letter's case, which is free either way.
+    [InlineData("file:///c%3A/src/Program.cs", @"C:\src\Program.cs")]
+    [InlineData("file:///C:/src/Program.cs", @"C:\src\Program.cs")]
+    // A space left raw rather than escaped — legal, and what a skipEncoding serialisation writes.
+    [InlineData("file:///c%3A/src/No Skin.ascx", @"C:\src\No Skin.ascx")]
+    [InlineData("file:///C:/src/No%20Skin.ascx", @"C:\src\No Skin.ascx")]
+    public void EveryClientSpellingOfOnePathNormalizesToThisServersSpelling(string spelling, string path) =>
+        // Case-insensitively, which is the comparison the sweep's own lookup uses: a Windows drive
+        // letter's case is free — it survives the round trip as whichever case came in — and two
+        // spellings of one path that differ only there already match where it matters.
+        Assert.Equal(LspConverters.PathToUri(path), LspConverters.NormalizeUri(spelling), ignoreCase: true);
+
+    /// <summary>A URI that names no file is left exactly as it came in.</summary>
+    [Fact]
+    public void NormalizingLeavesAVirtualUriAlone()
+    {
+        const string generated = "roslynsense-generated:/Project/Hint.g.cs";
+        Assert.Equal(generated, LspConverters.NormalizeUri(generated));
+    }
+
     [Fact]
     public async Task MarkupIsSweptWithoutAnyDocumentBeingOpen()
     {
@@ -1229,7 +1295,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
     {
         await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
 
-        var solution = WorkspaceService.TryGetMostRecentSolution();
+        var solution = WorkspaceService.TryGetSessionSolution();
         Assert.NotNull(solution);
 
         var project = solution.Projects.First(

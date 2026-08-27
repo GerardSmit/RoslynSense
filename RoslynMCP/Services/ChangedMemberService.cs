@@ -39,13 +39,16 @@ public sealed record ChangedMember(
 /// <param name="FirstChangedLine">The file's first changed line — where a click on the file
 /// itself should land when there are no members to click instead.</param>
 /// <param name="Staged">Whether the file's whole change is staged.</param>
+/// <param name="ChangedLineCount">How many lines the diff touched in the file. Zero for a
+/// whole-file change, where the count would only repeat "all of them".</param>
 public sealed record ChangedMemberFile(
     string FilePath,
     bool WholeFile,
     IReadOnlyList<ChangedMember> Members,
     bool IsTest,
     int FirstChangedLine = 1,
-    bool Staged = false);
+    bool Staged = false,
+    int ChangedLineCount = 0);
 
 /// <summary>What the diff touched, member by member, or why that could not be answered.</summary>
 /// <param name="DiffBaseRef">The revision the diff compared against, for a client that wants to
@@ -101,7 +104,8 @@ public static class ChangedMemberService
                 isCSharp ? ReadMembers(file, ct) : [],
                 IsInTestProject(file.FilePath),
                 file.WholeFile ? 1 : file.Ranges.Min(r => r.Start),
-                file.IsFullyStaged));
+                file.IsFullyStaged,
+                file.WholeFile ? 0 : file.Ranges.Sum(r => r.End - r.Start + 1)));
         }
 
         return new ChangedMemberSet(files, changes.Description, DiffBaseRef: changes.DiffTarget);

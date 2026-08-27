@@ -50,7 +50,20 @@ public sealed record LaunchTarget(
     [property: JsonPropertyName("launchProfile")] string? LaunchProfile = null,
     // Where to open a browser: the app URL with the profile's launchUrl applied.
     [property: JsonPropertyName("browseUrl")] string? BrowseUrl = null,
-    [property: JsonPropertyName("launchBrowser")] bool? LaunchBrowser = null);
+    [property: JsonPropertyName("launchBrowser")] bool? LaunchBrowser = null)
+{
+    /// <summary>
+    /// Whether this target is debugged by the adapter the server ships rather than by netcoredbg.
+    /// </summary>
+    /// <remarks>
+    /// Answered here rather than derived by the client from <see cref="IsNetFramework"/>: a
+    /// .NET Framework target always is, and a .NET one is whenever the engine setting says so, and
+    /// that setting lives on the server. A client working it out for itself would be reading a
+    /// different copy of it — or, for a value set in <c>roslynsense.json</c>, none at all.
+    /// </remarks>
+    [JsonPropertyName("serverDebugAdapter")]
+    public bool ServerDebugAdapter { get; init; }
+}
 
 /// <summary>A launchSettings.json profile, as much of it as a client needs to show and pick it.</summary>
 public sealed record LaunchProfileDescriptor(

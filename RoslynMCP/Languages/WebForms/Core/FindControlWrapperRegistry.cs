@@ -53,7 +53,7 @@ internal static class FindControlWrapperRegistry
         {
             try
             {
-                var project = WorkspaceService.TryGetMostRecentSolution()?.Projects
+                var project = WorkspaceService.TryGetSessionSolution()?.Projects
                     .FirstOrDefault(p =>
                         p.Language == LanguageNames.CSharp
                         && string.Equals(p.AssemblyName, assemblyName, StringComparison.Ordinal));

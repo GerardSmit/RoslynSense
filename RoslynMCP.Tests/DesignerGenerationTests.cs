@@ -721,6 +721,82 @@ public class DesignerGenerationTests
         Assert.Contains("    public partial class SamplePage {", text);
     }
 
+    /// <summary>
+    /// Markup with no server IDs produces an empty partial class, which is not worth a file that
+    /// does not exist yet.
+    /// </summary>
+    [Fact]
+    public async Task WhenMarkupHasNoControlsThenNoDesignerFileIsCreated()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <p>Nothing but static markup.</p>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        var result = await scenario.RegenerateThroughServiceAsync(dryRun: false);
+
+        Assert.Equal(DesignerOutcome.NotNeeded, result.Outcome);
+        Assert.False(File.Exists(scenario.DesignerPath), "an empty designer file was created.");
+    }
+
+    /// <summary>
+    /// An empty designer that already exists stays in step with the markup: it is Visual Studio's
+    /// own output, and deleting or ignoring it is not this tool's call.
+    /// </summary>
+    [Fact]
+    public async Task WhenEmptyDesignerAlreadyExistsThenItIsStillMaintained()
+    {
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <p>Nothing but static markup.</p>
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }");
+
+        await File.WriteAllTextAsync(scenario.DesignerPath, ReformattedDesigner("lblRemoved"));
+
+        var result = await scenario.RegenerateThroughServiceAsync(dryRun: false);
+
+        Assert.Equal(DesignerOutcome.Updated, result.Outcome);
+        Assert.DoesNotContain("lblRemoved", await File.ReadAllTextAsync(scenario.DesignerPath));
+    }
+
+    /// <summary>
+    /// A variant sharing another file's code-behind class has its fields in that file's designer,
+    /// so it gets no designer file of its own.
+    /// </summary>
+    [Fact]
+    public async Task WhenVariantSharesACodeBehindThenItGetsNoDesignerFileOfItsOwn()
+    {
+        const string variantMarkup = """
+                                     <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                                     <asp:Label ID="lblVariant" runat="server" />
+                                     """;
+
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.SamplePage" %>
+                    <asp:Label ID="lblHeading" runat="server" />
+                    """,
+            codeBehind: "namespace Fixture { public partial class SamplePage : System.Web.UI.Page { } }",
+            siblings: ("Variant.aspx", variantMarkup));
+
+        var variantPath = scenario.SiblingPaths[0];
+
+        var result = await scenario.RegenerateThroughServiceAsync(dryRun: false, sourcePath: variantPath);
+
+        Assert.Equal(DesignerOutcome.NotNeeded, result.Outcome);
+        Assert.False(File.Exists(variantPath + ".designer.cs"),
+            "an empty designer file was created for the variant.");
+
+        // The canonical file still carries both variants' controls.
+        var canonical = await File.ReadAllTextAsync(scenario.DesignerPath);
+        Assert.Contains("lblHeading", canonical);
+        Assert.Contains("lblVariant", canonical);
+    }
+
     private sealed class MarkupScenario : IAsyncDisposable
     {
         private static readonly string StubSource =
@@ -812,7 +888,8 @@ public class DesignerGenerationTests
         }
 
         /// <summary>Runs the full service, which resolves the project from disk rather than in memory.</summary>
-        public async Task<DesignerRegeneration> RegenerateThroughServiceAsync(bool dryRun)
+        public async Task<DesignerRegeneration> RegenerateThroughServiceAsync(
+            bool dryRun, string? sourcePath = null)
         {
             // A minimal SDK project file so the service's project lookup succeeds.
             await File.WriteAllTextAsync(
@@ -824,7 +901,7 @@ public class DesignerGenerationTests
                 """);
 
             var service = new DesignerRegenerationService([new AspxDesignerGenerator()]);
-            return await service.RegenerateAsync(MarkupPath, dryRun, default);
+            return await service.RegenerateAsync(sourcePath ?? MarkupPath, dryRun, default);
         }
 
         public ValueTask DisposeAsync()

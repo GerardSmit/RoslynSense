@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Rename;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.ExternalSource;
 
 namespace RoslynMCP.Lsp.Handlers;
 
@@ -20,6 +21,13 @@ internal static class RenameHandler
             return null;
 
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
+
+        // Nothing under the external cache can be renamed. The file is a decompilation or a
+        // download, written read-only, and the declaration in it is a copy of one that lives in an
+        // assembly — but Roslyn sees an ordinary source symbol there and would produce edits
+        // against a file the editor cannot write, for a name nothing else in the solution reads.
+        if (ExternalSourceCache.IsExternalSourcePath(path))
+            return null;
 
         // Before the symbol lookup, never after: a caret inside a string literal binds to nothing,
         // so by the time a contributor would be reached this method has already returned null. What
@@ -62,6 +70,10 @@ internal static class RenameHandler
             return null;
 
         string filePath = LspConverters.UriToPath(p.TextDocument.Uri);
+
+        // The same refusal prepareRename makes, for the clients that do not ask it first.
+        if (ExternalSourceCache.IsExternalSourcePath(filePath))
+            return null;
 
         // Ahead of the symbol lookup for the same reason prepareRename is.
         foreach (var provider in

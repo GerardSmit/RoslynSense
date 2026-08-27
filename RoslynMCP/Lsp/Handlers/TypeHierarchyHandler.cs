@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.ExternalSource;
 
 namespace RoslynMCP.Lsp.Handlers;
 
@@ -39,8 +40,12 @@ internal static class TypeHierarchyHandler
     public static async Task<HierarchyItem[]> SupertypesAsync(
         TypeHierarchyItemParams p, CancellationToken ct)
     {
-        var (symbol, _) = await HierarchyItemFactory.ResolveSymbolAsync(p.Item, ct);
-        return Supertypes(symbol, mapper: null);
+        var (symbol, document) = await HierarchyItemFactory.ResolveSymbolAsync(p.Item, ct);
+
+        // A base type read off a decompiled type is metadata, and an item needs a source location
+        // to be navigable — so a type whose base the solution declares itself showed nothing. Read
+        // off the solution's own symbol instead, where that base is source.
+        return Supertypes(await InSolutionAsync(symbol, document, ct), mapper: null);
     }
 
     public static HierarchyItem[] Supertypes(ISymbol? symbol, IHierarchySourceMapper? mapper)
@@ -67,7 +72,32 @@ internal static class TypeHierarchyHandler
         if (document is null)
             return Array.Empty<HierarchyItem>();
 
-        return await SubtypesAsync(symbol, document.Project.Solution, mapper: null, ct);
+        // What derives from a decompiled type is in the solution, and the project behind such a
+        // file holds nothing but that file — the same mapping find-references makes.
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            symbol, document, Services.WorkspaceService.TryGetSessionSolution(), ct);
+
+        return await SubtypesAsync(
+            mapped?.Symbol ?? symbol,
+            mapped?.Project.Solution ?? document.Project.Solution,
+            mapper: null,
+            ct);
+    }
+
+    /// <summary>
+    /// The symbol as the session's solution sees it when the document is decompiled or downloaded
+    /// source, and the symbol itself otherwise.
+    /// </summary>
+    private static async Task<ISymbol?> InSolutionAsync(
+        ISymbol? symbol, Document? document, CancellationToken ct)
+    {
+        if (symbol is null || document is null)
+            return symbol;
+
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            symbol, document, Services.WorkspaceService.TryGetSessionSolution(), ct);
+
+        return mapped?.Symbol ?? symbol;
     }
 
     public static async Task<HierarchyItem[]> SubtypesAsync(

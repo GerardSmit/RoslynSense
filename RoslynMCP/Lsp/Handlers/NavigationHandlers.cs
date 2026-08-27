@@ -33,6 +33,19 @@ internal static class NavigationHandlers
         if (symbol is null)
             return Array.Empty<LspLocation>();
 
+        // Decompiled source naming something the solution declares itself should land in that
+        // source rather than in a second decompilation of it. Only when the solution really has
+        // it in source: a symbol that is metadata there too maps to metadata, and the decompiling
+        // path below is still the answer.
+        if (await ExternalSymbolBridge.TryMapAsync(
+                typeDefinition ? TypeOf(symbol) : symbol, document,
+                Services.WorkspaceService.TryGetSessionSolution(), ct) is { } declared
+            && declared.Symbol.OriginalDefinition.Locations.Any(l => l.IsInSource))
+        {
+            return await HandlerHelpers.ToLocationsAsync(
+                declared.Symbol.OriginalDefinition.Locations, declared.Project, ct);
+        }
+
         // A dispatcher is not a destination. The caret on a mediator's Send binds to the one
         // interface member every send in the solution binds to, so Roslyn's answer is the same
         // wherever it is asked from and is never what was wanted; which handler runs is decided by
@@ -424,7 +437,13 @@ internal static class NavigationHandlers
                 redirected, document.Project, redirectedLocations, languages, ct);
         }
 
-        return await ImplementationLocationsAsync(symbol, document.Project, languages, ct);
+        // Ctrl+F12 in decompiled source is asking what the solution implements, and the project
+        // behind such a file holds nothing but that file — the same mapping Shift+F12 makes.
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            symbol, document, Services.WorkspaceService.TryGetSessionSolution(), ct);
+
+        return await ImplementationLocationsAsync(
+            mapped?.Symbol ?? symbol, mapped?.Project ?? document.Project, languages, ct);
     }
 
     /// <summary>

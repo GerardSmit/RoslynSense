@@ -57,11 +57,26 @@ internal static class InheritanceMarkersHandler
         var markers = new List<InheritanceMarker>();
         int downQueries = 0;
 
+        // Decompiled source relates to the solution's types, not to the one file it was opened
+        // in — so every marker here is read off the solution's own symbol where it has one. Warm
+        // projects only: markers recompute on every typing pause, and the file this runs over is
+        // one nobody is typing in.
+        var anchor = EnumerateDeclarations(root)
+            .Select(d => model.GetDeclaredSymbol(d.Declaration, ct))
+            .FirstOrDefault(declared => declared is not null);
+
+        var bridge = await ExternalSymbolBridge.TryOpenAsync(
+            document, anchor, WorkspaceService.TryGetSessionSolution(), ct,
+            warmProjectsOnly: true);
+
         foreach (var (declaration, identifier) in EnumerateDeclarations(root))
         {
             ct.ThrowIfCancellationRequested();
-            if (model.GetDeclaredSymbol(declaration, ct) is not { } symbol)
+            if (model.GetDeclaredSymbol(declaration, ct) is not { } declared)
                 continue;
+
+            var symbol = bridge?.Map(declared) ?? declared;
+            var searchScope = bridge?.Solution ?? solution;
 
             var position = text.Lines.GetLinePosition(identifier.Start);
 
@@ -76,7 +91,7 @@ internal static class InheritanceMarkersHandler
 
             if (ApplicableDownKind(symbol) is { } downKind && downQueries++ < MaxDownQueries)
             {
-                var targets = (await ComputeDownTargetsAsync(symbol, downKind, solution, ct))
+                var targets = (await ComputeDownTargetsAsync(symbol, downKind, searchScope, ct))
                     .Select(t => ToTarget(t.Symbol, t.Title))
                     .Where(t => t.Uri is not null) // derived/implementing types are source symbols
                     .Take(MaxTargets)
@@ -98,14 +113,23 @@ internal static class InheritanceMarkersHandler
         if (resolved is not var (document, _, offset))
             return null;
 
-        var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
-        if (symbol is null)
+        var found = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
+        if (found is null)
             return null;
+
+        // Mapped exactly as the markers were, warm-only included: this re-resolves the target list
+        // to take one entry out of it by index, so a list computed differently would open the
+        // wrong thing.
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            found, document, WorkspaceService.TryGetSessionSolution(), ct, warmProjectsOnly: true);
+
+        var symbol = mapped?.Symbol ?? found;
 
         var targets = ComputeUpTargets(symbol, p.Kind);
         if (targets.Count == 0)
         {
-            targets = await ComputeDownTargetsAsync(symbol, p.Kind, document.Project.Solution, ct);
+            targets = await ComputeDownTargetsAsync(
+                symbol, p.Kind, mapped?.Project.Solution ?? document.Project.Solution, ct);
         }
         if (p.Index < 0 || p.Index >= targets.Count)
             return null;

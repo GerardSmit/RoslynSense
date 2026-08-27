@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.ExternalSource;
 using LspCodeLens = RoslynMCP.Lsp.Protocol.CodeLens;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
 
@@ -237,8 +238,17 @@ internal static class CodeLensHandler
         // above the peek that lists twelve is worse than no gutter. Counted rather than
         // enumerated: the peek below shows MaxReferenceLocations at most, so a symbol referenced
         // ten thousand times must not be searched to the end on every scroll.
+        // Decompiled source counts against the solution, like the peek the click opens — a lens
+        // reading "0 references" above every member of a type the solution uses everywhere is
+        // worse than no lens. Warm projects only: this resolves as the view scrolls, and compiling
+        // the solution to put a number in the gutter is not a trade anybody asked for.
+        var counted = await ExternalSymbolBridge.TryMapAsync(
+            symbol, document, Services.WorkspaceService.TryGetSessionSolution(), ct,
+            warmProjectsOnly: true);
+
         var (locations, capped) = await NavigationHandlers.CountedReferencesAsync(
-            symbol, document.Project, MaxReferenceLocations, ct, languages);
+            counted?.Symbol ?? symbol, counted?.Project ?? document.Project,
+            MaxReferenceLocations, ct, languages);
 
         string title = capped
             ? $"{MaxReferenceLocations}+ references"
@@ -265,8 +275,17 @@ internal static class CodeLensHandler
         if (symbol is null)
             return lens with { Command = inert };
 
+        // Mapped the way the gutter markers are, and warm-only for the same reason, so the two
+        // renderings of one relationship cannot disagree about how many there are.
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            symbol, document, Services.WorkspaceService.TryGetSessionSolution(), ct,
+            warmProjectsOnly: true);
+
         var targets = await InheritanceMarkersHandler.ComputeDownTargetsAsync(
-            symbol, data.Kind, document.Project.Solution, ct);
+            mapped?.Symbol ?? symbol,
+            data.Kind,
+            mapped?.Project.Solution ?? document.Project.Solution,
+            ct);
         string noun = data.Kind switch
         {
             "implemented" => targets.Count == 1 ? "implementation" : "implementations",

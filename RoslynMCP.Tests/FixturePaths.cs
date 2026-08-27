@@ -159,6 +159,20 @@ internal static class FixturePaths
     public static string UnloadedSolutionFile =>
         Path.Combine(SharedProjectSolutionsDir, "Unloaded", "Unloaded.sln");
 
+    /// <summary>
+    /// A solution of one project, for the gestures started inside a decompilation of the assembly
+    /// it builds: an interface with one implementation, and one call into a framework member. Its
+    /// own solution rather than a loose project so a test can bind it — what
+    /// <see cref="RoslynMCP.Services.WorkspaceService.TryGetSessionSolution"/> answers for an
+    /// unbound process is whichever project was touched last, which in a parallel run is whatever
+    /// another collection happened to open.
+    /// </summary>
+    public static string DecompiledConsumerDir => Path.Combine(s_fixturesRoot, "DecompiledConsumer");
+    public static string DecompiledConsumerSolutionFile =>
+        Path.Combine(DecompiledConsumerDir, "DecompiledConsumer.sln");
+    public static string DecompiledConsumerProjectFile =>
+        Path.Combine(DecompiledConsumerDir, "Consumer", "Consumer.csproj");
+
     public static string MultiSolutionDir => Path.Combine(s_fixturesRoot, "MultiSolution");
     public static string MultiSolutionFile => Path.Combine(MultiSolutionDir, "MultiSolution.sln");
     public static string MultiProjectAFile => Path.Combine(MultiSolutionDir, "ProjectA", "ProjectA.csproj");

@@ -133,9 +133,12 @@ public class ExternalSourceReferenceTests
     [Fact]
     public async Task ReferencesFromDecompiledSourceReachTheSolutionsCallSites()
     {
-        // The session solution the handler asks for is the most recently used one, so the project
-        // holding the call site is opened last.
-        await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
+        // Bound rather than merely loaded: what a session answers when nothing is bound is
+        // whichever project was touched last, which in a parallel run is whatever another
+        // collection happened to open a moment earlier.
+        using var bound = WorkspaceService.BindSolutionForTesting(
+            FixturePaths.DecompiledConsumerSolutionFile);
+        await RoslynTestHelpers.OpenProjectAsync(FixturePaths.DecompiledConsumerProjectFile);
 
         string file = WriteFetchedFile(DecompiledStringBuilder, "System.Text.StringBuilder");
         var position = PositionOf(file, DecompiledStringBuilder, "Append(string value)");
@@ -145,11 +148,10 @@ public class ExternalSourceReferenceTests
                 position.TextDocument, position.Position, new ReferenceContext(IncludeDeclaration: false)),
             default);
 
-        // FrameworkReferences.BuildMessage appends to a StringBuilder; nothing else in the fixture
-        // does.
+        // PlainReportFormatter.Build appends to a StringBuilder; nothing else in the fixture does.
         Assert.Contains(locations, l =>
             LspConverters.UriToPath(l.Uri)
-                .EndsWith("FrameworkReferences.cs", StringComparison.OrdinalIgnoreCase));
+                .EndsWith("Reporting.cs", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>A solution that calls the member, standing in for the user's own.</summary>

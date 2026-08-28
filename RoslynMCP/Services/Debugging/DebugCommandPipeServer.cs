@@ -208,7 +208,7 @@ internal sealed class DebugCommandPipeServer : IDisposable
 
     private async Task<string> StopSessionAsync()
     {
-        var timeout = Tools.DebugControlTool.DebugStopTimeout;
+        var timeout = DebugSessionManager.ShutdownTimeout;
         var managed = DebugSessionManager.GetSession();
         if (managed is null)
         {

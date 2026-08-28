@@ -2,18 +2,20 @@ using System.ComponentModel;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using ModelContextProtocol.Server;
-using RoslynMCP.Services;
 using RoslynMCP.Languages;
 
-namespace RoslynMCP.Tools;
+namespace RoslynMCP.Services;
 
 /// <summary>
 /// Produces a compact, token-efficient outline of a C# file's structure
 /// (namespaces, types, members) with line numbers for navigation.
 /// </summary>
-[McpServerToolType]
-public static class GetFileOutlineTool
+/// <remarks>
+/// Reached as an attachable resource rather than as a tool — see <c>FileOutlineResource</c> — and
+/// by the Razor outline, which formats its members through the same methods so one file does not
+/// read differently depending on which surface asked for its outline.
+/// </remarks>
+public static class FileOutlineFormatter
 {
     private const string Indent = "  ";
 
@@ -21,14 +23,9 @@ public static class GetFileOutlineTool
     /// Returns a compact tree-style outline of a C# file showing namespaces, types,
     /// and member signatures with line numbers.
     /// </summary>
-    [McpServerTool, Description(
-        "Get a compact outline of a C# or ASPX file showing namespaces, types, and member " +
-        "signatures with line numbers. For ASPX files, shows directives, controls, expressions, " +
-        "and code blocks. For Razor files, shows directives, @code block members, and component structure. " +
-        "Useful for understanding file structure without reading the full source. " +
-        "Supports multiple files separated by semicolons.")]
+    /// <param name="filePath">One path, or several separated by semicolons.</param>
     public static async Task<string> GetFileOutline(
-        [Description("Path to the C# or ASPX file. Separate multiple paths with semicolons.")] string filePath,
+        string filePath,
         IOutputFormatter fmt,
         IEnumerable<IOutlineHandler>? handlers = null,
         CancellationToken cancellationToken = default)

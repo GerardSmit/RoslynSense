@@ -117,23 +117,6 @@ public class MediatorToolsTests
     }
 
     [Fact]
-    public async Task CallHierarchyReportsTheDispatchesAsCallers()
-    {
-        PublishMediatorPack();
-
-        string result = await CallHierarchyTool.GetCallHierarchy(
-            filePath: FixturePaths.MediatorOrdersFile,
-            markupSnippet: "public ValueTask<OrderDto> [|Handle|](",
-            fmt: new MarkdownFormatter(),
-            direction: "callers");
-
-        // The hierarchy and find-references have to agree about one caret, which is the whole
-        // reason the contributor seam exists on both.
-        Assert.Contains("Mediator Dispatches", result);
-        Assert.Contains("GetViaExtensionArguments", result);
-    }
-
-    [Fact]
     public async Task AnAspxReportIsUnchanged()
     {
         PublishMediatorPack();

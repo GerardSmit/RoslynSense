@@ -7,7 +7,7 @@ namespace RoslynMCP.Resources;
 
 /// <summary>
 /// Exposes a C# file's structural outline as an MCP resource template.
-/// Delegates to <see cref="GetFileOutlineTool"/> for the actual outline generation,
+/// Delegates to <see cref="FileOutlineFormatter"/> for the actual outline generation,
 /// making the same data available as attachable context rather than a tool call.
 /// </summary>
 [McpServerResourceType]
@@ -28,6 +28,6 @@ public static class FileOutlineResource
         IOutputFormatter fmt,
         CancellationToken cancellationToken = default)
     {
-        return await GetFileOutlineTool.GetFileOutline(filePath, fmt, handlers: null, cancellationToken: cancellationToken);
+        return await FileOutlineFormatter.GetFileOutline(filePath, fmt, handlers: null, cancellationToken: cancellationToken);
     }
 }

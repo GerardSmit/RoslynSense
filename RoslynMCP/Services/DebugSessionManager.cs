@@ -16,6 +16,12 @@ namespace RoslynMCP.Services;
 /// </remarks>
 internal static class DebugSessionManager
 {
+    /// <summary>How long a debuggee gets to shut itself down before it is killed. Read by both
+    /// paths that end a session — the editor's stop button over
+    /// <see cref="DebugCommandPipeServer"/>, and a session torn down here — so a debuggee gets
+    /// the same budget however the stop was asked for.</summary>
+    internal static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(10);
+
     private static IDebugBackend? s_session;
     private static DebugCommandPipeServer? s_pipeServer;
     private static readonly Lock s_lock = new();

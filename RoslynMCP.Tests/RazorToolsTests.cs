@@ -76,7 +76,7 @@ public class RazorToolsTests
     [RequiresRazorSourceGeneratorFact]
     public async Task FileOutline_CounterRazor_ShowsCodeBlockMembers()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(
+        var result = await FileOutlineFormatter.GetFileOutline(
             filePath: FixturePaths.CounterRazorFile,
             fmt: new MarkdownFormatter(),
             handlers: TestHandlers.Outline);
@@ -91,7 +91,7 @@ public class RazorToolsTests
     [RequiresRazorSourceGeneratorFact]
     public async Task FileOutline_WeatherRazor_ShowsDirectivesAndCodeBlock()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(
+        var result = await FileOutlineFormatter.GetFileOutline(
             filePath: FixturePaths.WeatherRazorFile,
             fmt: new MarkdownFormatter(),
             handlers: TestHandlers.Outline);
@@ -108,7 +108,7 @@ public class RazorToolsTests
     [Fact]
     public async Task FileOutline_CounterRazor_ShowsInlineExpressions()
     {
-        var result = await GetFileOutlineTool.GetFileOutline(
+        var result = await FileOutlineFormatter.GetFileOutline(
             filePath: FixturePaths.CounterRazorFile,
             fmt: new MarkdownFormatter(),
             handlers: TestHandlers.Outline);

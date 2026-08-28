@@ -213,8 +213,8 @@ internal class RazorOutline : IOutlineHandler
         {
             string? outline = child switch
             {
-                MethodDeclarationSyntax m => GetFileOutlineTool.FormatMethod(m),
-                PropertyDeclarationSyntax p => GetFileOutlineTool.FormatProperty(p),
+                MethodDeclarationSyntax m => FileOutlineFormatter.FormatMethod(m),
+                PropertyDeclarationSyntax p => FileOutlineFormatter.FormatProperty(p),
                 FieldDeclarationSyntax f => FormatFieldSimple(f),
                 EventFieldDeclarationSyntax e => FormatEventFieldSimple(e),
                 _ => null
@@ -238,7 +238,7 @@ internal class RazorOutline : IOutlineHandler
 
     private static string FormatFieldSimple(FieldDeclarationSyntax field)
     {
-        string modifiers = GetFileOutlineTool.FormatModifiers(field.Modifiers);
+        string modifiers = FileOutlineFormatter.FormatModifiers(field.Modifiers);
         string type = field.Declaration.Type.ToString();
         var names = string.Join(", ", field.Declaration.Variables.Select(v => v.Identifier.Text));
         return $"{modifiers}{type} {names}";
@@ -246,7 +246,7 @@ internal class RazorOutline : IOutlineHandler
 
     private static string FormatEventFieldSimple(EventFieldDeclarationSyntax eventField)
     {
-        string modifiers = GetFileOutlineTool.FormatModifiers(eventField.Modifiers);
+        string modifiers = FileOutlineFormatter.FormatModifiers(eventField.Modifiers);
         string type = eventField.Declaration.Type.ToString();
         var names = string.Join(", ", eventField.Declaration.Variables.Select(v => v.Identifier.Text));
         return $"{modifiers}event {type} {names}";

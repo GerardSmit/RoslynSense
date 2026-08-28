@@ -15,6 +15,7 @@ This skill covers everyday work: conventions, navigation, editing, building, pac
 
 - **csharp-testing** — writing and fixing tests, test conventions, reading failures.
 - **csharp-profiling** — CPU hotspots; any "why is this slow" or "where does the time go" question.
+- **csharp-database** — reading or changing data behind the app, inspecting a schema, or finding out why a query is slow.
 
 # General C# Development
 
@@ -115,7 +116,7 @@ Only run `dotnet tool update --global RoslynSense` when asked, or when told a ne
 
 ## Markup Snippet Convention
 
-Many RoslynSense tools use a `markupSnippet` parameter with `[| |]` delimiters to identify a target symbol. Copy a small code snippet from the file and wrap the target symbol:
+**FindUsages** and **GoToDefinitionSnippet** take a `markupSnippet` parameter with `[| |]` delimiters to identify a target symbol. Copy a small code snippet from the file and wrap the target symbol:
 
 ```
 var x = [|Foo|].Bar();          // targets Foo
@@ -156,7 +157,8 @@ Only after understanding the structure should you drill into specific code.
 
 Use these tools to trace code flows and understand relationships:
 
-- **GoToDefinition** — jump to a symbol's definition. Auto-decompiles referenced assembly symbols when source is unavailable.
+- **GoToDefinition** — jump to a symbol's definition, by *fully-qualified name* (`Namespace.Type.Member`). Auto-decompiles referenced assembly symbols when source is unavailable.
+- **GoToDefinitionSnippet** — the same jump when you have the call site in front of you rather than the symbol's full name: pass a `markupSnippet` instead. Reach for this one while reading code; reach for GoToDefinition when a stack trace or a compiler error handed you the qualified name.
 - **FindUsages** — find all references to a symbol across the project. Also searches Razor-generated files and ASPX inline code.
 - **SemanticSymbolSearch** — ranked symbol search combining name and camelCase matching (e.g., `AC` matches `AddCalculation`) with signature terms, XML docs, and source cues. Use for phrase-style queries when you're unsure of the exact symbol name.
 - **GetSourceGeneratedFileContent** — see what a source generator (Razor, System.Text.Json, regex, ...) actually emitted, by the hint name a stack trace or compiler error gives it.
@@ -172,7 +174,7 @@ Use these tools to trace code flows and understand relationships:
 ### After editing
 
 1. **RegenerateDesigner** — if you edited `.aspx`/`.ascx`/`.master` markup or a `.dbml`, regenerate before checking diagnostics. Unnecessary when **OpenSolution** is watching.
-2. **GetRoslynDiagnostics** — check for errors/warnings in the edited file(s). Pass multiple files separated by semicolons. Use `severityFilter: "error"` for a quick check; omit `filePath` to ask what is broken across every project at once.
+2. **GetRoslynDiagnostics** — check for errors/warnings in the edited file(s). Pass multiple files separated by semicolons. Use `severityFilter: "error"` for a quick check. Pass a `.csproj` path instead of a source file to ask what is broken across a whole project.
 3. **BuildProject** — build the project or solution to catch cross-file issues.
 
 ### Refactoring
@@ -202,7 +204,7 @@ Use this to observe real behaviour rather than inferring it from source.
 
 ## Workflow: Background Tasks
 
-For long-running operations (tests, builds, coverage), set `background: true` to stay productive:
+For long-running operations, set `background: true` to stay productive:
 
 - **RunTests** / **BuildProject** with `background: true` — run in the background and return a task ID immediately.
 - **GetBackgroundTaskResult** — check status (running/completed/failed) and get results for a specific task ID.
@@ -224,4 +226,5 @@ For long-running operations (tests, builds, coverage), set `background: true` to
 | Add or update a NuGet package | `dotnet add package`, then **BuildProject** | Hand-editing the `.csproj` and not reloading |
 | Write, run, or fix tests | **csharp-testing** skill | — |
 | Find CPU hotspots | **csharp-profiling** skill | Guessing without data |
+| Query a database, or explain a slow query | **csharp-database** skill | Guessing the schema from the C# model |
 | Run tests/builds while doing other work | `background: true` + **GetBackgroundTaskResult** | — |

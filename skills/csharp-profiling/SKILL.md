@@ -19,8 +19,10 @@ investigation tools work identically.
 - **ProfileStart** / **ProfileStop** — recording mode: ProfileStart attaches and returns immediately, you exercise the app yourself (curl the endpoints, run the scenario, click through pages), then ProfileStop collects and returns the hot methods. Works on both runtimes. A recording stops collecting by itself after `maxDurationSeconds` (default 600) but its data stays available for ProfileStop.
 
 For web apps, pass `hitUrls` (semicolon-separated) so the pages under investigation are actually
-requested during the profiling window — profiling an idle server measures nothing. ProfileApp
-defaults to hammering the app's root URL for web projects.
+requested during the profiling window — profiling an idle server measures nothing. For a
+**.NET Framework** web project ProfileApp falls back to hammering the app's root URL when you
+pass none; on ASP.NET Core nothing is requested for you, so a run without `hitUrls` profiles an
+idle server and reports almost nothing.
 
 By default the hot-methods table shows **only the solution's own code** — framework and
 third-party methods (System.*, SQL client internals, CMS plumbing) are hidden and counted in a

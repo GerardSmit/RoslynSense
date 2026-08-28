@@ -1,6 +1,6 @@
 ---
 name: csharp-testing
-description: C#/.NET testing conventions plus the RoslynSense tools for discovering, running, and analyzing tests — test structure and naming, mocking, code coverage, and running only the tests your changes affect. Use when writing or fixing tests, investigating test failures, or measuring coverage in a C# project.
+description: C#/.NET testing conventions plus the RoslynSense tools for running tests and reading their failures — test structure and naming, mocking, filtering a run down to one test, and resolving a failure to the assertion that produced it. Use when writing or fixing tests, or investigating test failures, in a C# project.
 ---
 # C# Testing with RoslynSense
 
@@ -57,8 +57,7 @@ description: C#/.NET testing conventions plus the RoslynSense tools for discover
   - No filter runs all tests in the project.
   - Set `background: true` to run tests in the background and continue working. Check results later with **GetBackgroundTaskResult**.
 - **GetTestFailures** — the failures from the last run, each resolved to the file and line of the failing assertion. Use it after RunTests instead of re-reading run output or re-running with verbose logging.
-- Work on one failing test at a time until it passes, then run the full suite.
-- If a test is failing and the cause isn't clear from the error message, narrow it with a `filter` down to the one test and read **GetTestFailures**, which resolves each failure to the assertion's own file and line.
+- Work on one failing test at a time: narrow the run with a `filter` down to that one test, then read **GetTestFailures**. Once it passes, run the full suite again.
 
 ## Tool selection
 

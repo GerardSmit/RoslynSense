@@ -759,6 +759,7 @@ loads them automatically when the work matches; you can also invoke one explicit
 | **`csharp`** | The core: C#/.NET conventions plus navigation, editing, diagnostics, building, and running apps — which tool to reach for instead of grep or a shell build, and when to regenerate designer files rather than editing them. Points at the skills below. |
 | **`csharp-testing`** | Test conventions, running tests, and reading failures back to the assertion that produced them. |
 | **`csharp-profiling`** | CPU sampling: hot paths and callers/callees. |
+| **`csharp-database`** | The `db_*` tools: listing the connections a solution already declares, reading a schema, parameterised queries, and reading an execution plan back to why a query is slow. |
 
 Skills are a Claude Code feature. On other MCP clients, point your agent at those files directly —
 they are plain Markdown with no Claude-Code-specific syntax in the body.

@@ -78,6 +78,10 @@ A plan is evidence about one execution against one data distribution. An index i
 seeded development database may be pointless in production, so report what the plan showed
 alongside what you concluded from it.
 
+For acting on what the plan shows — sargability rewrites, index derivation, parameter sniffing,
+deadlocks, workload-level analysis — the `csharp-database-tuning` skill carries the tuning
+knowledge, with engine-specific references for SQL Server and PostgreSQL.
+
 ## Tool selection
 
 | Task | Preferred Tool | Avoid |

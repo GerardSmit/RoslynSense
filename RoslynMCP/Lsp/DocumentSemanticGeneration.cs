@@ -3,8 +3,9 @@ using Microsoft.CodeAnalysis;
 namespace RoslynMCP.Lsp;
 
 /// <summary>
-/// What a semantic answer about one C# document depends on: the document's own text, and the
-/// semantics of its project and everything that project references.
+/// What a solution-wide answer about one C# document depends on: the document's own text, and the
+/// text of every project that could mention its symbols — the ones its project references, and the
+/// ones that reference it.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -17,10 +18,14 @@ namespace RoslynMCP.Lsp;
 /// and paid in full as a gutter arrow.
 /// </para>
 /// <para>
-/// The staleness this admits is the one <see cref="Handlers.CodeLensHandler"/> already documents
-/// and accepts: an edit in a project that depends on this one can leave a count stale until this
-/// key next moves. Every IDE's lens makes that trade, because the alternative is re-running a
-/// workspace search on every keystroke in every open file.
+/// Two deliberately wide choices, both because the queries this keys are reference-shaped. The
+/// dependents are in: a new call site for this file's method is typed into a project that
+/// <em>depends on</em> this one, so a key that only looked at what this project references served
+/// "0 references" forever while the caller's editor showed the call. And the versions are text
+/// versions rather than Roslyn's semantic ones, because a call site is a method-body edit and the
+/// semantic stamps track top-level declarations only — keyed semantically, the very edit that
+/// changes the count is the one that would not move the key. What this costs is recomputation on
+/// body edits that changed no count; what it cannot do is hold a stale one.
 /// </para>
 /// </remarks>
 internal static class DocumentSemanticGeneration
@@ -28,10 +33,24 @@ internal static class DocumentSemanticGeneration
     private sealed record Generation(VersionStamp Text, VersionStamp Semantics);
 
     /// <summary>The generation for a resolved document.</summary>
-    public static async Task<object> ForAsync(Document document, CancellationToken ct) =>
-        new Generation(
-            await document.GetTextVersionAsync(ct),
-            await document.Project.GetDependentSemanticVersionAsync(ct));
+    public static async Task<object> ForAsync(Document document, CancellationToken ct)
+    {
+        var project = document.Project;
+        var solution = project.Solution;
+
+        // Text of this project and everything it references, then everything that references it.
+        // Dependents' dependent-versions reach their own references too, which double-counts this
+        // project — a superset of the right inputs, never a subset.
+        var version = await project.GetDependentVersionAsync(ct);
+        foreach (var id in solution.GetProjectDependencyGraph()
+                     .GetProjectsThatTransitivelyDependOnThisProject(project.Id))
+        {
+            if (solution.GetProject(id) is { } dependent)
+                version = version.GetNewerVersion(await dependent.GetDependentVersionAsync(ct));
+        }
+
+        return new Generation(await document.GetTextVersionAsync(ct), version);
+    }
 
     /// <summary>
     /// The generation for a document URI, or <see langword="null"/> when the URI does not resolve

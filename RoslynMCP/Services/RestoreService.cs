@@ -41,8 +41,7 @@ namespace RoslynMCP.Services;
 internal static class RestoreService
 {
     /// <summary>Restore target (solution or project path) → the run currently in flight for it.</summary>
-    private static readonly ConcurrentDictionary<string, Task> s_inflight =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SingleFlight s_inflight = new();
 
     /// <summary>
     /// Whether restore evaluates the project graph once up front rather than walking it with the
@@ -92,7 +91,7 @@ internal static class RestoreService
             return;
 
         string target = RestoreTargetFor(projectPath, need);
-        var run = s_inflight.GetOrAdd(target, key => RunAsync(key, need));
+        var run = s_inflight.Start(target, key => RunAsync(key, need));
 
         try
         {
@@ -107,14 +106,6 @@ internal static class RestoreService
             // A failed restore is reported by RunAsync and then let go: the project loads with
             // whatever MSBuild can resolve, which is a degraded project rather than a failed
             // request, and is a far better outcome than refusing to open it at all.
-        }
-        finally
-        {
-            // Removed so the next caller retries rather than joining a completed run — a restore
-            // that failed on a transient network blip should not poison the solution for the life
-            // of the process. Removal is keyed on the task identity, so a concurrent caller that
-            // has already started a *newer* run does not have it dropped out from under it.
-            s_inflight.TryRemove(new KeyValuePair<string, Task>(target, run));
         }
     }
 

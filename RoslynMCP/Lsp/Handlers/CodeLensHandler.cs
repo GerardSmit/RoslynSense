@@ -195,10 +195,11 @@ internal static class CodeLensHandler
             return lens;
 
         // Both kinds run a workspace-wide search, and the client re-resolves every visible lens on
-        // every edit and every scroll. The answer is a function of this file's text and the
-        // semantics it can see, so it is memoized against exactly that — the same key
-        // AnalyzerDiagnosticCache versions by. An edit in a project that depends on this one can
-        // leave a count stale until this key next moves, which is the trade every IDE's lens makes.
+        // every edit and every scroll. The answer is a function of this file's text and of every
+        // project that could mention its symbols — dependents included, because a new call site is
+        // typed into the caller's project — so it is memoized against exactly that. Scroll after
+        // scroll is served from the memo; the edit that could change the count is the one that
+        // drops it.
         if (await DocumentSemanticGeneration.ForAsync(data.Uri, ct) is { } generation)
         {
             return await CodeLensResolveMemo.ResolveAsync(data, generation, lens,

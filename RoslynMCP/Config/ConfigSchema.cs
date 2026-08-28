@@ -63,7 +63,7 @@ public static class ConfigSchema
             ["tools.formatting"] = ("Format strings", "The `{0:dd-MM-yyyy}` of a composite format string and the `yyyyMMdd` of an interpolation, coloured a component at a time and hovered with a worked example."),
             ["tools.valueSets"] = ("Allowed string values", "For a string that has to be one of a short list — an order status of `\"SHIPPED\"`, a document type, a country code. Completes the literal from the list, says on hover what the code means, and reports one the list does not have."),
             ["tools.cron"] = ("Scheduled jobs", "The `\"0 22 * * 1-6\"` handed to Hangfire or Quartz, coloured a field at a time and hovered with what it means and when it next runs. Also lists every scheduled job in the solution."),
-            ["tools.debugger"] = ("Debugger", "Launch, breakpoints, stepping and evaluation."),
+            ["tools.debugger"] = ("Debugger", "The debugger the editor drives: launch, breakpoints, stepping and evaluation."),
             ["tools.profiling"] = ("Profiling", "CPU sampling, memory snapshots and coverage."),
             ["tools.database"] = ("Database", "Querying and describing the databases the solution connects to."),
 

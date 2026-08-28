@@ -57,7 +57,19 @@ class Program
         // A debug adapter for .NET Framework targets, backed by ICorDebug. netcoredbg speaks DAP
         // natively but only debugs CoreCLR, so this is what gives the editor F5 on Framework.
         if (args.Length > 0 && args[0].Equals("--dap", StringComparison.OrdinalIgnoreCase))
+        {
+            // The editor spawns this process itself, so the toggle has to be read here rather
+            // than inherited: --no-debugger on the server command line never reaches these args,
+            // and refusing at launch is what makes tools.debugger:false mean anything at all.
+            if (!DebuggerEnabled(args))
+            {
+                Console.Error.WriteLine(
+                    "[roslyn-sense] The debugger is disabled (tools.debugger / --no-debugger). "
+                    + "Re-enable it in roslynsense.json to debug from the editor.");
+                return 1;
+            }
             return await RoslynMCP.Services.Debugging.DapServer.RunAsync(args[1..]);
+        }
 
         // Shared-host daemon mode: roslyn-sense --host <solution>
         // Long-lived process that owns the Roslyn workspaces for one solution and serves tool
@@ -257,6 +269,16 @@ class Program
             await host.RunAsync();
         }
         return 0;
+    }
+
+    /// <summary>The debugger toggle, resolved from the config file and the command line, for the
+    /// entry points that run before the main settings pass. Warnings are dropped: a bad config is
+    /// reported by whichever mode owns the console, and a debug adapter has no console the editor
+    /// would show them in.</summary>
+    private static bool DebuggerEnabled(string[] args)
+    {
+        var layers = RoslynSenseConfigLoader.LoadLayers(Directory.GetCurrentDirectory());
+        return RoslynMCP.Config.EffectiveSettings.Resolve(args, layers.Config, out _).Debugger;
     }
 
     /// <summary>Mirrors the feature-flag filtering applied to tool TYPES, at the method level,

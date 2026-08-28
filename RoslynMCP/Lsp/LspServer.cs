@@ -1259,20 +1259,40 @@ internal sealed class LspServer : IDisposable
 
     // ---- Debug bridge ----------------------------------------------------------------
 
+    /// <summary>
+    /// Whether the debugger is enabled for this session. A server built without services —
+    /// every test that constructs one directly — debugs, which is the default the settings
+    /// themselves carry.
+    /// </summary>
+    private bool DebuggerEnabled =>
+        (_services.GetService(typeof(RoslynMCP.Config.EffectiveSettings))
+            as RoslynMCP.Config.EffectiveSettings)?.Debugger ?? true;
+
     [JsonRpcMethod("roslynSense/debugSessions")]
-    public DebugSessionInfo[] DebugSessions() => Handlers.DebugBridgeHandler.Sessions();
+    public DebugSessionInfo[] DebugSessions() =>
+        DebuggerEnabled ? Handlers.DebugBridgeHandler.Sessions() : [];
 
     [JsonRpcMethod("roslynSense/debugCommand", UseSingleObjectParameterDeserialization = true)]
     public Task<DebugCommandResult> DebugCommand(DebugCommandParams p, CancellationToken ct) =>
-        Handlers.DebugBridgeHandler.CommandAsync(p, ct);
+        DebuggerEnabled
+            ? Handlers.DebugBridgeHandler.CommandAsync(p, ct)
+            : Task.FromResult(new DebugCommandResult(
+                false,
+                "The debugger is disabled (tools.debugger / --no-debugger)."));
 
     [JsonRpcMethod("roslynSense/editorDebugState", UseSingleObjectParameterDeserialization = true)]
-    public void EditorDebugState(EditorDebugStateParams p) =>
-        Handlers.DebugBridgeHandler.EditorState(p);
+    public void EditorDebugState(EditorDebugStateParams p)
+    {
+        if (DebuggerEnabled)
+            Handlers.DebugBridgeHandler.EditorState(p);
+    }
 
     [JsonRpcMethod("roslynSense/syncBreakpoints", UseSingleObjectParameterDeserialization = true)]
-    public void SyncBreakpoints(SyncBreakpointsParams p) =>
-        Handlers.DebugBridgeHandler.SyncBreakpoints(p);
+    public void SyncBreakpoints(SyncBreakpointsParams p)
+    {
+        if (DebuggerEnabled)
+            Handlers.DebugBridgeHandler.SyncBreakpoints(p);
+    }
 
     public void Dispose()
     {

@@ -84,7 +84,7 @@
         "debugger": {
           "type": "boolean",
           "title": "Debugger",
-          "description": "Launch, breakpoints, stepping and evaluation."
+          "description": "The debugger the editor drives: launch, breakpoints, stepping and evaluation."
         },
         "profiling": {
           "type": "boolean",

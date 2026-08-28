@@ -16,8 +16,9 @@
         // A line whose last unclosed opener is "{", "(" or "[" opens a level. The quote classes
         // keep an opener inside a string from counting, the leading (?!//) a commented-out one.
         "increaseIndentPattern": "^((?!\\/\\/).)*(\\{[^}\"'`]*|\\([^)\"'`]*|\\[[^\\]\"'`]*)$",
-        // A line that starts with a closer sits one level back out.
-        "decreaseIndentPattern": "^((?!.*?\\/\\*).*\\*\\/)?\\s*[\\}\\]\\)].*$"
+        // A line that starts with a closer sits one level back out — and so does a switch label,
+        // which belongs beside the label above it rather than inside that one's body.
+        "decreaseIndentPattern": "^((?!.*?\\/\\*).*\\*\\/)?\\s*([\\}\\]\\)].*|(case\\b.*|default)\\s*:.*)$"
     },
     "onEnterRules": [
         {
@@ -35,9 +36,21 @@
             // A body that opens a brace is not this shape — the brace owns the level, and
             // decreaseIndentPattern already takes it back at the "}".
             "beforeText": "^\\s*(?!.*[{}]\\s*$).*;\\s*$",
-            "previousLineText": "^\\s*(\\}\\s*)?(else\\s+if\\s*\\(.*\\)|if\\s*\\(.*\\)|for\\s*\\(.*\\)|foreach\\s*\\(.*\\)|while\\s*\\(.*\\)|using\\s*\\(.*\\)|lock\\s*\\(.*\\)|fixed\\s*\\(.*\\)|else)\\s*$",
+            "previousLineText": "^\\s*(\\}\\s*)?(else\\s+if\\s*\\(.*\\)|if\\s*\\(.*\\)|for\\s*\\(.*\\)|foreach\\s*\\(.*\\)|while\\s*\\(.*\\)|using\\s*\\(.*\\)|lock\\s*\\(.*\\)|fixed\\s*\\(.*\\)|else|do)\\s*$",
             "action": {
                 "indent": "outdent"
+            }
+        },
+        {
+            // The way into a switch section. "case 1:" opens a level the same way a brace does,
+            // and no indentation rule can see it: increaseIndentPattern only knows openers, so
+            // the body of every case sat level with its own label.
+            //
+            // The label itself is taken back out by decreaseIndentPattern, so typing the next
+            // "case" leaves it beside the one above rather than inside its body.
+            "beforeText": "^\\s*(case\\b.*|default)\\s*:\\s*$",
+            "action": {
+                "indent": "indent"
             }
         }
     ]

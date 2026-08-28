@@ -35,7 +35,7 @@ description: C#/.NET testing conventions plus the RoslynSense tools for discover
 
 ## Test framework
 
-- **Use the framework already in the solution** (xUnit/NUnit/MSTest) for new tests. Check with **GetProjectStructure** which detects the test framework automatically.
+- **Use the framework already in the solution** (xUnit/NUnit/MSTest) for new tests. The test project's `.csproj` names it in its package references.
 
 ## Mocking
 
@@ -44,10 +44,9 @@ description: C#/.NET testing conventions plus the RoslynSense tools for discover
 - External dependencies can be mocked. Never mock code whose implementation is part of the solution under test.
 - Try to verify that the outputs (e.g. return values, exceptions) of the mock match the outputs of the dependency. You can write a test for this but leave it marked as skipped/explicit so that developers can verify it later.
 
-## Discovering tests
+## Finding the tests that cover something
 
-- **DiscoverTests** — statically discover all test methods in a project. Returns test names, frameworks, file paths, and line numbers. Use `className` to filter.
-- **FindTests** — find tests that reference a specific symbol. Useful for checking test coverage of a method before changing it. Set `useCoverage: true` for runtime-accurate results (requires RunCoverage first).
+- **FindUsages** on the member you are about to change: its references from a test project are the tests that exercise it, and they are the ones to run first.
 
 ## Running tests
 
@@ -59,20 +58,7 @@ description: C#/.NET testing conventions plus the RoslynSense tools for discover
   - Set `background: true` to run tests in the background and continue working. Check results later with **GetBackgroundTaskResult**.
 - **GetTestFailures** — the failures from the last run, each resolved to the file and line of the failing assertion. Use it after RunTests instead of re-reading run output or re-running with verbose logging.
 - Work on one failing test at a time until it passes, then run the full suite.
-- If a test is failing and the cause isn't clear from the error message, debug it rather than guessing — load the **csharp-debugging** skill and use **DebugStartTest**.
-
-## Code coverage
-
-1. **RunCoverage** — collect coverage data. Must be called before GetCoverage. Set `background: true` for background collection.
-2. **GetCoverage** — query results by file, class, or method. Shows line and branch coverage with uncovered lines.
-- Re-run RunCoverage after code changes that affect coverage.
-
-## Running only the tests your changes affect
-
-- **RunImpactedTests** runs the tests the current git changes can reach, instead of the whole suite. Use it as the inner loop while iterating; run the full suite before you call the work done.
-- Set `dryRun: true` first when you want to see the selection and why each test was picked.
-- `scope` is `uncommitted` by default; use `branch` for everything since the merge base with main, or `ref` with `gitRef` for an explicit revision.
-- The selection is only as good as the per-test coverage map — **BuildCoverageMap** builds it (one coverage run per test class, incremental afterwards). Without a map the selection falls back to walking references, which cannot see calls made through DI or reflection.
+- If a test is failing and the cause isn't clear from the error message, narrow it with a `filter` down to the one test and read **GetTestFailures**, which resolves each failure to the assertion's own file and line.
 
 ## Tool selection
 
@@ -80,7 +66,5 @@ description: C#/.NET testing conventions plus the RoslynSense tools for discover
 |------|---------------|-------|
 | Run a specific test | **RunTests** with `filter` | `dotnet test --filter` (use RunTests instead) |
 | See why a test failed | **GetTestFailures** | Re-running with verbose logging |
-| Re-run tests after an edit | **RunImpactedTests** | Running the whole suite for a one-file change |
-| Check test coverage | **RunCoverage** then **GetCoverage** | Manual inspection |
-| Debug a failing test | **DebugStartTest** (csharp-debugging skill) | Adding Console.WriteLine |
+| Re-run tests after an edit | **RunTests** with a `filter` covering what you touched | Running the whole suite for a one-file change |
 | Run tests while doing other work | **RunTests** with `background: true` + **GetBackgroundTaskResult** | — |

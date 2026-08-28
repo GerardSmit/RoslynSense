@@ -1,6 +1,6 @@
 ﻿# RoslynSense
 
-A Model Context Protocol (MCP) server that provides C# code analysis, navigation, refactoring, testing, and debugging capabilities using the Roslyn compiler platform. Includes extensible support for WebForms (ASPX/ASCX), Razor (.razor/.cshtml), Protobuf (.proto) and LINQ to SQL (.dbml) files.
+A Model Context Protocol (MCP) server and language server that provide C# code analysis, navigation, diagnostics, building, testing and running to an agent, and IDE features — including debugging — to an editor, using the Roslyn compiler platform. Includes extensible support for WebForms (ASPX/ASCX), Razor (.razor/.cshtml), Protobuf (.proto) and LINQ to SQL (.dbml) files.
 
 Inspired by [egorpavlikhin/roslyn-mcp](https://github.com/egorpavlikhin/roslyn-mcp).
 
@@ -181,8 +181,8 @@ Use the following server configuration:
 | `--no-webconfig` | Disable `web.config` / `app.config` settings support: the same for `<appSettings>` and `<connectionStrings>`. Binding-redirect checking — warnings, fixes, the lens and the hover — is unaffected. |
 | `--no-logging` | Disable logging message templates: no placeholder colouring, completion, hover or template diagnostics. |
 | `--no-valuesets` | Disable value sets: no completion, hover or diagnostic for strings bound to a set of allowed values. |
-| `--no-debugger` | Disable all debugger tools (see [Debugging](#debugging)). |
-| `--no-debugger-display` | Show values as their type name rather than through `[DebuggerDisplay]`. See [Debugging](#debugging). |
+| `--no-debugger` | Disable the debugger the editor drives over LSP. |
+| `--no-debugger-display` | Show values as their type name rather than through `[DebuggerDisplay]`. |
 | `--no-type-proxy` | Expand values as their own fields rather than through `[DebuggerTypeProxy]`. |
 | `--no-debugger-browsable` | List every field, ignoring `[DebuggerBrowsable]`. |
 | `--no-raw-view` | Omit the **Raw View** child that a proxy or a hidden member would otherwise add. |
@@ -452,7 +452,7 @@ In-process memory is also bounded independently of the host:
 | `ROSLYNMCP_INDEX_IDLE_TIMEOUT_SECONDS` | `600` | Idle eviction for ASPX/Razor project-index caches. |
 | `ROSLYNMCP_OPEN_PROJECT_TIMEOUT_SECONDS` | `300` | Ceiling on a single project/solution open. |
 
-**Debugging and running are per-chat.** Debug and run tools are *not* forwarded to the shared host — they run in-process in each client, so every chat has its own independent debug session and its own launched applications. Multiple chats can debug the same solution at once without colliding, and a launched app is torn down with the client that started it rather than being orphaned. (Trade-off: a debug session loads its own workspace in the client process, but debugging is interactive and infrequent.)
+**Running is per-chat.** Run tools are *not* forwarded to the shared host — they run in-process in each client, so every chat has its own launched applications, and an app is torn down with the client that started it rather than being orphaned. The editor-driven debug session is per-client for the same reason: two editors can debug one solution without colliding.
 
 Designer regeneration is the exception: it is a side effect on the shared source tree, so `OpenSolution` runs a single watcher in the host rather than one per chat.
 
@@ -501,7 +501,6 @@ A minimal VSCode extension lives in [`vscode-extension/`](vscode-extension/) —
 | Tool | Description |
 |------|-------------|
 | **GetRoslynDiagnostics** | Get diagnostics for a C# file, ASPX/ASCX file, Razor file, or entire project. Returns a compact markdown table with severity counts. Accepts a severity filter (error, warning, info, hidden, all). Supports multiple files separated by semicolons. |
-| **GetCodeActions** | List available code fixes for a diagnostic. Optionally apply a fix by index. Also discovers refactorings (Extract Method, Introduce Variable, etc.). |
 
 ### Navigation
 
@@ -510,18 +509,11 @@ A minimal VSCode extension lives in [`vscode-extension/`](vscode-extension/) —
 | **GoToDefinition** | Navigate to a symbol's definition with code context, or auto-decompile referenced assembly symbols. For type definitions, shows a members table. Works with C#, ASPX, and Razor files. |
 | **FindUsages** | Find all references to a symbol across a project. Also searches Razor source-generated files and ASPX inline code. |
 | **SemanticSymbolSearch** | Ranked symbol search combining name, signature, docs, and source cues. Supports phrase-style queries (e.g. "calculate tax", "user repository"). |
-| **FindImplementations** | Find all implementations of an interface, abstract class, or virtual/abstract member. |
-| **GetCallHierarchy** | Show callers and/or callees of a method or property. |
-| **GetTypeHierarchy** | Show the full type hierarchy (base classes, interfaces, derived types). |
 
-### Structure
+### Generated Code
 
 | Tool | Description |
 |------|-------------|
-| **GetProjectStructure** | Get an overview of a project: target framework, references, source files, and types by namespace. |
-| **GetFileOutline** | Get a compact outline of a C#, ASPX, or Razor file with namespaces, types, members, and line ranges (start-end for multi-line members). Supports multiple files separated by semicolons. |
-| **ListProjects** | Discover all projects loaded in the workspace. |
-| **ListSourceGeneratedFiles** | List all source-generated files in a project, grouped by generator. |
 | **GetSourceGeneratedFileContent** | View the content of a specific source-generated file by hint name. |
 
 ### Build
@@ -577,105 +569,11 @@ it, so two chats never fight over one process.
 | **ListRunningProjects** | List applications started in this chat with state, PID, URL and uptime. |
 | **GetProjectOutput** | Read captured stdout/stderr for a session. |
 
-### Refactoring
-
-| Tool | Description |
-|------|-------------|
-| **RenameSymbol** | Rename a symbol and all references across the project, including ASPX/ASCX and Razor files. Supports dry-run preview and file renames. |
-| **ExpandVarTypes** | Return a method's source with all `var` declarations replaced by their resolved explicit types. Use as a first step to understand what types a method works with — reveals return types, collection element types, and destructured results without chasing each call individually. Read-only; supports `hintLine` for overload disambiguation. |
-
-### Testing & Coverage
+### Testing
 
 | Tool | Description |
 |------|-------------|
 | **RunTests** | Run tests in a .NET test project with optional filter expression and timeout. Set `background: true` to run in the background (builds first, then tests). |
-| **DiscoverTests** | Discover all test methods in a project using static Roslyn analysis. Returns test names, frameworks, file paths, and line numbers. |
-| **FindTests** | Find test methods that reference a symbol. Optionally uses coverage data for runtime-accurate results. |
-| **RunCoverage** | Collect code coverage for a test project using coverlet. Caches results for querying. Set `background: true` for background collection. |
-| **GetCoverage** | Query coverage by project, file, class, or method. Shows line and branch coverage with uncovered lines. |
-| **GetMethodCoverage** | Get per-line coverage detail for a specific method. Shows every executable line with hit count and source code. Lines marked with `!` have partial branch coverage. |
-| **BuildCoverageMap** | Build the per-test coverage map — which tests execute which lines. Compiles once, runs coverage per test class (concurrently where the collector allows), then rebuilds only the classes whose source changed. |
-| **RunImpactedTests** | Run only the tests your current git changes can affect. Matches changed lines against the coverage map, and walks references for code the map has not seen yet. `scope`: `uncommitted` (default), `branch`, or `ref`. Set `dryRun: true` to see the selection and why each test was picked. |
-
-### Debugging
-
-Disable with `--no-debugger`.
-
-The debug engine is selected automatically from the target — you never choose it:
-
-| Target | Engine |
-|--------|--------|
-| .NET / .NET Core | [netcoredbg](https://github.com/Samsung/netcoredbg), auto-provisioned on first use |
-| .NET Framework | ICorDebug, built in |
-
-No single engine covers both: netcoredbg speaks only to CoreCLR, and ICorDebug is the only way into
-.NET Framework. `DebugStartTest` picks from the project's target framework; `DebugAttach` has no
-project to consult, so it picks from the CLR the target process actually loaded — which is how
-attaching to `iisexpress.exe` or `w3wp.exe` resolves to the .NET Framework engine.
-
-.NET Framework debugging binds breakpoints through Windows PDBs, and pending breakpoints rebind as
-modules load — so breakpoints land in shadow-copied `bin` assemblies and in the generated
-`App_Web_*` assemblies produced from inline ASPX code.
-
-Expression evaluation resolves arguments, locals, fields and array elements directly, and calls
-into the debuggee for computed properties and parameterless methods (`order.Total`,
-`order.Describe()`). `DebugSetVariable`-style assignment works for primitives and booleans.
-
-**Debugger attributes.** The ICorDebug engine honours the `System.Diagnostics` attributes a type
-uses to describe itself to a debugger, so a value looks the way its author meant it to rather than
-the way it is stored:
-
-- `[DebuggerDisplay("…{Member}…")]` renders the value. Placeholders are member paths evaluated in
-  the target, so a computed property named by one runs its getter; `,nq` drops the quotes around a
-  string. Breakpoint conditions deliberately compare the *raw* value, never the display string.
-- `[DebuggerTypeProxy(typeof(View))]` expands the value through its view type — constructed in the
-  debuggee, so a dictionary shows its entries instead of its bucket arrays.
-- `[DebuggerBrowsable]` hides a member (`Never`) or replaces it with its own children
-  (`RootHidden`, which is how a `List<T>` shows elements rather than an `_items` array).
-- `[DebuggerStepThrough]`, `[DebuggerHidden]` and `[DebuggerNonUserCode]` are stepped past, along
-  with framework modules and code with no symbols — Just My Code.
-
-Whenever a proxy or a hidden member means the listed children are not the object's own fields, a
-**Raw View** child is offered beside them; expanding it gives the unfiltered fields. Every one of
-these is a switch, because each hides something and the day the attribute is what is wrong is the
-day you need it off:
-
-```json
-"debugger": {
-    "debuggerDisplay": true,
-    "typeProxy": true,
-    "browsable": true,
-    "justMyCode": true,
-    "rawView": true,
-    "maxChildren": 100
-}
-```
-
-The same switches exist as `--no-debugger-display`, `--no-type-proxy`, `--no-debugger-browsable`,
-`--no-just-my-code`, `--no-raw-view`, and in the editor as `roslynSense.debugger.*` — where a
-change reaches a session that is stopped right now, without restarting it. On CoreCLR targets
-netcoredbg implements the display attributes itself with no switch to turn them off, so there only
-`justMyCode` is forwarded.
-
-**Cross-architecture targets.** ICorDebug cannot attach across x86/x64, so a target whose bitness
-differs from the server is debugged through a matching worker process running the same engine —
-this is what makes a 32-bit IIS Express app pool debuggable. Selection is automatic. The workers
-are framework-dependent, so debugging a 32-bit target needs the x86 .NET runtime installed; when it
-or the worker is missing, the error says so rather than failing at attach.
-
-One current limit: `DebugStartTest` is not supported for .NET Framework test projects — run the
-tests, then `DebugAttach` to the test host.
-
-| Tool | Description |
-|------|-------------|
-| **DebugStartTest** | Start debugging a .NET test project. Builds, launches the test host, and attaches the debugger. |
-| **DebugAttach** | Attach the debugger to a running .NET or .NET Framework process by PID. |
-| **DebugSetBreakpoint** | Set a breakpoint at a file and line. Supports conditions and batch mode. |
-| **DebugRemoveBreakpoint** | Remove a breakpoint by ID. Supports batch removal. |
-| **DebugContinue** | Continue, step in/over/out, pause, run until/to a line, or move the instruction pointer — selected with the `action` parameter. |
-| **DebugEvaluate** | Evaluate expressions in the current debug context. Supports batch evaluation with semicolons. |
-| **DebugStatus** | Get debugger status, breakpoints, and current pause position with optional locals and stack trace. |
-| **DebugStop** | Stop the debug session and clean up. The debuggee shuts down cleanly, and is killed only if it will not exit. |
 
 ### Profiling
 
@@ -841,7 +739,7 @@ The provider for each connection string is resolved in this order — first matc
 | Resource | URI Pattern | Description |
 |----------|-------------|-------------|
 | **project-structure** | `roslyn://project-structure/{filePath}` | Project file/folder structure grouped by directory. |
-| **file-outline** | `roslyn://file-outline/{filePath}` | Structural outline of a C# file (same as GetFileOutline tool). |
+| **file-outline** | `roslyn://file-outline/{filePath}` | Structural outline of a C# file — namespaces, types, members and their line ranges — as attachable context. |
 
 ## Prompts
 
@@ -858,10 +756,9 @@ loads them automatically when the work matches; you can also invoke one explicit
 
 | Skill | Covers |
 |-------|--------|
-| **`csharp`** | The core: C#/.NET conventions plus navigation, editing, refactoring, building, packages, and running apps — which tool to reach for instead of grep or a shell build, and when to regenerate designer files rather than editing them. Points at the skills below. |
-| **`csharp-testing`** | Test conventions, discovering and running tests, coverage, and impacted-test selection. |
-| **`csharp-debugging`** | Breakpoints, stepping, evaluating, watching values — on either runtime, including IIS Express. |
-| **`csharp-profiling`** | CPU sampling and heap snapshots: hot paths, callers/callees, and leak hunting. |
+| **`csharp`** | The core: C#/.NET conventions plus navigation, editing, diagnostics, building, and running apps — which tool to reach for instead of grep or a shell build, and when to regenerate designer files rather than editing them. Points at the skills below. |
+| **`csharp-testing`** | Test conventions, running tests, and reading failures back to the assertion that produced them. |
+| **`csharp-profiling`** | CPU sampling: hot paths and callers/callees. |
 
 Skills are a Claude Code feature. On other MCP clients, point your agent at those files directly —
 they are plain Markdown with no Claude-Code-specific syntax in the body.

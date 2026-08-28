@@ -1,8 +1,8 @@
 ---
 name: csharp-profiling
-description: Profile CPU hotspots and trace memory usage in C#/.NET code with the RoslynSense profiling tools — sample tests, applications, or running processes, drill into hot paths, and diff heap snapshots to find leaks. Use for performance questions ("why is this slow", "what eats memory") on modern .NET or .NET Framework (including IIS Express / w3wp).
+description: Profile CPU hotspots in C#/.NET code with the RoslynSense profiling tools — sample tests, applications, or running processes, and drill into hot paths and their callers. Use for performance questions ("why is this slow", "where does the time go") on modern .NET or .NET Framework (including IIS Express / w3wp).
 ---
-# C# Profiling & Memory Tracing with RoslynSense
+# C# Profiling with RoslynSense
 
 Measure before optimizing — profile the scenario, find the hot methods, and only then change code.
 
@@ -47,27 +47,10 @@ After profiling, use the session ID to drill into the results:
 - Use **ProfileCalls** with `direction: "callers"` to trace upward from a hot method to understand *why* it's being called, or `direction: "callees"` to trace downward to find *where* time is actually spent.
 - Combine with **GoToDefinition** to navigate to a hot method's source code.
 
-## Memory tracing
-
-Heap snapshots use ClrMD and work on both .NET Framework and modern .NET processes. The target
-keeps running; snapshots are retained for 30 minutes.
-
-1. **MemorySnapshot** — snapshot a process by PID (e.g. from **RunProject**) and see the types using the most memory.
-2. Exercise the app (requests, the suspected scenario), then **MemorySnapshot** again.
-3. **MemoryCompare** — diff the two snapshots to see which types grew in bytes and instance count. Repeated growth across cycles is the leak signature; one-time growth is usually caching.
-4. **MemoryPathsToRoot** — for a growing type, walk the GC root paths that keep instances alive. Static fields and event handlers near the root are the usual leak anchors.
-5. **ListMemorySnapshots** — list snapshots taken in the last 30 minutes.
-
-Memory tips:
-
-- `System.String` and arrays dominating a snapshot is normal — compare against a baseline instead of judging absolute numbers.
-- 32-bit targets (e.g. a 32-bit IIS Express app pool) are inspected through the bundled bitness-matched worker, the same mechanism cross-bitness debugging uses; it requires the x86 .NET runtime, and the error says so when it is missing.
-
 ## Tool selection
 
 | Task | Preferred Tool | Avoid |
 |------|---------------|-------|
 | Profile CPU hotspots | **ProfileTests** or **ProfileApp** | Manual dotnet-trace |
 | Profile a running (IIS Express) site | **ProfileProcess** with the RunProject PID | Assuming .NET Framework cannot be profiled |
-| Find what eats memory / leaks | **MemorySnapshot** → **MemoryCompare** → **MemoryPathsToRoot** | Guessing from Task Manager |
 | Investigate hot methods | **ProfileCalls** | Guessing without data |

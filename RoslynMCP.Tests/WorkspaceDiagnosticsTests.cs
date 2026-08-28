@@ -865,6 +865,15 @@ public class WorkspaceDiagnosticsTests : IDisposable
         {
             LspFeatureOptions.WorkspaceDiagnosticsScope = "openProjects";
 
+            // Bound rather than merely opened. The sweep asks SolutionProjectIndex which projects
+            // to walk, and that falls back to the most recently used workspace when nothing is
+            // bound — so in a parallel run any other collection opening a project steals this
+            // one out from under it. Every sibling here is single-project and cannot tell the
+            // difference; this is the only multi-project sweep, so it is the only one that loses
+            // the race.
+            using var bound = WorkspaceService.BindSolutionForTesting(
+                FixturePaths.LayeredAppSolutionFile);
+
             // Opening Storefront pulls Warehouse in through its ProjectReference, so both live in
             // one solution and the dependency edge the scenario is about actually exists.
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.LayeredAppStorefrontProjectFile);

@@ -3,7 +3,7 @@ name: csharp
 description: C#/.NET coding conventions plus how to drive the RoslynSense MCP tools for analysis, navigation, refactoring, building, and running. Use when working in a C# project — any .cs, .csproj, .sln, .aspx/.ascx (WebForms) or .razor/.cshtml file, on modern .NET or .NET Framework.
 ---
 # C# prompt instructions
-You are an expert C#/.NET developer. You help with .NET tasks by giving clean, well-designed, error-free, fast, secure, readable, and maintainable code that follows .NET conventions. You also give insights, best practices, general software design tips, and testing best practices.
+You are an expert C#/.NET developer. Write correct, readable code that follows .NET conventions, and say what you are trading away when you trade something away. Offer the design reasoning behind a change, not only the change.
 
 You are familiar with the currently released .NET and C# versions (up to .NET 10 and C# 14 at the time of writing).
 
@@ -61,7 +61,9 @@ Prefer **BuildProject** and **RunTests** over shell commands. When you do fall b
 - Always add `-v q` for quiet output; only when absolutely necessary (e.g. seeing test exception), remove `-v` from the command.
   NEVER USE `-v n` OR `-v d`.
 - Always add `-tl:false` to disable interactive console.
-- Always add `-l "console;verbosity=normal"` if a test is failing, remove it once the tests succeed.
+- Do not reach for `-l "console;verbosity=normal"` to investigate a failing test. **GetTestFailures**
+  already resolves each failure to the assertion's own file and line, which is what the verbose
+  log was being read for.
 
 
 ## Build
@@ -191,8 +193,12 @@ Use this to observe real behaviour rather than inferring it from source.
 
 - **RunProject** — build and run a project, leaving it running. ASP.NET Core and console apps (.NET and .NET Framework) launch directly; legacy ASP.NET sites launch under IIS Express on the port and virtual path from the project's `WebProjectProperties`. For web projects it waits until the port accepts connections, then returns the URL and PID. Builds first by default (like Visual Studio); pass `build: false` to launch existing output.
 - **StopProject** — stop by session ID, project path, or `all`. Kills the whole process tree.
-- **ListRunningProjects** — what is running, with state, PID, URL and uptime.
-- **GetProjectOutput** — the app's captured stdout/stderr.
+- **ListRunningProjects** — what is running, with state, PID, URL and uptime. Covers apps this
+  chat started *and* apps the user started from the editor, so it is the answer to "what is
+  running right now" regardless of who started it.
+- **GetProjectOutput** — the app's captured stdout/stderr. Returns the last 100 lines; pass
+  `lines` for more. Takes the session ID from RunProject, or a PID for an app the editor
+  started.
 - Launch profiles come from the project's `launchSettings.json`; pass one by name to RunProject's `profile` parameter.
 
 ### Running tips
@@ -201,6 +207,51 @@ Use this to observe real behaviour rather than inferring it from source.
 - If the process exits immediately, **GetProjectOutput** has the reason — read it before changing code.
 - Applications are per-chat and are stopped when the session ends, but **StopProject** when finished rather than leaving ports held.
 - To debug what you started, attach the editor's debugger to the PID **RunProject** reports.
+
+### The app the user is running
+
+When the user says "the app", "the current run", "the process", or asks why the thing on their
+screen is misbehaving, **call ListRunningProjects first**. Do not assume they mean something
+this chat started, and do not offer to start a second copy before looking — the port is
+already held, and a second instance is its own confusing bug.
+
+Apps the user launched or debugged from the editor are registered too, with a session id
+prefixed `editor-`. That prefix is the tell: it separates "the user started this" from "a chat
+did", which decides whether stopping it is yours to do. **Do not StopProject an `editor-`
+entry** — the editor still believes it is supervising that process. Ask.
+
+Their output is readable the same way: pass the **PID** to GetProjectOutput. The log outlives
+the process on purpose, so an app that has already exited can still be asked what it printed
+on the way out.
+
+One limit worth knowing before concluding nothing is running: this only covers debug sessions
+started with the **C# (RoslynSense)** launch configuration. A session started with another C#
+debug extension is invisible here — an empty list means "nothing I can see", not "nothing is
+running", so say which one you mean.
+
+### Reading debug output
+
+**GetProjectOutput reads stdout and stderr, and that is not everything the app prints.**
+`Console.WriteLine` and the `ILogger` console provider both write to stdout, so those appear.
+`Debug.WriteLine` and `Trace.WriteLine` do not: `DefaultTraceListener` hands them to an
+attached debugger and nowhere else, so for an app started by RunProject alone they are
+written into the void.
+
+So when a `Debug.WriteLine` you can see in the source never shows up, the message is not
+missing and the code did not fail to run — nothing was listening.
+
+**Attach the debugger to make them readable.** On **.NET Framework** this is wired up: the
+runtime raises those messages once a debugger asks, and they flow into the same log
+GetProjectOutput reads — so attach, exercise the app, then read the output by the app's PID.
+A message written with `Debug.WriteLine(message, category)` arrives as `category: message`,
+so search the output for `category:` rather than for brackets.
+
+On **modern .NET** a different debug engine handles the target, so whether the same messages
+reach GetProjectOutput is not something to assume in either direction — look, and if they do
+not appear, fall back to reading the source rather than concluding the line never ran.
+
+Either way: do not treat silence as proof a branch was not taken. Confirm the call site
+writes somewhere you can actually read before using missing output as evidence.
 
 ## Workflow: Background Tasks
 
@@ -221,7 +272,7 @@ For long-running operations, set `background: true` to stay productive:
 | Find a symbol by partial name | **SemanticSymbolSearch** | grep (doesn't understand C# syntax) |
 | Fix a missing control field in a code-behind | **RegenerateDesigner** | Editing the `.designer.cs`, or declaring the field by hand |
 | Update code after editing ASPX markup or a `.dbml` | **RegenerateDesigner** (or let **OpenSolution** watch) | Hand-writing the generated file |
-| Start a web app or console app | **RunProject** | `dotnet run` in a shell |
+| Start a web app or console app | **ListRunningProjects**, then **RunProject** | `dotnet run` in a shell |
 | See why a launched app died | **GetProjectOutput** | Re-running it blind |
 | Add or update a NuGet package | `dotnet add package`, then **BuildProject** | Hand-editing the `.csproj` and not reloading |
 | Write, run, or fix tests | **csharp-testing** skill | — |

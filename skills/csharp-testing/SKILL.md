@@ -50,7 +50,9 @@ description: C#/.NET testing conventions plus the RoslynSense tools for running 
 
 ## Running tests
 
-- **RunTests** — run tests with an optional filter expression. Examples:
+- **RunTests** — run tests with an optional filter expression. `projectPath` takes the test
+  `.csproj`, or any source file inside the test project when that is what you have open.
+  Examples:
   - `filter: "ClassName.MethodName"` — run a specific test
   - `filter: "FullyQualifiedName~MyTest"` — substring match
   - `filter: "Category=Unit"` — by category

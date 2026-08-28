@@ -18,11 +18,16 @@ investigation tools work identically.
 - **ProfileProcess** — attach to an already-running process by PID (e.g. from **RunProject**), .NET Framework or modern .NET alike. This is the way to profile `iisexpress.exe`/`w3wp.exe` hosting a running site. Blocks for the whole duration; use `hitUrls` for traffic, or use ProfileStart/ProfileStop instead when you want to drive the app yourself.
 - **ProfileStart** / **ProfileStop** — recording mode: ProfileStart attaches and returns immediately, you exercise the app yourself (curl the endpoints, run the scenario, click through pages), then ProfileStop collects and returns the hot methods. Works on both runtimes. A recording stops collecting by itself after `maxDurationSeconds` (default 600) but its data stays available for ProfileStop.
 
+ProfileTests takes the test `.csproj` or a source file inside the test project, the same as
+RunTests. ProfileStop's `recordingId` is optional while exactly one recording is active; pass
+it once a second one starts, which is what the error tells you to do.
+
 For web apps, pass `hitUrls` (semicolon-separated) so the pages under investigation are actually
 requested during the profiling window — profiling an idle server measures nothing. For a
 **.NET Framework** web project ProfileApp falls back to hammering the app's root URL when you
 pass none; on ASP.NET Core nothing is requested for you, so a run without `hitUrls` profiles an
-idle server and reports almost nothing.
+idle server and reports almost nothing. `appArgs` is rejected outright for .NET Framework
+projects — pass the arguments through the launch profile instead.
 
 By default the hot-methods table shows **only the solution's own code** — framework and
 third-party methods (System.*, SQL client internals, CMS plumbing) are hidden and counted in a

@@ -174,6 +174,114 @@ internal static class AspxCatalog
         return results;
     }
 
+    /// <summary>
+    /// Properties a <c>ParseChildren</c> control accepts as nested elements: its templates
+    /// (<c>&lt;ItemTemplate&gt;</c>) and its sub-object properties (<c>&lt;Columns&gt;</c>,
+    /// <c>&lt;HeaderStyle&gt;</c>). Control-typed properties are excluded — <c>Page</c> and
+    /// <c>Parent</c> are class-typed on every control, and neither is ever written as markup.
+    /// </summary>
+    public static IReadOnlyList<IPropertySymbol> ElementProperties(INamedTypeSymbol type)
+    {
+        var results = new List<IPropertySymbol>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var current in Hierarchy(type))
+        {
+            foreach (var property in current.GetMembers().OfType<IPropertySymbol>())
+            {
+                if (property.IsStatic || property.IsIndexer
+                    || property.DeclaredAccessibility != Accessibility.Public
+                    || property.GetMethod is not { DeclaredAccessibility: Accessibility.Public })
+                    continue;
+
+                bool nested = property.Type.IsTemplate()
+                    || (property.Type is INamedTypeSymbol
+                        {
+                            TypeKind: TypeKind.Class,
+                            SpecialType: SpecialType.None,
+                        } propertyType
+                        && !propertyType.IsAssignableTo(ControlBaseName));
+
+                if (nested && seen.Add(property.Name))
+                    results.Add(property);
+            }
+        }
+
+        return results;
+    }
+
+    /// <summary>The element type a collection property accepts, read from its <c>Add</c>
+    /// method — what ASP.NET's object parser itself calls with each child.</summary>
+    public static INamedTypeSymbol? CollectionItemType(INamedTypeSymbol collectionType)
+    {
+        foreach (var current in Hierarchy(collectionType))
+        {
+            foreach (var method in current.GetMembers("Add").OfType<IMethodSymbol>())
+            {
+                if (method is { IsStatic: false, DeclaredAccessibility: Accessibility.Public, Parameters.Length: 1 }
+                    && method.Parameters[0].Type is INamedTypeSymbol item)
+                    return item;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Every type the file's registered prefixes reach that fits in a collection of
+    /// <paramref name="itemType"/> — the <c>asp:BoundField</c>s a <c>&lt;Columns&gt;</c> accepts.
+    /// Not restricted to controls: most collection items (a grid column, a list item
+    /// definition) are plain objects.
+    /// </summary>
+    public static IReadOnlyList<AspxControlEntry> CollectionItems(
+        AspxDocument document, INamedTypeSymbol itemType)
+    {
+        if (document.Tree is not { } root)
+            return [];
+
+        var entries = new List<AspxControlEntry>();
+        var seen = new HashSet<(string, string)>();
+
+        foreach (var (prefix, namespaces) in root.TagPrefixes)
+        {
+            foreach (string ns in namespaces)
+            {
+                if (ResolveNamespace(document.Compilation, ns) is not { } symbol)
+                    continue;
+
+                foreach (var type in symbol.GetTypeMembers())
+                {
+                    if (type is not
+                        {
+                            TypeKind: TypeKind.Class,
+                            IsAbstract: false,
+                            DeclaredAccessibility: Accessibility.Public,
+                        })
+                        continue;
+
+                    if (!IsAssignableTo(type, itemType))
+                        continue;
+
+                    if (seen.Add((prefix, type.Name)))
+                        entries.Add(new AspxControlEntry(prefix, type.Name, type));
+                }
+            }
+        }
+
+        return entries;
+    }
+
+    private static bool IsAssignableTo(INamedTypeSymbol type, INamedTypeSymbol target)
+    {
+        for (ITypeSymbol? current = type; current is not null; current = current.BaseType)
+        {
+            if (SymbolEqualityComparer.Default.Equals(current, target))
+                return true;
+        }
+
+        return type.AllInterfaces.Contains(target, SymbolEqualityComparer.Default);
+    }
+
     public static IReadOnlyList<IEventSymbol> Events(INamedTypeSymbol type)
     {
         var results = new List<IEventSymbol>();

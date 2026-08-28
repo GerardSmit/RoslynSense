@@ -706,10 +706,11 @@ internal static class AspxLanguageHandler
         var resources = await AspxResourceHandler.DiagnosticsAsync(document, ct);
         var embedded = await EmbeddedDiagnosticsAsync(document, ct);
         var bindings = await AspxBindingDiagnostics.DiagnosticsAsync(document, ct);
+        var runat = AspxRunatDiagnostics.Diagnostics(document);
 
-        return resources.Length == 0 && embedded.Length == 0 && bindings.Length == 0
+        return resources.Length == 0 && embedded.Length == 0 && bindings.Length == 0 && runat.Length == 0
             ? parse
-            : [.. parse, .. resources, .. embedded, .. bindings];
+            : [.. parse, .. resources, .. embedded, .. bindings, .. runat];
     }
 
     /// <summary>

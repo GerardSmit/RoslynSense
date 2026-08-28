@@ -414,6 +414,190 @@ public class WebFormsLspTests
         Assert.Contains("asp:Label", completions.Items.Select(i => i.Label));
     }
 
+    /// <summary>Runs <paramref name="body"/> with <paramref name="path"/> showing
+    /// <paramref name="buffer"/> instead of what is on disk.</summary>
+    private static async Task WithBufferAsync(string path, string buffer, Func<Task> body)
+    {
+        string session = Guid.NewGuid().ToString("N");
+        try
+        {
+            OpenDocumentStore.Open(
+                session, path, Microsoft.CodeAnalysis.Text.SourceText.From(buffer), 1);
+            await body();
+        }
+        finally
+        {
+            OpenDocumentStore.Close(session, path);
+            AspxDocumentService.Invalidate(path);
+        }
+    }
+
+    /// <summary>The position of <paramref name="needle"/> in <paramref name="text"/> itself,
+    /// for a buffer that differs from the file on disk.</summary>
+    private static Position PositionIn(string text, string needle, int offsetIntoNeedle = 0)
+    {
+        int index = text.IndexOf(needle, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"'{needle}' is not in the buffer");
+
+        var source = Microsoft.CodeAnalysis.Text.SourceText.From(text);
+        var line = source.Lines.GetLinePosition(index + offsetIntoNeedle);
+        return new Position(line.Line, line.Character);
+    }
+
+    [Fact]
+    public async Task CommittingATagNameWritesRunatServerWithIt()
+    {
+        // A half-typed control tag: committing "asp:Repeater" must land as a server control,
+        // because without runat the tag is literal text and every other feature goes dark.
+        string path = FixturePaths.DesignerAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace("<asp:TextBox ID=\"txtName\" runat=\"server\" />", "<asp:Rep");
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            var completions = await AspxCompletionHandler.CompletionAsync(
+                new CompletionParams(Doc(path), PositionIn(buffer, "<asp:Rep", "<asp:Rep".Length)),
+                new LspResolveCache(),
+                default);
+
+            var item = completions.Items.Single(i => i.Label == "asp:Repeater");
+            Assert.Equal("asp:Repeater runat=\"server\"", item.TextEdit!.NewText);
+        });
+    }
+
+    [Fact]
+    public async Task RetypingATagNameDoesNotDuplicateItsRunat()
+    {
+        // The caret is in the name of a tag that already carries runat="server", so the commit
+        // replaces the name alone.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.DesignerAspxFile),
+                PositionOf(FixturePaths.DesignerAspxFile, "<asp:Label", "<asp:La".Length)),
+            new LspResolveCache(),
+            default);
+
+        var item = completions.Items.Single(i => i.Label == "asp:Label");
+        Assert.Equal("asp:Label", item.TextEdit!.NewText);
+    }
+
+    [Fact]
+    public async Task CompletionInsideAParseChildrenControlOffersItsTemplates()
+    {
+        // Direct children of a Repeater are its properties, not controls — that is what
+        // [ParseChildren(true)] means — so a tag opened there completes the template names.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.DesignerAspxFile),
+                PositionOf(FixturePaths.DesignerAspxFile, "<ItemTemplate>", 1)),
+            new LspResolveCache(),
+            default);
+
+        var labels = completions.Items.Select(i => i.Label).ToList();
+
+        Assert.Contains("ItemTemplate", labels);
+        Assert.Contains("FooterTemplate", labels);
+        Assert.DoesNotContain("asp:Label", labels);
+    }
+
+    [Fact]
+    public async Task CompletionInsideACollectionElementOffersItsItemTypes()
+    {
+        // Inside <Columns> only what the collection's Add accepts fits, so the item type is
+        // offered — without runat, which a plain object rejects.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.ImplicitAspxFile),
+                PositionOf(FixturePaths.ImplicitAspxFile, "<uc:ItemGridColumn", 1)),
+            new LspResolveCache(),
+            default);
+
+        var item = completions.Items.Single(i => i.Label == "uc:ItemGridColumn");
+        Assert.Equal("uc:ItemGridColumn", item.TextEdit!.NewText);
+        Assert.DoesNotContain("asp:Label", completions.Items.Select(i => i.Label));
+    }
+
+    [Fact]
+    public async Task CompletingRunatAsAnAttributeWritesItsValueWithIt()
+    {
+        // `server` is the only value runat takes, so committing the attribute writes the whole
+        // thing rather than leaving the caret in empty quotes.
+        string path = FixturePaths.DesignerAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace("<asp:TextBox ID=\"txtName\" runat=\"server\" />", "<asp:TextBox  />");
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            var completions = await AspxCompletionHandler.CompletionAsync(
+                new CompletionParams(
+                    Doc(path), PositionIn(buffer, "<asp:TextBox  />", "<asp:TextBox ".Length)),
+                new LspResolveCache(),
+                default);
+
+            var item = completions.Items.Single(i => i.Label == "runat");
+            Assert.Equal("runat=\"server\"", item.TextEdit!.NewText);
+        });
+    }
+
+    [Fact]
+    public async Task AControlTagWithoutRunatIsAnError()
+    {
+        string path = FixturePaths.DesignerAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace(
+                "<asp:TextBox ID=\"txtName\" runat=\"server\" />",
+                "<asp:TextBox ID=\"txtName\" />");
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            var diagnostics = await AspxLanguageHandler.DiagnosticsAsync(path, default);
+
+            var missing = Assert.Single(diagnostics, d => d.Code == "WFR0001");
+            Assert.Equal(1, missing.Severity);
+            Assert.Contains("runat", missing.Message);
+        });
+    }
+
+    [Fact]
+    public async Task CollectionItemsNeedNoRunat()
+    {
+        // <uc:ItemGridColumn> inside <Columns> is an item of the collection, not a control
+        // that forgot its runat.
+        var diagnostics = await AspxLanguageHandler.DiagnosticsAsync(
+            FixturePaths.ImplicitAspxFile, default);
+
+        Assert.DoesNotContain(diagnostics, d => d.Code == "WFR0001");
+    }
+
+    [Fact]
+    public async Task TheMissingRunatQuickFixWritesTheAttribute()
+    {
+        string path = FixturePaths.DesignerAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace(
+                "<asp:TextBox ID=\"txtName\" runat=\"server\" />",
+                "<asp:TextBox ID=\"txtName\" />");
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            var position = PositionIn(buffer, "<asp:TextBox ID=\"txtName\" />", 2);
+            var actions = await AspxCodeActionHandler.CodeActionsAsync(
+                new CodeActionParams(
+                    Doc(path),
+                    new Lsp.Protocol.Range(position, position),
+                    new CodeActionContext([])),
+                default);
+
+            var fix = Assert.Single(actions, a => a.Title == "Add runat=\"server\"");
+            var edit = Assert.Single(fix.Edit!.Changes[LspConverters.PathToUri(path)]);
+            Assert.Equal(" runat=\"server\"", edit.NewText);
+
+            // The attribute lands right after the tag name.
+            var expected = PositionIn(buffer, "<asp:TextBox ID=\"txtName\" />", "<asp:TextBox".Length);
+            Assert.Equal(expected, edit.Range.Start);
+        });
+    }
+
     [Fact]
     public async Task RenamingAHandlerFromMarkupRewritesBothHalves()
     {

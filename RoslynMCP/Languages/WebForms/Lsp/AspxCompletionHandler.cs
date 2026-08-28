@@ -143,6 +143,19 @@ internal static class AspxCompletionHandler
     {
         var range = AspxLanguageHandler.ToRange(document, context.ReplaceSpan);
 
+        // A caret inside a ParseChildren control completes that control's own nested elements —
+        // its templates and sub-object properties, or the items of its collection — because that
+        // is all ASP.NET accepts there. Everywhere else (top level, inside a template) the tag
+        // is a control.
+        if (NestedTagNames(document, context, range) is { } nested)
+            return nested;
+
+        // A committed control tag gets `runat="server"` written with it: without the attribute
+        // the runtime treats the tag as literal text, so there is no tag one would complete and
+        // then not want it on. Skipped when the tag already carries one — retyping a name must
+        // not duplicate it.
+        string suffix = HasRunat(document.Text, context.ReplaceSpan.End) ? "" : " runat=\"server\"";
+
         var items = AspxCatalog.Controls(document)
             .Select(entry =>
             {
@@ -156,11 +169,160 @@ internal static class AspxCompletionHandler
                     // Prefixes the file registered itself sort above the framework's.
                     (entry.SourcePath is null ? "1" : "0") + label,
                     label,
-                    new TextEdit(range, label));
+                    new TextEdit(range, label + suffix));
             })
             .ToArray();
 
         return items.Length == 0 ? Empty : new CompletionList(false, items);
+    }
+
+    /// <summary>
+    /// The list for a tag that names a member of its container rather than a control, or
+    /// <c>null</c> when the container takes ordinary controls.
+    /// </summary>
+    private static CompletionList? NestedTagNames(
+        AspxDocument document, AspxCompletionContext context, Protocol.Range range)
+    {
+        switch (FindContainer(document, context.TagStart))
+        {
+            // Inside `<Columns>`: only what the collection's Add accepts fits.
+            case CollectionNode collection:
+                return ItemTags(document, collection.PropertyType, range) ?? Empty;
+
+            case ControlNode { ParseChildren: true } control:
+            {
+                var items = new List<CompletionItem>();
+                var type = control.ControlType;
+
+                foreach (var property in AspxCatalog.ElementProperties(type))
+                {
+                    bool template = property.Type.IsTemplate();
+                    items.Add(new CompletionItem(
+                        property.Name,
+                        LspCompletionItemKind.Property,
+                        property.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat),
+                        // Templates first: they are where the markup goes.
+                        (template ? "0" : "1") + property.Name,
+                        property.Name,
+                        new TextEdit(range, property.Name)));
+                }
+
+                // `[ParseChildren(true, "Items")]`: the items sit directly inside the control
+                // tag with no property wrapper, so they complete beside its properties.
+                if (type.DefaultCollectionProperty() is { } name
+                    && type.GetMemberDeep(name)?.Type is INamedTypeSymbol collectionType
+                    && ItemTags(document, collectionType, range) is { } defaultItems)
+                {
+                    items.AddRange(defaultItems.Items);
+                }
+
+                return items.Count == 0 ? Empty : new CompletionList(false, [.. items]);
+            }
+
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>The types a collection property accepts as child tags, or <c>null</c> when its
+    /// item type cannot be read off an <c>Add</c> method.</summary>
+    private static CompletionList? ItemTags(
+        AspxDocument document, INamedTypeSymbol collectionType, Protocol.Range range)
+    {
+        if (AspxCatalog.CollectionItemType(collectionType) is not { } itemType)
+            return null;
+
+        // No runat: a collection item (`<asp:BoundField>`) is a plain object, and ASP.NET
+        // rejects the attribute on one.
+        var items = AspxCatalog.CollectionItems(document, itemType)
+            .Select(entry =>
+            {
+                string label = $"{entry.Prefix}:{entry.TagName}";
+                return new CompletionItem(
+                    label,
+                    LspCompletionItemKind.Class,
+                    entry.Type.ContainingNamespace?.ToDisplayString(),
+                    "2" + label,
+                    label,
+                    new TextEdit(range, label));
+            })
+            .ToArray();
+
+        return items.Length == 0 ? null : new CompletionList(false, items);
+    }
+
+    /// <summary>
+    /// The element the tag being typed sits inside, or <c>null</c> at the top level. Found by
+    /// range rather than by parent link: the half-typed tag itself has no node to ask.
+    /// </summary>
+    private static ElementNode? FindContainer(AspxDocument document, int tagStart)
+    {
+        if (document.Tree is not { } root || tagStart < 0)
+            return null;
+
+        ElementNode? found = null;
+
+        foreach (var element in AspxSymbolResolver.EnumerateElements(root))
+        {
+            var start = element.StartTag.Range;
+
+            if (start.Start.Offset >= tagStart || start.End.Offset > tagStart)
+                continue;
+            if (element.EndTag is { } end && end.Range.Start.Offset <= tagStart)
+                continue;
+            // An element with no end tag read to the end of the file — unless its start tag
+            // closed itself, which the parser does not record and the source still shows.
+            if (element.EndTag is null && IsSelfClosing(document.Text, start))
+                continue;
+
+            if (found is null || start.Start.Offset > found.StartTag.Range.Start.Offset)
+                found = element;
+        }
+
+        return found;
+    }
+
+    private static bool IsSelfClosing(string text, WebFormsCore.Models.TokenRange startTag)
+    {
+        int end = Math.Min(startTag.End.Offset, text.Length);
+        return end >= 2 && text[end - 2] == '/' && text[end - 1] == '>';
+    }
+
+    /// <summary>Whether the tag already carries a <c>runat</c> attribute past the caret's
+    /// replace span.</summary>
+    private static bool HasRunat(string text, int offset)
+    {
+        int i = offset;
+        while (i < text.Length)
+        {
+            char c = text[i];
+
+            if (c is '>' or '<')
+                return false;
+
+            if (c is '"' or '\'')
+            {
+                int end = text.IndexOf(c, i + 1);
+                if (end < 0)
+                    return false;
+                i = end + 1;
+                continue;
+            }
+
+            if (char.IsLetter(c))
+            {
+                int start = i;
+                while (i < text.Length && IsAttributeChar(text[i]))
+                    i++;
+                if (text[start..i].Equals("runat", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                continue;
+            }
+
+            i++;
+        }
+
+        return false;
     }
 
     // ---- Attribute names -------------------------------------------------------------------
@@ -179,21 +341,25 @@ internal static class AspxCompletionHandler
 
         // `ID` is offered up front because it is what a control tag almost always needs next,
         // and `Control` also declares it as an ordinary property — hence the dedupe.
-        void Add(string name, int kind, string? detail, string sort)
+        void Add(string name, int kind, string? detail, string sort, string? insert = null)
         {
             if (written.Contains(name) || !added.Add(name))
                 return;
             items.Add(new CompletionItem(
-                name, kind, detail, sort + name, name, new TextEdit(range, Insertion(name, hasValue)))
+                name, kind, detail, sort + name, name,
+                new TextEdit(range, insert ?? Insertion(name, hasValue)))
             {
-                InsertTextFormat = hasValue || !LspClientState.SnippetSupport
+                InsertTextFormat = insert is not null || hasValue || !LspClientState.SnippetSupport
                     ? LspInsertTextFormat.PlainText
                     : LspInsertTextFormat.Snippet,
             });
         }
 
         Add("ID", LspCompletionItemKind.Property, "control identifier", "0");
-        Add("runat", LspCompletionItemKind.Property, "server", "0");
+        // Value and all: `server` is the only value the attribute takes, so there is nothing
+        // for a caret between the quotes to decide.
+        Add("runat", LspCompletionItemKind.Property, "server", "0",
+            insert: hasValue ? null : "runat=\"server\"");
 
         // Events first: wiring one up is the reason to open completion inside a control tag,
         // and there are far fewer of them than there are properties.

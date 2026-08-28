@@ -159,7 +159,10 @@ namespace System.Web.UI
             public string Value { get; set; } = "";
         }
 
-        public class ListItemCollection { }
+        public class ListItemCollection
+        {
+            public void Add(ListItem item) { }
+        }
 
         [System.Web.UI.ParseChildren(true)]
         public class Repeater : WebControl

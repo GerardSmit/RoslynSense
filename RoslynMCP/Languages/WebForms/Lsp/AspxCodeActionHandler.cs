@@ -6,6 +6,7 @@ using WebFormsCore.Nodes;
 using RoslynMCP.Services;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
+using Protocol = RoslynMCP.Lsp.Protocol;
 
 namespace RoslynMCP.Languages.WebForms.Lsp;
 
@@ -27,23 +28,58 @@ internal static class AspxCodeActionHandler
     {
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         var document = await AspxDocumentService.GetAsync(path, ct);
-        if (document?.Tree is null || document.CodeBehind is null)
+        if (document?.Tree is null)
             return [];
 
         int offset = LspConverters.ToOffset(document.SourceText, p.Range.Start);
-        var hit = AspxSymbolResolver.ResolveAt(document, offset);
-        if (hit is null)
-            return [];
-
         var actions = new List<CodeAction>();
 
-        if (MissingHandlerAction(document, hit) is { } fix)
-            actions.Add(fix);
+        // A tag without runat is a plain element, so ResolveAt has no hit to offer for it —
+        // this one is found from the tree, and it needs no code-behind.
+        if (MissingRunatAction(document, offset) is { } runat)
+            actions.Add(runat);
 
-        if (DefaultEventAction(document, hit) is { } wire)
-            actions.Add(wire);
+        if (document.CodeBehind is not null
+            && AspxSymbolResolver.ResolveAt(document, offset) is { } hit)
+        {
+            if (MissingHandlerAction(document, hit) is { } fix)
+                actions.Add(fix);
+
+            if (DefaultEventAction(document, hit) is { } wire)
+                actions.Add(wire);
+        }
 
         return actions.ToArray();
+    }
+
+    /// <summary>
+    /// The caret is on a tag that names a control but is missing <c>runat="server"</c>: write
+    /// the attribute where the tag name ends.
+    /// </summary>
+    private static CodeAction? MissingRunatAction(AspxDocument document, int offset)
+    {
+        foreach (var element in AspxSymbolResolver.EnumerateElements(document.Tree!))
+        {
+            if (!AspxSymbolResolver.Contains(element.StartTag.Range, offset))
+                continue;
+
+            if (AspxRunatDiagnostics.TagWithoutRunat(document, element) is null)
+                continue;
+
+            var position = LspConverters.ToPosition(
+                document.SourceText.Lines.GetLinePosition(element.StartTag.ElementRange.End.Offset));
+
+            return new CodeAction(
+                "Add runat=\"server\"",
+                "quickfix",
+                new WorkspaceEdit(new Dictionary<string, TextEdit[]>
+                {
+                    [LspConverters.PathToUri(document.FilePath)] =
+                        [new TextEdit(new Protocol.Range(position, position), " runat=\"server\"")],
+                }));
+        }
+
+        return null;
     }
 
     /// <summary>

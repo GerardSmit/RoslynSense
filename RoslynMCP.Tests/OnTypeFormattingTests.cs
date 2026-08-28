@@ -201,6 +201,45 @@ public class OnTypeFormattingTests
     /// "$$" marking where the caret is, just past the character that was typed — and returns
     /// the text the edits it answered with produce.
     /// </summary>
+    [Fact]
+    public async Task AKeywordGetsItsSpaceWhenTheBracelessBodyEnds()
+    {
+        // "if(x) {" has always been spaced by the "{" trigger. The braceless body was the gap:
+        // the first statement ancestor of the ";" is the body, and the spacing lives on the
+        // header above it.
+        string result = await TypeAsync(";", "        if(true) Console.WriteLine(1);$$");
+
+        Assert.Contains("if (true)", result, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("for(int i = 0; i < 1; i++) Console.WriteLine(i);", "for (int i = 0;")]
+    [InlineData("while(true) Console.WriteLine(1);", "while (true)")]
+    [InlineData("foreach(var c in \"ab\") Console.WriteLine(c);", "foreach (var c in")]
+    [InlineData("lock(this) Console.WriteLine(1);", "lock (this)")]
+    public async Task EveryControlFlowKeywordGetsTheSameTreatment(string typed, string expected)
+    {
+        // One Roslyn spacing option covers them all, so widening the span is the whole change —
+        // there is nothing per-keyword to add.
+        string result = await TypeAsync(";", "        " + typed + "$$");
+
+        Assert.Contains(expected, result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AStatementInsideABlockDoesNotDragTheHeaderIn()
+    {
+        // The guard on the widening. A body written with braces is a block, and formatting the
+        // enclosing header's whole span would reflow every sibling in it — the regression this
+        // handler already carries a comment about.
+        string result = await TypeAsync(
+            ";",
+            "        if (true)\r\n        {\r\n            int x=1;$$\r\n            int y   =   2;\r\n        }");
+
+        // The sibling the user was not typing on keeps its own spacing.
+        Assert.Contains("int y   =   2;", result, StringComparison.Ordinal);
+    }
+
     private static async Task<string> TypeAsync(string character, string body)
     {
         string path = FixturePaths.CalculatorFile;

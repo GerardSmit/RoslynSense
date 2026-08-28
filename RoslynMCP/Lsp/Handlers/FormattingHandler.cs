@@ -102,8 +102,47 @@ internal static class FormattingHandler
         var node = typed.Parent?
             .AncestorsAndSelf()
             .FirstOrDefault(n => n is StatementSyntax or MemberDeclarationSyntax);
-        return node is null ? Array.Empty<TextSpan>() : [node.Span];
+        if (node is null)
+            return Array.Empty<TextSpan>();
+
+        // Out to the header a braceless body belongs to. The spacing rules that turn "if(x)" into
+        // "if (x)" live on the header, and the first statement ancestor of the ";" is the body
+        // itself — so a braceless "if" was the one shape that never got them, while "if(x) {" has
+        // always had them from the "{" trigger.
+        //
+        // Climbing is bounded by the absence of a block: a body written with braces is a
+        // BlockSyntax and stops this immediately, which is what keeps the span off the siblings
+        // in an ordinary block. A braceless body is the single statement just typed, so widening
+        // to its header reflows nothing the user did not just write.
+        while (node is StatementSyntax embedded && HeaderOf(embedded) is { } header)
+            node = header;
+
+        return [node.Span];
     }
+
+    /// <summary>
+    /// The control-flow statement <paramref name="statement"/> is the braceless body of, or null
+    /// when it is not one — a block, a statement in a block, or a body written with braces.
+    /// </summary>
+    /// <remarks>
+    /// An <c>else</c> body deliberately does not climb. Its header is the whole if-statement, so
+    /// reaching it would drag the then-branch — braces, body and all — into the span, which is
+    /// the reflow this handler exists to avoid. Nothing is lost: <c>else</c> takes no parentheses,
+    /// and in <c>else if (x)</c> the inner if is the header its own body climbs to.
+    /// </remarks>
+    private static StatementSyntax? HeaderOf(StatementSyntax statement) =>
+        statement is BlockSyntax ? null : statement.Parent switch
+        {
+            IfStatementSyntax p when p.Statement == statement => p,
+            ForStatementSyntax p when p.Statement == statement => p,
+            CommonForEachStatementSyntax p when p.Statement == statement => p,
+            WhileStatementSyntax p when p.Statement == statement => p,
+            DoStatementSyntax p when p.Statement == statement => p,
+            UsingStatementSyntax p when p.Statement == statement => p,
+            LockStatementSyntax p when p.Statement == statement => p,
+            FixedStatementSyntax p when p.Statement == statement => p,
+            _ => null,
+        };
 
     /// <summary>
     /// The header up to and including the opening brace, plus — when the closing brace is the

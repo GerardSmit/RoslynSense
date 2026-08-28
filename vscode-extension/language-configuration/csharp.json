@@ -18,5 +18,27 @@
         "increaseIndentPattern": "^((?!\\/\\/).)*(\\{[^}\"'`]*|\\([^)\"'`]*|\\[[^\\]\"'`]*)$",
         // A line that starts with a closer sits one level back out.
         "decreaseIndentPattern": "^((?!.*?\\/\\*).*\\*\\/)?\\s*[\\}\\]\\)].*$"
-    }
+    },
+    "onEnterRules": [
+        {
+            // The way out of a braceless body. A single-statement "if (x)" body ends at its
+            // semicolon, so the line after it belongs at the "if"'s own indent — but no
+            // indentation rule can know that: increaseIndentPattern does not match a line
+            // ending in ";", and when nothing matches the editor keeps the previous line's
+            // whitespace, which leaves the caret hanging under the statement it just finished.
+            //
+            // Matched on the pair of lines rather than one: the header alone would outdent
+            // after any statement following an "if", and the statement alone would outdent
+            // in the middle of an ordinary block. Both together identify the one shape where
+            // a level was entered without a brace and has now been left.
+            //
+            // A body that opens a brace is not this shape — the brace owns the level, and
+            // decreaseIndentPattern already takes it back at the "}".
+            "beforeText": "^\\s*(?!.*[{}]\\s*$).*;\\s*$",
+            "previousLineText": "^\\s*(\\}\\s*)?(else\\s+if\\s*\\(.*\\)|if\\s*\\(.*\\)|for\\s*\\(.*\\)|foreach\\s*\\(.*\\)|while\\s*\\(.*\\)|using\\s*\\(.*\\)|lock\\s*\\(.*\\)|fixed\\s*\\(.*\\)|else)\\s*$",
+            "action": {
+                "indent": "outdent"
+            }
+        }
+    ]
 }

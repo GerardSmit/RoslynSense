@@ -1871,12 +1871,28 @@ function forwardProcessOutput(session: vscode.DebugSession, body: any): void {
     if (!client || !text) {
         return;
     }
+    const pid = outputPidFor(session);
+    if (pid !== undefined) {
+        void client.sendNotification('roslynSense/processOutput', { pid, text });
+    }
+}
+
+/**
+ * The pid to file this session's output under.
+ *
+ * A launch is known from the registry the process event built. An attach is not in that
+ * registry — registering it would claim the editor supervises a process it only observes —
+ * but its pid is in the configuration, and output is worth forwarding either way: attaching
+ * to a running app is exactly how Debug.WriteLine output becomes readable at all, since the
+ * runtime only raises those messages while a debugger is listening.
+ */
+function outputPidFor(session: vscode.DebugSession): number | undefined {
     for (const [pid, owner] of editorLaunches) {
         if (owner === session) {
-            void client.sendNotification('roslynSense/processOutput', { pid, text });
-            return;
+            return pid;
         }
     }
+    return attachedPid(session);
 }
 
 function unregisterEditorProcess(session: vscode.DebugSession): void {

@@ -2738,6 +2738,33 @@ public sealed partial class DebugSession : IDebugSession
                         string.Empty, 0);
                 }
             };
+            callback.OnCreateProcess += (_, e) =>
+            {
+                // Debug.WriteLine and Trace.WriteLine never reach stdout: DefaultTraceListener
+                // hands them to the debugger and nowhere else, so without this they are
+                // invisible to anything reading the debuggee's streams. The runtime raises them
+                // as LogMessage callbacks only once asked, and the ask is per process, which is
+                // why it happens here rather than at each of the four places that attach.
+                // Try rather than Enable: this engine also drives CoreCLR when configured to,
+                // and a runtime that declines is answering a question rather than failing at
+                // one — nothing the user could act on if it were reported.
+                Safe(() => e.Process.TryEnableLogMessages(true));
+            };
+            callback.OnLogMessage += (_, e) =>
+            {
+                // Emitted as Output so it lands wherever the debuggee's console output already
+                // goes. The switch name is not the Debug.WriteLine category — the framework has
+                // already folded that into the text as "category: message" by this point, and
+                // leaves the switch empty. It is only ever set by a direct Debugger.Log, and is
+                // prefixed rather than dropped so that caller keeps the label it passed.
+                var message = Safe(() => e.Message) ?? string.Empty;
+                if (message.Length == 0)
+                    return;
+                var category = Safe(() => e.LogSwitchName) ?? string.Empty;
+                if (category.Length > 0)
+                    message = $"[{category}] {message}";
+                Emit(DebugEventKind.Output, message, string.Empty, ThreadId(e.Thread));
+            };
             callback.OnExitProcess += (_, _) =>
             {
                 Emit(DebugEventKind.Exited, DescribeExit(), string.Empty, 0);

@@ -5,6 +5,10 @@ public enum ServiceLogSeverity
     Info,
     Warning,
     Error,
+
+    /// <summary>Self-diagnostics: reports about the tool's own health rather than the user's
+    /// solution. Routed to a dedicated debug output channel, never a toast.</summary>
+    Debug,
 }
 
 /// <summary>
@@ -16,6 +20,15 @@ public static class ServiceLog
 {
     /// <summary>Installed by the LSP layer. The key groups repeats for rate limiting.</summary>
     public static Action<ServiceLogSeverity, string, string?>? Sink { get; set; }
+
+    /// <summary>
+    /// Self-diagnostics: reports about the tool's own health (a sweep that is not converging, an
+    /// internal cache churning) rather than about the user's solution. The LSP sink writes these
+    /// into the editor's debug output channel — never a toast — and stderr keeps the record
+    /// either way, which is what a bug report attaches.
+    /// </summary>
+    public static void Debug(string message, string? key = null) =>
+        Report(ServiceLogSeverity.Debug, message, key);
 
     public static void Info(string message) => Report(ServiceLogSeverity.Info, message, null);
 

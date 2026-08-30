@@ -27,12 +27,43 @@ internal static class LspLog
 
     /// <summary>Installs the sink so non-LSP services can report through the editor.</summary>
     public static void Install() => ServiceLog.Sink = (severity, message, key) =>
+    {
+        if (severity == ServiceLogSeverity.Debug)
+        {
+            SendDebug(message);
+            return;
+        }
         Send(severity switch
         {
             ServiceLogSeverity.Error => MessageType.Error,
             ServiceLogSeverity.Warning => MessageType.Warning,
             _ => MessageType.Info,
         }, message, key);
+    };
+
+    /// <summary>
+    /// Self-diagnostics go to the extension's own debug output channel via a custom
+    /// notification, not through <c>window/logMessage</c>: the standard channel is the user's
+    /// view of their solution, and a report about the tool's internals showing up there — let
+    /// alone as a toast — is how the sweep-convergence telemetry became a complaint.
+    /// </summary>
+    private static void SendDebug(string message)
+    {
+        Console.Error.WriteLine($"[Lsp] Debug: {message}");
+
+        var payload = new DebugLogParams(message);
+        foreach (var rpc in LspSessionRegistry.ActiveSessions())
+        {
+            try
+            {
+                _ = rpc.NotifyWithParameterObjectAsync("roslynSense/debugLog", payload);
+            }
+            catch (Exception ex) when (ex is ConnectionLostException or ObjectDisposedException)
+            {
+                // Session ended; the others still get it.
+            }
+        }
+    }
 
     private static void Send(MessageType type, string message, string? key)
     {
@@ -83,4 +114,8 @@ internal static class LspLog
 
 public sealed record ShowMessageParams(
     [property: JsonPropertyName("type")] int Type,
+    [property: JsonPropertyName("message")] string Message);
+
+/// <summary>A line for the extension's debug output channel.</summary>
+public sealed record DebugLogParams(
     [property: JsonPropertyName("message")] string Message);

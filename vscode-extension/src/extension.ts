@@ -25,6 +25,8 @@ import { registerSolutionReady } from './solutionReady';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerChangedMembers } from './changedMembers';
 import { registerSolutionExplorer } from './solutionExplorer';
+import { registerDiscoveryExplorer } from './discoveryExplorer';
+import { extensionDebug } from './extensionDebug';
 import { registerSearchEverywhere } from './search';
 import { registerSettingsPanel } from './settings';
 import { registerVirtualDocuments } from './virtualDocuments';
@@ -219,8 +221,24 @@ export const EXTRA_LANGUAGES: readonly ExtraLanguage[] = [
     },
     {
         // Nor this one: a schedule is a fact about a string literal too, and the Cron Jobs section
-        // of the Solution Explorer hangs off the solution rather than off any file.
+        // of the Discovery view hangs off the solution rather than off any file.
         id: 'cron',
+        extensions: [],
+        breakpoints: false,
+    },
+    {
+        // Nor this one, for the same reason: a route is an attribute or a call in a `.cs` file,
+        // and the Routes section hangs off the solution. The row exists only to carry the id into
+        // `serverSettings().languages`.
+        id: 'routes',
+        extensions: [],
+        breakpoints: false,
+    },
+    {
+        // Nor this one. The files it reads are YAML, and claiming `.yml` would claim every
+        // pipeline definition in the solution with it — the pack knows its own files by where they
+        // are, which no document selector can express. The row carries the id and nothing else.
+        id: 'templates',
         extensions: [],
         breakpoints: false,
     },
@@ -706,6 +724,50 @@ function capturingServerOptions(
         });
 }
 
+/** The oldest server release this extension's custom LSP requests are known to work against. */
+const MIN_SERVER_VERSION = '0.3.0';
+
+let warnedAboutServerVersion = false;
+
+/**
+ * A soft nudge when the connected server predates what the extension was built against — the
+ * protocol carries custom methods, and an old daemon answering them with errors looks like the
+ * extension being broken. Silent when the version does not parse (a dev build reporting a
+ * suffix, or nothing at all): the people running those know what they are running.
+ */
+function warnOnOutdatedServer(serverVersion: string | undefined): void {
+    if (warnedAboutServerVersion || !serverVersion) {
+        return;
+    }
+    const parse = (v: string) => v.match(/^(\d+)\.(\d+)\.(\d+)/)?.slice(1, 4).map(Number);
+    const actual = parse(serverVersion);
+    const wanted = parse(MIN_SERVER_VERSION)!;
+    if (!actual) {
+        return;
+    }
+    const older =
+        actual[0] !== wanted[0] ? actual[0] < wanted[0]
+        : actual[1] !== wanted[1] ? actual[1] < wanted[1]
+        : actual[2] < wanted[2];
+    if (!older) {
+        return;
+    }
+    warnedAboutServerVersion = true;
+    void vscode.window
+        .showWarningMessage(
+            `The RoslynSense server is ${serverVersion}, older than this extension expects ` +
+                `(${MIN_SERVER_VERSION}+). Some features may not answer until it is updated.`,
+            'Update Server'
+        )
+        .then((choice) => {
+            if (choice === 'Update Server') {
+                const terminal = vscode.window.createTerminal('RoslynSense update');
+                terminal.show();
+                terminal.sendText('dotnet tool update -g RoslynSense', true);
+            }
+        });
+}
+
 async function startClient(
     context: vscode.ExtensionContext,
     binding?: { solutionPath?: string; folder?: vscode.WorkspaceFolder }
@@ -879,6 +941,10 @@ async function startClient(
     clientsBySolution.set(clientKey, client);
     wireEditorDebugCommandHandler(client);
     wireNuGetCredentials(client, context);
+    // The server's self-diagnostics (roslynSense/debugLog) land in the shared debug channel
+    // rather than the main output: they are about the tool's health, not the user's solution.
+    client.onNotification('roslynSense/debugLog', (params: { message: string }) =>
+        extensionDebug().appendLine(`[server] ${params.message}`));
     client.onDidChangeState((e) => {
         if (!statusItem) {
             return;
@@ -904,11 +970,13 @@ async function startClient(
 
     try {
         await client.start();
+        void vscode.commands.executeCommand('setContext', 'roslynSense.serverMissing', false);
         statusItem.busy = false;
         statusItem.severity = vscode.LanguageStatusSeverity.Information;
         statusItem.text = solutionPath
             ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
             : 'RoslynSense: running';
+        warnOnOutdatedServer(client.initializeResult?.serverInfo?.version);
         refreshInheritanceMarkers?.();
         sendBreakpointSnapshot();
     } catch (err) {
@@ -925,12 +993,30 @@ async function startClient(
 
         // The install advice only fits a spawn failure. Printing it for every failure sends the
         // reader to check their PATH for a problem that is in the extension.
-        void vscode.window.showErrorMessage(
-            /ENOENT|spawn|not recognized|cannot find/i.test(String(err))
-                ? `RoslynSense failed to start: ${err}. Install with: dotnet tool install -g ` +
-                  `RoslynSense, or set roslynSense.serverPath.`
-                : `RoslynSense failed to start: ${err}`
-        );
+        if (/ENOENT|spawn|not recognized|cannot find/i.test(String(err))) {
+            // Drives the Solution view's welcome content, which repeats these actions for
+            // whoever missed the toast.
+            void vscode.commands.executeCommand('setContext', 'roslynSense.serverMissing', true);
+            void vscode.window
+                .showErrorMessage(
+                    `RoslynSense could not run '${serverPath}'. Install the server (needs the ` +
+                        '.NET SDK), or point roslynSense.serverPath at a built binary.',
+                    'Install Server',
+                    'Open Settings'
+                )
+                .then((choice) => {
+                    if (choice === 'Install Server') {
+                        void vscode.commands.executeCommand('roslynSense.installServer');
+                    } else if (choice === 'Open Settings') {
+                        void vscode.commands.executeCommand(
+                            'workbench.action.openSettings',
+                            'roslynSense.serverPath'
+                        );
+                    }
+                });
+        } else {
+            void vscode.window.showErrorMessage(`RoslynSense failed to start: ${err}`);
+        }
     }
 }
 
@@ -996,6 +1082,34 @@ async function stopClient(): Promise<void> {
 }
 
 /**
+ * Whether this workspace has shown any reason to run the server — a solution, a project, or a
+ * C# file, found by the activation scan or by the user opening one of the languages below.
+ * `false` means activation happened for something incidental (syntax highlighting for a .proto
+ * or .resx in a repository that is not .NET at all) and no server is spawned.
+ */
+let dotnetWorkspace = false;
+
+/** Languages whose documents justify starting the server in a workspace the scan cleared. */
+const SERVER_WARRANTING_LANGUAGES = new Set(['csharp', 'webforms', 'msbuild', 'dbml']);
+
+function markDotnetWorkspace(): void {
+    if (!dotnetWorkspace) {
+        dotnetWorkspace = true;
+        void vscode.commands.executeCommand('setContext', 'roslynSense.noDotnetWorkspace', false);
+    }
+}
+
+/** One bounded findFiles: does anything here look like .NET? */
+async function workspaceHasDotnetContent(folder: vscode.WorkspaceFolder): Promise<boolean> {
+    const hits = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(folder, '**/*.{sln,slnx,csproj,cs,aspx,ascx,master}'),
+        SOLUTION_SEARCH_EXCLUDE,
+        1
+    );
+    return hits.length > 0;
+}
+
+/**
  * Points `client` at the solution owning the focused editor, starting that solution's client the
  * first time it is needed.
  *
@@ -1014,6 +1128,14 @@ async function bindActiveEditor(
     if (!folder) {
         return;
     }
+
+    // A workspace that showed no .NET content at activation starts no server until a document
+    // that needs one is actually opened. Without this, the extension activating for a stray
+    // .proto file in an unrelated repository spawns (and toasts about) a C# server nobody wants.
+    if (!dotnetWorkspace && !SERVER_WARRANTING_LANGUAGES.has(document.languageId)) {
+        return;
+    }
+    markDotnetWorkspace();
 
     const solutionPath = await solutionForFolder(folder);
     const key = bindingKey(solutionPath, folder);
@@ -3352,16 +3474,34 @@ function wireEditorDebugCommandHandler(c: LanguageClient): void {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    context.subscriptions.push(extensionDebug());
     context.subscriptions.push(
         vscode.commands.registerCommand('roslynSense.openSolution', async () => {
             const config = vscode.workspace.getConfiguration('roslynSense');
             await config.update('solutionPath', undefined, vscode.ConfigurationTarget.Workspace);
+            markDotnetWorkspace();
             await stopClient();
             await startClient(context);
         }),
         vscode.commands.registerCommand('roslynSense.restartServer', async () => {
+            markDotnetWorkspace();
             await stopClient();
             await startClient(context);
+        }),
+        vscode.commands.registerCommand('roslynSense.installServer', () => {
+            const terminal = vscode.window.createTerminal('RoslynSense install');
+            terminal.show();
+            terminal.sendText('dotnet tool install -g RoslynSense', true);
+            void vscode.window
+                .showInformationMessage(
+                    'Installing the RoslynSense server. When the install finishes, restart the server.',
+                    'Restart Server'
+                )
+                .then((choice) => {
+                    if (choice === 'Restart Server') {
+                        void vscode.commands.executeCommand('roslynSense.restartServer');
+                    }
+                });
         })
     );
     registerConfigurationSync(context);
@@ -3381,6 +3521,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerCoverageExplorer(context, () => client);
     registerChangedMembers(context, () => client);
     registerSolutionExplorer(context, () => client);
+    registerDiscoveryExplorer(context, () => client);
     registerVirtualDocuments(context, () => client);
     registerEmbeddedLanguages(context);
     registerSearchEverywhere(context, () => client);
@@ -3404,12 +3545,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // first file opened started a *second* client over the same files. Both then answered every
     // request, which is two of every code lens, two definitions, two of everything.
     const firstRoot = vscode.workspace.workspaceFolders?.[0];
-    await startClient(
-        context,
-        firstRoot
-            ? { solutionPath: await solutionForFolder(firstRoot, true), folder: firstRoot }
-            : undefined
-    );
+    if (firstRoot && !(await workspaceHasDotnetContent(firstRoot))) {
+        // Activated for something incidental — a .proto, a .resx — in a workspace with no .NET
+        // content. Highlighting needs no server; the client starts if the user opens a C# file
+        // (bindActiveEditor below) or picks a solution, and the Solution view explains itself
+        // through the viewsWelcome bound to this context key.
+        void vscode.commands.executeCommand('setContext', 'roslynSense.noDotnetWorkspace', true);
+        // The document that triggered activation may already be focused, in which case no
+        // editor-change event is coming — judge it now.
+        void bindActiveEditor(context, vscode.window.activeTextEditor?.document);
+    } else {
+        markDotnetWorkspace();
+        await startClient(
+            context,
+            firstRoot
+                ? { solutionPath: await solutionForFolder(firstRoot, true), folder: firstRoot }
+                : undefined
+        );
+    }
 
     // Multi-root: follow the focused editor to whichever solution owns it.
     context.subscriptions.push(

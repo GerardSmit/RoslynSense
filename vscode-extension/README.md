@@ -9,13 +9,15 @@ assistant's analysis tools, and the assistant's view is always in sync with what
 
 ## Requirements
 
+- The [.NET SDK](https://dotnet.microsoft.com/download) (the server is a dotnet tool).
 - The `roslyn-sense` dotnet tool on PATH:
 
   ```bash
-  dotnet tool install -g roslyn-sense
+  dotnet tool install -g RoslynSense
   ```
 
-  Or set `roslynSense.serverPath` to a locally built binary.
+  Or set `roslynSense.serverPath` to a locally built binary. If the server is missing, the
+  extension offers to install it — from the error notification or from the Solution view.
 
 ## How it works
 
@@ -39,7 +41,8 @@ logpoints, and data breakpoints are not supported by netcoredbg.
 assistant to start a debug session for those; it uses ICorDebug.
 
 Separately, the `roslynsense-ai` debug type mirrors a debug session an AI chat owns, so you can
-watch and control it in the normal debugger UI. See the debug bridge notes in the main README.
+watch and control it in the normal debugger UI. See the debug bridge notes in the
+[repository README](https://github.com/GerardSmit/RoslynSense#readme).
 
 ## Test Explorer
 

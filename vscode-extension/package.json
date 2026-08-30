@@ -5,6 +5,32 @@
   "version": "0.2.0",
   "publisher": "roslyn-sense",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GerardSmit/RoslynSense.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/GerardSmit/RoslynSense/issues"
+  },
+  "homepage": "https://github.com/GerardSmit/RoslynSense",
+  "keywords": [
+    "csharp",
+    "C#",
+    ".NET",
+    "roslyn",
+    "webforms",
+    "asp.net",
+    "resx",
+    "msbuild",
+    "nuget",
+    "solution explorer",
+    "debugger",
+    "test explorer",
+    "mcp",
+    "language server"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -249,6 +275,10 @@
       {
         "command": "roslynSense.restartServer",
         "title": "RoslynSense: Restart Server"
+      },
+      {
+        "command": "roslynSense.installServer",
+        "title": "RoslynSense: Install Language Server"
       },
       {
         "command": "roslynSense.reloadValueSets",
@@ -690,6 +720,18 @@
         "icon": "$(debug-alt)"
       },
       {
+        "command": "roslynSense.solutionExplorer.startStartupProject",
+        "title": "Start",
+        "category": "RoslynSense",
+        "icon": "$(play)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.debugStartupProject",
+        "title": "Debug",
+        "category": "RoslynSense",
+        "icon": "$(debug-alt)"
+      },
+      {
         "command": "roslynSense.solutionExplorer.newSolutionFolder",
         "title": "New Solution Folder",
         "category": "RoslynSense",
@@ -721,9 +763,22 @@
         "category": "RoslynSense"
       },
       {
-        "command": "roslynSense.solutionExplorer.goToJobMethod",
-        "title": "Go to Job Method",
-        "category": "RoslynSense"
+        "command": "roslynSense.discovery.refresh",
+        "title": "Refresh",
+        "category": "RoslynSense",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "roslynSense.discovery.goToDefinition",
+        "title": "Go to Definition",
+        "category": "RoslynSense",
+        "icon": "$(symbol-interface)"
+      },
+      {
+        "command": "roslynSense.discovery.goToImplementation",
+        "title": "Go to Implementation",
+        "category": "RoslynSense",
+        "icon": "$(symbol-class)"
       },
       {
         "command": "roslynSense.solutionExplorer.addProjectReference",
@@ -762,6 +817,14 @@
           "contextualTitle": "Changed Members",
           "icon": "$(git-compare)",
           "initialSize": 1
+        },
+        {
+          "id": "roslynSense.discovery",
+          "name": "Discovery",
+          "contextualTitle": "Discovery",
+          "icon": "$(compass)",
+          "visibility": "collapsed",
+          "initialSize": 2
         }
       ],
       "test": [
@@ -773,6 +836,18 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "roslynSense.solutionExplorer",
+        "contents": "The RoslynSense language server (`roslyn-sense`) was not found. It is a dotnet tool and needs the .NET SDK.\n[Install Language Server](command:roslynSense.installServer)\nAlready built it yourself? Point `roslynSense.serverPath` at the binary.\n[Open Settings](command:workbench.action.openSettings?%5B%22roslynSense.serverPath%22%5D)\nThen restart the server.\n[Restart Server](command:roslynSense.restartServer)",
+        "when": "roslynSense.serverMissing"
+      },
+      {
+        "view": "roslynSense.solutionExplorer",
+        "contents": "No solution or C# project found in this workspace. The server starts when a solution is picked or a C# file is opened.\n[Pick Solution](command:roslynSense.openSolution)",
+        "when": "!roslynSense.serverMissing && roslynSense.noDotnetWorkspace"
+      }
+    ],
     "breakpoints": [
       {
         "language": "csharp"
@@ -1095,7 +1170,11 @@
           "when": "false"
         },
         {
-          "command": "roslynSense.solutionExplorer.goToJobMethod",
+          "command": "roslynSense.discovery.goToDefinition",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.discovery.goToImplementation",
           "when": "false"
         },
         {
@@ -1135,6 +1214,14 @@
           "when": "false"
         },
         {
+          "command": "roslynSense.solutionExplorer.startStartupProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugStartupProject",
+          "when": "false"
+        },
+        {
           "command": "roslynSense.solutionExplorer.newSolutionFolder",
           "when": "false"
         },
@@ -1146,11 +1233,6 @@
         {
           "command": "roslynSense.solutionExplorer.goToProject",
           "when": "view == roslynSense.solutionExplorer && viewItem == projectRef",
-          "group": "1_edit@1"
-        },
-        {
-          "command": "roslynSense.solutionExplorer.goToJobMethod",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^cronJob.*Method$/",
           "group": "1_edit@1"
         },
         {
@@ -1182,6 +1264,11 @@
         }
       ],
       "view/title": [
+        {
+          "command": "roslynSense.discovery.refresh",
+          "when": "view == roslynSense.discovery",
+          "group": "navigation@1"
+        },
         {
           "command": "roslynSense.runImpactedTests",
           "when": "view == workbench.view.testing",
@@ -1318,14 +1405,24 @@
           "group": "navigation@2"
         },
         {
-          "command": "roslynSense.solutionExplorer.goToNode",
+          "command": "roslynSense.solutionExplorer.startStartupProject",
           "when": "view == roslynSense.solutionExplorer",
           "group": "navigation@1"
         },
         {
-          "command": "roslynSense.solutionExplorer.focusCurrentFile",
+          "command": "roslynSense.solutionExplorer.debugStartupProject",
           "when": "view == roslynSense.solutionExplorer",
           "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToNode",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.focusCurrentFile",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@4"
         },
         {
           "command": "roslynSense.solutionExplorer.followCurrentFile",
@@ -1379,6 +1476,31 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "roslynSense.discovery.goToDefinition",
+          "when": "view == roslynSense.discovery && viewItem =~ /^(protoService|protoRpc|cronJob|route|templateEntry|templateModule)(Dynamic)?(Target)?$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "roslynSense.discovery.goToImplementation",
+          "when": "view == roslynSense.discovery && viewItem =~ /Target$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "roslynSense.discovery.goToDefinition",
+          "when": "view == roslynSense.discovery && viewItem =~ /^(protoService|protoRpc|cronJob|route|templateEntry|templateModule)(Dynamic)?(Target)?$/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.discovery.goToImplementation",
+          "when": "view == roslynSense.discovery && viewItem =~ /Target$/",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.discovery.refresh",
+          "when": "view == roslynSense.discovery",
+          "group": "9_refresh"
+        },
         {
           "command": "roslynSense.changedMembers.openDiff",
           "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|Block|OtherFile)(Reviewed|Staged)?$/",
@@ -1852,6 +1974,16 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Colour, explain and check the crontab expressions handed to Hangfire and Quartz — and any string passed to a parameter named `cronExpression` or close to it — and list every scheduled job in the solution under Cron Jobs. Off hides the section and leaves the strings plain in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.routes": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "List every HTTP endpoint the solution serves under Routes \u2014 the path, the verb and the method that handles it \u2014 reading ASP.NET Core attributes and minimal APIs, ASP.NET Web API attributes, and any attribute or registration method named under `routes` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.templates": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "List the screens an application declares in template files under Templates \u2014 nested as the files nest them, with a button to the declaration and one to the control that renders it. Reads `App_Data/Templates` and `App_Data/TemplatesCustom`, and any folder named under `templates` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.logging": {
           "type": "boolean",

@@ -85,6 +85,39 @@ jobs:
       - name: Test
         run: dotnet test RoslynMCP.sln --configuration Release --no-build --nologo -p:UseAppHost=false
 
+  vscode-extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vscode-extension
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Package
+        run: npx @vscode/vsce package
+
+      - name: Upload vsix
+        uses: actions/upload-artifact@v4
+        with:
+          name: roslyn-sense-vsix
+          path: vscode-extension/*.vsix
+          if-no-files-found: error
+
   release:
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))

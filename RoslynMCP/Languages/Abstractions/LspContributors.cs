@@ -380,39 +380,46 @@ internal enum WatchedFileChange
 }
 
 /// <summary>
-/// A section of the Solution Explorer that a pack owns, hung under the solution node beside the
-/// projects.
+/// A top-level section of the Discovery view that a pack owns.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The tree answers "what is in this solution" structurally — folders, projects, files — and there
-/// are facts about a solution that no structure holds. Which jobs run on a schedule is one: the
-/// registrations are ordinary calls in one startup file, so the tree has no row for them and the
-/// job methods look uncalled, and the answer to "what runs here, and when" exists nowhere in the
-/// editor. A section is where a pack puts an answer like that.
+/// The Solution Explorer answers "what is in this solution" structurally — folders, projects,
+/// files — and there are facts about a solution that no structure holds. Which jobs run on a
+/// schedule is one: the registrations are ordinary calls in one startup file, so the tree has no
+/// row for them and the job methods look uncalled, and the answer to "what runs here, and when"
+/// exists nowhere in the editor. The routes an app serves and the rpcs it exposes are two more.
+/// A section is where a pack puts an answer like that.
+/// </para>
+/// <para>
+/// These hung under the solution node once, and moving them out is what the view is for. A
+/// section is not a folder and does not belong in a list of them: the Explorer is browsed by
+/// where a file lives, and none of these answers is reachable that way. Keeping the two apart
+/// also lets a section group its rows however its own subject wants — Routes by project, Proto by
+/// package — rather than by whatever the solution's folders happen to be.
 /// </para>
 /// <para>
 /// Two methods rather than one, and the split is the whole contract.
-/// <see cref="SectionAsync"/> runs on the root listing, which is bound by the tree's promise that
-/// drawing the solution evaluates no project — so it answers from cheap evidence only: a manifest
-/// scan, a cached probe, configuration. <see cref="ChildrenAsync"/> runs after a click, which can
-/// afford a compilation.
+/// <see cref="SectionAsync"/> runs on the root listing, which is drawn every time the view
+/// becomes visible — so it answers from cheap evidence only: a manifest scan, a cached probe,
+/// configuration. <see cref="ChildrenAsync"/> runs after a click, which can afford a compilation.
 /// </para>
 /// </remarks>
-internal interface ILanguageSolutionTreeContributor
+internal interface ILanguageDiscoveryContributor
 {
     /// <summary>
     /// The prefix every node id this contributor mints begins with, colon included — <c>"cron:"</c>.
     /// </summary>
     /// <remarks>
-    /// How the handler routes a click back without knowing what the pack put in the tree, and why
-    /// the routing arm goes last: a prefix here can never shadow <c>project:</c> or <c>file:</c>.
+    /// How the handler routes a click back without knowing what the pack put in the tree. Prefixes
+    /// have to stay distinct between packs: the handler takes the first contributor whose prefix
+    /// matches, so two packs sharing one would send half the clicks to the wrong pack.
     /// </remarks>
     string NodeIdPrefix { get; }
 
     /// <summary>
-    /// This contributor's own node under the solution root, or null when the solution has nothing
-    /// for it — which is the answer in most solutions and has to stay the cheap one.
+    /// This contributor's own root node, or null when the solution has nothing for it — which is
+    /// the answer in most solutions and has to stay the cheap one.
     /// </summary>
     Task<SolutionTreeNode?> SectionAsync(string solutionPath, CancellationToken ct);
 
@@ -422,4 +429,42 @@ internal interface ILanguageSolutionTreeContributor
     /// </summary>
     Task<SolutionTreeNode[]> ChildrenAsync(
         string nodeId, SolutionTreeParams p, CancellationToken ct);
+}
+
+/// <summary>
+/// Where the thing a Discovery row names is implemented, resolved when the button is pressed
+/// rather than when the row was drawn.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The other half of <see cref="SolutionNodeKind.SecondaryTargetSuffix"/>. Most rows do not need
+/// this: a scheduled job knows its own method and an endpoint knows its handler, so both carry the
+/// answer in <see cref="SolutionTreeNode.GoToSecondary"/> and the button opens it without asking
+/// anybody. A pack implements this interface only when its rows cannot.
+/// </para>
+/// <para>
+/// An rpc cannot, for two reasons that are both about cost rather than difficulty. Crossing from a
+/// <c>.proto</c> declaration to the C# honouring it is a solution-wide symbol search over derived
+/// classes and overrides — far too much to run for every row the moment a service is expanded,
+/// and the contributor contract says a listing must not evaluate a project at all. And there may
+/// be several answers where <c>GoToSecondary</c> holds exactly one: an rpc overridden by a real
+/// server and by a test double has two implementations, and picking one of them arbitrarily would
+/// be worse than either offering both or offering neither.
+/// </para>
+/// <para>
+/// Answering is therefore allowed to be slow, because it only ever runs for a button somebody
+/// pressed. It must honour the cancellation token for the same reason — the search waits on
+/// however many projects consume the contract, which for a low-level one is the whole solution,
+/// and the token is the only bound on that wait.
+/// </para>
+/// </remarks>
+internal interface ILanguageDiscoveryImplementationResolver
+{
+    /// <summary>
+    /// What implements the declaration at this position, or an explained emptiness. Never null:
+    /// "nothing, and here is why" is an answer, and the reason is the part the caller cannot work
+    /// out for itself.
+    /// </summary>
+    Task<DiscoveryImplementationsResult> DiscoveryImplementationsAsync(
+        TextDocumentPositionParams p, CancellationToken ct);
 }

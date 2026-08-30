@@ -63,6 +63,10 @@
       <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
       <PackageReference Include="StreamJsonRpc" Version="2.25.29" />
       <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="all" ExcludeAssets="runtime" />
+      <!-- YAML with source positions. The Templates pack turns a row in a tree into a jump
+           to the line that declares it, so the parser has to report marks - which rules out
+           deserializing into a model and rules out reading the file by hand. -->
+      <PackageReference Include="YamlDotNet" Version="16.3.0" />
     </ItemGroup>
 
     <!-- Compile-time access to Roslyn internals (inlay hints, MEF export provider, signature

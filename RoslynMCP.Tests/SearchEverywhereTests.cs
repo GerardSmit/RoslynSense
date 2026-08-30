@@ -492,6 +492,31 @@ public class SearchEverywhereTests
         }
     }
 
+    [Fact]
+    public async Task AnEditIsVisibleToTheVeryNextSearch()
+    {
+        // The sweep answers from LoadedDeclarationCache, which reuses a document's extracted
+        // declarations until its text version moves. An edit must move it: a search that still
+        // answered from the pre-edit entry would be a cache keyed on the wrong thing, and the bug
+        // would present as Ctrl+T not finding the class that was just written.
+        var solution = await SolutionAsync(FixturePaths.SampleProjectFile);
+        var document = solution.Projects.SelectMany(p => p.Documents).First();
+
+        var before = await SearchEverywhere.SearchAsync(
+            solution, "EditProbeWidget", maxResults: 50, default, includeFiles: false);
+        Assert.DoesNotContain(before, h => h.Name == "EditProbeWidget");
+
+        var text = await document.GetTextAsync();
+        var edited = solution.WithDocumentText(
+            document.Id,
+            Microsoft.CodeAnalysis.Text.SourceText.From(
+                text + "\nclass EditProbeWidget { }\n"));
+
+        var after = await SearchEverywhere.SearchAsync(
+            edited, "EditProbeWidget", maxResults: 50, default, includeFiles: false);
+        Assert.Contains(after, h => h.Kind == SearchItemKind.Type && h.Name == "EditProbeWidget");
+    }
+
     private static async Task<IReadOnlyList<SearchHit>> SearchAsync(
         string query, int maxResults = 50, bool includeFiles = true)
     {

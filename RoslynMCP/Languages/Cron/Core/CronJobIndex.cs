@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -123,24 +123,24 @@ internal sealed class CronJobIndex(CronSettings settings)
         if (Match(declared, settings) is not { } binding)
             return null;
 
-        var arguments = Arguments(call, method, declared);
+        var arguments = RegistrationFacts.Arguments(call, method, declared);
 
         var (methodFacet, target) = binding.MethodIndex is { } methodIndex
-            ? CronFacts.Method(At(arguments, methodIndex), model, ct)
-            : CronFacts.Method(At(arguments, MethodPosition(declared, settings)), model, ct);
+            ? RegistrationFacts.Method(RegistrationFacts.At(arguments, methodIndex), model, ct)
+            : RegistrationFacts.Method(RegistrationFacts.At(arguments, MethodPosition(declared, settings)), model, ct);
 
         // Quartz names a class through a type argument rather than passing one, so a registration
         // with no method argument still has a job to name.
-        if (methodFacet.Origin == CronOrigin.Absent)
-            (methodFacet, target) = CronFacts.TypeArgument(method, ct);
+        if (methodFacet.Origin == RegistrationOrigin.Absent)
+            (methodFacet, target) = RegistrationFacts.TypeArgument(method, ct);
 
         var cron = binding.Kind == CronRegistrationKind.Remove
-            ? CronFacet.Absent
-            : CronFacts.Read(At(arguments, CronPosition(binding, declared, settings)), model, ct);
+            ? RegistrationFacet.Absent
+            : RegistrationFacts.Read(RegistrationFacts.At(arguments, CronPosition(binding, declared, settings)), model, ct);
 
-        var id = CronFacts.Read(At(arguments, binding.IdIndex ?? IdPosition(declared)), model, ct);
+        var id = RegistrationFacts.Read(RegistrationFacts.At(arguments, binding.IdIndex ?? IdPosition(declared)), model, ct);
 
-        var (targetRange, targetUri) = Declaration(target, ct);
+        var (targetRange, targetUri) = RegistrationFacts.Declaration(target, ct);
 
         return new CronJob(
             JobId: id,
@@ -181,46 +181,6 @@ internal sealed class CronJobIndex(CronSettings settings)
 
         return null;
     }
-
-    /// <summary>
-    /// The call's arguments in the declaration's parameter order, so an index means the same thing
-    /// whether or not the call used named arguments.
-    /// </summary>
-    private static ExpressionSyntax?[] Arguments(
-        InvocationExpressionSyntax call, IMethodSymbol method, IMethodSymbol declared)
-    {
-        var parameters = declared.Parameters;
-        var slots = new ExpressionSyntax?[parameters.Length];
-
-        // An extension method called as one writes no argument for its receiver, while the
-        // declaration ReducedFrom put back still has it as parameter zero. Keyed on the reduction
-        // rather than on the syntax, because the same method called statically writes it.
-        int position = method.ReducedFrom is not null ? 1 : 0;
-        foreach (var argument in call.ArgumentList.Arguments)
-        {
-            int slot;
-            if (argument.NameColon?.Name.Identifier.ValueText is { } name)
-            {
-                slot = parameters.IndexOf(parameters.FirstOrDefault(p => p.Name == name));
-                if (slot < 0)
-                    continue;
-            }
-            else
-            {
-                slot = position++;
-            }
-
-            if (slot >= 0 && slot < slots.Length)
-                slots[slot] = argument.Expression;
-        }
-
-        return slots;
-    }
-
-    private static ExpressionSyntax? At(ExpressionSyntax?[] arguments, int? index) =>
-        index is { } position && position >= 0 && position < arguments.Length
-            ? arguments[position]
-            : null;
 
     /// <summary>
     /// Which argument carries the schedule: the binding's position, or the parameter whose name
@@ -277,29 +237,5 @@ internal sealed class CronJobIndex(CronSettings settings)
         }
 
         return null;
-    }
-
-    /// <summary>Where a symbol is written, when it is written in source at all.</summary>
-    private static (Lsp.Protocol.Range? Range, string? Uri) Declaration(
-        ISymbol? symbol, CancellationToken ct)
-    {
-        if (symbol?.DeclaringSyntaxReferences.FirstOrDefault() is not { } reference)
-            return (null, null);
-
-        var tree = reference.SyntaxTree;
-        if (tree.FilePath is not { Length: > 0 } path)
-            return (null, null);
-
-        // The name rather than the whole declaration: a method body can be a screenful, and a
-        // selection covering all of it reads as a mistake rather than as a destination.
-        var node = reference.GetSyntax(ct);
-        var span = node switch
-        {
-            MethodDeclarationSyntax method => method.Identifier.Span,
-            TypeDeclarationSyntax type => type.Identifier.Span,
-            _ => node.Span,
-        };
-
-        return (LspConverters.ToRange(tree.GetText(ct).Lines, span), LspConverters.PathToUri(path));
     }
 }

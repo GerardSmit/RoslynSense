@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace RoslynMCP.Lsp.Protocol;
 
@@ -52,11 +52,14 @@ public static class SolutionNodeKind
     /// </summary>
     public const string UnloadedProject = "projectUnloaded";
 
-    // The scheduled-jobs section, which a language pack contributes rather than the tree building
-    // it. Declared here anyway: the client maps kinds to icons and context menus, so the set is
-    // part of the protocol wherever it is produced.
+    // ---- Discovery ------------------------------------------------------------------------
+    //
+    // The sections of the Discovery view, every one of them contributed by a language pack rather
+    // than built by a handler. Declared here with the tree's own kinds because the client maps a
+    // kind to an icon and a context menu, and it does that from one table for both views — so the
+    // set is part of the protocol wherever the node is produced.
 
-    /// <summary>The section under the solution node listing what runs on a schedule.</summary>
+    /// <summary>The section listing what runs on a schedule.</summary>
     public const string CronJobs = "cronJobs";
 
     /// <summary>One project inside that section.</summary>
@@ -67,20 +70,96 @@ public static class SolutionNodeKind
 
     /// <summary>
     /// The context value of a job row, built from the base name and up to two suffixes:
-    /// <c>Dynamic</c> when something about the job is only knowable at run time, and
-    /// <c>Method</c> when its own method was named and can be opened. So a fully static job with a
-    /// resolved method is <c>cronJobMethod</c>, and a config-driven one with none is
-    /// <c>cronJobDynamic</c>.
+    /// <see cref="CronJobDynamicSuffix"/> when something about the job is only knowable at run
+    /// time, and <see cref="SecondaryTargetSuffix"/> when its own method was named and can be
+    /// opened. So a fully static job with a resolved method is <c>cronJobTarget</c>, and a
+    /// config-driven one with none is <c>cronJobDynamic</c>.
     /// </summary>
     /// <remarks>
-    /// Composed rather than enumerated because the two facts are independent, and because a menu
-    /// item that opens the job's method must not appear on a row that has no method to open —
-    /// which the client can only decide from the context value it was given.
+    /// Composed rather than enumerated because the two facts are independent, and because a button
+    /// that opens the job's method must not appear on a row that has no method to open — which the
+    /// client can only decide from the context value it was given.
     /// </remarks>
     public const string CronJobDynamicSuffix = "Dynamic";
 
-    /// <summary>The job's own method was named and has a declaration to open.</summary>
-    public const string CronJobMethodSuffix = "Method";
+    /// <summary>The section listing what the solution's <c>.proto</c> files declare.</summary>
+    public const string ProtoServices = "protoServices";
+
+    /// <summary>One protobuf package, which is the namespace its services are declared in.</summary>
+    public const string ProtoPackage = "protoPackage";
+
+    /// <summary>One <c>service</c>.</summary>
+    public const string ProtoService = "protoService";
+
+    /// <summary>One <c>rpc</c> inside a service.</summary>
+    public const string ProtoRpc = "protoRpc";
+
+    /// <summary>
+    /// This row has a second place worth going: the thing it names is implemented, handled or run
+    /// somewhere else. Appended to the context value of a job, an endpoint or an rpc alike, which
+    /// is what lets one <c>when</c> clause put the Implementation button on all three.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately says nothing about <em>where</em>, because the two ways of answering that are
+    /// not alike. A cron job and a route carry their target in
+    /// <see cref="SolutionTreeNode.GoToSecondary"/>, resolved when the row was built. An rpc does
+    /// not: crossing from a <c>.proto</c> declaration to the C# overriding it runs a solution-wide
+    /// symbol search, which is far too expensive to do for every row on expand, and there may be
+    /// several answers where <c>GoToSecondary</c> holds one. So that one is resolved by the client
+    /// when the button is pressed.
+    /// </para>
+    /// <para>
+    /// The suffix marks both cases the same on purpose. Whether the answer was already known or
+    /// has to be gone and fetched is the client's problem, not the menu's — what the menu needs to
+    /// know is only whether the row leads anywhere at all.
+    /// </para>
+    /// </remarks>
+    public const string SecondaryTargetSuffix = "Target";
+
+    /// <summary>The section listing the HTTP endpoints the solution serves.</summary>
+    public const string Routes = "routes";
+
+    /// <summary>One project inside that section.</summary>
+    public const string RouteProject = "routeProject";
+
+    /// <summary>A path prefix more than one endpoint of a project shares.</summary>
+    public const string RouteGroup = "routeGroup";
+
+    /// <summary>One endpoint: a method, a path, and somewhere to go.</summary>
+    public const string Route = "route";
+
+    /// <summary>
+    /// The context value of an endpoint row, the base name plus <c>Dynamic</c> when the path is
+    /// only knowable at run time — a template built from a constant the pack could not fold, or a
+    /// prefix composed by a route group.
+    /// </summary>
+    /// <remarks>
+    /// Composed the same way <see cref="CronJob"/>'s is, and for the same reason: the menu item
+    /// that copies a row's path must not appear on a row whose path is a guess, and the client can
+    /// only decide that from the context value it was given.
+    /// </remarks>
+    public const string RouteDynamicSuffix = "Dynamic";
+
+    /// <summary>The section listing the screens an application declares in template files.</summary>
+    public const string Templates = "templates";
+
+    /// <summary>
+    /// One application's templates, listed only when a solution holds more than one set of them.
+    /// </summary>
+    public const string TemplateRoot = "templateRoot";
+
+    /// <summary>One entry of that tree: a screen, or a heading holding screens.</summary>
+    public const string TemplateEntry = "templateEntry";
+
+    /// <summary>
+    /// One module an entry hosts, listed only when it hosts more than one.
+    /// </summary>
+    /// <remarks>
+    /// An entry hosting a single module carries that module's implementation on its own row
+    /// instead, so this kind appears exactly where there is a choice to make.
+    /// </remarks>
+    public const string TemplateModule = "templateModule";
 }
 
 public sealed record SolutionTreeParams(
@@ -111,6 +190,18 @@ public sealed record SolutionTreeNode(
     [property: JsonPropertyName("contextValue")] string ContextValue,
     [property: JsonPropertyName("dimmed")] bool Dimmed = false,
     [property: JsonPropertyName("highlights")] int[][]? Highlights = null,
+
+    /// <summary>
+    /// What the hover says, when the row itself cannot hold it.
+    /// </summary>
+    /// <remarks>
+    /// The client shows the resource path when this is null, which is right for a file. A row
+    /// standing for something written inside a file wants the line as well — and often something
+    /// the row deliberately does not show, like the method serving a route, which is the same name
+    /// on every row of a controller and belongs on the hover rather than in the column beside the
+    /// path.
+    /// </remarks>
+    [property: JsonPropertyName("tooltip")] string? Tooltip = null,
 
     /// <summary>
     /// Where clicking this node should land, when that is somewhere other than the top of

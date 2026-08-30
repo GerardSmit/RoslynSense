@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services.Packages;
@@ -142,9 +142,8 @@ public class BindingRedirectLensTests
             new ExecuteCommandParams(lens.Command!.Name, Arguments(lens.Command.Arguments!)),
             CancellationToken.None);
 
-        // No solution is bound in a unit test, so no project is found beside the temp file — which
-        // is the point: the path arrived, was recognised as this command's, and got as far as
-        // looking for the project that owns it.
+        // Nothing sits in the config file's own directory, which is the point: the path arrived,
+        // was recognised as this command's, and got as far as looking for the project that owns it.
         Assert.Equal("No project sits beside this config file.", result);
     }
 
@@ -198,9 +197,21 @@ public class BindingRedirectLensTests
     private static BindingRedirectFinding Stale(string name) =>
         new(BindingRedirectProblem.Stale, name, "30ad4fe6b2a6aeed", "neutral", "12.0.0.0", "13.0.0.0", "", 4);
 
+    /// <summary>The config file, in a directory of its own.</summary>
+    /// <remarks>
+    /// Its own directory rather than the temp root, because the command looks for the project
+    /// <em>beside</em> the config file. Any test anywhere in the suite that names a project path
+    /// directly under the temp root — several do, to check what happens to a project that is not
+    /// there — puts one beside this file, and the command then answers about that project instead.
+    /// </remarks>
     private static string Write(string content)
     {
-        string path = Path.Combine(Path.GetTempPath(), $"binding-lens-{Guid.NewGuid():N}.config");
+        string directory = Path.Combine(
+            Path.GetTempPath(), "roslyn-sense-tests", $"binding-lens-{Guid.NewGuid():N}");
+
+        Directory.CreateDirectory(directory);
+
+        string path = Path.Combine(directory, "web.config");
         File.WriteAllText(path, content);
         return path;
     }

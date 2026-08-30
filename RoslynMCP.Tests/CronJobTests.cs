@@ -1,7 +1,8 @@
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.Cron;
 using RoslynMCP.Languages.Cron.Core;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services.Symbols;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -55,7 +56,7 @@ public class CronJobTests
             (await JobsAsync()).Where(j => j.Kind == CronRegistrationKind.Remove));
 
         Assert.Equal("retired", job.JobId.Text);
-        Assert.Equal(CronOrigin.Absent, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Absent, job.Cron.Origin);
     }
 
     // ---- What is knowable -------------------------------------------------------------------------
@@ -65,7 +66,7 @@ public class CronJobTests
     {
         var job = await ScheduleAsync("*/10 * * * *");
 
-        Assert.Equal(CronOrigin.Literal, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Literal, job.Cron.Origin);
         Assert.False(job.IsDynamic);
     }
 
@@ -78,7 +79,7 @@ public class CronJobTests
         var job = await JobAsync("const");
 
         Assert.Equal("0 4 * * *", job.Cron.Text);
-        Assert.Equal(CronOrigin.Constant, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Constant, job.Cron.Origin);
         Assert.False(job.IsDynamic);
     }
 
@@ -92,7 +93,7 @@ public class CronJobTests
         var job = await JobAsync("readonly");
 
         Assert.Equal("0 5 * * *", job.Cron.Text);
-        Assert.Equal(CronOrigin.Constant, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Constant, job.Cron.Origin);
     }
 
     /// <summary>A local assigned once is its initializer, which is what a reader concludes too.</summary>
@@ -115,7 +116,7 @@ public class CronJobTests
         var job = await JobAsync("reassigned");
 
         Assert.Null(job.Cron.Text);
-        Assert.Equal(CronOrigin.Variable, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Variable, job.Cron.Origin);
         Assert.True(job.IsDynamic);
     }
 
@@ -130,7 +131,7 @@ public class CronJobTests
         var job = await JobAsync("configured");
 
         Assert.Null(job.Cron.Text);
-        Assert.Equal(CronOrigin.Configuration, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Configuration, job.Cron.Origin);
         Assert.Equal("Jobs:Nightly:Cron", job.Cron.Detail);
     }
 
@@ -139,7 +140,7 @@ public class CronJobTests
     {
         var job = await JobAsync("passed");
 
-        Assert.Equal(CronOrigin.Parameter, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Parameter, job.Cron.Origin);
         Assert.Equal("cronExpression", job.Cron.Detail);
     }
 
@@ -148,7 +149,7 @@ public class CronJobTests
     {
         var job = await JobAsync("ternary");
 
-        Assert.Equal(CronOrigin.Expression, job.Cron.Origin);
+        Assert.Equal(RegistrationOrigin.Expression, job.Cron.Origin);
         Assert.Contains("?", job.Cron.Detail!, StringComparison.Ordinal);
     }
 
@@ -191,7 +192,7 @@ public class CronJobTests
         var job = await JobAsync("branching");
 
         Assert.Null(job.Method.Text);
-        Assert.Equal(CronOrigin.Expression, job.Method.Origin);
+        Assert.Equal(RegistrationOrigin.Expression, job.Method.Origin);
         Assert.Null(job.Target);
     }
 
@@ -204,7 +205,7 @@ public class CronJobTests
 
         Assert.Equal("resend", row.Label);
         Assert.Equal("Every 10 minutes · Jobs.SyncOrders", row.Description);
-        Assert.Equal(SolutionNodeKind.CronJob + "Method", row.ContextValue);
+        Assert.Equal(SolutionNodeKind.CronJob + SolutionNodeKind.SecondaryTargetSuffix, row.ContextValue);
     }
 
     /// <summary>
@@ -247,7 +248,8 @@ public class CronJobTests
         var row = CronLanguage.Node(await JobAsync("branching"));
 
         Assert.Null(row.GoToSecondary);
-        Assert.DoesNotContain("Method", row.ContextValue, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            SolutionNodeKind.SecondaryTargetSuffix, row.ContextValue, StringComparison.Ordinal);
     }
 
     /// <summary>

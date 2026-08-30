@@ -21,6 +21,13 @@ public sealed class RoslynSenseConfig
 
     public CronConfig Cron { get; init; } = new();
 
+    /// <summary>The <c>routes</c> section: which attributes and calls declare an HTTP endpoint.</summary>
+    public RoutesConfig Routes { get; init; } = new();
+
+    /// <summary>The <c>templates</c> section: where the template files are, and in which language
+    /// their names are read.</summary>
+    public TemplatesConfig Templates { get; init; } = new();
+
     /// <summary>The <c>webForms</c> section: which markup attributes carry data expressions.</summary>
     public WebFormsConfig WebForms { get; init; } = new();
 
@@ -62,6 +69,8 @@ public sealed class ToolsConfig
     public bool Formatting { get; init; } = true;
     public bool ValueSets { get; init; } = true;
     public bool Cron { get; init; } = true;
+    public bool Routes { get; init; } = true;
+    public bool Templates { get; init; } = true;
     public bool Debugger { get; init; } = true;
     public bool Profiling { get; init; } = true;
     public bool Database { get; init; } = true;
@@ -193,6 +202,119 @@ public sealed class CronBindingEntry
     /// the project's own references decide, which is right whenever only one is referenced.
     /// </summary>
     public string? Dialect { get; init; }
+}
+
+/// <summary>
+/// The <c>routes</c> section of <c>roslynsense.json</c>: what declares an HTTP endpoint here.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Separate from the <c>tools.routes</c> switch that turns the pack on: one decides whether the
+/// pack runs, the other what it runs over.
+/// </para>
+/// <para>
+/// The shipped tables cover ASP.NET Core's attributes and minimal APIs and ASP.NET Web API's
+/// attributes, so this section is for the routing layer a solution wrote for itself — the
+/// <c>[Endpoint("orders")]</c> that derives from nothing and that no list of framework names could
+/// have guessed at.
+/// </para>
+/// </remarks>
+public sealed class RoutesConfig
+{
+    /// <summary>Attributes of the solution's own that carry a route template.</summary>
+    public IReadOnlyList<RouteAttributeEntry>? Attributes { get; init; }
+
+    /// <summary>Methods of the solution's own that register an endpoint.</summary>
+    public IReadOnlyList<RouteMethodEntry>? Methods { get; init; }
+}
+
+/// <summary>
+/// The <c>templates</c> section of <c>roslynsense.json</c>: where an application declares its
+/// screens, and whose language the tree reads them in.
+/// </summary>
+/// <remarks>
+/// Separate from the <c>tools.templates</c> switch that turns the pack on, the same way every
+/// other section is: one decides whether the pack runs, the other what it runs over.
+/// </remarks>
+public sealed class TemplatesConfig
+{
+    /// <summary>
+    /// Folders of template files, relative to a project. Added to the conventional two rather than
+    /// replacing them.
+    /// </summary>
+    public IReadOnlyList<string>? Folders { get; init; }
+
+    /// <summary>
+    /// Folders holding the modules an application installed, searched for the control that renders
+    /// a module the templates name but do not describe. Added to the conventional one.
+    /// </summary>
+    public IReadOnlyList<string>? ControlFolders { get; init; }
+
+    /// <summary>
+    /// The language tag a row's name is read from. Omit for whichever the file writes first.
+    /// </summary>
+    public string? Locale { get; init; }
+}
+
+/// <summary>
+/// One attribute whose argument is a route template.
+/// </summary>
+/// <remarks>
+/// Matched on the attribute's name, with or without the <c>Attribute</c> suffix — both spellings
+/// mean the same attribute in C#, so both are accepted here.
+/// </remarks>
+public sealed class RouteAttributeEntry
+{
+    /// <summary>The attribute's name, as it is written or with the suffix. Required.</summary>
+    public string? AttributeName { get; init; }
+
+    /// <summary>
+    /// The attribute class's full name. Omit to match the name wherever it is declared, which is
+    /// usually what is wanted — naming the attribute is the reason for the entry.
+    /// </summary>
+    public string? ContainingType { get; init; }
+
+    /// <summary>Which constructor argument carries the template, counted from 0. Omit for the
+    /// first one that is a string.</summary>
+    public int? PathIndex { get; init; }
+
+    /// <summary>
+    /// The HTTP method this attribute means — <c>GET</c>, <c>POST</c>, and so on. Omit when it
+    /// constrains none, which is what a bare route attribute does.
+    /// </summary>
+    public string? Verb { get; init; }
+}
+
+/// <summary>One method whose string argument registers an endpoint.</summary>
+/// <remarks>
+/// The same vocabulary as <see cref="CronBindingEntry"/> and <see cref="ValueBindingEntry"/>, so a
+/// reader who has configured one has configured this.
+/// </remarks>
+public sealed class RouteMethodEntry
+{
+    /// <summary>The member's name. Required.</summary>
+    public string? MemberName { get; init; }
+
+    /// <summary>The full name of the class or interface declaring the member.</summary>
+    public string? ContainingType { get; init; }
+
+    /// <summary>One type name per parameter, <c>*</c> for any. Empty matches every overload.</summary>
+    public IReadOnlyList<string>? ParameterTypes { get; init; }
+
+    /// <summary>Which parameter carries the template, counted from 0. Omit for the first string.</summary>
+    public int? PathIndex { get; init; }
+
+    /// <summary>Which parameter says what runs, counted from 0.</summary>
+    public int? HandlerIndex { get; init; }
+
+    /// <summary>The HTTP method. Omit when the call constrains none.</summary>
+    public string? Verb { get; init; }
+
+    /// <summary>
+    /// What the call does: <c>endpoint</c>, or <c>group</c> for one that opens a prefix every
+    /// endpoint registered on its result carries. Omit for <c>endpoint</c>.
+    /// </summary>
+    public string? Kind { get; init; }
 }
 
 /// <summary>

@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Config;
 using RoslynMCP.Languages;
@@ -13,6 +13,8 @@ using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.Routes;
+using RoslynMCP.Languages.Templates;
 using RoslynMCP.Languages.WebConfig;
 using RoslynMCP.Languages.WebForms;
 using RoslynMCP.Lsp;
@@ -145,6 +147,8 @@ public class LanguageRegistryTests
             pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<FormattingLanguage>(pack),
             pack => Assert.IsType<CronLanguage>(pack),
+            pack => Assert.IsType<RoutesLanguage>(pack),
+            pack => Assert.IsType<TemplatesLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),
@@ -222,6 +226,8 @@ public class LanguageRegistryTests
             pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<FormattingLanguage>(pack),
             pack => Assert.IsType<CronLanguage>(pack),
+            pack => Assert.IsType<RoutesLanguage>(pack),
+            pack => Assert.IsType<TemplatesLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),
@@ -269,6 +275,8 @@ public class LanguageRegistryTests
             pack => Assert.IsType<LoggingLanguage>(pack),
             pack => Assert.IsType<FormattingLanguage>(pack),
             pack => Assert.IsType<CronLanguage>(pack),
+            pack => Assert.IsType<RoutesLanguage>(pack),
+            pack => Assert.IsType<TemplatesLanguage>(pack),
             pack => Assert.IsType<MsBuildLanguage>(pack),
             pack => Assert.IsType<DbmlLanguage>(pack),
             pack => Assert.IsType<AppSettingsLanguage>(pack),

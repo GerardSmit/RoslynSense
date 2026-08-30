@@ -1,16 +1,17 @@
-using System.Globalization;
+﻿using System.Globalization;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.Cron.Core;
 using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Symbols;
 using RoslynMCP.Services.ProjectModel;
 
 namespace RoslynMCP.Languages.Cron;
 
 /// <summary>
-/// The <b>Cron Jobs</b> section of the Solution Explorer: which projects schedule anything, and
-/// what each of them runs.
+/// The <b>Cron Jobs</b> section of the Discovery view: which projects schedule anything, and what
+/// each of them runs.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -21,15 +22,15 @@ namespace RoslynMCP.Languages.Cron;
 /// the registrations.
 /// </para>
 /// <para>
-/// The section is drawn on the root listing, which is bound by the tree's promise to evaluate no
-/// project until something is expanded. So the decision to show it at all comes from
+/// The section is drawn on the root listing, which happens every time the view becomes visible
+/// and must therefore evaluate no project. So the decision to show it at all comes from
 /// <see cref="CronProjectProbe"/> — a text scan of the manifests — or from the user having
 /// configured a binding, which is the case a package probe would miss: an in-house wrapper lives
 /// in a project referencing no scheduler, and hiding the section from the one person who
 /// configured it would be the worst answer available.
 /// </para>
 /// </remarks>
-internal sealed partial class CronLanguage : ILanguageSolutionTreeContributor
+internal sealed partial class CronLanguage : ILanguageDiscoveryContributor
 {
     /// <summary>The section, and the prefix of everything under it.</summary>
     private const string Prefix = "cron:";
@@ -184,7 +185,7 @@ internal sealed partial class CronLanguage : ILanguageSolutionTreeContributor
     private static string ContextValue(CronJob job) =>
         SolutionNodeKind.CronJob
         + (job.IsDynamic ? SolutionNodeKind.CronJobDynamicSuffix : string.Empty)
-        + (job.Target is not null ? SolutionNodeKind.CronJobMethodSuffix : string.Empty);
+        + (job.Target is not null ? SolutionNodeKind.SecondaryTargetSuffix : string.Empty);
 
     /// <summary>What the row is called: the job's id, or the method when it has no id.</summary>
     private static string Label(CronJob job)
@@ -219,11 +220,11 @@ internal sealed partial class CronLanguage : ILanguageSolutionTreeContributor
             var parse = Cron.Parse(schedule, job.Dialect);
             parts.Add(CronDescription.Describe(parse) is { } sentence ? sentence : schedule);
         }
-        else if (job.Cron.Origin == CronOrigin.Configuration)
+        else if (job.Cron.Origin == RegistrationOrigin.Configuration)
         {
             parts.Add($"{Open}config: {job.Cron.Detail}{Close}");
         }
-        else if (job.Cron.Origin != CronOrigin.Absent)
+        else if (job.Cron.Origin != RegistrationOrigin.Absent)
         {
             parts.Add($"{Open}{job.Cron.Detail ?? "computed"}{Close}");
         }

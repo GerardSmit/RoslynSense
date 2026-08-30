@@ -81,6 +81,16 @@
           "title": "Scheduled jobs",
           "description": "The `\"0 22 * * 1-6\"` handed to Hangfire or Quartz, coloured a field at a time and hovered with what it means and when it next runs. Also lists every scheduled job in the solution."
         },
+        "routes": {
+          "type": "boolean",
+          "title": "HTTP routes",
+          "description": "Lists what the solution serves over HTTP, and where each endpoint is handled."
+        },
+        "templates": {
+          "type": "boolean",
+          "title": "Templates",
+          "description": "Lists the screens an application declares in template files, as the tree they describe."
+        },
         "debugger": {
           "type": "boolean",
           "title": "Debugger",
@@ -912,6 +922,192 @@
       },
       "title": "Scheduled jobs",
       "description": "A crontab expression is five or six numbers that decide when something runs on a server nobody is watching, and nothing in C# checks it — a transposed field is a job that quietly runs on the wrong day. Hangfire and Quartz are recognised already, and so is any parameter named `cronExpression` or close to it, so this section is only needed for an in-house scheduler whose method nobody could have guessed the name of."
+    },
+    "routes": {
+      "type": "object",
+      "properties": {
+        "attributes": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "attributeName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Attribute",
+                "description": "The attribute's name, written with or without the `Attribute` suffix — both spellings mean the same attribute."
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the attribute class. Leave empty to match the name wherever it is declared, which is usually what is wanted: naming the attribute is the reason for the entry."
+              },
+              "pathIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Path is argument",
+                "description": "Which constructor argument carries the template, counted from 0. Leave empty for the first argument that is a string."
+              },
+              "verb": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "HTTP method",
+                "description": "`GET`, `POST`, and so on. Leave empty when the attribute constrains none, which is what a bare route attribute does — an endpoint reachable by every method is a real thing and the list says so by leaving the column empty."
+              }
+            },
+            "title": "Attribute",
+            "description": "One attribute that carries a route template."
+          },
+          "title": "Attributes",
+          "description": "The attributes of your own that carry a route template. Matched by name, so an attribute named here is read wherever it is declared."
+        },
+        "methods": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Member",
+                "description": "The method name."
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the member. Leave empty to match the member on any class."
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."
+              },
+              "pathIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Path is parameter",
+                "description": "Which parameter carries the template, counted from 0. Leave empty for the first string."
+              },
+              "handlerIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Handler is parameter",
+                "description": "Which parameter says what runs, counted from 0. Used to point the Implementation button at it."
+              },
+              "verb": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "HTTP method",
+                "description": "`GET`, `POST`, and so on. Leave empty when the call constrains none."
+              },
+              "kind": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "The call",
+                "description": "`endpoint`, or `group` for one that opens a prefix every endpoint registered on its result carries. Leave empty for `endpoint`."
+              }
+            },
+            "title": "Method",
+            "description": "One method that registers an endpoint."
+          },
+          "title": "Methods",
+          "description": "The methods of your own that register an endpoint — a `MapEndpoint(path, handler)` wrapper, say."
+        }
+      },
+      "title": "HTTP routes",
+      "description": "What the solution serves over HTTP, listed under Routes: the path, the verb and the method that handles it. ASP.NET Core's attributes and minimal APIs and ASP.NET Web API's attributes are recognised already, so this section is only needed for a routing layer of your own — the `[Endpoint(\"orders\")]` that derives from nothing and that no list of framework names could have guessed at."
+    },
+    "templates": {
+      "type": "object",
+      "properties": {
+        "folders": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Folders",
+          "description": "Where the template files are, relative to a project. `App_Data/Templates` and `App_Data/TemplatesCustom` are read already, so this is only needed for a layout that keeps them somewhere else."
+        },
+        "controlFolders": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Module folders",
+          "description": "Where the modules an application installed live, searched for the control that renders a module the templates name but never describe. `DesktopModules` is looked in already."
+        },
+        "locale": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Language",
+          "description": "Which language tag a row's name is read from — `nl-NL`, `en-US`. Leave empty for whichever the file writes first. This is the customer's language rather than yours: the names in the tree should be the words in the screenshots you are sent."
+        }
+      },
+      "title": "Templates",
+      "description": "An application whose screens are declared in YAML rather than built in code has a structure — pages under pages, each hosting something that renders it — that exists in no file tree, because the files are named after the change that introduced them rather than after the screen they describe. Listed under Templates, with a button to the declaration and one to the control that renders it."
     },
     "webForms": {
       "type": "object",

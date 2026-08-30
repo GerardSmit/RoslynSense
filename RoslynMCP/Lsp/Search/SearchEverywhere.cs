@@ -198,48 +198,69 @@ public static class SearchEverywhere
     private static List<SearchHit> FindNames(
         NameIndexSnapshot index, SearchQuery request, CancellationToken ct)
     {
-        var matcher = request.NameMatcher;
         var hits = new List<SearchHit>();
 
         foreach (var source in index.Sources)
         {
-            ct.ThrowIfCancellationRequested();
-
-            bool isGenerated = SearchFileRules.IsGenerated(source.Path);
-
-            foreach (var declaration in source.Declarations)
-            {
-                if (KindOf(declaration.Kind) is not { } kind)
-                    continue;
-
-                if (kind == SearchItemKind.Type ? !request.IncludesTypes : !request.IncludesMembers)
-                    continue;
-
-                if (matcher.Match(declaration.Name) is not { } match)
-                    continue;
-
-                if (!request.TryScoreContainer(declaration.Container, out int containerScore))
-                    continue;
-
-                hits.Add(new SearchHit(
-                    kind,
-                    declaration.Name,
-                    declaration.Container.Length == 0 ? null : declaration.Container,
-                    source.Path,
-                    declaration.Line,
-                    declaration.Character,
-                    declaration.EndLine,
-                    declaration.EndCharacter,
-                    ToLspSymbolKind(declaration.Kind),
-                    Score(
-                        match.Score,
-                        Tier(declaration.Kind, kind, match.Score),
-                        containerScore,
-                        isGenerated)));
-            }
+            MatchSource(
+                source.Path,
+                SearchFileRules.IsGenerated(source.Path),
+                source.Declarations,
+                request,
+                hits,
+                ct);
         }
 
         return hits;
+    }
+
+    /// <summary>
+    /// One file's declarations, matched and scored into <paramref name="hits"/> — the loop every
+    /// symbol corpus goes through, whether it was read off disk before the load or off the loaded
+    /// solution.
+    /// </summary>
+    private static void MatchSource(
+        string path,
+        bool isGenerated,
+        IReadOnlyList<NameDeclaration> declarations,
+        SearchQuery request,
+        List<SearchHit> hits,
+        CancellationToken ct)
+    {
+        var matcher = request.NameMatcher;
+
+        foreach (var declaration in declarations)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (KindOf(declaration.Kind) is not { } kind)
+                continue;
+
+            if (kind == SearchItemKind.Type ? !request.IncludesTypes : !request.IncludesMembers)
+                continue;
+
+            if (matcher.Match(declaration.Name) is not { } match)
+                continue;
+
+            if (!request.TryScoreContainer(declaration.Container, out int containerScore))
+                continue;
+
+            hits.Add(new SearchHit(
+                kind,
+                declaration.Name,
+                declaration.Container.Length == 0 ? null : declaration.Container,
+                path,
+                declaration.Line,
+                declaration.Character,
+                declaration.EndLine,
+                declaration.EndCharacter,
+                ToLspSymbolKind(declaration.Kind),
+                Score(
+                    match.Score,
+                    Tier(declaration.Kind, kind, match.Score),
+                    containerScore,
+                    isGenerated)));
+        }
     }
 
     /// <summary>
@@ -399,6 +420,14 @@ public static class SearchEverywhere
     /// qualified name written around it. Nothing here needed more than that — the ranking has
     /// always run on names.
     /// </para>
+    /// <para>
+    /// Even that index was too much to consult per keystroke: asking it for every document costs a
+    /// checksum derivation each, plus a text fetch for every document that matched, and on a few
+    /// thousand documents that is most of a second spent re-deriving what the last keystroke
+    /// already knew. The sweep therefore reads <see cref="LoadedDeclarationCache"/> — the same
+    /// declarations, flattened once per document version — and only a document whose text actually
+    /// moved goes back through the index.
+    /// </para>
     /// </remarks>
     private static async Task<IEnumerable<SearchHit>> FindSymbolsAsync(
         Solution solution, SearchQuery request, CancellationToken ct)
@@ -434,99 +463,18 @@ public static class SearchEverywhere
             },
             async (document, token) =>
             {
-                var hits = await MatchDeclarationsAsync(document, request, token);
+                if (await LoadedDeclarationCache.GetAsync(document, token) is not { } source)
+                    return;
+
+                var hits = new List<SearchHit>();
+                MatchSource(source.Path, source.IsGenerated, source.Declarations, request, hits, token);
                 if (hits.Count > 0)
                     perDocument.Add(hits);
             });
 
+        LoadedDeclarationCache.Reconcile(documents);
+
         return perDocument.SelectMany(hits => hits);
-    }
-
-    /// <summary>One document's declarations, matched and scored.</summary>
-    private static async Task<List<SearchHit>> MatchDeclarationsAsync(
-        Document document, SearchQuery request, CancellationToken ct)
-    {
-        TopLevelSyntaxTreeIndex? index;
-        try
-        {
-            index = await TopLevelSyntaxTreeIndex.GetIndexAsync(document, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // A document that will not parse — a stale generated file, a file the workspace has
-            // since lost — is one missing row, never a failed search.
-            return [];
-        }
-
-        if (index is null)
-            return [];
-
-        var matcher = request.NameMatcher;
-        List<(DeclaredSymbolInfo Info, SearchItemKind Kind, MatcherScore Score, int Container)>? matched = null;
-
-        foreach (var info in index.DeclaredSymbolInfos)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            if (KindOf(info.Kind) is not { } kind)
-                continue;
-
-            if (kind == SearchItemKind.Type ? !request.IncludesTypes : !request.IncludesMembers)
-                continue;
-
-            if (matcher.Match(info.Name) is not { } match)
-                continue;
-
-            if (!request.TryScoreContainer(info.FullyQualifiedContainerName, out int containerScore))
-                continue;
-
-            (matched ??= []).Add((info, kind, match.Score, containerScore));
-        }
-
-        if (matched is null)
-            return [];
-
-        // Only a document that matched something pays for its text. The index stores spans as
-        // offsets, and a line-and-column is what a client can open.
-        SourceText text;
-        try
-        {
-            text = await document.GetTextAsync(ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // Same contract as the index above: a file deleted out from under the workspace is
-            // this document's rows lost, not the search's.
-            return [];
-        }
-        string path = document.FilePath!;
-        bool isGenerated = SearchFileRules.IsGenerated(path);
-
-        var hits = new List<SearchHit>(matched.Count);
-        foreach (var (info, kind, score, containerScore) in matched)
-        {
-            // An index restored from disk can outlive the text it described by a moment; a span
-            // past the end of the file would throw rather than merely point somewhere odd.
-            if (info.Span.End > text.Length)
-                continue;
-
-            var span = text.Lines.GetLinePositionSpan(info.Span);
-            string container = info.FullyQualifiedContainerName;
-
-            hits.Add(new SearchHit(
-                kind,
-                info.Name,
-                container.Length == 0 ? null : container,
-                path,
-                span.Start.Line,
-                span.Start.Character,
-                span.End.Line,
-                span.End.Character,
-                ToLspSymbolKind(info.Kind),
-                Score(score, Tier(info.Kind, kind, score), containerScore, isGenerated)));
-        }
-
-        return hits;
     }
 
     /// <summary>

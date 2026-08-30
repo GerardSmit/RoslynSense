@@ -15,13 +15,6 @@ internal static class SearchEverywhereHandler
     public static async Task<SearchEverywhereResult> SearchAsync(
         SearchEverywhereParams p, CancellationToken ct, LanguageSession? languages = null)
     {
-        var timer = SearchTimer.Start("Search Everywhere", p.Query);
-
-        // Somebody is waiting on this: the background index sweep gives way for as long as it runs.
-        using var busy = ForegroundGate.Busy();
-
-        int limit = p.MaxResults is > 0 and <= MaxResults ? p.MaxResults : 50;
-
         SearchItemKind? only = p.Only?.ToLowerInvariant() switch
         {
             "type" => SearchItemKind.Type,
@@ -29,6 +22,19 @@ internal static class SearchEverywhereHandler
             "file" => SearchItemKind.File,
             _ => null,
         };
+
+        var timer = SearchTimer.Start("Search Everywhere", p.Query, only switch
+        {
+            SearchItemKind.Type => "types only",
+            SearchItemKind.Member => "members only",
+            SearchItemKind.File => "files only",
+            _ => p.IncludeMetadata ? "with non-solution items" : null,
+        });
+
+        // Somebody is waiting on this: the background index sweep gives way for as long as it runs.
+        using var busy = ForegroundGate.Busy();
+
+        int limit = p.MaxResults is > 0 and <= MaxResults ? p.MaxResults : 50;
 
         // The solution is being evaluated for the first time: answer from the names read off disk
         // instead of waiting for MSBuild. This is the cold-open case, and the whole of what used to

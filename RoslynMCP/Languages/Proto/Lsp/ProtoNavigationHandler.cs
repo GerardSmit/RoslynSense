@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
@@ -94,6 +94,70 @@ internal static class ProtoNavigationHandler
             await ProtoReferenceService.FindImplementationsAsync(
                 hit, view.Index, project, ct, ProtoReferenceService.ExplicitSearchBudget),
             project, ct);
+    }
+
+    /// <summary>
+    /// The same answer as <see cref="ImplementationAsync"/>, but saying why when there is none —
+    /// what the Discovery view's Implementation button calls.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two things differ from the plain LSP request, and both exist because the caller is a button
+    /// on a tree row rather than a caret in an editor. A caret that lands on nothing can simply do
+    /// nothing and the user reads that as "no". A button that was pressed on purpose has to say
+    /// something, and an empty list gives it nothing to say — see
+    /// <see cref="DiscoveryImplementationsResult"/> for the four different things emptiness means
+    /// here.
+    /// </para>
+    /// <para>
+    /// The other difference is the order of the checks. An unbuilt project is settled <em>before</em>
+    /// the search is started rather than after: <c>FindImplementationsAsync</c> waits for every
+    /// project consuming the contract to load before it ever looks at the generated index, so a
+    /// contracts repository nobody has built yet would sit through the whole of that wait to be
+    /// told the index was empty all along. The index is a dictionary; asking it first costs
+    /// nothing and turns minutes into an immediate answer.
+    /// </para>
+    /// </remarks>
+    public static async Task<DiscoveryImplementationsResult> DiscoveryImplementationsAsync(
+        TextDocumentPositionParams p, CancellationToken ct)
+    {
+        if (await ResolveAsync(p.TextDocument, p.Position, ct) is not var (view, offset))
+            return DiscoveryImplementationsResult.None(
+                "The schema could not be read. It may have been moved or deleted since this list "
+                + "was drawn.");
+
+        if (view.Project is not { } project)
+            return DiscoveryImplementationsResult.None(
+                "No implementation. The project this schema belongs to is not loaded, so there is "
+                + "no C# to search yet.");
+
+        // Before the search, not after. See the remarks.
+        if (view.Index.IsEmpty)
+            return DiscoveryImplementationsResult.None(
+                "No implementation. The project has produced no generated code, so there is no C# "
+                + "to search — build it and run this again.");
+
+        if (ProtoSymbolResolver.ResolveAt(view, offset) is not { } hit)
+            return DiscoveryImplementationsResult.None(
+                "No implementation. Nothing is declared at this position any more, which usually "
+                + "means the schema was edited since this list was drawn.");
+
+        var symbols = await ProtoReferenceService.FindImplementationsAsync(
+            hit, view.Index, project, ct, ProtoReferenceService.ExplicitSearchBudget);
+
+        if (symbols.Length == 0)
+        {
+            return DiscoveryImplementationsResult.None(
+                hit.Symbol is null
+                    ? "No implementation. This declaration is not bound to any generated symbol, "
+                        + "which usually means it was added or renamed since the last build."
+                    : "No implementation. The generated code exists and nothing in the solution "
+                        + "derives from it, which for a contract normally means the other side of "
+                        + "the wire is in another solution.");
+        }
+
+        return DiscoveryImplementationsResult.Found(
+            await SymbolLocationsAsync(symbols, project, ct));
     }
 
     /// <summary>Where a set of symbols is declared, as locations the editor can open.</summary>

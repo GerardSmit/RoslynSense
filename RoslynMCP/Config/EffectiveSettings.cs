@@ -1,7 +1,9 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using RoslynMCP.Languages.Cron;
 using RoslynMCP.Languages.Logging;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.Routes;
+using RoslynMCP.Languages.Templates;
 using RoslynMCP.Languages.Values;
 using RoslynMCP.Languages.WebConfig.Core;
 using RoslynMCP.Languages.WebForms;
@@ -50,6 +52,12 @@ public sealed record EffectiveSettings(
     /// <summary>The scheduled-job pack's gate and the scheduling APIs it recognises. Init-only for
     /// the same reason as <see cref="Resources"/>.</summary>
     internal CronSettings Cron { get; init; } = CronSettings.Disabled;
+
+    /// <summary>The HTTP-route pack's gate and what it reads as an endpoint declaration. Init-only
+    /// for the same reason as <see cref="Resources"/>.</summary>
+    internal RoutesSettings Routes { get; init; } = RoutesSettings.Disabled;
+
+    internal TemplatesSettings Templates { get; init; } = TemplatesSettings.Disabled;
 
     /// <summary>Which markup attributes are read as data expressions. Init-only for the same
     /// reason as <see cref="Resources"/>.</summary>
@@ -145,6 +153,10 @@ public sealed record EffectiveSettings(
         bool formatting = !HasFlag("--no-formatting") && tools.Formatting;
         var cron = CronSettings.Resolve(
             !HasFlag("--no-cron") && tools.Cron, config?.Cron, warnings);
+        var routes = RoutesSettings.Resolve(
+            !HasFlag("--no-routes") && tools.Routes, config?.Routes, warnings);
+        var templates = TemplatesSettings.Resolve(
+            !HasFlag("--no-templates") && tools.Templates, config?.Templates, warnings);
         bool debugger = !HasFlag("--no-debugger") && tools.Debugger;
         bool profiling = !HasFlag("--no-profiling") && tools.Profiling;
         bool database = !HasFlag("--no-db") && tools.Database;
@@ -211,6 +223,8 @@ public sealed record EffectiveSettings(
             ValueSets = valueSets,
             Formatting = formatting,
             Cron = cron,
+            Routes = routes,
+            Templates = templates,
             MarkupBindings = markupBindings,
         };
     }

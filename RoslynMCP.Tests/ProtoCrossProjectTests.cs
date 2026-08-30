@@ -1,4 +1,4 @@
-using Microsoft.CodeAnalysis.Text;
+﻿using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages.Proto.Core;
 using RoslynMCP.Languages.Proto.Lsp;
 using RoslynMCP.Lsp;
@@ -69,6 +69,84 @@ public class ProtoCrossProjectTests
         AssertFile(FixturePaths.ProtoServerServiceFile, location.Uri);
         Assert.Contains(
             "WatchWidgets(", LineAt(FixturePaths.ProtoServerServiceFile, location.Range.Start.Line));
+    }
+
+    // ---- The Discovery button ------------------------------------------------------------------
+
+    /// <summary>
+    /// The same answer as the caret gets, which is the whole claim the button makes: it is not a
+    /// second way of resolving an rpc, it is the same one with something to say when it finds
+    /// nothing.
+    /// </summary>
+    [Fact]
+    public async Task TheDiscoveryButtonLandsWhereGoToImplementationDoes()
+    {
+        var expected = await Implementation("rpc GetWidgetsById", "rpc ".Length);
+        var result = await DiscoveryImplementations("rpc GetWidgetsById", "rpc ".Length);
+
+        Assert.Null(result.Reason);
+        Assert.Equal(
+            expected.Select(location => location.Uri),
+            result.Locations.Select(location => location.Uri));
+    }
+
+    [Fact]
+    public async Task TheDiscoveryButtonResolvesAServiceToo()
+    {
+        var result = await DiscoveryImplementations("service WidgetService", "service ".Length);
+
+        var location = Assert.Single(result.Locations);
+        AssertFile(FixturePaths.ProtoServerServiceFile, location.Uri);
+        Assert.Null(result.Reason);
+    }
+
+    /// <summary>
+    /// The failure the row ids were shaped to avoid, reached here on purpose. A row points at the
+    /// name span; land anywhere else in the declaration and nothing is declared at the position —
+    /// so the button has to say that rather than report an unimplemented service.
+    /// </summary>
+    [Fact]
+    public async Task APositionOnNoDeclarationSaysSoRatherThanReportingNoImplementation()
+    {
+        // Offset 0 of "service WidgetService" is the keyword, which is outside the name span.
+        var result = await DiscoveryImplementations("service WidgetService", 0);
+
+        Assert.Empty(result.Locations);
+        Assert.NotNull(result.Reason);
+        Assert.Contains("Nothing is declared at this position", result.Reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A row drawn from a schema that has since been moved. Every empty answer the button can give
+    /// has to name a cause, because a button pressed on purpose showing nothing is a bug report.
+    /// </summary>
+    [Fact]
+    public async Task ASchemaThatCannotBeReadSaysThatRatherThanNothing()
+    {
+        var result = await ProtoNavigationHandler.DiscoveryImplementationsAsync(
+            new TextDocumentPositionParams(
+                Doc(Path.Combine(Path.GetDirectoryName(FixturePaths.ProtoSolutionWidgetsProtoFile)!,
+                    "moved-away.proto")),
+                new Position(0, 0)),
+            default);
+
+        Assert.Empty(result.Locations);
+        Assert.NotNull(result.Reason);
+        Assert.Contains("could not be read", result.Reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A message is a declaration the resolver finds and nothing derives from, which is the one
+    /// empty answer that is not a mistake anywhere — and it still has to explain itself.
+    /// </summary>
+    [Fact]
+    public async Task ADeclarationNothingImplementsSaysWhyItIsEmpty()
+    {
+        var result = await DiscoveryImplementations("message Widget", "message ".Length);
+
+        Assert.Empty(result.Locations);
+        Assert.NotNull(result.Reason);
+        Assert.StartsWith("No implementation.", result.Reason, StringComparison.Ordinal);
     }
 
     // ---- References, across two project boundaries at once ------------------------------------
@@ -225,6 +303,14 @@ public class ProtoCrossProjectTests
 
     private static Task<Location[]> Implementation(string needle, int offsetIntoNeedle) =>
         ProtoNavigationHandler.ImplementationAsync(
+            new TextDocumentPositionParams(
+                Doc(FixturePaths.ProtoSolutionWidgetsProtoFile),
+                PositionOf(needle, offsetIntoNeedle)),
+            default);
+
+    private static Task<DiscoveryImplementationsResult> DiscoveryImplementations(
+        string needle, int offsetIntoNeedle) =>
+        ProtoNavigationHandler.DiscoveryImplementationsAsync(
             new TextDocumentPositionParams(
                 Doc(FixturePaths.ProtoSolutionWidgetsProtoFile),
                 PositionOf(needle, offsetIntoNeedle)),

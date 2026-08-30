@@ -337,9 +337,10 @@ internal static class MemberEditAnalysis
 internal static class AnalyzerDiagnosticCache
 {
     /// <summary>
-    /// Documents to keep analyzer results for.
+    /// Documents to keep analyzer results for — the floor of a cap that follows the working set.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// This bounds the findings payload only — the "this version was analyzed" fact lives in
     /// <see cref="s_analyzedVersions"/> and is never trimmed, so crossing this ceiling costs
     /// memory pressure relief, not correctness: an evicted-but-unmoved file still answers
@@ -347,8 +348,27 @@ internal static class AnalyzerDiagnosticCache
     /// treat this as "a runaway guard, never a working limit" the day a solution with more
     /// analyzed files than entries turned every eviction into a re-report and the Problems panel
     /// into a sawtooth; the split is what makes the number allowed to be wrong.
+    /// </para>
+    /// <para>
+    /// Wrong, but not free. A fixed cap below the working set still churns through the sweep's
+    /// full-report path: any dependent-semantic-version move makes every document in the project
+    /// stale at once, and each stale document whose findings were evicted is served a fallback,
+    /// downgraded to a ":c" id, and queued for a recompute — whose store then evicts the next
+    /// document's findings. On a solution with ~2400 analyzed documents against a cap of 2048
+    /// that was a permanent treadmill: the trim warning below fired every dozen seconds for hours
+    /// and the convergence warning never stopped. So the effective cap scales with how many
+    /// documents have actually been analyzed (see <see cref="Trim"/>), and this constant is the
+    /// floor, with <see cref="MaxEntriesCeiling"/> as the genuine runaway guard.
+    /// </para>
     /// </remarks>
     private const int MaxEntries = 2048;
+
+    /// <summary>
+    /// The cap the working set can grow the cache to before eviction wins after all. Far above any
+    /// solution this daemon has met; a working set beyond it trades the treadmill for memory, and
+    /// the trim warning names the condition either way.
+    /// </summary>
+    private const int MaxEntriesCeiling = 16384;
 
     private static readonly ConcurrentDictionary<DocumentId, Entry> s_entries = new();
     // Lazy, not Task: ConcurrentDictionary may invoke a GetOrAdd factory more than once under
@@ -755,7 +775,14 @@ internal static class AnalyzerDiagnosticCache
 
     private static void Trim()
     {
-        int maxEntries = MaxEntriesOverrideForTesting ?? MaxEntries;
+        // Sized to the analyzed working set, not to a guess made before it existed: every entry
+        // evicted while its document is still being swept re-enters through a fallback report and
+        // a recompute, so a cap below the working set does not save the memory — it converts it
+        // into repeated analyzer passes. The slack covers the analyses in flight between a store
+        // and its s_analyzedVersions stamp. s_analyzedVersions accumulates dead DocumentIds across
+        // solution reloads, which can only make the cap generous; the ceiling is what bounds that.
+        int maxEntries = MaxEntriesOverrideForTesting
+            ?? Math.Clamp(s_analyzedVersions.Count + 256, MaxEntries, MaxEntriesCeiling);
         if (s_entries.Count <= maxEntries)
             return;
 

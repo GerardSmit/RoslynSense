@@ -231,7 +231,10 @@ internal static class WorkspaceDiagnosticsHandler
                 + $"[{Abbreviate(was)} -> {Abbreviate(report.ResultId)}]";
         });
 
-        Services.ServiceLog.Warn(
+        // Debug rather than Warn: this is a report about the tool's own health, not the user's
+        // solution — it goes to the extension's debug output channel, never a toast, and stderr
+        // keeps it either way.
+        Services.ServiceLog.Debug(
             $"The workspace sweep has re-reported files on {streak} consecutive passes "
             + $"({full.Count} full / {merged.Count - full.Count} unchanged this pass, "
             + $"{repeated} of them full on the previous pass too) — result ids "

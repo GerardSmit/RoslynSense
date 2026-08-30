@@ -12,6 +12,8 @@ using RoslynMCP.Languages.MsBuild;
 using RoslynMCP.Languages.Proto;
 using RoslynMCP.Languages.Razor;
 using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.Routes;
+using RoslynMCP.Languages.Templates;
 using RoslynMCP.Languages.Values;
 using RoslynMCP.Languages.WebConfig;
 using RoslynMCP.Languages.WebConfig.Core;
@@ -69,6 +71,17 @@ internal static class LanguagePackRegistration
         // claim wins, and an explicit configuration should beat a name this pack recognises.
         if (settings.Cron.Enabled)
             packs.Add(new CronLanguage(settings));
+
+        // Position is free: the pack claims no string literal, so nothing above it can be beaten to
+        // a claim and it can beat nobody. Beside the scheduled jobs because the two are siblings —
+        // both answer about what the solution runs rather than about a file it contains.
+        if (settings.Routes.Enabled)
+            packs.Add(new RoutesLanguage(settings));
+
+        // Beside the other two sections, and free of them: this pack reads its own files off the
+        // disk and claims no literal from any call, so nothing above it can be beaten to a claim.
+        if (settings.Templates.Enabled)
+            packs.Add(new TemplatesLanguage(settings));
         if (settings.MsBuild)
             packs.Add(new MsBuildLanguage());
         if (settings.Dbml)
@@ -118,6 +131,10 @@ internal static class LanguagePackRegistration
         // After the value sets — see Create for why.
         if (settings.Cron.Enabled)
             AddPack<CronLanguage>(services);
+        if (settings.Routes.Enabled)
+            AddPack<RoutesLanguage>(services);
+        if (settings.Templates.Enabled)
+            AddPack<TemplatesLanguage>(services);
         if (settings.MsBuild)
             AddPack<MsBuildLanguage>(services);
         if (settings.Dbml)

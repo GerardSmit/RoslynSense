@@ -1,4 +1,4 @@
-namespace RoslynMCP.Config;
+﻿namespace RoslynMCP.Config;
 
 /// <summary>
 /// What changed between two resolved settings, as short human-readable phrases — the "why" a
@@ -28,6 +28,8 @@ internal static class SettingsDiff
         Toggle("appsettings", old.AppSettings, @new.AppSettings);
         Toggle("webconfig", old.WebConfig, @new.WebConfig);
         Toggle("cron", old.Cron.Enabled, @new.Cron.Enabled);
+        Toggle("routes", old.Routes.Enabled, @new.Routes.Enabled);
+        Toggle("templates", old.Templates.Enabled, @new.Templates.Enabled);
         Toggle("debugger", old.Debugger, @new.Debugger);
         Toggle("profiling", old.Profiling, @new.Profiling);
         Toggle("database", old.Database, @new.Database);

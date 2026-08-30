@@ -489,7 +489,10 @@ internal static class SolutionWarmup
         {
             using var admitted = await ForegroundGate.AdmitAsync(token).ConfigureAwait(false);
             await SyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
-            await TopLevelSyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
+            // Derives TopLevelSyntaxTreeIndex on the way through, and leaves behind the flat
+            // per-document entry a Search Everywhere keystroke reads — so the first search after
+            // warmup is as warm as the hundredth.
+            await LoadedDeclarationCache.GetAsync(document, token).ConfigureAwait(false);
             swept?.Invoke();
         });
 

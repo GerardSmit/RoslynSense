@@ -28,18 +28,24 @@ internal struct SearchTimer
 
     private readonly string _what;
     private readonly string _query;
+    private readonly string? _filter;
     private readonly long _started;
     private long _searchStarted;
 
-    private SearchTimer(string what, string query)
+    private SearchTimer(string what, string query, string? filter)
     {
         _what = what;
         _query = query;
+        _filter = filter;
         _started = Stopwatch.GetTimestamp();
         _searchStarted = _started;
     }
 
-    public static SearchTimer Start(string what, string query) => new(what, query);
+    /// <param name="filter">What narrowed the search — the panel's tab, say — worded for the log
+    /// line. A query that finds 0 results under one tab and 51 under another looks like a bug
+    /// until the line says which tab each answer was for; it cost an investigation to learn that.</param>
+    public static SearchTimer Start(string what, string query, string? filter = null) =>
+        new(what, query, filter);
 
     /// <summary>The moment the corpus was ready and the search itself began.</summary>
     public void CorpusReady() => _searchStarted = Stopwatch.GetTimestamp();
@@ -56,7 +62,8 @@ internal struct SearchTimer
         var waiting = total - searching;
 
         ServiceLog.Info(
-            $"{_what} \"{_query}\" took {Seconds(total)} against the {corpus}: " +
+            $"{_what} \"{_query}\"{(_filter is null ? "" : $" ({_filter})")} took {Seconds(total)} " +
+            $"against the {corpus}: " +
             $"{Seconds(waiting)} waiting for the corpus, {Seconds(searching)} searching it " +
             $"({results} result{(results == 1 ? "" : "s")}).");
     }

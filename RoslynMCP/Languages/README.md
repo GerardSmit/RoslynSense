@@ -45,9 +45,19 @@ Languages/
     Core/              the engine: unescape, parse, stack the layers, resolve the four keys
     DotSettingsLanguage.cs
   Cron/                Hangfire and Quartz schedules — no files of its own, and the first pack to
-                       put a section in the Solution Explorer
+                       put a section in the Discovery view
     Core/              the engine: the grammar, the call sites, and the per-compilation job index
     CronLanguage.*.cs
+  Routes/              the HTTP endpoints a solution serves — no files of its own either, and no
+                       editor feature at all: a Discovery section and nothing else
+    Core/              the engine: the tables, the template arithmetic, and the per-compilation
+                       endpoint index
+    RoutesLanguage.*.cs
+  Templates/           the screens an application declares in data — a Discovery section too, and
+                       the only pack whose subject is not in a compilation at all
+    Core/              the engine: the YAML reader that keeps positions, the merge across a folder
+                       of files, and the two ways of finding what renders a screen
+    TemplatesLanguage.*.cs
 ```
 
 `DotSettings/` is the other kind of exception, and the opposite one. It owns two extensions and
@@ -72,14 +82,32 @@ and does it own spans inside someone else's".
 not even in the repository — it is rows in a lookup table — so what the pack contributes is a way
 of reaching something the compilation cannot see at all, hung off the same seam.
 
-`Cron/` is the one pack that adds a row to the tree rather than an answer to a request. It is the
-same problem `Mediator/` has, one level up: a recurring job is registered by an ordinary call in a
-startup method, so the job's own method looks uncalled and the question "what runs on this system,
-and when" is answered nowhere in the editor. Answering it needed a seam that did not exist —
-`ILanguageSolutionTreeContributor`, whose two methods split along the tree's own promise that
-drawing the solution root evaluates no project: `SectionAsync` runs there and may only read cheap
-evidence, while `ChildrenAsync` runs after a click and can afford a compilation. A pack's node ids
-are prefixed and routed last, so no prefix it chooses can shadow `project:` or `file:`.
+`Cron/`, `Routes/` and `Templates/` are the packs that add a row to a tree rather than an answer
+to a request. It is the same problem `Mediator/` has, one level up: a recurring job is registered
+by an ordinary call in a startup method and an endpoint by an attribute on a method, so in both
+cases the method looks uncalled and the question — "what runs on this system, and when", "what
+does this service serve, and where is it handled" — is answered nowhere in the editor.
+
+`Templates/` is the far end of that. Its subject is not in the compilation at all: an application
+whose screens are declared in YAML has a structure — pages under pages, each hosting something
+that renders it — spread across a couple of hundred files named after the change that introduced
+them rather than after the screen they describe. So the pack reads the folder itself, merges it the
+way the application does, and draws the tree; and because a declaration and the control honouring
+it are two files in two languages joined by nothing but a name, the two buttons on a row are the
+point of the section rather than a convenience on top of it.
+
+Answering it needed a seam that did not exist, `ILanguageDiscoveryContributor`, whose two methods
+split along the view's own promise that listing its sections evaluates no project: `SectionAsync`
+runs there and may only read cheap evidence — a manifest scan, a cached probe, the configuration —
+while `ChildrenAsync` runs after a click and can afford a compilation. Node ids are prefixed and
+routed by prefix, so the prefixes have to stay distinct between packs; the handler takes the first
+that matches.
+
+These sections hung under the solution node in the Solution Explorer before the **Discovery** view
+existed, and both things that went wrong there were structural. A section sat in a list of solution
+folders while being nothing of the kind, so the one row that was not browsable by location looked
+exactly like the rows that were; and it could only ever be found by expanding the solution, which
+is the node people collapse first on a repository big enough for the question to matter.
 
 Not every pack is a file type. `Mediator/` owns no extension at all: a request, its handler and the
 call joining them are ordinary C#, and what is missing is the *edge* between them, which Roslyn

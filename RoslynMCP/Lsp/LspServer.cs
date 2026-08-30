@@ -490,7 +490,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/solutionTree", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
-        Handlers.SolutionTreeHandler.ChildrenAsync(p, ct, _languages);
+        Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
 
     [JsonRpcMethod("roslynSense/solutionProjects")]
     public SolutionProjectInfo[] SolutionProjects() => Handlers.SolutionTreeHandler.Projects();
@@ -515,6 +515,33 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/solutionTreeEdit", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeEditResult> SolutionTreeEdit(SolutionTreeEditParams p, CancellationToken ct) =>
         Handlers.SolutionTreeEditHandler.EditAsync(p, ct);
+
+    // ---- Discovery ----------------------------------------------------------------------
+
+    [JsonRpcMethod("roslynSense/discoveryTree", UseSingleObjectParameterDeserialization = true)]
+    public Task<SolutionTreeNode[]> DiscoveryTree(SolutionTreeParams p, CancellationToken ct) =>
+        Handlers.DiscoveryTreeHandler.ChildrenAsync(p, ct, _languages);
+
+    /// <summary>
+    /// What implements the declaration a Discovery row points at. Routed by the row's own document,
+    /// so the pack that owns the file answers.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <c>textDocument/implementation</c> because the empty answer has to explain
+    /// itself — see <see cref="DiscoveryImplementationsResult"/>. The C# fallback is not "ask
+    /// Roslyn": a row whose file belongs to no pack has nothing deferred about it, so reaching
+    /// here at all means the client asked about a row that should never have shown the button.
+    /// </remarks>
+    [JsonRpcMethod("roslynSense/discoveryImplementations", UseSingleObjectParameterDeserialization = true)]
+    public Task<DiscoveryImplementationsResult> DiscoveryImplementations(
+        TextDocumentPositionParams p, CancellationToken ct) =>
+        Route<Languages.ILanguageDiscoveryImplementationResolver, DiscoveryImplementationsResult>(
+            p.TextDocument,
+            resolver => resolver.DiscoveryImplementationsAsync(p, ct),
+            () => Task.FromResult(DiscoveryImplementationsResult.None(
+                "No implementation. Nothing in this solution knows how to resolve one for this row.")),
+            whenBroken: () => DiscoveryImplementationsResult.None(
+                "The implementation could not be looked up. See the RoslynSense output for why."));
 
     // ---- Virtual documents (generated and decompiled sources) ----------------------------
 

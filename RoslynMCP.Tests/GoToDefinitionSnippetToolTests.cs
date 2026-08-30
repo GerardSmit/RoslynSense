@@ -119,6 +119,13 @@ public class GoToDefinitionSnippetToolTests
     [Fact]
     public async Task WhenExternalDependencyTargetedThenNestedGoToDefinitionWorks()
     {
+        // The subject is the decompiled file and navigating within it, not how the source was
+        // obtained. Without this the fixture assembly's Source Link map — which points at this
+        // repository on GitHub — is followed on a machine that can reach it, and the answer becomes
+        // real source at a path outside the decompilation cache, which the second half then cannot
+        // navigate. The two tests above scope it off for the same reason.
+        using var offline = ExternalSourceScope.Offline();
+
         var externalDefinition = await GoToDefinitionSnippetTool.GoToDefinitionSnippet(
             filePath: FixturePaths.ExternalReferencesFile,
             markupSnippet: "return math.[|AddTen|](value);",

@@ -28,27 +28,28 @@ internal class RazorDiagnostics : IDiagnosticsHandler
 
         var sourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(project, cancellationToken);
 
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation is null)
-            return "Error: Unable to produce compilation for project.";
-
         var sb = new StringBuilder();
         sb.AppendLine($"**Razor Validation: {Path.GetFileName(filePath)}**");
         sb.AppendLine();
 
-        var allDiagnostics = compilation.GetDiagnostics();
+        // Bind only this file's generated documents instead of the whole compilation: the map
+        // already knows which generated docs carry #line directives pointing at this file, and
+        // the version-keyed cache is shared with the LSP session in the same process.
         var mappedDiags = new List<RazorMappedDiagnostic>();
-
-        foreach (var diag in allDiagnostics)
+        foreach (var genDoc in GeneratedDocumentsFor(sourceMap, filePath))
         {
-            var mapped = RazorSourceMappingService.MapDiagnostic(sourceMap, diag);
-            if (mapped.MappedLocation is not null &&
-                string.Equals(
-                    Path.GetFullPath(mapped.MappedLocation.RazorFilePath),
-                    Path.GetFullPath(filePath),
-                    StringComparison.OrdinalIgnoreCase))
+            var result = await Lsp.CompilerDiagnosticCache.GetOrComputeAsync(genDoc, cancellationToken);
+            foreach (var diag in result.Compiler)
             {
-                mappedDiags.Add(mapped);
+                var mapped = RazorSourceMappingService.MapDiagnostic(sourceMap, diag);
+                if (mapped.MappedLocation is not null &&
+                    string.Equals(
+                        Path.GetFullPath(mapped.MappedLocation.RazorFilePath),
+                        Path.GetFullPath(filePath),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    mappedDiags.Add(mapped);
+                }
             }
         }
 
@@ -78,5 +79,20 @@ internal class RazorDiagnostics : IDiagnosticsHandler
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>The generated documents whose #line directives point at <paramref name="filePath"/>.
+    /// The map's keys are the paths as the directives wrote them, so a direct hit is tried first
+    /// and a normalized comparison second.</summary>
+    private static IEnumerable<SourceGeneratedDocument> GeneratedDocumentsFor(
+        RazorSourceMap sourceMap, string filePath)
+    {
+        if (sourceMap.RazorToGeneratedDocuments.TryGetValue(filePath, out var docs))
+            return docs;
+
+        string fullPath = Path.GetFullPath(filePath);
+        return sourceMap.RazorToGeneratedDocuments
+            .Where(kv => string.Equals(Path.GetFullPath(kv.Key), fullPath, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kv => kv.Value);
     }
 }

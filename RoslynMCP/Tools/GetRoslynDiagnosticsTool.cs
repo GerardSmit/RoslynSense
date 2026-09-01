@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using ModelContextProtocol.Server;
+using RoslynMCP.Config;
 using RoslynMCP.Services;
 using RoslynMCP.Languages;
 
@@ -104,7 +105,7 @@ public static class GetRoslynDiagnosticsTool
             return "Error: File not found in project.";
 
         var diagnostics = await CollectFileDiagnosticsAsync(
-            fileCtx.Document, fileCtx.Project, fileCtx.SystemPath, runAnalyzers, cancellationToken);
+            fileCtx.Document, runAnalyzers, cancellationToken);
 
         if (filter is not null)
             diagnostics = diagnostics.Where(d => d.Severity == filter.Value).ToList();
@@ -159,25 +160,34 @@ public static class GetRoslynDiagnosticsTool
     /// Collects all diagnostics for a single file from compilation and (optionally)
     /// analyzers, deduplicating by diagnostic ID and source span.
     /// </summary>
+    /// <remarks>
+    /// Rides the LSP pull path's caches rather than compiling the whole project to answer for
+    /// one file: the compiler half is a version-keyed single-document bind
+    /// (<see cref="Lsp.CompilerDiagnosticCache"/>), the analyzer half a document-scoped run over
+    /// the cached per-project driver. Both are shared with the editor session in the same
+    /// process, so a file the editor has already shown squiggles for answers from cache.
+    /// </remarks>
     private static async Task<List<Diagnostic>> CollectFileDiagnosticsAsync(
-        Document document, Project project, string filePath, bool runAnalyzers,
-        CancellationToken cancellationToken)
+        Document document, bool runAnalyzers, CancellationToken cancellationToken)
     {
         var all = new List<Diagnostic>();
 
-        var compilation = await project.GetCompilationAsync(cancellationToken);
-        if (compilation is null)
-            return all;
+        var compiler = await Lsp.CompilerDiagnosticCache.GetOrComputeAsync(document, cancellationToken);
+        all.AddRange(compiler.Compiler);
 
-        all.AddRange(compilation.GetDiagnostics()
-            .Where(d => d.Location.SourceTree is not null &&
-                        string.Equals(d.Location.SourceTree.FilePath, filePath,
-                            StringComparison.OrdinalIgnoreCase)));
+        // A single-tree bind structurally misses the unused-member family (CS0169 & co.) —
+        // a whole-compilation fact. That pass is keyed on the declaration version (body edits
+        // keep it valid) and shared with the LSP sweep, so it usually answers from cache.
+        await Lsp.ProjectWideDiagnosticCache.RefreshAsync(document.Project, cancellationToken);
+        all.AddRange(Lsp.ProjectWideDiagnosticCache.TryGetAnyVersion(document.Project, document.FilePath));
 
         if (runAnalyzers)
         {
-            var analyzerDiags = await AnalyzerService.RunAnalyzersAsync(
-                project, compilation, filePath, Console.Error, cancellationToken);
+            // The cache honours the editor's analyzer toggle and returns nothing when it is off;
+            // this caller asked for analyzers explicitly, so run them document-scoped instead.
+            var analyzerDiags = LspFeatureOptions.AnalyzerDiagnostics
+                ? await Lsp.AnalyzerDiagnosticCache.GetOrComputeAsync(document, cancellationToken)
+                : await AnalyzerService.RunDocumentAnalyzersAsync(document, cancellationToken);
             all.AddRange(analyzerDiags);
         }
 

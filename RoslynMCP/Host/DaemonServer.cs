@@ -1,7 +1,9 @@
 ﻿using System.IO.Pipes;
 using System.Reflection;
+using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Database;
 
 namespace RoslynMCP.Daemon;
 
@@ -17,6 +19,10 @@ internal sealed class DaemonServer
     private readonly DaemonLifecycle _lifecycle;
     private readonly string _pipeName;
     private readonly string _workingDir;
+
+    /// <summary>Set right after construction in <see cref="RunHostAsync"/>; a config reload
+    /// hands it the new settings so later file events resolve under them.</summary>
+    private DbConnectionWatcher? _dbWatcher;
 
     /// <summary>
     /// Providers replaced by a configuration reload. Kept alive, never disposed mid-run:
@@ -111,6 +117,14 @@ internal sealed class DaemonServer
         // edit — the thin clients and LSP proxies just forward here.
         using var configWatcher = ConfigWatcher.Start(workingDir, [], settings, server.ApplyConfigReload);
 
+        // Same reasoning for the connection-string sources (web.config, appsettings*.json):
+        // without this, an edited connection string keeps the db_* tools on the old database
+        // until the daemon idles out. The registry instance is carried across config reloads,
+        // so resolving it once here stays valid for the daemon's whole life.
+        using var dbWatcher = DbConnectionWatcher.Start(
+            workingDir, settings, services.GetRequiredService<DbConnectionRegistry>());
+        server._dbWatcher = dbWatcher;
+
         try
         {
             await server.AcceptLoopAsync(shutdownCts.Token);
@@ -179,6 +193,10 @@ internal sealed class DaemonServer
             _retired.Add(previous);
             _services = fresh;
         }
+
+        // Build above already re-resolved the carried connection registry under the new
+        // settings; the file watcher only needs them for the next config-file event.
+        _dbWatcher?.UpdateSettings(settings);
 
         WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
         _lifecycle.UpdateIdleTimeout(TimeSpan.FromMinutes(settings.HostIdleMinutes));

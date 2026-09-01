@@ -26,14 +26,20 @@ internal static class ToolHostServices
     /// <paramref name="carryFrom"/> is what makes a live configuration reload safe: the stores
     /// hold state the user can see — running apps, background tasks, profiling sessions, open
     /// designer watches — and rebuilding them because a feature toggle changed would kill all of
-    /// it. Everything the settings actually shape (language packs, the registry, database
-    /// connections) is built fresh. The old provider must NOT be disposed while the new one
+    /// it. Everything the settings actually shape (language packs, the registry) is built fresh;
+    /// database connections are carried and re-resolved in place, so runtime-added connections
+    /// survive a reload too. The old provider must NOT be disposed while the new one
     /// lives: disposing it disposes the carried stores, which the new container only borrows.
     /// </remarks>
     public static ServiceProvider Build(
         EffectiveSettings settings, IOutputFormatter formatter, string workingDir, ServiceProvider? carryFrom)
     {
-        var dbProviders = ResolveDbProviders(settings, workingDir);
+        // The registry instance is carried (runtime-added connections are user-visible state),
+        // but its resolved contents follow the new settings: explicit connections and a fresh
+        // auto-discovery pass replace the old ones in place.
+        var dbRegistry = carryFrom?.GetService<DbConnectionRegistry>()
+            ?? new DbConnectionRegistry(Array.Empty<IDbProvider>());
+        DbConnectionWatcher.Resolve(dbRegistry, settings, workingDir, out _);
 
         var services = new ServiceCollection();
         services.AddSingleton(settings);
@@ -43,7 +49,7 @@ internal static class ToolHostServices
         Carry<RoslynMCP.Services.Memory.MemorySnapshotStore>(services, carryFrom);
         Carry<BackgroundTaskStore>(services, carryFrom);
         Carry<BuildWarningsStore>(services, carryFrom);
-        services.AddSingleton(new DbConnectionRegistry(dbProviders));
+        services.AddSingleton(dbRegistry);
         Carry<ExecutionPlanStore>(services, carryFrom);
 
         services.AddSingleton<DesignerRegenerationService>();
@@ -83,19 +89,4 @@ internal static class ToolHostServices
             services.AddSingleton(carryFrom.GetRequiredService<T>());
     }
 
-    private static IReadOnlyList<IDbProvider> ResolveDbProviders(EffectiveSettings settings, string workingDir)
-    {
-        if (!settings.Database)
-            return Array.Empty<IDbProvider>();
-        if (!settings.ShouldRunAutoDiscovery())
-            return settings.ExplicitDbProviders;
-
-        var auto = AutoConnectionStringDiscovery.Discover(workingDir, out _);
-        var existing = new HashSet<string>(settings.ExplicitDbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
-        var merged = new List<IDbProvider>(settings.ExplicitDbProviders);
-        foreach (var p in auto)
-            if (existing.Add(p.Alias))
-                merged.Add(p);
-        return merged;
-    }
 }

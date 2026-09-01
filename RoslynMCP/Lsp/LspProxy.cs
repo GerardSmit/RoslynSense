@@ -1,6 +1,8 @@
-﻿using RoslynMCP.Config;
+﻿using Microsoft.Extensions.DependencyInjection;
+using RoslynMCP.Config;
 using RoslynMCP.Daemon;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Database;
 
 namespace RoslynMCP.Lsp;
 
@@ -156,8 +158,15 @@ internal static class LspProxy
         // process exits with the session anyway.
         var replaced = new List<Microsoft.Extensions.DependencyInjection.ServiceProvider>();
         var currentProvider = services;
+
+        // In-process host, so nothing else watches the connection-string sources either. The
+        // registry instance is carried across config reloads, so this stays valid throughout.
+        using var dbWatcher = DbConnectionWatcher.Start(
+            workingDir, settings, services.GetRequiredService<DbConnectionRegistry>());
+
         using var configWatcher = Daemon.ConfigWatcher.Start(workingDir, [], settings, reload =>
         {
+            dbWatcher?.UpdateSettings(reload.Settings);
             Console.Error.WriteLine(
                 $"[Lsp] {RoslynSenseConfigLoader.FileName} changed: {string.Join("; ", reload.Changes)}. Applying.");
             bool toon = string.Equals(reload.Settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);

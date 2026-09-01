@@ -693,6 +693,8 @@ Plain relative paths (no placeholder) resolve in this order: CWD → solutionRoo
 
 At startup the server scans the working directory tree for `web.config`, `app.config`, and `appsettings*.json` files and registers any connection strings it finds. The alias is `ProjectName_ConnectionStringName` (project name comes from the nearest `*.csproj` walking up; non-alphanumerics are replaced with `_`). Explicit `--db` flags and `roslynsense.json` `connections` always win over auto-discovered aliases with the same name.
 
+The scan stays live: editing, adding, or deleting one of those config files re-runs discovery on a running host, so the registered connections follow the file on disk (build outputs like `bin/` and `obj/` are ignored). The same applies to `connections` edited in `roslynsense.json`. Connections added at runtime with `db_add_connection` survive every refresh, and an alias removed with `db_remove_connection` stays removed until re-added or the host restarts.
+
 Disable the scan entirely with `--no-auto-db` (or `database.autoDiscovery: false` in `roslynsense.json`), or disable the database tools altogether with `--no-db`.
 
 <details>

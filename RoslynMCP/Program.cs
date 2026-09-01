@@ -101,26 +101,9 @@ class Program
         DebuggerViewOptions.Current = settings.DebugView;
         DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
-        IReadOnlyList<IDbProvider> dbProviders;
-        IReadOnlyList<AutoConnectionStringDiscovery.DiscoveryWarning> autoDbWarnings = Array.Empty<AutoConnectionStringDiscovery.DiscoveryWarning>();
-        if (!settings.Database)
-        {
-            dbProviders = Array.Empty<IDbProvider>();
-        }
-        else if (!settings.ShouldRunAutoDiscovery())
-        {
-            dbProviders = settings.ExplicitDbProviders;
-        }
-        else
-        {
-            var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out autoDbWarnings);
-            var existing = new HashSet<string>(settings.ExplicitDbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
-            var merged = new List<IDbProvider>(settings.ExplicitDbProviders);
-            foreach (var p in auto)
-                if (existing.Add(p.Alias))
-                    merged.Add(p);
-            dbProviders = merged;
-        }
+        var dbRegistry = new DbConnectionRegistry(Array.Empty<IDbProvider>());
+        DbConnectionWatcher.Resolve(
+            dbRegistry, settings, Directory.GetCurrentDirectory(), out var autoDbWarnings);
 
         var builder = Host.CreateApplicationBuilder(args);
         builder.Logging.AddConsole(consoleLogOptions =>
@@ -161,7 +144,7 @@ class Program
         builder.Services.AddSingleton<RoslynMCP.Services.Memory.MemorySnapshotStore>();
         builder.Services.AddSingleton<BackgroundTaskStore>();
         builder.Services.AddSingleton<BuildWarningsStore>();
-        builder.Services.AddSingleton(new DbConnectionRegistry(dbProviders));
+        builder.Services.AddSingleton(dbRegistry);
         builder.Services.AddSingleton<ExecutionPlanStore>();
 
         builder.Services.AddSingleton<DesignerRegenerationService>();
@@ -253,23 +236,38 @@ class Program
                     layeredConfig.Present.Select(layer => $"{layer.FilePath} [{layer.Scope}]")));
         }
 
-        // Shared-host mode: the daemon watches roslynsense.json itself and applies changes live.
-        // In-process mode the MCP SDK owns the container, so a change cannot be applied without
-        // a restart — but silently ignoring the edit is worse than saying so.
+        // Shared-host mode: the daemon watches roslynsense.json and the connection-string
+        // sources itself and applies changes live. In-process mode the MCP SDK owns the
+        // container, so most of a config change cannot be applied without a restart — but the
+        // database connections live in a mutable registry, so those ARE applied live, both from
+        // a roslynsense.json edit and from an edited web.config / appsettings*.json.
         RoslynMCP.Daemon.ConfigWatcher? configWatcher = null;
+        DbConnectionWatcher? dbWatcher = null;
         if (sharedHostSolution is null)
         {
+            dbWatcher = DbConnectionWatcher.Start(Directory.GetCurrentDirectory(), settings, dbRegistry);
+
             var reloadLogger = host.Services.GetRequiredService<ILoggerFactory>()
                 .CreateLogger("RoslynMCP.Config");
             configWatcher = RoslynMCP.Daemon.ConfigWatcher.Start(
                 Directory.GetCurrentDirectory(), args, settings, reload =>
+                {
+                    dbWatcher?.UpdateSettings(reload.Settings);
+                    var dbChanges = DbConnectionWatcher.Resolve(
+                        dbRegistry, reload.Settings, Directory.GetCurrentDirectory(), out _);
+                    if (dbChanges.Count > 0)
+                        reloadLogger.LogInformation(
+                            "Database connections updated live: {Changes}.",
+                            string.Join("; ", dbChanges));
                     reloadLogger.LogWarning(
-                        "roslynsense.json changed ({Changes}); restart this server to apply it. "
+                        "roslynsense.json changed ({Changes}); restart this server to apply the rest. "
                         + "(The shared host applies config changes live.)",
-                        string.Join("; ", reload.Changes)));
+                        string.Join("; ", reload.Changes));
+                });
         }
 
         using (configWatcher)
+        using (dbWatcher)
         {
             await host.RunAsync();
         }

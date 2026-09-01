@@ -83,6 +83,11 @@ class Program
             return await RoslynMCP.Daemon.DaemonServer.RunHostAsync(target);
         }
 
+        // Asks every shared host on this machine to exit, so `dotnet tool update` can uninstall
+        // a package whose binaries the daemons would otherwise keep loaded and locked.
+        if (args.Length > 0 && args[0].Equals("--stop-daemons", StringComparison.OrdinalIgnoreCase))
+            return await RoslynMCP.Daemon.DaemonStopper.StopAllAsync();
+
         var startupWarnings = new List<string>();
 
         var layeredConfig = RoslynSenseConfigLoader.LoadLayers(Directory.GetCurrentDirectory());

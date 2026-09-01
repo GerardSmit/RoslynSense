@@ -51,6 +51,41 @@ internal static class HostRegistry
     /// prune by PID, the same way <c>RunningProcessRegistry</c> does, so there is no state that
     /// only an orderly exit can clean up.
     /// </summary>
+    /// <summary>
+    /// Every published host whose process is still alive. Descriptors whose PID is gone are
+    /// stale crash leftovers and are skipped, matching how <c>Withdraw</c>'s remark says readers
+    /// behave.
+    /// </summary>
+    public static IReadOnlyList<HostInfo> All()
+    {
+        var hosts = new List<HostInfo>();
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(
+                HostPaths.DaemonRoot, "host.json", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    var info = JsonSerializer.Deserialize<HostInfo>(File.ReadAllText(file));
+                    if (info is null)
+                        continue;
+                    using var process = System.Diagnostics.Process.GetProcessById(info.Pid);
+                    if (!process.HasExited)
+                        hosts.Add(info);
+                }
+                catch
+                {
+                    // Unparseable or the process is gone — a crash leftover, not a host.
+                }
+            }
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // No daemon has ever run on this machine.
+        }
+        return hosts;
+    }
+
     public static void Withdraw(string solutionKey)
     {
         try { File.Delete(FileFor(solutionKey)); }

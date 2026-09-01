@@ -253,6 +253,17 @@ internal sealed class DaemonServer
                     return;
                 }
 
+                if (string.Equals(request.Kind, "exit", StringComparison.Ordinal))
+                {
+                    // Answer first, then die: the stopper waits for this process to exit, and a
+                    // response that never comes would cost it its whole timeout per daemon.
+                    Console.Error.WriteLine("[Daemon] Exit requested; shutting down.");
+                    await IpcProtocol.WriteMessageAsync(
+                        pipe, new DaemonResponse(request.Id, true, "exiting", null), ct);
+                    _lifecycle.RequestShutdown();
+                    return;
+                }
+
                 var response = string.Equals(request.Kind, "editor-debug", StringComparison.Ordinal)
                     ? await RelayEditorDebugAsync(request, ct)
                     : string.Equals(request.Kind, "hot-reload", StringComparison.Ordinal)

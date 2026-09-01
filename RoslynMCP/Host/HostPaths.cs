@@ -70,8 +70,12 @@ internal static class HostPaths
 
     public static string PipeName(string solutionKey) => $"roslyn-mcp-host-{Hash(solutionKey)}";
 
+    /// <summary>The directory every daemon's lock directory lives under — what an enumeration
+    /// of running daemons scans.</summary>
+    public static string DaemonRoot => Path.Combine(Path.GetTempPath(), "roslyn-mcp-daemon");
+
     public static string LockDirectory(string solutionKey) =>
-        Path.Combine(Path.GetTempPath(), "roslyn-mcp-daemon", Hash(solutionKey));
+        Path.Combine(DaemonRoot, Hash(solutionKey));
 
     public static string LockFilePath(string solutionKey) =>
         Path.Combine(LockDirectory(solutionKey), ".lock");

@@ -87,7 +87,8 @@ public sealed record BuildResult(
     [property: JsonPropertyName("success")] bool Success,
     [property: JsonPropertyName("summary")] string Summary,
     [property: JsonPropertyName("errors")] BuildMessage[] Errors,
-    [property: JsonPropertyName("warnings")] BuildMessage[] Warnings);
+    [property: JsonPropertyName("warnings")] BuildMessage[] Warnings,
+    [property: JsonPropertyName("log")] string Log = "");
 
 public sealed record BuildMessage(
     [property: JsonPropertyName("file")] string? File,

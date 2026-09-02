@@ -365,7 +365,8 @@ internal static partial class LaunchHandler
                 ? $"{done} {Path.GetFileName(projectPath)} ({warnings.Length} warning(s))."
                 : $"{verb[..^3]} failed with {errors.Length} error(s).",
             errors,
-            warnings);
+            warnings,
+            output.ToString());
     }
 
     /// <summary>

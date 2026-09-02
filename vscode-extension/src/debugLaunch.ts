@@ -68,6 +68,8 @@ interface BuildResult {
     summary: string;
     errors: BuildMessage[];
     warnings: BuildMessage[];
+    // The raw MSBuild output. Absent from a server that predates it.
+    log?: string;
 }
 
 interface AttachTarget {
@@ -85,6 +87,11 @@ export function registerDebugLaunch(
 ): void {
     const buildDiagnostics = vscode.languages.createDiagnosticCollection('roslynSense.build');
     context.subscriptions.push(buildDiagnostics);
+
+    // Holds the most recent launch build's raw MSBuild output; created on first use so the
+    // Output dropdown does not gain an empty entry before anything has been built.
+    let buildLog: vscode.OutputChannel | undefined;
+    context.subscriptions.push({ dispose: () => buildLog?.dispose() });
 
     // Referenced from attach configurations as "${command:roslynSense.pickProcess}".
     context.subscriptions.push(
@@ -320,17 +327,26 @@ export function registerDebugLaunch(
                 }
 
                 publishBuildDiagnostics(buildDiagnostics, build);
+                if (build.log) {
+                    buildLog ??= vscode.window.createOutputChannel('RoslynSense Build');
+                    buildLog.replace(build.log);
+                }
                 if (!build.success) {
                     const firstError = build.errors[0];
+                    const actions = build.log
+                        ? ['Show Build Log', 'Show Problems']
+                        : ['Show Problems'];
                     void vscode.window
                         .showErrorMessage(
                             firstError
                                 ? `Build failed: ${firstError.message}`
                                 : build.summary,
-                            'Show Problems'
+                            ...actions
                         )
                         .then((choice) => {
-                            if (choice === 'Show Problems') {
+                            if (choice === 'Show Build Log') {
+                                buildLog?.show(true);
+                            } else if (choice === 'Show Problems') {
                                 void vscode.commands.executeCommand('workbench.actions.view.problems');
                             }
                         });

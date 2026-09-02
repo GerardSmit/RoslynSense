@@ -761,9 +761,7 @@ function warnOnOutdatedServer(serverVersion: string | undefined): void {
         )
         .then((choice) => {
             if (choice === 'Update Server') {
-                const terminal = vscode.window.createTerminal('RoslynSense update');
-                terminal.show();
-                terminal.sendText('dotnet tool update -g RoslynSense', true);
+                void vscode.commands.executeCommand('roslynSense.updateServer');
             }
         });
 }
@@ -3487,6 +3485,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             markDotnetWorkspace();
             await stopClient();
             await startClient(context);
+        }),
+        vscode.commands.registerCommand('roslynSense.updateServer', async () => {
+            // The update uninstalls the very binaries the server runs, so everything holding
+            // them has to go first: this window's LSP proxies (stopClient), then every shared
+            // daemon and its MSBuild hosts (--stop-daemons — run from the old install, and
+            // exited before the update starts). Other windows and MCP chats using the tool
+            // keep their own locks; the message names them instead of pretending to fix them.
+            await stopClient();
+            const terminal = vscode.window.createTerminal('RoslynSense update');
+            terminal.show();
+            terminal.sendText('roslyn-sense --stop-daemons; dotnet tool update -g RoslynSense', true);
+            void vscode.window
+                .showInformationMessage(
+                    'Updating the RoslynSense server. If the update reports locked files, close ' +
+                        'other editor windows and AI chats using RoslynSense and rerun it. ' +
+                        'When it finishes, restart the server.',
+                    'Restart Server'
+                )
+                .then((choice) => {
+                    if (choice === 'Restart Server') {
+                        void vscode.commands.executeCommand('roslynSense.restartServer');
+                    }
+                });
         }),
         vscode.commands.registerCommand('roslynSense.installServer', () => {
             const terminal = vscode.window.createTerminal('RoslynSense install');

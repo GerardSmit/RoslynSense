@@ -36,6 +36,36 @@ export function registerTaskProvider(
     getClient: () => LanguageClient | undefined
 ): void {
     context.subscriptions.push(
+        // The tasks run with reveal: Silent, so a failure would otherwise only show as a bare
+        // exit-code line. The log itself is the task's terminal; the button brings it up.
+        vscode.tasks.onDidEndTaskProcess((e) => {
+            const definition = e.execution.task.definition as TaskDefinition;
+            if (definition.type !== TASK_TYPE || !e.exitCode) {
+                // exitCode 0 is success; undefined means the process never ran (or was killed),
+                // which the terminal already narrates.
+                return;
+            }
+            if (definition.task !== 'build' && definition.task !== 'rebuild' && definition.task !== 'clean') {
+                return;
+            }
+            const taskName = e.execution.task.name;
+            void vscode.window
+                .showErrorMessage(`${taskName} failed.`, 'Show Build Log')
+                .then((choice) => {
+                    if (choice !== 'Show Build Log') {
+                        return;
+                    }
+                    const terminal = vscode.window.terminals.find((t) => t.name.includes(taskName));
+                    if (terminal) {
+                        terminal.show();
+                    } else {
+                        // The terminal is gone (closed, or reused by a later task): the Problems
+                        // view still has the matched errors.
+                        void vscode.commands.executeCommand('workbench.actions.view.problems');
+                    }
+                });
+        }),
+
         vscode.tasks.registerTaskProvider(TASK_TYPE, {
             async provideTasks() {
                 const client = getClient();

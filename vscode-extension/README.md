@@ -19,6 +19,13 @@ assistant's analysis tools, and the assistant's view is always in sync with what
   Or set `roslynSense.serverPath` to a locally built binary. If the server is missing, the
   extension offers to install it — from the error notification or from the Solution view.
 
+  To update, use **RoslynSense: Update Language Server** rather than running
+  `dotnet tool update` yourself: the update cannot uninstall a package whose binaries are
+  loaded, and the extension's own server and the shared daemon are exactly that. The command
+  stops this window's server, runs `roslyn-sense --stop-daemons`, and then updates. Other
+  editor windows and AI chats using RoslynSense hold their own locks — close them if the
+  update still reports a denied path.
+
 ## How it works
 
 The extension launches `roslyn-sense --lsp`, which connects to the per-solution shared daemon

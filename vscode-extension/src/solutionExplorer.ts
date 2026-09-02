@@ -1105,6 +1105,26 @@ export function registerSolutionExplorer(
         );
     }
 
+    async function buildProject(
+        node: SolutionTreeNode,
+        target: 'build' | 'rebuild' | 'clean'
+    ): Promise<void> {
+        const client = getClient();
+        if (!client || !node.id.startsWith('project:')) {
+            return;
+        }
+
+        const titles = { build: 'Building', rebuild: 'Rebuilding', clean: 'Cleaning' };
+        await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Window, title: `${titles[target]} ${node.label}…` },
+            () =>
+                client.sendRequest('workspace/executeCommand', {
+                    command: 'roslynSense.build',
+                    arguments: [node.id.slice('project:'.length), 'Debug', target],
+                })
+        );
+    }
+
     /**
      * The node one level up.
      *
@@ -1983,23 +2003,11 @@ export function registerSolutionExplorer(
                 );
             }
         ),
-        onNode(
-            'roslynSense.solutionExplorer.buildProject',
-            async (node) => {
-                const client = getClient();
-                if (!client || !node.id.startsWith('project:')) {
-                    return;
-                }
-                await vscode.window.withProgress(
-                    { location: vscode.ProgressLocation.Window, title: 'Building…' },
-                    () =>
-                        client.sendRequest('workspace/executeCommand', {
-                            command: 'roslynSense.build',
-                            arguments: [node.id.slice('project:'.length), 'Debug'],
-                        })
-                );
-            }
-        )
+        onNode('roslynSense.solutionExplorer.buildProject', (node) => buildProject(node, 'build')),
+        onNode('roslynSense.solutionExplorer.rebuildProject', (node) =>
+            buildProject(node, 'rebuild')
+        ),
+        onNode('roslynSense.solutionExplorer.cleanProject', (node) => buildProject(node, 'clean'))
     );
 
     // "Follow current file", off by default because it fights with manual navigation.

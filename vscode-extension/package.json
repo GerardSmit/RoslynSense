@@ -281,6 +281,10 @@
         "title": "RoslynSense: Install Language Server"
       },
       {
+        "command": "roslynSense.updateServer",
+        "title": "RoslynSense: Update Language Server"
+      },
+      {
         "command": "roslynSense.reloadValueSets",
         "title": "RoslynSense: Reload Value Sets"
       },
@@ -575,6 +579,16 @@
         "title": "Build Project",
         "category": "RoslynSense",
         "icon": "$(tools)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.rebuildProject",
+        "title": "Rebuild Project",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.cleanProject",
+        "title": "Clean Project",
+        "category": "RoslynSense"
       },
       {
         "command": "roslynSense.manageNuGet",
@@ -1525,6 +1539,31 @@
           "command": "roslynSense.solutionExplorer.buildProject",
           "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
           "group": "inline@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.runProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "00_run@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "00_run@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.buildProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "01_build@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.rebuildProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "01_build@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.cleanProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "01_build@3"
         },
         {
           "command": "roslynSense.solutionExplorer.openProjectFile",

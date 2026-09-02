@@ -516,6 +516,22 @@ internal sealed class LspServer : IDisposable
     public Task<SolutionTreeEditResult> SolutionTreeEdit(SolutionTreeEditParams p, CancellationToken ct) =>
         Handlers.SolutionTreeEditHandler.EditAsync(p, ct);
 
+    /// <summary>
+    /// What the project says about one file or folder — the Properties panel's form.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/itemProperties", UseSingleObjectParameterDeserialization = true)]
+    public Task<ItemPropertiesResult> ItemProperties(ItemPropertiesParams p, CancellationToken ct) =>
+        Handlers.ItemPropertiesHandler.GetAsync(p, ct);
+
+    /// <summary>
+    /// Writes one of those back, and answers with the form as it now reads — the panel shows
+    /// what the project file ended up saying rather than what it asked for.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/setItemProperties", UseSingleObjectParameterDeserialization = true)]
+    public Task<SetItemPropertiesResult> SetItemProperties(
+        SetItemPropertiesParams p, CancellationToken ct) =>
+        Handlers.ItemPropertiesHandler.SetAsync(p, ct);
+
     // ---- Discovery ----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/discoveryTree", UseSingleObjectParameterDeserialization = true)]

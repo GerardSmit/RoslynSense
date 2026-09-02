@@ -786,6 +786,195 @@ public static class ProjectMutationService
     }
 
     /// <summary>
+    /// The item types a file can be, in the order a picker should offer them.
+    /// </summary>
+    /// <remarks>
+    /// The ones MSBuild gives a file: what compiles, what ships beside the build, what is
+    /// embedded, and the two that only mean something to a particular SDK. A project may define
+    /// its own item types, and a file that has one keeps it — this list is what can be chosen,
+    /// not what can be read.
+    /// </remarks>
+    public static readonly string[] FileItemTypes =
+        ["Compile", "Content", "None", "EmbeddedResource", "Page", "AdditionalFiles", "Resource"];
+
+    /// <summary>
+    /// Rewrites what the project says about one file: its item type, and the metadata a
+    /// Properties panel edits.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three shapes, decided by how the file got into the project. A file the project names is
+    /// edited where it stands. A file a wildcard swept up keeps its glob when only metadata
+    /// changes — that is what <c>Update</c> is for, and it is what every generated
+    /// <c>Compile Update</c> in a real project already looks like. Only a change of item type has
+    /// to break the file out of its glob, and then it is removed from every glob that could have
+    /// claimed it before being named explicitly, for the same reason
+    /// <see cref="ExcludeFileAsync"/> does it: which glob owns a file depends on the SDK, a
+    /// <c>Remove</c> that matches nothing costs nothing, and a duplicate item is a build error.
+    /// </para>
+    /// <para>
+    /// A metadata value that is null or empty removes the metadata rather than writing it empty,
+    /// so a panel can put a property back to "not set" — which for
+    /// <c>CopyToOutputDirectory</c> differs from <c>Never</c> only in the file, not in the build.
+    /// </para>
+    /// </remarks>
+    public static async Task<MutationResult> SetItemPropertiesAsync(
+        string projectPath,
+        string filePath,
+        string? itemType,
+        IReadOnlyDictionary<string, string?>? metadata = null,
+        CancellationToken ct = default)
+    {
+        string full = Path.GetFullPath(filePath);
+        string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+        string include = Path.GetRelativePath(projectDirectory, full);
+
+        var evaluation = await ProjectEvaluationService.EvaluateAsync(projectPath, ct);
+        var current = evaluation?.Items.FirstOrDefault(item =>
+            string.Equals(item.FullPath, full, StringComparison.OrdinalIgnoreCase));
+
+        string currentType = current?.ItemType ?? DefaultGlobsFor(full)[0];
+        string targetType = itemType is { Length: > 0 } ? itemType : currentType;
+        bool typeChanged = !string.Equals(targetType, currentType, StringComparison.OrdinalIgnoreCase);
+
+        if (!typeChanged && (metadata is null || metadata.Count == 0))
+            return new MutationResult(true, "Nothing to change.");
+
+        try
+        {
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+            if (document.RootSyntax is not { } original)
+                return new MutationResult(false, "The project file could not be read.");
+
+            var root = original;
+
+            if (typeChanged)
+            {
+                while (AnyItemFor(root, include) is { } stale)
+                    root = root.RemoveNode(stale, SyntaxRemoveOptions.KeepNoTrivia)!;
+
+                if (current?.FromGlob != false)
+                    root = RemoveFromDefaultGlobs(root, full, include);
+
+                root = AddFileItem(root, targetType, "Include", include);
+            }
+            else if (AnyItemFor(root, include) is null)
+            {
+                // Globbed, and only its metadata is changing: an Update leaves the glob alone.
+                root = AddFileItem(root, targetType, "Update", include);
+            }
+
+            root = WriteMetadata(root, include, metadata);
+
+            File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
+            SelfWriteTracker.Note(projectPath);
+        }
+        catch (Exception ex)
+        {
+            return new MutationResult(false, $"Could not edit the project file: {ex.Message}");
+        }
+
+        await InvalidateAsync(ct, projectPath);
+
+        return new MutationResult(true, typeChanged
+            ? $"{Path.GetFileName(full)} is now {targetType} in " +
+              $"{Path.GetFileNameWithoutExtension(projectPath)}."
+            : $"Updated {Path.GetFileName(full)} in " +
+              $"{Path.GetFileNameWithoutExtension(projectPath)}.");
+    }
+
+    /// <summary>Every element naming this file, whatever item type it carries.</summary>
+    /// <remarks>
+    /// Broader than <see cref="ItemFor"/>, which answers for the four types file scaffolding
+    /// deals in. A Properties panel has to find the element whatever it says, or a file that is
+    /// <c>Page</c> today would gain a second element rather than losing its first.
+    /// </remarks>
+    private static XmlElementBaseSyntax? AnyItemFor(XmlElementBaseSyntax root, string include) =>
+        root.Descendants().FirstOrDefault(element =>
+            element.NameNode?.LocalName is { Length: > 0 } name
+            && FileItemTypes.Contains(name, StringComparer.OrdinalIgnoreCase)
+            && string.Equals(
+                element.GetAttributeValue("Include") ?? element.GetAttributeValue("Update"),
+                include,
+                StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Tells every glob that could have claimed the file to stop.</summary>
+    private static XmlElementBaseSyntax RemoveFromDefaultGlobs(
+        XmlElementBaseSyntax root, string fullPath, string include)
+    {
+        var missing = DefaultGlobsFor(fullPath)
+            .Where(item => !root.DescendantsByLocalName(item).Any(e => string.Equals(
+                e.GetAttributeValue("Remove"), include, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+
+        if (missing.Count == 0)
+            return root;
+
+        var group = (XmlElementBaseSyntax)Parser.ParseText("<ItemGroup></ItemGroup>").RootSyntax!;
+
+        foreach (string item in missing)
+            group = group.AddElement(item, out _, (_, e) => e.SetAttribute("Remove", include));
+
+        return root.AddChild(group.NormalizeTrivia(root));
+    }
+
+    /// <summary>Adds an item element naming the file, in an item group of its own kind.</summary>
+    private static XmlElementBaseSyntax AddFileItem(
+        XmlElementBaseSyntax root, string itemType, string attribute, string include)
+    {
+        var withGroup = root.GetOrAddElement(
+            "ItemGroup",
+            group => group.GetElementByLocalName(itemType) is not null,
+            out var itemGroup);
+
+        return withGroup.ReplaceNode(
+            itemGroup,
+            itemGroup.AddElement(itemType, out _, (_, e) => e.SetAttribute(attribute, include)));
+    }
+
+    /// <summary>
+    /// Sets or clears each metadata element on the item that names the file.
+    /// </summary>
+    /// <remarks>
+    /// The item is found again for every entry: each edit returns a new tree, and a node found
+    /// before one belongs to the tree that edit replaced.
+    /// </remarks>
+    private static XmlElementBaseSyntax WriteMetadata(
+        XmlElementBaseSyntax root, string include, IReadOnlyDictionary<string, string?>? metadata)
+    {
+        if (metadata is null)
+            return root;
+
+        foreach (var (name, value) in metadata)
+        {
+            if (AnyItemFor(root, include) is not { } item)
+                break;
+
+            var existing = item.GetElementByLocalName(name);
+
+            if (value is not { Length: > 0 })
+            {
+                if (existing is not null)
+                    root = root.RemoveNode(existing, SyntaxRemoveOptions.KeepNoTrivia)!;
+
+                continue;
+            }
+
+            if (existing is not null)
+            {
+                root = root.ReplaceNode(existing, existing.WithText(value));
+                continue;
+            }
+
+            var updated = item.AddElement(name, out var added, (_, e) => e);
+            updated = updated.ReplaceNode(added, added.WithText(value));
+            root = root.ReplaceNode(item, updated);
+        }
+
+        return root;
+    }
+
+    /// <summary>
     /// The item types whose default glob would pick a file up, and which therefore have to be
     /// told not to.
     /// </summary>
@@ -849,7 +1038,7 @@ public static class ProjectMutationService
     /// Ignoring that would put every generated file in a namespace the rest of the project does not
     /// use, and the analyzer checking the correspondence would agree with us and flag the file.
     /// </remarks>
-    private static string InferNamespace(string projectPath, string projectDirectory, string fullPath)
+    internal static string InferNamespace(string projectPath, string projectDirectory, string fullPath)
     {
         string root = ReadProperty(projectPath, "RootNamespace")
             ?? Path.GetFileNameWithoutExtension(projectPath);
@@ -998,7 +1187,7 @@ public static class ProjectMutationService
                 StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The nearest project above a file, which owns it for item purposes.</summary>
-    private static string? FindOwningProject(string filePath)
+    internal static string? FindOwningProject(string filePath)
     {
         var directory = new DirectoryInfo(Path.GetDirectoryName(filePath)!);
         while (directory is not null)

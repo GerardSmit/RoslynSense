@@ -4,13 +4,28 @@ using Microsoft.Build.Evaluation;
 namespace RoslynMCP.Services.ProjectModel;
 
 /// <summary>One evaluated item with the metadata the Solution Explorer needs.</summary>
+/// <param name="CopyToOutputDirectory">Never, PreserveNewest or Always, as MSBuild spells
+/// them; null when the item does not say, which is the same as Never.</param>
+/// <param name="Generator">The custom tool that owns the file — ResXFileCodeGenerator and its
+/// kind. What explains a .Designer.cs sitting next to it.</param>
+/// <param name="DeclaredIn">The file whose XML carried the item, which for a globbed item is an
+/// SDK targets file rather than the project. Null when MSBuild does not say.</param>
+/// <param name="FromGlob">Whether the item was matched by a wildcard rather than named. It
+/// decides what editing the item has to write: a named item is edited where it stands, a globbed
+/// one is edited by adding an Update, or removed from its glob and re-added under another type.
+/// </param>
 public sealed record ProjectItemInfo(
     string ItemType,
     string EvaluatedInclude,
     string FullPath,
     string? DependentUpon,
     string? Link,
-    bool Visible);
+    bool Visible,
+    string? CopyToOutputDirectory = null,
+    string? Generator = null,
+    string? CustomToolNamespace = null,
+    string? DeclaredIn = null,
+    bool FromGlob = false);
 
 /// <summary>
 /// A package reference and where its version actually came from.
@@ -280,7 +295,20 @@ public static class ProjectEvaluationService
                 bool visible = !string.Equals(
                     item.GetMetadataValue("Visible"), "false", StringComparison.OrdinalIgnoreCase);
 
-                items.Add(new ProjectItemInfo(itemType, include, full, dependentUpon, link, visible));
+                // The declaring element is what separates "this file is listed in the project"
+                // from "a wildcard in the SDK swept it up", and the two are edited differently.
+                // An item MSBuild synthesised has no Xml at all, which reads as neither.
+                string? declaredIn = item.Xml?.ContainingProject?.FullPath;
+                bool fromGlob = item.Xml?.Include is { Length: > 0 } declared
+                    && declared.AsSpan().IndexOfAny('*', '?') >= 0;
+
+                items.Add(new ProjectItemInfo(
+                    itemType, include, full, dependentUpon, link, visible,
+                    Nullify(item.GetMetadataValue("CopyToOutputDirectory")),
+                    Nullify(item.GetMetadataValue("Generator")),
+                    Nullify(item.GetMetadataValue("CustomToolNamespace")),
+                    declaredIn,
+                    fromGlob));
             }
         }
 

@@ -119,6 +119,19 @@ internal sealed class ReSharperSettings
         }
     }
 
+    /// <summary>
+    /// Whether a folder contributes its name to the namespaces underneath it.
+    /// </summary>
+    /// <remarks>
+    /// The question <see cref="NamespaceSegments"/> answers for a whole path, asked about one
+    /// folder — what a Properties panel shows as a checkbox. True when nothing says otherwise,
+    /// which is the default and the answer for every project with no layers at all.
+    /// </remarks>
+    public bool IsNamespaceProvider(string? relativeDirectory) =>
+        string.IsNullOrEmpty(relativeDirectory)
+        || relativeDirectory == "."
+        || !_namespaceFoldersToSkip.Contains(Normalize(relativeDirectory));
+
     /// <summary>Whether this file is one the team excluded from analysis, by path or by mask.</summary>
     /// <remarks>
     /// A spec may name a folder rather than a file, so the walk goes up the path as well as

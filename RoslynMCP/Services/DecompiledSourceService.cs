@@ -203,24 +203,135 @@ internal static class DecompiledSourceService
         Path.Combine(Path.GetTempPath(), "RoslynMCP", "DecompileTemp");
 
     /// <summary>
-    /// Deletes all orphaned decompile temp directories from previous runs. Called once at
-    /// startup; safe because the copies only live for the duration of a process's workspaces.
+    /// Where each temp copy came from: the copy's full path, to the assembly it was copied from.
     /// </summary>
-    public static void CleanupOrphanedTempDirs()
+    /// <remarks>
+    /// The copy exists so that a long-lived metadata reference never holds a lock on the user's
+    /// build output, and that is the right trade — but it throws away the one piece of evidence
+    /// several answers downstream are read from. Which framework an assembly belongs to is
+    /// decided from where it sits (<c>...\.NETFramework\v4.7.2\System.Web.dll</c>), because a
+    /// framework reference assembly carries no <c>TargetFrameworkAttribute</c> to ask instead; a
+    /// copy under a GUID directory answers "no framework", and the published sources for that
+    /// framework are then declined for a symbol that has them. So the copy is made and the
+    /// original is remembered.
+    /// </remarks>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
+        s_originalOfCopy = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The assembly a path names, mapped back out of the temp copies when it names one of those.
+    /// </summary>
+    /// <remarks>
+    /// Answers with the path given when it is not a copy, so every caller can ask unconditionally.
+    /// The original having since been deleted or moved is the one case the copy is still the
+    /// better answer, and the caller checks for that the way it always did.
+    /// </remarks>
+    internal static string OriginalAssemblyPath(string assemblyPath)
     {
+        if (assemblyPath is not { Length: > 0 })
+            return assemblyPath;
+
+        string full;
         try
         {
-            if (Directory.Exists(s_decompileTempRoot))
-                Directory.Delete(s_decompileTempRoot, recursive: true);
+            full = Path.GetFullPath(assemblyPath);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            Console.Error.WriteLine($"[DecompiledSourceService] Failed to clean temp root: {ex.Message}");
+            return assemblyPath;
+        }
+
+        return s_originalOfCopy.TryGetValue(full, out string? original) ? original : assemblyPath;
+    }
+
+    /// <summary>
+    /// Deletes the decompile temp directories that no live process is still reading from. Called
+    /// once at startup.
+    /// </summary>
+    /// <remarks>
+    /// One directory at a time, and only the ones nothing claims. This root is shared by every
+    /// RoslynSense process on the machine — an editor session, a second window, a test run — and
+    /// deleting the whole of it reached into workspaces that were still open: the copies a live
+    /// session has mapped cannot be deleted, so the sweep half-emptied a stranger's directory and
+    /// then reported the file it could not remove as a failure to clean anything. What each
+    /// directory is named after is what makes the difference knowable.
+    /// </remarks>
+    public static void CleanupOrphanedTempDirs() => CleanupOrphanedTempDirs(s_decompileTempRoot);
+
+    /// <summary>The sweep, against a named root, so it can be run over a directory of fakes.</summary>
+    internal static void CleanupOrphanedTempDirs(string root)
+    {
+        string[] directories;
+        try
+        {
+            if (!Directory.Exists(root))
+                return;
+
+            directories = Directory.GetDirectories(root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"[DecompiledSourceService] Failed to read temp root: {ex.Message}");
+            return;
+        }
+
+        foreach (string directory in directories)
+        {
+            if (!IsClaimedByALiveProcess(Path.GetFileName(directory)))
+                TryDeleteTempDir(directory);
+        }
+    }
+
+    /// <summary>
+    /// Whether a temp directory's name says a process that is still running made it.
+    /// </summary>
+    /// <remarks>
+    /// A process id can be reused, so a directory left by a crash can be claimed by an unrelated
+    /// process that happens to inherit the number. That costs one directory until that process
+    /// exits and the next sweep takes it, which is the right way round: the other answer deletes
+    /// files out from under a running editor.
+    /// </remarks>
+    internal static bool IsClaimedByALiveProcess(string directoryName)
+    {
+        int separator = directoryName.IndexOf('-');
+
+        // Written by a build that named its directories after nothing but a GUID, and so says
+        // nothing about who owns it. Left alone rather than guessed at: a version of this process
+        // from before the rename may be reading it this second, and nothing creates these any
+        // more, so what is left of them goes when the last of those exits.
+        if (separator <= 0 || !int.TryParse(directoryName[..separator], out int pid))
+            return true;
+
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            // No process has that id: the one that made this directory is gone.
+            return false;
+        }
+        catch (Exception)
+        {
+            // A protected process inherited the id and will not answer to us, or the id could not
+            // be read at all. Nothing here is worth throwing for — this runs inside a static
+            // constructor, where an escaping exception makes every later use of the workspace
+            // throw a TypeInitializationException — and keeping a directory costs a directory.
+            return true;
         }
     }
 
     internal static void TryDeleteTempDir(string tempDir)
     {
+        // Before the delete rather than after it, because a failed delete leaves files nothing
+        // references any more either — the workspace that held them is gone by the time this runs.
+        foreach (string copy in s_originalOfCopy.Keys)
+        {
+            if (copy.StartsWith(tempDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                s_originalOfCopy.TryRemove(copy, out _);
+        }
+
         try
         {
             if (Directory.Exists(tempDir))
@@ -720,6 +831,7 @@ internal static class DecompiledSourceService
                     try
                     {
                         File.Copy(normalized, dest, overwrite: true);
+                        s_originalOfCopy[dest] = normalized;
                         references.Add(MetadataReference.CreateFromFile(dest));
                         return;
                     }
@@ -821,9 +933,14 @@ internal static class DecompiledSourceService
         return false;
     }
 
+    /// <summary>
+    /// A directory of this process's own, named after it so a stranger's sweep leaves it alone.
+    /// </summary>
     private static string CreateTempDir()
     {
-        string dir = Path.Combine(s_decompileTempRoot, Guid.NewGuid().ToString("N"));
+        string dir = Path.Combine(
+            s_decompileTempRoot,
+            $"{Environment.ProcessId}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
         return dir;
     }

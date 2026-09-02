@@ -75,6 +75,48 @@ public class ExternalSourceProjectTests
         Assert.Equal("string", type!.ToDisplayString());
     }
 
+    /// <summary>
+    /// F12 inside fetched source, onto a type the fetched source does not declare.
+    /// </summary>
+    /// <remarks>
+    /// The ad-hoc project reads its references out of a temp copy, so that nothing here holds a
+    /// lock on the user's build output. Reported as the copy, every path-derived answer above
+    /// this collapsed: a framework reference assembly is dated by the directory it sits in and
+    /// carries no attribute to ask instead, so a copy under a GUID belonged to no framework, no
+    /// published snapshot matched it, and F12 on the base class of a fetched framework file
+    /// answered nothing at all.
+    /// </remarks>
+    [Fact]
+    public async Task WhenASymbolComesFromTheAssemblyThenItsOwnPathIsReported()
+    {
+        string file = WriteFetchedFile(
+            """
+            namespace Example
+            {
+                public class Holder
+                {
+                    public object Value = null!;
+                }
+            }
+            """);
+
+        var document = await WorkspaceService.FindDocumentAsync(file, default);
+        var model = await document!.GetSemanticModelAsync(default);
+        var root = await document.GetSyntaxRootAsync(default);
+
+        var field = root!.DescendantNodes()
+            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax>()
+            .Single();
+
+        var type = model!.GetTypeInfo(field.Declaration.Type).Type;
+        Assert.NotNull(type);
+
+        string? assembly = await SourceMemberLocator.AssemblyPathAsync(
+            type!, document.Project, default);
+
+        Assert.Equal(typeof(object).Assembly.Location, assembly, ignoreCase: true);
+    }
+
     [Fact]
     public void WhenAFileHasNoSidecarThenItBelongsToNoProject()
     {

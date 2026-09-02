@@ -477,6 +477,15 @@ internal static class SourceMemberLocator
     /// The assembly file a metadata symbol came from, as the compilation sees it — a reference
     /// assembly for the framework and for packages that ship a <c>ref</c> folder.
     /// </summary>
+    /// <remarks>
+    /// Where the assembly really is, not where this compilation happens to be reading it from.
+    /// The two differ for a file that is itself external source: it is opened in an ad-hoc project
+    /// whose references are temp copies, and everything asked of the path afterwards — which
+    /// framework this is, which published snapshot matches it, what to write in the sidecar — is
+    /// read from the location. Left as the copy, F12 inside a fetched framework file answered
+    /// nothing at all: no snapshot matched, and a metadata-only reference assembly has nothing to
+    /// decompile either.
+    /// </remarks>
     public static async Task<string?> AssemblyPathAsync(
         ISymbol symbol, Project project, CancellationToken ct)
     {
@@ -487,7 +496,14 @@ internal static class SourceMemberLocator
         if (compilation?.GetMetadataReference(assembly) is not PortableExecutableReference reference)
             return null;
 
-        return reference.FilePath is { Length: > 0 } path && File.Exists(path) ? path : null;
+        if (reference.FilePath is not { Length: > 0 } path)
+            return null;
+
+        string original = DecompiledSourceService.OriginalAssemblyPath(path);
+
+        return File.Exists(original) ? original
+            : File.Exists(path) ? path
+            : null;
     }
 
     /// <summary>The metadata spelling of a type: <c>Ns.Outer`1+Inner</c>.</summary>

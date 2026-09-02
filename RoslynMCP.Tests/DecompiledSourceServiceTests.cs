@@ -18,6 +18,59 @@ public class DecompiledSourceServiceTests
         Assert.False(DecompiledSourceService.IsGeneratedProjectPath("MyProject.csproj"));
     }
 
+    /// <summary>
+    /// The temp root is shared by every RoslynSense process on the machine, so the startup sweep
+    /// has to tell a crash leftover from an editor session that is still reading its copies.
+    /// </summary>
+    [Fact]
+    public void WhenATempDirectoryNamesALiveProcessThenItIsNotOrphaned()
+    {
+        Assert.True(DecompiledSourceService.IsClaimedByALiveProcess(
+            $"{Environment.ProcessId}-0123456789abcdef"));
+
+        // No process has this id: it is above the range Windows hands out at all.
+        Assert.False(DecompiledSourceService.IsClaimedByALiveProcess(
+            $"{int.MaxValue}-0123456789abcdef"));
+
+        // Written by a build that named its directories after nothing but a GUID: it names no
+        // owner, so it is left where it is rather than deleted out from under one.
+        Assert.True(DecompiledSourceService.IsClaimedByALiveProcess("0123456789abcdef"));
+    }
+
+    /// <summary>
+    /// What the sweep does with the two: the leftover goes, and the live session's copies — which
+    /// it could not have deleted anyway, being mapped — are left where they are rather than
+    /// half-emptied and reported as a failure.
+    /// </summary>
+    [Fact]
+    public void WhenSweepingThenOnlyTheUnclaimedDirectoriesGo()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "roslyn-sense-sweep", Guid.NewGuid().ToString("N"));
+
+        string live = Path.Combine(root, $"{Environment.ProcessId}-{Guid.NewGuid():N}");
+        string dead = Path.Combine(root, $"{int.MaxValue}-{Guid.NewGuid():N}");
+        string legacy = Path.Combine(root, Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            foreach (string directory in new[] { live, dead, legacy })
+            {
+                Directory.CreateDirectory(directory);
+                File.WriteAllText(Path.Combine(directory, "Copied.dll"), "not really");
+            }
+
+            DecompiledSourceService.CleanupOrphanedTempDirs(root);
+
+            Assert.True(Directory.Exists(live));
+            Assert.False(Directory.Exists(dead));
+            Assert.True(Directory.Exists(legacy));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { }
+        }
+    }
+
     [Fact]
     public void WhenFileInNonExistentDirectoryThenTryGetGeneratedProjectPathReturnsNull()
     {

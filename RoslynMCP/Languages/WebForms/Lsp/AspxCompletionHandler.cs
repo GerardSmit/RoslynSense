@@ -355,11 +355,16 @@ internal static class AspxCompletionHandler
             });
         }
 
-        Add("ID", LspCompletionItemKind.Property, "control identifier", "0");
-        // Value and all: `server` is the only value the attribute takes, so there is nothing
-        // for a caret between the quotes to decide.
-        Add("runat", LspCompletionItemKind.Property, "server", "0",
-            insert: hasValue ? null : "runat=\"server\"");
+        // Only a real control carries these; a collection item like a grid column is a plain
+        // object with neither.
+        if (type.IsAssignableTo("Control"))
+        {
+            Add("ID", LspCompletionItemKind.Property, "control identifier", "0");
+            // Value and all: `server` is the only value the attribute takes, so there is nothing
+            // for a caret between the quotes to decide.
+            Add("runat", LspCompletionItemKind.Property, "server", "0",
+                insert: hasValue ? null : "runat=\"server\"");
+        }
 
         // Events first: wiring one up is the reason to open completion inside a control tag,
         // and there are far fewer of them than there are properties.

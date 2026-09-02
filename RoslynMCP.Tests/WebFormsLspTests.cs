@@ -518,6 +518,27 @@ public class WebFormsLspTests
     }
 
     [Fact]
+    public async Task AttributeCompletionOnACollectionItemOffersNeitherIdNorRunat()
+    {
+        // A grid column is a plain object: it has the properties its class declares, but no
+        // ID and no runat — offering them would invite the very attribute WFR0001 warns about.
+        var completions = await AspxCompletionHandler.CompletionAsync(
+            new CompletionParams(
+                Doc(FixturePaths.ImplicitAspxFile),
+                PositionOf(
+                    FixturePaths.ImplicitAspxFile,
+                    "<uc:ItemGridColumn UniqueName=\"Amount\"",
+                    "<uc:ItemGridColumn ".Length)),
+            new LspResolveCache(),
+            default);
+
+        var labels = completions.Items.Select(i => i.Label).ToArray();
+        Assert.Contains("UniqueName", labels);
+        Assert.DoesNotContain("runat", labels);
+        Assert.DoesNotContain("ID", labels);
+    }
+
+    [Fact]
     public async Task CompletingRunatAsAnAttributeWritesItsValueWithIt()
     {
         // `server` is the only value runat takes, so committing the attribute writes the whole
@@ -567,6 +588,26 @@ public class WebFormsLspTests
             FixturePaths.ImplicitAspxFile, default);
 
         Assert.DoesNotContain(diagnostics, d => d.Code == "WFR0001");
+    }
+
+    [Fact]
+    public async Task ANonControlTagNeedsNoRunatEvenAsAPlainElement()
+    {
+        // When the parser cannot attach an item to its collection (mixed-case legacy markup
+        // does this) the tag is a plain element, but its type is still not a Control — runat
+        // would be wrong on it, so no diagnostic.
+        string path = FixturePaths.ImplicitAspxFile;
+        string buffer = (await File.ReadAllTextAsync(path))
+            .Replace(
+                "<asp:Literal ID=\"litStatus\" runat=\"server\" />",
+                "<uc:ItemGridColumn UniqueName=\"Loose\" />");
+
+        await WithBufferAsync(path, buffer, async () =>
+        {
+            var diagnostics = await AspxLanguageHandler.DiagnosticsAsync(path, default);
+
+            Assert.DoesNotContain(diagnostics, d => d.Code == "WFR0001");
+        });
     }
 
     [Fact]

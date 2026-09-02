@@ -1,4 +1,5 @@
 using RoslynMCP.Languages.WebForms.Core;
+using WebFormsCore;
 using WebFormsCore.Nodes;
 using Protocol = RoslynMCP.Lsp.Protocol;
 
@@ -49,9 +50,11 @@ internal static class AspxRunatDiagnostics
 
     /// <summary>
     /// The control type a plain element would have been, or <c>null</c> when the element is fine
-    /// as it is. Only a prefixed tag whose prefix and name resolve qualifies: an unknown tag is
-    /// legitimately literal, and a control, collection or template node already parsed as server
-    /// content — inside a collection no <c>runat</c> is needed at all.
+    /// as it is. Only a prefixed tag whose prefix and name resolve to a <c>Control</c> qualifies:
+    /// an unknown tag is legitimately literal, a control, collection or template node already
+    /// parsed as server content — inside a collection no <c>runat</c> is needed at all — and a
+    /// non-control type like <c>asp:TemplateColumn</c> or <c>asp:ListItem</c> is a collection
+    /// item that never carries the attribute.
     /// </summary>
     public static Microsoft.CodeAnalysis.INamedTypeSymbol? TagWithoutRunat(
         AspxDocument document, ElementNode element)
@@ -62,6 +65,7 @@ internal static class AspxRunatDiagnostics
         if (element.Namespace is not { } prefix)
             return null;
 
-        return AspxCatalog.ResolveTag(document, prefix.Value, element.Name.Value);
+        var type = AspxCatalog.ResolveTag(document, prefix.Value, element.Name.Value);
+        return type.IsAssignableTo("Control") ? type : null;
     }
 }

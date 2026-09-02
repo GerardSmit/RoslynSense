@@ -19,6 +19,10 @@ public sealed record ChangedBlock(int StartLine, int EndLine, string Preview, bo
 /// where "which lines" has no useful answer.</param>
 /// <param name="Staged">Whether nothing in the member is left to stage — the whole of its
 /// change is in the index already.</param>
+/// <param name="Removed">Whether the diff deleted the member outright. It has no lines of its
+/// own any more: the line fields all point at where the deletion is visible — the spot the
+/// removal collapsed onto in the file as it is now, or, for a deleted file, the member's own
+/// line in the base revision, the only version left to open.</param>
 public sealed record ChangedMember(
     string Name,
     string ContainerType,
@@ -29,7 +33,8 @@ public sealed record ChangedMember(
     int FirstChangedLine,
     int ChangedLineCount,
     IReadOnlyList<ChangedBlock> Blocks,
-    bool Staged);
+    bool Staged,
+    bool Removed = false);
 
 /// <summary>A changed file and the members the diff touched inside it.</summary>
 /// <param name="Members">Empty when the file is not C# or could not be read or parsed — the
@@ -41,6 +46,8 @@ public sealed record ChangedMember(
 /// <param name="Staged">Whether the file's whole change is staged.</param>
 /// <param name="ChangedLineCount">How many lines the diff touched in the file. Zero for a
 /// whole-file change, where the count would only repeat "all of them".</param>
+/// <param name="Deleted">Whether the diff deleted the file itself. Its members all list as
+/// removed, and only the base revision is left to open.</param>
 public sealed record ChangedMemberFile(
     string FilePath,
     bool WholeFile,
@@ -48,7 +55,8 @@ public sealed record ChangedMemberFile(
     bool IsTest,
     int FirstChangedLine = 1,
     bool Staged = false,
-    int ChangedLineCount = 0);
+    int ChangedLineCount = 0,
+    bool Deleted = false);
 
 /// <summary>What the diff touched, member by member, or why that could not be answered.</summary>
 /// <param name="DiffBaseRef">The revision the diff compared against, for a client that wants to
@@ -83,6 +91,9 @@ public static class ChangedMemberService
         if (changes.Error is not null)
             return ChangedMemberSet.Failed(changes.Error);
 
+        // For naming what a deletion deleted: removed members only exist in the diff base.
+        string? repository = GitChangeService.FindRepositoryRoot(anchorPath);
+
         var files = new List<ChangedMemberFile>();
 
         foreach (var file in changes.Files)
@@ -100,12 +111,13 @@ public static class ChangedMemberService
 
             files.Add(new ChangedMemberFile(
                 file.FilePath,
-                file.WholeFile,
-                isCSharp ? ReadMembers(file, ct) : [],
+                file.WholeFile && !file.Deleted,
+                isCSharp ? await ReadMembersAsync(file, repository, changes.DiffTarget, ct) : [],
                 IsInTestProject(file.FilePath),
                 file.WholeFile ? 1 : file.Ranges.Min(r => r.Start),
                 file.IsFullyStaged,
-                file.WholeFile ? 0 : file.Ranges.Sum(r => r.End - r.Start + 1)));
+                file.WholeFile ? 0 : file.Ranges.Sum(r => r.End - r.Start + 1),
+                Deleted: file.Deleted));
         }
 
         return new ChangedMemberSet(files, changes.Description, DiffBaseRef: changes.DiffTarget);
@@ -143,25 +155,47 @@ public static class ChangedMemberService
         return false;
     }
 
-    private static IReadOnlyList<ChangedMember> ReadMembers(ChangedFile file, CancellationToken ct)
+    private static async Task<IReadOnlyList<ChangedMember>> ReadMembersAsync(
+        ChangedFile file, string? repository, string? diffTarget, CancellationToken ct)
+    {
+        var root = file.Deleted ? null : ParseFromDisk(file.FilePath, ct);
+        IReadOnlyList<ChangedMember> members = root is null ? [] : CollectMembers(root, file);
+
+        // What the diff deleted outright has no declaration on disk to find; only the base
+        // revision can still name it.
+        if (file.RemovedRanges is not { Count: > 0 } || repository is null || diffTarget is null)
+            return members;
+
+        string? oldSource = await GitChangeService.ReadFileAtAsync(
+            repository, diffTarget, Path.GetRelativePath(repository, file.FilePath), ct);
+        if (oldSource is null)
+            return members;
+
+        var oldRoot = CSharpSyntaxTree.ParseText(oldSource, cancellationToken: ct).GetRoot(ct);
+        var removed = CollectRemovedMembers(oldRoot, root, file);
+        return removed.Count == 0
+            ? members
+            : members.Concat(removed).OrderBy(m => m.StartLine).ToList();
+    }
+
+    private static SyntaxNode? ParseFromDisk(string filePath, CancellationToken ct)
     {
         string source;
         try
         {
-            source = File.ReadAllText(file.FilePath);
+            source = File.ReadAllText(filePath);
         }
         catch (IOException)
         {
             // Mid-write, locked, or gone since the diff ran; the file node still lists.
-            return [];
+            return null;
         }
         catch (UnauthorizedAccessException)
         {
-            return [];
+            return null;
         }
 
-        var root = CSharpSyntaxTree.ParseText(source, cancellationToken: ct).GetRoot(ct);
-        return CollectMembers(root, file);
+        return CSharpSyntaxTree.ParseText(source, cancellationToken: ct).GetRoot(ct);
     }
 
     /// <summary>Every member declaration whose lines the diff touched, in file order.</summary>
@@ -216,6 +250,107 @@ public static class ChangedMemberService
         members.Sort((a, b) => a.StartLine.CompareTo(b.StartLine));
         return members;
     }
+
+    /// <summary>
+    /// The declarations the diff deleted: present in the base revision, gone from the file as it
+    /// is now. A removed type is one row — its members went with it and would only repeat it.
+    /// Rows point at the line the deletion collapsed onto in the new file; for a deleted file
+    /// (<paramref name="newRoot"/> null) they keep their base-revision lines, since that version
+    /// is the only one left to open.
+    /// </summary>
+    internal static IReadOnlyList<ChangedMember> CollectRemovedMembers(
+        SyntaxNode oldRoot, SyntaxNode? newRoot, ChangedFile file)
+    {
+        if (file.RemovedRanges is not { Count: > 0 } cuts)
+            return [];
+
+        HashSet<(string, string, string, string)> kept = newRoot is null
+            ? []
+            : Declarations(newRoot)
+                .Select(d => (d.Name, d.Kind, d.Container, d.Namespace))
+                .ToHashSet();
+
+        var removed = new List<ChangedMember>();
+        var removedTypes = new HashSet<SyntaxNode>();
+
+        foreach (var d in Declarations(oldRoot))
+        {
+            var span = d.Node.GetLocation().GetLineSpan();
+            int start = span.StartLinePosition.Line + 1;
+            int end = span.EndLinePosition.Line + 1;
+
+            var hits = cuts
+                .Where(c => c.OldStart <= end && c.OldEnd >= start)
+                .OrderBy(c => c.OldStart)
+                .ToList();
+            if (hits.Count == 0 || kept.Contains((d.Name, d.Kind, d.Container, d.Namespace)))
+                continue;
+            if (d.Node.Ancestors().Any(removedTypes.Contains))
+                continue;
+            if (d.Node is BaseTypeDeclarationSyntax)
+                removedTypes.Add(d.Node);
+
+            int anchor = newRoot is null ? start : hits[0].NewLine;
+
+            removed.Add(new ChangedMember(
+                d.Name, d.Container, d.Namespace, d.Kind,
+                anchor, anchor, anchor,
+                hits.Sum(c => Math.Min(c.OldEnd, end) - Math.Max(c.OldStart, start) + 1),
+                [],
+                file.IsStaged(anchor, anchor),
+                Removed: true));
+        }
+
+        return removed;
+    }
+
+    /// <summary>
+    /// Every named declaration, one entry per name: field and event variables come apart so a
+    /// single deleted variable can be named alone, and types count too, so a removed type can
+    /// stand as one row for everything inside it.
+    /// </summary>
+    private static IEnumerable<(string Name, string Kind, string Container, string Namespace, SyntaxNode Node)>
+        Declarations(SyntaxNode root)
+    {
+        foreach (var node in root.DescendantNodes())
+        {
+            switch (node)
+            {
+                case BaseTypeDeclarationSyntax type:
+                    yield return (type.Identifier.Text, TypeKindOf(type),
+                        ContainerOf(node), NamespaceOf(node), node);
+                    break;
+                case FieldDeclarationSyntax field:
+                    foreach (var variable in field.Declaration.Variables)
+                        yield return (variable.Identifier.Text, "field",
+                            ContainerOf(node), NamespaceOf(node), node);
+                    break;
+                case EventFieldDeclarationSyntax @event:
+                    foreach (var variable in @event.Declaration.Variables)
+                        yield return (variable.Identifier.Text, "event",
+                            ContainerOf(node), NamespaceOf(node), node);
+                    break;
+                default:
+                    if (NameAndKind(node) is { } named)
+                        yield return (named.Name, named.Kind,
+                            ContainerOf(node), NamespaceOf(node), node);
+                    break;
+            }
+        }
+    }
+
+    private static string TypeKindOf(BaseTypeDeclarationSyntax type) =>
+        type switch
+        {
+            RecordDeclarationSyntax r =>
+                r.ClassOrStructKeyword.IsKind(SyntaxKind.StructKeyword)
+                    ? "record struct"
+                    : "record",
+            InterfaceDeclarationSyntax => "interface",
+            StructDeclarationSyntax => "struct",
+            EnumDeclarationSyntax => "enum",
+            _ => "class",
+        };
 
     /// <summary>The text a block leads with, cut to a row's worth.</summary>
     private static string Preview(Microsoft.CodeAnalysis.Text.TextLineCollection lines, int line)

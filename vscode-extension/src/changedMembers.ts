@@ -9,7 +9,9 @@ import type { LanguageClient } from 'vscode-languageclient/node';
  * validated symbol by symbol; the inline actions open the same spot as a git diff or as a plain
  * editor, whichever the click itself was not configured to do. Members can be ticked off as
  * reviewed — a tick that turns gray if the member changes again afterwards — and staging counts
- * as a tick, block by block, so `git add` is a way to mark a change read. Changed files that
+ * as a tick, block by block, so `git add` is a way to mark a change read. Deleted members and
+ * types list by name with a "removed" tag; clicking one lands where the deletion is visible, or
+ * on the base revision's copy when the whole file is gone. Changed files that
  * are not C# — markup, contracts, configs — have no members to list, so each is one file row
  * that opens at its first changed line; the ... menu can hide them.
  */
@@ -34,6 +36,8 @@ interface ChangedMemberInfo {
     blocks: ChangedBlockInfo[];
     /** The member's whole change is staged — nothing of it is left dirty. */
     staged: boolean;
+    /** The diff deleted the member outright; the lines point at where the deletion is visible. */
+    removed: boolean;
 }
 
 interface ChangedMembersFileInfo {
@@ -47,6 +51,8 @@ interface ChangedMembersFileInfo {
     staged: boolean;
     /** How many lines the diff touched in the file; zero for a whole-file change. */
     changedLineCount: number;
+    /** The diff deleted the file itself; only the diff base's version is left to open. */
+    deleted: boolean;
 }
 
 interface ChangedMembersResult {
@@ -74,6 +80,7 @@ interface FileNode {
     firstChangedLine: number;
     staged: boolean;
     changedLineCount: number;
+    deleted: boolean;
     children: MemberNode[];
 }
 
@@ -398,10 +405,12 @@ class ChangedMembersProvider implements vscode.TreeDataProvider<Node> {
 
     /**
      * Every clickable change spot in view order — what next/previous stepping walks. Members
-     * whose lines are unknowable (whole files) contribute their one landing line.
+     * whose lines are unknowable (whole files) contribute their one landing line. Deleted files
+     * stay out: their lines belong to the base revision, and stepping walks the working tree.
      */
     targets(): { filePath: string; line: number }[] {
         return this.visibleFiles()
+            .filter((file) => !file.deleted)
             .flatMap((file) =>
                 file.members.length > 0
                     ? file.members.flatMap((member) =>
@@ -476,7 +485,9 @@ class ChangedMembersProvider implements vscode.TreeDataProvider<Node> {
                   ? new vscode.ThemeIcon('beaker')
                   : vscode.ThemeIcon.File;
             item.tooltip = reviewTooltip(fileState);
-            if (node.wholeFile) {
+            if (node.deleted) {
+                item.description = 'deleted';
+            } else if (node.wholeFile) {
                 item.description = 'new';
             }
             // A file with nothing under it is its own click target — non-C# files always,
@@ -530,9 +541,12 @@ class ChangedMembersProvider implements vscode.TreeDataProvider<Node> {
                 ? vscode.TreeItemCollapsibleState.Collapsed
                 : vscode.TreeItemCollapsibleState.None
         );
-        item.description = node.row.isTest && viewMode() !== 'simpleTree'
-            ? `${node.detail} · test`
-            : node.detail;
+        const tags = [
+            node.detail,
+            member.removed ? 'removed' : '',
+            node.row.isTest && viewMode() !== 'simpleTree' ? 'test' : '',
+        ].filter(Boolean);
+        item.description = tags.join(' · ');
 
         const staged = member.staged;
         const reviewedAs = this.reviews.fingerprintAtReview(reviewKey(node.row));
@@ -542,17 +556,25 @@ class ChangedMembersProvider implements vscode.TreeDataProvider<Node> {
                   'check',
                   new vscode.ThemeColor(stale ? 'disabledForeground' : 'testing.iconPassed')
               )
-            : new vscode.ThemeIcon(iconFor(member.kind));
+            : member.removed
+              ? new vscode.ThemeIcon(
+                    iconFor(member.kind),
+                    new vscode.ThemeColor('gitDecoration.deletedResourceForeground')
+                )
+              : new vscode.ThemeIcon(iconFor(member.kind));
 
         item.resourceUri = vscode.Uri.file(node.row.filePath);
         item.tooltip = new vscode.MarkdownString(
             [
                 `**${qualifiedName(member)}**`,
                 '',
-                node.row.wholeFile
-                    ? 'New file — everything is a change.'
-                    : `${member.changedLineCount} changed line${member.changedLineCount === 1 ? '' : 's'}, ` +
-                      `first at ${member.firstChangedLine}`,
+                member.removed
+                    ? `Removed — ${member.changedLineCount} deleted line${member.changedLineCount === 1 ? '' : 's'}; ` +
+                      'the line points at where it used to be.'
+                    : node.row.wholeFile
+                      ? 'New file — everything is a change.'
+                      : `${member.changedLineCount} changed line${member.changedLineCount === 1 ? '' : 's'}, ` +
+                        `first at ${member.firstChangedLine}`,
                 staged
                     ? 'Staged — counted as reviewed.'
                     : stale
@@ -627,7 +649,9 @@ export function registerChangedMembers(
     context.subscriptions.push(
         view,
         vscode.commands.registerCommand('roslynSense.refreshChangedMembers', refresh),
-        vscode.commands.registerCommand('roslynSense.changedMembers.openFile', openInEditor),
+        vscode.commands.registerCommand('roslynSense.changedMembers.openFile', (node) =>
+            openInEditor(node, provider.diffBaseRef)
+        ),
         vscode.commands.registerCommand('roslynSense.changedMembers.openDiff', (node) =>
             openInDiffView(node, provider.diffBaseRef)
         ),
@@ -855,14 +879,42 @@ function targetOf(node: FileNode | MemberNode | BlockNode): { uri: vscode.Uri; s
     };
 }
 
-async function openInEditor(node: FileNode | MemberNode | BlockNode): Promise<void> {
+async function openInEditor(node: FileNode | MemberNode | BlockNode, baseRef: string): Promise<void> {
     const { uri, selection } = targetOf(node);
+    if (!fs.existsSync(uri.fsPath)) {
+        await showBase(uri, selection, baseRef);
+        return;
+    }
     await vscode.window.showTextDocument(uri, { selection });
 }
 
 async function openInDiffView(node: FileNode | MemberNode | BlockNode, baseRef: string): Promise<void> {
     const { uri, selection } = targetOf(node);
+    if (!fs.existsSync(uri.fsPath)) {
+        await showBase(uri, selection, baseRef);
+        return;
+    }
     await showDiff(uri, selection, baseRef);
+}
+
+function gitApi(): { toGitUri(uri: vscode.Uri, ref: string): vscode.Uri } | undefined {
+    const git = vscode.extensions.getExtension<GitExtension>('vscode.git')?.exports;
+    return git?.enabled ? git.getAPI(1) : undefined;
+}
+
+/**
+ * The base revision's version of a file the working tree no longer has — the only side of a
+ * deleted file left to open. Without the Git extension there is nothing to show.
+ */
+async function showBase(uri: vscode.Uri, selection: vscode.Range, baseRef: string): Promise<void> {
+    const api = gitApi();
+    if (!api) {
+        void vscode.window.showInformationMessage(
+            `RoslynSense: ${basename(uri.fsPath)} was deleted, and the Git extension is not available to show what it was.`
+        );
+        return;
+    }
+    await vscode.window.showTextDocument(api.toGitUri(uri, baseRef), { selection });
 }
 
 /**
@@ -871,8 +923,7 @@ async function openInDiffView(node: FileNode | MemberNode | BlockNode, baseRef: 
  * extension's content provider; without it (git disabled) the plain editor is all there is.
  */
 async function showDiff(uri: vscode.Uri, selection: vscode.Range, baseRef: string): Promise<void> {
-    const git = vscode.extensions.getExtension<GitExtension>('vscode.git')?.exports;
-    const api = git?.enabled ? git.getAPI(1) : undefined;
+    const api = gitApi();
     if (!api) {
         await vscode.window.showTextDocument(uri, { selection });
         return;
@@ -915,6 +966,7 @@ function build(files: ChangedMembersFileInfo[], mode: ViewMode): Node[] {
             firstChangedLine: file.firstChangedLine,
             staged: file.staged,
             changedLineCount: file.changedLineCount,
+            deleted: file.deleted,
             children: [],
         }));
 
@@ -943,6 +995,7 @@ function build(files: ChangedMembersFileInfo[], mode: ViewMode): Node[] {
                 firstChangedLine: file.firstChangedLine,
                 staged: file.staged,
                 changedLineCount: file.changedLineCount,
+                deleted: file.deleted,
                 children: file.members.map((member) =>
                     memberNode(rowOf(file, member), withLine(member, member.containerType))
                 ),

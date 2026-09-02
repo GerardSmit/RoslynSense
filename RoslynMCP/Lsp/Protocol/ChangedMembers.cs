@@ -32,7 +32,11 @@ public sealed record ChangedMemberInfo(
     [property: JsonPropertyName("blocks")] ChangedBlockInfo[] Blocks,
     /// <summary>Whether the member's whole change is staged — nothing of it is left dirty.
     /// A client may read that as "already reviewed".</summary>
-    [property: JsonPropertyName("staged")] bool Staged);
+    [property: JsonPropertyName("staged")] bool Staged,
+    /// <summary>Whether the diff deleted the member outright. The line fields then point at
+    /// where the deletion is visible: the line it collapsed onto in the working tree, or the
+    /// member's own base-revision line when the whole file is gone.</summary>
+    [property: JsonPropertyName("removed")] bool Removed);
 
 public sealed record ChangedMembersFileInfo(
     [property: JsonPropertyName("filePath")] string FilePath,
@@ -49,7 +53,10 @@ public sealed record ChangedMembersFileInfo(
     [property: JsonPropertyName("staged")] bool Staged,
     /// <summary>How many lines the diff touched in the file; zero for a whole-file change.
     /// Enough for a client to tell a file it ticked off from the same file changed again.</summary>
-    [property: JsonPropertyName("changedLineCount")] int ChangedLineCount);
+    [property: JsonPropertyName("changedLineCount")] int ChangedLineCount,
+    /// <summary>Whether the diff deleted the file itself. Its members all list as removed, and
+    /// only the diff base's version is left to open.</summary>
+    [property: JsonPropertyName("deleted")] bool Deleted);
 
 /// <summary>
 /// The Changed Members view's data: each changed source file with the members the diff touched.

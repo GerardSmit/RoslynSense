@@ -34,6 +34,7 @@ internal static class ChangedMembersHandler
                     FirstChangedLine: f.FirstChangedLine,
                     Staged: f.Staged,
                     ChangedLineCount: f.ChangedLineCount,
+                    Deleted: f.Deleted,
                     Members:
                     f.Members
                         .Select(m => new ChangedMemberInfo(
@@ -43,7 +44,8 @@ internal static class ChangedMembersHandler
                                 .Select(b => new ChangedBlockInfo(
                                     b.StartLine, b.EndLine, b.Preview, b.Staged))
                                 .ToArray(),
-                            m.Staged))
+                            m.Staged,
+                            m.Removed))
                         .ToArray()))
                 .ToArray(),
             set.Description,

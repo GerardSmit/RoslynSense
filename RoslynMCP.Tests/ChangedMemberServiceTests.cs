@@ -220,4 +220,131 @@ public class ChangedMemberServiceTests
 
         Assert.False(block.Staged);
     }
+
+    // ---- Removed members: named from the diff base, since the new file no longer has them ----
+
+    [Fact]
+    public void CollectRemovedMembers_NamesTheDeletedProperty()
+    {
+        var oldRoot = CSharpSyntaxTree.ParseText("""
+            class Widget
+            {
+                public int Count { get; set; }
+
+                public int Kept() => 1;
+            }
+            """).GetRoot();
+        var newRoot = CSharpSyntaxTree.ParseText("""
+            class Widget
+            {
+                public int Kept() => 1;
+            }
+            """).GetRoot();
+
+        // The property and its trailing blank line were old lines 3-4; the deletion is visible
+        // at line 2 of the file as it is now.
+        var file = new ChangedFile(@"C:\repo\Widget.cs", [new LineRange(2, 2)],
+            RemovedRanges: [new RemovedRange(3, 4, 2)]);
+
+        var member = Assert.Single(
+            ChangedMemberService.CollectRemovedMembers(oldRoot, newRoot, file));
+
+        Assert.Equal("Count", member.Name);
+        Assert.Equal("property", member.Kind);
+        Assert.Equal("Widget", member.ContainerType);
+        Assert.True(member.Removed);
+        Assert.Equal(2, member.FirstChangedLine);
+        Assert.Empty(member.Blocks);
+    }
+
+    [Fact]
+    public void CollectRemovedMembers_AMemberStillPresentIsNotRemoved()
+    {
+        // Total's body was replaced, not deleted: the old lines are gone, the member is not.
+        var oldRoot = CSharpSyntaxTree.ParseText(Source).GetRoot();
+        var newRoot = CSharpSyntaxTree.ParseText(Source.Replace("count * _limit", "count")).GetRoot();
+
+        var file = new ChangedFile(@"C:\repo\OrderService.cs", [new LineRange(18, 18)],
+            RemovedRanges: [new RemovedRange(18, 18, 18)]);
+
+        Assert.Empty(ChangedMemberService.CollectRemovedMembers(oldRoot, newRoot, file));
+    }
+
+    [Fact]
+    public void CollectRemovedMembers_ADeletedTypeIsOneRowForEverythingInIt()
+    {
+        var oldRoot = CSharpSyntaxTree.ParseText("""
+            class Kept { }
+
+            class Extra
+            {
+                public int Count { get; set; }
+
+                void Run() { }
+            }
+            """).GetRoot();
+        var newRoot = CSharpSyntaxTree.ParseText("class Kept { }").GetRoot();
+
+        var file = new ChangedFile(@"C:\repo\Types.cs", [new LineRange(1, 1)],
+            RemovedRanges: [new RemovedRange(2, 8, 1)]);
+
+        var member = Assert.Single(
+            ChangedMemberService.CollectRemovedMembers(oldRoot, newRoot, file));
+
+        Assert.Equal("Extra", member.Name);
+        Assert.Equal("class", member.Kind);
+        Assert.True(member.Removed);
+    }
+
+    [Fact]
+    public void CollectRemovedMembers_ADeletedFileKeepsBaseRevisionLines()
+    {
+        // The whole file is gone: there is no new-side line to land on, so rows keep the lines
+        // they had in the base revision, the only version left to open.
+        var oldRoot = CSharpSyntaxTree.ParseText("""
+            namespace App;
+
+            class Gone
+            {
+                void Run() { }
+            }
+            """).GetRoot();
+
+        var file = new ChangedFile(@"C:\repo\Gone.cs", [],
+            RemovedRanges: [new RemovedRange(1, 6, 1)], Deleted: true);
+
+        var member = Assert.Single(
+            ChangedMemberService.CollectRemovedMembers(oldRoot, null, file));
+
+        Assert.Equal("Gone", member.Name);
+        Assert.Equal("class", member.Kind);
+        Assert.Equal("App", member.Namespace);
+        Assert.Equal(3, member.FirstChangedLine);
+    }
+
+    [Fact]
+    public void CollectRemovedMembers_ASingleDeletedFieldVariableIsNamedAlone()
+    {
+        var oldRoot = CSharpSyntaxTree.ParseText("""
+            class C
+            {
+                int a, b;
+            }
+            """).GetRoot();
+        var newRoot = CSharpSyntaxTree.ParseText("""
+            class C
+            {
+                int b;
+            }
+            """).GetRoot();
+
+        var file = new ChangedFile(@"C:\repo\C.cs", [new LineRange(3, 3)],
+            RemovedRanges: [new RemovedRange(3, 3, 3)]);
+
+        var member = Assert.Single(
+            ChangedMemberService.CollectRemovedMembers(oldRoot, newRoot, file));
+
+        Assert.Equal("a", member.Name);
+        Assert.Equal("field", member.Kind);
+    }
 }

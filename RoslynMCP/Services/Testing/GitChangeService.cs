@@ -28,10 +28,18 @@ public enum GitChangeScope
 /// same coordinates as <paramref name="Ranges"/>. An empty list means the whole change is
 /// staged; <see langword="null"/> means nobody asked, and nothing counts as staged.
 /// </param>
+/// <param name="RemovedRanges">
+/// The old side of every hunk that removed or replaced lines — what a consumer needs to name
+/// what a deletion deleted. <see langword="null"/> when the diff source carries no old side.
+/// </param>
+/// <param name="Deleted">Whether the whole file is gone; <see cref="FilePath"/> then names
+/// where it was, and <see cref="RemovedRanges"/> covers everything it held.</param>
 public sealed record ChangedFile(
     string FilePath,
     IReadOnlyList<LineRange> Ranges,
-    IReadOnlyList<LineRange>? UnstagedRanges = null)
+    IReadOnlyList<LineRange>? UnstagedRanges = null,
+    IReadOnlyList<RemovedRange>? RemovedRanges = null,
+    bool Deleted = false)
 {
     /// <summary>Stands in for "all of it" where a file has no per-line answer to give.</summary>
     public static readonly IReadOnlyList<LineRange> Everything = [new LineRange(1, int.MaxValue)];
@@ -56,6 +64,10 @@ public sealed record ChangedFile(
 }
 
 public readonly record struct LineRange(int Start, int End);
+
+/// <summary>One hunk's old side: the base-revision lines it removed or replaced (inclusive,
+/// 1-based), and the new-file line the change is visible at now.</summary>
+public readonly record struct RemovedRange(int OldStart, int OldEnd, int NewLine);
 
 /// <summary>What the diff said, or why it could not be taken.</summary>
 /// <param name="DiffTarget">The revision the working tree was compared against — "HEAD", a
@@ -197,28 +209,44 @@ public static partial class GitChangeService
     /// Turns <c>git diff --unified=0</c> output into per-file line ranges.
     /// </summary>
     /// <remarks>
-    /// Only the new-side of each hunk header matters: a range that is purely a deletion has a
-    /// zero length and is recorded as the single line it collapsed onto, because that line is
-    /// where the change is visible now. Renames and deletions of the whole file arrive as a
-    /// header with no hunks and are reported as whole-file changes.
+    /// The new side of each hunk header carries the ranges: a range that is purely a deletion
+    /// has a zero length and is recorded as the single line it collapsed onto, because that line
+    /// is where the change is visible now. The old side of every removing hunk is kept apart in
+    /// <see cref="ChangedFile.RemovedRanges"/>, so a consumer can still name what a deletion
+    /// deleted. A deleted file lists under its old path with everything in
+    /// <see cref="ChangedFile.RemovedRanges"/>; renames arrive as a header with no hunks and are
+    /// reported as whole-file changes.
     /// </remarks>
     internal static IReadOnlyList<ChangedFile> ParseUnifiedDiff(string diff, string repositoryRoot)
     {
         var files = new List<ChangedFile>();
         string? currentPath = null;
+        string? currentOldPath = null;
         List<LineRange>? currentRanges = null;
+        List<RemovedRange>? currentRemoved = null;
         bool currentIsWholeFile = false;
+        bool currentIsDeleted = false;
 
         void Flush()
         {
-            if (currentPath is null)
-                return;
-            files.Add(new ChangedFile(
-                currentPath, currentIsWholeFile ? [] : currentRanges ?? []));
+            if (currentPath is not null)
+            {
+                files.Add(new ChangedFile(
+                    currentPath,
+                    currentIsWholeFile || currentIsDeleted ? [] : currentRanges ?? [],
+                    RemovedRanges: currentRemoved,
+                    Deleted: currentIsDeleted));
+            }
             currentPath = null;
+            currentOldPath = null;
             currentRanges = null;
+            currentRemoved = null;
             currentIsWholeFile = false;
+            currentIsDeleted = false;
         }
+
+        string ToFullPath(string path) =>
+            Path.GetFullPath(Path.Combine(repositoryRoot, path));
 
         foreach (string raw in diff.Split('\n'))
         {
@@ -230,20 +258,34 @@ public static partial class GitChangeService
                 continue;
             }
 
+            // "--- a/path/to/file" names the old side; /dev/null means the file is new. Only a
+            // header before "+++" counts — once the new side is named, a removed content line
+            // could spell the same prefix.
+            if (currentPath is null && !currentIsDeleted &&
+                line.StartsWith("--- ", StringComparison.Ordinal))
+            {
+                string path = line[4..].Trim();
+                currentOldPath = path == "/dev/null"
+                    ? null
+                    : path.StartsWith("a/", StringComparison.Ordinal) ? path[2..] : path;
+                continue;
+            }
+
             // "+++ b/path/to/file" names the new side. /dev/null means the file was deleted;
-            // nothing in it can be covered, so it is dropped rather than recorded.
+            // it lists under its old path so the deletion still has a name.
             if (line.StartsWith("+++ ", StringComparison.Ordinal))
             {
                 string path = line[4..].Trim();
                 if (path == "/dev/null")
                 {
-                    currentPath = null;
+                    currentPath = currentOldPath is null ? null : ToFullPath(currentOldPath);
+                    currentIsDeleted = currentPath is not null;
                     continue;
                 }
                 if (path.StartsWith("b/", StringComparison.Ordinal))
                     path = path[2..];
 
-                currentPath = Path.GetFullPath(Path.Combine(repositoryRoot, path));
+                currentPath = ToFullPath(path);
                 currentRanges = [];
                 currentIsWholeFile = false;
                 continue;
@@ -268,15 +310,42 @@ public static partial class GitChangeService
 
             int start = int.Parse(match.Groups["start"].Value);
             int count = match.Groups["count"].Success ? int.Parse(match.Groups["count"].Value) : 1;
+            int oldStart = int.Parse(match.Groups["oldStart"].Value);
+            int oldCount = match.Groups["oldCount"].Success
+                ? int.Parse(match.Groups["oldCount"].Value)
+                : 1;
 
-            currentRanges ??= [];
-            currentRanges.Add(count == 0
-                ? new LineRange(Math.Max(1, start), Math.Max(1, start))
-                : new LineRange(start, start + count - 1));
+            // A pure deletion collapses onto the line before it on the new side; start can be 0
+            // when the removal was at the very top of the file.
+            int newAnchor = count == 0 ? Math.Max(1, start) : start;
+
+            if (!currentIsDeleted)
+            {
+                currentRanges ??= [];
+                currentRanges.Add(count == 0
+                    ? new LineRange(newAnchor, newAnchor)
+                    : new LineRange(start, start + count - 1));
+            }
+
+            if (oldCount > 0)
+            {
+                currentRemoved ??= [];
+                currentRemoved.Add(new RemovedRange(oldStart, oldStart + oldCount - 1, newAnchor));
+            }
         }
 
         Flush();
         return files;
+    }
+
+    /// <summary>The file's content at a revision, or null when git cannot produce it — an
+    /// unknown revision, or a path the revision does not have (a rename's new name).</summary>
+    internal static async Task<string?> ReadFileAtAsync(
+        string repository, string reference, string relativePath, CancellationToken ct)
+    {
+        var (exitCode, stdout, _) = await RunGitAsync(
+            repository, $"show \"{reference}:{relativePath.Replace('\\', '/')}\"", ct);
+        return exitCode == 0 ? stdout : null;
     }
 
     /// <summary>The nearest enclosing directory that git calls a work tree.</summary>
@@ -362,7 +431,7 @@ public static partial class GitChangeService
         return text.Trim().Split('\n').FirstOrDefault()?.Trim() ?? "unknown error";
     }
 
-    /// <summary>"@@ -12,3 +45,7 @@" — only the new side is captured.</summary>
-    [GeneratedRegex(@"^@@ -\d+(?:,\d+)? \+(?<start>\d+)(?:,(?<count>\d+))? @@")]
+    /// <summary>"@@ -12,3 +45,7 @@" — both sides are captured.</summary>
+    [GeneratedRegex(@"^@@ -(?<oldStart>\d+)(?:,(?<oldCount>\d+))? \+(?<start>\d+)(?:,(?<count>\d+))? @@")]
     private static partial Regex HunkHeader();
 }

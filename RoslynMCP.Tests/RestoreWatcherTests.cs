@@ -49,7 +49,7 @@ public class RestoreWatcherTests
 
             // What a restore looks like from the outside. The content has to actually differ:
             // byte-identical rewrites are ignored on purpose, which the next test covers.
-            await File.WriteAllBytesAsync(assets, [.. original, .. " "u8]);
+            await WriteAsync(assets, [.. original, .. " "u8]);
 
             Assert.True(
                 await WaitForAsync(
@@ -60,7 +60,7 @@ public class RestoreWatcherTests
         finally
         {
             RestoreWatcher.ResetForTests();
-            await File.WriteAllBytesAsync(assets, original);
+            await WriteAsync(assets, original);
             await WorkspaceService.EvictAllAsync();
         }
     }
@@ -90,7 +90,7 @@ public class RestoreWatcherTests
                 await WaitForAsync(() => RestoreWatcher.WatchedDirectoryCount > 0, TimeSpan.FromSeconds(10)),
                 "The load did not install a restore watcher.");
 
-            await File.WriteAllBytesAsync(assets, original);
+            await WriteAsync(assets, original);
 
             // Several times the debounce, so a wrong answer here shows up as a failure rather than
             // as a race that passes on a fast machine.
@@ -101,8 +101,40 @@ public class RestoreWatcherTests
         finally
         {
             RestoreWatcher.ResetForTests();
-            await File.WriteAllBytesAsync(assets, original);
+            await WriteAsync(assets, original);
             await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    /// <summary>
+    /// Writes the fixture's assets file, waiting out whoever else has it open.
+    /// </summary>
+    /// <remarks>
+    /// This is the one file in the fixture that something outside the test reads: a project load
+    /// anywhere in the suite opens it, and MSBuild opens it denying writers. So the write raced
+    /// the rest of the run and failed with "used by another process" — in the whole suite, never
+    /// alone, which is the signature of a shared file rather than of the watcher this is about.
+    /// A read lock is held for as long as a read takes, so waiting is all that is needed.
+    /// </remarks>
+    private static async Task WriteAsync(string path, byte[] bytes)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+
+        while (true)
+        {
+            try
+            {
+                await File.WriteAllBytesAsync(path, bytes);
+                return;
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+            }
+            catch (UnauthorizedAccessException) when (DateTime.UtcNow < deadline)
+            {
+            }
+
+            await Task.Delay(100);
         }
     }
 

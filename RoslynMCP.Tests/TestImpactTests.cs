@@ -54,10 +54,12 @@ public class TestImpactTests
         var file = Assert.Single(GitChangeService.ParseUnifiedDiff(diff, @"C:\repo"));
 
         Assert.Equal([new LineRange(12, 12)], file.Ranges);
+        // The old side survives too, so the deletion can still be named.
+        Assert.Equal([new RemovedRange(12, 15, 12)], file.RemovedRanges);
     }
 
     [Fact]
-    public void ParseUnifiedDiff_DropsDeletedFilesAndKeepsBinaryOnesWhole()
+    public void ParseUnifiedDiff_KeepsDeletedFilesUnderTheirOldPathAndBinaryOnesWhole()
     {
         const string diff = """
             diff --git a/src/Gone.cs b/src/Gone.cs
@@ -74,9 +76,15 @@ public class TestImpactTests
 
         var files = GitChangeService.ParseUnifiedDiff(diff, @"C:\repo");
 
-        var file = Assert.Single(files);
-        Assert.EndsWith("logo.png", file.FilePath, StringComparison.OrdinalIgnoreCase);
-        Assert.True(file.WholeFile);
+        Assert.Equal(2, files.Count);
+        var gone = files.Single(f => f.FilePath.EndsWith("Gone.cs", StringComparison.Ordinal));
+        Assert.True(gone.Deleted);
+        Assert.True(gone.WholeFile);
+        Assert.Equal([new RemovedRange(1, 5, 1)], gone.RemovedRanges);
+
+        var logo = files.Single(f => f.FilePath.EndsWith("logo.png", StringComparison.OrdinalIgnoreCase));
+        Assert.True(logo.WholeFile);
+        Assert.False(logo.Deleted);
     }
 
     [Fact]

@@ -9,6 +9,13 @@ namespace RoslynMCP.Tests;
 /// <summary>
 /// Solution folders — groupings that live in the solution file rather than on disk.
 /// </summary>
+/// <remarks>
+/// Shared, because one test below binds a solution, and which solution this process is bound to
+/// is what everything above the workspace means by "this session" — the launch targets, the
+/// package list, the symbol search. Binding it from a parallel collection reached into whatever
+/// was being asked at that moment.
+/// </remarks>
+[Collection(SharedState.Name)]
 public sealed class SolutionFolderTests : IDisposable
 {
     private const string EmptySolution = """
@@ -61,7 +68,10 @@ public sealed class SolutionFolderTests : IDisposable
         string solution = Path.Combine(_directory, "Bound.sln");
         await File.WriteAllTextAsync(solution, EmptySolution);
 
-        WorkspaceService.BindSolution(solution);
+        // Restored when the scope ends. The binding outlives the test otherwise, and this one
+        // names a file under a directory the test deletes — so every later test asking what this
+        // session's solution is got a solution that no longer exists.
+        using var bound = WorkspaceService.BindSolutionForTesting(solution);
 
         var result = await SolutionTreeEditHandler.EditAsync(
             new SolutionTreeEditParams(

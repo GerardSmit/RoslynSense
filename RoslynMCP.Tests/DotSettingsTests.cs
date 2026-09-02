@@ -316,6 +316,30 @@ public class ReSharperSettingsTests : IDisposable
             .IsExcluded(Path.Combine(_root, "Acme.Api", "Generated", "Deep", "File.cs")));
     }
 
+    /// <summary>
+    /// The value ReSharper actually writes, and its opposite: a file marked ForceIncluded is
+    /// kept in analysis, not taken out of it.
+    /// </summary>
+    [Theory]
+    [InlineData("ExplicitlyExcluded", true)]
+    [InlineData("ForceIncluded", false)]
+    public void ReadsTheExclusionStateRatherThanTreatingEveryEntryAsOne(string state, bool excluded)
+    {
+        const string guid = "155A78F7-41F0-40CE-835B-0F7C74E60CE0";
+
+        File.WriteAllText(Path.Combine(_root, "Acme.sln"),
+            "Microsoft Visual Studio Solution File, Format Version 12.00\n"
+            + $"Project(\"{{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}}\") = \"Acme.Api\", "
+            + $"\"Acme.Api\\Acme.Api.csproj\", \"{{{guid}}}\"\nEndProject\n");
+
+        string encoded = DotSettingsEscaping.Encode($"{guid}/d:Services/f:Impl.cs");
+        WriteProjectLayer(
+            $"""<s:String x:Key="/Default/CodeInspection/ExcludedFiles/FilesAndFoldersToSkip2/={encoded}/@EntryIndexedValue">{state}</s:String>""");
+
+        Assert.Equal(excluded, ReSharperSettings.ForProject(_projectPath)
+            .IsExcluded(Path.Combine(_root, "Acme.Api", "Services", "Impl.cs")));
+    }
+
     /// <summary>A GUID no solution claims is a project that was removed, and names nothing.</summary>
     [Fact]
     public void IgnoresASpecWhoseProjectIsGone()

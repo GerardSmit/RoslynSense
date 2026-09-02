@@ -278,6 +278,21 @@ internal sealed class ReSharperSettings
                 if (target is null || entry.Index is not { } index)
                     continue;
 
+                // FilesAndFoldersToSkip2 is not a set of flags: its value names one of
+                // ReSharper's states for the file, and only ExplicitlyExcluded is an exclusion.
+                // ForceIncluded is the opposite — what the "include this file again" gesture
+                // writes, keeping a file in analysis that a broader rule would have taken out —
+                // and reading it as a boolean excluded every file a team had deliberately kept.
+                if (entry.Path == ExcludedFilesKey && entry.Accessor == "EntryIndexedValue")
+                {
+                    if (IsExcludedState(entry.Value))
+                        target.Add(index);
+                    else
+                        target.Remove(index);
+
+                    continue;
+                }
+
                 if (entry.IsRemovedIndex)
                     target.Remove(index);
                 else if (entry.IsPresentIndex)
@@ -291,6 +306,18 @@ internal sealed class ReSharperSettings
             masks.Select(MaskRegex).ToImmutableArray(),
             coverage.Select(CoverageExclusion.Parse).OfType<CoverageExclusion>().ToImmutableArray());
     }
+
+    /// <summary>
+    /// Whether a <c>FilesAndFoldersToSkip2</c> value means the file is out of analysis.
+    /// </summary>
+    /// <remarks>
+    /// <c>True</c> is accepted alongside ReSharper's own <c>ExplicitlyExcluded</c> because a
+    /// hand-written layer may say it that way, and it can only ever have meant "excluded".
+    /// Everything else — <c>ForceIncluded</c> above all — is not an exclusion.
+    /// </remarks>
+    private static bool IsExcludedState(string? value) =>
+        string.Equals(value, "ExplicitlyExcluded", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "True", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Folder paths compare as relative Windows paths, whichever separator was stored.</summary>
     private static string Normalize(string folder) =>

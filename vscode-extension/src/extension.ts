@@ -29,6 +29,7 @@ import { registerDiscoveryExplorer } from './discoveryExplorer';
 import { extensionDebug } from './extensionDebug';
 import { registerSearchEverywhere } from './search';
 import { registerSettingsPanel } from './settings';
+import { registerPropertiesPanel } from './properties';
 import { registerVirtualDocuments } from './virtualDocuments';
 import { registerEmbeddedLanguages } from './embeddedLanguages';
 import { registerNuGetPanel } from './nuget';
@@ -3547,6 +3548,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerEmbeddedLanguages(context);
     registerSearchEverywhere(context, () => client);
     registerSettingsPanel(context, () => client);
+    registerPropertiesPanel(context, () => client);
     registerNuGetPanel(context, () => client);
     registerTaskProvider(context, () => client);
     registerHotReload(context, () => client);

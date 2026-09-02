@@ -635,6 +635,11 @@
         "category": "RoslynSense"
       },
       {
+        "command": "roslynSense.solutionExplorer.properties",
+        "title": "Properties",
+        "category": "RoslynSense"
+      },
+      {
         "command": "roslynSense.solutionExplorer.delete",
         "title": "Delete",
         "category": "RoslynSense"
@@ -1606,6 +1611,11 @@
           "group": "2_modify@4"
         },
         {
+          "command": "roslynSense.solutionExplorer.properties",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "9_properties"
+        },
+        {
           "command": "roslynSense.solutionExplorer.newItem",
           "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
           "group": "2_modify@0"
@@ -2142,7 +2152,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json && tsc -p ./tsconfig.webview.settings.json",
+    "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json && tsc -p ./tsconfig.webview.settings.json && tsc -p ./tsconfig.webview.properties.json",
     "build": "npm run compile && npm run compile:webview",
     "vscode:prepublish": "npm run build",
     "watch": "tsc -watch -p ./",

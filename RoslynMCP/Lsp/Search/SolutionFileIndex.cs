@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 
 using RoslynMCP.Languages.DotSettings.Core;
+using RoslynMCP.Services;
 namespace RoslynMCP.Lsp.Search;
 
 /// <summary>
@@ -97,7 +98,9 @@ public static class SolutionFileIndex
         var files = new List<string>();
         try
         {
-            Walk(root, files, depth: 0, ct);
+            // Asked once for the root rather than once per directory underneath it: every
+            // subdirectory of a root shares the root's solution, and finding it is a walk.
+            Walk(root, PathHelper.FindNearestSolution(root), files, depth: 0, ct);
         }
         catch (OperationCanceledException) { throw; }
         catch (IOException) { /* a directory vanished mid-walk — report what was found */ }
@@ -112,7 +115,8 @@ public static class SolutionFileIndex
     /// directory is never descended into: skipping <c>obj/</c> after enumerating it still pays
     /// for enumerating it, and on a big solution that is most of the walk.
     /// </summary>
-    private static void Walk(string directory, List<string> files, int depth, CancellationToken ct)
+    private static void Walk(
+        string directory, string? solutionPath, List<string> files, int depth, CancellationToken ct)
     {
         const int MaxDepth = 32;
         if (depth > MaxDepth)
@@ -126,14 +130,14 @@ public static class SolutionFileIndex
         foreach (string child in Directory.EnumerateDirectories(directory))
         {
             if (SearchFileRules.IsExcluded(Path.GetFileName(child))
-                || DotSettingsExclusions.IsExcluded(child))
+                || DotSettingsExclusions.IsExcluded(solutionPath, child))
             {
                 continue;
             }
 
             try
             {
-                Walk(child, files, depth + 1, ct);
+                Walk(child, solutionPath, files, depth + 1, ct);
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }

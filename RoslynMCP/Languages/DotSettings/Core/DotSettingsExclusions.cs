@@ -52,11 +52,28 @@ internal static class DotSettingsExclusions
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Whether a <c>.DotSettings</c> layer in this file's solution excludes it.</summary>
-    public static bool IsExcluded(string absolutePath)
+    public static bool IsExcluded(string absolutePath) => IsExcluded(null, absolutePath);
+
+    /// <summary>
+    /// The same question asked by a caller that already knows which solution it is searching.
+    /// </summary>
+    /// <remarks>
+    /// Finding the owning solution from a path alone walks the directory tree, and these callers
+    /// ask per file while holding the one answer the walk could return. Passing it turns the
+    /// per-file question into a dictionary lookup. A null or empty
+    /// <paramref name="solutionPath"/> means the caller has no solution in hand — a search running
+    /// before one was loaded — and the path is resolved the long way.
+    /// <para>
+    /// The two are not quite the same question for a project that lives outside its solution's
+    /// folder beside a second <c>.sln</c>: this overload answers under the solution being
+    /// searched, which is the one whose exclusions the user meant.
+    /// </para>
+    /// </remarks>
+    public static bool IsExcluded(string? solutionPath, string absolutePath)
     {
         try
         {
-            return IsExcludedCore(absolutePath);
+            return IsExcludedCore(solutionPath, absolutePath);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -68,12 +85,16 @@ internal static class DotSettingsExclusions
         }
     }
 
-    private static bool IsExcludedCore(string absolutePath)
+    private static bool IsExcludedCore(string? solutionPath, string absolutePath)
     {
         if (!Enabled || string.IsNullOrEmpty(absolutePath))
             return false;
 
-        if (PathHelper.FindNearestSolution(absolutePath) is not { Length: > 0 } solution)
+        string? owning = solutionPath is { Length: > 0 }
+            ? solutionPath
+            : PathHelper.FindNearestSolution(absolutePath);
+
+        if (owning is not { Length: > 0 } solution)
             return false;
 
         var index = IndexFor(solution);
@@ -121,6 +142,10 @@ internal static class DotSettingsExclusions
     {
         s_cache.Clear();
         ReSharperSettings.Clear();
+
+        // The map from a directory to its owning solution is what the per-path overload walks,
+        // and a solution close is exactly when a checkout may have moved under it.
+        PathHelper.ClearNearestSolutionCache();
     }
 
     private static Index IndexFor(string solutionPath)

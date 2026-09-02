@@ -333,7 +333,7 @@ public static class SearchEverywhere
             var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
             if (location?.SourceTree?.FilePath is not { Length: > 0 } path
                 || SearchFileRules.IsExcluded(path)
-                || DotSettingsExclusions.IsExcluded(path))
+                || DotSettingsExclusions.IsExcluded(solution.FilePath, path))
             {
                 continue;
             }
@@ -441,9 +441,11 @@ public static class SearchEverywhere
                 // project's generated AssemblyInfo lives. A .DotSettings layer adds whatever the
                 // team excluded on top of that. Asked once per document rather than once per hit,
                 // which is also what keeps the excluded documents from being indexed at all.
+                // The solution is handed over rather than found from each path: this loop runs
+                // per keystroke over every document, and finding it per path was the search.
                 if (document.FilePath is not { Length: > 0 } path
                     || SearchFileRules.IsExcluded(path)
-                    || DotSettingsExclusions.IsExcluded(path))
+                    || DotSettingsExclusions.IsExcluded(solution.FilePath, path))
                 {
                     continue;
                 }

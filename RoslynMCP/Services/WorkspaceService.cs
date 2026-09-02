@@ -1990,6 +1990,10 @@ internal static class WorkspaceService
             // through here, so this is where the stale verdict has to go.
             s_plainGlob.Clear();
 
+            // Which directory belongs to which solution is remembered for the life of the
+            // process; a solution switch is when that can stop being true.
+            PathHelper.ClearNearestSolutionCache();
+
             // What is watched follows what is loaded: with nothing cached there is nothing for a
             // restore to invalidate, and holding the handles would leak a tree per solution switch.
             RestoreWatcher.StopAll();

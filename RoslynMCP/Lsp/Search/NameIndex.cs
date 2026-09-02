@@ -386,7 +386,8 @@ public static class NameIndex
         {
             foreach (string file in SolutionFileIndex.FilesUnder(root, CancellationToken.None))
             {
-                if (SearchFileRules.IsExcluded(file) || DotSettingsExclusions.IsExcluded(file))
+                if (SearchFileRules.IsExcluded(file)
+                    || DotSettingsExclusions.IsExcluded(solutionPath, file))
                     continue;
 
                 if (seen.Add(file))

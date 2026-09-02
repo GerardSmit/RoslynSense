@@ -251,6 +251,25 @@ internal static partial class PathHelper
     }
 
     /// <summary>
+    /// Which directory owns which solution, so that the walk below is paid once per directory
+    /// rather than once per question.
+    /// </summary>
+    /// <remarks>
+    /// The walk is two directory enumerations per ancestor level, and the callers ask it per
+    /// file: a Search Everywhere keystroke asked it once per document, which on a solution of a
+    /// couple of thousand files measured at 2.8s of pure filesystem metadata — the whole of the
+    /// search. A directory's nearest solution is a fact about the checkout rather than about the
+    /// session, so it is remembered until <see cref="ClearNearestSolutionCache"/> says the layout
+    /// moved. Misses are cached too: "nothing above here" costs a walk to the drive root, and it
+    /// is the answer for every file outside the tree.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<string, string?> s_nearestSolution =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Forgets the directory-to-solution map — for a solution open or close, and tests.</summary>
+    public static void ClearNearestSolutionCache() => s_nearestSolution.Clear();
+
+    /// <summary>
     /// Walks up from a file or directory looking for the nearest .sln.
     /// Returns null if not found.
     /// </summary>
@@ -263,25 +282,51 @@ internal static partial class PathHelper
         // what keeps the walk from enumerating the file path itself as one.
         var dir = Directory.Exists(normalized) ? normalized : Path.GetDirectoryName(normalized);
 
-        while (dir is not null)
+        if (dir is null)
+            return null;
+
+        if (s_nearestSolution.TryGetValue(dir, out string? memoized))
+            return memoized;
+
+        // Every directory passed on the way up shares the answer found above it: none of them
+        // held a solution, or the walk would have stopped there. So one walk fills the whole
+        // chain, and the next file in any of those directories asks the filesystem nothing.
+        var walked = new List<string>();
+        string? solution = null;
+
+        for (string? current = dir; current is not null; current = Path.GetDirectoryName(current))
         {
-            if (Directory.Exists(dir))
+            if (s_nearestSolution.TryGetValue(current, out string? cached))
             {
-                try
+                solution = cached;
+                break;
+            }
+
+            walked.Add(current);
+
+            if (!Directory.Exists(current))
+                continue;
+
+            try
+            {
+                var slnFiles = FindSolutionFiles(current);
+                if (slnFiles.Length >= 1)
                 {
-                    var slnFiles = FindSolutionFiles(dir);
-                    if (slnFiles.Length >= 1) return slnFiles[0];
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    // Deleted between the check and the enumeration, or unreadable: an ancestor
-                    // may still hold the solution.
+                    solution = slnFiles[0];
+                    break;
                 }
             }
-            dir = Path.GetDirectoryName(dir);
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Deleted between the check and the enumeration, or unreadable: an ancestor
+                // may still hold the solution.
+            }
         }
 
-        return null;
+        foreach (string visited in walked)
+            s_nearestSolution[visited] = solution;
+
+        return solution;
     }
 
     /// <summary>

@@ -316,7 +316,10 @@ public static class RunConfigResolver
         if (string.IsNullOrWhiteSpace(launchUrl))
             return baseUrl;
 
-        if (Uri.TryCreate(launchUrl, UriKind.Absolute, out var absolute))
+        // On Unix, Uri treats a leading slash as an absolute file URI. launchUrl is a
+        // browser URL, so `/swagger` must remain relative to the application's binding.
+        if (Uri.TryCreate(launchUrl, UriKind.Absolute, out var absolute) &&
+            absolute.Scheme is "http" or "https")
             return absolute.ToString();
 
         return baseUrl is null ? null : $"{baseUrl}/{launchUrl.TrimStart('/')}";
@@ -527,7 +530,9 @@ public static class RunConfigResolver
     internal static int StablePort(string projectPath)
     {
         ulong hash = 14695981039346656037; // FNV-1a
-        foreach (var c in PathHelper.NormalizePath(projectPath).ToLowerInvariant())
+        // Hash a platform-neutral spelling: launch settings may arrive from a Windows
+        // client even when the server is running in Linux or a container.
+        foreach (var c in projectPath.Replace('\\', '/').TrimEnd('/').ToLowerInvariant())
         {
             hash ^= c;
             hash *= 1099511628211;

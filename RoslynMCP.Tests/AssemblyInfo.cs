@@ -1,9 +1,6 @@
 using Xunit;
 
-// Test classes run in parallel; the ones sharing process-wide state opt out by joining
-// SharedState's collection. See SharedState.cs for why that is one collection and not several.
-//
-// The cap is deliberate rather than "as many as there are cores": these tests load MSBuild
-// workspaces and spawn real processes, so they are heavy on memory, file handles and child
-// processes rather than on CPU, and oversubscribing turns a fast run into a thrashing one.
-[assembly: CollectionBehavior(MaxParallelThreads = 8)]
+// The suite exercises process-wide workspace, configuration, cache, and environment state.
+// Keep classes serialized until every remaining owner of that state has been made instance-local;
+// parallelizing only selected collections allows unrelated tests to invalidate one another.
+[assembly: CollectionBehavior(DisableTestParallelization = true)]

@@ -10,6 +10,17 @@ function publishedServer(extensionRoot: string): string {
     const repositoryRoot = path.resolve(extensionRoot, '..');
     const output = path.join(extensionRoot, '.vscode-test', 'roslyn-sense-server');
     fs.mkdirSync(output, { recursive: true });
+
+    // RoslynMCP's build targets invoke projects that are not regular project
+    // references. Restore the solution so those projects also have assets in a
+    // clean checkout before publishing the temporary integration-test server.
+    const restore = cp.spawnSync(
+        'dotnet',
+        ['restore', path.join(repositoryRoot, 'RoslynMCP.sln'), '--nologo'],
+        { stdio: 'inherit', shell: false }
+    );
+    if (restore.status !== 0) throw new Error(`Solution restore failed with ${restore.status}.`);
+
     const result = cp.spawnSync(
         'dotnet',
         [
@@ -17,6 +28,7 @@ function publishedServer(extensionRoot: string): string {
             path.join(repositoryRoot, 'RoslynMCP', 'RoslynMCP.csproj'),
             '--configuration', 'Release',
             '--output', output,
+            '--no-restore',
             '--nologo',
             '-p:Version=0.3.0',
             '-p:BuildDebugWorkers=false',

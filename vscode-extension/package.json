@@ -2161,7 +2161,7 @@
     "package": "vsce package",
     "check:embedded": "node scripts/checkEmbedded.mjs",
     "test": "npm run test:unit",
-    "test:unit": "npm run compile && node --test \"out/test/*.test.js\"",
+    "test:unit": "npm run compile && node --test out/test/*.test.js",
     "test:integration": "npm run build && node out/test/integration/run.js"
   },
   "dependencies": {

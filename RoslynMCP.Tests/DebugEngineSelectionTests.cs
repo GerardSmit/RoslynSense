@@ -358,14 +358,25 @@ internal sealed class FxTargetProcess : IDisposable
         if (!OperatingSystem.IsWindows())
             return null;
 
-        var csc = new[] { "Framework64", "Framework" }
+        var frameworkCompilers = new[] { "Framework64", "Framework" }
             .Select(d => Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                "Microsoft.NET", d, "v4.0.30319", "csc.exe"))
+                "Microsoft.NET", d, "v4.0.30319", "csc.exe"));
+        var csc = new[]
+            {
+                WorkspaceService.LegacyMsBuildDirectory is { } msbuild
+                    ? Path.Combine(msbuild, "Roslyn", "csc.exe")
+                    : null,
+            }
+            .Concat(frameworkCompilers)
             .FirstOrDefault(File.Exists);
 
         if (csc is null)
+        {
+            Console.Error.WriteLine(
+                "[FxTargetProcess] No Visual Studio or .NET Framework C# compiler was found.");
             return null;
+        }
 
         var directory = Path.Combine(Path.GetTempPath(), "roslynsense-fxtarget-" + Guid.NewGuid().ToString("N"));
         System.IO.Directory.CreateDirectory(directory);
@@ -385,8 +396,25 @@ internal sealed class FxTargetProcess : IDisposable
             ArgumentList = { "-nologo", "-debug:full", "-out:" + exe, source },
         })!;
 
-        process.WaitForExit(120_000);
-        return process.ExitCode == 0 && File.Exists(exe) ? exe : null;
+        // Drain both pipes while the compiler runs. Waiting before reading redirected output can
+        // deadlock when a compiler or its host writes enough diagnostics to fill either pipe.
+        Task<string> output = process.StandardOutput.ReadToEndAsync();
+        Task<string> errors = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(120_000))
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            Console.Error.WriteLine($"[FxTargetProcess] Compiler '{csc}' timed out after 120 seconds.");
+            return null;
+        }
+
+        Task.WaitAll([output, errors], 5_000);
+        if (process.ExitCode == 0 && File.Exists(exe))
+            return exe;
+
+        Console.Error.WriteLine(
+            $"[FxTargetProcess] Compiler '{csc}' exited with code {process.ExitCode}. " +
+            $"stdout: {output.Result} stderr: {errors.Result}");
+        return null;
     }
 
     public void Dispose()

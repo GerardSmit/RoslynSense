@@ -234,9 +234,14 @@ public sealed class SuspendedProcess : IDisposable
         {
             File.WriteAllText(script, HelperScript);
 
+            var pwsh = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "PowerShell", "7", "pwsh.exe");
             using var helper = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
             {
-                FileName = "powershell.exe",
+                // PowerShell 7's Add-Type uses the bundled Roslyn compiler and starts much faster.
+                // Windows PowerShell remains the universal fallback for machines without it.
+                FileName = File.Exists(pwsh) ? pwsh : "powershell.exe",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
@@ -251,7 +256,19 @@ public sealed class SuspendedProcess : IDisposable
             if (helper is null)
                 return false;
 
-            return helper.WaitForExit(HelperTimeoutMilliseconds) && helper.ExitCode == 0;
+            // Drain both pipes while the helper runs. Waiting first can deadlock when Add-Type
+            // writes enough compiler output to fill a redirected pipe—the hosted runner exposed
+            // this as an exact 30-second timeout while stopping at a breakpoint.
+            Task<string> output = helper.StandardOutput.ReadToEndAsync();
+            Task<string> errors = helper.StandardError.ReadToEndAsync();
+            if (!helper.WaitForExit(HelperTimeoutMilliseconds))
+            {
+                try { helper.Kill(entireProcessTree: true); } catch { }
+                return false;
+            }
+
+            Task.WaitAll([output, errors], 5_000);
+            return helper.ExitCode == 0;
         }
         catch
         {

@@ -14,6 +14,14 @@ on:
           - minor
           - major
         default: patch
+      extension_channel:
+        description: "VS Code Marketplace channel"
+        required: true
+        type: choice
+        options:
+          - prerelease
+          - stable
+        default: prerelease
 
 env:
   NETCOREDBG_VERSION: "3.1.3-1062"
@@ -183,6 +191,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       previous_version: ${{ steps.version.outputs.previous_version }}
+      extension_prerelease: ${{ steps.version.outputs.extension_prerelease }}
 
     steps:
       - name: Checkout
@@ -226,14 +235,19 @@ jobs:
             $previousTag = $latestTag
           }
           $previousVersion = if ($previousTag) { $previousTag.Substring(1) } else { '' }
+          $extensionPrerelease = '${{ github.event_name }}' -eq 'workflow_dispatch' `
+            -and '${{ github.event.inputs.extension_channel }}' -eq 'prerelease'
           "version=$version" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
           "tag=v$version" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
           "previous_version=$previousVersion" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-          Write-Host "Building release $version (previous: $previousVersion)"
+          "extension_prerelease=$($extensionPrerelease.ToString().ToLowerInvariant())" |
+            Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host "Building release $version (previous: $previousVersion, extension prerelease: $extensionPrerelease)"
 
       - name: Restore and build release binaries
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          EXTENSION_PRERELEASE: ${{ steps.version.outputs.extension_prerelease }}
         shell: pwsh
         run: |
           dotnet restore RoslynMCP.sln
@@ -256,7 +270,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm version $env:VERSION --no-git-tag-version --allow-same-version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx @vscode/vsce package --out "../artifacts/roslyn-sense-$env:VERSION.vsix"
+          $vsceArgs = @('@vscode/vsce', 'package', '--out', "../artifacts/roslyn-sense-$env:VERSION.vsix")
+          if ($env:EXTENSION_PRERELEASE -eq 'true') { $vsceArgs += '--pre-release' }
+          & npx @vsceArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify Windows payloads are in the tool package
@@ -448,11 +464,14 @@ jobs:
         working-directory: vscode-extension
         env:
           VERSION: ${{ needs.release_artifacts.outputs.version }}
-        run: >
-          npx @vscode/vsce publish
-          --packagePath "../artifacts/roslyn-sense-${VERSION}.vsix"
-          --azure-credential
-          --skip-duplicate
+          EXTENSION_PRERELEASE: ${{ needs.release_artifacts.outputs.extension_prerelease }}
+        run: |
+          set -euo pipefail
+          args=(publish --packagePath "../artifacts/roslyn-sense-${VERSION}.vsix" --azure-credential --skip-duplicate)
+          if [[ "$EXTENSION_PRERELEASE" == "true" ]]; then
+            args+=(--pre-release)
+          fi
+          npx @vscode/vsce "${args[@]}"
 
       - name: Create tag (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
@@ -491,6 +510,7 @@ jobs:
             artifacts/*.nupkg
             artifacts/*.vsix
           generate_release_notes: false
+          prerelease: ${{ needs.release_artifacts.outputs.extension_prerelease == 'true' }}
 
   # Claude Code reads .claude-plugin/plugin.json from the DEFAULT BRANCH when a user adds or
   # updates the marketplace, not from the release tag — so the manifest has to be synced on the

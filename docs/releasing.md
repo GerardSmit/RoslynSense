@@ -34,7 +34,9 @@ Require reviewers for the `release` environment if publication should have a man
 
 ## Starting a release
 
-For the normal path, open the **CI** workflow, choose **Run workflow**, and select `patch`, `minor`, or `major`. The version is calculated from the latest `v*` tag. Publication occurs only after every build, integration test, package inspection, and install/update smoke test succeeds.
+For the normal path, open the **CI** workflow and choose **Run workflow**. Select `patch`, `minor`, or `major`, then choose the VS Code Marketplace channel. `prerelease` is the default for manual runs; it marks both the packaged VSIX and Marketplace publication as prerelease while keeping the required numeric extension version. `stable` publishes to the normal channel. The .NET tool remains a normal NuGet release in either case. The version is calculated from the latest `v*` tag. Publication occurs only after every build, integration test, package inspection, and install/update smoke test succeeds.
+
+Marketplace extension versions cannot use SemVer suffixes. A prerelease `0.3.1` and stable `0.3.1` cannot both exist, so the later stable extension must use another version such as `0.3.2`. Tag-triggered releases publish the extension as stable; use the manual workflow selector for prereleases.
 
 Maintainers can also push an annotated semantic version tag such as `v0.3.0`. In that case the tag is the version source of truth.
 

@@ -191,7 +191,7 @@ public static class ProjectMutationService
     }
 
     /// <summary>What a new file should contain.</summary>
-    public enum FileKind { Class, Interface, Record, Enum, Empty }
+    public enum FileKind { Class, Interface, Record, Struct, Enum, Empty }
 
     public static async Task<MutationResult> AddFileAsync(
         string projectPath, string relativePath, FileKind kind = FileKind.Class,
@@ -883,6 +883,137 @@ public static class ProjectMutationService
               $"{Path.GetFileNameWithoutExtension(projectPath)}.");
     }
 
+    /// <summary>
+    /// One file a template produces, and what the project should say about it.
+    /// </summary>
+    /// <param name="ItemType">The item type to write. Null takes the one the extension implies,
+    /// which is what the SDK's own glob would have used.</param>
+    /// <param name="Metadata">Item metadata — <c>DependentUpon</c> for a code-behind,
+    /// <c>SubType</c> for a designer surface, <c>Generator</c> for a .resx. Its presence is also
+    /// what decides whether an SDK-style project gets an item at all.</param>
+    public sealed record GeneratedFile(
+        string RelativePath,
+        string Contents,
+        string? ItemType = null,
+        IReadOnlyDictionary<string, string>? Metadata = null);
+
+    /// <summary>
+    /// Creates the files one template produces, and says in the project what they are.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A template is more than one file more often than not — a Form is a partial class and its
+    /// designer half, a Web Form is markup and two code files that have to be nested under it —
+    /// and half-creating one is worse than not creating it. So every path is checked before
+    /// anything is written, and the project file is rewritten once for all of them.
+    /// </para>
+    /// <para>
+    /// What gets an item depends on the project. A legacy project lists everything, so everything
+    /// is listed. An SDK-style project globs, so an item is written only when there is metadata
+    /// to carry — and then as an <c>Update</c>, which leaves the glob owning the file and says
+    /// only the part the glob cannot.
+    /// </para>
+    /// </remarks>
+    public static async Task<MutationResult> AddGeneratedFilesAsync(
+        string projectPath, IReadOnlyList<GeneratedFile> files, CancellationToken ct = default)
+    {
+        if (!File.Exists(projectPath))
+            return new MutationResult(false, $"Project not found: {projectPath}");
+
+        if (files.Count == 0)
+            return new MutationResult(false, "The template produced no files.");
+
+        string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
+        var planned = new List<(GeneratedFile File, string FullPath)>();
+
+        foreach (var file in files)
+        {
+            string full = Path.GetFullPath(Path.Combine(projectDirectory, file.RelativePath));
+
+            if (!full.StartsWith(projectDirectory + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return new MutationResult(false, "The file must be inside the project directory.");
+            }
+
+            if (File.Exists(full))
+                return new MutationResult(
+                    false, $"{Path.GetRelativePath(projectDirectory, full)} already exists.");
+
+            planned.Add((file, full));
+        }
+
+        foreach (var (file, full) in planned)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+            await File.WriteAllTextAsync(full, file.Contents, ct);
+        }
+
+        bool wroteProject = false;
+
+        try
+        {
+            var document = Parser.ParseText(File.ReadAllText(projectPath));
+
+            if (document.RootSyntax is { } original)
+            {
+                var root = original;
+                bool sdkStyle = IsSdkStyle(original)
+                    && !string.Equals(
+                        ReadProperty(projectPath, "EnableDefaultCompileItems"),
+                        "false",
+                        StringComparison.OrdinalIgnoreCase);
+
+                foreach (var (file, full) in planned)
+                {
+                    var metadata = file.Metadata;
+                    bool hasMetadata = metadata is { Count: > 0 };
+
+                    // Globbed and with nothing the glob cannot say: the project stays as it is.
+                    if (sdkStyle && !hasMetadata)
+                        continue;
+
+                    string include = Path.GetRelativePath(projectDirectory, full);
+                    string itemType = file.ItemType ?? DefaultGlobsFor(full)[0];
+
+                    root = AddFileItem(root, itemType, sdkStyle ? "Update" : "Include", include);
+
+                    if (hasMetadata)
+                    {
+                        root = WriteMetadata(
+                            root,
+                            include,
+                            metadata!.ToDictionary(
+                                pair => pair.Key,
+                                pair => (string?)pair.Value,
+                                StringComparer.OrdinalIgnoreCase));
+                    }
+                }
+
+                if (!ReferenceEquals(root, original))
+                {
+                    File.WriteAllText(projectPath, document.ReplaceNode(original, root).ToFullString());
+                    SelfWriteTracker.Note(projectPath);
+                    wroteProject = true;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // The files are on disk and correct; only the bookkeeping failed. Saying so beats
+            // deleting work somebody asked for.
+            ServiceLog.Warn(
+                $"Could not list the new files in '{Path.GetFileName(projectPath)}': {ex.Message}",
+                key: $"generated-items:{projectPath}");
+        }
+
+        await InvalidateAsync(ct, projectPath);
+
+        return new MutationResult(true,
+            $"Created {string.Join(", ", planned.Select(p => Path.GetFileName(p.FullPath)))}"
+            + (wroteProject ? $" and listed them in {Path.GetFileName(projectPath)}." : "."));
+    }
+
     /// <summary>Every element naming this file, whatever item type it carries.</summary>
     /// <remarks>
     /// Broader than <see cref="ItemFor"/>, which answers for the four types file scaffolding
@@ -1007,6 +1138,7 @@ public static class ProjectMutationService
         {
             FileKind.Interface => "interface",
             FileKind.Record => "record",
+            FileKind.Struct => "struct",
             FileKind.Enum => "enum",
             _ => "class",
         };

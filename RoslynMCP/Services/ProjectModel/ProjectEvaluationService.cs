@@ -326,6 +326,9 @@ public static class ProjectEvaluationService
         "CentralPackageVersionOverrideEnabled", "NuGetAudit", "NuGetAuditMode", "NuGetAuditLevel",
         "RestorePackagesWithLockFile", "TargetFramework", "TargetFrameworks", "TargetFrameworkVersion",
         "AssemblyName", "OutputType", "OutputPath",
+        // What a project can have new files of: a WinForms project offers a Form, a WPF one a
+        // Window, and neither trait is visible anywhere else in the evaluation.
+        "UseWPF", "UseWindowsForms", "RootNamespace",
     ];
 
     private static IReadOnlyDictionary<string, string> ReadProperties(Project project)

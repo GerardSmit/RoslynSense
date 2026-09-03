@@ -532,6 +532,22 @@ internal sealed class LspServer : IDisposable
         SetItemPropertiesParams p, CancellationToken ct) =>
         Handlers.ItemPropertiesHandler.SetAsync(p, ct);
 
+    /// <summary>
+    /// What can be added on this node. The list depends on the project — a Form where WinForms is
+    /// on, a Web Form on a legacy System.Web site — which is why it is asked for rather than held
+    /// in the editor.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/itemTemplates", UseSingleObjectParameterDeserialization = true)]
+    public Task<ItemTemplatesResult> ItemTemplates(ItemTemplatesParams p, CancellationToken ct) =>
+        Handlers.ItemTemplatesHandler.ListAsync(p, ct);
+
+    /// <summary>
+    /// Creates one, and answers with every file it made so the editor can open the right one.
+    /// </summary>
+    [JsonRpcMethod("roslynSense/createItem", UseSingleObjectParameterDeserialization = true)]
+    public Task<CreateItemResult> CreateItem(CreateItemParams p, CancellationToken ct) =>
+        Handlers.ItemTemplatesHandler.CreateAsync(p, ct);
+
     // ---- Discovery ----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/discoveryTree", UseSingleObjectParameterDeserialization = true)]

@@ -1265,16 +1265,21 @@ public class WorkspaceDiagnosticsTests : IDisposable
             new WorkspaceDiagnosticParams(), default);
         Assert.DoesNotContain("CS0067", CodesFor(first, "OutlineShowcase"));
 
-        // Polling the report itself, because the sweep schedules a pass for every project in scope
-        // and this asserts about one file in one of them.
-        List<string> codes = [];
-        for (int i = 0; i < 100 && !codes.Contains("CS0067"); i++)
-        {
+        // Wait for the pass the first sweep scheduled without repeatedly running another complete
+        // solution sweep. On a constrained CI runner those competing sweeps can starve the
+        // compilation whose result they are polling for.
+        var project = WorkspaceService.TryGetSessionSolution()!.Projects.First(
+            p => p.FilePath is { } f
+                 && f.EndsWith("SampleProject.csproj", StringComparison.OrdinalIgnoreCase));
+        string? version = await ProjectWideDiagnosticCache.GetVersionAsync(project, default);
+        Assert.NotNull(version);
+
+        for (int i = 0; i < 300 && !ProjectWideDiagnosticCache.IsComputed(project, version); i++)
             await Task.Delay(100);
-            codes = CodesFor(
-                await WorkspaceDiagnosticsHandler.DiagnoseAsync(new WorkspaceDiagnosticParams(), default),
-                "OutlineShowcase");
-        }
+
+        var codes = CodesFor(
+            await WorkspaceDiagnosticsHandler.DiagnoseAsync(new WorkspaceDiagnosticParams(), default),
+            "OutlineShowcase");
 
         Assert.Contains("CS0067", codes);
 

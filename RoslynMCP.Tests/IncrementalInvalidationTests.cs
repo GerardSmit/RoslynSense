@@ -504,7 +504,7 @@ public class IncrementalInvalidationTests
     /// generates is not a per-document fact — but the <c>#line</c> scan of each generated
     /// document is what the time went into, and that is a function of its own text.
     /// </remarks>
-    [Fact]
+    [RequiresRazorSourceGeneratorFact]
     public async Task RebuildingTheRazorMapRereadsOnlyGeneratedDocumentsThatMoved()
     {
         var project = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.BlazorProjectFile);

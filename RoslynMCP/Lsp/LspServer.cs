@@ -1210,7 +1210,8 @@ internal sealed class LspServer : IDisposable
         {
             return await Route<ILanguageCodeLensProvider, Protocol.CodeLens[]>(p.TextDocument,
                 l => l.CodeLensAsync(p, ct),
-                () => Handlers.CodeLensHandler.CodeLensAsync(p, ct, _languages));
+                () => Handlers.CodeLensHandler.CodeLensAsync(
+                    p, ct, _languages, _clientRefreshesCodeLens));
         }
 
         // Added to the pack's rather than instead of them: a web.config is the webconfig pack's

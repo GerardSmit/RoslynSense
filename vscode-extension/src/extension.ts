@@ -1306,6 +1306,14 @@ async function runTestFromLens(
 const LENS_PRE_RESOLVE_TIMEOUT_MS = 400;
 
 /**
+ * The documents the editor has already been handed a lens list for.
+ *
+ * Only the first list for a document skips the pre-resolve, so this has to survive between calls
+ * and not between sessions of a document — a file closed and reopened is a first list again.
+ */
+const lensedDocuments = new Set<string>();
+
+/**
  * Resolve the lenses on screen before the editor is handed the list they belong to.
  *
  * See codeLensPrewarm.ts for why this exists and what it costs. The one rule that matters here is
@@ -1320,6 +1328,18 @@ async function preResolveVisibleLenses(
     const active = client;
 
     if (!active) {
+        return lenses;
+    }
+
+    // The dead key is a hazard of *replacing* a drawn list. The first list for a document
+    // replaces nothing — there is no anchor on screen to leave wired to a key that has gone — so
+    // waiting on it buys nothing and costs the whole deadline on exactly the open the user
+    // notices: a large file, cold, where every one of these resolves is a workspace-wide search.
+    // The editor resolves what is on screen a tick later anyway.
+    const first = !lensedDocuments.has(document.uri.toString());
+    lensedDocuments.add(document.uri.toString());
+
+    if (first) {
         return lenses;
     }
 
@@ -1377,6 +1397,10 @@ async function preResolveVisibleLenses(
 
 function registerLensCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
+        // A closed document has no lenses drawn, so its next list is a first one again.
+        vscode.workspace.onDidCloseTextDocument((document) =>
+            lensedDocuments.delete(document.uri.toString())
+        ),
         // CodeLens "▶ Run test" / "Debug test": route into the Test Explorer so results land
         // in the test UI with pass/fail decorations, rather than as terminal scrollback.
         vscode.commands.registerCommand(

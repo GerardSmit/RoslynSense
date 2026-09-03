@@ -143,6 +143,30 @@ public class LspPullAndLensTests
         Assert.Contains("Unknown command", Assert.IsType<string>(result));
     }
 
+    /// <summary>
+    /// A pull that arrives before the semantic model does answers with what the tree alone can
+    /// say, and catches up afterwards — the short answer is what the editor draws while the
+    /// project is still binding, and it must not become the permanent one.
+    /// </summary>
+    [Fact]
+    public async Task CodeLensAnswersBeforeTheSemanticModelAndCatchesUpOnTheNextPull()
+    {
+        string uri = LspConverters.PathToUri(FixturePaths.ServicesFile);
+        var request = new CodeLensParams(new TextDocumentIdentifier(uri));
+        CodeLensHandler.ClearWarmupState();
+
+        var first = await CodeLensHandler.CodeLensAsync(request, default, clientRefreshes: true);
+
+        // Whatever the model's state, the syntactic half is on screen straight away.
+        Assert.Contains(first, l => l.Command is null && l.Data is { Kind: "references" });
+
+        var second = await CodeLensHandler.CodeLensAsync(request, default, clientRefreshes: true);
+
+        // And the semantic half by the second pull at the latest: having answered short once for
+        // this text, the handler waits rather than answering short again.
+        Assert.Contains(second, l => l.Command?.Name == "roslynSense.showInheritanceAt");
+    }
+
     private static (int Line, int Character) PositionOf(string text, string anchor)
     {
         int index = text.IndexOf(anchor, StringComparison.Ordinal);

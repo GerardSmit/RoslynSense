@@ -1,9 +1,11 @@
+using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services;
 using RoslynMCP.Services.ExternalSource;
 using LspCodeLens = RoslynMCP.Lsp.Protocol.CodeLens;
 using LspLocation = RoslynMCP.Lsp.Protocol.Location;
@@ -32,8 +34,13 @@ internal static class CodeLensHandler
         "TestMethod", "DataTestMethod",         // MSTest
     };
 
+    /// <param name="clientRefreshes">Whether the client honours
+    /// <c>workspace/codeLens/refresh</c>. It is what makes it safe to answer before the semantic
+    /// model exists: a client that cannot be asked to re-pull would keep the short list forever,
+    /// so for one the model is awaited as it always was.</param>
     public static async Task<LspCodeLens[]> CodeLensAsync(
-        CodeLensParams p, CancellationToken ct, LanguageSession? languages = null)
+        CodeLensParams p, CancellationToken ct, LanguageSession? languages = null,
+        bool clientRefreshes = false)
     {
         var document = await LspDocumentResolver.ResolveAsync(
             LspConverters.UriToPath(p.TextDocument.Uri), ct);
@@ -42,9 +49,14 @@ internal static class CodeLensHandler
 
         var root = await document.GetSyntaxRootAsync(ct);
         var text = await document.GetTextAsync(ct);
-        var model = await document.GetSemanticModelAsync(ct);
-        if (root is null || model is null)
+        if (root is null)
             return Array.Empty<LspCodeLens>();
+
+        // The syntactic lenses cost a parse the editor has already paid for; the inheritance ones
+        // cost a semantic model, which on a large file in a cold project is the whole wait. So the
+        // model is used when it is already there and never waited for: the first pull answers with
+        // what the tree alone can say, and the arrows arrive on the re-pull the warm-up asks for.
+        var model = await SemanticModelForListAsync(document, clientRefreshes, ct);
 
         string? projectPath = document.Project.FilePath;
         var lenses = new List<LspCodeLens>();
@@ -86,7 +98,7 @@ internal static class CodeLensHandler
             // down counts (derived/implementations) need workspace queries -> lazy resolve,
             // and only where results are likely (interfaces, abstract members) to avoid a
             // wall of "0 overrides".
-            if (model.GetDeclaredSymbol(declaration, ct) is { } symbol)
+            if (model?.GetDeclaredSymbol(declaration, ct) is { } symbol)
             {
                 object[] inheritanceArgs =
                     [p.TextDocument.Uri, identifierPosition.Line, identifierPosition.Character];
@@ -142,6 +154,94 @@ internal static class CodeLensHandler
         }
 
         return lenses.ToArray();
+    }
+
+    /// <summary>
+    /// Which files have already had a lens list answered without their semantic model, and at
+    /// which version of their text.
+    /// </summary>
+    /// <remarks>
+    /// The bound on the loop. Without it a document whose model keeps being dropped — a file in a
+    /// project half the solution depends on, edited elsewhere — would answer short, ask for a
+    /// refresh, be asked again, answer short again, forever. Remembering the version turns that
+    /// into exactly one extra round trip: the second pull for the same text waits for the model.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<string, VersionStamp> s_answeredWithout =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Files whose model is being warmed, so a scroll does not start a second warm-up.</summary>
+    private static readonly ConcurrentDictionary<string, byte> s_warming =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The semantic model for the list pass — the one already built, or none.
+    /// </summary>
+    /// <remarks>
+    /// Roslyn hands one over immediately when it has it, and building one otherwise means binding
+    /// the project: seconds on a large file the first time it is opened, during which the editor
+    /// shows no lens at all rather than the run buttons and reference counts it could already
+    /// have. So a miss returns null and warms the model on a thread of its own, and the client is
+    /// asked to re-pull when it lands.
+    /// </remarks>
+    private static async Task<SemanticModel?> SemanticModelForListAsync(
+        Document document, bool clientRefreshes, CancellationToken ct)
+    {
+        if (document.TryGetSemanticModel(out var ready))
+        {
+            if (document.FilePath is { Length: > 0 } done)
+                s_answeredWithout.TryRemove(done, out _);
+
+            return ready;
+        }
+
+        if (!clientRefreshes || document.FilePath is not { Length: > 0 } path)
+            return await document.GetSemanticModelAsync(ct);
+
+        var version = await document.GetTextVersionAsync(ct);
+
+        // Already answered short for this exact text and the model still is not here: waiting is
+        // the honest answer now, rather than a third short list.
+        if (s_answeredWithout.TryGetValue(path, out var answered) && answered == version)
+            return await document.GetSemanticModelAsync(ct);
+
+        s_answeredWithout[path] = version;
+        WarmSemanticModel(document, path);
+        return null;
+    }
+
+    private static void WarmSemanticModel(Document document, string path)
+    {
+        if (!s_warming.TryAdd(path, 0))
+            return;
+
+        // Not awaited, and not cancelled by the request that started it: the point is to have the
+        // model by the time the client comes back, and the request that noticed it was missing is
+        // over long before then.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await document.GetSemanticModelAsync(CancellationToken.None);
+                LspSessionRegistry.ScheduleRefresh(RefreshKind.CodeLens, "codelens-semantics");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                ServiceLog.Warn(
+                    $"Could not warm the semantic model for '{Path.GetFileName(path)}': {ex.Message}",
+                    key: $"codelens-warm:{path}");
+            }
+            finally
+            {
+                s_warming.TryRemove(path, out _);
+            }
+        });
+    }
+
+    /// <summary>Forgets what has been answered short. Tests only.</summary>
+    internal static void ClearWarmupState()
+    {
+        s_answeredWithout.Clear();
+        s_warming.Clear();
     }
 
     /// <summary>codeLens/resolve: computes the reference count (or inheritance-down count)

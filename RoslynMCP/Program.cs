@@ -29,6 +29,12 @@ class Program
         if (await RoslynMCP.DevBuildRedirect.TryRunAsync(args) is { } redirected)
             return redirected;
 
+        if (args.Length > 0 && args[0].Equals("--version", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Out.WriteLine(CurrentVersion());
+            return 0;
+        }
+
         // Schema mode: roslyn-sense --config-schema [path]
         // Prints (or writes) the JSON Schema for roslynsense.json. The extension ships a copy for
         // editor validation and for its settings page; a test keeps that copy honest.
@@ -273,6 +279,9 @@ class Program
         }
         return 0;
     }
+
+    internal static string CurrentVersion() =>
+        typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "unknown";
 
     /// <summary>The debugger toggle, resolved from the config file and the command line, for the
     /// entry points that run before the main settings pass. Warnings are dropped: a bad config is

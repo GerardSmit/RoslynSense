@@ -69,7 +69,9 @@ public static class ItemTemplates
         var traits = await TraitsAsync(projectPath, ct);
         bool atProjectRoot = IsProjectRoot(projectPath, targetPath);
 
-        var templates = new List<ItemTemplate>(CodeTemplates);
+        var templates = new List<ItemTemplate>(
+            CodeTemplates.Where(template =>
+                template.Id != "record" || traits.LanguageVersion >= Records));
 
         if (traits.Razor)
             templates.AddRange(RazorTemplates);
@@ -155,6 +157,17 @@ public static class ItemTemplates
 
         var traits = await TraitsAsync(projectPath, ct);
         var files = Build(template, projectPath, full, traits.TestFramework ?? "MSTest");
+
+        // The templates are written for a modern compiler; a project that predates file-scoped
+        // namespaces gets the same source with the braces put back, rather than CS8370 on a file
+        // it has just been handed.
+        if (traits.LanguageVersion < FileScopedNamespaces)
+        {
+            files = [.. files.Select(file =>
+                Path.GetExtension(file.RelativePath).Equals(".cs", StringComparison.OrdinalIgnoreCase)
+                    ? file with { Contents = BlockScoped(file.Contents) }
+                    : file)];
+        }
 
         string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
 
@@ -274,7 +287,8 @@ public static class ItemTemplates
             new("nugetconfig", "NuGet Config", "Solution", "nuget.config", Fixed: true),
             new("tool-manifest", "Local Tool Manifest", "Solution", ".config\\dotnet-tools.json",
                 Fixed: true),
-            new("readme", "Markdown File", "Solution", "README.md"),
+            new("readme", "Markdown File", "Solution", "README.md",
+                "The solution's README.", Fixed: true),
         ];
 
         return [.. all.Where(template =>
@@ -285,7 +299,13 @@ public static class ItemTemplates
 
     private sealed record Traits(
         bool Legacy, bool AspNetCore, bool Razor, bool Blazor, bool Wpf, bool WinForms,
-        bool WebForms, string? TestFramework);
+        bool WebForms, string? TestFramework, int LanguageVersion);
+
+    /// <summary>The C# version a file-scoped namespace needs.</summary>
+    private const int FileScopedNamespaces = 10;
+
+    /// <summary>The C# version a record needs.</summary>
+    private const int Records = 9;
 
     private static async Task<Traits> TraitsAsync(string projectPath, CancellationToken ct)
     {
@@ -300,6 +320,13 @@ public static class ItemTemplates
                 && evaluation.Properties.TryGetValue(property, out string? value)
                 && string.Equals(value, "true", StringComparison.OrdinalIgnoreCase))
             || SaysTrue(projectPath, property);
+
+        string? Value(string property) =>
+            evaluation is not null
+            && evaluation.Properties.TryGetValue(property, out string? evaluated)
+            && evaluated.Length > 0
+                ? evaluated
+                : Says(projectPath, property);
 
         bool References(string prefix) =>
             evaluation is not null
@@ -331,7 +358,9 @@ public static class ItemTemplates
             WinForms: True("UseWindowsForms") || References("System.Windows.Forms"),
             WebForms: classification.Style == ProjectStyle.Legacy
                 && classification.Kind == AppKind.AspNetClassic,
-            TestFramework: testFramework);
+            TestFramework: testFramework,
+            LanguageVersion: LanguageVersionOf(
+                Value("LangVersion"), Value("TargetFrameworks") ?? Value("TargetFramework")));
     }
 
     /// <summary>Whether the project file itself sets a boolean property to true.</summary>
@@ -347,6 +376,118 @@ public static class ItemTemplates
         {
             return false;
         }
+    }
+
+    /// <summary>What the project file itself sets a property to, if it sets it at all.</summary>
+    private static string? Says(string projectPath, string property)
+    {
+        try
+        {
+            string text = File.ReadAllText(projectPath);
+            int open = text.IndexOf($"<{property}>", StringComparison.OrdinalIgnoreCase);
+
+            if (open < 0)
+                return null;
+
+            open += property.Length + 2;
+            int close = text.IndexOf($"</{property}>", open, StringComparison.OrdinalIgnoreCase);
+
+            return close < 0 ? null : text[open..close].Trim();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The C# version the project compiles at, as a major number.
+    /// </summary>
+    /// <remarks>
+    /// It decides what the templates are allowed to write, and the projects that cannot take the
+    /// modern spellings are not a rare corner: every legacy .NET Framework project defaults to
+    /// 7.3, and so does an SDK project targeting netstandard2.0. Guessing low costs nothing but
+    /// older-looking source; guessing high hands somebody a file that will not compile.
+    /// </remarks>
+    private static int LanguageVersionOf(string? langVersion, string? targetFramework)
+    {
+        const int Newest = 99;
+
+        if (langVersion is { Length: > 0 } declared)
+        {
+            string version = declared.Trim();
+
+            if (version.StartsWith("latest", StringComparison.OrdinalIgnoreCase)
+                || version.Equals("preview", StringComparison.OrdinalIgnoreCase)
+                || version.Equals("default", StringComparison.OrdinalIgnoreCase))
+            {
+                return Newest;
+            }
+
+            // "10", "10.0", "7.3" -- the major is all this has to answer.
+            if (int.TryParse(version.Split('.')[0], out int parsed))
+                return parsed;
+        }
+
+        // Only the .NET 5+ monikers move with the compiler: net6.0 brought C# 10 and each one
+        // since brought the next. Everything else -- netcoreapp, netstandard, v4.x -- is 7.3 or 8.
+        string first = (targetFramework ?? "").Split(';')[0].Trim();
+        int dot = first.IndexOf('.', StringComparison.Ordinal);
+
+        if (dot > 3
+            && first.StartsWith("net", StringComparison.OrdinalIgnoreCase)
+            && !first.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase)
+            && !first.StartsWith("netcoreapp", StringComparison.OrdinalIgnoreCase)
+            && int.TryParse(first[3..dot], out int net))
+        {
+            return net >= 6 ? net + 4 : net == 5 ? 9 : 7;
+        }
+
+        return 7;
+    }
+
+    /// <summary>
+    /// The file-scoped namespace the templates are written with, put back inside braces.
+    /// </summary>
+    /// <remarks>
+    /// A rewrite of one known shape rather than a general reformat: every C# template here puts
+    /// <c>namespace X;</c> on a line of its own with the body flat beneath it, and nothing else in
+    /// the file is touched. That matters most for the WinForms designer half, where the region,
+    /// the field and the order of the methods are what the designer looks for.
+    /// </remarks>
+    private static string BlockScoped(string source)
+    {
+        string[] lines = source.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+
+        int at = Array.FindIndex(lines, line =>
+            line.StartsWith("namespace ", StringComparison.Ordinal)
+            && line.EndsWith(";", StringComparison.Ordinal));
+
+        if (at < 0)
+            return source;
+
+        var rebuilt = new List<string>(lines.Length + 3);
+        rebuilt.AddRange(lines.Take(at));
+        rebuilt.Add(lines[at][..^1].TrimEnd());
+        rebuilt.Add("{");
+
+        // The blank line under the declaration and the one the templates end with both belong
+        // outside the brace, or the body gains an empty first and last line.
+        int start = at + 1;
+        while (start < lines.Length && lines[start].Length == 0)
+            start++;
+
+        int end = lines.Length;
+        while (end > start && lines[end - 1].Length == 0)
+            end--;
+
+        for (int i = start; i < end; i++)
+            rebuilt.Add(lines[i].Length == 0 ? "" : "    " + lines[i]);
+
+        rebuilt.Add("}");
+        rebuilt.Add("");
+
+        return string.Join(Environment.NewLine, rebuilt);
     }
 
     private const string WpfProjectTypeGuid = "60dc8134-eba5-43b8-bcc9-bb4bc16c2548";
@@ -407,10 +548,20 @@ public static class ItemTemplates
             ? "I" + name
             : name;
 
+    /// <summary>
+    /// The template's extension, unless the name already ends in it.
+    /// </summary>
+    /// <remarks>
+    /// Compared against the one extension this template writes, rather than against "has a dot in
+    /// it": <c>Order.Item</c> is a class name Visual Studio would turn into <c>Order.Item.cs</c>,
+    /// and reading <c>.Item</c> as an extension leaves a C# file the compiler never sees.
+    /// </remarks>
     private static string WithExtension(string name, string extension) =>
-        name.Length == 0 || Path.GetExtension(name).Length > 0
-            ? name
-            : name + extension;
+        name.Length == 0
+            || extension.Length == 0
+            || name.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
+                ? name
+                : name + extension;
 
     // --- Solution-level items, which the SDK owns ---
 
@@ -487,7 +638,19 @@ public static class ItemTemplates
 
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(TimeSpan.FromSeconds(60));
-            await process.WaitForExitAsync(timeout.Token);
+
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Left alive it would still hold the template cache when the person retries, and
+                // would write its file underneath whichever attempt eventually succeeds.
+                try { process.Kill(entireProcessTree: true); } catch { }
+
+                return (1, $"`dotnet new {shortName}` did not finish in time.");
+            }
 
             string output = (await stdout + Environment.NewLine + await stderr).Trim();
             return (process.ExitCode, output);

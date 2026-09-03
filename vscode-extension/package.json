@@ -47,7 +47,7 @@
     "onLanguage:msbuild",
     "workspaceContains:**/*.{sln,slnx,csproj}"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "languages": [
       {
@@ -2027,17 +2027,17 @@
         "roslynSense.languages.routes": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "List every HTTP endpoint the solution serves under Routes \u2014 the path, the verb and the method that handles it \u2014 reading ASP.NET Core attributes and minimal APIs, ASP.NET Web API attributes, and any attribute or registration method named under `routes` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+          "markdownDescription": "List every HTTP endpoint the solution serves under Routes — the path, the verb and the method that handles it — reading ASP.NET Core attributes and minimal APIs, ASP.NET Web API attributes, and any attribute or registration method named under `routes` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.templates": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "List the screens an application declares in template files under Templates \u2014 nested as the files nest them, with a button to the declaration and one to the control that renders it. Reads `App_Data/Templates` and `App_Data/TemplatesCustom`, and any folder named under `templates` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+          "markdownDescription": "List the screens an application declares in template files under Templates — nested as the files nest them, with a button to the declaration and one to the control that renders it. Reads `App_Data/Templates` and `App_Data/TemplatesCustom`, and any folder named under `templates` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.logging": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Language features for structured logging message templates \u2014 Microsoft.Extensions.Logging, Serilog and NLog. Colours each `{Placeholder}`, completes it from the values the call passes, explains on hover which value it actually prints, and warns when the template and the values disagree or an exception is passed as a value instead of as the first argument. Off leaves the template as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+          "markdownDescription": "Language features for structured logging message templates — Microsoft.Extensions.Logging, Serilog and NLog. Colours each `{Placeholder}`, completes it from the values the call passes, explains on hover which value it actually prints, and warns when the template and the values disagree or an exception is passed as a value instead of as the first argument. Off leaves the template as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.formatting": {
           "type": "boolean",
@@ -2047,7 +2047,7 @@
         "roslynSense.languages.valuesets": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Language features for a string that is really a code \u2014 an order status, a document type, a country \u2014 whose list of allowed values lives in a database table rather than in the code. Completes the literal from that list, explains on hover what the code means and where it is defined, and reports one the list does not have. Needs `valueSets` in `roslynsense.json` to have anything to do. Off leaves those literals as plain strings in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+          "markdownDescription": "Language features for a string that is really a code — an order status, a document type, a country — whose list of allowed values lives in a database table rather than in the code. Completes the literal from that list, explains on hover what the code means and where it is defined, and reports one the list does not have. Needs `valueSets` in `roslynsense.json` to have anything to do. Off leaves those literals as plain strings in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
         },
         "roslynSense.languages.msbuild": {
           "type": "boolean",
@@ -2153,13 +2153,16 @@
   "scripts": {
     "compile": "tsc -p ./",
     "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json && tsc -p ./tsconfig.webview.settings.json && tsc -p ./tsconfig.webview.properties.json",
-    "build": "npm run compile && npm run compile:webview",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --main-fields=module,main --external:vscode --outfile=dist/extension.js --sourcemap",
+    "build": "npm run compile && npm run compile:webview && npm run bundle",
     "vscode:prepublish": "npm run build",
     "watch": "tsc -watch -p ./",
     "dev": "npm run build && node scripts/dev.mjs",
     "package": "vsce package",
     "check:embedded": "node scripts/checkEmbedded.mjs",
-    "test": "npm run compile && node --test \"out/test/*.test.js\""
+    "test": "npm run test:unit",
+    "test:unit": "npm run compile && node --test \"out/test/*.test.js\"",
+    "test:integration": "npm run build && node out/test/integration/run.js"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1",
@@ -2170,7 +2173,9 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.4.0"
   }
 }

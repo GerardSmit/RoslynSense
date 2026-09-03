@@ -39,6 +39,7 @@ import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
 import { bindNestedCodeActions, registerNestedCodeActions } from './nestedCodeActions';
 import { lensesToPreResolve } from './codeLensPrewarm';
+import { globalToolPath, installGlobalTool, updateGlobalTool } from './toolManagement';
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.LanguageStatusItem | undefined;
@@ -657,7 +658,9 @@ async function promptReloadForLanguages(): Promise<void> {
  * An explicit `roslynSense.serverPath` wins. Otherwise `ROSLYNSENSE_SERVER` is honoured, which
  * is the same variable the MCP entry point uses to redirect to a development build: without it,
  * opening any folder that has no workspace setting silently falls back to the installed
- * `roslyn-sense` on PATH, and a change you just built appears not to have happened.
+ * `roslyn-sense` on PATH, and a change you just built appears not to have happened. The known
+ * global-tool shim is preferred when present so a first install works even when VS Code started
+ * before `$HOME/.dotnet/tools` was added to PATH.
  */
 function resolveServerPath(config: vscode.WorkspaceConfiguration): string {
     // inspect() rather than get(): get() returns the manifest's default when nothing is set,
@@ -670,10 +673,18 @@ function resolveServerPath(config: vscode.WorkspaceConfiguration): string {
         return chosen.trim();
     }
 
-    return process.env.ROSLYNSENSE_SERVER?.trim() || 'roslyn-sense';
+    const redirected = process.env.ROSLYNSENSE_SERVER?.trim();
+    if (redirected) {
+        return redirected;
+    }
+
+    const cliHome = process.env.DOTNET_CLI_HOME?.trim() || os.homedir();
+    const installed = globalToolPath(cliHome);
+    return fs.existsSync(installed) ? installed : 'roslyn-sense';
 }
 
 let serverStderrChannel: vscode.OutputChannel | undefined;
+let toolManagementChannel: vscode.OutputChannel | undefined;
 
 /**
  * Spawns the server ourselves so the bytes the client's reader actually receives can be written
@@ -697,13 +708,17 @@ function capturingServerOptions(
 
             const dir = path.join(os.tmpdir(), 'roslyn-mcp-lsp-diagnostics');
             let capture: fs.WriteStream | undefined;
+            let stderrCapture: fs.WriteStream | undefined;
             try {
                 fs.mkdirSync(dir, { recursive: true });
                 capture = fs.createWriteStream(path.join(dir, `client-in-${child.pid ?? 'unknown'}.bin`));
+                stderrCapture = fs.createWriteStream(
+                    path.join(dir, `client-stderr-${child.pid ?? 'unknown'}.log`));
                 // A writable that emits 'error' with nobody listening throws in the extension
                 // host: without this, filling the temp disk mid-session would crash the very
                 // thing the capture exists to diagnose.
                 capture.on('error', () => { capture = undefined; });
+                stderrCapture.on('error', () => { stderrCapture = undefined; });
             } catch {
                 // A capture that cannot be written must not stop the server from starting.
             }
@@ -719,7 +734,11 @@ function capturingServerOptions(
             // The client only drains stderr when it owns the spawn; left unread, the server
             // blocks on its next diagnostic write once the pipe buffer fills.
             serverStderrChannel ??= vscode.window.createOutputChannel('RoslynSense Server');
-            child.stderr.on('data', (chunk: Buffer) => serverStderrChannel!.append(chunk.toString('utf8')));
+            child.stderr.on('data', (chunk: Buffer) => {
+                serverStderrChannel!.append(chunk.toString('utf8'));
+                stderrCapture?.write(chunk);
+            });
+            child.stderr.on('end', () => stderrCapture?.end());
 
             resolve({ reader, writer: child.stdin });
         });
@@ -1222,16 +1241,30 @@ function registerOnAutoInsert(context: vscode.ExtensionContext): void {
     );
 }
 
-async function showInheritanceForLine(line: number | undefined): Promise<void> {
+/**
+ * The inheritance relations on one line, as a pick.
+ *
+ * @param uri The document the line belongs to. A lens carries its own, and a lens list outlives
+ * the editor it was drawn in — a click that arrives after the focus moved would otherwise ask
+ * about a line number in whatever file happens to be active, and answer confidently about the
+ * wrong member.
+ */
+async function showInheritanceForLine(line: number | undefined, uri?: string): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!client || !editor || editor.document.languageId !== 'csharp' || line === undefined) {
         return;
     }
+    if (uri !== undefined && code2Protocol(editor.document.uri) !== uri) {
+        return;
+    }
     let markers: InheritanceMarker[];
     try {
-        markers = await client.sendRequest<InheritanceMarker[]>(
-            'roslynSense/inheritanceMarkers',
-            { textDocument: { uri: code2Protocol(editor.document.uri) } }
+        markers = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Window, title: 'RoslynSense: inheritance…' },
+            () =>
+                client!.sendRequest<InheritanceMarker[]>('roslynSense/inheritanceMarkers', {
+                    textDocument: { uri: code2Protocol(editor.document.uri) },
+                })
         );
     } catch {
         return;
@@ -1247,7 +1280,9 @@ async function showInheritanceForLine(line: number | undefined): Promise<void> {
     );
     if (items.length === 0) {
         void vscode.window.showInformationMessage(
-            'RoslynSense: no inheritance relations on this line.'
+            markers.length > 0
+                ? 'RoslynSense: that lens is out of date — the file has changed since it was drawn.'
+                : 'RoslynSense: no inheritance relations on this line.'
         );
         return;
     }
@@ -1306,14 +1341,6 @@ async function runTestFromLens(
 const LENS_PRE_RESOLVE_TIMEOUT_MS = 400;
 
 /**
- * The documents the editor has already been handed a lens list for.
- *
- * Only the first list for a document skips the pre-resolve, so this has to survive between calls
- * and not between sessions of a document — a file closed and reopened is a first list again.
- */
-const lensedDocuments = new Set<string>();
-
-/**
  * Resolve the lenses on screen before the editor is handed the list they belong to.
  *
  * See codeLensPrewarm.ts for why this exists and what it costs. The one rule that matters here is
@@ -1328,18 +1355,6 @@ async function preResolveVisibleLenses(
     const active = client;
 
     if (!active) {
-        return lenses;
-    }
-
-    // The dead key is a hazard of *replacing* a drawn list. The first list for a document
-    // replaces nothing — there is no anchor on screen to leave wired to a key that has gone — so
-    // waiting on it buys nothing and costs the whole deadline on exactly the open the user
-    // notices: a large file, cold, where every one of these resolves is a workspace-wide search.
-    // The editor resolves what is on screen a tick later anyway.
-    const first = !lensedDocuments.has(document.uri.toString());
-    lensedDocuments.add(document.uri.toString());
-
-    if (first) {
         return lenses;
     }
 
@@ -1397,10 +1412,6 @@ async function preResolveVisibleLenses(
 
 function registerLensCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
-        // A closed document has no lenses drawn, so its next list is a first one again.
-        vscode.workspace.onDidCloseTextDocument((document) =>
-            lensedDocuments.delete(document.uri.toString())
-        ),
         // CodeLens "▶ Run test" / "Debug test": route into the Test Explorer so results land
         // in the test UI with pass/fail decorations, rather than as terminal scrollback.
         vscode.commands.registerCommand(
@@ -1484,7 +1495,7 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
         ),
         vscode.commands.registerCommand(
             'roslynSense.showInheritanceAt',
-            (_uri: string, line: number) => showInheritanceForLine(line)
+            (uri: string, line: number) => showInheritanceForLine(line, uri)
         ),
         // Gutter marker link for a metadata target: server decompiles and returns a location.
         vscode.commands.registerCommand(
@@ -3514,40 +3525,74 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('roslynSense.updateServer', async () => {
             // The update uninstalls the very binaries the server runs, so everything holding
             // them has to go first: this window's LSP proxies (stopClient), then every shared
-            // daemon and its MSBuild hosts (--stop-daemons — run from the old install, and
-            // exited before the update starts). Other windows and MCP chats using the tool
+            // daemon and its MSBuild hosts. A temporary copy of the newest tool runs
+            // --stop-daemons so upgrading from a version that predates that switch also works.
+            // Other windows and MCP chats using the tool
             // keep their own locks; the message names them instead of pretending to fix them.
             await stopClient();
-            const terminal = vscode.window.createTerminal('RoslynSense update');
-            terminal.show();
-            terminal.sendText('roslyn-sense --stop-daemons; dotnet tool update -g RoslynSense', true);
-            void vscode.window
-                .showInformationMessage(
-                    'Updating the RoslynSense server. If the update reports locked files, close ' +
-                        'other editor windows and AI chats using RoslynSense and rerun it. ' +
-                        'When it finishes, restart the server.',
-                    'Restart Server'
-                )
-                .then((choice) => {
-                    if (choice === 'Restart Server') {
-                        void vscode.commands.executeCommand('roslynSense.restartServer');
+            toolManagementChannel ??= vscode.window.createOutputChannel('RoslynSense Tool');
+            toolManagementChannel.clear();
+            const abort = new AbortController();
+            try {
+                await vscode.window.withProgress(
+                    {
+                        location: vscode.ProgressLocation.Notification,
+                        title: 'Updating the RoslynSense server',
+                        cancellable: true,
+                    },
+                    async (_progress, token) => {
+                        token.onCancellationRequested(() => abort.abort());
+                        await updateGlobalTool(
+                            (text) => toolManagementChannel!.append(text),
+                            abort.signal
+                        );
                     }
-                });
+                );
+                const choice = await vscode.window.showInformationMessage(
+                    'RoslynSense was updated successfully.',
+                    'Restart Server'
+                );
+                if (choice === 'Restart Server') {
+                    await vscode.commands.executeCommand('roslynSense.restartServer');
+                }
+            } catch (err) {
+                toolManagementChannel.show(true);
+                void vscode.window.showErrorMessage(
+                    `RoslynSense could not be updated: ${err}. Close other editor windows and ` +
+                        'AI chats using RoslynSense, then try again.'
+                );
+            }
         }),
-        vscode.commands.registerCommand('roslynSense.installServer', () => {
-            const terminal = vscode.window.createTerminal('RoslynSense install');
-            terminal.show();
-            terminal.sendText('dotnet tool install -g RoslynSense', true);
-            void vscode.window
-                .showInformationMessage(
-                    'Installing the RoslynSense server. When the install finishes, restart the server.',
-                    'Restart Server'
-                )
-                .then((choice) => {
-                    if (choice === 'Restart Server') {
-                        void vscode.commands.executeCommand('roslynSense.restartServer');
+        vscode.commands.registerCommand('roslynSense.installServer', async () => {
+            toolManagementChannel ??= vscode.window.createOutputChannel('RoslynSense Tool');
+            toolManagementChannel.clear();
+            const abort = new AbortController();
+            try {
+                await vscode.window.withProgress(
+                    {
+                        location: vscode.ProgressLocation.Notification,
+                        title: 'Installing the RoslynSense server',
+                        cancellable: true,
+                    },
+                    async (_progress, token) => {
+                        token.onCancellationRequested(() => abort.abort());
+                        await installGlobalTool(
+                            (text) => toolManagementChannel!.append(text),
+                            abort.signal
+                        );
                     }
-                });
+                );
+                const choice = await vscode.window.showInformationMessage(
+                    'RoslynSense was installed successfully.',
+                    'Restart Server'
+                );
+                if (choice === 'Restart Server') {
+                    await vscode.commands.executeCommand('roslynSense.restartServer');
+                }
+            } catch (err) {
+                toolManagementChannel.show(true);
+                void vscode.window.showErrorMessage(`RoslynSense could not be installed: ${err}`);
+            }
         })
     );
     registerConfigurationSync(context);
@@ -3622,5 +3667,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export async function deactivate(): Promise<void> {
     statusItem?.dispose();
     statusItem = undefined;
+    toolManagementChannel?.dispose();
+    toolManagementChannel = undefined;
     await stopClient();
 }

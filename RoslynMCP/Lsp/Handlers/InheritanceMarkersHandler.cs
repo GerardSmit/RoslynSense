@@ -20,8 +20,18 @@ namespace RoslynMCP.Lsp.Handlers;
 /// </summary>
 internal static class InheritanceMarkersHandler
 {
-    private const int MaxTargets = 10;
-    private const int MaxDownQueries = 50;
+    /// <summary>How many targets one marker carries. Shared with the lens, so a count in the
+    /// gutter cannot promise more than the list behind the click has.</summary>
+    internal const int MaxTargets = 10;
+
+    /// <summary>
+    /// How many members in a file get a downward query at all.
+    /// </summary>
+    /// <remarks>
+    /// Each one is a workspace-wide search. The lens list stops at the same number and in the same
+    /// order, so there is no member that shows a count here and finds nothing to open.
+    /// </remarks>
+    internal const int MaxDownQueries = 50;
 
     public static async Task<InheritanceMarker[]> MarkersAsync(
         InheritanceMarkersParams p, CancellationToken ct)

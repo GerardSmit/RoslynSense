@@ -47,16 +47,25 @@ internal static class CodeLensHandler
         if (document is null)
             return Array.Empty<LspCodeLens>();
 
-        var root = await document.GetSyntaxRootAsync(ct);
-        var text = await document.GetTextAsync(ct);
+        // The syntactic lenses cost a parse the editor has already paid for; the inheritance ones
+        // cost a semantic model, which on a large file in a project nothing has built yet is the
+        // whole wait. So the model is taken where it is cheap and skipped where it is not: a pull
+        // that skips it answers with what the tree alone can say, and the arrows arrive on the
+        // re-pull asked for once the project is built.
+        var model = await SemanticModelForListAsync(document, clientRefreshes, ct);
+
+        // Read off the model's own tree where there is one. A frozen model carries this file's
+        // current tree, but it is a different Document, and a symbol lookup for a node from
+        // another tree answers null however identical the two look.
+        var root = model is not null
+            ? await model.SyntaxTree.GetRootAsync(ct)
+            : await document.GetSyntaxRootAsync(ct);
+        var text = model is not null
+            ? await model.SyntaxTree.GetTextAsync(ct)
+            : await document.GetTextAsync(ct);
+
         if (root is null)
             return Array.Empty<LspCodeLens>();
-
-        // The syntactic lenses cost a parse the editor has already paid for; the inheritance ones
-        // cost a semantic model, which on a large file in a cold project is the whole wait. So the
-        // model is used when it is already there and never waited for: the first pull answers with
-        // what the tree alone can say, and the arrows arrive on the re-pull the warm-up asks for.
-        var model = await SemanticModelForListAsync(document, clientRefreshes, ct);
 
         string? projectPath = document.Project.FilePath;
         var lenses = new List<LspCodeLens>();
@@ -64,6 +73,11 @@ internal static class CodeLensHandler
         // Read once for the whole document: the coverage map is a solution-wide file, and the
         // rows for this file are all any member in it can match against.
         var coverageRows = TestCoverageLenses.ForFile(document.FilePath);
+
+        // The same budget the markers handler spends, counted the same way over the same members.
+        // A lens past it would show a count and open an empty list, because the handler behind
+        // the click stopped querying before it reached that member.
+        int downQueries = 0;
 
         foreach (var (declaration, identifier) in EnumerateMembers(root))
         {
@@ -86,12 +100,19 @@ internal static class CodeLensHandler
                 }
             }
 
-            // Reference count: deferred to codeLens/resolve.
-            lenses.Add(new LspCodeLens(range, Command: null)
+            // Reference count: deferred to codeLens/resolve, but only where the answer can be
+            // had. Resolving one needs the same semantic model the list pass just declined to
+            // wait for, so on a cold project the placeholder would sit in the gutter looking
+            // exactly like a lens for as long as the project takes to bind, and do nothing when
+            // clicked. Better nothing there at all until the refresh brings the real one.
+            if (model is not null)
             {
-                Data = new CodeLensData(p.TextDocument.Uri,
-                    identifierPosition.Line, identifierPosition.Character, "references"),
-            });
+                lenses.Add(new LspCodeLens(range, Command: null)
+                {
+                    Data = new CodeLensData(p.TextDocument.Uri,
+                        identifierPosition.Line, identifierPosition.Character, "references"),
+                });
+            }
 
             // Inheritance lenses — the clickable counterpart to the gutter arrows (which
             // VSCode gives no click/hover events for). Up relations are cheap and inline;
@@ -125,7 +146,9 @@ internal static class CodeLensHandler
                 bool likelyHasDown = symbol is INamedTypeSymbol { TypeKind: TypeKind.Interface }
                     || symbol.ContainingType?.TypeKind == TypeKind.Interface
                     || symbol.IsAbstract;
-                if (likelyHasDown && InheritanceMarkersHandler.ApplicableDownKind(symbol) is { } downKind)
+                if (likelyHasDown
+                    && InheritanceMarkersHandler.ApplicableDownKind(symbol) is { } downKind
+                    && downQueries++ < InheritanceMarkersHandler.MaxDownQueries)
                 {
                     lenses.Add(new LspCodeLens(range, Command: null)
                     {
@@ -169,71 +192,142 @@ internal static class CodeLensHandler
     private static readonly ConcurrentDictionary<string, VersionStamp> s_answeredWithout =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Files whose model is being warmed, so a scroll does not start a second warm-up.</summary>
+    /// <summary>Files whose project is being built, so a scroll does not start a second build.</summary>
+    /// <remarks>
+    /// One at a time per file, and deliberately not per version. What is being waited for is the
+    /// project's first compilation, which is the same work whichever snapshot asked for it; a
+    /// version-keyed guard would let every keystroke during that minute start another full bind
+    /// and another generator run of its own.
+    /// </remarks>
     private static readonly ConcurrentDictionary<string, byte> s_warming =
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// The semantic model for the list pass — the one already built, or none.
+    /// How many files may be remembered as answered-short before the record is dropped wholesale.
     /// </summary>
     /// <remarks>
-    /// Roslyn hands one over immediately when it has it, and building one otherwise means binding
-    /// the project: seconds on a large file the first time it is opened, during which the editor
-    /// shows no lens at all rather than the run buttons and reference counts it could already
-    /// have. So a miss returns null and warms the model on a thread of its own, and the client is
-    /// asked to re-pull when it lands.
+    /// Nothing here is told when a document closes, and the entry for a file that is never pulled
+    /// again would otherwise sit there for the life of the process. Dropping the lot costs at most
+    /// one extra short answer per file still open, which is what the record was worth anyway.
+    /// </remarks>
+    private const int MaxRemembered = 64;
+
+    /// <summary>
+    /// The semantic model for the list pass — the frozen one wherever there is one to freeze.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The distinction that matters is not whether a model happens to be cached — an edit throws
+    /// that away every keystroke, and gating on it drops the inheritance lenses out of a warm file
+    /// constantly — but whether the project has ever been built. A project with a compiler behind
+    /// it can be frozen, and a frozen model costs a bind of this one file. A project that has
+    /// never been built cannot: the first request for a model builds it, which on a large solution
+    /// is the wait the user sees as an empty gutter.
+    /// </para>
+    /// <para>
+    /// The freeze is also what the gutter markers are computed from, so the arrows a lens claims
+    /// and the list its click opens are now read off the same snapshot rather than two.
+    /// </para>
     /// </remarks>
     private static async Task<SemanticModel?> SemanticModelForListAsync(
         Document document, bool clientRefreshes, CancellationToken ct)
     {
-        if (document.TryGetSemanticModel(out var ready))
-        {
-            if (document.FilePath is { Length: > 0 } done)
-                s_answeredWithout.TryRemove(done, out _);
+        var frozen = await document.FreezeAsync(ct);
 
-            return ready;
+        // FreezeAsync hands the document straight back in two cases: the project already has a
+        // compilation, which is the cheap one; and the project has never been built, which is the
+        // expensive one -- and in that case it has just started the build in the background.
+        bool cold = ReferenceEquals(frozen, document)
+            && !document.Project.TryGetCompilation(out _);
+
+        if (!cold)
+        {
+            if (document.FilePath is { Length: > 0 } warm)
+                s_answeredWithout.TryRemove(warm, out _);
+
+            return await ModelOrNullAsync(frozen, ct);
         }
 
         if (!clientRefreshes || document.FilePath is not { Length: > 0 } path)
-            return await document.GetSemanticModelAsync(ct);
+            return await ModelOrNullAsync(document, ct);
 
         var version = await document.GetTextVersionAsync(ct);
 
-        // Already answered short for this exact text and the model still is not here: waiting is
-        // the honest answer now, rather than a third short list.
+        // Already answered short for this exact text and the project still is not built: waiting
+        // is the honest answer now, rather than a third short list.
         if (s_answeredWithout.TryGetValue(path, out var answered) && answered == version)
-            return await document.GetSemanticModelAsync(ct);
+            return await ModelOrNullAsync(document, ct);
+
+        if (s_answeredWithout.Count >= MaxRemembered)
+            s_answeredWithout.Clear();
 
         s_answeredWithout[path] = version;
-        WarmSemanticModel(document, path);
+        WatchForTheBuild(document, path);
         return null;
     }
 
-    private static void WarmSemanticModel(Document document, string path)
+    /// <summary>
+    /// The model, or none if asking for it throws.
+    /// </summary>
+    /// <remarks>
+    /// A project that cannot bind at all — a broken restore, a target that will not load — would
+    /// otherwise take the whole lens list down with it, and the syntactic lenses are exactly the
+    /// ones still worth having there.
+    /// </remarks>
+    private static async Task<SemanticModel?> ModelOrNullAsync(Document document, CancellationToken ct)
+    {
+        try
+        {
+            return await document.GetSemanticModelAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"No semantic model for '{Path.GetFileName(document.FilePath ?? "?")}': {ex.Message}",
+                key: $"codelens-model:{document.FilePath}");
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Waits out the build <see cref="FrozenSemantics.FreezeAsync"/> just started, and asks the
+    /// client to come back for the lenses it could not be given.
+    /// </summary>
+    private static void WatchForTheBuild(Document document, string path)
     {
         if (!s_warming.TryAdd(path, 0))
             return;
 
         // Not awaited, and not cancelled by the request that started it: the point is to have the
-        // model by the time the client comes back, and the request that noticed it was missing is
-        // over long before then.
+        // compilation by the time the client comes back, and the request that noticed it was
+        // missing is over long before then.
         _ = Task.Run(async () =>
         {
+            bool built = false;
+
             try
             {
-                await document.GetSemanticModelAsync(CancellationToken.None);
-                LspSessionRegistry.ScheduleRefresh(RefreshKind.CodeLens, "codelens-semantics");
+                await document.Project.GetCompilationAsync(CancellationToken.None);
+                built = true;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 ServiceLog.Warn(
-                    $"Could not warm the semantic model for '{Path.GetFileName(path)}': {ex.Message}",
+                    $"Could not build '{Path.GetFileName(document.Project.FilePath ?? "?")}' "
+                        + $"for the lenses in '{Path.GetFileName(path)}': {ex.Message}",
                     key: $"codelens-warm:{path}");
             }
             finally
             {
                 s_warming.TryRemove(path, out _);
             }
+
+            // Only on success. A re-pull of a project that cannot build would take the branch
+            // above that waits for the model, fail there too, and answer with nothing at all --
+            // losing even the run-test lenses the short list still had.
+            if (built)
+                LspSessionRegistry.ScheduleRefresh(RefreshKind.CodeLens, "codelens-semantics");
         });
     }
 
@@ -319,20 +413,17 @@ internal static class CodeLensHandler
     private static async Task<LspCodeLens> ResolveReferencesAsync(
         LspCodeLens lens, CodeLensData data, CancellationToken ct, LanguageSession? languages)
     {
-        // Zero-reference lenses still carry the showReferences command (with an empty
-        // location list) — LSP requires a non-empty command id, and an empty peek is a
-        // sane click result.
-        var noReferences = new Command("0 references", "roslynSense.showReferences",
-            [data.Uri, data.Line, data.Character, Array.Empty<LspLocation>()]);
-
+        // A position that no longer resolves is a stale lens, not a symbol with no references,
+        // and "0 references" over a member that has plenty is worse than nothing. Uncommanded, so
+        // the editor draws nothing until the list it belongs to is replaced.
         var resolved = await HandlerHelpers.ResolveAsync(
             new TextDocumentIdentifier(data.Uri), new Position(data.Line, data.Character), ct);
         if (resolved is not var (document, _, offset))
-            return lens with { Command = noReferences };
+            return lens;
 
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
         if (symbol is null)
-            return lens with { Command = noReferences };
+            return lens;
 
         // Contributors included, rather than Roslyn's answer alone. A method a dozen mediator
         // sends dispatch to has no C# references at all, and a gutter reading "0 references"
@@ -365,16 +456,19 @@ internal static class CodeLensHandler
         LspCodeLens lens, CodeLensData data, CancellationToken ct)
     {
         object[] args = [data.Uri, data.Line, data.Character];
-        var inert = new Command("", "roslynSense.showInheritanceAt", args);
 
+        // Left without a command, so the editor draws nothing. A command with an empty title is
+        // still a lens: it renders as a bare separator next to its neighbours, invites a click and
+        // then does nothing, which is what a lens whose position no longer resolves used to do
+        // after a file was moved or edited out from under the list.
         var resolved = await HandlerHelpers.ResolveAsync(
             new TextDocumentIdentifier(data.Uri), new Position(data.Line, data.Character), ct);
         if (resolved is not var (document, _, offset))
-            return lens with { Command = inert };
+            return lens;
 
         var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, ct);
         if (symbol is null)
-            return lens with { Command = inert };
+            return lens;
 
         // Mapped the way the gutter markers are, and warm-only for the same reason, so the two
         // renderings of one relationship cannot disagree about how many there are.
@@ -387,15 +481,28 @@ internal static class CodeLensHandler
             data.Kind,
             mapped?.Project.Solution ?? document.Project.Solution,
             ct);
+
+        // Counted the way the list behind the click is built: source targets only, since a
+        // derived type in metadata is dropped there, and capped at the same number it keeps. A
+        // lens promising more than the pick can show sends the reader looking for the rest.
+        int found = targets.Count(target => target.Symbol.Locations.Any(l => l.IsInSource));
+
+        if (found == 0)
+            return lens;
+
         string noun = data.Kind switch
         {
-            "implemented" => targets.Count == 1 ? "implementation" : "implementations",
-            "overridden" => targets.Count == 1 ? "override" : "overrides",
+            "implemented" => found == 1 ? "implementation" : "implementations",
+            "overridden" => found == 1 ? "override" : "overrides",
             _ => "derived",
         };
+        string count = found > InheritanceMarkersHandler.MaxTargets
+            ? $"{InheritanceMarkersHandler.MaxTargets}+"
+            : found.ToString();
+
         return lens with
         {
-            Command = new Command($"↓ {targets.Count} {noun}", "roslynSense.showInheritanceAt", args),
+            Command = new Command($"↓ {count} {noun}", "roslynSense.showInheritanceAt", args),
         };
     }
 

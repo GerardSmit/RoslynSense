@@ -22,8 +22,11 @@ assistant's analysis tools, and the assistant's view is always in sync with what
   To update, use **RoslynSense: Update Language Server** rather than running
   `dotnet tool update` yourself: the update cannot uninstall a package whose binaries are
   loaded, and the extension's own server and the shared daemon are exactly that. The command
-  stops this window's server, runs `roslyn-sense --stop-daemons`, and then updates. Other
-  editor windows and AI chats using RoslynSense hold their own locks — close them if the
+  stops this window's server, installs a temporary copy of the newest tool to stop every shared
+  daemon (including when upgrading from a version without `--stop-daemons`), and then runs the
+  update directly without depending on the configured terminal shell. Progress and command output are
+  reported in **RoslynSense Tool**, and restart is offered only after a successful exit. Other
+  editor windows and AI chats using RoslynSense can hold their own locks — close them if the
   update still reports a denied path.
 
 ## How it works
@@ -647,10 +650,10 @@ method gets the same editor without the panel learning anything new.
 
 ```bash
 cd vscode-extension
-npm install
-npm run compile
-npm test          # node --test over the pure-TypeScript half
-npm run package   # produces the .vsix (requires @vscode/vsce)
+  npm ci
+  npm test                  # node --test over the pure-TypeScript half
+  npm run test:integration  # publishes a temporary LSP build and drives VS Code
+  npm run package           # produces the bundled .vsix
 ```
 
 ## Third-party content

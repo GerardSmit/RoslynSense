@@ -58,6 +58,27 @@ public class ItemTemplateTests : IDisposable
         </Project>
         """;
 
+    private const string LegacyLibrary = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+          <PropertyGroup>
+            <RootNamespace>Orders</RootNamespace>
+            <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+          </PropertyGroup>
+          <ItemGroup>
+          </ItemGroup>
+        </Project>
+        """;
+
+    private const string ExplicitCompileItems = """
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <TargetFramework>net10.0</TargetFramework>
+            <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+          </PropertyGroup>
+        </Project>
+        """;
+
     private string WriteProject(string name, string contents)
     {
         string directory = Path.Combine(_root, name);
@@ -187,6 +208,78 @@ public class ItemTemplateTests : IDisposable
         Assert.False(File.Exists(Path.Combine(directory, "MainForm.cs")));
         Assert.Equal("// mine", await File.ReadAllTextAsync(
             Path.Combine(directory, "MainForm.Designer.cs")));
+    }
+
+    /// <summary>
+    /// A project that predates file-scoped namespaces gets braces. Handing a .NET Framework
+    /// project `namespace X;` is CS8370 on the next build — a New that does not compile.
+    /// </summary>
+    [Fact]
+    public async Task ALegacyProjectGetsANamespaceItCanCompile()
+    {
+        string project = WriteProject("Orders", LegacyLibrary);
+
+        var result = await ItemTemplates.CreateAsync(
+            "class", Path.GetDirectoryName(project)!, "Basket");
+
+        Assert.True(result.Ok, result.Message);
+        string written = await File.ReadAllTextAsync(Assert.Single(result.Paths));
+
+        Assert.Contains("namespace Orders" + Environment.NewLine + "{", written, StringComparison.Ordinal);
+        Assert.DoesNotContain("namespace Orders;", written, StringComparison.Ordinal);
+        // Braces alone are not enough: the body has to move in with them.
+        Assert.Contains("    public class Basket", written, StringComparison.Ordinal);
+    }
+
+    /// <summary>And a template the language cannot express is not offered at all.</summary>
+    [Fact]
+    public async Task ARecordIsNotOfferedWhereThereAreNoRecords()
+    {
+        string legacy = WriteProject("Orders", LegacyLibrary);
+        string modern = WriteProject("Desk", Library);
+
+        Assert.DoesNotContain(
+            await ItemTemplates.ForAsync(legacy), template => template.Id == "record");
+        Assert.Contains(
+            await ItemTemplates.ForAsync(modern), template => template.Id == "record");
+    }
+
+    /// <summary>
+    /// A dot in a name is part of the name. Visual Studio turns Order.Item into Order.Item.cs,
+    /// and a file called `Order.Item` is one the compiler never sees.
+    /// </summary>
+    [Fact]
+    public async Task ANameWithADotStillGetsItsExtension()
+    {
+        string project = WriteProject("Orders", Library);
+
+        var result = await ItemTemplates.CreateAsync(
+            "class", Path.GetDirectoryName(project)!, "Order.Item");
+
+        Assert.True(result.Ok, result.Message);
+        Assert.EndsWith("Order.Item.cs", Assert.Single(result.Paths), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Turning off the Compile glob does not turn off the others, so a resource still has to be
+    /// left to its own glob — an Include beside a live glob is NETSDK1022 and a build that stops.
+    /// </summary>
+    [Fact]
+    public async Task ExplicitCompileItemsDoNotMakeEveryItemExplicit()
+    {
+        string project = WriteProject("Orders", ExplicitCompileItems);
+        string directory = Path.GetDirectoryName(project)!;
+
+        var resource = await ItemTemplates.CreateAsync("resx", directory, "Strings");
+        Assert.True(resource.Ok, resource.Message);
+
+        var code = await ItemTemplates.CreateAsync("class", directory, "Basket");
+        Assert.True(code.Ok, code.Message);
+
+        string written = await File.ReadAllTextAsync(project);
+        Assert.DoesNotContain("EmbeddedResource Include=", written, StringComparison.Ordinal);
+        // The Compile glob really is off, though, so the class does have to be listed.
+        Assert.Contains("<Compile Include=\"Basket.cs\"", written, StringComparison.Ordinal);
     }
 
     /// <summary>

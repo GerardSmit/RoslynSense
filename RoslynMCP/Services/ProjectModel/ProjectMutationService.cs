@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Text;
 using Microsoft.Language.Xml;
 
@@ -943,10 +943,28 @@ public static class ProjectMutationService
             planned.Add((file, full));
         }
 
-        foreach (var (file, full) in planned)
+        // Written one at a time, and taken back together. Half a Web Form is worse than none:
+        // the markup names a code-behind that is not there, and in a legacy project nothing is
+        // listed either, so the files are invisible in the tree and fatal to the build.
+        var written = new List<string>(planned.Count);
+
+        try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-            await File.WriteAllTextAsync(full, file.Contents, ct);
+            foreach (var (file, full) in planned)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                await File.WriteAllTextAsync(full, file.Contents, ct);
+                written.Add(full);
+            }
+        }
+        catch (Exception ex)
+        {
+            foreach (string orphan in written)
+            {
+                try { File.Delete(orphan); } catch { }
+            }
+
+            return new MutationResult(false, $"Could not write the files: {ex.Message}");
         }
 
         bool wroteProject = false;
@@ -958,25 +976,27 @@ public static class ProjectMutationService
             if (document.RootSyntax is { } original)
             {
                 var root = original;
-                bool sdkStyle = IsSdkStyle(original)
-                    && !string.Equals(
-                        ReadProperty(projectPath, "EnableDefaultCompileItems"),
-                        "false",
-                        StringComparison.OrdinalIgnoreCase);
+                bool sdk = IsSdkStyle(original);
 
                 foreach (var (file, full) in planned)
                 {
                     var metadata = file.Metadata;
                     bool hasMetadata = metadata is { Count: > 0 };
 
-                    // Globbed and with nothing the glob cannot say: the project stays as it is.
-                    if (sdkStyle && !hasMetadata)
-                        continue;
-
                     string include = Path.GetRelativePath(projectDirectory, full);
                     string itemType = file.ItemType ?? DefaultGlobsFor(full)[0];
 
-                    root = AddFileItem(root, itemType, sdkStyle ? "Update" : "Include", include);
+                    // Asked per item type, because the switches are per item type. A project that
+                    // sets EnableDefaultCompileItems=false to list its sources by hand still has
+                    // the EmbeddedResource and None globs on, and writing an Include for one of
+                    // those alongside the glob is NETSDK1022, a build that no longer starts.
+                    bool globbed = sdk && Globs(projectPath, itemType);
+
+                    // Globbed and with nothing the glob cannot say: the project stays as it is.
+                    if (globbed && !hasMetadata)
+                        continue;
+
+                    root = AddFileItem(root, itemType, globbed ? "Update" : "Include", include);
 
                     if (hasMetadata)
                     {
@@ -1302,6 +1322,37 @@ public static class ProjectMutationService
     /// </summary>
     private static bool IsSdkStyle(XmlElementBaseSyntax? root) =>
         root?.GetAttribute("Sdk") is not null || root?.GetElementByLocalName("Sdk") is not null;
+
+    /// <summary>
+    /// Whether an SDK project's default glob for one item type is still on.
+    /// </summary>
+    /// <remarks>
+    /// Each item type has its own switch and <c>EnableDefaultItems</c> turns off the lot, so the
+    /// answer for <c>Compile</c> says nothing about the answer for <c>EmbeddedResource</c>. An
+    /// item type with no switch of its own -- <c>Page</c>, <c>ApplicationDefinition</c> -- is not
+    /// globbed by the base SDK and has to be listed.
+    /// </remarks>
+    private static bool Globs(string projectPath, string itemType)
+    {
+        if (string.Equals(ReadProperty(projectPath, "EnableDefaultItems"), "false",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        string? property = itemType switch
+        {
+            "Compile" => "EnableDefaultCompileItems",
+            "EmbeddedResource" => "EnableDefaultEmbeddedResourceItems",
+            "None" => "EnableDefaultNoneItems",
+            "Content" => "EnableDefaultContentItems",
+            _ => null,
+        };
+
+        return property is not null
+            && !string.Equals(ReadProperty(projectPath, property), "false",
+                StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>The first <c>ProjectReference</c> to a given relative path.</summary>
     private static XmlElementBaseSyntax? Referencing(XmlElementBaseSyntax root, string include) =>

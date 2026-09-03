@@ -51,6 +51,15 @@ internal static class FileOperationsHandler
                 !newPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            // The project item first, and for a move as much as for a rename — the two cases
+            // below both skip a file that kept its name, which is exactly what a drag in the
+            // explorer is. A project that lists its sources by hand is left naming a path that is
+            // gone: the file stops compiling, no document is ever created for its new path, and
+            // everything the server offers over it — lenses, navigation, diagnostics — is quietly
+            // missing with nothing on screen to say why. An SDK project globs and has no item to
+            // move, which this treats as success.
+            await ProjectMutationService.RenameFileItemAsync(oldPath, newPath, ct);
+
             string oldName = Path.GetFileNameWithoutExtension(oldPath);
             string newName = Path.GetFileNameWithoutExtension(newPath);
             if (oldName.Equals(newName, StringComparison.Ordinal) || !IsIdentifier(newName))

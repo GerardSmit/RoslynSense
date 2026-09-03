@@ -77,6 +77,53 @@ public class FileOperationsTests : IAsyncLifetime
         Assert.All(edit.Changes.Values, edits => Assert.NotEmpty(edits));
     }
 
+    /// <summary>
+    /// Moving a .cs in a project that lists its sources moves the item too, even though the file
+    /// kept its name and no type is renamed.
+    /// </summary>
+    /// <remarks>
+    /// A drag in the explorer is exactly this: same name, new folder. Left alone, the project goes
+    /// on naming a path that is gone, the file stops compiling, and no document is ever created
+    /// for where it now lives — so lenses, navigation and diagnostics are all silently absent
+    /// there, which reads to the user as the whole file having gone stale.
+    /// </remarks>
+    [Fact]
+    public async Task MovingASourceFileMovesTheItemThatNamesIt()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"file-move-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(root, "Models"));
+
+        string project = Path.Combine(root, "Legacy.csproj");
+        await File.WriteAllTextAsync(project, """
+            <?xml version="1.0" encoding="utf-8"?>
+            <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+              <ItemGroup>
+                <Compile Include="Basket.cs" />
+              </ItemGroup>
+            </Project>
+            """);
+
+        string from = Path.Combine(root, "Basket.cs");
+        string to = Path.Combine(root, "Models", "Basket.cs");
+        await File.WriteAllTextAsync(from, "public class Basket { }");
+
+        try
+        {
+            await FileOperationsHandler.WillRenameAsync(
+                new RenameFilesParams([new FileRename(
+                    LspConverters.PathToUri(from), LspConverters.PathToUri(to))]),
+                default);
+
+            string written = await File.ReadAllTextAsync(project);
+            Assert.Contains("Include=\"Models\\Basket.cs\"", written, StringComparison.Ordinal);
+            Assert.DoesNotContain("Include=\"Basket.cs\"", written, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     [Fact]
     public async Task RenamingToAnInvalidIdentifierProducesNoEdit()
     {

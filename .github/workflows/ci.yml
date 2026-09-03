@@ -20,6 +20,7 @@ env:
 
 jobs:
   build-test:
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -87,6 +88,7 @@ jobs:
 
   vscode-extension:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: vscode-extension
@@ -108,6 +110,9 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Audit shipped dependencies
+        run: npm audit --omit=dev
+
       - name: Package
         run: npx @vscode/vsce package
 
@@ -118,16 +123,66 @@ jobs:
           path: vscode-extension/*.vsix
           if-no-files-found: error
 
-  release:
+  vscode-integration:
+    name: VS Code ${{ matrix.vscode }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            vscode: stable
+          - os: ubuntu-latest
+            vscode: stable
+          - os: ubuntu-latest
+            vscode: insiders
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Run VS Code integration test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: vscode-extension
+        env:
+          VSCODE_VERSION: ${{ matrix.vscode }}
+        run: npm run test:integration
+
+      - name: Run VS Code integration test (Linux)
+        if: runner.os == 'Linux'
+        working-directory: vscode-extension
+        env:
+          VSCODE_VERSION: ${{ matrix.vscode }}
+        run: xvfb-run -a npm run test:integration
+
+  release_artifacts:
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
       || github.event_name == 'workflow_dispatch'
-    needs: build-test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    needs: [build-test, vscode-extension, vscode-integration]
+    runs-on: windows-latest
+    timeout-minutes: 45
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_version: ${{ steps.version.outputs.previous_version }}
 
     steps:
       - name: Checkout
@@ -140,51 +195,247 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
       - name: Determine version
         id: version
+        shell: pwsh
+        run: |
+          $tags = @(git tag -l 'v*' --sort=-v:refname)
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME.StartsWith('v')) {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+            $previousTag = $tags | Where-Object { $_ -ne $env:GITHUB_REF_NAME } | Select-Object -First 1
+          } else {
+            $latestTag = $tags | Select-Object -First 1
+            if ($latestTag) {
+              $base = [version]$latestTag.Substring(1)
+            } else {
+              [xml]$project = Get-Content RoslynMCP/RoslynMCP.csproj
+              $base = [version]$project.Project.PropertyGroup.VersionPrefix
+            }
+            switch ('${{ github.event.inputs.bump }}') {
+              'major' { $version = "$($base.Major + 1).0.0" }
+              'minor' { $version = "$($base.Major).$($base.Minor + 1).0" }
+              default { $version = "$($base.Major).$($base.Minor).$($base.Build + 1)" }
+            }
+            $previousTag = $latestTag
+          }
+          $previousVersion = if ($previousTag) { $previousTag.Substring(1) } else { '' }
+          "version=$version" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          "tag=v$version" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          "previous_version=$previousVersion" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host "Building release $version (previous: $previousVersion)"
+
+      - name: Restore and build release binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: pwsh
+        run: |
+          dotnet restore RoslynMCP.sln
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo `
+            -p:ContinuousIntegrationBuild=true -p:Version=$env:VERSION -p:PackageVersion=$env:VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet pack RoslynMCP/RoslynMCP.csproj --configuration Release --output artifacts `
+            --no-build --nologo -p:ContinuousIntegrationBuild=true `
+            -p:Version=$env:VERSION -p:PackageVersion=$env:VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package the extension at the release version
+        working-directory: vscode-extension
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm version $env:VERSION --no-git-tag-version --allow-same-version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx @vscode/vsce package --out "../artifacts/roslyn-sense-$env:VERSION.vsix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Windows payloads are in the tool package
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $package = Get-ChildItem artifacts/RoslynSense.*.nupkg | Select-Object -First 1
+          $archive = [IO.Compression.ZipFile]::OpenRead($package.FullName)
+          try {
+            $names = @($archive.Entries.FullName)
+            foreach ($required in @('/workers/x64/', '/workers/x86/', '/tray/')) {
+              if (-not ($names | Where-Object { $_.Replace('\', '/').Contains($required) })) {
+                throw "Release package is missing $required"
+              }
+            }
+          } finally {
+            $archive.Dispose()
+          }
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/RoslynSense.*.nupkg
+            artifacts/roslyn-sense-*.vsix
+          if-no-files-found: error
+
+  release_smoke_windows:
+    if: needs.release_artifacts.result == 'success'
+    needs: release_artifacts
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.release_artifacts.outputs.version }}
+          path: artifacts
+
+      - name: Install, stop a live daemon, and update the packaged tool
+        env:
+          VERSION: ${{ needs.release_artifacts.outputs.version }}
+          PREVIOUS_VERSION: ${{ needs.release_artifacts.outputs.previous_version }}
+        shell: pwsh
+        run: |
+          $toolPath = Join-Path $env:RUNNER_TEMP 'roslyn-sense-tool-smoke'
+          $stopperPath = Join-Path $env:RUNNER_TEMP 'roslyn-sense-update-stopper'
+          if ($env:PREVIOUS_VERSION) {
+            dotnet tool install RoslynSense --tool-path $toolPath --version $env:PREVIOUS_VERSION
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            dotnet tool install RoslynSense --tool-path $stopperPath --version $env:VERSION `
+              --add-source (Resolve-Path artifacts) --ignore-failed-sources
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $exe = Join-Path $toolPath 'roslyn-sense.exe'
+            $stopperExe = Join-Path $stopperPath 'roslyn-sense.exe'
+            $solution = (Resolve-Path 'vscode-extension/src/test/integration/fixture/Fixture.sln').Path
+            # The previous public version may predate daemon mode. The extension bootstraps the
+            # new package beside it, so exercise the same path here.
+            $daemon = Start-Process -FilePath $stopperExe `
+              -ArgumentList @('--host', $solution) `
+              -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 3
+            & $stopperExe --stop-daemons
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $daemon.WaitForExit(10000) | Out-Null
+            dotnet tool update RoslynSense --tool-path $toolPath --version $env:VERSION `
+              --add-source (Resolve-Path artifacts) --ignore-failed-sources
+          } else {
+            dotnet tool install RoslynSense --tool-path $toolPath --version $env:VERSION `
+              --add-source (Resolve-Path artifacts) --ignore-failed-sources
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $actual = & (Join-Path $toolPath 'roslyn-sense.exe') --version
+          if ($actual.Trim() -ne $env:VERSION) { throw "Expected $env:VERSION, got $actual" }
+
+  release_smoke_container:
+    if: needs.release_artifacts.result == 'success'
+    needs: release_artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: mcr.microsoft.com/dotnet/sdk:10.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.release_artifacts.outputs.version }}
+          path: artifacts
+
+      - name: Install, stop a live daemon, and update in Docker
+        env:
+          VERSION: ${{ needs.release_artifacts.outputs.version }}
+          PREVIOUS_VERSION: ${{ needs.release_artifacts.outputs.previous_version }}
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          tool_path=/tmp/roslyn-sense-tool-smoke
+          stopper_path=/tmp/roslyn-sense-update-stopper
+          if [[ -n "$PREVIOUS_VERSION" ]]; then
+            dotnet tool install RoslynSense --tool-path "$tool_path" --version "$PREVIOUS_VERSION"
+            dotnet tool install RoslynSense --tool-path "$stopper_path" --version "$VERSION" \
+              --add-source "$GITHUB_WORKSPACE/artifacts" --ignore-failed-sources
+            "$stopper_path/roslyn-sense" --host \
+              "$GITHUB_WORKSPACE/vscode-extension/src/test/integration/fixture/Fixture.sln" \
+              >/tmp/roslyn-sense-host.log 2>&1 &
+            daemon_pid=$!
+            sleep 3
+            "$stopper_path/roslyn-sense" --stop-daemons
+            wait "$daemon_pid" || true
+            dotnet tool update RoslynSense --tool-path "$tool_path" --version "$VERSION" \
+              --add-source "$GITHUB_WORKSPACE/artifacts" --ignore-failed-sources
           else
-            bump="${{ github.event.inputs.bump }}"
-            latest_tag=$(git tag -l 'v*' --sort=-v:refname | head -1 || true)
-
-            if [[ -n "$latest_tag" ]]; then
-              base="${latest_tag#v}"
-            else
-              base=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' RoslynMCP/RoslynMCP.csproj)
-            fi
-
-            IFS='.' read -r major minor patch <<< "$base"
-            case "$bump" in
-              major) version="$((major + 1)).0.0" ;;
-              minor) version="$major.$((minor + 1)).0" ;;
-              patch) version="$major.$minor.$((patch + 1))" ;;
-            esac
+            dotnet tool install RoslynSense --tool-path "$tool_path" --version "$VERSION" \
+              --add-source "$GITHUB_WORKSPACE/artifacts" --ignore-failed-sources
           fi
+          test "$("$tool_path/roslyn-sense" --version)" = "$VERSION"
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing version $version"
+  publish_release:
+    if: >-
+      needs.release_artifacts.result == 'success'
+      && needs.release_smoke_windows.result == 'success'
+      && needs.release_smoke_container.result == 'success'
+    needs: [release_artifacts, release_smoke_windows, release_smoke_container]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      version: ${{ needs.release_artifacts.outputs.version }}
 
-      - name: Create tag (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Pack
-        run: >
-          dotnet restore RoslynMCP.sln &&
-          dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo &&
-          dotnet pack RoslynMCP/RoslynMCP.csproj
-          -c Release -o artifacts --no-build --nologo
-          /p:ContinuousIntegrationBuild=true
-          /p:Version=${{ steps.version.outputs.version }}
-          /p:PackageVersion=${{ steps.version.outputs.version }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install Marketplace publisher
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Download tested release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.release_artifacts.outputs.version }}
+          path: artifacts
+
+      - name: Sign in to Azure using GitHub OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Publish to NuGet
         run: >
@@ -193,28 +444,52 @@ jobs:
           --api-key "${{ secrets.NUGET_API_KEY }}"
           --skip-duplicate
 
-      - name: Generate release notes
-        id: notes
-        shell: bash
+      - name: Publish to Visual Studio Marketplace
+        working-directory: vscode-extension
+        env:
+          VERSION: ${{ needs.release_artifacts.outputs.version }}
+        run: >
+          npx @vscode/vsce publish
+          --packagePath "../artifacts/roslyn-sense-${VERSION}.vsix"
+          --azure-credential
+          --skip-duplicate
+
+      - name: Create tag (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ needs.release_artifacts.outputs.tag }}
         run: |
-          previous_tag=$(git tag -l 'v*' --sort=-v:refname | grep -v "^${{ steps.version.outputs.tag }}$" | head -1 || true)
-          if [[ -n "$previous_tag" ]]; then
-            log=$(git log --pretty=format:"- %s (%h)" "$previous_tag..${{ steps.version.outputs.tag }}" --no-merges)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ needs.release_artifacts.outputs.version }}
+          PREVIOUS_VERSION: ${{ needs.release_artifacts.outputs.previous_version }}
+        run: |
+          if [[ -n "$PREVIOUS_VERSION" ]]; then
+            log=$(git log --pretty=format:"- %s (%h)" "v$PREVIOUS_VERSION..HEAD" --no-merges)
           else
             log=$(git log --pretty=format:"- %s (%h)" --no-merges)
           fi
 
           echo "$log" > release_notes.md
           echo "" >> release_notes.md
-          echo "**NuGet:** [RoslynSense ${{ steps.version.outputs.version }}](https://www.nuget.org/packages/RoslynSense/${{ steps.version.outputs.version }})" >> release_notes.md
+          echo "**NuGet:** [RoslynSense $VERSION](https://www.nuget.org/packages/RoslynSense/$VERSION)" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**VS Code:** [RoslynSense $VERSION](https://marketplace.visualstudio.com/items?itemName=roslyn-sense.roslyn-sense)" >> release_notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: RoslynSense v${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.release_artifacts.outputs.tag }}
+          name: RoslynSense v${{ needs.release_artifacts.outputs.version }}
           body_path: release_notes.md
-          files: artifacts/*.nupkg
+          files: |
+            artifacts/*.nupkg
+            artifacts/*.vsix
           generate_release_notes: false
 
   # Claude Code reads .claude-plugin/plugin.json from the DEFAULT BRANCH when a user adds or
@@ -224,8 +499,8 @@ jobs:
   # Deliberately a separate job: it pushes a commit, and doing that inside `release` would risk
   # changing the tree that was just packed and published.
   sync-plugin-manifest:
-    if: needs.release.result == 'success'
-    needs: release
+    if: needs.publish_release.result == 'success'
+    needs: publish_release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -238,7 +513,7 @@ jobs:
 
       - name: Sync plugin manifest version
         env:
-          VERSION: ${{ needs.release.outputs.version }}
+          VERSION: ${{ needs.publish_release.outputs.version }}
         run: |
           set -euo pipefail
 

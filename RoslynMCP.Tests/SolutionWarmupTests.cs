@@ -18,6 +18,16 @@ namespace RoslynMCP.Tests;
 [Collection(SharedState.Name)]
 public class SolutionWarmupTests
 {
+    [Fact]
+    public void BindingNullClearsTheCurrentSolution()
+    {
+        using var restore = WorkspaceService.BindSolutionForTesting(FixturePaths.MultiSolutionFile);
+
+        WorkspaceService.BindSolution(null);
+
+        Assert.Null(WorkspaceService.BoundSolutionPath);
+    }
+
     /// <summary>
     /// ProjectB references ProjectA and nothing references ProjectB, so ProjectB is exactly what
     /// demand-driven loading never reaches on its own: opening a file in ProjectA pulls in its

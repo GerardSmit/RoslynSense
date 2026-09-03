@@ -17,6 +17,20 @@ internal static class HandlerHelpers
             return null;
 
         var text = await document.GetTextAsync(ct);
+
+        // A position past the end of the file is not an error to throw: it is what a request built
+        // against text the server has already moved on from looks like, and every client sends
+        // them -- a code lens drawn before an edit that shortened the file, a hover from a stale
+        // decoration. Answering "no such position" lets each caller degrade the way it should;
+        // throwing turned a stale code lens into a failed request and a lens that never resolved.
+        if (position.Line < 0 || position.Line >= text.Lines.Count)
+            return null;
+
+        var line = text.Lines[position.Line];
+
+        if (position.Character < 0 || position.Character > line.SpanIncludingLineBreak.Length)
+            return null;
+
         int offset = LspConverters.ToOffset(text, position);
         return (document, text, offset);
     }

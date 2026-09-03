@@ -172,6 +172,10 @@ Use the following server configuration:
 
 | Flag | Description |
 |------|-------------|
+| `--version` | Print the installed RoslynSense version and exit. |
+| `--stop-daemons` | Ask every shared host on this machine to exit; used before updating the tool. |
+| `--lsp [--solution <path>]` | Run the Language Server Protocol endpoint used by editors. |
+| `--cli <tool> [options]` | Run one RoslynSense tool from the command line; use `--cli --help` to list tools. |
 | `--no-webforms` | Disable WebForms (ASPX/ASCX) support. |
 | `--no-razor` | Disable Razor (.razor/.cshtml) support. |
 | `--no-proto` | Disable Protobuf/gRPC (.proto) support: no navigation between a `.proto` and the C# protoc generated from it. |
@@ -784,6 +788,9 @@ even when there is nothing to update, on every single session.
 | `ROSLYNMCP_NO_UPDATE_CHECK` | `1`/`true`/`on` disables the version check entirely. |
 
 If the tool is missing altogether, the `csharp` skill tells the agent to install it and ask for a restart.
+
+Release maintainers should follow [the release setup and validation guide](docs/releasing.md),
+including the Microsoft Entra workload-identity setup required for secure Marketplace publishing.
 
 ## Markup Snippet Convention
 

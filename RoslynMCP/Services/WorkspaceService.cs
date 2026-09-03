@@ -1774,6 +1774,14 @@ internal static class WorkspaceService
 
     public static void BindSolution(string? solutionPath)
     {
+        // A caller restoring an optional previous binding must be able to restore "unbound" too.
+        // Treating null as a no-op leaked one editor/test session's solution into every later one.
+        if (string.IsNullOrWhiteSpace(solutionPath))
+        {
+            BoundSolutionPath = null;
+            return;
+        }
+
         if (solutionPath is { Length: > 0 } path && PathHelper.IsSolutionFile(path) && File.Exists(path))
         {
             BoundSolutionPath = Path.GetFullPath(path);

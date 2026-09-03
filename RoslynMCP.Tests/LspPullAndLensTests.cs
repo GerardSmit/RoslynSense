@@ -144,27 +144,71 @@ public class LspPullAndLensTests
     }
 
     /// <summary>
-    /// A pull that arrives before the semantic model does answers with what the tree alone can
-    /// say, and catches up afterwards — the short answer is what the editor draws while the
-    /// project is still binding, and it must not become the permanent one.
+    /// A project that has been built answers in full on the first pull, refresh support or not.
     /// </summary>
+    /// <remarks>
+    /// The regression this pins: gating the list on a cached semantic model looks reasonable and
+    /// is not, because an edit throws that cache away and the gate then misses on every keystroke.
+    /// The inheritance lenses flickered out of a warm file constantly, which is how a lens the
+    /// user meant to click stops being there by the time they click it.
+    /// </remarks>
     [Fact]
-    public async Task CodeLensAnswersBeforeTheSemanticModelAndCatchesUpOnTheNextPull()
+    public async Task ABuiltProjectGetsItsInheritanceLensesOnTheFirstPull()
     {
         string uri = LspConverters.PathToUri(FixturePaths.ServicesFile);
         var request = new CodeLensParams(new TextDocumentIdentifier(uri));
         CodeLensHandler.ClearWarmupState();
 
-        var first = await CodeLensHandler.CodeLensAsync(request, default, clientRefreshes: true);
+        var lenses = await CodeLensHandler.CodeLensAsync(request, default, clientRefreshes: true);
 
-        // Whatever the model's state, the syntactic half is on screen straight away.
-        Assert.Contains(first, l => l.Command is null && l.Data is { Kind: "references" });
+        Assert.Contains(lenses, lens => lens.Command?.Name == "roslynSense.showInheritanceAt");
+        Assert.Contains(lenses, lens => lens.Data is { Kind: "references" });
+    }
 
-        var second = await CodeLensHandler.CodeLensAsync(request, default, clientRefreshes: true);
+    /// <summary>
+    /// Nothing in a lens list is a lens the editor cannot act on: every entry either carries a
+    /// command it can run or the data to resolve one. A command with an empty title still draws —
+    /// as a bare separator beside its neighbours — and swallows the click.
+    /// </summary>
+    [Fact]
+    public async Task CodeLensDrawsNothingItCannotAnswer()
+    {
+        foreach (string path in new[]
+                 { FixturePaths.ServicesFile, FixturePaths.CalculatorFile,
+                   FixturePaths.DebugCalculatorTestsFile })
+        {
+            var lenses = await CodeLensHandler.CodeLensAsync(
+                new CodeLensParams(new TextDocumentIdentifier(LspConverters.PathToUri(path))),
+                default,
+                clientRefreshes: true);
 
-        // And the semantic half by the second pull at the latest: having answered short once for
-        // this text, the handler waits rather than answering short again.
-        Assert.Contains(second, l => l.Command?.Name == "roslynSense.showInheritanceAt");
+            Assert.All(lenses, lens => Assert.True(
+                lens.Command is { Name.Length: > 0, Title.Length: > 0 } || lens.Data is not null,
+                $"{Path.GetFileName(path)} has a lens that renders and cannot act"));
+        }
+    }
+
+    /// <summary>
+    /// And a lens the editor cannot answer stays uncommanded rather than claiming a number.
+    /// A position that no longer resolves is a stale lens, not a symbol with no references.
+    /// </summary>
+    [Fact]
+    public async Task ResolvingAStalePositionCommandsNothing()
+    {
+        string uri = LspConverters.PathToUri(FixturePaths.CalculatorFile);
+        string text = await File.ReadAllTextAsync(FixturePaths.CalculatorFile);
+        int past = text.Count(c => c == '\n') + 500;
+
+        var stale = new RoslynMCP.Lsp.Protocol.CodeLens(
+            new RoslynMCP.Lsp.Protocol.Range(new Position(past, 0), new Position(past, 1)),
+            Command: null)
+        {
+            Data = new CodeLensData(uri, past, 0, "references"),
+        };
+
+        var resolved = await CodeLensHandler.ResolveAsync(stale, default);
+
+        Assert.Null(resolved.Command);
     }
 
     private static (int Line, int Character) PositionOf(string text, string anchor)

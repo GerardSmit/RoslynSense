@@ -16,6 +16,7 @@ public class WorkflowConfigurationTests
         Assert.Contains("--no-build", content, StringComparison.Ordinal);
         Assert.Contains("-p:UseAppHost=false", content, StringComparison.Ordinal);
         Assert.Contains("--blame-hang", content, StringComparison.Ordinal);
+        Assert.Contains("--blame-hang-dump-type mini", content, StringComparison.Ordinal);
     }
 
     [Fact]

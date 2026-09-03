@@ -610,22 +610,34 @@ public class DapServerTests
         var server = new DapServer(backend, input, output);
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var listening = server.ListenAsync(timeout.Token);
+        // HeldStream deliberately blocks after the scripted requests. Run the listener on its own
+        // worker so a synchronously completed ReadAsync cannot block this harness before it gets
+        // the chance to observe the output and release the stream. That scheduling race only
+        // showed up reliably on the hosted runner.
+        var listening = Task.Run(() => server.ListenAsync(timeout.Token), CancellationToken.None);
 
-        while (!until(Parse(output.Snapshot())))
+        try
         {
-            if (timeout.IsCancellationRequested)
-                throw new TimeoutException("the adapter never sent what the test was waiting for");
-            await Task.Delay(20, CancellationToken.None);
+            while (!until(Parse(output.Snapshot())))
+            {
+                if (timeout.IsCancellationRequested)
+                    throw new TimeoutException("the adapter never sent what the test was waiting for");
+                await Task.Delay(20, CancellationToken.None);
+            }
+
+            // Settle before snapshotting: a test asserting that something was sent once has to give a
+            // duplicate the chance to arrive, or it passes by reading too early.
+            await Task.Delay(150, CancellationToken.None);
+
+            return Parse(output.Snapshot());
         }
-
-        // Settle before snapshotting: a test asserting that something was sent once has to give a
-        // duplicate the chance to arrive, or it passes by reading too early.
-        await Task.Delay(150, CancellationToken.None);
-
-        input.Release();
-        await listening;
-        return Parse(output.Snapshot());
+        finally
+        {
+            // Release on both success and assertion/timeout failure. Otherwise the listener owns a
+            // permanently blocked thread which can keep the test host alive until blame-hang kills it.
+            input.Release();
+            await listening.WaitAsync(TimeSpan.FromSeconds(3));
+        }
     }
 
     private static byte[] Frame(IEnumerable<JsonObject> requests)

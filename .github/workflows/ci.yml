@@ -101,7 +101,7 @@ jobs:
         run: >-
           dotnet test RoslynMCP.sln --configuration Release --no-build --nologo
           -p:UseAppHost=false
-          --blame-hang --blame-hang-timeout 3m
+          --blame-hang --blame-hang-timeout 3m --blame-hang-dump-type mini
           --logger "console;verbosity=normal"
           --logger "trx;LogFileName=tests.trx"
           --results-directory TestResults

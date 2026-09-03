@@ -200,6 +200,164 @@ export function registerSolutionExplorer(
         }
     }
 
+    /** One offer from `roslynSense/itemTemplates`. */
+    interface ItemTemplate {
+        readonly id: string;
+        readonly label: string;
+        readonly group: string;
+        readonly defaultName: string;
+        readonly detail: string | null;
+        readonly fixed: boolean;
+    }
+
+    /**
+     * The New menu.
+     *
+     * What it offers is asked for rather than held here, because the answer depends on the
+     * project: a Form belongs in a WinForms project and nowhere else, a Web Form in a legacy
+     * System.Web site, and a test class comes in three flavours depending on what the project
+     * references. The server knows all three; this end only draws the list.
+     */
+    async function newItem(node: SolutionTreeNode): Promise<void> {
+        const client = getClient();
+        const target = templateTargetOf(node);
+
+        if (!client || !target) {
+            return;
+        }
+
+        let templates: ItemTemplate[];
+
+        try {
+            const answer = await client.sendRequest<{ templates: ItemTemplate[] }>(
+                'roslynSense/itemTemplates',
+                { path: target }
+            );
+            templates = answer.templates;
+        } catch (error) {
+            void vscode.window.showErrorMessage(
+                `Could not list templates: ${error instanceof Error ? error.message : String(error)}`
+            );
+            return;
+        }
+
+        type Choice = vscode.QuickPickItem & { readonly template?: ItemTemplate };
+        const choices: Choice[] = [];
+        let group: string | undefined;
+
+        for (const template of templates) {
+            if (template.group !== group) {
+                group = template.group;
+                choices.push({ label: group, kind: vscode.QuickPickItemKind.Separator });
+            }
+            choices.push({
+                label: template.label,
+                description: template.fixed ? template.defaultName : undefined,
+                detail: template.detail ?? undefined,
+                template,
+            });
+        }
+
+        // A folder is not a template — it is a directory, and the tree already makes those.
+        const folder = 'Folder';
+        if (node.kind !== 'solution' && !node.id.startsWith('slnfolder:')) {
+            choices.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+            choices.push({ label: folder, detail: 'A directory in the project.' });
+        }
+
+        if (choices.length === 0) {
+            void vscode.window.showInformationMessage('Nothing can be added here.');
+            return;
+        }
+
+        const chosen = await vscode.window.showQuickPick(choices, {
+            title: 'New',
+            placeHolder: 'What to add',
+            matchOnDetail: true,
+        });
+
+        if (!chosen) {
+            return;
+        }
+
+        if (chosen.label === folder && !chosen.template) {
+            await vscode.commands.executeCommand('roslynSense.solutionExplorer.newFolder', node);
+            return;
+        }
+
+        const template = chosen.template;
+
+        if (!template) {
+            return;
+        }
+
+        // A name the template fixes is not asked for: Web.config under another name is not a
+        // web.config. Everything else opens with the name Visual Studio would have suggested,
+        // with the extension left out of the selection so typing over it keeps the extension.
+        let name = template.defaultName;
+
+        if (!template.fixed) {
+            const suggested = await vscode.window.showInputBox({
+                title: `New ${template.label}`,
+                prompt: 'Name',
+                value: template.defaultName,
+                valueSelection: [
+                    0,
+                    template.defaultName.length - Path.extname(template.defaultName).length,
+                ],
+            });
+
+            if (!suggested) {
+                return;
+            }
+
+            name = suggested;
+        }
+
+        const result = await client.sendRequest<{
+            ok: boolean;
+            message: string;
+            paths: string[];
+        }>('roslynSense/createItem', { path: target, templateId: template.id, name });
+
+        refresh(node);
+
+        if (!result.ok) {
+            void vscode.window.showErrorMessage(result.message);
+            return;
+        }
+
+        // The first path is the one the template is about — the markup rather than its
+        // code-behind, the form rather than its designer half.
+        if (result.paths.length > 0) {
+            await vscode.window.showTextDocument(vscode.Uri.file(result.paths[0]));
+        }
+    }
+
+    /**
+     * The path a template request is about: a solution, a project file, or a folder.
+     *
+     * A solution folder is not a directory — it exists only in the .sln — so what belongs "in"
+     * one is what belongs beside the solution, and that is the path sent.
+     */
+    function templateTargetOf(node: SolutionTreeNode): string | undefined {
+        if (node.id.startsWith('solution:')) {
+            return node.id.slice('solution:'.length);
+        }
+
+        if (node.id.startsWith('slnfolder:')) {
+            return memorySolution;
+        }
+
+        if (node.id.startsWith('project:')) {
+            return node.id.slice('project:'.length);
+        }
+
+        return node.resourceUri
+            ? vscode.Uri.parse(node.resourceUri).fsPath
+            : projectPathOf(node);
+    }
+
     const provider: vscode.TreeDataProvider<SolutionTreeNode> = {
         onDidChangeTreeData: changeEmitter.event,
 
@@ -1952,25 +2110,7 @@ export function registerSolutionExplorer(
                 refresh();
             }
         ),
-        onNode(
-            'roslynSense.solutionExplorer.newItem',
-            async (node) => {
-                const kind = await vscode.window.showQuickPick(
-                    ['class', 'interface', 'record', 'enum', 'empty file', 'folder'],
-                    { title: 'New' }
-                );
-                if (!kind) {
-                    return;
-                }
-                await vscode.commands.executeCommand(
-                    kind === 'folder'
-                        ? 'roslynSense.solutionExplorer.newFolder'
-                        : 'roslynSense.solutionExplorer.newFile',
-                    node,
-                    kind === 'empty file' ? 'empty' : kind
-                );
-            }
-        ),
+        onNode('roslynSense.solutionExplorer.newItem', (node) => newItem(node)),
         onNode('roslynSense.solutionExplorer.startupAndDebug', (node) =>
             launch(node, { debug: true })
         ),

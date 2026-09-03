@@ -1617,7 +1617,7 @@
         },
         {
           "command": "roslynSense.solutionExplorer.newItem",
-          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder|project|projectRunnable|folder)$/",
           "group": "2_modify@0"
         },
         {

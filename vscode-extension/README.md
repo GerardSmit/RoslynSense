@@ -74,6 +74,21 @@ to them as solution items, including by dragging from the OS file explorer. Both
 Add Existing Item on a project reads the surrounding folder: a file already inside the project's
 directory is included where it lies, and only a file from elsewhere is copied in.
 
+New… offers what the project can actually have. A Form and a User Control where WinForms is
+switched on, a Window and a Resource Dictionary where WPF is, Razor components, views and pages
+under the Razor SDK, Web Forms items — `.aspx`, `.ascx`, master pages, handlers, `Global.asax` —
+on a legacy System.Web site, and a test class in the framework the project references rather than
+a guess. On the solution it offers the files that belong beside a `.sln`: `.editorconfig`,
+`.gitignore`, `global.json`, `Directory.Build.props` and the rest, and only the ones not already
+there. A class made in `Models/` gets `Models` in its namespace, including where a team's
+`.DotSettings` says a folder does not count — which is the one thing `dotnet new class` cannot do.
+
+Properties on a file or folder opens a form for what the project says about it: the build action,
+whether it copies to the output, the custom tool and its namespace, and whether an item names the
+file or a wildcard swept it up. On a folder it is the one property a folder has — whether its name
+is part of the namespace, the ReSharper and Rider setting that otherwise has no home outside those
+two tools. Editable, and what it shows after a write is the project file re-read.
+
 The toolbar carries three buttons — Search the solution, Focus Current File, and Collapse All. The
 rest of the view's toggles (Follow Current File, Show All Files, Show Ignored Folders, file nesting,
 Refresh) live in the `…` menu beside them.

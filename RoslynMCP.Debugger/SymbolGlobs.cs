@@ -57,7 +57,7 @@ public static class SymbolGlobs
         if (glob.Length == 0)
             return false;
         var subject = glob.AsSpan().IndexOfAny('\\', '/') < 0
-            ? Path.GetFileName(modulePath)
+            ? Path.GetFileName(modulePath.Replace('\\', '/'))
             : modulePath;
         return s_compiled.GetOrAdd(glob, Compile).IsMatch(subject);
     }

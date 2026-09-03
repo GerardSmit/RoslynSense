@@ -77,7 +77,7 @@ public class NetFrameworkSupportTests : IDisposable
         Assert.True(result.Ok, result.Message);
         string xml = await File.ReadAllTextAsync(app);
         Assert.Contains("ProjectReference", xml);
-        Assert.Contains(@"..\Lib\Lib.csproj", xml);
+        Assert.Contains(Path.Combine("..", "Lib", "Lib.csproj"), xml);
         // Visual Studio writes both, and tooling that reads the solution expects them.
         Assert.Contains("{11111111-2222-3333-4444-555555555555}", xml);
         Assert.Contains("<Name", xml);

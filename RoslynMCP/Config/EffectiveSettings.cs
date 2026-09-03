@@ -256,7 +256,7 @@ public sealed record EffectiveSettings(
             if (name.Length == 0)
                 continue;
 
-            if (name.IndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]) >= 0
+            if (name.IndexOfAny(['/', '\\']) >= 0
                 || name.Contains('*') || name.Contains('?'))
             {
                 warnings.Add(

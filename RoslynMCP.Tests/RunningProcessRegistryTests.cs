@@ -41,7 +41,9 @@ public class RunningProcessRegistryTests
     {
         // Register an entry pointing at a PID that is certainly gone, by writing through a
         // session whose process has exited.
-        var dead = Process.Start(new ProcessStartInfo("cmd", "/c exit 0") { CreateNoWindow = true })!;
+        var dead = Process.Start(OperatingSystem.IsWindows()
+            ? new ProcessStartInfo("cmd", "/c exit 0") { CreateNoWindow = true }
+            : new ProcessStartInfo("/bin/sh", "-c \"exit 0\"") { CreateNoWindow = true })!;
         dead.WaitForExit();
 
         var session = new AppSession

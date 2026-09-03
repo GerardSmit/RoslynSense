@@ -425,7 +425,10 @@ public class TemplateIndexTests
 
         public void Write(string relativePath, string content)
         {
-            string path = Path.Combine(Root, relativePath);
+            string path = Path.Combine(
+                Root,
+                relativePath.Replace('/', Path.DirectorySeparatorChar)
+                    .Replace('\\', Path.DirectorySeparatorChar));
 
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.WriteAllText(path, content);

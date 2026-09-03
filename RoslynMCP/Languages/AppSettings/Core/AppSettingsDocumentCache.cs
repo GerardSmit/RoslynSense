@@ -56,7 +56,7 @@ internal static class AppSettingsFile
         if (filePath is not { Length: > 0 })
             return false;
 
-        string name = Path.GetFileName(filePath);
+        string name = PathHelper.GetFileName(filePath);
 
         return name.Equals(SecretsFileName, StringComparison.OrdinalIgnoreCase)
             || (name.StartsWith("appsettings", StringComparison.OrdinalIgnoreCase)
@@ -65,13 +65,13 @@ internal static class AppSettingsFile
 
     public static bool IsSecretsPath(string? filePath) =>
         filePath is { Length: > 0 }
-        && Path.GetFileName(filePath).Equals(SecretsFileName, StringComparison.OrdinalIgnoreCase);
+        && PathHelper.GetFileName(filePath).Equals(SecretsFileName, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The environment an overlay file targets — <c>Development</c> for
     /// <c>appsettings.Development.json</c> — or null for the base file and secrets.</summary>
     public static string? Environment(string filePath)
     {
-        string name = Path.GetFileName(filePath);
+        string name = PathHelper.GetFileName(filePath);
 
         if (!name.StartsWith("appsettings.", StringComparison.OrdinalIgnoreCase)
             || !name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))

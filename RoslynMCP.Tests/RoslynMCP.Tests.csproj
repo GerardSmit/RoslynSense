@@ -82,49 +82,64 @@
     </Target>
 
     <Target Name="PrepareFixtureProjects" BeforeTargets="BeforeBuild">
-        <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\SampleProject\SampleProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\BlazorProject\BlazorProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\AspxProject\AspxProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\SourceGenFixture\Consumer\Consumer.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\MultiSolution\ProjectB\ProjectB.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <!-- MSBuildWorkspace intentionally evaluates Debug by default, independently of the
+             test assembly's configuration. Build its fixtures in that same configuration so a
+             Release test run does not leave every output reference unresolved. -->
+        <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj;Fixtures\CpmSolution\MultiTfm\MultiTfm.csproj" Targets="Restore" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\SampleProject\SampleProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\BlazorProject\BlazorProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\AspxProject\AspxProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\SourceGenFixture\Consumer\Consumer.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\MultiSolution\ProjectB\ProjectB.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
         <!--
           The two projects under one Directory.Build.props, for counting what a suppression written
           there is hiding. Restore only: the count compiles them in-process, and a build would just
           be the same compilation done twice.
         -->
-        <MSBuild Projects="Fixtures\SuppressedWarnings\Alpha\Alpha.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\SuppressedWarnings\Beta\Beta.csproj" Targets="Restore" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\DebugTestProject\DebugTestProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\ProtoProject\ProtoProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\ProtoNeverBuiltProject\ProtoNeverBuiltProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\SuppressedWarnings\Alpha\Alpha.csproj" Targets="Restore" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\SuppressedWarnings\Beta\Beta.csproj" Targets="Restore" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\DebugTestProject\DebugTestProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\ProtoProject\ProtoProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\ProtoNeverBuiltProject\ProtoNeverBuiltProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
         <!--
           MediatorGenerator comes in through MediatorProject's analyzer reference, so one line
           builds both. It has to build here rather than on demand: the generated SenderExtensions
           is what the fixture's own call sites bind against.
         -->
-        <MSBuild Projects="Fixtures\MediatorProject\MediatorProject.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\MediatorProject\MediatorProject.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
         <!--
           Server and Client each pull Contracts in through their ProjectReference, so the three
           together cover the whole ProtoSolution graph; Unrelated references nothing and needs its
           own line. Restored here rather than left to the on-demand restore inside a workspace load,
           which would otherwise happen with the load's timeout already running.
         -->
-        <MSBuild Projects="Fixtures\ProtoSolution\Server\Server.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\ProtoSolution\Client\Client.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\ProtoSolution\Unrelated\Unrelated.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\ProtoSolution\Server\Server.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\ProtoSolution\Client\Client.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\ProtoSolution\Unrelated\Unrelated.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
         <!--
           The cross-project navigation fixtures. Api covers Contracts and Messaging through its
           ProjectReference; Inventory and Billing sit in sibling subtrees nothing references, so
           each needs its own line. Same for Storefront over Warehouse.
         -->
-        <MSBuild Projects="Fixtures\MediatorModules\Api\Api.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\MediatorModules\Inventory\Inventory.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\MediatorModules\Billing\Billing.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
-        <MSBuild Projects="Fixtures\LayeredApp\Storefront\Storefront.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\MediatorModules\Api\Api.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\MediatorModules\Inventory\Inventory.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\MediatorModules\Billing\Billing.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\LayeredApp\Storefront\Storefront.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
         <!-- WebApp covers ControlLib through its ProjectReference. -->
-        <MSBuild Projects="Fixtures\ControlLibApp\WebApp\WebApp.csproj" Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\ControlLibApp\WebApp\WebApp.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+    </Target>
+
+    <!-- Some tests exercise the artifacts produced by the configuration under test, while the
+         product workspace above evaluates Debug by default. Keep both sets available when CI
+         builds the test assembly in Release. -->
+    <Target Name="PrepareConfiguredFixtureProjects"
+            AfterTargets="PrepareFixtureProjects"
+            Condition="'$(Configuration)' != 'Debug'">
+        <MSBuild Projects="Fixtures\BrokenProject\BrokenProject.csproj;Fixtures\CpmSolution\MultiTfm\MultiTfm.csproj;Fixtures\SuppressedWarnings\Alpha\Alpha.csproj;Fixtures\SuppressedWarnings\Beta\Beta.csproj"
+                 Targets="Restore" Properties="Configuration=$(Configuration)" />
+        <MSBuild Projects="Fixtures\SampleProject\Aardvark.Empty.csproj;Fixtures\SampleProject\SampleProject.csproj;Fixtures\BlazorProject\BlazorProject.csproj;Fixtures\AspxProject\AspxProject.csproj;Fixtures\SourceGenFixture\Consumer\Consumer.csproj;Fixtures\MultiSolution\ProjectB\ProjectB.csproj;Fixtures\DebugTestProject\DebugTestProject.csproj;Fixtures\ProtoProject\ProtoProject.csproj;Fixtures\ProtoNeverBuiltProject\ProtoNeverBuiltProject.csproj;Fixtures\MediatorProject\MediatorProject.csproj;Fixtures\ProtoSolution\Server\Server.csproj;Fixtures\ProtoSolution\Client\Client.csproj;Fixtures\ProtoSolution\Unrelated\Unrelated.csproj;Fixtures\MediatorModules\Api\Api.csproj;Fixtures\MediatorModules\Inventory\Inventory.csproj;Fixtures\MediatorModules\Billing\Billing.csproj;Fixtures\LayeredApp\Storefront\Storefront.csproj;Fixtures\ControlLibApp\WebApp\WebApp.csproj"
+                 Targets="Restore;Build" Properties="Configuration=$(Configuration)" />
     </Target>
 
 </Project>

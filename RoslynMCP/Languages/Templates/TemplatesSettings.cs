@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using RoslynMCP.Config;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.Templates;
 
@@ -132,7 +133,7 @@ internal sealed record TemplatesSettings
 
             string trimmed = folder.Trim();
 
-            if (Path.IsPathRooted(trimmed) || trimmed.Contains("..", StringComparison.Ordinal))
+            if (PathHelper.IsRooted(trimmed) || trimmed.Contains("..", StringComparison.Ordinal))
             {
                 warnings.Add(
                     $"templates.{setting}: '{trimmed}' is not a path relative to a project; "

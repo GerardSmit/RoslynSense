@@ -1686,6 +1686,11 @@ internal static class WorkspaceService
         var searchRoot = new FileInfo(normalizedTarget).Directory;
         for (int i = 0; i < 5 && searchRoot?.Parent != null; i++)
         {
+            // A source archive need not contain .git. Never turn that into a recursive scan of
+            // the filesystem root (/ on Unix, or a drive root on Windows).
+            if (searchRoot.Parent.Parent is null)
+                break;
+
             searchRoot = searchRoot.Parent;
             if (Directory.Exists(Path.Combine(searchRoot.FullName, ".git")))
                 break;

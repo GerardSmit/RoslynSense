@@ -282,7 +282,10 @@ public class TemplateTreeTests : IDisposable
 
     private void Write(string relativePath, string content)
     {
-        string path = Path.Combine(_root, relativePath);
+        string path = Path.Combine(
+            _root,
+            relativePath.Replace('/', Path.DirectorySeparatorChar)
+                .Replace('\\', Path.DirectorySeparatorChar));
 
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, content);

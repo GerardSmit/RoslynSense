@@ -37,7 +37,7 @@ internal static class BindingRedirectHandler
 
     public static bool IsConfigPath(string? filePath) =>
         filePath is { Length: > 0 } &&
-        s_names.Contains(Path.GetFileName(filePath), StringComparer.OrdinalIgnoreCase);
+        s_names.Contains(PathHelper.GetFileName(filePath), StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// The project whose redirects this file carries — the one beside it.

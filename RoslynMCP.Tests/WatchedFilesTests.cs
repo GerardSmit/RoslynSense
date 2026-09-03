@@ -390,7 +390,7 @@ public class WatchedFilesTests
     /// workspace and reloaded it — which is most of what "it reloads constantly" was, for anyone
     /// not on SDK-style projects.
     /// </remarks>
-    [Fact]
+    [RequiresVisualStudioFact]
     public async Task SavingAFileInALegacyProjectDoesNotReloadTheWorkspace()
     {
         string file = FixturePaths.LegacyCalculatorFile;
@@ -426,7 +426,7 @@ public class WatchedFilesTests
     /// <summary>
     /// One project file changing reloads that project, not every solution in the process.
     /// </summary>
-    [Fact]
+    [RequiresVisualStudioFact]
     public async Task AProjectFileChangeReloadsOnlyItsOwnWorkspace()
     {
         await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
@@ -601,7 +601,7 @@ public class WatchedFilesTests
     /// A file created in a legacy project is not compiled until the project says so, and finding
     /// that out must not cost a reload.
     /// </summary>
-    [Fact]
+    [RequiresVisualStudioFact]
     public async Task CreatingAFileInALegacyProjectDoesNotReloadTheWorkspace()
     {
         string file = Path.Combine(FixturePaths.LegacyProjectDir, $"LegacyNew{Guid.NewGuid():N}.cs");

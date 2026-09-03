@@ -99,7 +99,7 @@ internal static class WebConfigFile
 
     public static bool IsConfigPath(string? filePath) =>
         filePath is { Length: > 0 }
-        && Names.Contains(Path.GetFileName(filePath), StringComparer.OrdinalIgnoreCase);
+        && Names.Contains(PathHelper.GetFileName(filePath), StringComparer.OrdinalIgnoreCase);
 
     public static bool OwnsFileName(string fileName) =>
         Names.Contains(fileName, StringComparer.OrdinalIgnoreCase);

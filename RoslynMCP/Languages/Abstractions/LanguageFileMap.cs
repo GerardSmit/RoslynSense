@@ -1,4 +1,5 @@
 using RoslynMCP.Lsp.Handlers;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages;
 
@@ -48,7 +49,7 @@ internal sealed class LanguageFileMap
         if (uriOrPath is not { Length: > 0 } candidate || IsVirtual(candidate))
             return null;
 
-        string fileName = Path.GetFileName(candidate);
+        string fileName = PathHelper.GetFileName(candidate);
         if (fileName.Length > 0)
         {
             if (_byFileName.TryGetValue(fileName, out var byName))
@@ -61,7 +62,7 @@ internal sealed class LanguageFileMap
             }
         }
 
-        string extension = Path.GetExtension(candidate);
+        string extension = Path.GetExtension(fileName);
         return extension.Length > 0 && _byExtension.TryGetValue(extension, out var pack) ? pack : null;
     }
 

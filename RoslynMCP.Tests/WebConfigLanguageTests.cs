@@ -190,7 +190,7 @@ public class WebConfigChainTests : IDisposable
         string hover = builder.ToString();
 
         Assert.Contains("Overridden in:", hover);
-        Assert.Contains(@"`Admin\web.config` → `dark`", hover);
+        Assert.Contains($"`{Path.Combine("Admin", "web.config")}` → `dark`", hover);
         Assert.DoesNotContain("Overrides:", hover);
     }
 

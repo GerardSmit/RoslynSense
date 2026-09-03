@@ -81,7 +81,7 @@ internal static class FormattingHandler
         var formatted = await Formatter.FormatAsync(document, spans, options: null, cancellationToken: ct);
         var changes = await formatted.GetTextChangesAsync(document, ct);
         var edits = changes
-            .Select(c => new TextEdit(LspConverters.ToRange(text.Lines, c.Span), c.NewText ?? ""))
+            .Select(c => ToEdit(c, text))
             .ToArray();
 
         return p.Character is "\n" or "\r\n" ? WithoutCaretLine(edits, p.Position.Line) : edits;
@@ -218,7 +218,47 @@ internal static class FormattingHandler
         var changes = await formatted.GetTextChangesAsync(document, ct);
 
         return changes
-            .Select(c => new TextEdit(LspConverters.ToRange(oldText.Lines, c.Span), c.NewText ?? ""))
+            .Select(c => ToEdit(c, oldText))
             .ToArray();
+    }
+
+    private static TextEdit ToEdit(TextChange change, SourceText source)
+    {
+        string oldValue = source.ToString(change.Span);
+        string newValue = PreserveNewLines(change.NewText ?? "", source);
+        int prefix = 0;
+        int shared = Math.Min(oldValue.Length, newValue.Length);
+        while (prefix < shared && oldValue[prefix] == newValue[prefix])
+            prefix++;
+
+        int suffix = 0;
+        while (suffix < shared - prefix
+               && oldValue[^(suffix + 1)] == newValue[^(suffix + 1)])
+        {
+            suffix++;
+        }
+
+        var span = TextSpan.FromBounds(
+            change.Span.Start + prefix,
+            change.Span.End - suffix);
+        string replacement = newValue.Substring(prefix, newValue.Length - prefix - suffix);
+        return new TextEdit(LspConverters.ToRange(source.Lines, span), replacement);
+    }
+
+    private static string PreserveNewLines(string value, SourceText source)
+    {
+        var line = source.Lines.FirstOrDefault(candidate =>
+            candidate.SpanIncludingLineBreak.Length > candidate.Span.Length);
+        if (line.SpanIncludingLineBreak.Length == line.Span.Length)
+            return value;
+
+        string newLine = source.ToString(TextSpan.FromBounds(line.End, line.EndIncludingLineBreak));
+        if (newLine == "\n")
+            return value.Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Replace('\r', '\n');
+
+        return value.Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Replace("\n", newLine, StringComparison.Ordinal);
     }
 }

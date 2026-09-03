@@ -38,7 +38,7 @@ public class LegacyBuildEnvironmentTests
         }
     }
 
-    [Fact]
+    [RequiresVisualStudioFact]
     public async Task ALegacyProjectBuilds()
     {
         // Asserted rather than skipped: a silent return would make this pass on the very

@@ -150,7 +150,9 @@ internal static partial class ExcludedFileResolver
 
             try
             {
-                builder[guid] = PathHelper.NormalizePath(Path.Combine(directory, relative));
+                string portable = relative.Replace('/', Path.DirectorySeparatorChar)
+                    .Replace('\\', Path.DirectorySeparatorChar);
+                builder[guid] = PathHelper.NormalizePath(Path.Combine(directory, portable));
             }
             catch (ArgumentException)
             {

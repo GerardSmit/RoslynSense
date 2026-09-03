@@ -60,7 +60,7 @@ public sealed class UserCodeMap
     public static UserCodeMap From(IEnumerable<string> outputAssemblies) =>
         new(outputAssemblies
             .Where(p => p is { Length: > 0 })
-            .Select(Path.GetFileNameWithoutExtension)
+            .Select(PortableAssemblyName)
             .Where(n => n is { Length: > 0 })
             .Select(n => n!));
 
@@ -79,7 +79,7 @@ public sealed class UserCodeMap
             return UserCodeVerdict.Unknown;
 
         string name;
-        try { name = Path.GetFileNameWithoutExtension(modulePath); }
+        try { name = PortableAssemblyName(modulePath); }
         catch { return UserCodeVerdict.Unknown; }
 
         if (name.Length > 0 && _assemblies.Contains(name))
@@ -124,6 +124,9 @@ public sealed class UserCodeMap
     /// </remarks>
     public bool CouldBeUserCode(string modulePath) =>
         Classify(modulePath) != UserCodeVerdict.External;
+
+    private static string PortableAssemblyName(string path) =>
+        Path.GetFileNameWithoutExtension(path.Replace('\\', '/'));
 
     /// <summary>
     /// Directories nobody's own code is built into.

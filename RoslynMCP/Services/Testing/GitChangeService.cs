@@ -245,8 +245,13 @@ public static partial class GitChangeService
             currentIsDeleted = false;
         }
 
-        string ToFullPath(string path) =>
-            Path.GetFullPath(Path.Combine(repositoryRoot, path));
+        string ToFullPath(string path)
+        {
+              // Preserve the root's syntax. Tests and protocol callers can supply a Windows
+              // checkout path even when this code is running in a Linux container.
+              char separator = repositoryRoot.Contains('\\') ? '\\' : Path.DirectorySeparatorChar;
+              return Path.GetFullPath(repositoryRoot.TrimEnd('/', '\\') + separator + path);
+          }
 
         foreach (string raw in diff.Split('\n'))
         {

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Languages.MsBuild.Core;
 
@@ -70,7 +71,7 @@ internal static class MsBuildFile
         if (filePath is not { Length: > 0 })
             return MsBuildFileKind.None;
 
-        string name = Path.GetFileName(filePath);
+        string name = PathHelper.GetFileName(filePath);
 
         if (name.Equals("packages.config", StringComparison.OrdinalIgnoreCase))
             return MsBuildFileKind.PackagesConfig;
@@ -78,7 +79,7 @@ internal static class MsBuildFile
         if (name.Equals("nuget.config", StringComparison.OrdinalIgnoreCase))
             return MsBuildFileKind.NuGetConfig;
 
-        return Path.GetExtension(filePath).ToLowerInvariant() switch
+        return Path.GetExtension(name).ToLowerInvariant() switch
         {
             ".csproj" or ".fsproj" or ".vbproj" => MsBuildFileKind.Project,
             ".props" => MsBuildFileKind.Properties,

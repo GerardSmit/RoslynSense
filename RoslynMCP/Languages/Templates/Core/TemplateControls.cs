@@ -136,7 +136,9 @@ internal sealed class TemplateControls
         foreach (string folder in _folders)
         {
             string root = Path.Combine(
-                _contentRoot, folder.Replace('/', Path.DirectorySeparatorChar));
+                _contentRoot,
+                folder.Replace('/', Path.DirectorySeparatorChar)
+                    .Replace('\\', Path.DirectorySeparatorChar));
 
             if (!Directory.Exists(root))
                 continue;

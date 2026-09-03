@@ -32,8 +32,12 @@ jobs:
   build-test:
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # The exhaustive suite includes Visual Studio MSBuild, .NET Framework and Windows debugger
+        # scenarios. Linux is covered end-to-end by both VS Code integration channels below and
+        # by the release container smoke test, without mixing incompatible toolchain assumptions.
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
 
     steps:

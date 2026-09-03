@@ -80,13 +80,13 @@ internal static class LspConverters
     {
         string local = new Uri(uri).LocalPath;
 
-        // Only where a drive letter means one: elsewhere "/c:/x" is a directory named "c:".
-        return OperatingSystem.IsWindows()
-               && local.Length >= 3
+        // VS Code can send a Windows file URI to a server-side normalization path while tests
+        // and remote tooling run on another OS. Preserve its drive syntax before GetFullPath.
+        return local.Length >= 3
                && local[0] == '/'
                && char.IsAsciiLetter(local[1])
                && local[2] == ':'
-            ? local[1..]
+            ? local[1..].Replace('/', '\\')
             : local;
     }
 

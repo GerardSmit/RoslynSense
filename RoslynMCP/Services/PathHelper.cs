@@ -11,6 +11,20 @@ namespace RoslynMCP.Services;
 /// </summary>
 internal static partial class PathHelper
 {
+    /// <summary>Gets the last path component even when the spelling uses the other OS's separator.</summary>
+    public static string GetFileName(string path) =>
+        Path.GetFileName(path.Replace('\\', '/'));
+
+    /// <summary>Gets the last path component without its extension across either separator style.</summary>
+    public static string GetFileNameWithoutExtension(string path) =>
+        Path.GetFileNameWithoutExtension(path.Replace('\\', '/'));
+
+    /// <summary>Whether a path is rooted in either the native or Windows drive/UNC syntax.</summary>
+    public static bool IsRooted(string path) =>
+        Path.IsPathRooted(path)
+        || (path.Length >= 3 && char.IsAsciiLetter(path[0]) && path[1] == ':' && path[2] is '/' or '\\')
+        || path.StartsWith("\\\\", StringComparison.Ordinal);
+
     [GeneratedRegex("""Sdk\s*=\s*["']([^"']+)["']""", RegexOptions.IgnoreCase)]
     private static partial Regex SdkAttributeRegex();
 
@@ -356,7 +370,10 @@ internal static partial class PathHelper
                 {
                     var rel = elem.GetAttributeValue("Path");
                     if (!string.IsNullOrEmpty(rel) && rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-                        result.Add(Path.GetFullPath(Path.Combine(slnDir, rel.Replace('/', Path.DirectorySeparatorChar))));
+                        result.Add(Path.GetFullPath(Path.Combine(
+                            slnDir,
+                            rel.Replace('\\', Path.DirectorySeparatorChar)
+                               .Replace('/', Path.DirectorySeparatorChar))));
                 }
             }
             else
@@ -368,7 +385,10 @@ internal static partial class PathHelper
                     if (parts.Length < 6) continue;
                     var rel = parts[5];
                     if (rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-                        result.Add(Path.GetFullPath(Path.Combine(slnDir, rel.Replace('\\', Path.DirectorySeparatorChar))));
+                        result.Add(Path.GetFullPath(Path.Combine(
+                            slnDir,
+                            rel.Replace('\\', Path.DirectorySeparatorChar)
+                               .Replace('/', Path.DirectorySeparatorChar))));
                 }
             }
         }

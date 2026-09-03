@@ -412,20 +412,21 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
     }
 
     [RequiresX86WorkerFact]
-    public async Task WhenAnArrayIsLongerThanThePageThenTheMoreRowContinuesIt()
+    public async Task WhenAnArrayIsLongerThanThePageThenRangeRowsReachEveryElement()
     {
         var locals = await fixture.LocalsAsync();
         var many = Assert.Single(locals, v => v.Name == "many");
-        var firstPage = await fixture.ExpandAsync(many.VariablesReference);
+        var ranges = await fixture.ExpandAsync(many.VariablesReference);
 
-        var more = Assert.Single(firstPage, c => c.Name == "...");
-        Assert.False(string.IsNullOrEmpty(more.VariablesReference), "the ... row is not expandable");
+        Assert.Equal(["[0..99]", "[100..199]", "[200..249]"], ranges.Select(v => v.Name));
+        var middle = Assert.Single(ranges, c => c.Name == "[100..199]");
+        Assert.False(string.IsNullOrEmpty(middle.VariablesReference), "the range row is not expandable");
 
-        var secondPage = await fixture.ExpandAsync(more.VariablesReference);
+        var elements = await fixture.ExpandAsync(middle.VariablesReference);
 
-        // The second page starts where the first stopped, not back at [0].
-        Assert.DoesNotContain(secondPage, c => c.Name == "[0]");
-        Assert.Equal("55", Assert.Single(secondPage, c => c.Name == "[100]").Value);
+        // Expanding a range starts at that range, not back at the beginning of the array.
+        Assert.DoesNotContain(elements, c => c.Name == "[0]");
+        Assert.Equal("55", Assert.Single(elements, c => c.Name == "[100]").Value);
     }
 
     [RequiresX86WorkerFact]

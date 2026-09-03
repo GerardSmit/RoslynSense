@@ -11,7 +11,11 @@ public class WorkflowConfigurationTests
 
         Assert.Contains("dotnet-version: 10.0.x", content, StringComparison.Ordinal);
         Assert.Contains("dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo", content, StringComparison.Ordinal);
-        Assert.Contains("dotnet test RoslynMCP.sln --configuration Release --no-build --nologo -p:UseAppHost=false", content, StringComparison.Ordinal);
+        Assert.Contains("dotnet test RoslynMCP.sln", content, StringComparison.Ordinal);
+        Assert.Contains("--configuration Release", content, StringComparison.Ordinal);
+        Assert.Contains("--no-build", content, StringComparison.Ordinal);
+        Assert.Contains("-p:UseAppHost=false", content, StringComparison.Ordinal);
+        Assert.Contains("--blame-hang", content, StringComparison.Ordinal);
     }
 
     [Fact]

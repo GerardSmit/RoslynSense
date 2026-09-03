@@ -37,9 +37,27 @@ public class WorkflowConfigurationTests
         Assert.Contains("RoslynSense", content, StringComparison.Ordinal);
         Assert.Contains("dotnet nuget push", content, StringComparison.Ordinal);
         Assert.Contains("NUGET_API_KEY", content, StringComparison.Ordinal);
+        Assert.Contains("uses: azure/login@v3", content, StringComparison.Ordinal);
+
+        string packageStep = GetWorkflowStep(content, "Package the extension at the release version");
+        Assert.Contains(
+            "EXTENSION_PRERELEASE: ${{ steps.version.outputs.extension_prerelease }}",
+            packageStep,
+            StringComparison.Ordinal);
+        Assert.Contains("$vsceArgs += '--pre-release'", packageStep, StringComparison.Ordinal);
         // GitHub Release
         Assert.Contains("softprops/action-gh-release", content, StringComparison.Ordinal);
         Assert.Contains("contents: write", content, StringComparison.Ordinal);
+    }
+
+    private static string GetWorkflowStep(string workflow, string stepName)
+    {
+        string marker = $"- name: {stepName}";
+        int start = workflow.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Workflow step '{stepName}' was not found.");
+
+        int next = workflow.IndexOf("\n      - name:", start + marker.Length, StringComparison.Ordinal);
+        return next >= 0 ? workflow[start..next] : workflow[start..];
     }
 
     private static string GetRepoPath(params string[] parts)

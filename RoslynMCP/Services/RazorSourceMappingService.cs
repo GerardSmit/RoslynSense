@@ -38,8 +38,7 @@ internal static partial class RazorSourceMappingService
             if (!IsRazorGeneratedDocument(doc))
                 continue;
 
-            var text = await doc.GetTextAsync(cancellationToken);
-            var lineMappings = ParseLineDirectives(doc.FilePath ?? doc.Name, text);
+            var lineMappings = await LineMappingsAsync(doc, cancellationToken);
 
             foreach (var mapping in lineMappings)
             {
@@ -57,6 +56,77 @@ internal static partial class RazorSourceMappingService
         }
 
         return new RazorSourceMap(mappings, razorToGenerated);
+    }
+
+    /// <summary>One generated document's <c>#line</c> mappings, against a checksum of the text
+    /// they were read from.</summary>
+    /// <remarks>
+    /// A checksum rather than a <see cref="VersionStamp"/>, which is what the equivalent memo for
+    /// ordinary documents uses. These documents come out of a source generator, and re-running one
+    /// produces a new version for text identical to what it produced last time — so a version
+    /// comparison misses whenever the driver decides to run again, which is often enough that the
+    /// memo stopped helping. What the mappings actually depend on is the bytes.
+    /// </remarks>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string, (System.Collections.Immutable.ImmutableArray<byte> Checksum, IReadOnlyList<RazorLineMapping> Mappings)>
+        s_lineMappings = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The project file and the generator's hint name, rather than the document's id.
+    /// </summary>
+    /// <remarks>
+    /// A source-generated document gets a fresh <see cref="DocumentId"/> whenever the project it
+    /// belongs to is reloaded, so an id-keyed memo starts empty again after every reload — and a
+    /// reload is exactly what a project-shaping change causes. The project file and the hint name
+    /// together name the same generated file across those, and the checksum decides whether its
+    /// contents are still the ones that were scanned.
+    /// </remarks>
+    private static string MemoKey(Document doc) =>
+        $"{doc.Project.FilePath ?? doc.Project.Name}|{doc.FilePath ?? doc.Name}";
+
+    /// <summary>Bounds the memo; dropping all of it costs one rebuild, which is what every rebuild
+    /// used to cost.</summary>
+    private const int MaxLineMappingScans = 4096;
+
+    private static long s_lineMappingParseCount;
+
+    /// <summary>How many generated documents have actually been read and scanned, as opposed to
+    /// answered from the memo. A test hook, for the same reason
+    /// <see cref="Languages.WebForms.Core.AspxSourceMappingService.AccessorScanCount"/> is
+    /// one.</summary>
+    internal static long LineMappingParseCount => Interlocked.Read(ref s_lineMappingParseCount);
+
+    /// <summary>
+    /// The mappings a generated document declares, remembered against its text version.
+    /// </summary>
+    /// <remarks>
+    /// Editing one <c>.razor</c> — or adding any <c>.cs</c> — marks the whole map stale, and
+    /// rebuilding it read and re-scanned the text of every Razor-generated document in the project
+    /// for <c>#line</c> directives. Only the generated documents that actually moved can have
+    /// different directives, so the rest cost a version comparison. The map itself is still
+    /// reassembled each time: which documents a <c>.razor</c> generates is not a per-document fact.
+    /// </remarks>
+    private static async Task<IReadOnlyList<RazorLineMapping>> LineMappingsAsync(
+        Document doc, CancellationToken cancellationToken)
+    {
+        var text = await doc.GetTextAsync(cancellationToken);
+        var checksum = text.GetChecksum();
+        string key = MemoKey(doc);
+
+        if (s_lineMappings.TryGetValue(key, out var cached)
+            && cached.Checksum.AsSpan().SequenceEqual(checksum.AsSpan()))
+        {
+            return cached.Mappings;
+        }
+
+        Interlocked.Increment(ref s_lineMappingParseCount);
+        var parsed = ParseLineDirectives(doc.FilePath ?? doc.Name, text);
+
+        if (s_lineMappings.Count >= MaxLineMappingScans)
+            s_lineMappings.Clear();
+
+        s_lineMappings[key] = (checksum, parsed);
+        return parsed;
     }
 
     /// <summary>

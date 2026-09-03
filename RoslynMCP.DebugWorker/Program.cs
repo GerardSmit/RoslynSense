@@ -58,7 +58,7 @@ internal static class Program
                 var response = await HandleAsync(request);
                 Write(response);
 
-                if (request.Op == "terminate")
+                if (request.Op is "terminate" or "shutdown")
                     break;
             }
         }
@@ -120,6 +120,16 @@ internal static class Program
                     session.Attach(request.Pid, request.Breakpoints ?? [], request.Runtime);
                     break;
 
+                case "launch":
+                    session.Launch(
+                        request.Executable ?? throw new ArgumentException("no executable supplied"),
+                        request.Arguments ?? [],
+                        request.Breakpoints ?? [],
+                        request.Environment,
+                        request.WorkingDirectory,
+                        request.Runtime);
+                    break;
+
                 case "addBreakpoint":
                     if (request.Breakpoint is null)
                         throw new ArgumentException("no breakpoint supplied");
@@ -134,16 +144,51 @@ internal static class Program
                     session.Continue();
                     break;
 
+                case "pause":
+                    session.Pause();
+                    break;
+
                 case "step":
                     session.Step(request.Step);
                     break;
 
                 case "stackTrace":
-                    response.Frames = await session.StackTraceAsync();
+                    response.Frames = await session.StackTraceAsync(request.ThreadId);
+                    break;
+
+                case "threads":
+                    response.Threads = await session.ThreadsAsync();
                     break;
 
                 case "variables":
                     response.Variables = await session.VariablesAsync(request.FrameIndex);
+                    break;
+
+                case "expand":
+                    response.Variables = await session.ExpandAsync(request.FrameIndex, request.Path ?? "");
+                    break;
+
+                case "displayOptions":
+                    session.DisplayOptions = request.DisplayOptions ?? new DebugDisplayOptions();
+                    break;
+
+                case "injectAgent":
+                {
+                    var (ok, detail) = await session.InjectAgentAsync(new DebugSession.AgentInjection(
+                        request.ModulePath ?? "",
+                        request.TypeName ?? "",
+                        request.MethodName ?? "",
+                        request.Value));
+                    // Empty means it started; anything else is why it did not. Reported as a
+                    // normal answer, because a process that cannot take the agent is an outcome,
+                    // not a broken request.
+                    response.Value = ok ? "" : detail.Length > 0 ? detail : "the agent did not start";
+                    break;
+                }
+
+                case "decompiledSymbols":
+                    if (DecompiledSymbolMap.Parse(request.DecompiledSymbols) is { } decompiled)
+                        session.AddDecompiledSymbols(request.ModulePath ?? "", decompiled);
                     break;
 
                 case "evaluate":
@@ -161,6 +206,78 @@ internal static class Program
                         request.FrameIndex, request.Name ?? "", request.Value ?? "");
                     response.Ok = ok;
                     response.Variable = variable;
+                    response.Error = error;
+                    break;
+                }
+
+                case "applyDelta":
+                {
+                    var (ok, error) = await session.ApplyDeltaAsync(
+                        request.Name ?? "",
+                        Convert.FromBase64String(request.MetadataDelta ?? ""),
+                        Convert.FromBase64String(request.IlDelta ?? ""),
+                        Convert.FromBase64String(request.PdbDelta ?? ""),
+                        request.SymbolMap);
+                    response.Ok = ok;
+                    response.Error = error;
+                    break;
+                }
+
+                case "runToLocation":
+                    response.RunToLocation = await session.RunToLocationAsync(new RunToLocationRequest
+                    {
+                        Location = new SourceRange
+                        {
+                            FilePath = request.FilePath ?? "",
+                            Line = (uint)Math.Max(0, request.Line),
+                        },
+                        Force = request.Force,
+                        ModulePath = request.ModulePath ?? "",
+                        MethodToken = request.MethodToken,
+                        IlOffset = request.IlOffset,
+                    });
+                    break;
+
+                case "setNextStatement":
+                    response.SetNextStatement = await session.SetNextStatementAsync(new SetNextStatementRequest
+                    {
+                        FrameIndex = request.FrameIndex,
+                        Location = new SourceRange
+                        {
+                            FilePath = request.FilePath ?? "",
+                            Line = (uint)Math.Max(0, request.Line),
+                        },
+                        MethodToken = request.MethodToken,
+                        IlOffset = request.IlOffset,
+                    });
+                    break;
+
+                case "modules":
+                    response.Modules = await session.ModulesAsync();
+                    break;
+
+                case "detach":
+                {
+                    var (ok, error) = await session.DetachAsync();
+                    response.Ok = ok;
+                    response.Error = error;
+                    break;
+                }
+
+                case "exceptionPolicy":
+                    session.SetExceptionPolicy(request.ExceptionPolicy ?? ExceptionPolicy.Default);
+                    break;
+
+                case "shutdown":
+                {
+                    var timeout = request.TimeoutSeconds > 0
+                        ? TimeSpan.FromSeconds(request.TimeoutSeconds)
+                        : TimeSpan.FromSeconds(10);
+                    var (graceful, error) = await session.ShutdownAsync(timeout);
+
+                    // A debuggee that had to be killed is still a completed request: the caller
+                    // wants to report how the session ended, not to see it fail.
+                    response.Graceful = graceful;
                     response.Error = error;
                     break;
                 }

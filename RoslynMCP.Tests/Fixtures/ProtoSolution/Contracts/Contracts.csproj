@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ProtoSolution.Contracts</RootNamespace>
+    <!--
+      Same reason as the single-project ProtoProject fixture: the sources under Generated\ are
+      shaped exactly like protoc's output, and protoc emits nullable-oblivious code. Silencing the
+      diagnostics it trips keeps the fixture a faithful copy and still compiles clean.
+      CS8765/CS8767 come from the generated Equals pair: object.Equals(object?) is overridden as
+      Equals(object) and IEquatable<T>.Equals(T?) is implemented as Equals(T).
+    -->
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CS8765;CS8767</NoWarn>
+  </PropertyGroup>
+
+  <!--
+    Deliberately no Grpc.Tools and no <Protobuf> items: the fixture must build without protoc.
+    Only the runtime packages the generated code binds against are referenced, pinned to the
+    versions the generated code was produced with — the same versions ProtoProject pins, so a
+    solution holding both fixtures restores one copy of each.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.32.1" />
+    <PackageReference Include="Grpc.Core.Api" Version="2.71.0" />
+  </ItemGroup>
+
+</Project>

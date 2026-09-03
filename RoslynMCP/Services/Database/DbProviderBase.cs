@@ -16,7 +16,7 @@ public abstract class DbProviderBase : IDbProvider
 
     public string Alias { get; }
     public string ProviderName { get; }
-    protected string ConnectionString { get; }
+    protected internal string ConnectionString { get; }
 
     protected abstract DbConnection CreateConnection();
     protected abstract DbCommand CreateCommand(string sql, DbConnection conn);

@@ -112,6 +112,11 @@ internal static class DaemonClient
     {
         if (!forceLocal)
         {
+            // Once the request has been written the daemon may have executed it, even if the
+            // response never arrives. Re-running locally at that point would apply a mutating
+            // tool (a refactoring, a project edit) twice — so the fallback is only for failures
+            // that happen before delivery.
+            bool delivered = false;
             try
             {
                 var pipe = await DaemonSpawner.ConnectOrSpawnAsync(solutionKey, ct);
@@ -121,9 +126,14 @@ internal static class DaemonClient
                     {
                         var request = new DaemonRequest(Guid.NewGuid().ToString("N"), name, args, format, kind);
                         await IpcProtocol.WriteMessageAsync(pipe, request, ct);
+                        delivered = true;
                         var response = await IpcProtocol.ReadMessageAsync<DaemonResponse>(pipe, ct);
                         if (response is not null)
                             return (response.Ok, response.Ok ? response.Result ?? "" : response.Error ?? $"{kind} failed.");
+
+                        return (false,
+                            $"The shared host accepted the {kind} call but closed the connection " +
+                            "before answering; whether it ran is unknown. Check the state and retry if needed.");
                     }
                 }
             }
@@ -131,9 +141,15 @@ internal static class DaemonClient
             {
                 throw;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!delivered)
             {
                 Console.Error.WriteLine($"[SharedHost] Forwarding failed, running in-process: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return (false,
+                    $"The shared host connection failed after the {kind} call was sent " +
+                    $"({ex.Message}); whether it ran is unknown. Check the state and retry if needed.");
             }
         }
 

@@ -5,7 +5,7 @@ using Microsoft.CodeAnalysis;
 
 namespace WebFormsCore;
 
-internal static class Descriptors
+public static class Descriptors
 {
     private const string Category = "WebFormsCore";
 
@@ -16,4 +16,9 @@ internal static class Descriptors
     public static readonly DiagnosticDescriptor InheritNotFound = new("WFC0005", "Inherit not found", "Could not detect the inherit attribute in file '{0}'", Category, DiagnosticSeverity.Warning, true);
     public static readonly DiagnosticDescriptor UnexpectedClosingTag = new("WFC0006", "Unexpected closing tag", "Expected closing tag for '{0}' but found '{1}'", Category, DiagnosticSeverity.Warning, true);
     public static readonly DiagnosticDescriptor TypeNotFoundInNamespace = new("WFC0007", "Type not found in namespace", "Could not find type '{0}' in namespace '{1}'", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor EventHandlerNotFound = new("WFC0008", "Event handler not found", "'{1}' does not contain a definition for '{0}'", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor DuplicateAttribute = new("WFC0009", "Duplicate attribute", "The attribute '{0}' is written more than once on this tag; the first is used", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor InheritsTypeNotFound = new("WFC0010", "Code-behind class not found", "Could not find the class '{0}' named by Inherits; the page is read as '{1}'", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor ClosingTagWithNothingOpen = new("WFC0011", "Closing tag with nothing open", "Unexpected closing tag '{0}': nothing is open here", Category, DiagnosticSeverity.Warning, true);
+    public static readonly DiagnosticDescriptor IncludeFileNotFound = new("WFC0012", "Include file not found", "Could not find include file '{0}'", Category, DiagnosticSeverity.Warning, true);
 }

@@ -36,15 +36,20 @@ public interface IDebugSession
     void Continue();
     void Pause();
     void Step(StepKind kind);
-    void SetExceptionPolicy(bool breakOnFirstChance);
-    Task<List<StackFrame>> StackTraceAsync();
+    void SetExceptionPolicy(ExceptionPolicy policy);
+    /// <param name="threadId">Which thread to walk; <c>0</c> means the one the stop landed on.</param>
+    Task<List<StackFrame>> StackTraceAsync(int threadId = 0);
     Task<List<DebugThread>> ThreadsAsync();
     Task<List<DebugModule>> ModulesAsync();
     Task<List<DebugVariable>> VariablesAsync(uint frameIndex);
+    Task<List<DebugVariable>> ExpandAsync(uint frameIndex, string path);
+    DebugDisplayOptions DisplayOptions { get; set; }
     Task<List<DebugScope>> ScopesAsync(uint frameIndex);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(uint frameIndex, string name, string value);
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
-    Task<(bool Ok, string Error)> ApplyDeltaAsync(string assemblyName, byte[] metadata, byte[] il);
+    Task<(bool Ok, string Error)> ApplyDeltaAsync(
+        string assemblyName, byte[] metadata, byte[] il, byte[] pdb, string? symbolMap = null);
     Task<(bool Ok, string Error)> DetachAsync();
+    Task<(bool Graceful, string Error)> ShutdownAsync(TimeSpan timeout);
     void Terminate();
 }

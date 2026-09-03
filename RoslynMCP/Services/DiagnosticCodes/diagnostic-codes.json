@@ -1,0 +1,1087 @@
+{
+"MSB1051": {
+"description": "MSB1051: Specify one or more warning codes to treat as low importance messages when using the -warnAsMessage switch.",
+"severity": "warning"
+},
+"MSB1060": {
+"description": "There are two errors that can give this error code. The first relates to the -warnNotAsError (or the short form -noerr) command-line switch. See MSBuild command line reference.",
+"severity": "warning"
+},
+"MSB3052": {
+"description": "This error occurs when a command-line input to the Csc task was incorrectly specified, perhaps due to a syntax error, incorrect shell escape character, or missing or incorrect environment variable or property value.",
+"severity": "warning"
+},
+"MSB3160": {
+"description": "MSB3160: Xml Validation warning in file 'value':",
+"severity": "warning"
+},
+"MSB3178": {
+"description": "This warning occurs when MSBuild tries to process a manifest file, but encountered a file that looks like an assembly that was specified as an ordinary file, instead of using the correct XML structure for an assembly.",
+"severity": "warning"
+},
+"MSB3187": {
+"description": "This message is a warning, not an error. The question is whether the platform mismatch is intended or not.",
+"severity": "warning"
+},
+"MSB3232": {
+"description": "This warning occurs when MSBuild tries to remove a directory, but the directory provided to the RemoveDir task was an empty string. See RemoveDir task.",
+"severity": "warning"
+},
+"MSB3243": {
+"description": "This diagnostic code is emitted when MSBuild finds two conflicting assemblies for a given reference, with no way to resolve the conflict.",
+"severity": "warning"
+},
+"MSB3247": {
+"description": "MSB3247: Found conflicts between different versions of the same dependent assembly. In Visual Studio, double-click this warning (or select it and press Enter) to fix the conflicts; otherwise, add the following binding re…",
+"severity": "warning"
+},
+"MSB3268": {
+"description": "This warning occurs when your project references an assembly that itself has a dependency on a framework assembly that requires a different version of the framework.",
+"severity": "warning"
+},
+"MSB3270": {
+"description": "The message indicates that you're trying to use a dependency from an architecture that doesn't match the target architecture configured for your project.",
+"severity": "warning"
+},
+"MSB3271": {
+"description": "The WinMD file is the Windows Metadata file, which contains type information for UWP or WinRT applications that enables language projection. For more information, see WinMD files.",
+"severity": "warning"
+},
+"MSB3273": {
+"description": "The WinMD file is the Windows Metadata file, which contains type information for UWP or WinRT applications that enables language projection. See WinMD files.",
+"severity": "warning"
+},
+"MSB3277": {
+"description": "This warning occurs during a build when more than one version of the same dependent assembly is referenced in a build of the same project.",
+"severity": "warning"
+},
+"MSB3305": {
+"description": "This warning is a generic notification of an issue with a COM reference. Some possible causes include:",
+"severity": "warning"
+},
+"MSB3483": {
+"description": "MSB3483: A warning occurred while signing:",
+"severity": "warning"
+},
+"MSB3491": {
+"description": "This error occurs when MSBuild tries to write to a file, but the operating system returns an error.",
+"severity": "warning"
+},
+"MSB3501": {
+"description": "This error occurs when your project is using the ReadLinesFromFile task, but the specified file wasn't found.",
+"severity": "warning"
+},
+"MSB3825": {
+"description": "This warning occurs with .NET 8 and earlier. The deprecated .NET type , previously commonly used for serializing and deserializing arbitrary .NET types, isn't considered secure, because it allows arbitrary .NET types to…",
+"severity": "warning"
+},
+"MSB4010": {
+"description": "MSB4010: The 'value' files could not be successfully loaded from their expected location 'value'. Default tasks will not be available.",
+"severity": "warning"
+},
+"MSB4011": {
+"description": "This diagnostic code is emitted when you import the same project more than once in the same project file. This build issue isn't a blocking error.",
+"severity": "warning"
+},
+"MSB4130": {
+"description": "MSB4130: The condition 'value' may have been evaluated incorrectly in an earlier version of MSBuild. Please verify that the order of the AND and OR clauses is written as intended.",
+"severity": "warning"
+},
+"MSB4196": {
+"description": "MSB4196: The 'value' files could not be successfully loaded from their expected location 'value'. Default tasks will not be overridden.",
+"severity": "warning"
+},
+"MSB4262": {
+"description": "MSB4262: Solution file 'value' contains the following warnings and errors: Warnings: 'value' Errors: Warnings: {1} Errors: {2} -->",
+"severity": "warning"
+},
+"MSB8000": {
+"severity": "warning"
+},
+"MSB8025": {
+"severity": "warning"
+},
+"MSB8027": {
+"description": "This error occurs when two or more source files have the same name, and build results go to the same intermediate directory.",
+"severity": "warning"
+},
+"MSB8030": {
+"severity": "warning"
+},
+"MSB8088": {
+"severity": "warning"
+},
+"NU1000": {
+"description": "The NuGet operation had a problem. NU1000 is used when we haven't yet assigned a unique error code for that issue. So we can improve, please feel free to file the issue with details of your error.",
+"severity": "error"
+},
+"NU1001": {
+"description": "The project doesn't contain one or more frameworks.",
+"message": "The project 'Project' does not specify any target frameworks in 'ProjectFile'",
+"severity": "error"
+},
+"NU1002": {
+"description": "Invalid combination of inputs along with a CLEAR keyword.",
+"message": "'CLEAR' cannot be used in conjunction with other values",
+"severity": "error"
+},
+"NU1003": {
+"description": "PackageTargetFallback and AssetTargetFallback provide different behavior for selecting assets and cannot be used together.",
+"message": "PackageTargetFallback and AssetTargetFallback cannot be used together. Remove PackageTargetFallback(deprecated) references from the project environment.",
+"severity": "error"
+},
+"NU1004": {
+"description": "When restore is run in locked mode, it ensures that the project dependencies have not changed since the last restore. A new framework, net5.0 has been added to the project.",
+"message": "The project target frameworks are different than the lock file's target frameworks. Lock file target frameworks: net6.0,net5.0. Project target frameworks net6.0.",
+"severity": "error"
+},
+"NU1005": {
+"description": "There are 2 opt-in methods the lock file functionality, by setting the RestorePackagesWithLockFile property, or create a packages.lock.json next to the project file, and they are conflicting.",
+"message": "Invalid restore input where RestorePackagesWithLockFile property is set to false but a packages lock file exists at C:\\SourceCode\\ContosoProject\\Contoso.Library\\packages.lock.json",
+"severity": "error"
+},
+"NU1006": {
+"description": "The configuration file has an invalid package source value.",
+"message": "NuGet.Config has an invalid package source value 'C:\\PackageSource>\\'. Reason: Illegal characters in path.",
+"severity": "error"
+},
+"NU1007": {
+"description": "The runtime.json specified in the project could not be parsed. This is normally a .NET SDK, or a package issue.",
+"message": "The runtime.json specified in the project 'C:\\Program Files\\dotnet\\sdk\\X.Y.Z00\\RuntimeIdentifierGraph.json",
+"severity": "error"
+},
+"NU1008": {
+"description": "A project is configured to use NuGet Central Package Management and a item is defined which specifies a value for the Version attribute:",
+"message": "The following PackageReference items cannot define a value for Version: PackageName. Projects using Central Package Management must define a Version value on a PackageVersion item.",
+"severity": "error"
+},
+"NU1009": {
+"description": "A project is configured to use NuGet Central Package Management and a item is defined in the Directory.Packages.props file for a package that is implicitly defined.",
+"message": "The following PackageReference items are implicitly defined and cannot define a PackageVersion item: PackageName.",
+"severity": "error"
+},
+"NU1010": {
+"description": "A project is configured to use NuGet Central Package Management and a item is defined but a corresponding item with the same name is not defined in the Directory.Packages.props file:",
+"message": "The following PackageReference items do not define a corresponding PackageVersion item: PackageName.",
+"severity": "error"
+},
+"NU1011": {
+"description": "A project is configured to use NuGet Central Package Management and a item is defined which specifies a floating version value for the Version attribute:",
+"message": "The following PackageVersion items cannot specify a floating version: PackageName.",
+"severity": "error"
+},
+"NU1012": {
+"description": "You have specified a target framework with a platform in your project file but the platform version is not available.",
+"message": "Platform version is not present for one or more target frameworks, even though they have specified a platform: net6.0-android.",
+"severity": "error"
+},
+"NU1013": {
+"description": "A project is configured to use NuGet Central Package Management and a item is defined which specifies a value for the VersionOverride attribute but this functionality has been disabled:",
+"message": "The following PackageReference items cannot specify a value for VersionOverride: PackageName. Projects using Central Package Management are currently configured to disable this functionality.",
+"severity": "error"
+},
+"NU1014": {
+"description": "Your project file, or a file it imports (for example Directory.Build.props) has defined the MSBuild property shown in the error message (either NuGetAudit, NuGetAuditLevel, or NuGetAuditMode) to an invalid value.",
+"message": "Invalid NuGetAudit value 'sample'. Valid values: true, false.",
+"severity": "error"
+},
+"NU1015": {
+"description": "Your project file, or a file it imports (for example Directory.Build.props) has defined a PackageReference without a version.",
+"message": "The following PackageReference item(s) do not have a version specified: Contoso.Utilities",
+"severity": "error"
+},
+"NU1016": {
+"description": "Managing packages with project.json is deprecated. Migrate to PackageReference.",
+"message": "Managing packages with project.json is deprecated. Migrate to PackageReference.",
+"severity": "error"
+},
+"NU1017": {
+"description": "The package ID is invalid because it does not match the required format. NuGet validates package IDs using this regex:",
+"message": "Invalid package id : contoso../id.",
+"severity": "error"
+},
+"NU1018": {
+"description": "Your project file has multiple TargetFrameworks entries that resolve to the same NuGet framework. This scenario is known as framework aliasing, where different TargetFramework properties map to the same underlying framework.",
+"message": "The project 'MyProject' is attempting to restore duplicate frameworks, which are supported only in the default dependency resolver when the .NET SDK is version 10.0.300 or newer.",
+"severity": "error"
+},
+"NU1019": {
+"description": "Your project file has a TargetFramework or TargetFrameworks value that contains disallowed characters. NuGet doesn't allow the following characters in target framework names:",
+"message": "The project 'MyProject' contains a TargetFramework 'net10.0/benchmark' with disallowed characters. TargetFramework names must contain only ASCII characters and must not contain path separators.",
+"severity": "error"
+},
+"NU1100": {
+"description": "A dependency could not be resolved. This is a generic issue for types that are not packages or projects.",
+"message": "Unable to resolve 'Dependency (>= 1.0.0)' for 'TargetFramework'",
+"severity": "error"
+},
+"NU1101": {
+"description": "The package cannot be found on any sources.",
+"message": "Unable to find package 'PackageId'. No packages exist with this id in source(s): sourceA, sourceB, sourceC",
+"severity": "error"
+},
+"NU1102": {
+"description": "The package identifier is found but a version within the specified dependency range cannot be found on any of the sources. The range might be specified by a package and not the user.",
+"message": "Unable to find package 'PackageId' with version (>= 9.0.1) - Found 30 version(s) in 'sourceA' [ Nearest version: '4.0.0' ] - Found 10 version(s) in 'sourceB' [ Nearest version: '4.0.0-rc-2129' ] - Fou…",
+"severity": "error"
+},
+"NU1103": {
+"description": "The project specified a stable version for the dependency range, but no stable versions were found in that range. Pre-release versions were found but are not allowed.",
+"message": "Unable to find a stable package 'PackageId' with version (>= 3.0.0) - Found 10 version(s) in 'sourceA' [ Nearest version: '4.0.0-rc-2129' ] - Found 9 version(s) in 'sourceB' [ Nearest version: '3.0.0-…",
+"severity": "error"
+},
+"NU1104": {
+"description": "A ProjectReference points to a file that doesn't exist.",
+"message": "Project reference does not exist 'ProjectFile'. Check that the project reference is valid and that the project file exists.",
+"severity": "error"
+},
+"NU1105": {
+"description": "The project file exists but no restore information was provided for it. Ensure you are opening a project with the new project system or the legacy project system.",
+"message": "Unable to read project information for 'ProjectFile'. The project file may be invalid or missing targets required for restore.",
+"severity": "error"
+},
+"NU1106": {
+"description": "Dependency constraints cannot be resolved.",
+"message": "Unable to satisfy conflicting requests for 'PackageId': 'Conflict path' Framework: 'Target graph'",
+"severity": "error"
+},
+"NU1107": {
+"description": "Unable to resolve dependency constraints between packages. Two different packages are asking for two different versions of 'PackageA'. The project needs to choose which version of 'PackageA' to use.",
+"message": "Version conflict detected for 'PackageA'. Install/reference 'PackageA' v4.0.0 directly to resolve this issue. 'PackageB' 3.5.0 -> 'PackageA' (= 3.5.0) 'PackageC' 4.0.0 -> 'PackageA' (= 4.0.0)",
+"severity": "error"
+},
+"NU1108": {
+"description": "A circular dependency was detected.",
+"message": "Cycle detected: A -> B -> A",
+"severity": "error"
+},
+"NU1109": {
+"description": "A project is configured to use NuGet Central Package Management and a transitive package dependency is pinned to a version lower than is specified by the dependency package.",
+"message": "NU1109: Detected package downgrade: PackageB from 2.0.0 to centrally defined 1.0.0. Update the centrally managed package version to a higher version.",
+"severity": "error"
+},
+"NU1110": {
+"description": "A previous restore retrieved package B from a package source which your current solution does not have configured.",
+"message": "NU1110: The package B is available in the Global packages folder, but the source it came from https://api.nuget.org/v3/index.json is not one of the configured sources.",
+"severity": "error"
+},
+"NU1201": {
+"description": "A dependency project doesn't contain a framework compatible with the current project. Typically, the project's target framework is a higher version than the consuming project.",
+"message": "Project 'ProjectA' is not compatible with 'TargetFramework'. Project 'ProjectA' supports: - 'TargetFrameworkA' - 'TargetFrameworkB'",
+"severity": "error"
+},
+"NU1202": {
+"description": "A dependency package doesn't contain any assets compatible with the project.",
+"message": "Package 'PackageId' 4.0.11 is not compatible with 'TargetFramework'. Package 'PackageId' 4.0.11 supports: - 'TargetFrameworkA' - 'TargetFrameworkB' - 'TargetFrameworkC'",
+"severity": "error"
+},
+"NU1203": {
+"description": "The package doesn't support the project's RuntimeIdentifier.",
+"message": "'PackageId' 1.0.0 provides a compile-time reference assembly for 'Foo.dll' on 'TargetFramework', but there is no compatible run-time assembly.",
+"severity": "error"
+},
+"NU1204": {
+"description": "The Contoso.Tool package has more than one package type. [DotnetTool](../../create-packages/set-package-type.md#known-package-types packages can only contain one PackageType.",
+"message": "Invalid tools package Contoso.Tool 1.0.0. Tools packages cannot contain more than one PackageType.",
+"severity": "error"
+},
+"NU1211": {
+"description": "The project you are attempting to restore has special restrictions and exactly 1 PackageReference package must be specified.",
+"message": "Project DotnelToolReferenceProject.csproj must have a single package reference(s).",
+"severity": "error"
+},
+"NU1212": {
+"description": "DotnetToolReference project style can only reference .NET tools with the DotnetTool package type. Either the project style is not DotnetToolReference or a referenced package is not of DotnetTool type.",
+"message": "Invalid project-package combination for Contoso.Library 1.0.0. DotnetToolReference project style can only contain references of the DotnetTool type",
+"severity": "error"
+},
+"NU1213": {
+"description": "Certain package types cannot be installed into standard projects.",
+"message": "The package Contoso.Platform 1.0.0 has a package type DotnetPlatform that is incompatible with this project.",
+"severity": "error"
+},
+"NU1301": {
+"description": "Restore could not be completed because the listed source is unavailable.",
+"message": "The local source 'C:\\Code\\Contoso\\contosoLocalSource' doesn't exist.",
+"severity": "error"
+},
+"NU1302": {
+"description": "myHttpSource is an insecure HTTP source. We recommend using an HTTPS source instead.",
+"message": "You are running the 'restore' operation with an 'HTTP' source: myHttpSource. NuGet requires HTTPS sources.",
+"severity": "error"
+},
+"NU1401": {
+"description": "The package requires features or frameworks not currently supported by the installed version of NuGet.",
+"message": "The 'PackageId' package requires NuGet client version '5.0.0' or above, but the current NuGet version is '4.3.0'.",
+"severity": "error"
+},
+"NU1402": {
+"description": "The package contains a file that is unsafe for extraction.",
+"message": "NU1402: The package 'PackageId.1.0.0' contains an entry '../../foo.dll' which is unsafe for extraction.",
+"severity": "error"
+},
+"NU1403": {
+"description": "The content of the package in the global packages folder is different from the value in the lock file. The package on the source may have changed, or a multiple sources may have different instances of the same package id and version.",
+"message": "Package content hash validation failed for PackageId.13.0.1. The package is different than the last restore.",
+"severity": "error"
+},
+"NU1500": {
+"description": "The NuGet operation had a problem. NU1500 is used when we haven't yet assigned a unique warning code for that issue. So we can improve, please feel free to file the issue with details of your error.",
+"severity": "warning"
+},
+"NU1501": {
+"description": "The project restore is attempting to operate on was not found.",
+"message": "The folder 'FolderPath' does not contain a project to restore.",
+"severity": "warning"
+},
+"NU1502": {
+"description": "RuntimeSupports contains an invalid profile. Typically, the supports profile was not found in a runtime.json file from the current dependency packages.",
+"message": "Unknown Compatibility Profile: 'aaa'",
+"severity": "warning"
+},
+"NU1503": {
+"description": "A dependency project doesn't import NuGet's restore targets. This is similar to NU1105 but here the project is skipped and ignored instead of causing all of restore to fail.",
+"message": "Skipping restore for project 'c:\\a.csproj'. The project file may be invalid or missing targets required for restore.",
+"severity": "warning"
+},
+"NU1504": {
+"description": "Sometimes when adding PackageReference items, you may end up adding an item for a particular package multiple times.",
+"message": "Duplicate 'PackageReference' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior.",
+"severity": "warning"
+},
+"NU1505": {
+"description": "Sometimes when adding PackageDownload items, you may end up adding an item for a particular package multiple times.",
+"message": "Duplicate 'PackageDownload' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior.",
+"severity": "warning"
+},
+"NU1506": {
+"description": "Sometimes when adding PackageVersion items, you may end up adding an item for a particular package multiple times.",
+"message": "Duplicate 'PackageVersion' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior.",
+"severity": "warning"
+},
+"NU1507": {
+"description": "A project is configured to use NuGet Central Package Management and is not configured to use Package Source Mapping.",
+"message": "There are 2 package sources defined in your configuration. When using central package management, please map your package sources with package source mapping or specify a single package source.",
+"severity": "warning"
+},
+"NU1508": {
+"description": "Sometimes when adding NuGetAuditSuppress items, you may end up adding an item for a particular package multiple times.",
+"message": "Duplicate 'NuGetAuditSuppress' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior.",
+"severity": "warning"
+},
+"NU1509": {
+"description": "Sometimes when adding PrunePackageReference items, you may end up adding an item for a particular package multiple times.",
+"message": "Duplicate 'PrunePackageReference' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior.",
+"severity": "warning"
+},
+"NU1510": {
+"description": "This warning is raised as a result of NuGet dependency graph pruning, and indicates that an otherwise prunable package was restored due to a direct PackageReference.",
+"message": "PackageReference System.Text.Json will not be pruned. This package is automatically available and does not need to be referenced explicitly. Remove the PackageReference item",
+"severity": "warning"
+},
+"NU1511": {
+"description": "The project id X has been specified for pruning through the PrunePackageReference feature. Pruning of projects is not supported.",
+"message": "A ProjectReference cannot be pruned, X.",
+"severity": "warning"
+},
+"NU1512": {
+"description": "Both RestoreLockedMode and RestoreForceEvaluate are enabled for the restore, but these options are contradictory:",
+"message": "RestoreForceEvaluate overrides RestoreLockedMode; the packages lock file will be re-evaluated and regenerated, and locked mode is ignored.",
+"severity": "warning"
+},
+"NU1601": {
+"description": "A direct project dependency was bumped to a higher version than the project specified.",
+"message": "Dependency specified was 'PackageId' (>= 3.5.0) but ended up with 'PackageId' 4.0.0.",
+"severity": "warning"
+},
+"NU1602": {
+"description": "A package dependency is missing a lower bound. This doesn't allow restore to find a minimum version to use. When doing a complete restore, NuGet goes online to check all sources instead of using the packages that already exist in the user package folder.",
+"message": "'PackageA' 4.0.0 does not provide an inclusive lower bound for dependency 'PackageB' (> 3.5.0). 3.6.0 was resolved instead.",
+"severity": "warning"
+},
+"NU1603": {
+"description": "A package dependency specified a version that could not be found. Typically, the package sources do not contain the expected lower bound version. A higher version was used instead, which differs from what the package was authored against.",
+"message": "'PackageA' 4.0.0 depends on 'PackageB' (>= 4.0.0) but 4.0.0 was not found. 5.0.0 was resolved instead.",
+"severity": "warning"
+},
+"NU1604": {
+"description": "A project dependency doesn't define a version.",
+"message": "Project dependency 'PackageA' does not contain an inclusive lower bound. Include a lower bound in the dependency version to ensure consistent restore results.",
+"severity": "warning"
+},
+"NU1605": {
+"description": "A dependency package specified a version constraint on a higher version of a package than restore ultimately resolved.",
+"message": "Detected package downgrade: 'PackageB' from 4.0.0 to 3.5.0. Reference the package directly from the project to select a different version.",
+"severity": "warning"
+},
+"NU1608": {
+"description": "A resolved package is higher than a dependency constraint allows. This means that a package referenced directly by a project overrides dependency constraints from other packages.",
+"message": "Detected package version outside of dependency constraint: 'PackageA' 1.0.0 requires 'PackageB' (= 1.0.0) but version 'PackageB' 2.0.0 was resolved.",
+"severity": "warning"
+},
+"NU1701": {
+"description": "AssetTargetFallback was used to select assets from a package. The warning let users know that the assets may not be 100% compatible.",
+"message": "Package 'packageId' was restored using 'TargetFrameworkA' instead the project target framework 'TargetFrameworkB'. This package may not be fully compatible with your project.",
+"severity": "warning"
+},
+"NU1702": {
+"description": "AssetTargetFallback was used to select assets from a package. The warning lets users know that the assets may not be 100% compatible.",
+"message": "ProjectReference 'C:\\Code\\Project2.csproj' was resolved using '.NETFramework,Version=v4.7.2' instead of the project target framework '.NETCoreApp,Version=v5.0'.",
+"severity": "warning"
+},
+"NU1703": {
+"description": "A project targeting net11.0-android or later references a package whose resolved compile-time or runtime assemblies come from a monoandroid framework folder. The MonoAndroid target framework is deprecated in favor of net6.0-android and later .NET TFMs.",
+"message": "Package 'Contoso.Android.Library' 1.0.0 uses the deprecated MonoAndroid framework instead of 'net6.0-android' or later.",
+"severity": "warning"
+},
+"NU1801": {
+"description": "An error occurred when reading the feed when IgnoreFailedSources is set to true, converting it to a non-fatal warning. This could contain any message and is generic.",
+"severity": "warning"
+},
+"NU1802": {
+"description": "Updating last access time on file \"C:\\packages\\contoso.library\\1.0.0\\.nupkg.metadata\" failed with _various failure reasons_",
+"severity": "warning"
+},
+"NU1803": {
+"description": "You are running the 'restore' operation with an 'HTTP' source, 'http://api.source/index.json'. Non-HTTPS access will be removed in a future version. Consider migrating to an 'HTTPS' source.",
+"severity": "warning"
+},
+"NU1900": {
+"description": "Vulnerability data could not be downloaded from one of the package sources.",
+"severity": "warning"
+},
+"NU1901": {
+"description": "A package restored for your project has a known vulnerability.",
+"message": "warning NU1902: Package 'NuGet.Protocol' 5.11.2 has a known moderate severity vulnerability, https://github.com/advisories/GHSA-g3q9-xf95-8hp5",
+"severity": "warning"
+},
+"NU1904": {
+"description": "A package restored for your project has a known vulnerability.",
+"message": "warning NU1902: Package 'NuGet.Protocol' 5.11.2 has a known moderate severity vulnerability, https://github.com/advisories/GHSA-g3q9-xf95-8hp5",
+"severity": "warning"
+},
+"NU1905": {
+"description": "A source specified in a NuGet.Config element did not provide a vulnerability database.",
+"severity": "warning"
+},
+"NU3000": {
+"description": "The package has a primary signature which does not have a timestamp.",
+"message": "[!Tip] Use the verify command to view package signatures and timestamps.",
+"severity": "warning"
+},
+"NU3001": {
+"description": "A password protected certificate file was provided to the NuGet Sign operation. But an invalid or no password was provided.",
+"message": "Invalid password was provided for the certificate file 'certificate.pfx'. Provide a valid password using the '-CertificatePassword' option.",
+"severity": "error"
+},
+"NU3002": {
+"description": "The -Timestamper option was not provided to NuGet Sign command.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The '-Timestamper' option was not provided. The signed package will not be timestamped.",
+"severity": "warning"
+},
+"NU3003": {
+"description": "NuGet client tried to verify a package which does not contain a package signature.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package is not signed. Unable to verify signature from an unsigned package.",
+"severity": "warning"
+},
+"NU3004": {
+"description": "**If from nuget verify -signatures**",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package is not signed.",
+"severity": "error"
+},
+"NU3005": {
+"description": "NuGet client tried to verify a package with a signature file which has an invalid Local File Header.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package contains an invalid package signature file.",
+"severity": "error"
+},
+"NU3006": {
+"description": "NuGet client tried to verify a Zip64 package.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': Signed Zip64 packages are not supported.",
+"severity": "warning"
+},
+"NU3007": {
+"description": "NuGet client tried to verify a package which has a higher package signature version than the one supported by this client.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package signature format version is not supported. Updating your client may solve this problem.",
+"severity": "warning"
+},
+"NU3008": {
+"description": "NuGet package being verified has changed since it was signed.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package integrity check failed. The package has changed since it was signed.",
+"severity": "error"
+},
+"NU3009": {
+"description": "NuGet client tried to verify a package signature which contained multiple SignerInfo fields.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package signature file does not contain exactly one primary signature.",
+"severity": "warning"
+},
+"NU3010": {
+"description": "NuGet client tried to verify a package signature with a SignerInfo entry that does not contain a signing certificate.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature does not have a signing certificate.",
+"severity": "warning"
+},
+"NU3011": {
+"description": "NuGet client was unable to read the certificate chain for the signing certificate used to sign the package.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature is invalid.",
+"severity": "warning"
+},
+"NU3012": {
+"description": "NuGet client failed to verify the SignedCms signature present in the NuGet signature in the package.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature validation failed.",
+"severity": "error"
+},
+"NU3013": {
+"description": "The certificate used to sign the package has an unsupported signature algorithm.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The signing certificate has an unsupported signature algorithm.",
+"severity": "warning"
+},
+"NU3014": {
+"description": "The certificate used to sign the package does not meet the minimum public key length requirement.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The signing certificate does not meet a minimum public key length requirement.",
+"severity": "warning"
+},
+"NU3015": {
+"description": "The certificate used to sign the package has an unsupported Extended Key Usage.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The lifetime signing EKU in the primary signature's certificate is not supported.",
+"severity": "warning"
+},
+"NU3016": {
+"description": "NuGet client tried to verify a package which was signed using an unsupported hash algorithm.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package hash uses an unsupported hash algorithm.",
+"severity": "warning"
+},
+"NU3017": {
+"description": "The certificate used to sign the package has a validity in the future, but is not valid currently.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The signing certificate is not yet valid.",
+"severity": "warning"
+},
+"NU3018": {
+"description": "NuGet client failed to verify the certificate chain for the signing certificate used to sign the package.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature's signing certificate is not trusted by the trust provider.",
+"severity": "warning"
+},
+"NU3019": {
+"description": "The timestamp on the package signature has changed since it was generated by the Timestamp Authority.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp integrity check failed.",
+"severity": "warning"
+},
+"NU3020": {
+"description": "The timestamp on the package signature does not contain a signing certificate.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp does not have a signing certificate.",
+"severity": "warning"
+},
+"NU3021": {
+"description": "NuGet client failed to verify the SignedCms object inside the timestamp on the package signature.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature's timestamp signature validation failed.",
+"severity": "warning"
+},
+"NU3022": {
+"description": "The certificate used to timestamp the package signature has an unsupported signature algorithm.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature's timestamp certificate has an unsupported signature algorithm.",
+"severity": "warning"
+},
+"NU3023": {
+"description": "The certificate used to timestamp the package signature does not meet a minimum public key length requirement.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp certificate does not meet a minimum public key length requirement.",
+"severity": "warning"
+},
+"NU3024": {
+"description": "The timestamp's signature has an unsupported digest algorithm.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp signature has an unsupported digest algorithm.",
+"severity": "warning"
+},
+"NU3025": {
+"description": "The certificate used to timestamp the package signature has a validity in the future, but is not valid currently.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp signing certificate is not yet valid.",
+"severity": "warning"
+},
+"NU3026": {
+"description": "The timestamp authority did not return an expected nonce in its response; therefore, its response is invalid.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp response is invalid. Nonces did not match.",
+"severity": "warning"
+},
+"NU3027": {
+"description": "The package signature does not contain a timestamp.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The signature should be timestamped to enable long-term signature validity after the certificate has expired.",
+"severity": "warning"
+},
+"NU3028": {
+"description": "Certificate chain building failed for the timestamp signature. The timestamp signing certificate is untrusted, revoked, or revocation information for the certificate is unavailable.",
+"message": "The author primary signature's timestamp found a chain building issue: The revocation function was unable to check revocation because the revocation server could not be reached.",
+"severity": "warning"
+},
+"NU3029": {
+"description": "The timestamp signature is invalid.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp signature is invalid.",
+"severity": "warning"
+},
+"NU3030": {
+"description": "The primary signature's timestamp's message imprint uses an unsupported hash algorithm.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The primary signature's timestamp's message imprint uses an unsupported hash algorithm.",
+"severity": "warning"
+},
+"NU3031": {
+"description": "The repository countersignature is invalid.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The repository countersignature is invalid.",
+"severity": "warning"
+},
+"NU3032": {
+"description": "A signed package must not contain more than 1 repository countersignature. The package already contained a repository countersignature when attempting to add a new repository countersignature.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The package already contains a repository countersignature.",
+"severity": "warning"
+},
+"NU3033": {
+"description": "The primary signature should be either an author signature or a repository signature. A repository primary signature cannot have a repository countersignature.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': A repository primary signature must not have a repository countersignature.",
+"severity": "warning"
+},
+"NU3034": {
+"description": "There is a missing allow list, or the package signer does not match any signer in the list. This list could either be sent by the repository or specified in the trustedSigners section of the nuget.config.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': signatureValidationMode is set to require, so packages are allowed only if signed by trusted signers; however, no trusted s…",
+"severity": "error"
+},
+"NU3035": {
+"description": "A complete certificate chain could not be built for the repository countersignature's signing certificate.",
+"severity": "warning"
+},
+"NU3036": {
+"description": "The timestamp's generalized time is outside the timestamping certificate's validity period.",
+"message": "Package 'SamplePackage v1.0.0' from source 'https://contoso.com/index.json': The timestamp's generalized time is outside the timestamping certificate's validity period.",
+"severity": "warning"
+},
+"NU3037": {
+"description": "A NuGet package signature has expired. A package signature shares the same validity period as the certificate used to generate the signature. A package signature is invalid outside of that validity period.",
+"message": "[!Note] When NuGet’s signature validation mode is set to accept (default), a package with an expired package signature is treated as an unsigned package and installed anyway.",
+"severity": "warning"
+},
+"NU3038": {
+"description": "Verification settings require a repository countersignature, but the package does not have a repository countersignature.",
+"severity": "warning"
+},
+"NU3040": {
+"description": "There are conflicting attributes in a certificate item in nuget.config. Two certificate items share the same fingerprint and hashAlgorithm, but have different allowUntrustedRoot.",
+"message": "There are two certificates with conflicting allowUntrustedRoot attributes in the computed settings. The allowUntrustedRoot attribute is going to be set to false.",
+"severity": "warning"
+},
+"NU3042": {
+"description": "Warning NU3042 is raised when signed package verification failed because a root certificate was not found in the appropriate trusted root certificate bundle, either code signing or timestamping.",
+"message": "The following X.509 root certificate is untrusted because it is not present in the certificate bundle at &lt;file-path&gt;. For more information, see documentation for NU3042.",
+"severity": "warning"
+},
+"NU3043": {
+"description": "Starting with .NET 9 and NuGet.exe 6.12, NU3043 warning is raised when a SHA-1 certificate fingerprint is passed to the sign commands. SHA-1 is considered insecure and should no longer be used.",
+"message": "Invalid value for --certificate-fingerprint option in the dotnet nuget sign command or the CertificateFingerprint option in the NuGet.exe sign command.",
+"severity": "warning"
+},
+"NU5000": {
+"description": "The NuGet pack operation had a problem. NU5000 is used when we haven't yet assigned a unique error code for that issue. So we can improve, please feel free to file the issue with details of your error.",
+"severity": "error"
+},
+"NU5001": {
+"description": "The NuGet pack operation was invoked with the -InstallPackageToOutputPath option, but the output path already contained a nuspec file.",
+"message": "Unable to output resolved nuspec file because it would overwrite the original at 'F:\\project\\project.nuspec'.",
+"severity": "error"
+},
+"NU5002": {
+"description": "No input file was provided for the NuGet pack operation.",
+"message": "Please specify a nuspec, project.json, or project file to use.",
+"severity": "error"
+},
+"NU5003": {
+"description": "A framework assembly specified in the nuspec file does not contain a valid framework.",
+"message": "Failed to build package because of an unsupported targetFramework value on 'System.Net'.",
+"severity": "error"
+},
+"NU5004": {
+"description": "The NuGet pack operation was performed using -Symbol option, but the folder containing the nuspec file contained no assembly files.",
+"message": "Failed to build package. Ensure 'F:\\project\\project.nuspec' includes assembly files. For help on building symbols package, visit https://docs.nuget.org/.",
+"severity": "error"
+},
+"NU5005": {
+"description": "The NuGet pack operation was invoked with the -Symbols option, but the nuspec file does not contain any source or symbols files.",
+"message": "Ensure 'F:\\project\\project.nuspec' includes source and symbol files. For help on building symbols package, visit https://docs.nuget.org/.",
+"severity": "error"
+},
+"NU5007": {
+"description": "The NuGet pack operation was invoked with the -Symbols option, but the project being packaged has not been built yet and hence cannot be packed.",
+"message": "No build found in F:\\project\\bin\\Debug\\net461\\project.dll. Use the -Build option or build the project.",
+"severity": "error"
+},
+"NU5008": {
+"description": "The nuspec file passed to NuGet pack operation does not exist.",
+"message": "Manifest file not found at 'F:\\project\\project.nuspec'",
+"severity": "error"
+},
+"NU5009": {
+"description": "NuGet pack operation cannot find msbuild.",
+"message": "Cannot find version of msbuild.",
+"severity": "error"
+},
+"NU5010": {
+"description": "The version string given to NuGet pack operation is not a valid string.",
+"message": "Version string specified for package reference '9.9.9.9.9' is invalid.",
+"severity": "error"
+},
+"NU5011": {
+"description": "A runtime exception occurred while extracting metadata from an assembly or a project file.",
+"message": "Unable to extract metadata from 'project.csproj'.",
+"severity": "error"
+},
+"NU5012": {
+"description": "The project being packed has not been built yet and hence cannot be packaged.",
+"message": "Unable to find 'F:\\project\\bin\\Debug\\net461\\project.dll'. Make sure the project has been built.",
+"severity": "error"
+},
+"NU5013": {
+"description": "The project failed to build while running NuGet pack operation with the -Build option.",
+"message": "Failed to build 'project.csproj'",
+"severity": "error"
+},
+"NU5014": {
+"description": "The NuGet pack operation was run with the -IncludeReferencedProjects option and an error ocurred while reading the nuspec file with a referenced project.",
+"message": "Error occurred when processing file 'F:\\project2\\project2.csproj': The 'id' start tag on line 4 position 10 does not match the end tag of 'ids'. Line 4, position 20.",
+"severity": "error"
+},
+"NU5015": {
+"description": "The project.json file passed to NuGet pack operation contains multiple target frameworks.",
+"message": "[!WARNING] project.json support has been removed starting with NuGet 7.0 and this error will no longer be raised.",
+"severity": "error"
+},
+"NU5016": {
+"description": "The project has a package dependency which does not have a valid version.",
+"message": "Package version constraints for 'NuGet.Versioning' return a version range that is empty.",
+"severity": "error"
+},
+"NU5017": {
+"description": "The package being saved does not contain any package references, assemblies or framework references.",
+"message": "Cannot create a package that has no dependencies nor content.",
+"severity": "error"
+},
+"NU5018": {
+"description": "The nuspec file used to create the NuGet pack operation contained references that do not exist in the .\\lib folder in the project directory.",
+"message": "Invalid assembly reference 'xunit.dll'. Ensure that a file named 'xunit.dll' exists in the lib directory.",
+"severity": "error"
+},
+"NU5019": {
+"description": "The nuspec file used to create the NuGet pack operation contained files that do not exist.",
+"message": "File not found: 'bad_file.path'",
+"severity": "error"
+},
+"NU5020": {
+"description": "A source file was passed to msbuild -t:pack operation with an empty path.",
+"message": "A source file was added with an empty path.",
+"severity": "error"
+},
+"NU5021": {
+"description": "The NuGet pack operation was invoked with the -Symbols option, but the project directory for a source file was not found.",
+"message": "The project directory for the source file 'src/Project/Code.cs' could not be found.",
+"severity": "error"
+},
+"NU5022": {
+"description": "The MinClientVersion property passed to msbuild -t:pack operation is not a valid version string.",
+"message": "MinClient Version string specified '9.9.9.9.9' is invalid.",
+"severity": "error"
+},
+"NU5023": {
+"description": "The project passed to the msbuild -t:pack does not contain an assets file in the obj directory.",
+"message": "The assets file produced by restore does not exist. Try restoring the project again. The expected location of the assets file is F:\\project\\obj\\project.assets.json.",
+"severity": "error"
+},
+"NU5024": {
+"description": "The PackageVersion property passed to msbuild -t:pack operation is not a valid version string.",
+"message": "PackageVersion string specified '9.9.9.9.9' is invalid.",
+"severity": "error"
+},
+"NU5025": {
+"description": "The project passed to the msbuild -t:pack does not contain a valid assets file in the obj directory.",
+"message": "The assets file found does not contain a valid package spec. Try restoring the project again. The location of the assets file is F:\\project\\obj\\project.assets.json.",
+"severity": "error"
+},
+"NU5026": {
+"description": "The project being packed has not been built yet and hence cannot be packed.",
+"message": "The file ''F:\\project\\bin\\Debug\\net461\\project.exe' to be packed was not found on disk.",
+"severity": "error"
+},
+"NU5027": {
+"description": "An assembly being packaged does not contain a valid target framework metadata.",
+"message": "Invalid target framework for the file 'F:\\project\\project.dll'.",
+"severity": "error"
+},
+"NU5028": {
+"description": "No project file was specified to the msbuild -t:pack operation.",
+"message": "No project was provided to the PackTask.",
+"severity": "error"
+},
+"NU5029": {
+"description": "Properties passed to msbuild -t:pack -p:NuspecFile=project.nuspec command were not in the right format to be parsed.",
+"message": "NuspecProperties should be in the form of 'key1=value1;key2=value2'.",
+"severity": "error"
+},
+"NU5030": {
+"description": "The license file is referenced in the metadata with either PackageLicenseFile in the csproj or the license element in the nuspec, but the file itself was not included in the expected location within the package.",
+"message": "The license file 'LICENSE.txt' does not exist in the package.",
+"severity": "error"
+},
+"NU5031": {
+"description": "Only the listed file extensions are allowed.",
+"message": "The license file 'LICENSE.txt' has an invalid extension. Valid options are .txt, .md or none.",
+"severity": "error"
+},
+"NU5032": {
+"description": "The license expression does not conform to the NuGet license expression grammar.",
+"message": "The license expression 'MIT OR OR Apache-2.0' cannot be parsed succesfully. The license expression is invalid.",
+"severity": "error"
+},
+"NU5033": {
+"description": "The PackageLicenseExpression and PackageLicenseFile properties are mutually exclusive.",
+"message": "Invalid metadata. Cannot specify both a License Expression and a License File.",
+"severity": "error"
+},
+"NU5034": {
+"description": "The PackageLicenseExpressionVersion string is a System.Version. That means no labels are allowed.",
+"message": "The PackageLicenseExpressionVersion string '2.0.0-InvalidSystemVersion' is not a valid version.",
+"severity": "error"
+},
+"NU5035": {
+"description": "When using PackageLicenseFile or PackageLicenseExpression, you should not set the PackageLicenseUrl property. The licenseUrl metadata will be auto-generated by the client tools to a down-level friendly url.",
+"message": "The PackageLicenseUrl cannot be used in conjunction with the PackageLicenseFile and PackageLicenseExpression.",
+"severity": "error"
+},
+"NU5036": {
+"description": "LicenseUrl metadata value in the nuspec file should be properly escaped. Some versions of nuget pack functionality have a problem which will be updated asap.",
+"message": "This package has an improperly escaped Url in LicenseUrl",
+"severity": "error"
+},
+"NU5037": {
+"description": "Restore fails when the nuspec file is missing from the package on the feed, or from the global packages folder of the package.",
+"message": "The package is missing the required nuspec file.",
+"severity": "error"
+},
+"NU5038": {
+"description": "The readme file must be a markdown file, and must end in '*.md*'.",
+"message": "The readme file 'readme.txt' has an invalid extension. It must end in .md.",
+"severity": "error"
+},
+"NU5039": {
+"description": "NuGet is unable to find the readme file in the package.",
+"message": "The readme file 'readme.md' does not exist in the package.",
+"severity": "error"
+},
+"NU5040": {
+"description": "The file that is specified as the package readme is empty.",
+"message": "The readme file 'readme.md' is empty.",
+"severity": "error"
+},
+"NU5041": {
+"description": "NuGet is unable to find and open the readme file in the package.",
+"message": "Cannot open the readme file 'readme.md'",
+"severity": "error"
+},
+"NU5042": {
+"description": "NuGet.exe pack for project.json projects is not supported.",
+"message": "[!WARNING] project.json support has been removed starting with NuGet 7.0 and this error will no longer be raised.",
+"severity": "error"
+},
+"NU5045": {
+"description": "The icon file provided does not have a supported extension.",
+"message": "The 'icon' element 'icon.svg' has an invalid file extension. Valid options are .png, .jpg or .jpeg.",
+"severity": "error"
+},
+"NU5046": {
+"description": "NuGet is unable find the icon file in the package.",
+"message": "The icon file 'icon.png' does not exist in the package.",
+"severity": "error"
+},
+"NU5047": {
+"description": "The file that is specified as the package icon is larger than 1 megabyte (MB). NuGet only allows icons whose file size is less than 1 MB.",
+"message": "The icon file size must not exceed 1 megabyte.",
+"severity": "error"
+},
+"NU5048": {
+"description": "Icon URL is deprecated in favor of embedding the icon inside the NuGet package. Possible causes are:",
+"message": "The 'PackageIconUrl'/'iconUrl' element is deprecated. Consider using the 'PackageIcon'/'icon' element instead. Learn more at https://aka.ms/deprecateIconUrl",
+"severity": "warning"
+},
+"NU5049": {
+"description": "NuGet.exe pack should not be used to generate packages for SDK-style projects.",
+"message": "The pack command for SDK-style projects is not supported, use dotnet pack or msbuild -t:pack to pack this project instead.",
+"severity": "error"
+},
+"NU5051": {
+"description": "A project like the following has two aliases (apple and banana) that both resolve to net10.0:",
+"severity": "error"
+},
+"NU5052": {
+"description": "Your package ID contains characters that don't comply with the NuGet package ID standards. Valid package IDs must follow these rules:",
+"message": "The package ID 'PackageId' does not adhere to the restricted set of characters. The ID must only contain ASCII letters, digits, dots ('.'), and dashes ('-').",
+"severity": "warning"
+},
+"NU5100": {
+"description": "The folder being packaged contains an assembly file that is not in lib folder.",
+"message": "The assembly 'bin\\Debug\\net461\\project.dll' is not inside the 'lib' folder and hence it won't be added as a reference when the package is installed into a project.",
+"severity": "warning"
+},
+"NU5101": {
+"description": "The folder being packaged contains an assembly file that is directly under a lib folder.",
+"message": "The assembly 'lib\\project.dll' is placed directly under 'lib' folder. It is recommended that assemblies be placed inside a framework-specific folder. Move it into a framework-specific folder.",
+"severity": "warning"
+},
+"NU5102": {
+"description": "A default value was used for a Nuspec property.",
+"message": "The value \"http://project_url_here_or_delete_this_line/\" for ProjectUrl is a sample value and should be removed. Replace it with an appropriate value or remove it and rebuild your package.",
+"severity": "warning"
+},
+"NU5103": {
+"description": "An assembly was detected to be under an invalid target framework or culture identifier folder under the lib folder.",
+"message": "The folder 'lib\\random_tfm\\temp.dll' under 'lib' is not recognized as a valid framework name or a supported culture identifier. Rename it to a valid framework name or culture identifier.",
+"severity": "warning"
+},
+"NU5104": {
+"description": "The project or nuspec being packaged contains a dependency on a prerelease package.",
+"message": "A stable release of a package should not have a prerelease dependency. Either modify the version spec of dependency \"NuGet.Versioning [4.7.0-preview4.5065, )\" or update the version field in the nuspec…",
+"severity": "warning"
+},
+"NU5105": {
+"description": "The version property specified contains SemVer 2.0.0 components or SemVer 1.0.0 components that may not be supported on NuGet clients older than v4.3",
+"message": "[!NOTE] This warning was deprecated in NuGet 5.6 (Visual Studio 2019 version 16.6 and .NET SDK 3.1.300). Starting from NuGet 5.6, pack no longer raises NU5105 when packing a SemVer 2.0 package.",
+"severity": "warning"
+},
+"NU5106": {
+"description": "A file was detected to be under an WinRT or WinRT45 target framework folder under the lib folder. However, WinRT and WinRT45 target frameworks are now obsolete.",
+"message": "The file at 'lib\\WinRT\\temp.dll' uses the obsolete 'WinRT' as the framework folder. Replace 'WinRT' or 'WinRT45' with 'NetCore45'.",
+"severity": "warning"
+},
+"NU5107": {
+"description": "An init.ps1 file was detected in a folder under the tools folder.",
+"message": "The file 'tools/subfolder/init.ps1' will be ignored by NuGet because it is not directly under 'tools' folder. Place the file directly under 'tools' folder.",
+"severity": "warning"
+},
+"NU5108": {
+"description": "An .pp or a .transform file was detected in a folder other than content folder.",
+"message": "The transform file 'other\\code.pp' is outside the 'content' folder and hence will not be transformed during installation of this package. Move it into the 'content' folder.",
+"severity": "warning"
+},
+"NU5109": {
+"description": "A file with file name _._ was detected in a folder that contains other files.",
+"message": "The file at 'tools/_._' uses the symbol for empty directory '_._', but it is present in a directory that contains other files. Please remove this file from directories that contain other files.",
+"severity": "warning"
+},
+"NU5110": {
+"description": "An .ps1 file was detected in a folder other than tools folder.",
+"message": "The script file 'other\\init.ps1' is outside the 'tools' folder and hence will not be executed during installation of this package. Move it into the 'tools' folder.",
+"severity": "warning"
+},
+"NU5111": {
+"description": "An unrecognized .ps1 file was detected being packaged.",
+"message": "The script file 'tools\\random.ps1' is not recognized by NuGet and hence will not be executed during installation of this package.",
+"severity": "warning"
+},
+"NU5112": {
+"description": "A dependency was specified in the nuspec file without a version i.e. -",
+"message": "The version of dependency 'NuGet.Versioning' is not specified. Specify the version of dependency and rebuild your package.",
+"severity": "warning"
+},
+"NU5114": {
+"description": "A property was specified in the project file and also passed through pack command using -Properties or -p:NuspecProperties options.",
+"message": "'SolutionDir' key already exists in Properties collection. Overriding value.",
+"severity": "warning"
+},
+"NU5115": {
+"description": "A property was not specified to the pack command, hence a default value was chosen instead.",
+"message": "Description was not specified. Using 'Description'.",
+"severity": "warning"
+},
+"NU5116": {
+"description": "A content file specified in the project being packaged does not exist on the disk and is being skipped.",
+"message": "'Content\\sample.txt' was included in the project but doesn't exist. Skipping...",
+"severity": "warning"
+},
+"NU5117": {
+"description": "A file was added in the project file but the file path could not be resolved during the pack operation.",
+"message": "'$(MSBuildProjectDirectory)/tools/sample.txt' was included in the project but the path could not be resolved. Skipping...",
+"severity": "warning"
+},
+"NU5118": {
+"description": "A file added as Content in the project file could not be added to the package being generated because another with the same PackagePath was already added to the package.",
+"message": "File 'F :\\validation\\test\\proj\\tools\\readme.1.txt' is not added because the package already contains file 'tools\\readme.txt'",
+"severity": "warning"
+},
+"NU5119": {
+"description": "The NuGet pack operation found a .nupkg file or a file/folder starting with . to be added to the package.",
+"message": "File 'F:\\project\\binary\\Libuv.1.10.0.nupkg' was not added to the package. Files and folders starting with '.' or ending with '.nupkg' are excluded by default.",
+"severity": "warning"
+},
+"NU5120": {
+"description": "The package contains an install.ps1 file. The file will not be executed if the package is installed to a package reference type of project.",
+"message": "install.ps1 script will be ignored when the package is installed after the migration.",
+"severity": "warning"
+},
+"NU5121": {
+"description": "The package contains an files under a Content folder. These assets will not be available if the package is installed to a package reference type of project.",
+"message": "'content' assets will not be available when the package is installed after the migration.",
+"severity": "warning"
+},
+"NU5122": {
+"description": "The package contains an assembly file that is not under a target framework specific folder. The package will not be compatible with a package reference type of project.",
+"message": "XDT transform file 'tools/transform.xdt' will not be applied when the package is installed after the migration.",
+"severity": "warning"
+},
+"NU5123": {
+"description": "A file was detected to have an installed path of longer than 200 characters. Installed path is defined as the //target_file_path, where target_file_path is defined in the target property of the section in the nuspec file.",
+"message": "The file 'content/&lt;LongPath&gt;/readme.txt' path, name, or both are too long. Your package might not work without long file path support. Please shorten the file path or file name.",
+"severity": "warning"
+},
+"NU5124": {
+"description": "The NuGet Client tools have a known list of license identifiers. As this knowledge is contained within the product, sometimes version of the tools is not aware of the standardization of the license.",
+"message": "The license identifier 'Microsoft-SpecialLicense' is not recognized by the current toolset.",
+"severity": "error"
+},
+"NU5125": {
+"description": "The licenseUrl element is being replaced by the license element.",
+"message": "The 'licenseUrl' element will be deprecated. Consider using the 'license' element instead.",
+"severity": "error"
+},
+"NU5126": {
+"description": "project.json as a package management style is no longer actively developed and was replaced by PackageReference and pack targets.",
+"message": "project.json pack is deprecated. Please consider migrating '{0}' to PackageReference and using the pack targets",
+"severity": "error"
+},
+"NU5127": {
+"description": "Projects using packages with PackageReference only use lib/ and ref/ assemblies to determine package compatibility. Therefore, a package without any lib/ or ref/ files will be considered compatible with all projects.",
+"message": "This package does not contain a lib/ or ref/ folder, and will therefore be treated as compatible for all frameworks.",
+"severity": "warning"
+},
+"NU5128": {
+"description": "The lib// or ref// directory in the package contains at least one file for the Target Framework Moniker (TFM) specified in the warning message. However, no dependency group exists for this TFM in the nuspec file.",
+"message": "Some target frameworks declared in the dependencies group of the nuspec and the lib/ref folder do not have exact matches in the other location.",
+"severity": "warning"
+},
+"NU5129": {
+"description": "Packages that include MSBuild props and targets need to follow the naming convention of using the package id before the .props or .targets extension. Files that do not follow this convention will not be imported into projects that use the package.",
+"message": "At least one .&lt;extension&gt; file was found in '&lt;build_folder&gt;/&lt;tfm&gt;/', but '&lt;build_folder&gt;/&lt;tfm&gt;/&lt;package_id&gt;.&lt;extension&gt;' was not.",
+"severity": "warning"
+},
+"NU5130": {
+"description": "The lib// or ref// directory in the package contains at least one file for the Target Framework Moniker (TFM) specified in the warning message. However, no dependency group exists for this TFM in the nuspec file.",
+"message": "Some target frameworks declared in the dependencies group of the nuspec and the lib/ref folder have compatible matches, but not exact matches in the other location.",
+"severity": "warning"
+},
+"NU5131": {
+"description": "NuGet has a feature to allow package authors to select which assemblies will be available at compile time in projects that use the package.",
+"message": "References were found in the nuspec, but some reference assemblies were not found in both the nuspec and ref folder.",
+"severity": "warning"
+},
+"NU5133": {
+"description": "When downloading a file on Windows, in this case nuget.exe, through a web browser, the Mark Of The Web may be added. This makes Windows consider that flag as potentially dangerous despite coming from a well known source such as nuget.org.",
+"message": "Warning NU5133: NuGet.exe file on path \\Downloads\\nuget.exe needs to be unblocked after downloading.",
+"severity": "warning"
+},
+"NU5500": {
+"description": "The NuGet pack operation had a problem. NU5500 is used when we haven't yet assigned a unique warning code for that issue. So we can improve, please feel free to file the issue with details of your error.",
+"severity": "warning"
+},
+"NU5501": {
+"description": "The dependency group framework must included dots in their framework version number. This is required for frameworks newer than net5.0.",
+"message": "The following dependency group(s) require(s) dots in the framework version: net50-windows7.0",
+"severity": "warning"
+}
+}

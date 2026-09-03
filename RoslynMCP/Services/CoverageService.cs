@@ -2,7 +2,8 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
+using RoslynMCP.Languages.DotSettings.Core;
 using RoslynMCP.Tools;
 
 namespace RoslynMCP.Services;
@@ -25,6 +26,42 @@ public static class CoverageService
         string projectPath, string? filter = null, int timeoutSeconds = 300,
         CancellationToken cancellationToken = default, BuildWarningsStore? warningsStore = null)
     {
+        var result = await CollectAsync(projectPath, filter, timeoutSeconds, cancellationToken, warningsStore);
+        if (result.Data is null)
+            return result;
+
+        lock (Lock)
+        {
+            _cachedData = result.Data;
+            _cachedProjectPath = result.ProjectPath ?? projectPath;
+            _cachedAt = DateTime.UtcNow;
+        }
+
+        // Also to disk, so the coverage view has something to show in a process that did not run
+        // the tests — the editor's, most of the time.
+        Testing.CoverageSnapshotStore.Record(result.ProjectPath ?? projectPath, result.Data);
+
+        return result with { Message = FormatSummary(result.Data, result.ProjectPath ?? projectPath) };
+    }
+
+    /// <summary>
+    /// One coverage run, parsed but not cached — for callers that run many filtered passes in a
+    /// row and must not have each one overwrite the session's "current" coverage.
+    /// </summary>
+    /// <param name="noBuild">Skip building — for callers that built once and run many passes.</param>
+    /// <param name="dynamicInstrumentation">
+    /// Use the profiler-based "Code Coverage" collector (ships with Microsoft.NET.Test.Sdk)
+    /// instead of coverlet. Coverlet rewrites the assemblies on disk for the duration of the run,
+    /// so two coverlet runs on the same output directory corrupt each other; the dynamic
+    /// collector instruments in memory, which is what makes concurrent passes safe. Old SDKs
+    /// cannot write Cobertura from it — that run comes back with
+    /// <see cref="CoverageResult.NoCoverageFile"/> so the caller can fall back.
+    /// </param>
+    public static async Task<CoverageResult> CollectAsync(
+        string projectPath, string? filter = null, int timeoutSeconds = 300,
+        CancellationToken cancellationToken = default, BuildWarningsStore? warningsStore = null,
+        bool noBuild = false, bool dynamicInstrumentation = false)
+    {
         string csprojPath;
         if (projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) && File.Exists(projectPath))
         {
@@ -39,7 +76,7 @@ public static class CoverageService
         }
 
         if (PathHelper.RequiresMsBuild(csprojPath))
-            return await RunLegacyCoverageAsync(csprojPath, filter, timeoutSeconds, cancellationToken, warningsStore);
+            return await RunLegacyCoverageAsync(csprojPath, filter, timeoutSeconds, cancellationToken, warningsStore, noBuild);
 
         // Create a temp directory for results to avoid conflicts
         string resultsDir = Path.Combine(Path.GetTempPath(), "roslyn-mcp-coverage", Guid.NewGuid().ToString("N"));
@@ -52,15 +89,36 @@ public static class CoverageService
             args.Append('"');
             args.Append(csprojPath);
             args.Append('"');
-            args.Append(" --collect:\"XPlat Code Coverage\"");
+            args.Append(dynamicInstrumentation
+                ? " --collect:\"Code Coverage;Format=cobertura\""
+                : " --collect:\"XPlat Code Coverage\"");
             args.Append($" --results-directory \"{resultsDir}\"");
             args.Append(" --nologo");
+            if (noBuild)
+            {
+                args.Append(" --no-build");
+            }
             if (!string.IsNullOrWhiteSpace(filter))
             {
                 args.Append($" --filter \"{filter.Replace("\"", "\\\"")}\"");
             }
-            // Include test assembly in coverage (for projects with code and tests together)
-            args.Append(" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeTestAssembly=true");
+            if (!dynamicInstrumentation)
+            {
+                // Include test assembly in coverage (for projects with code and tests together);
+                // the dynamic collector includes it on its own.
+                args.Append(" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.IncludeTestAssembly=true");
+
+                // What the team already excludes in ReSharper, excluded here too — otherwise a
+                // number measured in the IDE and the same number measured here disagree, and the
+                // generated-code the exclusions exist to hide drags the second one down.
+                // coverlet only; the dynamic collector takes its filters from a runsettings file.
+                if (ReSharperSettings.ForProject(csprojPath).CoverletExcludeFilters is { IsEmpty: false } excludes)
+                {
+                    args.Append(" DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude=\"")
+                        .Append(string.Join(',', excludes))
+                        .Append('"');
+                }
+            }
 
             using var process = new Process
             {
@@ -118,24 +176,21 @@ public static class CoverageService
                 return new CoverageResult(false, $"Tests failed (exit code {process.ExitCode}).\n{output}", null);
             }
 
-            // Find the coverage.cobertura.xml file
-            var coberturaFile = Directory.GetFiles(resultsDir, "coverage.cobertura.xml", SearchOption.AllDirectories)
+            // coverlet writes coverage.cobertura.xml; the dynamic collector writes <guid>.cobertura.xml
+            var coberturaFile = Directory.GetFiles(resultsDir, "*.cobertura.xml", SearchOption.AllDirectories)
                 .FirstOrDefault();
 
             if (coberturaFile is null)
-                return new CoverageResult(false, "Coverage file not found. Ensure coverlet.collector is referenced in the test project.", null);
+                return new CoverageResult(false,
+                    dynamicInstrumentation
+                        ? "Coverage file not found. The 'Code Coverage' collector could not write Cobertura on this SDK."
+                        : "Coverage file not found. Ensure coverlet.collector is referenced in the test project.",
+                    null, NoCoverageFile: true);
 
             var data = ParseCoberturaXml(coberturaFile);
             ComputeSourceHashes(data);
 
-            lock (Lock)
-            {
-                _cachedData = data;
-                _cachedProjectPath = csprojPath;
-                _cachedAt = DateTime.UtcNow;
-            }
-
-            return new CoverageResult(true, FormatSummary(data, csprojPath), data);
+            return new CoverageResult(true, "", data, csprojPath);
         }
         finally
         {
@@ -150,7 +205,7 @@ public static class CoverageService
     /// </summary>
     private static async Task<CoverageResult> RunLegacyCoverageAsync(
         string csprojPath, string? filter, int timeoutSeconds, CancellationToken cancellationToken,
-        BuildWarningsStore? warningsStore = null)
+        BuildWarningsStore? warningsStore = null, bool noBuild = false)
     {
         var msbuild = MsBuildLocator.FindMsBuild();
         if (msbuild is null)
@@ -172,21 +227,23 @@ public static class CoverageService
                 : "Coverage collection was cancelled.";
 
         // Build the project
-        var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
-        using (var buildProcess = new Process
+        if (!noBuild)
         {
-            StartInfo = new ProcessStartInfo
+            var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
+            using var buildProcess = new Process
             {
-                FileName = msbuild,
-                Arguments = buildArgs,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = workingDirectory
-            }
-        })
-        {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = msbuild,
+                    Arguments = buildArgs,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = workingDirectory
+                }
+            };
+
             BuildProcessHelper.ConfigureMsBuildEnvironment(buildProcess.StartInfo);
             MsBuildLocator.SetVsEnvironment(buildProcess.StartInfo, msbuild);
             var buildOut = new StringBuilder();
@@ -268,13 +325,7 @@ public static class CoverageService
 
             var data = ParseCoberturaXml(outputPath);
             ComputeSourceHashes(data);
-            lock (Lock)
-            {
-                _cachedData = data;
-                _cachedProjectPath = csprojPath;
-                _cachedAt = DateTime.UtcNow;
-            }
-            return new CoverageResult(true, FormatSummary(data, csprojPath), data);
+            return new CoverageResult(true, "", data, csprojPath);
         }
         finally
         {
@@ -282,7 +333,11 @@ public static class CoverageService
         }
     }
 
-    private static async Task<string?> FindOrProvisionDotnetCoverageAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// The <c>dotnet-coverage</c> executable, installing it as a global tool if it is missing.
+    /// Shared with the per-test attribution builder, which drives the same tool in session mode.
+    /// </summary>
+    internal static async Task<string?> FindOrProvisionDotnetCoverageAsync(CancellationToken cancellationToken)
     {
         // Check if dotnet-coverage is on PATH
         try
@@ -479,23 +534,33 @@ public static class CoverageService
         return Convert.ToHexString(hash);
     }
 
+    /// <summary>
+    /// Parses one Cobertura document without touching the session's cached coverage — for the
+    /// attribution builder, which reads one document per group of tests.
+    /// </summary>
+    internal static CoverageData ParseCoberturaFile(string path)
+    {
+        var data = ParseCoberturaXml(path);
+        ComputeSourceHashes(data);
+        return data;
+    }
+
     private static CoverageData ParseCoberturaXml(string path)
     {
-        var doc = XDocument.Load(path);
-        var root = doc.Root!;
+        var root = Parser.ParseText(File.ReadAllText(path)).RootSyntax!;
 
         var data = new CoverageData
         {
-            LineCoverageRate = ParseDouble(root.Attribute("line-rate")?.Value),
-            BranchCoverageRate = ParseDouble(root.Attribute("branch-rate")?.Value),
-            LinesValid = ParseInt(root.Attribute("lines-valid")?.Value),
-            LinesCovered = ParseInt(root.Attribute("lines-covered")?.Value),
-            BranchesValid = ParseInt(root.Attribute("branches-valid")?.Value),
-            BranchesCovered = ParseInt(root.Attribute("branches-covered")?.Value),
+            LineCoverageRate = ParseDouble(root.GetAttributeValue("line-rate")),
+            BranchCoverageRate = ParseDouble(root.GetAttributeValue("branch-rate")),
+            LinesValid = ParseInt(root.GetAttributeValue("lines-valid")),
+            LinesCovered = ParseInt(root.GetAttributeValue("lines-covered")),
+            BranchesValid = ParseInt(root.GetAttributeValue("branches-valid")),
+            BranchesCovered = ParseInt(root.GetAttributeValue("branches-covered")),
         };
 
         // Collect source directories for resolving relative filenames
-        var sources = root.Element("sources")?.Elements("source")
+        var sources = root.GetElement("sources")?.GetElements("source")
             .Select(s => s.Value)
             .Where(s => !string.IsNullOrWhiteSpace(s))
             .ToList() ?? [];
@@ -504,10 +569,10 @@ public static class CoverageService
         {
             foreach (var cls in package.Descendants("class"))
             {
-                string fileName = cls.Attribute("filename")?.Value ?? "";
-                string className = cls.Attribute("name")?.Value ?? "";
-                double lineRate = ParseDouble(cls.Attribute("line-rate")?.Value);
-                double branchRate = ParseDouble(cls.Attribute("branch-rate")?.Value);
+                string fileName = cls.GetAttributeValue("filename") ?? "";
+                string className = cls.GetAttributeValue("name") ?? "";
+                double lineRate = ParseDouble(cls.GetAttributeValue("line-rate"));
+                double branchRate = ParseDouble(cls.GetAttributeValue("branch-rate"));
 
                 string normalizedFile = ResolveFilePath(fileName, sources);
 
@@ -527,15 +592,15 @@ public static class CoverageService
                 };
 
                 // Parse lines (only direct children of <lines>, not nested in <methods>)
-                var classLines = cls.Element("lines");
+                var classLines = cls.GetElement("lines");
                 if (classLines is not null)
                 {
-                    foreach (var line in classLines.Elements("line"))
+                    foreach (var line in classLines.GetElements("line"))
                     {
-                        int lineNum = ParseInt(line.Attribute("number")?.Value);
-                        int hits = ParseInt(line.Attribute("hits")?.Value);
-                        bool isBranch = string.Equals(line.Attribute("branch")?.Value, "True", StringComparison.OrdinalIgnoreCase);
-                        string? conditionCoverage = line.Attribute("condition-coverage")?.Value;
+                        int lineNum = ParseInt(line.GetAttributeValue("number"));
+                        int hits = ParseInt(line.GetAttributeValue("hits"));
+                        bool isBranch = string.Equals(line.GetAttributeValue("branch"), "True", StringComparison.OrdinalIgnoreCase);
+                        string? conditionCoverage = line.GetAttributeValue("condition-coverage");
 
                         var lineCov = new LineCoverage
                         {
@@ -551,22 +616,30 @@ public static class CoverageService
                 }
 
                 // Parse methods
-                var methodsElement = cls.Element("methods");
+                var methodsElement = cls.GetElement("methods");
                 if (methodsElement is not null)
                 {
-                    foreach (var method in methodsElement.Elements("method"))
+                    foreach (var method in methodsElement.GetElements("method"))
                     {
-                        string methodName = method.Attribute("name")?.Value ?? "";
-                        string signature = method.Attribute("signature")?.Value ?? "";
+                        string methodName = method.GetAttributeValue("name") ?? "";
+                        string signature = method.GetAttributeValue("signature") ?? "";
 
-                        var methodLinesElement = method.Element("lines");
-                        var methodLines = (methodLinesElement?.Elements("line") ?? []).Select(l => new LineCoverage
+                        var methodLines = new List<LineCoverage>();
+
+                        if (method.GetElement("lines") is { } methodLinesElement)
                         {
-                            LineNumber = ParseInt(l.Attribute("number")?.Value),
-                            Hits = ParseInt(l.Attribute("hits")?.Value),
-                            IsBranch = string.Equals(l.Attribute("branch")?.Value, "True", StringComparison.OrdinalIgnoreCase),
-                            ConditionCoverage = l.Attribute("condition-coverage")?.Value,
-                        }).ToList();
+                            foreach (var l in methodLinesElement.GetElements("line"))
+                            {
+                                methodLines.Add(new LineCoverage
+                                {
+                                    LineNumber = ParseInt(l.GetAttributeValue("number")),
+                                    Hits = ParseInt(l.GetAttributeValue("hits")),
+                                    IsBranch = string.Equals(
+                                        l.GetAttributeValue("branch"), "True", StringComparison.OrdinalIgnoreCase),
+                                    ConditionCoverage = l.GetAttributeValue("condition-coverage"),
+                                });
+                            }
+                        }
 
                         int coveredLines = methodLines.Count(l => l.Hits > 0);
                         int totalLines = methodLines.Count;
@@ -609,7 +682,7 @@ public static class CoverageService
     private static string FormatSummary(CoverageData data, string projectPath)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Coverage Report: {Path.GetFileName(projectPath)}");
+        sb.AppendLine($"**Coverage Report: {Path.GetFileName(projectPath)}**");
         sb.AppendLine();
         sb.AppendLine($"**Line Coverage**: {data.LineCoverageRate:P1} ({data.LinesCovered}/{data.LinesValid})");
         sb.AppendLine($"**Branch Coverage**: {data.BranchCoverageRate:P1} ({data.BranchesCovered}/{data.BranchesValid})");
@@ -770,4 +843,10 @@ public class LineCoverage
     }
 }
 
-public record CoverageResult(bool Success, string Message, CoverageData? Data);
+/// <param name="ProjectPath">The .csproj the run resolved to, which is not always what the
+/// caller passed — it may have been a source file inside the project.</param>
+/// <param name="NoCoverageFile">The tests ran but no Cobertura report appeared — the collector
+/// is missing or cannot write the format, as opposed to the tests having failed.</param>
+public record CoverageResult(
+    bool Success, string Message, CoverageData? Data, string? ProjectPath = null,
+    bool NoCoverageFile = false);

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ProtoSolution.Unrelated</RootNamespace>
+  </PropertyGroup>
+
+  <!--
+    Deliberately no ProjectReference and no protobuf packages. This project is in the solution and
+    spells the same member names as the contract, so anything it contributes to an answer is a name
+    match rather than a symbol match.
+  -->
+
+</Project>

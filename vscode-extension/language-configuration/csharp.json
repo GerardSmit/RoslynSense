@@ -1,0 +1,57 @@
+{
+    // Layered on top of VS Code's own csharp configuration, which supplies brackets, comments
+    // and the "///" rules but no indentation rules at all. A field left out here keeps whatever
+    // that configuration set; only what is named below is replaced.
+    //
+    // Without these, Enter copies the previous line's whitespace verbatim, so pressing it on a
+    // blank line inside a method lands the caret at column zero. With them the editor walks back
+    // to the last line that has something on it and works the indent out from there, which is
+    // what Rider and Visual Studio do.
+    //
+    // Deliberately no indentNextLinePattern: it would indent the line after a braceless
+    // "if (x)", and in C# the thing typed there is usually the brace, which belongs at the
+    // "if"'s own indent. A braceless body costs one Tab; a misplaced brace costs an argument
+    // with the formatter on every block.
+    "indentationRules": {
+        // A line whose last unclosed opener is "{", "(" or "[" opens a level. The quote classes
+        // keep an opener inside a string from counting, the leading (?!//) a commented-out one.
+        "increaseIndentPattern": "^((?!\\/\\/).)*(\\{[^}\"'`]*|\\([^)\"'`]*|\\[[^\\]\"'`]*)$",
+        // A line that starts with a closer sits one level back out — and so does a switch label,
+        // which belongs beside the label above it rather than inside that one's body.
+        "decreaseIndentPattern": "^((?!.*?\\/\\*).*\\*\\/)?\\s*([\\}\\]\\)].*|(case\\b.*|default)\\s*:.*)$"
+    },
+    "onEnterRules": [
+        {
+            // The way out of a braceless body. A single-statement "if (x)" body ends at its
+            // semicolon, so the line after it belongs at the "if"'s own indent — but no
+            // indentation rule can know that: increaseIndentPattern does not match a line
+            // ending in ";", and when nothing matches the editor keeps the previous line's
+            // whitespace, which leaves the caret hanging under the statement it just finished.
+            //
+            // Matched on the pair of lines rather than one: the header alone would outdent
+            // after any statement following an "if", and the statement alone would outdent
+            // in the middle of an ordinary block. Both together identify the one shape where
+            // a level was entered without a brace and has now been left.
+            //
+            // A body that opens a brace is not this shape — the brace owns the level, and
+            // decreaseIndentPattern already takes it back at the "}".
+            "beforeText": "^\\s*(?!.*[{}]\\s*$).*;\\s*$",
+            "previousLineText": "^\\s*(\\}\\s*)?(else\\s+if\\s*\\(.*\\)|if\\s*\\(.*\\)|for\\s*\\(.*\\)|foreach\\s*\\(.*\\)|while\\s*\\(.*\\)|using\\s*\\(.*\\)|lock\\s*\\(.*\\)|fixed\\s*\\(.*\\)|else|do)\\s*$",
+            "action": {
+                "indent": "outdent"
+            }
+        },
+        {
+            // The way into a switch section. "case 1:" opens a level the same way a brace does,
+            // and no indentation rule can see it: increaseIndentPattern only knows openers, so
+            // the body of every case sat level with its own label.
+            //
+            // The label itself is taken back out by decreaseIndentPattern, so typing the next
+            // "case" leaves it beside the one above rather than inside its body.
+            "beforeText": "^\\s*(case\\b.*|default)\\s*:\\s*$",
+            "action": {
+                "indent": "indent"
+            }
+        }
+    ]
+}

@@ -11,5 +11,6 @@ public enum NodeType
     Text,
     Event,
     Property,
-    Collection
+    Collection,
+    ExpressionBuilder
 }

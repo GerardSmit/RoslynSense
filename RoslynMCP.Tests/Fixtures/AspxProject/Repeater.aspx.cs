@@ -4,6 +4,15 @@ public class RepeaterPage : System.Web.UI.Page
 {
     protected System.Web.UI.WebControls.Repeater rptItems = null!;
 
+    /// <summary>Uses the control the markup declares, so that go-to-definition on its ID has a
+    /// code usage to report. Designer.aspx declares an <c>ID="rptItems"</c> of its own, which is
+    /// what makes this the wrong answer for that page.</summary>
+    protected override void OnLoad(System.EventArgs e)
+    {
+        base.OnLoad(e);
+        rptItems.ItemDataBound += rpt_OnItemDataBound;
+    }
+
     protected void rpt_OnItemDataBound(object sender, System.Web.UI.WebControls.RepeaterItemEventArgs e)
     {
         InitItem(e.Item);

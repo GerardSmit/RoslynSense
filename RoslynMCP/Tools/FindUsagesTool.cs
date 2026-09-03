@@ -4,6 +4,11 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.FindSymbols;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
+using RoslynMCP.Languages;
+using RoslynMCP.Languages.Mediator;
+using RoslynMCP.Languages.Mediator.Core;
+using RoslynMCP.Languages.WebForms.Core;
+using RoslynMCP.Lsp.Handlers;
 
 namespace RoslynMCP.Tools;
 
@@ -53,19 +58,47 @@ public static class FindUsagesTool
             if (ctx is null)
                 return errors.ToString();
 
+            // A resource key, a configuration name: text that binds to nothing, or that binds to
+            // the enclosing call rather than to itself. Asked ahead of the symbol the way
+            // find-references does over LSP, so one caret is not resolved two different ways by
+            // the editor and by a session.
+            if (ctx.Resolution.Position is { } keyOffset
+                && await SymbolFreeUsages.ReportAsync(
+                    ctx.SystemPath, keyOffset, ctx.Project, ctx.Markup.MarkedText,
+                    fmt, maxResults, cancellationToken) is { } keyReport)
+            {
+                return keyReport;
+            }
+
             if (!ctx.IsResolved)
                 return ToolHelper.FormatResolutionError(ctx.Resolution);
 
             var symbol = ctx.Symbol!;
 
+            // Visual Studio's Find All References options. The default the public overload
+            // forwards cascades the inheritance hierarchy in both directions, which searches
+            // every sibling implementation of every interface member involved — members that can
+            // never reach the one that was asked about.
             var references = await SymbolFinder.FindReferencesAsync(
-                symbol, ctx.Workspace.CurrentSolution, cancellationToken);
+                symbol, ctx.Workspace.CurrentSolution,
+                FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(symbol),
+                cancellationToken);
 
             // Build Razor source map for mapping generated references
             var razorSourceMap = await ProjectIndexCacheService.GetRazorSourceMapAsync(ctx.Project, cancellationToken);
 
-            // Build ASPX index for searching inline code references
-            var aspxIndex = await ProjectIndexCacheService.GetAspxIndexAsync(ctx.Project, cancellationToken);
+            // The markup half of the answer: tags, attributes and inline code that name the
+            // symbol. Bound through the project's C# projection, so the word in a comment or a
+            // string literal is not reported as a usage.
+            var aspxReferences = await AspxReferenceService.FindAsync(symbol, ctx.Project, cancellationToken);
+
+            // The mediator half: the Send, Publish and generated-extension calls that reach this
+            // symbol, which Roslyn sees only as calls to one interface member. Gated on the pack
+            // being registered rather than on an editor's settings, because an MCP session belongs
+            // to no window — roslynsense.json and --no-mediator are the only switches that reach it.
+            var mediatorReferences = LanguageScope.Process.IsEnabled(MediatorLanguage.PackId)
+                ? await MediatorReferenceService.FindAsync(symbol, ctx.Project, cancellationToken)
+                : [];
 
             // Search referencing projects for cross-project usages
             var crossProjectRefs = new List<(string ProjectName, List<ReferenceLocation> Locations)>();
@@ -98,7 +131,10 @@ public static class FindUsagesTool
 
                         if (refSymbol is null) continue;
 
-                        var refResults = await SymbolFinder.FindReferencesAsync(refSymbol, refSolution, cancellationToken);
+                        var refResults = await SymbolFinder.FindReferencesAsync(
+                            refSymbol, refSolution,
+                            FindReferencesSearchOptions.GetFeatureOptionsForStartingSymbol(refSymbol),
+                            cancellationToken);
                         var locations = refResults.SelectMany(r => r.Locations).ToList();
                         if (locations.Count > 0)
                         {
@@ -116,7 +152,8 @@ public static class FindUsagesTool
             string searchSummary = $"Markup target: `{ctx.Markup.MarkedText}`";
             return await FormatResultsAsync(
                 symbol, references, ctx.SystemPath, searchSummary, ctx.Project.FilePath!,
-                razorSourceMap, aspxIndex, crossProjectRefs, maxResults, fmt, cancellationToken);
+                razorSourceMap, aspxReferences, crossProjectRefs, maxResults, fmt, cancellationToken,
+                mediatorReferences: mediatorReferences);
         }
         catch (OperationCanceledException)
         {
@@ -149,13 +186,16 @@ public static class FindUsagesTool
         string searchSummary,
         string projectPath,
         RazorSourceMap razorSourceMap,
-        AspxProjectIndex aspxIndex,
+        IReadOnlyList<AspxReference> aspxReferences,
         List<(string ProjectName, List<ReferenceLocation> Locations)> crossProjectRefs,
         int maxResults,
         IOutputFormatter fmt,
         CancellationToken cancellationToken,
         List<AspxSymbolReference>? findControlRefs = null,
-        string? controlId = null)
+        string? controlId = null,
+        // Appended rather than placed beside aspxReferences on purpose: AspxFindUsages passes the
+        // first arguments positionally, and inserting one would silently re-bind them.
+        IReadOnlyList<MediatorDispatchSite>? mediatorReferences = null)
     {
         var refList = references.ToList();
         var results = new StringBuilder();
@@ -242,24 +282,49 @@ public static class FindUsagesTool
         }
 
         // Append ASPX references
-        var aspxRefs = AspxSourceMappingService.FindSymbolReferences(aspxIndex, symbol.Name);
-        if (aspxRefs.Count > 0)
+        if (aspxReferences.Count > 0)
         {
             fmt.AppendHeader(results, "ASPX References", level: 2);
-            fmt.AppendField(results, "Found", $"{aspxRefs.Count} potential references in ASPX/ASCX files");
+            fmt.AppendField(results, "Found", $"{aspxReferences.Count} reference(s) in ASPX/ASCX files");
             fmt.AppendSeparator(results);
 
             var aspxRows = new List<string[]>();
-            foreach (var aspxRef in aspxRefs)
+            foreach (var aspxRef in aspxReferences)
             {
-                var locType = aspxRef.LocationType == AspxCodeLocationType.Expression
-                    ? "Expression" : "Code Block";
-                var snippet = aspxRef.CodeSnippet.Length > 80
-                    ? aspxRef.CodeSnippet[..77] + "..."
-                    : aspxRef.CodeSnippet;
-                aspxRows.Add([Path.GetFileName(aspxRef.FilePath), $"{aspxRef.Line}", locType, snippet]);
+                var snippet = aspxRef.LineText.Length > 80
+                    ? aspxRef.LineText[..77] + "..."
+                    : aspxRef.LineText;
+                aspxRows.Add([
+                    Path.GetFileName(aspxRef.FilePath),
+                    $"{aspxRef.Line}",
+                    await RegionNameAsync(aspxRef, cancellationToken),
+                    snippet]);
             }
             fmt.AppendTable(results, "ASPX", ["File", "Line", "Type", "Snippet"], aspxRows);
+        }
+
+        // Append mediator dispatches. Their own section rather than folded into the C# references,
+        // because a dispatch is not a C# reference to this symbol: the name does not appear on the
+        // line, and a report that hides why would be one nobody could check.
+        if (mediatorReferences is { Count: > 0 })
+        {
+            fmt.AppendHeader(results, "Mediator Dispatches", level: 2);
+            fmt.AppendField(results, "Found", $"{mediatorReferences.Count} send/publish call site(s)");
+            fmt.AppendSeparator(results);
+
+            var mediatorRows = new List<string[]>();
+            foreach (var dispatch in mediatorReferences)
+            {
+                string snippet = dispatch.LineText.Length > 80
+                    ? dispatch.LineText[..77] + "..."
+                    : dispatch.LineText;
+                mediatorRows.Add([
+                    Path.GetFileName(dispatch.FilePath),
+                    $"{dispatch.Line}",
+                    dispatch.Kind.ToString(),
+                    snippet]);
+            }
+            fmt.AppendTable(results, "Mediator", ["File", "Line", "Via", "Snippet"], mediatorRows);
         }
 
         // Append FindControl references (for control ID searches)
@@ -283,9 +348,10 @@ public static class FindUsagesTool
         }
 
         fmt.AppendHeader(results, "Summary", level: 2);
-        int aspxCount = aspxRefs.Count;
+        int aspxCount = aspxReferences.Count;
         int findControlCount = findControlRefs?.Count ?? 0;
-        int totalRefCount = totalLocations + crossProjectCount + aspxCount + findControlCount;
+        int mediatorCount = mediatorReferences?.Count ?? 0;
+        int totalRefCount = totalLocations + crossProjectCount + aspxCount + findControlCount + mediatorCount;
         fmt.AppendField(results, "Symbol", $"`{symbol.Name}` ({symbol.Kind})");
         fmt.AppendField(results, "Total reference count", totalRefCount);
         var summaryParts = new List<string>
@@ -298,12 +364,31 @@ public static class FindUsagesTool
             summaryParts.Add($"{aspxCount} ASPX references");
         if (findControlCount > 0)
             summaryParts.Add($"{findControlCount} FindControl call(s)");
+        if (mediatorCount > 0)
+            summaryParts.Add($"{mediatorCount} mediator dispatch(es)");
         fmt.AppendField(results, "Breakdown", string.Join(", ", summaryParts));
         fmt.AppendSeparator(results);
 
         fmt.AppendHints(results, "Use GoToDefinition on a reference to see its context");
 
         return results.ToString();
+    }
+
+    /// <summary>
+    /// Says whether a markup hit is in an expression, a code block, a server script or the markup
+    /// itself. The parse it reads is the one the reference search already built, so naming the
+    /// region costs a dictionary lookup rather than a second parse.
+    /// </summary>
+    private static async Task<string> RegionNameAsync(AspxReference reference, CancellationToken ct)
+    {
+        var document = await AspxDocumentService.GetAsync(reference.FilePath, ct);
+        return AspxReferenceService.RegionOf(document?.Tree, reference.Span.Start) switch
+        {
+            AspxRegion.Expression => "Expression",
+            AspxRegion.CodeBlock => "Code Block",
+            AspxRegion.Script => "Script",
+            _ => "Markup",
+        };
     }
 
     /// <summary>

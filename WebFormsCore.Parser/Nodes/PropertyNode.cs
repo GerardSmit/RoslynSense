@@ -17,6 +17,14 @@ public class PropertyNode : Node
 
     public AttributeValue Value { get; set; }
 
+    /// <summary>
+    /// Where the attribute's name was written, as opposed to <see cref="Node.Range"/>, which is
+    /// its value. Code generation only ever needs the value; renaming the property needs this, and
+    /// without it a rename rewrites <c>Title="Welcome"</c> into <c>Title="NewName"</c>.
+    /// Null for a property the parser synthesised rather than read from source.
+    /// </summary>
+    public TokenRange? NameRange { get; set; }
+
     public INamedTypeSymbol? Converter { get; set; }
 
     public string DisplayType => Member.DisplayType;

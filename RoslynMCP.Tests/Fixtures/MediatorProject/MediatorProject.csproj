@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!--
+    Both libraries are stubbed in-tree rather than referenced, so the fixture builds offline and
+    pins the shapes navigation keys on rather than whatever version happened to restore.
+
+    The generator is real, and that is the point: whether a reference search reaches into
+    source-generated documents is the assumption the whole Zapto half of the pack rests on, and
+    committing its output as ordinary .cs would test nothing.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\MediatorGenerator\MediatorGenerator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

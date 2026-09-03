@@ -1,0 +1,77 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "MSBuild expressions",
+  "scopeName": "text.xml.msbuild.expression",
+  "comment": "Injected into MSBuild documents so the three things that are not XML stand out from the text they are embedded in. Without this a project file looks exactly like any other XML, which undercuts the reason for giving it its own language id at all.",
+  "injectionSelector": "L:text.xml.msbuild",
+  "patterns": [
+    {
+      "include": "#property"
+    },
+    {
+      "include": "#item"
+    },
+    {
+      "include": "#metadata"
+    }
+  ],
+  "repository": {
+    "property": {
+      "comment": "$(Configuration) — a property reference, and the most common thing in a condition.",
+      "name": "variable.other.property.msbuild",
+      "begin": "\\$\\(",
+      "end": "\\)",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.property.begin.msbuild" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.property.end.msbuild" }
+      },
+      "patterns": [
+        { "include": "#function" }
+      ]
+    },
+    "item": {
+      "comment": "@(Compile) — an item list, optionally transformed: @(Compile->'%(Filename)').",
+      "name": "variable.other.item.msbuild",
+      "begin": "@\\(",
+      "end": "\\)",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.item.begin.msbuild" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.item.end.msbuild" }
+      },
+      "patterns": [
+        { "include": "#metadata" },
+        { "include": "#string" }
+      ]
+    },
+    "metadata": {
+      "comment": "%(Filename) — item metadata, well-known or declared.",
+      "name": "variable.other.metadata.msbuild",
+      "begin": "%\\(",
+      "end": "\\)",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.metadata.begin.msbuild" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.metadata.end.msbuild" }
+      }
+    },
+    "function": {
+      "comment": "$([System.IO.Path]::GetFullPath(...)) — a property function.",
+      "match": "\\[[^\\]]+\\]::[A-Za-z_][A-Za-z0-9_]*",
+      "name": "entity.name.function.msbuild"
+    },
+    "string": {
+      "begin": "'",
+      "end": "'",
+      "name": "string.quoted.single.msbuild",
+      "patterns": [
+        { "include": "#metadata" },
+        { "include": "#property" }
+      ]
+    }
+  }
+}

@@ -4,6 +4,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public class GoToDefinitionToolTests
 {
     [Fact]
@@ -19,6 +20,8 @@ public class GoToDefinitionToolTests
     [Fact]
     public async Task WhenFrameworkTypeTargetedThenReturnsDecompiledSource()
     {
+        using var offline = ExternalSourceScope.Offline();
+
         var result = await GoToDefinitionTool.GoToDefinition(
             filePath: FixturePaths.CalculatorFile,
             symbolName: "System.Object",
@@ -76,6 +79,93 @@ public class GoToDefinitionToolTests
 
         Assert.Contains("Definition: List", result);
         Assert.Contains("System.Collections.Generic", result);
+    }
+
+    [Fact]
+    public async Task WhenDecompiledFileIsSmallThenShownInFull()
+    {
+        using var offline = ExternalSourceScope.Offline();
+
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.Object",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("shown in full", result);
+    }
+
+    [Fact]
+    public async Task WhenDecompiledFileIsLargeThenLineCountIsReported()
+    {
+        using var offline = ExternalSourceScope.Offline();
+
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.String",
+            fmt: new MarkdownFormatter());
+
+        Assert.Matches(@"\*\*Length\*\*: \d+ lines", result);
+        Assert.DoesNotContain("shown in full", result);
+    }
+
+    [Fact]
+    public async Task WhenGenericTypeGivenWithoutArityThenReturnsDefinition()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.Collections.Generic.List",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Definition: List", result);
+        Assert.Contains("System.Collections.Generic", result);
+    }
+
+    [Fact]
+    public async Task WhenNestedTypeGivenWithDotThenReturnsDefinition()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.Environment.SpecialFolder",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Definition: SpecialFolder", result);
+    }
+
+    [Fact]
+    public async Task WhenTypeNameHasWrongWordThenErrorSuggestsSimilarType()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.Threading.CancellationTokenOrigin",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("not found", result);
+        Assert.Contains("Did you mean", result);
+        Assert.Contains("System.Threading.CancellationTokenSource", result);
+    }
+
+    [Fact]
+    public async Task WhenTypeNameMisspelledThenErrorSuggestsCorrectType()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.Text.StringBuider",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Did you mean", result);
+        Assert.Contains("System.Text.StringBuilder", result);
+    }
+
+    [Fact]
+    public async Task WhenMemberMisspelledThenErrorSuggestsMember()
+    {
+        var result = await GoToDefinitionTool.GoToDefinition(
+            filePath: FixturePaths.CalculatorFile,
+            symbolName: "System.String.Lenght",
+            fmt: new MarkdownFormatter());
+
+        Assert.Contains("Did you mean", result);
+        Assert.Contains("System.String.Length", result);
     }
 
     [Fact]

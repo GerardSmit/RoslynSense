@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
-using System.Xml.Linq;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
 
@@ -141,6 +140,7 @@ public static class RunTestsTool
                 try
                 {
                     result = FormatTrxOutput(trxPath, process.ExitCode, fmt);
+                    RecordRun(csprojPath, trxPath);
                 }
                 catch
                 {
@@ -210,7 +210,7 @@ public static class RunTestsTool
         string result;
         if (File.Exists(trxPath))
         {
-            try { result = FormatTrxOutput(trxPath, exitCode, fmt); }
+            try { result = FormatTrxOutput(trxPath, exitCode, fmt); RecordRun(csprojPath, trxPath); }
             catch { result = FormatTestOutput(stdout, stderr, exitCode, fmt); }
             finally { try { File.Delete(trxPath); } catch { } }
         }
@@ -341,16 +341,27 @@ public static class RunTestsTool
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Keeps the run's structured results so get_test_failures can answer about it later —
+    /// this tool's markdown is for reading, not for re-parsing.
+    /// </summary>
+    private static void RecordRun(string csprojPath, string trxPath)
+    {
+        var results = Services.Testing.TrxParser.Parse(trxPath);
+        if (results.Count == 0 || PathHelper.FindNearestSolution(csprojPath) is not { } solution)
+            return;
+
+        Services.Testing.TestRunStore.Record(solution, csprojPath, results);
+    }
+
     internal static string FormatTrxOutput(string trxPath, int exitCode, IOutputFormatter fmt)
     {
         var sb = new StringBuilder();
-        XNamespace ns = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
-        var doc = XDocument.Load(trxPath);
-        var results = doc.Descendants(ns + "UnitTestResult").ToList();
+        var results = Services.Testing.TrxParser.Parse(trxPath);
 
-        int passed = results.Count(r => r.Attribute("outcome")?.Value == "Passed");
-        int failed = results.Count(r => r.Attribute("outcome")?.Value == "Failed");
-        int skipped = results.Count(r => r.Attribute("outcome")?.Value is "NotExecuted" or "Inconclusive");
+        int passed = results.Count(r => r.Outcome == "Passed");
+        int failed = results.Count(r => r.Outcome == "Failed");
+        int skipped = results.Count(r => r.Outcome is "NotExecuted" or "Inconclusive");
         int total = results.Count;
 
         if (exitCode == 0)
@@ -364,19 +375,17 @@ public static class RunTestsTool
         if (skipped > 0) fmt.AppendField(sb, "Skipped", skipped);
 
         // Show failed tests with details
-        var failedResults = results.Where(r => r.Attribute("outcome")?.Value == "Failed").ToList();
+        var failedResults = results.Where(r => r.Failed).ToList();
         if (failedResults.Count > 0)
         {
             fmt.AppendSeparator(sb);
             fmt.AppendHeader(sb, "Failed Tests", 2);
             foreach (var result in failedResults)
             {
-                var testName = result.Attribute("testName")?.Value ?? "Unknown";
-                var duration = result.Attribute("duration")?.Value;
-                var output = result.Element(ns + "Output");
-                var errorInfo = output?.Element(ns + "ErrorInfo");
-                var message = errorInfo?.Element(ns + "Message")?.Value;
-                var stackTrace = errorInfo?.Element(ns + "StackTrace")?.Value;
+                var testName = result.FullyQualifiedName;
+                var duration = result.DurationMs > 0 ? $"{result.DurationMs:0.###} ms" : null;
+                var message = result.ErrorMessage;
+                var stackTrace = result.StackTrace;
 
                 fmt.AppendHeader(sb, fmt.Escape(testName), 3);
                 if (duration is not null) fmt.AppendField(sb, "Duration", duration);

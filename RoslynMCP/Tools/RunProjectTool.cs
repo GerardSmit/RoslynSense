@@ -36,6 +36,9 @@ public static class RunProjectTool
         string? environment = null,
         [Description("Build before launching. Defaults to true; set false to launch existing output.")]
         bool build = true,
+        [Description("Start the app so ApplyHotReload can patch it later without a restart. " +
+                     "Has to be decided here: the runtime reads the settings only at startup.")]
+        bool hotReload = false,
         CancellationToken cancellationToken = default)
     {
         try
@@ -59,12 +62,13 @@ public static class RunProjectTool
             }
 
             var outcome = await runner.StartAsync(
-                resolved, configuration, profile, ParseEnvironment(environment), cancellationToken);
+                resolved, configuration, profile, ParseEnvironment(environment), cancellationToken,
+                hotReload);
 
             if (!outcome.Succeeded)
                 return $"Error: {outcome.Error}";
 
-            return Describe(outcome.Session!, fmt);
+            return Describe(outcome.Session!, fmt, hotReload);
         }
         catch (OperationCanceledException)
         {
@@ -78,9 +82,10 @@ public static class RunProjectTool
 
     [McpServerTool, Description(
         "Stop a running project by session ID, by project path, or pass 'all' to stop everything " +
-        "started in this chat. Kills the whole process tree.")]
+        "started in this chat. Kills the whole process tree. A PID also works, which is how to " +
+        "stop an app the user started in the editor — only do that when the user asks.")]
     public static async Task<string> StopProject(
-        [Description("A session ID from RunProject, a .csproj path, or 'all'.")]
+        [Description("A session ID from RunProject, a .csproj path, a PID, or 'all'.")]
         string target,
         AppSessionStore store,
         CancellationToken cancellationToken = default)
@@ -92,7 +97,14 @@ public static class RunProjectTool
 
             var sessions = ResolveTargets(target, store);
             if (sessions.Count == 0)
+            {
+                // Not ours: the registry owns the ones the editor or another chat started, and
+                // it only accepts PIDs it knows about.
+                if (int.TryParse(target, out int pid))
+                    return RunningProcessRegistry.Kill(pid);
+
                 return $"No running session matched '{target}'.";
+            }
 
             var stopped = new List<string>();
             foreach (var session in sessions)
@@ -113,50 +125,100 @@ public static class RunProjectTool
     }
 
     [McpServerTool, Description(
-        "List the applications started in this chat, with their state, PID, URL and uptime.")]
+        "List the applications started in this chat, with their state, PID, URL and uptime — " +
+        "plus the ones running outside it, started by the user in the editor or by another chat.")]
     public static string ListRunningProjects(AppSessionStore store)
     {
         var sessions = store.All();
-        if (sessions.Count == 0)
-            return "No applications have been started in this chat.";
+
+        // Everything in the machine-wide registry that this chat did not start: the editor's own
+        // F5 launches, and other chats'. Without these, "the app I have running" is invisible
+        // here and the model starts a second copy on the same port.
+        var elsewhere = RunningProcessRegistry.List()
+            .Where(e => e.OwnerPid != Environment.ProcessId)
+            .ToList();
+
+        if (sessions.Count == 0 && elsewhere.Count == 0)
+            return "No applications are running.";
 
         var sb = new StringBuilder();
-        sb.AppendLine("| Session | Project | State | PID | URL | Uptime |");
-        sb.AppendLine("|---------|---------|-------|-----|-----|--------|");
 
-        foreach (var session in sessions)
+        if (sessions.Count > 0)
         {
-            var state = session.State == AppSessionState.Exited
-                ? $"exited ({session.ExitCode?.ToString() ?? "?"})"
-                : session.State.ToString().ToLowerInvariant();
+            sb.AppendLine("## Started in this chat");
+            sb.AppendLine();
+            sb.AppendLine("| Session | Project | State | PID | URL | Uptime |");
+            sb.AppendLine("|---------|---------|-------|-----|-----|--------|");
 
+            foreach (var session in sessions)
+            {
+                var state = session.State == AppSessionState.Exited
+                    ? $"exited ({session.ExitCode?.ToString() ?? "?"})"
+                    : session.State.ToString().ToLowerInvariant();
+
+                sb.AppendLine(
+                    $"| {session.Id} | {Path.GetFileNameWithoutExtension(session.ProjectPath)} | {state} | " +
+                    $"{(AppSessionStore.IsLive(session) ? session.Pid.ToString() : "-")} | " +
+                    $"{session.Url ?? "-"} | {FormatDuration(session.Uptime)} |");
+            }
+            sb.AppendLine();
+        }
+
+        if (elsewhere.Count > 0)
+        {
+            sb.AppendLine("## Running outside this chat");
+            sb.AppendLine();
+            sb.AppendLine("| Started by | Project | PID | URL | Uptime |");
+            sb.AppendLine("|------------|---------|-----|-----|--------|");
+
+            foreach (var entry in elsewhere)
+            {
+                sb.AppendLine(
+                    $"| {(entry.SessionId.StartsWith("editor-", StringComparison.Ordinal) ? "the user (editor)" : "another chat")} | " +
+                    $"{Path.GetFileNameWithoutExtension(entry.ProjectPath)} | {entry.Pid} | " +
+                    $"{entry.Url ?? "-"} | {FormatDuration(DateTime.UtcNow - entry.StartedAtUtc)} |");
+            }
+            sb.AppendLine();
             sb.AppendLine(
-                $"| {session.Id} | {Path.GetFileNameWithoutExtension(session.ProjectPath)} | {state} | " +
-                $"{(AppSessionStore.IsLive(session) ? session.Pid.ToString() : "-")} | " +
-                $"{session.Url ?? "-"} | {FormatDuration(session.Uptime)} |");
+                "These are not this chat's to restart: read them with DebugAttach on the PID, " +
+                "and stop one with StopProject on its PID only if the user asks.");
         }
 
         return sb.ToString();
     }
 
     [McpServerTool, Description(
-        "Read the captured stdout/stderr of a running or exited project started in this chat.")]
+        "Read the captured stdout/stderr of a running or exited project started in this chat, or " +
+        "of one running outside it — pass the PID from ListRunningProjects.")]
     public static string GetProjectOutput(
-        [Description("Session ID from RunProject.")]
+        [Description("Session ID from RunProject, or a PID for an app started outside this chat.")]
         string sessionId,
         AppSessionStore store,
         [Description("How many trailing lines to return. Defaults to 100.")]
         int lines = 100)
     {
         if (store.Get(sessionId) is not { } session)
+        {
+            // An app the editor launched: its output reaches the daemon as debug-adapter events
+            // and is logged beside the registry, since there is no AppSession here to hold it.
+            if (int.TryParse(sessionId, out int pid))
+            {
+                string logged = ProcessOutputLog.Tail(pid, Math.Max(1, lines));
+                return logged.Length == 0
+                    ? $"No output has been captured for pid {pid}. Apps started outside this chat " +
+                      "are only captured while an editor is connected to the shared host."
+                    : $"**pid {pid}**\n\n```\n{logged}\n```";
+            }
+
             return $"Error: No session '{sessionId}'. Use ListRunningProjects to see the available IDs.";
+        }
 
         var output = session.Tail(Math.Max(1, lines));
         if (output.Length == 0)
             return $"'{sessionId}' has produced no output yet.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# {sessionId} — {session.State.ToString().ToLowerInvariant()}");
+        sb.AppendLine($"**{sessionId} — {session.State.ToString().ToLowerInvariant()}**");
         sb.AppendLine();
         sb.AppendLine("```");
         sb.Append(output);
@@ -176,15 +238,28 @@ public static class RunProjectTool
         return resolved is null ? [] : [.. store.LiveFor(resolved)];
     }
 
-    private static string Describe(AppSession session, IOutputFormatter fmt)
+    private static string Describe(AppSession session, IOutputFormatter fmt, bool hotReload = false)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Started {Path.GetFileNameWithoutExtension(session.ProjectPath)} — session `{session.Id}`");
+        sb.AppendLine($"**Started {Path.GetFileNameWithoutExtension(session.ProjectPath)} — session `{session.Id}`**");
         sb.AppendLine();
         sb.AppendLine($"- **PID**: {session.Pid}");
         if (session.Url is not null)
             sb.AppendLine($"- **URL**: {session.Url}");
         sb.AppendLine($"- **Runtime**: {(session.DebugRuntime == DebugRuntime.NetFramework ? ".NET Framework" : "CoreCLR")}");
+        if (hotReload)
+        {
+            // What actually opened rather than the request flag: the launcher may not have found
+            // the agent, and claiming an apply path that is not there sends the user debugging
+            // their edit.
+            sb.AppendLine(session.DebugRuntime == DebugRuntime.NetFramework
+                ? "- **Hot reload**: unavailable — .NET Framework applies edits through a debug " +
+                  "session, so use DebugAttach and then ApplyHotReload"
+                : session.HotReloadOpen
+                    ? "- **Hot reload**: enabled — use ApplyHotReload after editing"
+                    : "- **Hot reload**: requested, but no session opened — the hot reload agent " +
+                      "was not found beside the tool");
+        }
         sb.AppendLine();
 
         // A process that is already gone means startup failed; its output is the diagnosis.
@@ -194,6 +269,21 @@ public static class RunProjectTool
             sb.AppendLine();
             sb.AppendLine("```");
             sb.Append(session.Tail(40));
+            sb.AppendLine("```");
+            return sb.ToString();
+        }
+
+        // A launched app belongs to the process that started it and is killed when that process
+        // exits. In a chat that is the whole conversation; from the one-shot CLI it is the next
+        // few milliseconds, so the session handles below would name something already dead.
+        if (CliRunner.IsOneShot)
+        {
+            sb.AppendLine(
+                "**This was started from `--cli`, which exits immediately — the app is being " +
+                "stopped with it.** Run it from an MCP session, or start it yourself with:");
+            sb.AppendLine();
+            sb.AppendLine("```");
+            sb.AppendLine($"{session.CommandLine}");
             sb.AppendLine("```");
             return sb.ToString();
         }

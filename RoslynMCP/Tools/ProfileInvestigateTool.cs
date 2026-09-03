@@ -109,47 +109,57 @@ public static class ProfileInvestigateTool
         fmt.AppendTable(sb, "Matching Methods", columns, rows, matches.Count);
 
         fmt.AppendHints(sb,
-            "Use ProfileCallers to see who calls a method",
-            "Use ProfileCallees to see what a method calls",
+            "Use ProfileCalls (direction: callers or callees) to see who calls a method or what it calls",
             "Use ProfileHotPaths to see execution paths through a method");
 
         return sb.ToString();
     }
 
     [McpServerTool, Description(
-        "Show the direct callers of a method in a profiling session. " +
-        "Reveals which methods invoke the target and how much CPU time flows through each caller.")]
-    public static string ProfileCallers(
+        "Show the direct callers or callees of a method in a profiling session. " +
+        "direction='callers' reveals which methods invoke the target and how much CPU time flows through each; " +
+        "direction='callees' reveals which methods the target calls and how much CPU time is spent in each.")]
+    public static string ProfileCalls(
         [Description("Session ID from ProfileTests/ProfileApp output.")]
         string sessionId,
-        [Description("Method name or pattern to find callers for (substring or regex, case-insensitive).")]
+        [Description("Method name or pattern to look up (substring or regex, case-insensitive).")]
         string methodPattern,
         IOutputFormatter fmt,
         ProfilingSessionStore store,
-        [Description("Maximum callers to return. Default: 20.")]
+        [Description("'callers' (default) for who calls the method, 'callees' for what the method calls.")]
+        string direction = "callers",
+        [Description("Maximum results to return. Default: 20.")]
         int maxResults = 20)
     {
         var session = store.Get(sessionId);
         if (session is null)
             return $"Error: Session '{sessionId}' not found. Use ListProfilingSessions to see active sessions.";
 
-        var callers = store.GetCallers(session, methodPattern, maxResults);
+        bool callers = direction.Equals("callers", StringComparison.OrdinalIgnoreCase);
+        if (!callers && !direction.Equals("callees", StringComparison.OrdinalIgnoreCase))
+            return $"Error: Unknown direction '{direction}'. Use: callers, callees.";
+
+        var calls = callers
+            ? store.GetCallers(session, methodPattern, maxResults)
+            : store.GetCallees(session, methodPattern, maxResults);
         var sb = new StringBuilder();
-        fmt.AppendHeader(sb, $"Callers of '{methodPattern}'");
+        fmt.AppendHeader(sb, $"{(callers ? "Callers" : "Callees")} of '{methodPattern}'");
         fmt.AppendField(sb, "Session", $"{session.Id} ({session.Description})");
         fmt.AppendSeparator(sb);
 
-        if (callers.Count == 0)
+        if (calls.Count == 0)
         {
-            fmt.AppendEmpty(sb, $"No callers found for '{methodPattern}'. The method may be a root frame or not present in the profile.");
+            fmt.AppendEmpty(sb, callers
+                ? $"No callers found for '{methodPattern}'. The method may be a root frame or not present in the profile."
+                : $"No callees found for '{methodPattern}'. The method may be a leaf frame or not present in the profile.");
             return sb.ToString();
         }
 
-        var columns = new[] { "#", "Time%", "Time(ms)", "Samples", "Caller", "Module" };
+        var columns = new[] { "#", "Time%", "Time(ms)", "Samples", callers ? "Caller" : "Callee", "Module" };
         var rows = new List<string[]>();
-        for (int i = 0; i < callers.Count; i++)
+        for (int i = 0; i < calls.Count; i++)
         {
-            var c = callers[i];
+            var c = calls[i];
             rows.Add([
                 (i + 1).ToString(),
                 $"{c.Percent:F1}%",
@@ -160,66 +170,16 @@ public static class ProfileInvestigateTool
             ]);
         }
 
-        fmt.AppendTable(sb, "Direct Callers", columns, rows, callers.Count);
+        fmt.AppendTable(sb, callers ? "Direct Callers" : "Direct Callees", columns, rows, calls.Count);
 
         fmt.AppendHints(sb,
-            "Time% shows what fraction of total profile time flows through this caller into the target method",
-            "Use ProfileCallees to see what the target method calls",
-            "Use GoToDefinition to navigate to a caller's source code");
-
-        return sb.ToString();
-    }
-
-    [McpServerTool, Description(
-        "Show the direct callees of a method in a profiling session. " +
-        "Reveals which methods the target calls and how much CPU time is spent in each callee.")]
-    public static string ProfileCallees(
-        [Description("Session ID from ProfileTests/ProfileApp output.")]
-        string sessionId,
-        [Description("Method name or pattern to find callees for (substring or regex, case-insensitive).")]
-        string methodPattern,
-        IOutputFormatter fmt,
-        ProfilingSessionStore store,
-        [Description("Maximum callees to return. Default: 20.")]
-        int maxResults = 20)
-    {
-        var session = store.Get(sessionId);
-        if (session is null)
-            return $"Error: Session '{sessionId}' not found. Use ListProfilingSessions to see active sessions.";
-
-        var callees = store.GetCallees(session, methodPattern, maxResults);
-        var sb = new StringBuilder();
-        fmt.AppendHeader(sb, $"Callees of '{methodPattern}'");
-        fmt.AppendField(sb, "Session", $"{session.Id} ({session.Description})");
-        fmt.AppendSeparator(sb);
-
-        if (callees.Count == 0)
-        {
-            fmt.AppendEmpty(sb, $"No callees found for '{methodPattern}'. The method may be a leaf frame or not present in the profile.");
-            return sb.ToString();
-        }
-
-        var columns = new[] { "#", "Time%", "Time(ms)", "Samples", "Callee", "Module" };
-        var rows = new List<string[]>();
-        for (int i = 0; i < callees.Count; i++)
-        {
-            var c = callees[i];
-            rows.Add([
-                (i + 1).ToString(),
-                $"{c.Percent:F1}%",
-                $"{c.TimeMs:F1}",
-                c.SampleCount.ToString(),
-                c.Name,
-                c.Module
-            ]);
-        }
-
-        fmt.AppendTable(sb, "Direct Callees", columns, rows, callees.Count);
-
-        fmt.AppendHints(sb,
-            "Time% shows what fraction of total profile time is spent in this callee when called by the target",
-            "Use ProfileCallers on a callee to trace further down the hot path",
-            "Use GoToDefinition to navigate to a callee's source code");
+            callers
+                ? "Time% shows what fraction of total profile time flows through this caller into the target method"
+                : "Time% shows what fraction of total profile time is spent in this callee when called by the target",
+            callers
+                ? "Use ProfileCalls with direction='callees' to see what the target method calls"
+                : "Use ProfileCalls with direction='callers' on a callee to trace further down the hot path",
+            "Use GoToDefinition to navigate to the source code");
 
         return sb.ToString();
     }
@@ -264,7 +224,7 @@ public static class ProfileInvestigateTool
         fmt.AppendHints(sb,
             "Paths are shown from caller → ... → target method (up to 6 frames deep)",
             "Higher Time% means more CPU time flows through this specific call chain",
-            "Use ProfileCallers/ProfileCallees to explore individual methods in the chain");
+            "Use ProfileCalls to explore individual methods in the chain");
 
         return sb.ToString();
     }

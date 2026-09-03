@@ -1,0 +1,932 @@
+/*
+ * The settings panel. Every colour is a VS Code theme variable, so the page follows the editor
+ * into whatever theme it is wearing rather than approximating one.
+ */
+
+body {
+    margin: 0;
+    padding: 0;
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+}
+
+/*
+ * The browser's own rule for `[hidden]` is a plain `display: none`, so any author rule that gives an
+ * element a display — and rows here are grids — outranks it and the element stays on screen. The
+ * page hides by setting `hidden`: a filtered-out row, a condition that does not hold, the
+ * alternative that is not chosen. A row left visible while the form drops its value is a field that
+ * takes an answer and discards it, so the rule that hides has to win over the ones that lay out.
+ */
+[hidden] {
+    display: none !important;
+}
+
+/* ---------------------------------------------------------------------------
+ * Chrome: search and save, then the scope being edited and the file it writes
+ * ------------------------------------------------------------------------- */
+
+.chrome {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 10px 20px;
+    background: var(--vscode-editor-background);
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/*
+ * The two things that act on the whole page, on one line: what it is filtered by, and the one
+ * button that writes. Everything below this line is about a particular setting.
+ */
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.scope-row {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    min-width: 0;
+    margin-top: 8px;
+}
+
+#scopes {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    /* Shrinkable, so the tabs wrap among themselves in a panel too narrow for the row. */
+    flex: 0 1 auto;
+}
+
+/* The separator makes the tab row read as what it is: the merge, weakest to strongest. The glyph
+ * is drawn as a centred box of its own so it does not ride the text baseline below the tabs. */
+.cascade-arrow {
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
+    height: 100%;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.6;
+    user-select: none;
+}
+
+#scopes button {
+    padding: 4px 12px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--vscode-foreground);
+    font: inherit;
+    cursor: pointer;
+}
+
+#scopes button:hover {
+    background: var(--vscode-toolbar-hoverBackground);
+}
+
+#scopes button[aria-selected='true'] {
+    background: var(--vscode-tab-activeBackground);
+    border-color: var(--vscode-focusBorder);
+}
+
+/* A scope with no file yet is offered, not hidden: creating it is the point of choosing it. */
+#scopes button.empty {
+    color: var(--vscode-descriptionForeground);
+}
+
+/*
+ * Trails the tabs on the same line: the tabs say which scope, this says which file it is. Given a
+ * width it would rather have than none, so a narrow panel drops it to its own line instead of
+ * squeezing it down to an ellipsis and nothing else.
+ */
+.scope-file {
+    flex: 1 1 220px;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-align: right;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.scope-file .linklike {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Cut at the front, so the file name survives and the directories are what go. */
+    direction: rtl;
+    unicode-bidi: plaintext;
+}
+
+#search {
+    flex: 1;
+    min-width: 0;
+    max-width: 420px;
+    box-sizing: border-box;
+    padding: 4px 8px;
+    font: inherit;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 3px;
+}
+
+/* Pushed to the far edge whatever the search box does with the space between. */
+.save {
+    margin-left: auto;
+    flex: none;
+    padding: 4px 16px;
+    font: inherit;
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.save:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.save:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* How many edits are waiting, so the button is never the only thing that knows. */
+.pending {
+    flex: none;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+#search::placeholder {
+    color: var(--vscode-input-placeholderForeground);
+}
+
+.notice {
+    margin: 8px 0 0;
+    padding: 6px 10px;
+    border-radius: 4px;
+    background: var(--vscode-textBlockQuote-background);
+    border-left: 3px solid var(--vscode-focusBorder);
+}
+
+.notice.error {
+    border-left-color: var(--vscode-editorError-foreground);
+}
+
+/* ---------------------------------------------------------------------------
+ * The form
+ * ------------------------------------------------------------------------- */
+
+main {
+    padding: 4px 20px 32px;
+    max-width: 820px;
+}
+
+.group {
+    margin: 28px 0 0;
+}
+
+.group h2 {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 0;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+/*
+ * A top-level section announces itself: room above it, a larger heading, and a rule under the
+ * heading running the width of the page. Without one, "WebForms markup" arrived in the middle of
+ * a run of settings rows — each of which draws its own hairline — and read as one more row's
+ * label rather than as the start of something.
+ */
+main > .group {
+    margin-top: 44px;
+}
+
+main > .group:first-child {
+    margin-top: 20px;
+}
+
+main > .group > h2 {
+    padding-bottom: 6px;
+    font-size: 1.35em;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.group-description {
+    margin: 4px 0 12px;
+    color: var(--vscode-descriptionForeground);
+}
+
+main > .group > .group-description {
+    margin-top: 8px;
+}
+
+/* Nested groups step in, so `debugger` under the root reads as part of it. */
+.group .group {
+    margin: 20px 0 0 16px;
+    padding-left: 12px;
+    border-left: 1px solid var(--vscode-panel-border);
+}
+
+/*
+ * What a description writes in backticks. The editor's font and the theme's own code colour, and
+ * no chip behind it: these paragraphs are mostly about file names and identifiers, and a
+ * background on each one turns a sentence into a row of boxes.
+ */
+code {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.95em;
+    color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+}
+
+.setting {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+        'label control'
+        'description control'
+        'origin origin';
+    gap: 2px 16px;
+    align-items: start;
+    padding: 10px 0 10px 10px;
+    margin-left: -10px;
+    border-top: 1px solid var(--vscode-panel-border);
+    border-left: 2px solid transparent;
+}
+
+/* Rows this scope sets itself carry the modified-indicator bar, as the Settings editor does. */
+.setting.own {
+    border-left-color: var(--vscode-focusBorder);
+}
+
+.setting-label {
+    grid-area: label;
+    font-weight: 600;
+}
+
+.setting-control {
+    grid-area: control;
+    justify-self: end;
+}
+
+.setting-description {
+    grid-area: description;
+    margin: 0;
+    color: var(--vscode-descriptionForeground);
+}
+
+/* "Value from Global" / "Overridden by Personal" — the merge explained in words, per row. */
+.origin {
+    grid-area: origin;
+    margin-top: 2px;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.origin .linklike {
+    font-size: inherit;
+}
+
+/* Map and object-list editors span the row instead of sitting in the control column. */
+.setting.wide {
+    grid-template-areas:
+        'label label'
+        'description description'
+        'control control'
+        'origin origin';
+}
+
+.setting.wide .setting-control {
+    justify-self: stretch;
+    margin-top: 6px;
+}
+
+/* ---------------------------------------------------------------------------
+ * Map and object-list editors
+ * ------------------------------------------------------------------------- */
+
+.kv-entry {
+    margin-bottom: 6px;
+}
+
+.kv-editor .kv-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+/* What a `json:`/`xml:` reference resolves to right now — or why it does not. */
+.kv-resolved {
+    margin: 2px 0 0;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.85em;
+    color: var(--vscode-descriptionForeground);
+    overflow-wrap: anywhere;
+}
+
+.kv-resolved.error {
+    color: var(--vscode-editorError-foreground);
+}
+
+.kv-editor input {
+    min-width: 0;
+}
+
+.kv-key {
+    flex: 1;
+}
+
+.kv-value {
+    flex: 2.5;
+}
+
+/*
+ * A list item is one line: what it names, and the two things to do with it. The form that used to
+ * be here for every item at once is in the dialog Edit opens.
+ */
+.item-summary {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.item-summary:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.item-summary-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.item-empty {
+    margin: 0 0 4px;
+    color: var(--vscode-descriptionForeground);
+}
+
+.item-row {
+    display: grid;
+    grid-template-columns: 140px minmax(0, 1fr);
+    gap: 4px 10px;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.item-row label {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.item-row input,
+.item-row select,
+.item-row .dropdown {
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* The sentence under a field, same relationship as .setting-description to its row. */
+.item-help {
+    grid-column: 2;
+    margin: 0 0 2px;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+/* ---------------------------------------------------------------------------
+ * Editing one item: the dialog, the choice between alternatives
+ * ------------------------------------------------------------------------- */
+
+.modal-overlay {
+    position: fixed;
+    z-index: 20;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(0, 0, 0, 0.4);
+}
+
+.modal {
+    display: flex;
+    flex-direction: column;
+    width: 620px;
+    max-width: 100%;
+    max-height: 100%;
+    padding: 14px 18px;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: 4px;
+    box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+}
+
+.modal-title {
+    margin: 0 0 10px;
+    font-size: 1.05em;
+    font-weight: 600;
+}
+
+/* The form scrolls, the title and the buttons do not: Done stays where it was put. */
+.modal-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: flex-end;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--vscode-panel-border);
+}
+
+/* The two ways of filling an item in, as words rather than as a shape nobody has met before. */
+.alternatives {
+    margin: 6px 0 8px;
+}
+
+.alt-choice {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    margin-bottom: 6px;
+}
+
+.alt-option {
+    display: inline-flex;
+    gap: 5px;
+    align-items: center;
+    cursor: pointer;
+}
+
+.alt-option input {
+    margin: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Choosing several of what the solution offers
+ * ------------------------------------------------------------------------- */
+
+.picker {
+    position: relative;
+    min-width: 0;
+}
+
+/* Reads as an input rather than a button, because what it holds is the value. */
+.picker-face {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 3px 6px;
+    text-align: left;
+    font-family: var(--vscode-font-family);
+    font-size: 1em;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.picker-face:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.pills {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+}
+
+.picker-empty {
+    color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
+}
+
+/* Left to right is the order they are tried, which is the whole meaning of the field. */
+.pill {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    padding: 0 4px 0 6px;
+    font-size: 0.9em;
+    color: var(--vscode-badge-foreground);
+    background: var(--vscode-badge-background);
+    border-radius: 9px;
+}
+
+.pill-remove {
+    color: inherit;
+    opacity: 0.7;
+    cursor: pointer;
+}
+
+.pill-remove:hover {
+    opacity: 1;
+}
+
+/*
+ * The chevron, drawn rather than taken from the platform — see `.dropdown`. Two borders of a
+ * square, turned; the same shape VS Code's own dropdowns carry, and it follows the text colour
+ * because it is made of the text colour.
+ */
+.chevron {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    margin-bottom: 3px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(45deg);
+    opacity: 0.8;
+}
+
+.picker-menu {
+    position: absolute;
+    z-index: 10;
+    top: calc(100% + 2px);
+    right: 0;
+    left: 0;
+    max-height: 260px;
+    overflow-y: auto;
+    background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background));
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+    border-radius: 2px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, transparent);
+}
+
+.picker-option {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    padding: 3px 8px;
+    cursor: pointer;
+}
+
+.picker-option:hover,
+.picker-option:focus-visible {
+    outline: none;
+    color: var(--vscode-list-hoverForeground, var(--vscode-foreground));
+    background: var(--vscode-list-hoverBackground);
+}
+
+.picker-tick {
+    width: 1em;
+    flex: none;
+    color: var(--vscode-focusBorder);
+}
+
+.picker-name {
+    flex: none;
+}
+
+.picker-detail {
+    overflow: hidden;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.picker-note {
+    margin: 0;
+    padding: 4px 8px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+/* ---------------------------------------------------------------------------
+ * Naming a call shape
+ * ------------------------------------------------------------------------- */
+
+.shape {
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/* One line of code, completed as it is typed. */
+.call {
+    position: relative;
+    min-width: 0;
+}
+
+.call-input {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--vscode-editor-font-family);
+}
+
+.call-menu {
+    position: absolute;
+    z-index: 10;
+    top: calc(100% + 2px);
+    right: 0;
+    left: 0;
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--vscode-editorSuggestWidget-background, var(--vscode-editorWidget-background));
+    border: 1px solid var(--vscode-editorSuggestWidget-border, var(--vscode-panel-border));
+    border-radius: 2px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, transparent);
+}
+
+.call-option {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+    width: 100%;
+    padding: 2px 8px;
+    text-align: left;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-editorSuggestWidget-foreground, var(--vscode-foreground));
+    background: none;
+    border: 0;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.call-option:hover,
+.call-option.active {
+    color: var(--vscode-editorSuggestWidget-selectedForeground, var(--vscode-list-activeSelectionForeground));
+    background: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground));
+}
+
+/*
+ * Where a searched-for method lives. Trails the signature rather than leading it: the question
+ * being answered is "which GetString", and the answer is the namespace — but the method is what
+ * is being read down the list.
+ */
+.declared-by {
+    flex: none;
+    max-width: 55%;
+    overflow: hidden;
+    color: var(--vscode-descriptionForeground);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Long names are cut at the front, so the class survives and the namespace is what goes. */
+    direction: rtl;
+    unicode-bidi: plaintext;
+}
+
+.call-option.active .declared-by,
+.call-option:hover .declared-by,
+.overload:hover .declared-by {
+    color: inherit;
+}
+
+.overload {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+    width: 100%;
+}
+
+/*
+ * The characters that were typed, in the name being offered because of them. The list's own
+ * highlight colour, which is the one picked to carry against a list background in every theme —
+ * and the row around it stays at full foreground, because a highlight is only readable against
+ * text that is itself readable.
+ */
+.match {
+    color: var(--vscode-list-highlightForeground, var(--vscode-editorSuggestWidget-highlightForeground));
+    font-weight: 600;
+}
+
+.call-option.active .match,
+.call-option:hover .match {
+    color: var(--vscode-list-focusHighlightForeground, var(--vscode-list-highlightForeground));
+}
+
+/* What the entry currently selects — the one thing three text boxes could never say. */
+.shape-status {
+    grid-column: 2;
+    margin: 2px 0 4px 150px;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.shape-status.warn {
+    color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
+}
+
+.shape-overloads {
+    margin: 0 0 6px 150px;
+}
+
+.overload {
+    padding: 0;
+    text-align: left;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+    background: none;
+    border: 0;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.overload:hover {
+    color: var(--vscode-textLink-activeForeground);
+    text-decoration: underline;
+}
+
+/* The ones the signature selects, against the ones it merely shares a name with. */
+.overload.matched {
+    color: var(--vscode-foreground);
+}
+
+.chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.chip {
+    padding: 2px 8px;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    color: var(--vscode-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.chip:hover {
+    background: color-mix(in srgb, var(--vscode-foreground) 8%, var(--vscode-input-background));
+}
+
+.chip.picked {
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    border-color: var(--vscode-button-background);
+}
+
+.linklike.remove {
+    color: var(--vscode-descriptionForeground);
+}
+
+.linklike.remove:hover {
+    color: var(--vscode-errorForeground, var(--vscode-editorError-foreground));
+}
+
+/* ---------------------------------------------------------------------------
+ * Controls
+ * ------------------------------------------------------------------------- */
+
+/*
+ * A select and the multi-select sat side by side wearing different arrows: one the platform's,
+ * one the panel's. The platform's is turned off so that both wear the panel's.
+ */
+.dropdown {
+    position: relative;
+    display: inline-flex;
+    min-width: 0;
+}
+
+.dropdown select {
+    width: 100%;
+    padding-right: 22px;
+    appearance: none;
+}
+
+.dropdown::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    right: 9px;
+    width: 6px;
+    height: 6px;
+    margin-top: -5px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(45deg);
+    opacity: 0.8;
+    pointer-events: none;
+}
+
+input[type='text'],
+input[type='number'],
+select,
+textarea {
+    min-width: 220px;
+    padding: 3px 6px;
+    font: inherit;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 3px;
+}
+
+textarea {
+    font-family: var(--vscode-editor-font-family);
+    resize: vertical;
+}
+
+input::placeholder,
+textarea::placeholder {
+    color: var(--vscode-input-placeholderForeground);
+}
+
+:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+}
+
+.escape-hatch {
+    color: var(--vscode-descriptionForeground);
+}
+
+.linklike {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--vscode-textLink-foreground);
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+}
+
+.linklike:hover {
+    text-decoration: underline;
+}
+
+/* ---------------------------------------------------------------------------
+ * Empty state, footer, small panels
+ * ------------------------------------------------------------------------- */
+
+.no-matches {
+    margin: 24px 20px;
+    color: var(--vscode-descriptionForeground);
+}
+
+.status {
+    padding: 10px 20px;
+    border-top: 1px solid var(--vscode-panel-border);
+    color: var(--vscode-descriptionForeground);
+}
+
+/* Side-bar-width panels: control drops under the label instead of crushing it. */
+@media (max-width: 480px) {
+    .setting {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            'label'
+            'description'
+            'control'
+            'origin';
+    }
+
+    .setting-control {
+        justify-self: start;
+        margin-top: 4px;
+    }
+
+    .item-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .item-help,
+    .shape-status {
+        grid-column: 1;
+        margin-left: 0;
+    }
+
+    .shape-overloads {
+        margin-left: 0;
+    }
+}

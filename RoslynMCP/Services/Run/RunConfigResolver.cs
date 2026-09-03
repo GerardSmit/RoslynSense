@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Sockets;
-using System.Text.Json;
 using System.Xml;
 
 namespace RoslynMCP.Services.Run;
@@ -21,6 +20,23 @@ public sealed record RunSpec
 
     /// <summary>The port to poll for readiness, for web projects.</summary>
     public int? Port { get; init; }
+
+    /// <summary>The launchSettings.json profile this spec came from, when there was one.</summary>
+    public string? ProfileName { get; init; }
+
+    /// <summary>Every launchable profile in the project, so a caller can offer the others.</summary>
+    public IReadOnlyList<string> Profiles { get; init; } = [];
+
+    /// <summary>Where to send a browser once the app is up: <see cref="Url"/> with the profile's
+    /// <c>launchUrl</c> applied.</summary>
+    public string? BrowseUrl { get; init; }
+
+    /// <summary>The profile's <c>launchBrowser</c>. Null when no profile had a say, which leaves
+    /// the decision to the client rather than reading as an explicit "no".</summary>
+    public bool? LaunchBrowser { get; init; }
+
+    /// <summary>The profile's <c>hotReloadEnabled</c>, when it stated one.</summary>
+    public bool? HotReloadEnabled { get; init; }
 
     /// <summary>Why the project cannot be launched, when it cannot.</summary>
     public string? Error { get; init; }
@@ -113,6 +129,7 @@ public static class RunConfigResolver
             // an SSL binding would need applicationHost.config, which this deliberately never edits.
             Url = $"http://localhost:{port}{web.VirtualPath}",
             Port = port,
+            BrowseUrl = $"http://localhost:{port}{web.VirtualPath}",
         };
     }
 
@@ -124,6 +141,42 @@ public static class RunConfigResolver
         string? launchProfile,
         IReadOnlyDictionary<string, string>? extraEnvironment)
     {
+        var settings = LaunchSettings.Load(projectDir);
+        var profile = settings?.Select(launchProfile);
+        string[] profileNames = settings is null
+            ? []
+            : [.. settings.Profiles.Where(p => p.IsLaunchable).Select(p => p.Name)];
+
+        // A name that matches nothing would otherwise fall back to the default profile and run
+        // with the wrong environment, which looks like the profile was honoured.
+        if (!string.IsNullOrWhiteSpace(launchProfile) && profile is null)
+        {
+            return RunSpec.Unsupported(projectPath, classification.Kind,
+                $"'{launchProfile}' is not a profile in this project's launchSettings.json." +
+                (profileNames.Length == 0
+                    ? " It has no launchable profiles."
+                    : $" Available: {string.Join(", ", profileNames)}."));
+        }
+
+        if (profile is { IsLaunchable: false })
+        {
+            return RunSpec.Unsupported(projectPath, classification.Kind,
+                $"Profile '{profile.Name}' has commandName '{profile.CommandName}', which this " +
+                "server does not launch.");
+        }
+
+        var environment = Merge(profile?.EnvironmentVariables, extraEnvironment);
+        var profileArguments = SplitArguments(profile?.CommandLineArgs);
+
+        // An "Executable" profile runs something else entirely — the project's own output is not
+        // even involved, so neither is its build.
+        if (profile is { CommandName: "Executable" })
+        {
+            return ResolveProfileExecutable(
+                projectPath, projectDir, classification, profile, profileNames,
+                profileArguments, environment);
+        }
+
         // Running the built binary rather than `dotnet run` gives a stable PID, which the debugger
         // needs and `dotnet run` does not provide (it launches the app as a child of itself).
         var targetPath = MsBuildLocator.GetTargetPath(projectPath, configuration);
@@ -134,20 +187,77 @@ public static class RunConfigResolver
                 $"({configuration}). Build the project first.");
         }
 
-        var profile = LaunchProfile.Load(projectDir, launchProfile);
-        var environment = Merge(profile?.EnvironmentVariables, extraEnvironment);
-
         var url = profile?.ApplicationUrl;
+
+        // An IISExpress profile carries no URL of its own; the binding lives in iisSettings.
+        if (profile is { CommandName: "IISExpress" })
+            url ??= settings?.IisExpressApplicationUrl;
+
+        // --urls on the command line beats both, and is what the app will actually bind to.
+        url = UrlsFromArguments(profileArguments) ?? url;
+
         if (classification.Kind == AppKind.AspNetCore)
         {
-            url ??= $"http://localhost:{PickPort(0)}";
+            // Derived from the project path rather than asked of the OS, so the app keeps the same
+            // address across restarts and a bookmark or a running browser tab stays valid.
+            url ??= $"http://localhost:{PickPort(StablePort(projectPath))}";
 
             // ASPNETCORE_URLS is what actually binds the server; the launch profile only suggests it.
             if (!environment.ContainsKey("ASPNETCORE_URLS"))
                 environment["ASPNETCORE_URLS"] = url;
         }
 
-        var (executable, arguments) = ResolveHost(targetPath, classification);
+        var (executable, hostArguments) = ResolveHost(targetPath, classification);
+
+        return new RunSpec
+        {
+            ProjectPath = projectPath,
+            Kind = classification.Kind,
+            Executable = executable,
+            Arguments = [.. hostArguments, .. profileArguments],
+            WorkingDirectory = ResolveWorkingDirectory(profile?.WorkingDirectory, projectDir)
+                ?? Path.GetDirectoryName(targetPath) ?? projectDir,
+            Environment = environment,
+            DebugRuntime = classification.DebugRuntime,
+            Url = url,
+            Port = TryParsePort(url),
+            ProfileName = profile?.Name,
+            Profiles = profileNames,
+            BrowseUrl = CombineLaunchUrl(url, profile?.LaunchUrl),
+            LaunchBrowser = profile?.LaunchBrowser,
+            HotReloadEnabled = profile?.HotReloadEnabled,
+        };
+    }
+
+    /// <summary>
+    /// A <c>commandName: "Executable"</c> profile: the project is only the place the settings live,
+    /// and the thing that runs is whatever <c>executablePath</c> names.
+    /// </summary>
+    private static RunSpec ResolveProfileExecutable(
+        string projectPath,
+        string projectDir,
+        ProjectClassification classification,
+        LaunchProfileInfo profile,
+        IReadOnlyList<string> profileNames,
+        IReadOnlyList<string> arguments,
+        Dictionary<string, string> environment)
+    {
+        if (string.IsNullOrWhiteSpace(profile.ExecutablePath))
+        {
+            return RunSpec.Unsupported(projectPath, classification.Kind,
+                $"Profile '{profile.Name}' is an Executable profile but sets no executablePath.");
+        }
+
+        var executable = Path.IsPathRooted(profile.ExecutablePath)
+            ? profile.ExecutablePath
+            : Path.GetFullPath(profile.ExecutablePath, projectDir);
+
+        // A bare command name is meant to be found on PATH, so keep it as written when the
+        // project-relative interpretation does not exist.
+        if (!File.Exists(executable))
+            executable = profile.ExecutablePath;
+
+        var url = UrlsFromArguments(arguments) ?? profile.ApplicationUrl;
 
         return new RunSpec
         {
@@ -155,12 +265,130 @@ public static class RunConfigResolver
             Kind = classification.Kind,
             Executable = executable,
             Arguments = arguments,
-            WorkingDirectory = Path.GetDirectoryName(targetPath) ?? projectDir,
+            WorkingDirectory = ResolveWorkingDirectory(profile.WorkingDirectory, projectDir) ?? projectDir,
             Environment = environment,
             DebugRuntime = classification.DebugRuntime,
             Url = url,
             Port = TryParsePort(url),
+            ProfileName = profile.Name,
+            Profiles = profileNames,
+            BrowseUrl = CombineLaunchUrl(url, profile.LaunchUrl),
+            LaunchBrowser = profile.LaunchBrowser,
+            HotReloadEnabled = profile.HotReloadEnabled,
         };
+    }
+
+    private static string? ResolveWorkingDirectory(string? configured, string projectDir)
+    {
+        if (string.IsNullOrWhiteSpace(configured))
+            return null;
+
+        var expanded = Environment.ExpandEnvironmentVariables(configured);
+        return Path.IsPathRooted(expanded) ? expanded : Path.GetFullPath(expanded, projectDir);
+    }
+
+    /// <summary>
+    /// The <c>--urls</c> value from a profile's command line, which overrides both the profile's
+    /// applicationUrl and ASPNETCORE_URLS once the app is running.
+    /// </summary>
+    internal static string? UrlsFromArguments(IReadOnlyList<string> arguments)
+    {
+        for (int i = 0; i < arguments.Count; i++)
+        {
+            var argument = arguments[i];
+            if (argument.StartsWith("--urls=", StringComparison.OrdinalIgnoreCase))
+                return argument["--urls=".Length..];
+
+            if (argument.Equals("--urls", StringComparison.OrdinalIgnoreCase) && i + 1 < arguments.Count)
+                return arguments[i + 1];
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The address to open a browser at: a <c>launchUrl</c> is either absolute or relative to the
+    /// first URL the app binds to.
+    /// </summary>
+    internal static string? CombineLaunchUrl(string? applicationUrl, string? launchUrl)
+    {
+        var baseUrl = applicationUrl?.Split(';').FirstOrDefault()?.TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(launchUrl))
+            return baseUrl;
+
+        // On Unix, Uri treats a leading slash as an absolute file URI. launchUrl is a
+        // browser URL, so `/swagger` must remain relative to the application's binding.
+        if (Uri.TryCreate(launchUrl, UriKind.Absolute, out var absolute) &&
+            absolute.Scheme is "http" or "https")
+            return absolute.ToString();
+
+        return baseUrl is null ? null : $"{baseUrl}/{launchUrl.TrimStart('/')}";
+    }
+
+    /// <summary>
+    /// Splits a profile's <c>commandLineArgs</c> the way a shell would: double quotes group, and a
+    /// backslash only escapes when it precedes a quote.
+    /// </summary>
+    internal static IReadOnlyList<string> SplitArguments(string? commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine))
+            return [];
+
+        var arguments = new List<string>();
+        var current = new System.Text.StringBuilder();
+        bool quoted = false;
+        bool started = false;
+        int backslashes = 0;
+
+        void FlushBackslashes(bool beforeQuote)
+        {
+            current.Append('\\', beforeQuote ? backslashes / 2 : backslashes);
+            backslashes = 0;
+        }
+
+        foreach (var c in commandLine)
+        {
+            if (c == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+
+            if (c == '"')
+            {
+                bool escaped = backslashes % 2 == 1;
+                FlushBackslashes(beforeQuote: true);
+                if (escaped)
+                    current.Append('"');
+                else
+                    quoted = !quoted;
+                started = true;
+                continue;
+            }
+
+            FlushBackslashes(beforeQuote: false);
+
+            if (!quoted && char.IsWhiteSpace(c))
+            {
+                // An explicitly quoted empty argument is still an argument.
+                if (started)
+                {
+                    arguments.Add(current.ToString());
+                    current.Clear();
+                    started = false;
+                }
+                continue;
+            }
+
+            current.Append(c);
+            started = true;
+        }
+
+        FlushBackslashes(beforeQuote: false);
+        if (started || current.Length > 0)
+            arguments.Add(current.ToString());
+
+        return arguments;
     }
 
     /// <summary>
@@ -294,6 +522,25 @@ public static class RunConfigResolver
     /// gap between probing and binding is unavoidable, and a false "busy" only moves the site to a
     /// different port.
     /// </summary>
+    /// <summary>
+    /// A port derived from the project's path, in the range ASP.NET Core templates use. Stable by
+    /// construction: the same project gets the same address on every machine and every run, which
+    /// an OS-assigned port cannot promise even once.
+    /// </summary>
+    internal static int StablePort(string projectPath)
+    {
+        ulong hash = 14695981039346656037; // FNV-1a
+        // Hash a platform-neutral spelling: launch settings may arrive from a Windows
+        // client even when the server is running in Linux or a container.
+        foreach (var c in projectPath.Replace('\\', '/').TrimEnd('/').ToLowerInvariant())
+        {
+            hash ^= c;
+            hash *= 1099511628211;
+        }
+
+        return 5000 + (int)(hash % 1000);
+    }
+
     internal static int PickPort(int preferred)
     {
         if (preferred is > 0 and < 65536 && IsPortFree(preferred))
@@ -326,72 +573,4 @@ public static class RunConfigResolver
         }
     }
 
-    // -------------------------------------------------------------------------
-    // launchSettings.json
-    // -------------------------------------------------------------------------
-
-    private sealed record LaunchProfile(
-        string? ApplicationUrl, Dictionary<string, string> EnvironmentVariables)
-    {
-        /// <summary>
-        /// Loads a profile from <c>Properties/launchSettings.json</c>. Without an explicit name the
-        /// first "Project"-command profile wins, which is what the dotnet CLI does.
-        /// </summary>
-        public static LaunchProfile? Load(string projectDir, string? profileName)
-        {
-            var path = Path.Combine(projectDir, "Properties", "launchSettings.json");
-            if (!File.Exists(path))
-                return null;
-
-            try
-            {
-                using var document = JsonDocument.Parse(
-                    File.ReadAllText(path),
-                    new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
-
-                if (!document.RootElement.TryGetProperty("profiles", out var profiles))
-                    return null;
-
-                foreach (var profile in profiles.EnumerateObject())
-                {
-                    if (profileName is not null &&
-                        !profile.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    if (profileName is null &&
-                        profile.Value.TryGetProperty("commandName", out var command) &&
-                        command.GetString() is not "Project")
-                        continue;
-
-                    return Parse(profile.Value);
-                }
-            }
-            catch (Exception)
-            {
-                // A malformed launchSettings.json falls back to defaults rather than blocking the run.
-            }
-
-            return null;
-        }
-
-        private static LaunchProfile Parse(JsonElement profile)
-        {
-            var url = profile.TryGetProperty("applicationUrl", out var applicationUrl)
-                ? applicationUrl.GetString()
-                : null;
-
-            var environment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (profile.TryGetProperty("environmentVariables", out var variables) &&
-                variables.ValueKind == JsonValueKind.Object)
-            {
-                foreach (var variable in variables.EnumerateObject())
-                {
-                    if (variable.Value.ValueKind == JsonValueKind.String)
-                        environment[variable.Name] = variable.Value.GetString() ?? "";
-                }
-            }
-
-            return new LaunchProfile(url, environment);
-        }
-    }
 }

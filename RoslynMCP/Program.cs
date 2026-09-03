@@ -10,18 +10,72 @@ using RoslynMCP.Services.Database;
 using RoslynMCP.Services.Designers;
 using RoslynMCP.Services.Run;
 using RoslynMCP.Tools;
-using RoslynMCP.Tools.Razor;
-using RoslynMCP.Tools.WebForms;
+using RoslynMCP.Languages;
 
 [ExcludeFromCodeCoverage]
 class Program
 {
     static async Task<int> Main(string[] args)
     {
+        // When this process runs under `dotnet-trace collect -- ...`, the tracer starts it with
+        // DOTNET_DiagnosticPorts=...,suspend. Our own runtime consumed that at startup, but every
+        // helper this process spawns — BuildHosts, restores, test hosts — would inherit it and
+        // freeze at CLR start waiting for a profiler connection that is only ever coming for us.
+        // Scrubbed here, before anything can spawn, so profiling the tool doesn't hang it.
+        Environment.SetEnvironmentVariable("DOTNET_DiagnosticPorts", null);
+
+        // Before anything else, including mode selection: a redirect hands the whole session over
+        // as it is, whatever mode the host asked for.
+        if (await RoslynMCP.DevBuildRedirect.TryRunAsync(args) is { } redirected)
+            return redirected;
+
+        if (args.Length > 0 && args[0].Equals("--version", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Out.WriteLine(CurrentVersion());
+            return 0;
+        }
+
+        // Schema mode: roslyn-sense --config-schema [path]
+        // Prints (or writes) the JSON Schema for roslynsense.json. The extension ships a copy for
+        // editor validation and for its settings page; a test keeps that copy honest.
+        if (args.Length > 0 && args[0].Equals("--config-schema", StringComparison.OrdinalIgnoreCase))
+        {
+            string schema = ConfigSchema.GenerateText();
+            if (args.Length > 1)
+                File.WriteAllText(args[1], schema);
+            else
+                Console.Out.Write(schema);
+            return 0;
+        }
+
         // CLI mode: roslyn-sense --cli [tool] [options]
         // Runs a single tool and prints the result, without starting the MCP server.
         if (args.Length > 0 && args[0].Equals("--cli", StringComparison.OrdinalIgnoreCase))
             return await RoslynMCP.CliRunner.RunAsync(args[1..]);
+
+        // LSP mode: roslyn-sense --lsp [--solution <path>]
+        // Spawned by an editor as its C# language server; proxies LSP to the shared daemon so
+        // the editor and MCP clients share one loaded solution (in-process fallback otherwise).
+        if (args.Length > 0 && args[0].Equals("--lsp", StringComparison.OrdinalIgnoreCase))
+            return await RoslynMCP.Lsp.LspProxy.RunAsync(args[1..]);
+
+        // DAP mode: roslyn-sense --dap
+        // A debug adapter for .NET Framework targets, backed by ICorDebug. netcoredbg speaks DAP
+        // natively but only debugs CoreCLR, so this is what gives the editor F5 on Framework.
+        if (args.Length > 0 && args[0].Equals("--dap", StringComparison.OrdinalIgnoreCase))
+        {
+            // The editor spawns this process itself, so the toggle has to be read here rather
+            // than inherited: --no-debugger on the server command line never reaches these args,
+            // and refusing at launch is what makes tools.debugger:false mean anything at all.
+            if (!DebuggerEnabled(args))
+            {
+                Console.Error.WriteLine(
+                    "[roslyn-sense] The debugger is disabled (tools.debugger / --no-debugger). "
+                    + "Re-enable it in roslynsense.json to debug from the editor.");
+                return 1;
+            }
+            return await RoslynMCP.Services.Debugging.DapServer.RunAsync(args[1..]);
+        }
 
         // Shared-host daemon mode: roslyn-sense --host <solution>
         // Long-lived process that owns the Roslyn workspaces for one solution and serves tool
@@ -29,38 +83,33 @@ class Program
         if (args.Length > 0 && args[0].Equals("--host", StringComparison.OrdinalIgnoreCase))
         {
             string target = args.Length > 1 ? args[1] : Directory.GetCurrentDirectory();
+            // The daemon exists for exactly one solution; recording it means callers that need
+            // the solution's identity do not have to wait for a project to be loaded first.
+            WorkspaceService.BindSolution(target);
             return await RoslynMCP.Daemon.DaemonServer.RunHostAsync(target);
         }
 
+        // Asks every shared host on this machine to exit, so `dotnet tool update` can uninstall
+        // a package whose binaries the daemons would otherwise keep loaded and locked.
+        if (args.Length > 0 && args[0].Equals("--stop-daemons", StringComparison.OrdinalIgnoreCase))
+            return await RoslynMCP.Daemon.DaemonStopper.StopAllAsync();
+
         var startupWarnings = new List<string>();
 
-        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
+        var layeredConfig = RoslynSenseConfigLoader.LoadLayers(Directory.GetCurrentDirectory());
+        var (config, configPath, configError) =
+            (layeredConfig.Config, layeredConfig.PrimaryPath, layeredConfig.LoadError);
         if (configError is not null)
-            startupWarnings.Add($"roslynsense.json ({configPath}): {configError}");
+            startupWarnings.Add(configError);
 
         var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
         startupWarnings.AddRange(settingsWarnings);
+        DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
-        IReadOnlyList<IDbProvider> dbProviders;
-        IReadOnlyList<AutoConnectionStringDiscovery.DiscoveryWarning> autoDbWarnings = Array.Empty<AutoConnectionStringDiscovery.DiscoveryWarning>();
-        if (!settings.Database)
-        {
-            dbProviders = Array.Empty<IDbProvider>();
-        }
-        else if (!settings.ShouldRunAutoDiscovery())
-        {
-            dbProviders = settings.ExplicitDbProviders;
-        }
-        else
-        {
-            var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out autoDbWarnings);
-            var existing = new HashSet<string>(settings.ExplicitDbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
-            var merged = new List<IDbProvider>(settings.ExplicitDbProviders);
-            foreach (var p in auto)
-                if (existing.Add(p.Alias))
-                    merged.Add(p);
-            dbProviders = merged;
-        }
+        var dbRegistry = new DbConnectionRegistry(Array.Empty<IDbProvider>());
+        DbConnectionWatcher.Resolve(
+            dbRegistry, settings, Directory.GetCurrentDirectory(), out var autoDbWarnings);
 
         var builder = Host.CreateApplicationBuilder(args);
         builder.Logging.AddConsole(consoleLogOptions =>
@@ -101,7 +150,7 @@ class Program
         builder.Services.AddSingleton<RoslynMCP.Services.Memory.MemorySnapshotStore>();
         builder.Services.AddSingleton<BackgroundTaskStore>();
         builder.Services.AddSingleton<BuildWarningsStore>();
-        builder.Services.AddSingleton(new DbConnectionRegistry(dbProviders));
+        builder.Services.AddSingleton(dbRegistry);
         builder.Services.AddSingleton<ExecutionPlanStore>();
 
         builder.Services.AddSingleton<DesignerRegenerationService>();
@@ -112,22 +161,9 @@ class Program
 
         // Register non-C# file type handlers conditionally
         if (settings.WebForms)
-        {
             builder.Services.AddSingleton<IDesignerGenerator, AspxDesignerGenerator>();
-            builder.Services.AddSingleton<IGoToDefinitionHandler, AspxGoToDefinition>();
-            builder.Services.AddSingleton<IFindUsagesHandler, AspxFindUsages>();
-            builder.Services.AddSingleton<IOutlineHandler, AspxOutline>();
-            builder.Services.AddSingleton<IRenameHandler, AspxRename>();
-            builder.Services.AddSingleton<IDiagnosticsHandler, AspxDiagnostics>();
-        }
 
-        if (settings.Razor)
-        {
-            builder.Services.AddSingleton<IGoToDefinitionHandler, RazorGoToDefinition>();
-            builder.Services.AddSingleton<IOutlineHandler, RazorOutline>();
-            builder.Services.AddSingleton<IRenameHandler, RazorRename>();
-            builder.Services.AddSingleton<IDiagnosticsHandler, RazorDiagnostics>();
-        }
+        builder.Services.AddLanguagePacks(settings);
 
         var toolTypes = typeof(Program).Assembly
             .GetTypes()
@@ -142,11 +178,22 @@ class Program
         // which a thin forwarding client never needs. If it ever falls back to in-process, the
         // static ctor runs lazily then; the cap there is the default (the daemon sets its own).
         if (sharedHostSolution is null)
+        {
             WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
 
+            // An in-process MCP server lives long enough to reload solutions; standby hosts are
+            // what make those reloads meet warm MSBuild processes. (In shared-host mode the
+            // daemon enables its own.)
+            RoslynMCP.Services.SharedBuildHost.EnableStandbys();
+        }
+
+        // WithStdioServerTransport() would take stdout from Console.OpenStandardOutput(), whose
+        // stream reports short and failed pipe writes as successes — silent data loss on a channel
+        // that carries JSON-RPC, and tool results run well past the buffer size where it bites.
+        // Same streams, opened the way a protocol needs. See StdIo.
         var mcpBuilder = builder.Services
             .AddMcpServer()
-            .WithStdioServerTransport();
+            .WithStreamServerTransport(Console.OpenStandardInput(), RoslynMCP.StdIo.OpenProtocolOutput());
 
         if (sharedHostSolution is not null)
         {
@@ -185,11 +232,65 @@ class Program
         {
             var logger = host.Services.GetRequiredService<ILoggerFactory>()
                 .CreateLogger("RoslynMCP.Startup");
-            logger.LogInformation("Loaded roslynsense.json from {Path}", configPath);
+
+            // Every layer, weakest first — which is the order they were merged in, so a value that
+            // is not what the file next to the solution says has its explanation on this one line.
+            logger.LogInformation(
+                "Loaded roslynsense.json from {Path}",
+                string.Join(
+                    " < ",
+                    layeredConfig.Present.Select(layer => $"{layer.FilePath} [{layer.Scope}]")));
         }
 
-        await host.RunAsync();
+        // Shared-host mode: the daemon watches roslynsense.json and the connection-string
+        // sources itself and applies changes live. In-process mode the MCP SDK owns the
+        // container, so most of a config change cannot be applied without a restart — but the
+        // database connections live in a mutable registry, so those ARE applied live, both from
+        // a roslynsense.json edit and from an edited web.config / appsettings*.json.
+        RoslynMCP.Daemon.ConfigWatcher? configWatcher = null;
+        DbConnectionWatcher? dbWatcher = null;
+        if (sharedHostSolution is null)
+        {
+            dbWatcher = DbConnectionWatcher.Start(Directory.GetCurrentDirectory(), settings, dbRegistry);
+
+            var reloadLogger = host.Services.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("RoslynMCP.Config");
+            configWatcher = RoslynMCP.Daemon.ConfigWatcher.Start(
+                Directory.GetCurrentDirectory(), args, settings, reload =>
+                {
+                    dbWatcher?.UpdateSettings(reload.Settings);
+                    var dbChanges = DbConnectionWatcher.Resolve(
+                        dbRegistry, reload.Settings, Directory.GetCurrentDirectory(), out _);
+                    if (dbChanges.Count > 0)
+                        reloadLogger.LogInformation(
+                            "Database connections updated live: {Changes}.",
+                            string.Join("; ", dbChanges));
+                    reloadLogger.LogWarning(
+                        "roslynsense.json changed ({Changes}); restart this server to apply the rest. "
+                        + "(The shared host applies config changes live.)",
+                        string.Join("; ", reload.Changes));
+                });
+        }
+
+        using (configWatcher)
+        using (dbWatcher)
+        {
+            await host.RunAsync();
+        }
         return 0;
+    }
+
+    internal static string CurrentVersion() =>
+        typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "unknown";
+
+    /// <summary>The debugger toggle, resolved from the config file and the command line, for the
+    /// entry points that run before the main settings pass. Warnings are dropped: a bad config is
+    /// reported by whichever mode owns the console, and a debug adapter has no console the editor
+    /// would show them in.</summary>
+    private static bool DebuggerEnabled(string[] args)
+    {
+        var layers = RoslynSenseConfigLoader.LoadLayers(Directory.GetCurrentDirectory());
+        return RoslynMCP.Config.EffectiveSettings.Resolve(args, layers.Config, out _).Debugger;
     }
 
     /// <summary>Mirrors the feature-flag filtering applied to tool TYPES, at the method level,

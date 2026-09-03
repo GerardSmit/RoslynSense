@@ -46,6 +46,50 @@ public class SolutionSessionServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task WhenReopenedWithSameSolutionAndWatchThenPendingRegenerationSurvives()
+    {
+        using var session = CreateSession();
+        var solution = Path.Combine(_directory, "App.sln");
+        session.Open(solution, [_directory], watch: true);
+
+        // Arm a debounced regeneration, then reopen mid-debounce — the way an MCP open_solution
+        // arrives after the editor already opened the same solution. A reopen that restarted the
+        // watchers would cancel the pending run and the change would never be recorded.
+        await File.WriteAllTextAsync(Path.Combine(_directory, "Page.aspx"), "<%@ Page Language=\"C#\" %>");
+        var sawPending = await WaitForPendingAsync(session);
+        Assert.True(sawPending, "The watcher never queued a regeneration for the changed markup.");
+
+        session.Open(solution, [_directory], watch: true);
+
+        var recorded = await WaitForHistoryAsync(session);
+        Assert.True(recorded, "Reopening the same solution cancelled the pending regeneration.");
+    }
+
+    [Fact]
+    public void WhenReopenedWithWatchTurnedOffThenWatchingStops()
+    {
+        using var session = CreateSession();
+        var solution = Path.Combine(_directory, "App.sln");
+        session.Open(solution, [_directory], watch: true);
+
+        session.Open(solution, [_directory], watch: false);
+
+        Assert.False(session.IsWatching);
+    }
+
+    [Fact]
+    public void WhenReopenedWithWatchTurnedOnThenWatchingStarts()
+    {
+        using var session = CreateSession();
+        var solution = Path.Combine(_directory, "App.sln");
+        session.Open(solution, [_directory], watch: false);
+
+        session.Open(solution, [_directory], watch: true);
+
+        Assert.True(session.IsWatching);
+    }
+
+    [Fact]
     public void WhenClosedThenWatchingStopsAndStateIsCleared()
     {
         using var session = CreateSession();
@@ -122,6 +166,20 @@ public class SolutionSessionServiceTests : IAsyncLifetime
 
     private static SolutionSessionService CreateSession() =>
         new(new DesignerRegenerationService([new AspxDesignerGenerator(), new DbmlDesignerGenerator()]));
+
+    private static async Task<bool> WaitForPendingAsync(SolutionSessionService session)
+    {
+        // Polled tightly: the pending entry only exists for the debounce window plus the
+        // regeneration itself, and the point is to reopen while it is still there.
+        for (var attempt = 0; attempt < 200; attempt++)
+        {
+            if (session.PendingCount > 0)
+                return true;
+            await Task.Delay(10);
+        }
+
+        return false;
+    }
 
     private static async Task<bool> WaitForHistoryAsync(SolutionSessionService session)
     {

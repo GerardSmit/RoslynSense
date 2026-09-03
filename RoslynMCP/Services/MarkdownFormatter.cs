@@ -9,9 +9,19 @@ public sealed class MarkdownFormatter : IOutputFormatter
 {
     public void AppendHeader(StringBuilder sb, string text, int level = 1)
     {
-        sb.Append('#', level);
-        sb.Append(' ');
-        sb.AppendLine(text);
+        // The top level is bold rather than `#`: a tool result opens with its header, and clients
+        // that preview the first line render an h1 at a size that swamps the rest of the chat.
+        if (level <= 1)
+        {
+            sb.Append("**").Append(text).AppendLine("**");
+        }
+        else
+        {
+            sb.Append('#', level);
+            sb.Append(' ');
+            sb.AppendLine(text);
+        }
+
         sb.AppendLine();
     }
 

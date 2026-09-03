@@ -1,0 +1,28 @@
+<Project>
+
+  <!--
+    Central Package Management. Under this, a PackageReference in a csproj carries no Version at
+    all — NuGet joins it to the PackageVersion below during restore. Reading the reference's own
+    metadata therefore yields nothing, which is the defect this fixture exists to catch.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageVersionOverrideEnabled>true</CentralPackageVersionOverrideEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageVersion Include="Serilog" Version="3.0.0" />
+  </ItemGroup>
+
+  <!-- The Update= form, which is how a repository overrides an inherited central version. A
+       reader that only looks at the Include= would report the superseded 3.0.0. -->
+  <ItemGroup>
+    <PackageVersion Update="Serilog" Version="3.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <GlobalPackageReference Include="Nerdbank.GitVersioning" Version="3.6.133" />
+  </ItemGroup>
+
+</Project>

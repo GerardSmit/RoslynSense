@@ -24,9 +24,24 @@ public sealed record ReportedDiagnostic(
     /// <param name="diagnostic">Diagnostic to convert.</param>
     public static implicit operator Diagnostic(ReportedDiagnostic diagnostic)
     {
+        // A diagnostic that knows no file becomes one with no location, rather than throwing.
+        // Location.Create names its first parameter filePath and rejects null, and
+        // FileLinePositionSpan.Path is null whenever the reported location had no syntax tree
+        // behind it — which is an ordinary thing for a parser to produce and not an error.
+        //
+        // Worth being careful about because of where it lands. This conversion runs while the
+        // markup is being parsed, so the throw came out of Parse rather than out of whatever
+        // reported the diagnostic, and it took down every feature for that file at once: hover,
+        // folding, document symbols, semantic tokens, code lens, diagnostics — each one asks for
+        // the parse first. The trigger was a control registered with a src= that File.Exists could
+        // not confirm, which is what a symlinked web root does.
+        var location = string.IsNullOrEmpty(diagnostic.FileLineSpan.Path)
+            ? Location.None
+            : Location.Create(diagnostic.FileLineSpan.Path, diagnostic.TextSpan, diagnostic.FileLineSpan.Span);
+
         return Diagnostic.Create(
             descriptor: diagnostic.Descriptor,
-            location: Location.Create(diagnostic.FileLineSpan.Path, diagnostic.TextSpan, diagnostic.FileLineSpan.Span),
+            location: location,
             messageArgs: diagnostic.Arguments.GetUnsafeArray());
     }
 

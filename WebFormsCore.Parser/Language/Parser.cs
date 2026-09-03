@@ -41,16 +41,41 @@ public class Parser
     private readonly Dictionary<string, List<string>> _namespaces = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ControlKey, (string Type, string Path)> _controlTypes = new(ControlKeyCompare.OrdinalIgnoreCase);
     private INamedTypeSymbol? _type;
+
+    /// <summary>Whether <see cref="_type"/> is a base class standing in for an unresolved
+    /// <c>Inherits</c>, so the page's own members are unknown.</summary>
+    private bool _inheritsFallback;
     private readonly bool _addFields;
     private readonly string? _rootDirectory;
+    private readonly Func<string, string?> _readFile;
+    private readonly HashSet<string> _activeFiles = new(StringComparer.OrdinalIgnoreCase);
 
-    public Parser(Compilation compilation, string? rootNamespace, bool addFields, string? rootDirectory = null)
+    public Parser(
+        Compilation compilation, string? rootNamespace, bool addFields, string? rootDirectory = null,
+        Func<string, string?>? readFile = null)
     {
         _compilation = compilation;
         _rootNamespace = rootNamespace;
         _container = _rootContainer;
         _addFields = addFields;
         _rootDirectory = rootDirectory?.Replace('\\', '/');
+        _readFile = readFile ?? DefaultReadFile;
+    }
+
+    private static string? DefaultReadFile(string path)
+    {
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     public static ReadOnlySpan<char> IncludeSpan => "include".AsSpan();
@@ -61,13 +86,55 @@ public class Parser
 
     public RootNode Root => _container.Root;
 
+    /// <summary>Tag prefix → the namespaces it resolves against, from <c>@Register</c>
+    /// directives, web.config and the caller-supplied defaults.</summary>
+    public IReadOnlyDictionary<string, List<string>> TagPrefixes => _namespaces;
+
+    /// <summary>User-control registrations: prefix + tag name → the generated type and the
+    /// <c>.ascx</c> it came from.</summary>
+    public IReadOnlyDictionary<ControlKey, (string Type, string Path)> RegisteredControls => _controlTypes;
+
     public List<ReportedDiagnostic> Diagnostics { get; } = new();
 
     public void Parse(ref Lexer lexer)
     {
-        while (lexer.Next() is { } token)
+        // Guards include cycles: a file including itself, directly or through a chain, would
+        // recurse without end. Keyed on the file rather than the include record, and removed on
+        // the way out, so a diamond — two pages both including the same fragment — still inlines
+        // the fragment for each of them.
+        var fileKey = FileKey(lexer.File);
+
+        if (!_activeFiles.Add(fileKey))
         {
-            Consume(ref lexer, token);
+            return;
+        }
+
+        try
+        {
+            while (lexer.Next() is { } token)
+            {
+                Consume(ref lexer, token);
+            }
+
+            Diagnostics.AddRange(lexer.Diagnostics);
+        }
+        finally
+        {
+            _activeFiles.Remove(fileKey);
+        }
+    }
+
+    private static string FileKey(string file)
+    {
+        try
+        {
+            return Path.GetFullPath(file);
+        }
+        catch (Exception)
+        {
+            // Not every parse names a real path — tests and in-memory callers use placeholders
+            // that GetFullPath may reject. The raw string still guards a self-include.
+            return file;
         }
     }
 
@@ -86,6 +153,9 @@ public class Parser
                 break;
             case TokenType.Statement:
                 ConsumeStatement(token);
+                break;
+            case TokenType.ExpressionBuilderPrefix:
+                ConsumeExpressionBuilder(ref lexer, token);
                 break;
             case TokenType.TagOpen:
                 ConsumeOpenTag(ref lexer, token.Range.Start);
@@ -110,49 +180,96 @@ public class Parser
 
     private void ConsumeComment(ref Lexer lexer, Token token)
     {
-        var span = token.Text.Value.AsSpan().TrimStart();
-
-        if (span.Length == 0 || span[0] != '#')
+        if (!TryParseIncludePath(token.Text.Value, out var path))
         {
             return;
         }
 
-        // Check for include
+        var fullPath = ResolveIncludePath(lexer.File, path, _rootDirectory);
+
+        if (fullPath is null)
+        {
+            return;
+        }
+
+        var text = _readFile(fullPath);
+
+        var normalizedFullPath = fullPath.Replace('\\', '/');
+        var includePathRelative = _rootDirectory != null
+            && normalizedFullPath.StartsWith(_rootDirectory, StringComparison.OrdinalIgnoreCase)
+            ? normalizedFullPath.Substring(_rootDirectory.Length).TrimStart('/')
+            : path;
+
+        if (Root.IncludeFiles.All(i => !string.Equals(i.FullPath, fullPath, StringComparison.OrdinalIgnoreCase)))
+        {
+            Root.IncludeFiles.Add(new IncludeFile(
+                includePathRelative, fullPath, text is null ? null : RootNode.GenerateHash(text)));
+        }
+
+        if (text is null)
+        {
+            Diagnostics.Add(ReportedDiagnostic.Create(Descriptors.IncludeFileNotFound, token.Range, path));
+            return;
+        }
+
+        var newLexer = new Lexer(fullPath, text.AsSpan());
+        Parse(ref newLexer);
+    }
+
+    /// <summary>
+    /// Reads the target path out of a server-side include comment —
+    /// <c>#include file="..."</c> or <c>#include virtual="..."</c> — given the comment's inner
+    /// text (without the <c>&lt;!--</c>/<c>--&gt;</c> delimiters). Shared with the include
+    /// scanner on the tooling side so both read the directive identically.
+    /// </summary>
+    public static bool TryParseIncludePath(string commentText, out string path)
+    {
+        path = string.Empty;
+
+        var span = commentText.AsSpan().TrimStart();
+
+        if (span.Length == 0 || span[0] != '#')
+        {
+            return false;
+        }
+
         span = span.Slice(1).TrimStart();
 
         if (!span.StartsWith(IncludeSpan, StringComparison.OrdinalIgnoreCase))
         {
-            return;
+            return false;
         }
 
-        // Check for file
+        span = span.Slice(IncludeSpan.Length);
+
         var index = span.IndexOf(FileSpan, StringComparison.OrdinalIgnoreCase);
+        var keywordLength = FileSpan.Length;
 
         if (index == -1)
         {
             index = span.IndexOf(VirtualSpan, StringComparison.OrdinalIgnoreCase);
+            keywordLength = VirtualSpan.Length;
         }
 
         if (index == -1)
         {
-            return;
+            return false;
         }
 
-        span = span.Slice(index + FileSpan.Length);
+        span = span.Slice(index + keywordLength);
 
-        // Find attribute value
         index = span.IndexOf('=');
 
         if (index == -1)
         {
-            return;
+            return false;
         }
 
         span = span.Slice(index + 1).TrimStart();
 
         if (span.Length == 0 || span[0] is not ('"' or '\''))
         {
-            return;
+            return false;
         }
 
         var quote = span[0];
@@ -162,40 +279,72 @@ public class Parser
 
         if (end == -1)
         {
-            return;
+            return false;
         }
 
-        var path = span.Slice(0, end).ToString();
-        var directoryName = Path.GetDirectoryName(lexer.File);
+        path = span.Slice(0, end).ToString();
+        return path.Length > 0;
+    }
 
-        if (directoryName is null)
+    /// <summary>
+    /// Resolves an include path to an absolute path: <c>~/</c> and rooted paths against
+    /// <paramref name="rootDirectory"/> the way the runtime resolves a virtual path, anything
+    /// else against the including file's own directory. Null when there is nothing to resolve
+    /// against or the path is malformed.
+    /// </summary>
+    public static string? ResolveIncludePath(string includingFile, string includePath, string? rootDirectory)
+    {
+        var path = includePath.Trim();
+
+        if (path.Length == 0)
         {
-            return;
+            return null;
         }
 
-        var fullPath = Path.Combine(directoryName, path);
+        string? baseDirectory;
 
-        if (!File.Exists(fullPath))
+        if (path[0] == '~')
         {
-            return;
+            baseDirectory = rootDirectory;
+            path = path.Substring(1).TrimStart('/', '\\');
         }
-
-        var text = File.ReadAllText(fullPath);
-
-        var newLexer = new Lexer(fullPath, text.AsSpan());
-
-        fullPath = Path.GetFullPath(fullPath).Replace('\\', '/');
-
-        var includePathRelative = _rootDirectory != null && fullPath.StartsWith(_rootDirectory)
-            ? fullPath.Substring(_rootDirectory.Length).TrimStart('/')
-            : path;
-
-        if (Root.IncludeFiles.All(i => i.Path != includePathRelative))
+        else if (path[0] is '/' or '\\')
         {
-            Root.IncludeFiles.Add(new IncludeFile(includePathRelative, RootNode.GenerateHash(text)));
+            baseDirectory = rootDirectory;
+            path = path.TrimStart('/', '\\');
+        }
+        else
+        {
+            baseDirectory = GetDirectoryNameSafe(includingFile);
         }
 
-        Parse(ref newLexer);
+        if (string.IsNullOrEmpty(baseDirectory))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFullPath(Path.Combine(baseDirectory, path));
+        }
+        catch (Exception)
+        {
+            // Invalid characters, an unsupported format, a path past the OS limit — a directive
+            // whose target cannot be a file resolves to nothing rather than throwing mid-parse.
+            return null;
+        }
+    }
+
+    private static string? GetDirectoryNameSafe(string file)
+    {
+        try
+        {
+            return Path.GetDirectoryName(file);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private void ConsumeText(Token token)
@@ -242,6 +391,24 @@ public class Parser
         _container.AddStatement(element);
     }
 
+    private void ConsumeExpressionBuilder(ref Lexer lexer, Token token)
+    {
+        TokenString argument = default;
+
+        if (lexer.Peek() is { Type: TokenType.ExpressionBuilderArgument } argumentNode)
+        {
+            lexer.Next();
+            argument = argumentNode.Text;
+        }
+
+        _container.AddExpressionBuilder(new ExpressionBuilderNode
+        {
+            Range = token.Range,
+            Prefix = token.Text,
+            Argument = argument
+        });
+    }
+
     private void ConsumeDirective(ref Lexer lexer, TokenPosition startPosition)
     {
         var element = new DirectiveNode
@@ -270,7 +437,9 @@ public class Parser
                 }
                 else
                 {
-                    element.Attributes.Add(next.Text, new AttributeValue(false, value));
+                    // TryAdd for the same reason as a tag's attributes: a directive that repeats
+                    // one is a mistake in the markup, not a reason to abandon the whole file.
+                    element.Attributes.TryAdd(next.Text, new AttributeValue(false, value));
                 }
             }
             else if (next.Type == TokenType.EndDirective)
@@ -303,7 +472,30 @@ public class Parser
             {
                 _type = _compilation.GetType(inherits.Value);
 
-                if (_type != null)
+                // Read the page as the base it would have derived from: a null type turned every
+                // feature on the page off at once.
+                if (_type is null)
+                {
+                    _type = element.DirectiveType is DirectiveType.Control
+                        ? _compilation.GetType("WebFormsCore.UI.UserControl")
+                          ?? _compilation.GetType("System.Web.UI.UserControl")
+                        : _compilation.GetType("WebFormsCore.UI.Page")
+                          ?? _compilation.GetType("System.Web.UI.Page");
+
+                    _inheritsFallback = _type is not null;
+
+                    // Not Root.Inherits: the designer generator refuses to write against an
+                    // unresolved one, and a stand-in base would have it emit fields on UserControl.
+                    if (_type is not null)
+                    {
+                        Diagnostics.Add(ReportedDiagnostic.Create(
+                            Descriptors.InheritsTypeNotFound,
+                            inherits.Range,
+                            inherits.Value,
+                            _type.ToDisplayString()));
+                    }
+                }
+                else if (_type != null)
                 {
                     Root.Inherits = _type;
                     Root.AddFields = _type.ContainingAssembly.Equals(_compilation.Assembly, SymbolEqualityComparer.Default);
@@ -329,7 +521,8 @@ public class Parser
 
                         element.Properties.Add(new PropertyNode(member, kv.Value, null)
                         {
-                            Range = kv.Value.Range
+                            Range = kv.Value.Range,
+                            NameRange = kv.Key.Range
                         });
                     }
                 }
@@ -434,7 +627,7 @@ public class Parser
             }
 
             Diagnostics.Add(ReportedDiagnostic.Create(Descriptors.ControlNotFound, src.Range, src.Value));
-            _controlTypes.Add(key, ("WebFormsCore.UI.Control", path));
+            _controlTypes.TryAdd(key, (FallbackControlTypeName, path));
             return;
         }
 
@@ -448,7 +641,7 @@ public class Parser
             return;
         }
 
-        _controlTypes.Add(key, (typeName, path));
+        _controlTypes.TryAdd(key, (typeName, path));
     }
 
     private bool TryResolveAssemblyControl(string path, ControlKey key)
@@ -483,7 +676,7 @@ public class Parser
 
                     if (displayName is not null)
                     {
-                        _controlTypes.Add(key, (displayName, path));
+                        _controlTypes.TryAdd(key, (displayName, path));
                         return true;
                     }
                 }
@@ -533,7 +726,10 @@ public class Parser
                 var templateNode = new TemplateNode
                 {
                     Property = name,
+                    Member = elementMember,
                     ClassName = $"Template_{_type?.Name}_{_container.Current.VariableName}_{name}",
+                    IsSingleInstance = IsSingleInstanceTemplate(elementMember.Symbol),
+                    ContainerType = GetTemplateContainerType(elementMember.Symbol),
                     ControlsType = attributes.TryGetValue("ControlsType", out var controlsType)
                         ? controlsType.Value
                         : null,
@@ -573,14 +769,32 @@ public class Parser
                 Root.ScriptBlocks.Add(text);
             }
 
-            if (lexer.Peek() is { Type: TokenType.TagClose })
+            // This branch pushed nothing, so it must eat its own `</script>`: left for the main
+            // loop it closed whatever container the script sat in, reparenting everything after it.
+            if (lexer.Peek() is { Type: TokenType.TagOpenSlash })
             {
                 lexer.Next();
+
+                if (lexer.Peek() is { Type: TokenType.ElementNamespace })
+                    lexer.Next();
+
+                if (lexer.Peek() is { Type: TokenType.ElementName })
+                    lexer.Next();
+
+                if (lexer.Peek() is { Type: TokenType.TagClose })
+                    lexer.Next();
             }
 
             return;
         }
-        else if (runAt == RunAt.Server || (ns.HasValue && _container.Current is CollectionNode))
+        // The third arm is a default collection property — [ParseChildren(true, "Items")]:
+        // `<asp:ListItem>` sits directly inside `<asp:DropDownList>` with no `<Items>` wrapper,
+        // and ASP.NET parses it as an item of that collection all the same.
+        else if (runAt == RunAt.Server ||
+                 (ns.HasValue && _container.Current is CollectionNode) ||
+                 (ns.HasValue &&
+                  _container.Current is ControlNode { ParseChildren: true } listParent &&
+                  listParent.ControlType.DefaultCollectionProperty() is not null))
         {
             INamedTypeSymbol? controlType = null;
             string? controlPath = null;
@@ -606,7 +820,7 @@ public class Parser
                     }
                 }
 
-                controlType ??= GetControlType(ns?.Text, name.Text);
+                controlType ??= GetControlType(ns?.Text, name.Text, attributes: attributes);
             }
 
             controlType ??= _compilation.GetType("WebFormsCore.UI.HtmlGenericControl")
@@ -622,9 +836,13 @@ public class Parser
                 ItemType = itemType
             };
 
-            if (attributes.TryGetValue("id", out var id))
+            // Only Controls get designer fields: a collection item (`<asp:ListItem id="x">`)
+            // is a plain object the page class never holds.
+            if (attributes.TryGetValue("id", out var id) && !IsKnownNonControl(controlType))
             {
-                if (_container.Template == null)
+                // A control inside only single-instance templates (UpdatePanel.ContentTemplate)
+                // is instantiated once, so it gets a designer field like a top-level control.
+                if (_container.Template == null || !_container.InMultiInstanceTemplate)
                 {
                     var member = _type?.GetMemberDeep(id.Value);
 
@@ -667,6 +885,7 @@ public class Parser
             };
         }
 
+        node.RawAttributes = attributes;
         node.VariableName = $"ctrl{_container.ControlId++}";
         node.StartTag =  new HtmlTagNode
         {
@@ -682,6 +901,56 @@ public class Parser
         {
             _container.Pop();
         }
+    }
+
+    /// <summary>
+    /// Whether the type provably is not a Control. A base chain broken by an unresolved type —
+    /// a missing reference, code-behind mid-edit — gets the benefit of the doubt: dropping a
+    /// designer field over a transiently broken compilation would cascade into CS0103 on every
+    /// use of it.
+    /// </summary>
+    private static bool IsKnownNonControl(ITypeSymbol type)
+    {
+        for (var current = type; current != null; current = current.BaseType)
+        {
+            if (current.Name == "Control" || current.TypeKind == TypeKind.Error)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Whether a template property carries <c>[TemplateInstance(TemplateInstance.Single)]</c>.</summary>
+    private static bool IsSingleInstanceTemplate(ISymbol symbol)
+    {
+        foreach (var attribute in symbol.GetAttributes())
+        {
+            if (attribute.AttributeClass is { Name: "TemplateInstanceAttribute" }
+                && attribute.ConstructorArguments is [{ Value: 1 }])
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>The type <c>[TemplateContainer(typeof(X))]</c> declares for <c>Container</c>
+    /// inside the template, like <c>RepeaterItem</c> for a Repeater's ItemTemplate.</summary>
+    private static INamedTypeSymbol? GetTemplateContainerType(ISymbol symbol)
+    {
+        foreach (var attribute in symbol.GetAttributes())
+        {
+            if (attribute.AttributeClass is { Name: "TemplateContainerAttribute" }
+                && attribute.ConstructorArguments is [{ Value: INamedTypeSymbol container }, ..])
+            {
+                return container;
+            }
+        }
+
+        return null;
     }
 
     private void AddAttributes(Dictionary<TokenString, AttributeValue> attributes, ITypedNode node)
@@ -710,12 +979,29 @@ public class Parser
                 var eventSymbol = controlType?.GetDeep<IEventSymbol>(key.Substring(2));
                 var method = _type?.GetDeep<IMethodSymbol>(value);
 
-                if (eventSymbol != null && method != null)
+                // The control declares the event, so the attribute is one whatever else is known.
+                if (eventSymbol != null)
                 {
-                    node.Events.Add(new EventNode(eventSymbol, method)
+                    if (method != null)
                     {
-                        Range = attribute.Value.Range
-                    });
+                        node.Events.Add(new EventNode(eventSymbol, method)
+                        {
+                            Range = attribute.Value.Range
+                        });
+                        continue;
+                    }
+
+                    // A missing handler is a missing method, not a missing property — and only the
+                    // class the page actually names can be asked whether it has one.
+                    if (_type != null && !_inheritsFallback)
+                    {
+                        Diagnostics.Add(ReportedDiagnostic.Create(
+                            Descriptors.EventHandlerNotFound,
+                            value.Range,
+                            value.Value,
+                            _type.ToDisplayString()));
+                    }
+
                     continue;
                 }
             }
@@ -803,16 +1089,38 @@ public class Parser
 
             controlNode.Properties.Add(new PropertyNode(member, value, converter)
             {
-                Range = value.Range
+                Range = value.Range,
+                NameRange = key.Range
             });
             return;
         }
 
-        var implementsAttributeAccessor = controlType.AllInterfaces.Any(x => x.Name == "IAttributeAccessor" && x.ContainingNamespace.ToString() == "WebFormsCore.UI");
+        // No CLR member name contains a colon, so meta:resourcekey and friends can never be the
+        // property the author meant. DNN spells the same idea without a prefix. The lookup above
+        // still runs first, so a control that really declares ResourceKey keeps binding to it.
+        if (key.Value.Contains(':') ||
+            key.Value.Equals("resourcekey", StringComparison.OrdinalIgnoreCase))
+        {
+            controlNode.Attributes.TryAdd(key, value);
+            return;
+        }
+
+        // A control that implements IAttributeAccessor takes arbitrary attributes and renders them
+        // through, so an attribute it does not declare a property for is correct rather than a
+        // mistake — `class`, `style`, `data-*`, `aria-*` on any server control.
+        //
+        // Both namespaces, and that is the fix. The check named only WebFormsCore.UI, so on a
+        // classic ASP.NET project — where the interface is System.Web.UI.IAttributeAccessor, and
+        // where WebControl and HtmlControl implement it — nothing ever matched, and every such
+        // attribute reported "Could not find property 'class' on type ...". That is a warning on
+        // ordinary, correct markup, which teaches people to ignore the warnings.
+        var implementsAttributeAccessor = controlType.AllInterfaces.Any(x =>
+            x.Name == "IAttributeAccessor"
+            && x.ContainingNamespace.ToString() is "WebFormsCore.UI" or "System.Web.UI");
 
         if (implementsAttributeAccessor)
         {
-            controlNode.Attributes.Add(key, value);
+            controlNode.Attributes.TryAdd(key, value);
             return;
         }
 
@@ -833,7 +1141,11 @@ public class Parser
         {
             offset++;
 
-            if (current.Type is TokenType.TagClose or TokenType.TagSlashClose)
+            // A tag opening inside this one's attribute list ends the search as surely as the
+            // close does: `<html <asp:Literal runat="server" />>` is a literal that writes the
+            // html element's attributes, and that runat is the literal's own.
+            if (current.Type is TokenType.TagClose or TokenType.TagSlashClose
+                or TokenType.TagOpen or TokenType.TagOpenSlash)
             {
                 break;
             }
@@ -865,24 +1177,57 @@ public class Parser
         {
             if (keyNode.Type == TokenType.Attribute)
             {
-                TokenString value = default;
-                var isCode = false;
+                var value = default(AttributeValue);
 
                 if (lexer.Peek() is { Type: TokenType.AttributeValue or TokenType.EvalExpression } valueNode)
                 {
-                    isCode = valueNode.Type == TokenType.EvalExpression;
                     lexer.Next();
-                    value = valueNode.Text;
+                    value = new AttributeValue(valueNode.Type == TokenType.EvalExpression, valueNode.Text);
+                }
+                else if (lexer.Peek() is { Type: TokenType.ExpressionBuilderPrefix } prefixNode)
+                {
+                    lexer.Next();
+
+                    TokenString argument = default;
+
+                    if (lexer.Peek() is { Type: TokenType.ExpressionBuilderArgument } argumentNode)
+                    {
+                        lexer.Next();
+                        argument = argumentNode.Text;
+                    }
+
+                    // Deliberately no node: the builder belongs to this attribute, and the control
+                    // it is written on has not been pushed yet.
+                    value = new AttributeValue(AttributeValueKind.ExpressionBuilder, argument)
+                    {
+                        Prefix = prefixNode.Text
+                    };
                 }
 
                 var key = keyNode.Text;
 
-                if (key.Value.Equals("itemtype", StringComparison.OrdinalIgnoreCase))
+                if (value.Kind is AttributeValueKind.Literal &&
+                    key.Value.Equals("itemtype", StringComparison.OrdinalIgnoreCase))
                 {
                     _itemType = value.Value;
                 }
 
-                attributes.Add(key, new AttributeValue(isCode, value));
+                // A tag is allowed to write the same attribute twice. It is a mistake, but it is a
+                // mistake that exists in real markup — `runat="server"` duplicated by a merge, a
+                // copied tag with a leftover attribute — and ASP.NET itself renders such a page.
+                // Add threw on it, out of the middle of parsing, which took down every feature for
+                // the file: hover, folding, document symbols, semantic tokens, document links,
+                // code actions, code lens and diagnostics all ask for the parse first, and so does
+                // the code-behind's C# code lens.
+                //
+                // The first wins, matching how the tag reads left to right, and the duplicate is
+                // reported where it belongs — as a diagnostic on the offending attribute rather
+                // than as an exception that hides the rest of the file.
+                if (!attributes.TryAdd(key, value))
+                {
+                    Diagnostics.Add(ReportedDiagnostic.Create(
+                        Descriptors.DuplicateAttribute, key.Range, key.Value));
+                }
             }
             else if (keyNode.Type == TokenType.TagSlashClose)
             {
@@ -967,24 +1312,61 @@ public class Parser
         };
     }
 
-    private INamedTypeSymbol? GetControlType(TokenString? elementNs, TokenString name, bool returnNull = false)
+    private INamedTypeSymbol? GetControlType(
+        TokenString? elementNs,
+        TokenString name,
+        bool returnNull = false,
+        Dictionary<TokenString, AttributeValue>? attributes = null)
     {
         if (!elementNs.HasValue)
         {
+            // System.Web's HtmlTagNameToTypeMapper table, which is also what Visual Studio uses
+            // to type designer fields for `runat="server"` HTML elements — an `<input>` must be
+            // an HtmlInputText there, or code-behind touching `.Value` stops compiling.
+            // body/script/style/title go beyond that mapper (title is HtmlTitle only inside a
+            // `<head runat=server>` there): they exist for WebFormsCore, and on System.Web
+            // targets the missing ones fall back to HtmlGenericControl anyway.
             // Note: make sure this list is up-to-date with WebObjectActivator.CreateElement
-
-            return name.Value switch
+            var typeName = name.Value.ToLowerInvariant() switch
             {
-                "form" or "FORM" => ResolveHtmlControl("HtmlForm"),
-                "body" or "BODY" => ResolveHtmlControl("HtmlBody") ?? ResolveHtmlControl("HtmlGenericControl"),
-                "title" or "TITLE" => ResolveHtmlControl("HtmlTitle"),
-                "head" or "HEAD" => ResolveHtmlControl("HtmlHead"),
-                "link" or "LINK" => ResolveHtmlControl("HtmlLink"),
-                "script" or "SCRIPT" => ResolveHtmlControl("HtmlScript") ?? ResolveHtmlControl("HtmlGenericControl"),
-                "style" or "STYLE" => ResolveHtmlControl("HtmlStyle") ?? ResolveHtmlControl("HtmlGenericControl"),
-                "img" or "IMG" => ResolveHtmlControl("HtmlImage"),
-                _ => ResolveHtmlControl("HtmlGenericControl")
+                "a" => "HtmlAnchor",
+                "area" => "HtmlArea",
+                "audio" => "HtmlAudio",
+                "body" => "HtmlBody",
+                "button" => "HtmlButton",
+                "embed" => "HtmlEmbed",
+                "form" => "HtmlForm",
+                "head" => "HtmlHead",
+                "iframe" => "HtmlIframe",
+                "img" => "HtmlImage",
+                "input" => InputControlTypeName(attributes),
+                "link" => "HtmlLink",
+                "meta" => "HtmlMeta",
+                "script" => "HtmlScript",
+                "select" => "HtmlSelect",
+                "source" => "HtmlSource",
+                "style" => "HtmlStyle",
+                "table" => "HtmlTable",
+                "td" or "th" => "HtmlTableCell",
+                "textarea" => "HtmlTextArea",
+                "title" => "HtmlTitle",
+                "tr" => "HtmlTableRow",
+                "track" => "HtmlTrack",
+                "video" => "HtmlVideo",
+                _ => "HtmlGenericControl"
             };
+
+            var htmlType = ResolveHtmlControl(typeName);
+
+            // Pre-4.5 frameworks lack some of the specific types. Submit/reset land on the
+            // HtmlInputButton that era used; unknown input types raised a parse error there,
+            // but for tooling a lenient HtmlInputText beats refusing the page.
+            if (htmlType is null && typeName is "HtmlInputSubmit" or "HtmlInputReset")
+                htmlType = ResolveHtmlControl("HtmlInputButton");
+            if (htmlType is null && typeName is "HtmlInputGenericControl")
+                htmlType = ResolveHtmlControl("HtmlInputText");
+
+            return htmlType ?? ResolveHtmlControl("HtmlGenericControl");
         }
 
         INamedTypeSymbol? type;
@@ -1019,6 +1401,48 @@ public class Parser
 
         return type;
     }
+
+    /// <summary>
+    /// The <c>&lt;input&gt;</c> control type for its <c>type</c> attribute, per System.Web's
+    /// HtmlTagNameToTypeMapper: a missing type means text, and HTML5 types the mapper does not
+    /// know go to HtmlInputGenericControl.
+    /// </summary>
+    private static string InputControlTypeName(Dictionary<TokenString, AttributeValue>? attributes)
+    {
+        var type = attributes != null && attributes.TryGetValue("type", out var value)
+            ? value.Value
+            : "text";
+
+        return type.ToLowerInvariant() switch
+        {
+            "text" => "HtmlInputText",
+            "password" => "HtmlInputPassword",
+            "button" => "HtmlInputButton",
+            "submit" => "HtmlInputSubmit",
+            "reset" => "HtmlInputReset",
+            "image" => "HtmlInputImage",
+            "checkbox" => "HtmlInputCheckBox",
+            "radio" => "HtmlInputRadioButton",
+            "hidden" => "HtmlInputHidden",
+            "file" => "HtmlInputFile",
+            _ => "HtmlInputGenericControl"
+        };
+    }
+
+    /// <summary>
+    /// The <c>Control</c> base type to stand in with when a registered control cannot be resolved,
+    /// named for whichever framework this compilation actually references.
+    /// </summary>
+    /// <remarks>
+    /// It used to be <c>WebFormsCore.UI.Control</c> unconditionally. On a classic ASP.NET project
+    /// that type does not exist, so the stand-in resolved to nothing and every attribute on the
+    /// unresolved control was then reported as a property that could not be found — a page's worth
+    /// of warnings, caused by one control the parser could not locate.
+    /// </remarks>
+    private string FallbackControlTypeName =>
+        (_compilation.GetType("System.Web.UI", "Control")
+         ?? _compilation.GetType("WebFormsCore.UI", "Control"))?.ToDisplayString()
+        ?? "System.Web.UI.Control";
 
     private INamedTypeSymbol? ResolveHtmlControl(string typeName)
     {

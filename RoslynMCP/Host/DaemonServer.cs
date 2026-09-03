@@ -1,7 +1,9 @@
-using System.IO.Pipes;
+﻿using System.IO.Pipes;
 using System.Reflection;
+using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Database;
 
 namespace RoslynMCP.Daemon;
 
@@ -13,15 +15,32 @@ namespace RoslynMCP.Daemon;
 /// </summary>
 internal sealed class DaemonServer
 {
-    private readonly IServiceProvider _services;
+    private volatile Microsoft.Extensions.DependencyInjection.ServiceProvider _services;
     private readonly DaemonLifecycle _lifecycle;
     private readonly string _pipeName;
+    private readonly string _workingDir;
 
-    private DaemonServer(IServiceProvider services, DaemonLifecycle lifecycle, string pipeName)
+    /// <summary>Set right after construction in <see cref="RunHostAsync"/>; a config reload
+    /// hands it the new settings so later file events resolve under them.</summary>
+    private DbConnectionWatcher? _dbWatcher;
+
+    /// <summary>
+    /// Providers replaced by a configuration reload. Kept alive, never disposed mid-run:
+    /// in-flight tool calls and already-attached LSP sessions still resolve from them, and
+    /// disposing one would also dispose the stateful stores the current provider carried over.
+    /// The process exits with the daemon, which is what reclaims them — same as the current
+    /// provider today.
+    /// </summary>
+    private readonly List<IServiceProvider> _retired = [];
+
+    private DaemonServer(
+        Microsoft.Extensions.DependencyInjection.ServiceProvider services,
+        DaemonLifecycle lifecycle, string pipeName, string workingDir)
     {
         _services = services;
         _lifecycle = lifecycle;
         _pipeName = pipeName;
+        _workingDir = workingDir;
     }
 
     public static async Task<int> RunHostAsync(string solutionPathArg)
@@ -30,8 +49,25 @@ internal sealed class DaemonServer
         RedirectConsoleToLog(solutionKey);
         string workingDir = Path.GetDirectoryName(solutionKey) ?? Directory.GetCurrentDirectory();
 
-        var (config, _, _) = RoslynSenseConfigLoader.Load(workingDir);
-        var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out _);
+        var (config, _, configError) = RoslynSenseConfigLoader.Load(workingDir);
+
+        // Said out loud, because the alternative is what it used to be: one field of the wrong
+        // type stops the whole file from loading, every setting in it silently goes back to its
+        // default, and the editor shows a solution configured by nobody with nothing anywhere to
+        // say why. ConfigWatcher says the same on a reload; the first load said nothing at all.
+        if (configError is not null)
+            Console.Error.WriteLine($"[Config] {configError}; running on defaults.");
+
+        var settings = EffectiveSettings.Resolve(Array.Empty<string>(), config, out var configWarnings);
+
+        foreach (string warning in configWarnings)
+            Console.Error.WriteLine($"[Config] {warning}");
+        DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
+
+        // A daemon lives long enough to reload; standby hosts are what make those reloads meet
+        // warm MSBuild processes instead of paying initialisation again.
+        SharedBuildHost.EnableStandbys();
 
         // Acquire the single-owner lock BEFORE any expensive setup (MSBuild registration, DI
         // build). This is what guarantees exactly one live host per solution: a daemon that
@@ -50,6 +86,12 @@ internal sealed class DaemonServer
             return 0;
         }
 
+        DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
+        // A session that is stopped right now picks the new policy up on its next expansion,
+        // which is the whole point of making these switchable rather than start-up only.
+        Services.DebugSessionManager.GetSession()?.ApplyViewOptions(settings.DebugView);
+
         WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
         WorkspaceService.EnsureRegistered();
 
@@ -60,11 +102,29 @@ internal sealed class DaemonServer
         string pipeName = HostPaths.PipeName(solutionKey);
         Console.Error.WriteLine($"[Daemon] Host started for '{solutionKey}' (pipe '{pipeName}', idle {settings.HostIdleMinutes}m).");
 
+        // Say who we are, then make sure something is showing it. Both are advisory and neither
+        // can fail the host.
+        HostRegistry.Publish(solutionKey);
+        TrayLauncher.EnsureRunning();
+
         // No eager warm-up: projects load lazily on the first tool call that touches them
         // (open file X -> load X + its references only). Warming the whole solution here would
         // reintroduce the all-projects load the incremental workspace exists to avoid.
 
-        var server = new DaemonServer(services, lifecycle, pipeName);
+        var server = new DaemonServer(services, lifecycle, pipeName, workingDir);
+
+        // The daemon outlives every client, so it is the process that has to notice a config
+        // edit — the thin clients and LSP proxies just forward here.
+        using var configWatcher = ConfigWatcher.Start(workingDir, [], settings, server.ApplyConfigReload);
+
+        // Same reasoning for the connection-string sources (web.config, appsettings*.json):
+        // without this, an edited connection string keeps the db_* tools on the old database
+        // until the daemon idles out. The registry instance is carried across config reloads,
+        // so resolving it once here stays valid for the daemon's whole life.
+        using var dbWatcher = DbConnectionWatcher.Start(
+            workingDir, settings, services.GetRequiredService<DbConnectionRegistry>());
+        server._dbWatcher = dbWatcher;
+
         try
         {
             await server.AcceptLoopAsync(shutdownCts.Token);
@@ -72,7 +132,8 @@ internal sealed class DaemonServer
         catch (OperationCanceledException) { /* idle shutdown */ }
 
         Console.Error.WriteLine("[Daemon] Idle/shutdown; disposing workspaces.");
-        await WorkspaceService.EvictAllAsync();
+        HostRegistry.Withdraw(solutionKey);
+        await WorkspaceService.ShutdownAsync();
         AnalyzerService.DisposeHost();
         ProjectIndexCacheService.DisposeAll();
         ShadowCopyService.DisposeIfCreated();
@@ -100,6 +161,59 @@ internal sealed class DaemonServer
         {
             // Keep the default console on failure.
         }
+    }
+
+    /// <summary>
+    /// Applies a <c>roslynsense.json</c> reload to the running host: rebuilds the tool-host
+    /// container under the new settings (carrying the stateful stores over), republishes the
+    /// language registry, and asks connected editors to re-pull. Tool calls already in flight
+    /// finish on the provider they started with; everything after the swap sees the new one.
+    /// </summary>
+    /// <remarks>
+    /// Attached LSP sessions keep the provider they initialized with, but almost every handler
+    /// resolves packs through <c>LanguageRegistry.Current</c> — republished here — so behavior
+    /// follows the new settings immediately; only the capabilities advertised at initialize
+    /// stay until the editor reconnects.
+    /// </remarks>
+    internal void ApplyConfigReload(ConfigReload reload)
+    {
+        Console.Error.WriteLine(
+            $"[Daemon] {Config.RoslynSenseConfigLoader.FileName} changed: {string.Join("; ", reload.Changes)}. Applying.");
+        foreach (string warning in reload.Warnings)
+            Console.Error.WriteLine($"[Daemon] Config warning: {warning}");
+
+        var settings = reload.Settings;
+        bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
+        IOutputFormatter formatter = useToon ? new ToonFormatter() : new MarkdownFormatter();
+
+        var previous = _services;
+        var fresh = ToolHostServices.Build(settings, formatter, _workingDir, carryFrom: previous);
+        lock (_retired)
+        {
+            _retired.Add(previous);
+            _services = fresh;
+        }
+
+        // Build above already re-resolved the carried connection registry under the new
+        // settings; the file watcher only needs them for the next config-file event.
+        _dbWatcher?.UpdateSettings(settings);
+
+        WorkspaceService.MaxCachedWorkspaces = settings.MaxWorkspaces;
+        _lifecycle.UpdateIdleTimeout(TimeSpan.FromMinutes(settings.HostIdleMinutes));
+
+        // The reload log already described the debugger diff; this is what makes it true. The
+        // editor's settings push takes the same two steps in ConfigurationHandler — without them
+        // here, a roslynsense.json edit applied only at the next daemon start.
+        DebuggerViewOptions.Current = settings.DebugView;
+        Services.DebugSessionManager.GetSession()?.ApplyViewOptions(settings.DebugView);
+
+        // No counterpart for the running session: an engine cannot be swapped under a live
+        // debuggee, so this is read again when the next one starts.
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
+
+        // Editors re-pull diagnostics, lenses and tokens so anything a toggle changed shows up
+        // without a keystroke.
+        Lsp.LspSessionRegistry.ScheduleRefresh(Lsp.RefreshKind.All, "config-reload");
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
@@ -143,7 +257,36 @@ internal sealed class DaemonServer
                 if (request is null)
                     return; // client disconnected without sending
 
-                var response = await DispatchAsync(request, ct);
+                if (string.Equals(request.Kind, "lsp", StringComparison.Ordinal))
+                {
+                    // LSP handshake: this connection becomes a long-lived duplex LSP session.
+                    // Handing the raw pipe over is safe because ReadMessageAsync reads exactly
+                    // 4+N framed bytes and never buffers ahead — the next byte on the pipe is
+                    // the first byte of LSP JSON-RPC. The `await using` above keeps disposal
+                    // ownership here; the session runs until the editor disconnects, and
+                    // OnConnectionOpened/Closed keeps the idle timer disarmed meanwhile.
+                    Console.Error.WriteLine("[Daemon] LSP session attached.");
+                    await Lsp.LspSessionHost.RunAsync(pipe, _services, ct);
+                    Console.Error.WriteLine("[Daemon] LSP session ended.");
+                    return;
+                }
+
+                if (string.Equals(request.Kind, "exit", StringComparison.Ordinal))
+                {
+                    // Answer first, then die: the stopper waits for this process to exit, and a
+                    // response that never comes would cost it its whole timeout per daemon.
+                    Console.Error.WriteLine("[Daemon] Exit requested; shutting down.");
+                    await IpcProtocol.WriteMessageAsync(
+                        pipe, new DaemonResponse(request.Id, true, "exiting", null), ct);
+                    _lifecycle.RequestShutdown();
+                    return;
+                }
+
+                var response = string.Equals(request.Kind, "editor-debug", StringComparison.Ordinal)
+                    ? await RelayEditorDebugAsync(request, ct)
+                    : string.Equals(request.Kind, "hot-reload", StringComparison.Ordinal)
+                        ? await HotReloadHostAsync(request, ct)
+                        : await DispatchAsync(request, ct);
                 await IpcProtocol.WriteMessageAsync(pipe, response, ct);
                 if (OperatingSystem.IsWindows())
                 {
@@ -162,6 +305,67 @@ internal sealed class DaemonServer
         finally
         {
             _lifecycle.OnConnectionClosed();
+        }
+    }
+
+    /// <summary>
+    /// Relays a debug command from an MCP client into the editor's own debug session: the
+    /// chat-owned debugger lives in the client process, but the editor's debugger belongs to
+    /// VSCode — only a connected LSP session can drive it (DAP requests via the extension).
+    /// </summary>
+    private static async Task<DaemonResponse> RelayEditorDebugAsync(DaemonRequest request, CancellationToken ct)
+    {
+        if (!Lsp.LspSessionRegistry.HasSessions)
+            return new DaemonResponse(request.Id, false, null,
+                "No editor is connected to the shared host.");
+
+        var p = new Lsp.Protocol.EditorDebugCommandParams(
+            request.Tool,
+            request.Args.GetValueOrDefault("expression"),
+            request.Args.GetValueOrDefault("file"),
+            int.TryParse(request.Args.GetValueOrDefault("line"), out int line) ? line : 0,
+            request.Args.GetValueOrDefault("condition"));
+
+        string? result = await Lsp.LspSessionRegistry.TryInvokeEditorDebugCommandAsync(p, ct);
+        return result is null
+            ? new DaemonResponse(request.Id, false, null,
+                "The editor did not handle the debug command (no active debug session in the editor).")
+            : new DaemonResponse(request.Id, true, result, null);
+    }
+
+    /// <summary>
+    /// Serves the launch-time half of hot reload for a chat that is about to start an app.
+    /// </summary>
+    /// <remarks>
+    /// The daemon owns the agent server for the whole solution, so an app is reachable no matter
+    /// who started it: the chat injects this pipe name, the agent connects here, and an apply from
+    /// either the editor or any chat lands in the one process that holds the connection. The
+    /// alternative — each launcher running its own agent server — makes the app applicable only
+    /// by whoever happened to start it.
+    /// </remarks>
+    private static async Task<DaemonResponse> HotReloadHostAsync(DaemonRequest request, CancellationToken ct)
+    {
+        switch (request.Tool)
+        {
+            case "pipe":
+                return new DaemonResponse(
+                    request.Id, true, Services.HotReload.HotReloadAgentServer.Instance.PipeName, null);
+
+            case "start":
+            {
+                // Opened here, at launch, for the same reason the in-process path opens it there:
+                // this is the one moment the built output provably matches the source, so the
+                // baseline predates the user's next edit.
+                string projectPath = request.Args.GetValueOrDefault("projectPath") ?? "";
+                if (projectPath.Length == 0)
+                    return new DaemonResponse(request.Id, false, null, "No project path.");
+
+                var (session, message) = await Services.HotReload.HotReloadService.StartAsync(projectPath, ct);
+                return new DaemonResponse(request.Id, session is not null, message, message);
+            }
+
+            default:
+                return new DaemonResponse(request.Id, false, null, $"Unknown hot reload action '{request.Tool}'.");
         }
     }
 

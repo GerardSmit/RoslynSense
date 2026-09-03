@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ProtoSolution.Client</RootNamespace>
+  </PropertyGroup>
+
+  <!--
+    The other consumer of the same contract. It never references Server, so a caller and an
+    implementation coming back from one search can only be the solution-wide sweep working.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

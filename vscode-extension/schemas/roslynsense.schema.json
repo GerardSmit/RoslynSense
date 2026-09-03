@@ -1,0 +1,1359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://roslyn-sense.dev/schemas/roslynsense.schema.json",
+  "title": "RoslynSense configuration",
+  "description": "Settings for RoslynSense. Merged from every layer that applies: the global file in ~/.roslynsense, every roslynsense.json from the filesystem root down to the working directory, each one's roslynsense.local.json sibling, and the personal file ~/.roslynsense keeps for this directory. Nearest wins, field by field.",
+  "type": [
+    "object",
+    "null"
+  ],
+  "properties": {
+    "tools": {
+      "type": "object",
+      "properties": {
+        "webForms": {
+          "type": "boolean",
+          "title": "WebForms",
+          "description": "ASPX, ASCX and master pages: controls, properties and event handlers as C# symbols."
+        },
+        "razor": {
+          "type": "boolean",
+          "title": "Razor",
+          "description": "Razor and Blazor views."
+        },
+        "proto": {
+          "type": "boolean",
+          "title": "Protobuf",
+          "description": "`.proto` files joined to the C# they generate."
+        },
+        "mediator": {
+          "type": "boolean",
+          "title": "Mediator",
+          "description": "Request and handler types joined across a mediator dispatch."
+        },
+        "resources": {
+          "type": "boolean",
+          "title": "Resources",
+          "description": "`.resx` files: which file a resource key lives in, from C# and from markup."
+        },
+        "msBuild": {
+          "type": "boolean",
+          "title": "Project files",
+          "description": "`.csproj`, `.props` and `.targets`."
+        },
+        "dbml": {
+          "type": "boolean",
+          "title": "LINQ to SQL",
+          "description": "`.dbml` designer files."
+        },
+        "appSettings": {
+          "type": "boolean",
+          "title": "appsettings.json",
+          "description": "`appsettings*.json` keys joined to the configuration reads that name them."
+        },
+        "webConfig": {
+          "type": "boolean",
+          "title": "web.config",
+          "description": "`<appSettings>` and `<connectionStrings>` joined to the C# and markup that read them."
+        },
+        "dotSettings": {
+          "type": "boolean",
+          "title": "ReSharper settings",
+          "description": "Whether a committed `.DotSettings` narrows inferred namespaces, search results and coverage."
+        },
+        "logging": {
+          "type": "boolean",
+          "title": "Logging templates",
+          "description": "The `{Placeholder}` of a logging message joined to the value it prints. Microsoft.Extensions.Logging, Serilog and NLog."
+        },
+        "formatting": {
+          "type": "boolean",
+          "title": "Format strings",
+          "description": "The `{0:dd-MM-yyyy}` of a composite format string and the `yyyyMMdd` of an interpolation, coloured a component at a time and hovered with a worked example."
+        },
+        "valueSets": {
+          "type": "boolean",
+          "title": "Allowed string values",
+          "description": "For a string that has to be one of a short list — an order status of `\"SHIPPED\"`, a document type, a country code. Completes the literal from the list, says on hover what the code means, and reports one the list does not have."
+        },
+        "cron": {
+          "type": "boolean",
+          "title": "Scheduled jobs",
+          "description": "The `\"0 22 * * 1-6\"` handed to Hangfire or Quartz, coloured a field at a time and hovered with what it means and when it next runs. Also lists every scheduled job in the solution."
+        },
+        "routes": {
+          "type": "boolean",
+          "title": "HTTP routes",
+          "description": "Lists what the solution serves over HTTP, and where each endpoint is handled."
+        },
+        "templates": {
+          "type": "boolean",
+          "title": "Templates",
+          "description": "Lists the screens an application declares in template files, as the tree they describe."
+        },
+        "debugger": {
+          "type": "boolean",
+          "title": "Debugger",
+          "description": "The debugger the editor drives: launch, breakpoints, stepping and evaluation."
+        },
+        "profiling": {
+          "type": "boolean",
+          "title": "Profiling",
+          "description": "CPU sampling, memory snapshots and coverage."
+        },
+        "database": {
+          "type": "boolean",
+          "title": "Database",
+          "description": "Querying and describing the databases the solution connects to."
+        }
+      },
+      "title": "Language packs",
+      "description": "Which parts of RoslynSense are switched on. Turning one off removes its MCP tools and stops it answering editor requests."
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "autoDiscovery": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Auto-discovery",
+          "description": "Scan the tree for connection strings. Omitted runs the scan only when nothing is registered explicitly. Production-flavoured environment names are never loaded."
+        },
+        "connections": {
+          "type": "object",
+          "title": "Connections",
+          "description": "Explicit connections by alias. Either `provider:connectionString` or an object with `provider` and `connectionString`."
+        }
+      },
+      "title": "Databases",
+      "description": "Which databases the solution can be queried against."
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "preset": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Preset",
+          "description": "A built-in lookup set to start from: `webforms`, `dnn`, `dotnet`, or `none`. Omitted merges all three, which is the recommended setting.",
+          "enum": [
+            "webforms",
+            "dnn",
+            "dotnet",
+            "none"
+          ]
+        },
+        "include": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Include",
+          "description": "Globs relative to the project directory. Empty means every `.resx` outside `bin` and `obj`."
+        },
+        "exclude": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Exclude",
+          "description": "Globs removed from what Include found, applied first."
+        },
+        "overrides": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "title": "Segment",
+                "description": "The segment as it appears in the file name, `*` allowed — DNN's `Host` and `Portal-*`."
+              },
+              "rank": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Wins over",
+                "description": "Higher wins. The uncustomized file is 0, so `Host` is 1 and `Portal-*` is 2. Explicit because sorting `Portal-*` and `Host` alphabetically gets the precedence backwards."
+              }
+            },
+            "required": [
+              "pattern",
+              "rank"
+            ],
+            "title": "Override",
+            "description": "One customization segment and how strongly it wins.",
+            "x-summary": [
+              "pattern",
+              "rank"
+            ]
+          },
+          "title": "Overrides",
+          "description": "Customization segments beside a base file, such as DNN's `Portal-*`. Replaces the preset's set rather than adding to it."
+        },
+        "conventions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Name",
+                "description": "What a lookup's Fallbacks refers to this by. Reusing the name of a built-in convention replaces it and leaves the rest alone."
+              },
+              "siblingFolder": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Folder beside the file",
+                "description": "Looked for next to the calling file — `App_LocalResources`. Use this or Folder at the project root, not both."
+              },
+              "rootFolder": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Folder at the project root",
+                "description": "Looked for from the project root down — `App_GlobalResources`."
+              },
+              "fixedName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Always this file",
+                "description": "One file name every call site shares, such as `SharedResources`. Leave empty to name the file after the calling file."
+              },
+              "suffix": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "File endings",
+                "description": "What the resx name ends with. `.ascx.resx` for a user control's local file; defaults to `.resx`."
+              }
+            },
+            "title": "Convention",
+            "description": "One way of getting from a call site to the resx file it reads.",
+            "x-exclusive": [
+              {
+                "alternatives": [
+                  {
+                    "title": "Folder beside the file",
+                    "fields": [
+                      "siblingFolder"
+                    ]
+                  },
+                  {
+                    "title": "Folder at the project root",
+                    "fields": [
+                      "rootFolder"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "x-summary": [
+              "id",
+              "siblingFolder",
+              "rootFolder",
+              "fixedName"
+            ]
+          },
+          "title": "Conventions",
+          "description": "Named ways of turning a call-site file into a resx base name. Merged into the preset's by id."
+        },
+        "lookups": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the method — `DotNetNuke.Services.Localization.Localization`. Leave empty to match the method on any class, which is the escape hatch for a codebase where each module wraps localization in its own helper."
+              },
+              "methodName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Method",
+                "description": "The method name, or `Item` for an indexer."
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload — which is wrong wherever overloads disagree about where the file name sits."
+              },
+              "keyIndex": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Key is parameter",
+                "description": "Which parameter carries the resource key, counted from 0."
+              },
+              "rootSource": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "File name comes from",
+                "description": "Where the call site says which resx file to read.",
+                "enum": [
+                  "argument",
+                  "typeArgument",
+                  "containingType",
+                  "containingFile",
+                  "constant",
+                  "none"
+                ]
+              },
+              "rootInterpretation": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Read that as",
+                "description": "What kind of name that value is, which decides how it becomes a resx file.",
+                "enum": [
+                  "virtualPath",
+                  "globalClassName",
+                  "typeName",
+                  "relativePath",
+                  "baseName"
+                ]
+              },
+              "rootIndex": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "File name is parameter",
+                "description": "Which parameter carries it, counted from 0. Only used when the file name comes from an argument.",
+                "x-when": {
+                  "field": "rootSource",
+                  "equals": [
+                    "argument"
+                  ]
+                }
+              },
+              "rootConstant": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Fixed name",
+                "description": "The file name itself, for a helper that always reads one file. Only used when the file name is fixed.",
+                "x-when": {
+                  "field": "rootSource",
+                  "equals": [
+                    "constant"
+                  ]
+                }
+              },
+              "defaultKeySuffix": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Add to keys without a dot",
+                "description": "Appended to a key that contains no `.` — DNN's `.Text`, so `GetString(\"Submit\")` reads `Submit.Text`."
+              },
+              "fallbacks": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Then also look in",
+                "description": "Tried in order when the key is not in the first file. The list is what the preset defines plus any convention this file adds.",
+                "x-choices": "server"
+              }
+            },
+            "title": "Lookup",
+            "description": "One method that takes a resource key, and where the file it reads comes from.",
+            "x-shape": {
+              "kind": "member",
+              "type": "containingType",
+              "member": "methodName",
+              "parameters": "parameterTypes",
+              "positions": {
+                "keyIndex": "key",
+                "rootIndex": "file name"
+              },
+              "label": "Method",
+              "memberKinds": [
+                "method",
+                "indexer"
+              ]
+            }
+          },
+          "title": "Lookups",
+          "description": "Call shapes that carry a resource key. Appended to the preset's."
+        },
+        "markupBindings": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Markup bindings",
+          "description": "Key shapes an application composes from a markup attribute rather than any call site writing them out, each written as the key it produces: `[Control.ID].Text`, `Header[Control.UniqueName].Text`, `[Control.ID].Header`. Appended to the preset's."
+        },
+        "missingKeyDiagnostic": {
+          "type": "boolean",
+          "title": "Report missing keys",
+          "description": "Report a key that no file of its family declares. Off by default: a false report on a key that resolves fine at runtime is what gets the feature switched off wholesale."
+        }
+      },
+      "title": "Resource lookups",
+      "description": "How `.resx` files are found and which call shapes carry a resource key."
+    },
+    "webConfig": {
+      "type": "object",
+      "properties": {
+        "additionalFiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Additional files",
+          "description": "File names claimed alongside `web.config` and `app.config` — for frameworks that keep their own, such as DotNetNuke's `release.config` and `development.config`. Names only, not paths or globs."
+        }
+      },
+      "title": "web.config files",
+      "description": "Which files the web.config pack treats as Framework configuration."
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "templateSyntax": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Malformed template",
+          "description": "LOG0001 — an unclosed brace or a placeholder naming nothing. Microsoft.Extensions.Logging throws on the first of those rather than rendering it oddly."
+        },
+        "unknownPlaceholder": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Placeholder names no parameter",
+          "description": "LOG0002 — a placeholder in a `[LoggerMessage]` message that matches no parameter, so it prints as literal text. SYSLIB1014's claim, reported on the placeholder."
+        },
+        "valueCount": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Wrong number of values",
+          "description": "LOG0003 — the placeholders and the values disagree in count. Placeholders bind by position, so this shifts every placeholder after the mistake onto the wrong value."
+        },
+        "unusedValue": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Value never printed",
+          "description": "LOG0004 — a parameter or argument no placeholder renders. SYSLIB1015's claim for a generated method, reported on the parameter."
+        },
+        "exceptionPosition": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Exception in the wrong place",
+          "description": "LOG0005 — an exception passed as a rendered value rather than as the first argument, which loses the stack trace and the sink's exception handling."
+        }
+      },
+      "title": "Logging templates",
+      "description": "Which of the message-template rules report. Two of them restate what the `[LoggerMessage]` source generator says as SYSLIB1014 and SYSLIB1015, at a better location — turn those off where the generator runs."
+    },
+    "valueSets": {
+      "type": "object",
+      "properties": {
+        "sets": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Name",
+                "description": "What to call this list, so the settings below can point at it. `orderStatus`, say."
+              },
+              "connection": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Connection",
+                "description": "Which configured database connection to run the query against. Leave empty when only one is configured.",
+                "x-choices": "server"
+              },
+              "query": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Query",
+                "description": "The query producing the values — `SELECT [Code] FROM Shop_OrderStatus ORDER BY [Code]`. The first column is the value; a second column, if there is one, is shown beside it as a label."
+              },
+              "values": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Values",
+                "description": "The values written out, for a set with no database behind it. Ignored when a query is set."
+              },
+              "caseSensitive": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "title": "Match casing exactly",
+                "description": "Off by default, because the comparison the code does usually is case-insensitive too."
+              }
+            },
+            "title": "Set",
+            "description": "One list of codes, and where it comes from.",
+            "x-exclusive": [
+              {
+                "alternatives": [
+                  {
+                    "title": "From a database query",
+                    "fields": [
+                      "connection",
+                      "query"
+                    ]
+                  },
+                  {
+                    "title": "Values written here",
+                    "fields": [
+                      "values"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "x-summary": [
+              "id",
+              "query",
+              "values"
+            ]
+          },
+          "title": "Sets",
+          "description": "Where the lists of codes come from. Each set is a query against a configured database connection, or the codes written out here."
+        },
+        "bindings": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "set": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Set",
+                "description": "Which list above this member's codes come from.",
+                "x-choices": "server"
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the member. Leave empty to match the member on any class."
+              },
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Member",
+                "description": "The method, property or field name, or `Item` for an indexer."
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."
+              },
+              "valueIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Value is parameter",
+                "description": "Which parameter carries the value, counted from 0. Leave empty for a property, a field, or a method whose return value is one of the set."
+              }
+            },
+            "title": "Method",
+            "description": "One method, and the set its values come from. Give a parameter position and the value is that argument; leave it empty and the method returns a code, so what is checked is every literal its result is compared against.",
+            "x-shape": {
+              "kind": "member",
+              "type": "containingType",
+              "member": "memberName",
+              "parameters": "parameterTypes",
+              "positions": {
+                "valueIndex": "value"
+              },
+              "label": "Method",
+              "memberKinds": [
+                "method",
+                "indexer"
+              ]
+            }
+          },
+          "title": "Methods",
+          "description": "The methods that carry a code — the one that takes it as an argument, the one that returns it. Every literal written at the call is checked against the list."
+        },
+        "properties": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "set": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Set",
+                "description": "Which list above this member's codes come from.",
+                "x-choices": "server"
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the property or field. Leave empty to match the member on any class, which is the escape hatch for a code carried by a `Code` property on a dozen entities."
+              },
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Property",
+                "description": "The property or field name."
+              }
+            },
+            "title": "Property",
+            "description": "One property or field, and the set its values come from. `order.Status.Code == \"SHIPPED\"` is the shape this is for: nothing is called, so every literal the member is compared or assigned is what gets checked.",
+            "x-shape": {
+              "kind": "member",
+              "type": "containingType",
+              "member": "memberName",
+              "label": "Property",
+              "memberKinds": [
+                "property",
+                "field"
+              ]
+            }
+          },
+          "title": "Properties",
+          "description": "The properties and fields that hold a code — an order's `Status.Code`, a document's `TypeCode`. Every literal compared or assigned to one of them is checked against the list."
+        },
+        "unknownValueDiagnostic": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Report unknown values",
+          "description": "VAL0001 — a string that is not one of its set's values. Only ever reported for a set that loaded completely: an unreachable database says nothing rather than something wrong."
+        },
+        "severity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Report them as",
+          "description": "How loudly VAL0001 is reported. An error by default, because a code the table does not have is a branch that can never be taken. Soften it while a codebase catches up.",
+          "enum": [
+            "error",
+            "warning",
+            "information"
+          ]
+        }
+      },
+      "title": "Allowed string values",
+      "description": "Some strings are really codes: an order status, a document type, a country. The list of codes is in a database table or a spreadsheet somewhere, and nothing in C# knows it, so `\"SHIPED\"` compiles and fails at run time. Say where the list comes from under Sets, then name the methods and the properties that carry a code — those literals then complete from the list, hover with what each code means, and are reported when the list does not have them."
+    },
+    "cron": {
+      "type": "object",
+      "properties": {
+        "bindings": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the member. Leave empty to match the member on any class."
+              },
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Member",
+                "description": "The method name."
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."
+              },
+              "cronIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Schedule is parameter",
+                "description": "Which parameter carries the expression, counted from 0. Leave empty to find it by name instead, which is what makes one entry cover every overload."
+              },
+              "idIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Job name is parameter",
+                "description": "Which parameter names the job, counted from 0. Used to label it in the Cron Jobs list."
+              },
+              "methodIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Work is parameter",
+                "description": "Which parameter says what to run, counted from 0."
+              },
+              "dialect": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Read as",
+                "description": "`hangfire`, `quartz` or `standard`. Leave empty to let the project's own references decide, which is right whenever it references only one. It matters: Quartz numbers Sunday 1 and everyone else numbers it 0, so the same expression names days a day apart."
+              }
+            },
+            "title": "Method",
+            "description": "One method that takes a crontab expression."
+          },
+          "title": "Methods",
+          "description": "The methods of your own that take a schedule — a `Scheduler.AddJob(name, cron, work)` wrapper, say. Every literal written at the call is then coloured, hovered and checked."
+        },
+        "parameterNames": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Parameter names",
+          "description": "Extra parameter names that mean a string argument is a schedule. `cronExpression`, `cron`, `cronSchedule`, `crontab` and `cronString` are recognised already, whoever declares them."
+        },
+        "expressionDiagnostic": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Report bad schedules",
+          "description": "CRON0001 — an expression the library reading it would reject. Worth having because it is otherwise found at run time, by the job never running."
+        },
+        "severity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Report them as",
+          "description": "How loudly CRON0001 is reported. A warning by default rather than an error: the string is read by a library at a version RoslynSense cannot see, so being wrong is possible and a red squiggle under working code is worse than a yellow one."
+        }
+      },
+      "title": "Scheduled jobs",
+      "description": "A crontab expression is five or six numbers that decide when something runs on a server nobody is watching, and nothing in C# checks it — a transposed field is a job that quietly runs on the wrong day. Hangfire and Quartz are recognised already, and so is any parameter named `cronExpression` or close to it, so this section is only needed for an in-house scheduler whose method nobody could have guessed the name of."
+    },
+    "routes": {
+      "type": "object",
+      "properties": {
+        "attributes": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "attributeName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Attribute",
+                "description": "The attribute's name, written with or without the `Attribute` suffix — both spellings mean the same attribute."
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the attribute class. Leave empty to match the name wherever it is declared, which is usually what is wanted: naming the attribute is the reason for the entry."
+              },
+              "pathIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Path is argument",
+                "description": "Which constructor argument carries the template, counted from 0. Leave empty for the first argument that is a string."
+              },
+              "verb": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "HTTP method",
+                "description": "`GET`, `POST`, and so on. Leave empty when the attribute constrains none, which is what a bare route attribute does — an endpoint reachable by every method is a real thing and the list says so by leaving the column empty."
+              }
+            },
+            "title": "Attribute",
+            "description": "One attribute that carries a route template."
+          },
+          "title": "Attributes",
+          "description": "The attributes of your own that carry a route template. Matched by name, so an attribute named here is read wherever it is declared."
+        },
+        "methods": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "memberName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Member",
+                "description": "The method name."
+              },
+              "containingType": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Class",
+                "description": "The full name of the class or interface declaring the member. Leave empty to match the member on any class."
+              },
+              "parameterTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": "Parameters",
+                "description": "One type name per parameter, `*` for a parameter of any type. Leave empty to match every overload."
+              },
+              "pathIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Path is parameter",
+                "description": "Which parameter carries the template, counted from 0. Leave empty for the first string."
+              },
+              "handlerIndex": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ],
+                "pattern": "^-?(?:0|[1-9]\\d*)$",
+                "title": "Handler is parameter",
+                "description": "Which parameter says what runs, counted from 0. Used to point the Implementation button at it."
+              },
+              "verb": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "HTTP method",
+                "description": "`GET`, `POST`, and so on. Leave empty when the call constrains none."
+              },
+              "kind": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "The call",
+                "description": "`endpoint`, or `group` for one that opens a prefix every endpoint registered on its result carries. Leave empty for `endpoint`."
+              }
+            },
+            "title": "Method",
+            "description": "One method that registers an endpoint."
+          },
+          "title": "Methods",
+          "description": "The methods of your own that register an endpoint — a `MapEndpoint(path, handler)` wrapper, say."
+        }
+      },
+      "title": "HTTP routes",
+      "description": "What the solution serves over HTTP, listed under Routes: the path, the verb and the method that handles it. ASP.NET Core's attributes and minimal APIs and ASP.NET Web API's attributes are recognised already, so this section is only needed for a routing layer of your own — the `[Endpoint(\"orders\")]` that derives from nothing and that no list of framework names could have guessed at."
+    },
+    "templates": {
+      "type": "object",
+      "properties": {
+        "folders": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Folders",
+          "description": "Where the template files are, relative to a project. `App_Data/Templates` and `App_Data/TemplatesCustom` are read already, so this is only needed for a layout that keeps them somewhere else."
+        },
+        "controlFolders": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Module folders",
+          "description": "Where the modules an application installed live, searched for the control that renders a module the templates name but never describe. `DesktopModules` is looked in already."
+        },
+        "locale": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Language",
+          "description": "Which language tag a row's name is read from — `nl-NL`, `en-US`. Leave empty for whichever the file writes first. This is the customer's language rather than yours: the names in the tree should be the words in the screenshots you are sent."
+        }
+      },
+      "title": "Templates",
+      "description": "An application whose screens are declared in YAML rather than built in code has a structure — pages under pages, each hosting something that renders it — that exists in no file tree, because the files are named after the change that introduced them rather than after the screen they describe. Listed under Templates, with a button to the declaration and one to the control that renders it."
+    },
+    "webForms": {
+      "type": "object",
+      "properties": {
+        "dataExpressions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "tag": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Tag",
+                "description": "The tag it is written on — `telerik:GridBoundColumn` — or `*` for any. Matched on the tag as written rather than on the control's type, so it keeps working in a site whose vendor assembly does not resolve."
+              },
+              "attribute": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Attribute",
+                "description": "The attribute name. Matched without regard to casing, as markup attributes are."
+              },
+              "kind": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Value is",
+                "description": "A member path from the bound item, or a composite format string.",
+                "enum": [
+                  "member",
+                  "format"
+                ]
+              },
+              "source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "title": "Formats the value of",
+                "description": "For a format string, which sibling attribute names the value being formatted — `[ItemType].[Control.DataField]` reads this tag's `DataField` and resolves it against the bound item. That is what tells a `{0:dd-MM-yyyy}` it is formatting a date."
+              }
+            },
+            "title": "Attribute",
+            "description": "One attribute, and how its value reads.",
+            "x-summary": [
+              "tag",
+              "attribute"
+            ]
+          },
+          "title": "Data expressions",
+          "description": "The attributes to read as a path from the bound item. A grid's `SortExpression` and `DataField` are the usual ones."
+        },
+        "unknownMemberDiagnostic": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Report unknown members",
+          "description": "WFB0001 — a name the bound item type does not have. Only ever reported when that type is known: a container with no `ItemType` whose `DataSource` cannot be traced says nothing rather than something wrong."
+        },
+        "severity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "Report them as",
+          "description": "How loudly WFB0001 is reported. A warning by default, because a path is resolved case-insensitively through `TypeDescriptor` and can be satisfied at runtime by a type this tool never sees.",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hidden"
+          ]
+        }
+      },
+      "title": "WebForms markup",
+      "description": "Attributes whose value names a member of the bound item, the way `Eval(\"...\")` does. Nothing is read this way until it is listed here, because which attributes behave so comes from the control library rather than from the framework."
+    },
+    "debugger": {
+      "type": "object",
+      "properties": {
+        "debuggerDisplay": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "DebuggerDisplay",
+          "description": "Format values using their type's `DebuggerDisplayAttribute`."
+        },
+        "typeProxy": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "DebuggerTypeProxy",
+          "description": "Expand values through their type's `DebuggerTypeProxyAttribute`."
+        },
+        "browsable": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "DebuggerBrowsable",
+          "description": "Honour `DebuggerBrowsableAttribute` when listing members."
+        },
+        "callToString": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Call ToString",
+          "description": "Show values through their own `ToString` override when no attribute claims them — VS's \"call string-conversion function on objects in variables windows\"."
+        },
+        "justMyCode": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Just My Code",
+          "description": "Step past `DebuggerStepThrough`, `DebuggerHidden`, `DebuggerNonUserCode`, and code with no symbols."
+        },
+        "rawView": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Raw View",
+          "description": "Offer a Raw View child whenever a proxy or a hidden member means the listed children are not the object's own fields."
+        },
+        "maxChildren": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ],
+          "pattern": "^-?(?:0|[1-9]\\d*)$",
+          "title": "Max children",
+          "description": "How many children of one value to list before truncating. Defaults to 100."
+        },
+        "symbolInclude": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Load symbols only for",
+          "description": "Globs for the only modules whose symbols load, when the list is non-empty. A glob without a path separator matches the module's file name (`MyCompany.*.dll`); with one, its full path (`**\\bin\\**`). Empty loads symbols for every module not excluded."
+        },
+        "symbolExclude": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": "Never load symbols for",
+          "description": "Globs for modules whose symbols never load, taking precedence over the include list. A module without symbols cannot bind source breakpoints — the same trade VS's \"Load all modules, unless excluded\" makes. ASP.NET's generated `App_Web_*.dll` page assemblies are already skipped without any configuration."
+        },
+        "coreClrEngine": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "CoreCLR engine",
+          "description": "Which engine debugs .NET (CoreCLR) targets: `netcoredbg` (default) or `icordebug`. .NET Framework always uses `icordebug`, which is the only engine that can attach to it. `icordebug` additionally brings Just My Code through the runtime, breakpoints that bind against binaries built elsewhere, method return values after a step, and stepping through decompiled code — but it runs on Windows only and is newer on this runtime. Takes effect the next time debugging starts.",
+          "enum": [
+            "netcoredbg",
+            "icordebug"
+          ]
+        }
+      },
+      "title": "Debugger",
+      "description": "Which `System.Diagnostics` attributes the debug engines honour while inspecting and stepping, and which engine debugs a CoreCLR target."
+    },
+    "tableFormat": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "title": "Table format",
+      "description": "How tabular tool output is rendered: `markdown` (default) or `toon`.",
+      "enum": [
+        "markdown",
+        "toon"
+      ]
+    },
+    "preload": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "title": "Preload",
+      "description": "Solutions or projects to load on startup. Omitted auto-discovers the first solution in the working directory; an empty list disables preloading."
+    },
+    "sharedHost": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "title": "Shared host",
+      "description": "Load each solution once per machine and share it across every editor window and chat, instead of once per client."
+    },
+    "hostIdleMinutes": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ],
+      "pattern": "^-?(?:0|[1-9]\\d*)$",
+      "title": "Host idle timeout",
+      "description": "Minutes the shared host stays alive after its last client disconnects."
+    },
+    "maxWorkspaces": {
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ],
+      "pattern": "^-?(?:0|[1-9]\\d*)$",
+      "title": "Cached workspaces",
+      "description": "How many loaded solutions one process keeps before evicting the least recently used."
+    }
+  }
+}

@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+option csharp_namespace = "ProtoFixture.Common";
+
+package common;
+
+import "google/protobuf/empty.proto";
+
+enum Channel {
+  CHANNEL_UNKNOWN = 0;
+  CHANNEL_ALPHA = 1;
+  CHANNEL_BETA = 2;
+  CHANNEL_GAMMA = 4;
+}
+
+message OptionalStringUpdate {
+  oneof action {
+    string set = 1;
+    google.protobuf.Empty reset = 2;
+  }
+}
+
+message UUID {
+  string value = 1;
+}
+
+message Int64List {
+  repeated int64 values = 1;
+}

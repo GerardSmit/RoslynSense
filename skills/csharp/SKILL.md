@@ -1,13 +1,21 @@
 ---
 name: csharp
-description: C#/.NET coding conventions plus how to drive the RoslynSense MCP tools for analysis, navigation, refactoring, building, running, testing, and debugging. Use when working in a C# project — any .cs, .csproj, .sln, .aspx/.ascx (WebForms) or .razor/.cshtml file, on modern .NET or .NET Framework.
+description: C#/.NET coding conventions plus how to drive the RoslynSense MCP tools for analysis, navigation, refactoring, building, and running. Use when working in a C# project — any .cs, .csproj, .sln, .aspx/.ascx (WebForms) or .razor/.cshtml file, on modern .NET or .NET Framework.
 ---
 # C# prompt instructions
-You are an expert C#/.NET developer. You help with .NET tasks by giving clean, well-designed, error-free, fast, secure, readable, and maintainable code that follows .NET conventions. You also give insights, best practices, general software design tips, and testing best practices.
+You are an expert C#/.NET developer. Write correct, readable code that follows .NET conventions, and say what you are trading away when you trade something away. Offer the design reasoning behind a change, not only the change.
 
 You are familiar with the currently released .NET and C# versions (up to .NET 10 and C# 14 at the time of writing).
 
-**Always check the project's C# version first** using the **GetProjectStructure** tool (which shows the C# language version and target framework). Only use features available for that version.
+**Always check the project's C# version first** — **OpenSolution** reports each project's target framework, and the `.csproj` names an explicit `<LangVersion>` where one is set. Only use features available for that version.
+
+## Companion skills
+
+This skill covers everyday work: conventions, navigation, editing, building, packages, and running. Load the companion skill when the task calls for it:
+
+- **csharp-testing** — writing and fixing tests, test conventions, reading failures.
+- **csharp-profiling** — CPU hotspots; any "why is this slow" or "where does the time go" question.
+- **csharp-database** — reading or changing data behind the app, inspecting a schema, or finding out why a query is slow.
 
 # General C# Development
 
@@ -53,7 +61,9 @@ Prefer **BuildProject** and **RunTests** over shell commands. When you do fall b
 - Always add `-v q` for quiet output; only when absolutely necessary (e.g. seeing test exception), remove `-v` from the command.
   NEVER USE `-v n` OR `-v d`.
 - Always add `-tl:false` to disable interactive console.
-- Always add `-l "console;verbosity=normal"` if a test is failing, remove it once the tests succeed.
+- Do not reach for `-l "console;verbosity=normal"` to investigate a failing test. **GetTestFailures**
+  already resolves each failure to the assertion's own file and line, which is what the verbose
+  log was being read for.
 
 
 ## Build
@@ -81,53 +91,6 @@ Reach for `dotnet build` / `dotnet publish` / `MSBuild` directly only for someth
 - Prefer `await using` for async resources. Default to `Task` over `ValueTask`.
 - Don't add `async/await` if you just return the task.
 
-# Testing best practices
-
-## Test structure
-
-- Separate test project: **`[ProjectName].Tests`**.
-- Mirror classes: `CatDoor` -> `CatDoorTests`.
-- Name tests by behavior: `WhenCatMeowsThenCatDoorOpens`.
-- Follow existing naming conventions.
-- Use **public instance** classes; avoid **static** fields.
-- No branching/conditionals inside tests.
-
-## Unit Tests
-
-- One behavior per test;
-- Avoid Unicode symbols.
-- Follow the Arrange-Act-Assert (AAA) pattern
-- Use clear assertions that verify the outcome expressed by the test name
-- Avoid using multiple assertions in one test method. In this case, prefer multiple tests.
-- When testing multiple preconditions, write a test for each
-- When testing multiple outcomes for one precondition, use parameterized tests
-- Tests should be able to run in any order or in parallel
-- Avoid disk I/O; if needed, randomize paths, don't clean up, log file locations.
-- Test through **public APIs**; don't change visibility; avoid `InternalsVisibleTo`.
-- Require tests for new/changed **public APIs**.
-- Assert specific values and edge cases, not vague outcomes.
-
-## Test workflow
-
-- **Work test-driven.** For new features, write the test first. For bugs, write a failing test that reproduces the issue before fixing it.
-- Work on only one test until it passes. Then run other tests to ensure nothing has been broken.
-
-### Code coverage
-
-- Use the **RunCoverage** MCP tool to collect coverage, then **GetCoverage** to query results by file, class, or method.
-- Re-run RunCoverage after code changes that affect coverage.
-
-## Test framework
-
-- **Use the framework already in the solution** (xUnit/NUnit/MSTest) for new tests. Check with **GetProjectStructure** which detects the test framework automatically.
-
-## Mocking
-
-- Use NSubstitute
-- Avoid mocks/Fakes if possible
-- External dependencies can be mocked. Never mock code whose implementation is part of the solution under test.
-- Try to verify that the outputs (e.g. return values, exceptions) of the mock match the outputs of the dependency. You can write a test for this but leave it marked as skipped/explicit so that developers can verify it later.
-
 # Validate
 - Always run **BuildProject** and **RunTests** before ending the session to ensure no errors or test failures.
 - If you edited ASPX markup or a `.dbml`, run **RegenerateDesigner** first so the generated code matches.
@@ -137,7 +100,7 @@ Reach for `dotnet build` / `dotnet publish` / `MSBuild` directly only for someth
 
 # RoslynSense MCP Tools
 
-You have access to the **RoslynSense** MCP server, which provides C# code analysis, navigation, refactoring, testing, running, and debugging capabilities powered by the Roslyn compiler platform. It supports C# files, ASPX/ASCX (WebForms), and Razor (.razor/.cshtml) files, on both modern .NET and .NET Framework.
+You have access to the **RoslynSense** MCP server, which provides C# code analysis, navigation, diagnostics, building, testing and running powered by the Roslyn compiler platform. It supports C# files, ASPX/ASCX (WebForms), and Razor (.razor/.cshtml) files, on both modern .NET and .NET Framework.
 
 **Always prefer RoslynSense tools over shell commands or text-based grep when working with C# code.** These tools provide compiler-accurate results — they understand types, overloads, generics, and cross-project references.
 
@@ -155,7 +118,7 @@ Only run `dotnet tool update --global RoslynSense` when asked, or when told a ne
 
 ## Markup Snippet Convention
 
-Many RoslynSense tools use a `markupSnippet` parameter with `[| |]` delimiters to identify a target symbol. Copy a small code snippet from the file and wrap the target symbol:
+**FindUsages** and **GoToDefinitionSnippet** take a `markupSnippet` parameter with `[| |]` delimiters to identify a target symbol. Copy a small code snippet from the file and wrap the target symbol:
 
 ```
 var x = [|Foo|].Bar();          // targets Foo
@@ -186,9 +149,7 @@ Adding a control field manually to a designer file, or to the code-behind to "wo
 When starting work on an unfamiliar codebase, use these tools in order:
 
 1. **OpenSolution** — load the solution, report each project's framework and run kind plus the .NET Framework toolchain (MSBuild, IIS Express, SqlMetal), and start watching markup so designer files stay current. Call this first in any legacy WebForms solution. Omit `solutionPath` to auto-discover.
-2. **ListProjects** — discover all projects in a solution or directory.
-3. **GetProjectStructure** — get an overview of a project's target framework, references, source files, and types organized by namespace.
-4. **GetFileOutline** — get a compact outline of a file showing namespaces, types, and member signatures with line numbers. Supports multiple files (semicolon-separated paths).
+2. **SemanticSymbolSearch** — find the types the solution is built around, by phrase rather than by exact name.
 
 Only after understanding the structure should you drill into specific code.
 
@@ -198,13 +159,11 @@ Only after understanding the structure should you drill into specific code.
 
 Use these tools to trace code flows and understand relationships:
 
-- **GoToDefinition** — jump to a symbol's definition. Auto-decompiles referenced assembly symbols when source is unavailable.
+- **GoToDefinition** — jump to a symbol's definition, by *fully-qualified name* (`Namespace.Type.Member`). Auto-decompiles referenced assembly symbols when source is unavailable.
+- **GoToDefinitionSnippet** — the same jump when you have the call site in front of you rather than the symbol's full name: pass a `markupSnippet` instead. Reach for this one while reading code; reach for GoToDefinition when a stack trace or a compiler error handed you the qualified name.
 - **FindUsages** — find all references to a symbol across the project. Also searches Razor-generated files and ASPX inline code.
-- **FindSymbol** — search for declarations by name. Supports exact, prefix, substring, and camelCase matching (e.g., `AC` matches `AddCalculation`).
-- **SemanticSymbolSearch** — ranked search combining name, signature, XML docs, and source cues. Use for phrase-style queries when you're unsure of the exact symbol name.
-- **FindImplementations** — find all implementations of an interface, abstract class, or virtual/abstract member.
-- **GetCallHierarchy** — discover who calls a method (callers) and what a method calls (callees). Use `direction` parameter: `callers`, `callees`, or `both`.
-- **GetTypeHierarchy** — show base classes, interfaces, and derived/implementing types.
+- **SemanticSymbolSearch** — ranked symbol search combining name and camelCase matching (e.g., `AC` matches `AddCalculation`) with signature terms, XML docs, and source cues. Use for phrase-style queries when you're unsure of the exact symbol name.
+- **GetSourceGeneratedFileContent** — see what a source generator (Razor, System.Text.Json, regex, ...) actually emitted, by the hint name a stack trace or compiler error gives it.
 
 **Prefer these over grep for symbol lookups.** They resolve overloads correctly, follow cross-project references, and understand generics.
 
@@ -212,43 +171,21 @@ Use these tools to trace code flows and understand relationships:
 
 ### Before editing
 
-- Use **GetFileOutline** to understand the file structure and locate the right insertion point.
 - Use **GoToDefinition** and **FindUsages** to understand the impact of your change.
 
 ### After editing
 
 1. **RegenerateDesigner** — if you edited `.aspx`/`.ascx`/`.master` markup or a `.dbml`, regenerate before checking diagnostics. Unnecessary when **OpenSolution** is watching.
-2. **GetRoslynDiagnostics** — check for errors/warnings in the edited file(s). Pass multiple files separated by semicolons. Use `severityFilter: "error"` for a quick check.
+2. **GetRoslynDiagnostics** — check for errors/warnings in the edited file(s). Pass multiple files separated by semicolons. Use `severityFilter: "error"` for a quick check. Pass a `.csproj` path instead of a source file to ask what is broken across a whole project.
 3. **BuildProject** — build the project or solution to catch cross-file issues.
-4. **GetCodeActions** — if diagnostics show errors, check for available quick fixes. Use `applyIndex` to apply a fix directly.
 
 ### Refactoring
 
-- **RenameSymbol** — rename a symbol and all its references across the project, including ASPX/ASCX and Razor files. Use `dryRun: true` to preview changes before applying. When renaming a type whose name matches its file name, the file is also renamed.
-- **GetCodeActions** — discover refactorings like Extract Method, Introduce Variable, etc. at a specific code location.
+- **FindUsages** before you rewrite a member: a rename or a signature change is only safe once you have seen every call site, including the ones in ASPX and Razor that a text search does not reach.
 
-## Workflow: Testing
+## Workflow: NuGet Packages
 
-### Discovering tests
-
-- **DiscoverTests** — statically discover all test methods in a project. Returns test names, frameworks, file paths, and line numbers. Use `className` to filter.
-- **FindTests** — find tests that reference a specific symbol. Useful for checking test coverage of a method before changing it. Set `useCoverage: true` for runtime-accurate results (requires RunCoverage first).
-
-### Running tests
-
-- **RunTests** — run tests with an optional filter expression. Examples:
-  - `filter: "ClassName.MethodName"` — run a specific test
-  - `filter: "FullyQualifiedName~MyTest"` — substring match
-  - `filter: "Category=Unit"` — by category
-  - No filter runs all tests in the project.
-  - Set `background: true` to run tests in the background and continue working. Check results later with **GetBackgroundTaskResult**.
-- Work on one failing test at a time until it passes, then run the full suite.
-
-### Code coverage
-
-1. **RunCoverage** — collect coverage data. Must be called before GetCoverage. Set `background: true` for background collection.
-2. **GetCoverage** — query results by file, class, or method. Shows line and branch coverage with uncovered lines.
-- Re-run RunCoverage after code changes that affect coverage.
+Use the `dotnet` CLI — `dotnet add package`, `dotnet list package`, `dotnet restore`. Afterwards call **OpenSolution** again, or **BuildProject**, so later analysis is not answering from a workspace snapshot taken before the reference changed.
 
 ## Workflow: Running an Application
 
@@ -256,157 +193,89 @@ Use this to observe real behaviour rather than inferring it from source.
 
 - **RunProject** — build and run a project, leaving it running. ASP.NET Core and console apps (.NET and .NET Framework) launch directly; legacy ASP.NET sites launch under IIS Express on the port and virtual path from the project's `WebProjectProperties`. For web projects it waits until the port accepts connections, then returns the URL and PID. Builds first by default (like Visual Studio); pass `build: false` to launch existing output.
 - **StopProject** — stop by session ID, project path, or `all`. Kills the whole process tree.
-- **ListRunningProjects** — what is running, with state, PID, URL and uptime.
-- **GetProjectOutput** — the app's captured stdout/stderr.
+- **ListRunningProjects** — what is running, with state, PID, URL and uptime. Covers apps this
+  chat started *and* apps the user started from the editor, so it is the answer to "what is
+  running right now" regardless of who started it.
+- **GetProjectOutput** — the app's captured stdout/stderr. Returns the last 100 lines; pass
+  `lines` for more. Takes the session ID from RunProject, or a PID for an app the editor
+  started.
+- Launch profiles come from the project's `launchSettings.json`; pass one by name to RunProject's `profile` parameter.
 
 ### Running tips
 
 - **RunProject builds first**, so a code change is picked up without a separate step. If the build fails it reports the errors and starts nothing.
 - If the process exits immediately, **GetProjectOutput** has the reason — read it before changing code.
 - Applications are per-chat and are stopped when the session ends, but **StopProject** when finished rather than leaving ports held.
-- To debug what you started, pass the PID from **RunProject** to **DebugAttach**.
+- To debug what you started, attach the editor's debugger to the PID **RunProject** reports.
 
-## Workflow: Debugging
+### The app the user is running
 
-The debug engine is selected automatically from the target — never pick one:
+When the user says "the app", "the current run", "the process", or asks why the thing on their
+screen is misbehaving, **call ListRunningProjects first**. Do not assume they mean something
+this chat started, and do not offer to start a second copy before looking — the port is
+already held, and a second instance is its own confusing bug.
 
-| Target | Engine |
-|--------|--------|
-| .NET / .NET Core | netcoredbg, auto-provisioned on first use |
-| .NET Framework | ICorDebug, built in |
+Apps the user launched or debugged from the editor are registered too, with a session id
+prefixed `editor-`. That prefix is the tell: it separates "the user started this" from "a chat
+did", which decides whether stopping it is yours to do. **Do not StopProject an `editor-`
+entry** — the editor still believes it is supervising that process. Ask.
 
-`DebugStartTest` decides from the project's target framework; `DebugAttach` decides from the CLR the target process actually loaded, which is how attaching to `iisexpress.exe` or `w3wp.exe` resolves to the .NET Framework engine. A target of a different bitness (a 32-bit app pool) is driven through a matching worker process automatically.
+Their output is readable the same way: pass the **PID** to GetProjectOutput. The log outlives
+the process on purpose, so an app that has already exited can still be asked what it printed
+on the way out.
 
-### Starting a debug session
+One limit worth knowing before concluding nothing is running: this only covers debug sessions
+started with the **C# (RoslynSense)** launch configuration. A session started with another C#
+debug extension is invisible here — an empty list means "nothing I can see", not "nothing is
+running", so say which one you mean.
 
-- **DebugStartTest** — debug a test project. Builds, launches the test host, and attaches the debugger. Use `filter` to target specific tests. Use `initialBreakpoints` to set breakpoints before execution starts (e.g., `"MyService.cs:42;MyTest.cs:10"`). Not supported for .NET Framework test projects — run the tests, then **DebugAttach** to the test host.
-- **DebugAttach** — attach to a running .NET or .NET Framework process. Omit the PID to list available processes.
-- To debug a web app: **RunProject** to start it, then **DebugAttach** with the returned PID.
+### Reading debug output
 
-### Controlling execution
+**GetProjectOutput reads stdout and stderr, and that is not everything the app prints.**
+`Console.WriteLine` and the `ILogger` console provider both write to stdout, so those appear.
+`Debug.WriteLine` and `Trace.WriteLine` do not: `DefaultTraceListener` hands them to an
+attached debugger and nowhere else, so for an app started by RunProject alone they are
+written into the void.
 
-1. **DebugSetBreakpoint** — set breakpoints. Supports conditions (e.g., `condition: "i == 42"`) and batch mode (semicolon-separated `file:line` pairs).
-2. **DebugContinue** — control execution: `continue`, `step_in`, `step_over`, or `step_out`.
-3. **DebugRunUntil** — run to a specific line with an optional condition. Sets a temporary breakpoint that auto-removes once hit.
-4. **DebugEvaluate** — evaluate expressions at the current pause point. Separate multiple expressions with semicolons (e.g., `"x;y;list.Count"`).
-5. **DebugStatus** — check debugger state, breakpoints, and current position. Use `includeLocals: true` for local variables and `includeStackTrace: true` for the call stack.
+So when a `Debug.WriteLine` you can see in the source never shows up, the message is not
+missing and the code did not fail to run — nothing was listening.
 
-### Ending a debug session
+**Attach the debugger to make them readable.** On **.NET Framework** this is wired up: the
+runtime raises those messages once a debugger asks, and they flow into the same log
+GetProjectOutput reads — so attach, exercise the app, then read the output by the app's PID.
+A message written with `Debug.WriteLine(message, category)` arrives as `category: message`,
+so search the output for `category:` rather than for brackets.
 
-- **DebugRemoveBreakpoint** — remove breakpoints by ID. Supports batch removal.
-- **DebugStop** — stop the debug session and clean up all debugger processes.
+On **modern .NET** a different debug engine handles the target, so whether the same messages
+reach GetProjectOutput is not something to assume in either direction — look, and if they do
+not appear, fall back to reading the source rather than concluding the line never ran.
 
-### Debugging tips
-
-- Always set breakpoints **before** calling DebugContinue.
-- Use conditional breakpoints to avoid stopping on every iteration of a loop.
-- Evaluate expressions to inspect state without modifying code.
-- If a test is failing and the cause isn't clear from the error message, debug it rather than guessing.
-- In .NET Framework code, breakpoints in ASPX inline code bind once the generated `App_Web_*` assembly loads — hit the page after setting the breakpoint rather than assuming it failed.
-
-## Workflow: Performance Profiling
-
-CPU sampling works on both runtimes and is auto-provisioned on first use: modern .NET uses
-[dotnet-trace](https://learn.microsoft.com/dotnet/core/diagnostics/dotnet-trace), .NET Framework
-uses the free JetBrains dotTrace command-line profiler. Both feed the same session store, so the
-investigation tools work identically.
-
-### Collecting a profile
-
-- **ProfileTests** — profile a test project's execution. Use `filter` to target specific tests. Returns the hottest methods by self-time and a **session ID** for follow-up investigation. Modern .NET only — for .NET Framework tests, run them and attach with **ProfileProcess**.
-- **ProfileApp** — profile an application's execution. Modern .NET apps run under dotnet-trace; legacy ASP.NET sites are launched under IIS Express, sampled with dotTrace, and stopped again. Returns the same hot methods table and session ID.
-- **ProfileProcess** — attach to an already-running process by PID (e.g. from **RunProject**), .NET Framework or modern .NET alike. This is the way to profile `iisexpress.exe`/`w3wp.exe` hosting a running site. Blocks for the whole duration; use `hitUrls` for traffic, or use ProfileStart/ProfileStop instead when you want to drive the app yourself.
-- **ProfileStart** / **ProfileStop** — recording mode: ProfileStart attaches and returns immediately, you exercise the app yourself (curl the endpoints, run the scenario, click through pages), then ProfileStop collects and returns the hot methods. Works on both runtimes. A recording stops collecting by itself after `maxDurationSeconds` (default 600) but its data stays available for ProfileStop.
-
-For web apps, pass `hitUrls` (semicolon-separated) so the pages under investigation are actually
-requested during the profiling window — profiling an idle server measures nothing. ProfileApp
-defaults to hammering the app's root URL for web projects.
-
-By default the hot-methods table shows **only the solution's own code** — framework and
-third-party methods (System.*, SQL client internals, CMS plumbing) are hidden and counted in a
-note. Pass `ownCodeOnly=false` to see everything. For ProfileProcess, pass `projectPath` so the
-right solution defines what counts as own code. The stored session always keeps every method, so
-the investigation tools below search the full profile regardless of this setting.
-
-ProfileTests and ProfileApp use existing build output, so build the project first if needed.
-
-### Investigating profile results
-
-After profiling, use the session ID to drill into the results:
-
-1. **ListProfilingSessions** — list active profiling sessions (retained for 30 minutes).
-2. **ProfileSearchMethods** — search for methods by name pattern (substring or regex) in a session.
-3. **ProfileCallers** — show who calls a hot method and how much CPU time flows through each caller.
-4. **ProfileCallees** — show what a hot method calls and where time is spent.
-5. **ProfileHotPaths** — show the hottest execution paths through a method (call chains).
-
-### Profiling tips
-
-- Profile with a focused test filter first to reduce noise.
-- Methods with high **Self%** spend time in their own code — these are the optimization targets.
-- Methods with high **Total%** but low **Self%** are on hot call paths — optimize their callees instead.
-- Use **ProfileCallers** to trace upward from a hot method to understand *why* it's being called.
-- Use **ProfileCallees** to trace downward to find *where* time is actually spent.
-- Combine with **GoToDefinition** to navigate to a hot method's source code.
-
-## Workflow: Memory Tracing
-
-Heap snapshots use ClrMD and work on both .NET Framework and modern .NET processes. The target
-keeps running; snapshots are retained for 30 minutes.
-
-1. **MemorySnapshot** — snapshot a process by PID (e.g. from **RunProject**) and see the types using the most memory.
-2. Exercise the app (requests, the suspected scenario), then **MemorySnapshot** again.
-3. **MemoryCompare** — diff the two snapshots to see which types grew in bytes and instance count. Repeated growth across cycles is the leak signature; one-time growth is usually caching.
-4. **MemoryPathsToRoot** — for a growing type, walk the GC root paths that keep instances alive. Static fields and event handlers near the root are the usual leak anchors.
-5. **ListMemorySnapshots** — list snapshots taken in the last 30 minutes.
-
-Memory tips:
-
-- `System.String` and arrays dominating a snapshot is normal — compare against a baseline instead of judging absolute numbers.
-- 32-bit targets (e.g. a 32-bit IIS Express app pool) are inspected through the bundled bitness-matched worker, the same mechanism cross-bitness debugging uses; it requires the x86 .NET runtime, and the error says so when it is missing.
+Either way: do not treat silence as proof a branch was not taken. Confirm the call site
+writes somewhere you can actually read before using missing output as evidence.
 
 ## Workflow: Background Tasks
 
-For long-running operations (tests, builds, coverage), set `background: true` to stay productive:
+For long-running operations, set `background: true` to stay productive:
 
-### Starting background tasks
-- **RunTests** with `background: true` — builds then runs tests in the background. Returns a task ID immediately.
-- **BuildProject** with `background: true` — builds in the background. Returns a task ID immediately.
-- **RunCoverage** with `background: true` — runs coverage in the background. Returns a task ID immediately. Once done, results are cached for **GetCoverage**.
-
-### Monitoring
+- **RunTests** / **BuildProject** with `background: true` — run in the background and return a task ID immediately.
 - **GetBackgroundTaskResult** — check status (running/completed/failed) and get results for a specific task ID.
 - **ListBackgroundTasks** — list all background tasks with their statuses.
-
-### Background task tips
-- Start tests/coverage in the background while doing code analysis, refactoring, or writing new code.
-- After making changes, start a background test run and continue working.
-- Check results periodically with **GetBackgroundTaskResult**.
-- Background coverage results are cached — use **GetCoverage** to query them after the task completes.
+- Start tests or a build in the background while doing code analysis, refactoring, or writing new code, then check results periodically.
 
 ## Tool Selection Guide
 
 | Task | Preferred Tool | Avoid |
 |------|---------------|-------|
 | Find where a method is defined | **GoToDefinition** | grep for method name |
-| Find all callers of a method | **GetCallHierarchy** (callers) or **FindUsages** | grep for method name (misses indirect calls) |
+| Find all callers of a method | **FindUsages** | grep for method name (misses indirect calls) |
 | Check for compile errors | **GetRoslynDiagnostics** or **BuildProject** | `dotnet build` (use BuildProject instead) |
-| Rename a symbol | **RenameSymbol** | Find-and-replace (misses cross-file refs) |
-| Understand a class hierarchy | **GetTypeHierarchy** | Manual file inspection |
 | Find a symbol by partial name | **SemanticSymbolSearch** | grep (doesn't understand C# syntax) |
-| Apply a code fix | **GetCodeActions** with `applyIndex` | Manual editing |
-| Run a specific test | **RunTests** with `filter` | `dotnet test --filter` (use RunTests instead) |
-| Check test coverage | **RunCoverage** then **GetCoverage** | Manual inspection |
-| Debug a failing test | **DebugStartTest** | Adding Console.WriteLine |
 | Fix a missing control field in a code-behind | **RegenerateDesigner** | Editing the `.designer.cs`, or declaring the field by hand |
 | Update code after editing ASPX markup or a `.dbml` | **RegenerateDesigner** (or let **OpenSolution** watch) | Hand-writing the generated file |
-| Start a web app or console app | **RunProject** | `dotnet run` in a shell |
-| Debug a legacy ASP.NET site | **RunProject** then **DebugAttach** with the PID | Assuming .NET Framework cannot be debugged |
+| Start a web app or console app | **ListRunningProjects**, then **RunProject** | `dotnet run` in a shell |
 | See why a launched app died | **GetProjectOutput** | Re-running it blind |
-| Profile CPU hotspots | **ProfileTests** or **ProfileApp** | Manual dotnet-trace |
-| Profile a running (IIS Express) site | **ProfileProcess** with the RunProject PID | Assuming .NET Framework cannot be profiled |
-| Find what eats memory / leaks | **MemorySnapshot** → **MemoryCompare** → **MemoryPathsToRoot** | Guessing from Task Manager |
-| Investigate hot methods | **ProfileCallers** / **ProfileCallees** | Guessing without data |
-| Run tests while doing other work | **RunTests** with `background: true` + **GetBackgroundTaskResult** | — |
-| Build while doing other work | **BuildProject** with `background: true` + **GetBackgroundTaskResult** | — |
-| Collect coverage in background | **RunCoverage** with `background: true` + **GetBackgroundTaskResult** | — |
+| Add or update a NuGet package | `dotnet add package`, then **BuildProject** | Hand-editing the `.csproj` and not reloading |
+| Write, run, or fix tests | **csharp-testing** skill | — |
+| Find CPU hotspots | **csharp-profiling** skill | Guessing without data |
+| Query a database, or explain a slow query | **csharp-database** skill | Guessing the schema from the C# model |
+| Run tests/builds while doing other work | `background: true` + **GetBackgroundTaskResult** | — |

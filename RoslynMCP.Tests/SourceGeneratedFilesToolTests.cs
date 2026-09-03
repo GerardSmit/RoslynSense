@@ -7,50 +7,6 @@ namespace RoslynMCP.Tests;
 public class SourceGeneratedFilesToolTests
 {
     [Fact]
-    public async Task ListSourceGeneratedFiles_WhenEmptyPath_ThenReturnsError()
-    {
-        var result = await SourceGeneratedFilesTool.ListSourceGeneratedFiles("", new MarkdownFormatter());
-        Assert.StartsWith("Error", result);
-    }
-
-    [Fact]
-    public async Task ListSourceGeneratedFiles_WhenNonExistentPath_ThenReturnsError()
-    {
-        var result = await SourceGeneratedFilesTool.ListSourceGeneratedFiles(
-            @"C:\nonexistent\project.csproj", new MarkdownFormatter());
-        Assert.Contains("does not exist", result);
-    }
-
-    [Fact]
-    public async Task ListSourceGeneratedFiles_WhenProjectHasNoGenerators_ThenReturnsEmpty()
-    {
-        var result = await SourceGeneratedFilesTool.ListSourceGeneratedFiles(
-            FixturePaths.SampleProjectFile, new MarkdownFormatter());
-
-        // SampleProject has no source generators
-        Assert.Contains("No source-generated files", result);
-    }
-
-    [RequiresRazorSourceGeneratorFact]
-    public async Task ListSourceGeneratedFiles_WhenBlazorProject_ThenListsRazorGeneratedFiles()
-    {
-        var result = await SourceGeneratedFilesTool.ListSourceGeneratedFiles(
-            FixturePaths.BlazorProjectFile, new MarkdownFormatter());
-
-        Assert.Contains("Source Generated Files", result);
-        Assert.Contains("hintName", result);
-    }
-
-    [RequiresRazorSourceGeneratorFact]
-    public async Task ListSourceGeneratedFiles_WhenSourceFileProvided_ThenResolvesProject()
-    {
-        var result = await SourceGeneratedFilesTool.ListSourceGeneratedFiles(
-            FixturePaths.BlazorAppHelperFile, new MarkdownFormatter());
-
-        Assert.Contains("Source Generated Files", result);
-    }
-
-    [Fact]
     public async Task GetSourceGeneratedFileContent_WhenEmptyPath_ThenReturnsError()
     {
         var result = await SourceGeneratedFilesTool.GetSourceGeneratedFileContent("", "test.g.cs");
@@ -76,13 +32,7 @@ public class SourceGeneratedFilesToolTests
     [RequiresRazorSourceGeneratorFact]
     public async Task GetSourceGeneratedFileContent_WhenValidHintName_ThenReturnsContent()
     {
-        // First list to discover a valid hint name
-        var listResult = await SourceGeneratedFilesTool.ListSourceGeneratedFiles(
-            FixturePaths.BlazorProjectFile, new MarkdownFormatter());
-
-        Assert.Contains("Source Generated Files", listResult);
-
-        // Get the generated docs directly to find a valid hint name
+        // The hint name comes from Roslyn directly, which is what the tool resolves against.
         var project = await RoslynTestHelpers.OpenProjectAsync(FixturePaths.BlazorProjectFile);
         var generatedDocs = (await project.GetSourceGeneratedDocumentsAsync()).ToList();
         Assert.NotEmpty(generatedDocs);

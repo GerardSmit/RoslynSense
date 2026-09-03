@@ -1,4 +1,4 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Text;
 using ModelContextProtocol.Server;
 using RoslynMCP.Services;
@@ -55,16 +55,19 @@ public static class RegenerateDesignerTool
 
         var sb = new StringBuilder();
         var updated = considered.Count(r => r.Outcome is DesignerOutcome.Updated or DesignerOutcome.WouldUpdate);
-        var unchanged = considered.Count(r => r.Outcome == DesignerOutcome.Unchanged);
+        var unchanged = considered.Count(
+            r => r.Outcome is DesignerOutcome.Unchanged or DesignerOutcome.NotNeeded);
         var failed = considered.Where(r => r.Outcome == DesignerOutcome.Failed).ToList();
 
         sb.AppendLine(dryRun
-            ? $"# Designer regeneration (dry run) — {updated} would change, {unchanged} unchanged, {failed.Count} failed"
-            : $"# Designer regeneration — {updated} updated, {unchanged} unchanged, {failed.Count} failed");
+            ? $"**Designer regeneration (dry run) — {updated} would change, {unchanged} unchanged, {failed.Count} failed**"
+            : $"**Designer regeneration — {updated} updated, {unchanged} unchanged, {failed.Count} failed**");
         sb.AppendLine();
 
         // An all-unchanged sweep is the common case; listing every file would be noise.
-        var interesting = considered.Where(r => r.Outcome != DesignerOutcome.Unchanged).ToList();
+        var interesting = considered
+            .Where(r => r.Outcome is not (DesignerOutcome.Unchanged or DesignerOutcome.NotNeeded))
+            .ToList();
         if (interesting.Count > 0)
         {
             sb.AppendLine("| File | Result |");

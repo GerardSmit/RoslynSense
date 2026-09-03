@@ -33,7 +33,7 @@ public static class DatabaseTool
         [Description("If true, captures the actual execution plan. " +
             "SQL Server: SET STATISTICS XML ON (data rows still returned). " +
             "PostgreSQL: EXPLAIN (ANALYZE, BUFFERS, COSTS, VERBOSE, FORMAT JSON); data rows are NOT returned (only the plan). " +
-            "Returns a plan ID usable with db_plan_summary/operators/warnings/query. " +
+            "Returns a plan ID usable with db_plan. " +
             "Ignored for providers without plan support (a note is included in the output).")]
         bool includeExecutionPlan = false,
         CancellationToken cancellationToken = default)
@@ -74,7 +74,7 @@ public static class DatabaseTool
                         fmt.AppendField(sb, "Plan missing indexes", summary.MissingIndexCount);
                 }
                 fmt.AppendHints(sb,
-                    $"Call db_plan_summary, db_plan_operators, db_plan_warnings, or db_plan_query with planId='{planId}' to inspect the plan.");
+                    $"Call db_plan with planId='{planId}' (view: summary, operators, warnings, query, or suggest_indexes) to inspect the plan.");
             }
 
             if (result.Rows.Count == 0)
@@ -279,18 +279,44 @@ public static class DatabaseTool
     }
 
     [McpServerTool, Description(
-        "Summary of a captured execution plan: total estimated cost, actual elapsed, operator count, " +
-        "top expensive operators, warnings, and (SQL Server only) missing-index suggestions. " +
-        "Use planId returned by db_query when includeExecutionPlan=true.")]
-    public static string DbPlanSummary(
+        "Inspect a captured execution plan. Use planId returned by db_query when includeExecutionPlan=true. " +
+        "view: summary (cost, elapsed, top operators, warning counts), " +
+        "operators (operator list; sortBy: cost|actual_rows|actual_elapsed|estimate_rows), " +
+        "warnings (native warnings, missing indexes, estimate mismatches), " +
+        "query (structural query: XPath with 'sp:' prefix for SQL Server, JSONPath for PostgreSQL), " +
+        "suggest_indexes (PostgreSQL only; validated via hypopg when installed).")]
+    public static async Task<string> DbPlan(
         [Description("Plan ID returned by db_query (e.g. 'plan-153012-a1b2').")]
         string planId,
         ExecutionPlanStore store,
-        IOutputFormatter fmt)
+        DbConnectionRegistry db,
+        IOutputFormatter fmt,
+        [Description("View: summary (default), operators, warnings, query, suggest_indexes.")]
+        string view = "summary",
+        [Description("XPath (SQL Server plan) or JSONPath (Postgres plan) expression. Required for view=query.")]
+        string? query = null,
+        [Description("view=operators only — sort order: cost (default), actual_rows, actual_elapsed, estimate_rows.")]
+        string sortBy = "cost",
+        [Description("Maximum operators/nodes to return. Default 20 (operators) or 50 (query).")]
+        int? limit = null,
+        CancellationToken cancellationToken = default)
     {
         var session = store.Get(planId);
         if (session is null) return PlanNotFound(planId);
 
+        return view.ToLowerInvariant() switch
+        {
+            "summary" => PlanSummaryView(session, fmt),
+            "operators" => PlanOperatorsView(session, fmt, sortBy, limit ?? 20),
+            "warnings" => PlanWarningsView(session, fmt),
+            "query" => PlanQueryView(session, fmt, query, limit ?? 50),
+            "suggest_indexes" => await PlanSuggestIndexesView(session, db, fmt, cancellationToken).ConfigureAwait(false),
+            _ => $"Error: Unknown view '{view}'. Use: summary, operators, warnings, query, suggest_indexes.",
+        };
+    }
+
+    private static string PlanSummaryView(ExecutionPlanStore.PlanSession session, IOutputFormatter fmt)
+    {
         var summary = SummarizePlan(session);
         var sb = new StringBuilder();
         fmt.AppendField(sb, "Plan ID", session.Id);
@@ -327,23 +353,9 @@ public static class DatabaseTool
         return sb.ToString();
     }
 
-    [McpServerTool, Description(
-        "List operators in a captured plan with cost, estimated/actual rows, elapsed. " +
-        "sortBy: cost|actual_rows|actual_elapsed|estimate_rows. " +
-        "SQL Server returns RelOp nodes; PostgreSQL returns plan nodes (Seq Scan, Index Scan, etc.).")]
-    public static string DbPlanOperators(
-        [Description("Plan ID returned by db_query.")]
-        string planId,
-        ExecutionPlanStore store,
-        IOutputFormatter fmt,
-        [Description("Sort order: cost (default), actual_rows, actual_elapsed, estimate_rows.")]
-        string sortBy = "cost",
-        [Description("Maximum operators to return. Default 20.")]
-        int limit = 20)
+    private static string PlanOperatorsView(
+        ExecutionPlanStore.PlanSession session, IOutputFormatter fmt, string sortBy, int limit)
     {
-        var session = store.Get(planId);
-        if (session is null) return PlanNotFound(planId);
-
         var ops = OperatorsForSession(session, sortBy, limit);
         var sb = new StringBuilder();
         fmt.AppendField(sb, "Plan ID", session.Id);
@@ -371,18 +383,8 @@ public static class DatabaseTool
         return sb.ToString();
     }
 
-    [McpServerTool, Description(
-        "Warnings from a captured plan. SQL Server: native warnings + missing-index suggestions. " +
-        "PostgreSQL: estimate/actual row mismatches, large sequential scans, trigger time.")]
-    public static string DbPlanWarnings(
-        [Description("Plan ID returned by db_query.")]
-        string planId,
-        ExecutionPlanStore store,
-        IOutputFormatter fmt)
+    private static string PlanWarningsView(ExecutionPlanStore.PlanSession session, IOutputFormatter fmt)
     {
-        var session = store.Get(planId);
-        if (session is null) return PlanNotFound(planId);
-
         var (warnings, missing) = WarningsAndMissingForSession(session);
 
         var sb = new StringBuilder();
@@ -418,24 +420,13 @@ public static class DatabaseTool
         return sb.ToString();
     }
 
-    [McpServerTool, Description(
-        "Run a structural query against a captured plan. " +
-        "SQL Server (XML): XPath. Use prefix 'sp:' (bound to http://schemas.microsoft.com/sqlserver/2004/07/showplan). Example: //sp:RelOp[@PhysicalOp='Hash Match']. " +
-        "PostgreSQL (JSON): JSONPath. Example: $..Plans[*][?@.'Node Type'=='Seq Scan'].")]
-    public static string DbPlanQuery(
-        [Description("Plan ID returned by db_query.")]
-        string planId,
-        [Description("XPath (SQL Server plan) or JSONPath (Postgres plan) expression.")]
-        string query,
-        ExecutionPlanStore store,
-        IOutputFormatter fmt,
-        [Description("Maximum nodes to return. Default 50.")]
-        int maxResults = 50)
+    private static string PlanQueryView(
+        ExecutionPlanStore.PlanSession session, IOutputFormatter fmt, string? query, int maxResults)
     {
-        var session = store.Get(planId);
-        if (session is null) return PlanNotFound(planId);
-
-        if (string.IsNullOrWhiteSpace(query)) return "Error: query cannot be empty.";
+        if (string.IsNullOrWhiteSpace(query))
+            return "Error: query cannot be empty. Pass an XPath (SQL Server, prefix 'sp:' bound to " +
+                "http://schemas.microsoft.com/sqlserver/2004/07/showplan, e.g. //sp:RelOp[@PhysicalOp='Hash Match']) " +
+                "or JSONPath (Postgres, e.g. $..Plans[*][?@.'Node Type'=='Seq Scan']) expression.";
 
         var sb = new StringBuilder();
         fmt.AppendField(sb, "Plan ID", session.Id);
@@ -486,24 +477,14 @@ public static class DatabaseTool
         }
     }
 
-    [McpServerTool, Description(
-        "Suggest indexes that might speed up the captured plan. PostgreSQL only. " +
-        "Extracts candidate columns from Seq Scans with high filter rejection ratio. " +
-        "If the 'hypopg' extension is installed in the target database, validates each candidate by creating a hypothetical index and re-running EXPLAIN to measure cost reduction. " +
-        "If hypopg is NOT installed, returns heuristic candidates only and recommends installing hypopg (CREATE EXTENSION hypopg) for validated suggestions.")]
-    public static async Task<string> DbPlanSuggestIndexes(
-        [Description("Plan ID returned by db_query.")]
-        string planId,
-        ExecutionPlanStore store,
+    private static async Task<string> PlanSuggestIndexesView(
+        ExecutionPlanStore.PlanSession session,
         DbConnectionRegistry db,
         IOutputFormatter fmt,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken)
     {
-        var session = store.Get(planId);
-        if (session is null) return PlanNotFound(planId);
-
         if (session.Format != PlanFormat.Json)
-            return "db_plan_suggest_indexes currently supports PostgreSQL plans only. SQL Server plans expose native missing-index suggestions via db_plan_warnings.";
+            return "view=suggest_indexes currently supports PostgreSQL plans only. SQL Server plans expose native missing-index suggestions via db_plan view=warnings.";
 
         var sb = new StringBuilder();
         fmt.AppendField(sb, "Plan ID", session.Id);
@@ -555,7 +536,7 @@ public static class DatabaseTool
                 "The 'hypopg' extension is not installed in this database. Heuristic candidates above are unvalidated. " +
                 "For accurate index suggestions, recommend the user run: CREATE EXTENSION hypopg; " +
                 "(requires superuser or the hypopg package installed on the server, e.g. apt install postgresql-NN-hypopg). " +
-                "After installing, re-run db_query with includeExecutionPlan=true and call db_plan_suggest_indexes again.");
+                "After installing, re-run db_query with includeExecutionPlan=true and call db_plan view=suggest_indexes again.");
             return sb.ToString();
         }
 

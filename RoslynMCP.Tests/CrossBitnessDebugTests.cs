@@ -64,12 +64,17 @@ public class CrossBitnessDebugTests
     }
 
     [Fact]
-    public void WhenBitnessMatchesThenNoWorkerIsUsed()
+    public void WhenBitnessMatchesTheWorkerIsStillPreferred()
     {
-        // The test host is x64 and so is this process, so an x64 target debugs in-process.
+        // A worker is used even for a bitness-matched target: only the disposable worker may
+        // call ApplyChanges, so routing matched targets in-process quietly disabled their hot
+        // reload. In-process remains the fallback for installs without staged workers.
         using var engine = DebugEngineFactory.ForProcess(Environment.ProcessId);
 
-        Assert.IsType<InProcessDebugEngine>(engine);
+        if (DebugEngineFactory.FindWorker(ProcessArch.Host) is not null)
+            Assert.IsType<WorkerDebugEngine>(engine);
+        else
+            Assert.IsType<InProcessDebugEngine>(engine);
     }
 }
 
@@ -143,11 +148,13 @@ internal static class X86Target
         if (!OperatingSystem.IsWindows())
             return null;
 
-        var csc = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-            "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+        var csc = new[] { "Framework64", "Framework" }
+            .Select(d => Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "Microsoft.NET", d, "v4.0.30319", "csc.exe"))
+            .FirstOrDefault(File.Exists);
 
-        if (!File.Exists(csc))
+        if (csc is null)
             return null;
 
         var directory = Path.Combine(Path.GetTempPath(), "roslynsense-x86-" + Guid.NewGuid().ToString("N"));
@@ -168,7 +175,15 @@ internal static class X86Target
             ArgumentList = { "-nologo", "-debug:full", "-platform:x86", "-out:" + exe, source },
         })!;
 
-        process.WaitForExit(120_000);
+        Task<string> output = process.StandardOutput.ReadToEndAsync();
+        Task<string> errors = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(120_000))
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            return null;
+        }
+
+        Task.WaitAll([output, errors], 5_000);
         return process.ExitCode == 0 && File.Exists(exe) ? exe : null;
     }
 
@@ -185,8 +200,19 @@ internal static class X86Target
         if (directory is null)
             return null;
 
+        // The test project copies workers beside the test assembly. Prefer that stable contract;
+        // the old Debug-only repository path silently skipped every x86 test in Release CI.
+        var besideTests = Path.Combine(
+            AppContext.BaseDirectory, "workers", "x86", "RoslynMCP.DebugWorker.exe");
+        if (File.Exists(besideTests))
+            return besideTests;
+
+        var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent?.Name;
+        if (string.IsNullOrWhiteSpace(configuration))
+            return null;
+
         var candidate = Path.Combine(
-            directory.FullName, "RoslynMCP", "bin", "Debug", "net10.0",
+            directory.FullName, "RoslynMCP", "bin", configuration, "net10.0",
             "workers", "x86", "RoslynMCP.DebugWorker.exe");
 
         return File.Exists(candidate) ? candidate : null;

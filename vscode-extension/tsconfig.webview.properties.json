@@ -1,0 +1,15 @@
+{
+  // The Properties panel's browser-side script, built the same way the other panels are:
+  // `module: none` plus `outFile` makes tsc concatenate by the /// <reference> graph, so the
+  // panel gets one type-checked script and no bundler.
+  "compilerOptions": {
+    "module": "none",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "outFile": "out/webview/properties.js",
+    "sourceMap": false,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "files": ["src/properties/protocol.d.ts", "src/webview/properties/main.ts"]
+}

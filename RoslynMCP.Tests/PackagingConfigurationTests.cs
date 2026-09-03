@@ -1,4 +1,4 @@
-using System.Xml.Linq;
+using Microsoft.Language.Xml;
 using Xunit;
 
 namespace RoslynMCP.Tests;
@@ -8,7 +8,8 @@ public class PackagingConfigurationTests
     [Fact]
     public void RoslynMcpProjectIsConfiguredAsDotnetTool()
     {
-        var project = XDocument.Load(GetRepoPath("RoslynMCP", "RoslynMCP.csproj"));
+        var project = Parser.ParseText(
+            File.ReadAllText(GetRepoPath("RoslynMCP", "RoslynMCP.csproj")));
 
         Assert.Equal("net10.0", GetPropertyValue(project, "TargetFramework"));
         Assert.Equal("true", GetPropertyValue(project, "PackAsTool"));
@@ -33,11 +34,10 @@ public class PackagingConfigurationTests
         throw new InvalidOperationException("Could not locate the repository root.");
     }
 
-    private static string? GetPropertyValue(XDocument project, string propertyName) =>
-        project.Root?
-            .Elements()
-            .Where(element => element.Name.LocalName == "PropertyGroup")
-            .Elements()
-            .FirstOrDefault(element => element.Name.LocalName == propertyName)
+    private static string? GetPropertyValue(XmlDocumentSyntax project, string propertyName) =>
+        project.RootSyntax?
+            .GetElementsByLocalName("PropertyGroup")
+            .SelectMany(group => group.Elements)
+            .FirstOrDefault(element => element.NameNode?.LocalName == propertyName)
             ?.Value;
 }

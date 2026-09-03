@@ -45,14 +45,22 @@ public class DaemonHostTests
         var settings = EffectiveSettings.Resolve(Array.Empty<string>(), null, out _);
         await using var services = ToolHostServices.Build(settings, new MarkdownFormatter(), FixturePaths.MultiSolutionDir);
 
-        var method = ToolInvoker.FindTool("list_projects");
+        var method = ToolInvoker.FindTool("find_usages");
         Assert.NotNull(method);
 
-        var args = new Dictionary<string, string> { ["path"] = FixturePaths.MultiSolutionFile };
+        // A tool that refuses its arguments, deliberately: what is under test is the dispatch —
+        // the name resolving, both strings binding out of the IPC dictionary, the formatter and
+        // the handler collection coming from DI, and a string coming back. A tool that answered
+        // properly would have to open a project, and this class runs in parallel with everything
+        // that reads the workspace.
+        var args = new Dictionary<string, string>
+        {
+            ["filePath"] = FixturePaths.CalculatorFile,
+            ["markupSnippet"] = "",
+        };
         string result = await ToolInvoker.InvokeAsync(method!, args, services, new MarkdownFormatter(), default);
 
-        Assert.Contains("ProjectA", result);
-        Assert.Contains("ProjectB", result);
+        Assert.Equal("Error: markupSnippet cannot be empty.", result);
     }
 
     [Fact]

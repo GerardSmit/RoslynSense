@@ -74,7 +74,23 @@ public sealed class ConnectionEntryConverter : JsonConverter<ConnectionEntry>
         if (string.IsNullOrWhiteSpace(connRef))
             throw new JsonException($"Connection string '{value}' has empty connection string.");
 
-        var resolved = ConnectionStringResolver.Resolve(connRef);
-        return new ConnectionEntry(canonical, resolved);
+        // As a JsonException, which is the contract a converter's caller can catch. Resolving an
+        // 'xml:'/'json:' reference reads a file, so it fails in every way the filesystem can — a
+        // missing file, a bad XPath, no read access — and those escaped the deserializer as
+        // themselves. Nothing above catches them, so a config naming a file that is not where it
+        // says brought the whole language server down at start-up rather than degrading to
+        // defaults with a line in the log.
+        try
+        {
+            return new ConnectionEntry(canonical, ConnectionStringResolver.Resolve(connRef));
+        }
+        catch (JsonException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new JsonException($"Connection string '{value}' could not be resolved: {ex.Message}", ex);
+        }
     }
 }

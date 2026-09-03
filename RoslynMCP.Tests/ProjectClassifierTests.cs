@@ -8,6 +8,7 @@ namespace RoslynMCP.Tests;
 /// (<c>PathHelper.RequiresMsBuild</c>, <c>WorkspaceService.InferTargetFrameworkKind</c>,
 /// <c>ProjectStructureTool.InferTargetFramework</c> and the <c>ListProjects</c> text scan).
 /// </summary>
+[Collection(SharedState.Name)]
 public class ProjectClassifierTests
 {
     [Fact]

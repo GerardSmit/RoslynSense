@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2022",
+    "outDir": "out",
+    "lib": ["ES2022"],
+    "sourceMap": true,
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"],
+  // The webview half runs in a browser, not in Node: it is compiled by tsconfig.webview.json,
+  // with the DOM library and a different module system.
+  "exclude": ["src/webview"]
+}

@@ -54,7 +54,7 @@ public static class ProjectStructureResource
             .ToList();
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# Project: {project.Name}");
+        sb.AppendLine($"**Project: {project.Name}**");
         sb.AppendLine($"**Path**: {projectPath}");
         sb.AppendLine($"**Documents**: {documents.Count}");
         sb.AppendLine();

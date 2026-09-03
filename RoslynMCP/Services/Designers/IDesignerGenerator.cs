@@ -17,6 +17,20 @@ public sealed record DesignerResult(
 {
     public static DesignerResult Failed(string designerPath, params string[] errors) =>
         new(designerPath, null, errors);
+
+    /// <summary>
+    /// Whether the generated content declares nothing at all — an empty partial class. That is a
+    /// legitimate result (markup with no server IDs, or a variant whose fields live in the shared
+    /// designer of its group), but it is not worth a file that does not exist yet.
+    /// </summary>
+    public bool DeclaresNoMembers { get; init; }
+
+    /// <summary>
+    /// Other source files whose designers this result made stale, and which should therefore be
+    /// regenerated as well — the other markup files of a shared code-behind class. Empty for the
+    /// common single-file case.
+    /// </summary>
+    public IReadOnlyList<string> RelatedSources { get; init; } = [];
 }
 
 /// <summary>

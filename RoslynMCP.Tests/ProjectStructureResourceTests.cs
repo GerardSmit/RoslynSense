@@ -28,7 +28,7 @@ public class ProjectStructureResourceTests
     {
         var result = await ProjectStructureResource.GetProjectStructureAsync(FixturePaths.CalculatorFile);
 
-        Assert.Contains("# Project: SampleProject", result);
+        Assert.Contains("**Project: SampleProject**", result);
     }
 
     [Fact]

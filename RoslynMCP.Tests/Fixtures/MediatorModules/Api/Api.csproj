@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MediatorModules.Api</RootNamespace>
+  </PropertyGroup>
+
+  <!--
+    Deliberately no reference to Inventory or Billing: a dispatch site only ever references the
+    contracts, and the handlers sit in sibling subtrees the runtime wires up by registration.
+    That is what makes this fixture worth having — a search that stays inside the dispatch
+    project's dependency closure finds no handler at all here, and one that stops at the first
+    loaded project finds exactly one of the two.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

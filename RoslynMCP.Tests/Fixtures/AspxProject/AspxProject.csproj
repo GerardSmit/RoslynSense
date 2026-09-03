@@ -7,4 +7,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <!--
+    ASP.NET compiles App_*Resources at runtime, so a real site ships these as content rather than
+    embedding them. Leaving them out of the build also keeps MSBuild's culture inference away from
+    a fixture whose point is names like .Portal-3 and .Host that no culture list knows; the
+    resource catalog reads the directory, not the item group.
+  -->
+  <ItemGroup>
+    <EmbeddedResource Remove="App_GlobalResources\**\*.resx" />
+    <EmbeddedResource Remove="App_LocalResources\**\*.resx" />
+    <EmbeddedResource Remove="Controls\App_LocalResources\**\*.resx" />
+  </ItemGroup>
+
 </Project>

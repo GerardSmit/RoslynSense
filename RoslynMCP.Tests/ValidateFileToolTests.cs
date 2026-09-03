@@ -43,7 +43,7 @@ public class ValidateFileToolTests
             filePath: FixturePaths.CalculatorFile,
             runAnalyzers: false);
 
-        Assert.Contains("# Diagnostics:", result);
+        Assert.Contains("**Diagnostics:", result);
         Assert.Contains("Calculator.cs", result);
     }
 

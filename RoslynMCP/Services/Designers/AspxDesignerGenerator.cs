@@ -1,6 +1,7 @@
-using System.Text;
+﻿using System.Text;
 using Microsoft.CodeAnalysis;
 using WebFormsCore.Nodes;
+using RoslynMCP.Languages.WebForms.Core;
 
 namespace RoslynMCP.Services.Designers;
 
@@ -52,12 +53,169 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
                 "that the code-behind class exists in this project.");
         }
 
-        var fields = CollectFields(parseResult.ParseTree, codeBehind, designerPath);
+        var style = DesignerStyle.Detect(designerPath);
+
+        var group = await FindInheritsGroupAsync(
+            project, filePath, parseResult.ParseTree, codeBehind, compilation, projectDir, cancellationToken);
+
+        if (group.Count > 1)
+            return await GenerateForGroupAsync(
+                filePath, designerPath, parseResult, codeBehind, group, style, compilation, projectDir,
+                cancellationToken);
+
+        var fields = CollectFields(
+            parseResult.ParseTree, codeBehind,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { designerPath });
         var masterType = await ResolveMasterTypeAsync(
             parseResult, filePath, compilation, projectDir, cancellationToken);
 
-        return new DesignerResult(designerPath, Render(codeBehind, fields, masterType), []);
+        return new DesignerResult(
+            designerPath, Render(codeBehind, KeepExistingOrder(fields, style), masterType, style), [])
+        {
+            DeclaresNoMembers = fields.Count == 0 && masterType is null,
+        };
     }
+
+    /// <summary>
+    /// The designer for a class several markup files share. Visual Studio regenerates each file's
+    /// designer in isolation, which silently drops the fields the other variants need; here the
+    /// canonical file — the one beside the class's own code-behind — gets the union of every
+    /// variant's controls, and the variants get an empty partial so nothing is declared twice.
+    /// A control missing from some variants is emitted nullable, because it genuinely is null when
+    /// one of those variants is the one loaded.
+    /// </summary>
+    private async Task<DesignerResult> GenerateForGroupAsync(
+        string filePath,
+        string designerPath,
+        AspxParseResult parseResult,
+        INamedTypeSymbol codeBehind,
+        List<MarkupFile> group,
+        DesignerStyle style,
+        Compilation compilation,
+        string? projectDir,
+        CancellationToken cancellationToken)
+    {
+        var canonicalPath = SelectCanonicalPath(group, codeBehind);
+
+        if (!PathsEqual(canonicalPath, filePath))
+        {
+            return new DesignerResult(designerPath, Render(codeBehind, [], masterType: null, style), [])
+            {
+                DeclaresNoMembers = true,
+                RelatedSources = [canonicalPath],
+            };
+        }
+
+        var designerPaths = group
+            .Select(file => GetDesignerPath(file.Path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var fields = CollectUnionFields(group, canonicalPath, codeBehind, designerPaths);
+        var masterType = await ResolveMasterTypeAsync(
+            parseResult, filePath, compilation, projectDir, cancellationToken);
+
+        return new DesignerResult(
+            designerPath,
+            Render(codeBehind, KeepExistingOrder(fields, style), masterType, style, nullableDirective: true),
+            [])
+        {
+            DeclaresNoMembers = fields.Count == 0 && masterType is null,
+            RelatedSources = [.. group.Select(file => file.Path).Where(path => !PathsEqual(path, filePath))],
+        };
+    }
+
+    private readonly record struct MarkupFile(string Path, RootNode Tree);
+
+    /// <summary>
+    /// Every markup file in the project whose <c>Inherits</c> resolves to the same code-behind
+    /// class, the requested file included. Almost always a list of one.
+    /// </summary>
+    private static async Task<List<MarkupFile>> FindInheritsGroupAsync(
+        Project project,
+        string filePath,
+        RootNode selfTree,
+        INamedTypeSymbol codeBehind,
+        Compilation compilation,
+        string? projectDir,
+        CancellationToken cancellationToken)
+    {
+        var group = new List<MarkupFile> { new(filePath, selfTree) };
+        var className = codeBehind.Name;
+
+        foreach (var candidate in AspxReferenceService.EnumerateFiles(project))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (PathsEqual(candidate, filePath))
+                continue;
+            if (!DesignerExtensions.Contains(Path.GetExtension(candidate), StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            // Cheap textual pre-filter: a file that never mentions the class name cannot inherit it.
+            string text;
+            try
+            {
+                text = await File.ReadAllTextAsync(candidate, cancellationToken);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            if (!text.Contains(className, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                var parsed = await ParseAsync(candidate, compilation, projectDir, cancellationToken);
+                if (parsed.ParseTree is { } tree
+                    && SymbolEqualityComparer.Default.Equals(tree.Inherits, codeBehind))
+                {
+                    group.Add(new MarkupFile(candidate, tree));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // A sibling that fails to parse simply is not part of the group.
+            }
+        }
+
+        return group;
+    }
+
+    /// <summary>
+    /// The group member whose designer carries the fields: the markup sitting beside the class's
+    /// own code-behind file, by the <c>Foo.aspx</c> → <c>Foo.aspx.cs</c> convention. Falls back to
+    /// the lexicographically first path so the choice is stable either way.
+    /// </summary>
+    private static string SelectCanonicalPath(List<MarkupFile> group, INamedTypeSymbol codeBehind)
+    {
+        var declaringFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var reference in codeBehind.DeclaringSyntaxReferences)
+        {
+            if (reference.SyntaxTree.FilePath is { Length: > 0 } path)
+                declaringFiles.Add(path);
+        }
+
+        var candidates = group.Select(file => file.Path).OrderBy(p => p, StringComparer.OrdinalIgnoreCase);
+        string? first = null;
+
+        foreach (var path in candidates)
+        {
+            first ??= path;
+            if (declaringFiles.Contains(path + ".cs"))
+                return path;
+        }
+
+        return first!;
+    }
+
+    private static bool PathsEqual(string left, string right) =>
+        string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
 
     private static async Task<AspxParseResult> ParseAsync(
         string filePath, Compilation compilation, string? projectDir, CancellationToken cancellationToken)
@@ -73,56 +231,174 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
             rootDirectory: projectDir);
     }
 
-    private readonly record struct DesignerField(string Name, string TypeName);
+    private readonly record struct DesignerField(string Name, string TypeName, bool Nullable = false);
 
     /// <summary>
     /// Collects the controls that need a generated field.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Walks <see cref="ContainerNode.AllChildren"/>, which deliberately excludes template contents:
-    /// the parser stores templates on <c>ControlNode.Templates</c> rather than in the child
-    /// hierarchy, and a template-nested control genuinely gets no designer field (it is reached
-    /// through <c>FindControl</c> instead). <c>FieldName</c> is set by the parser only for
-    /// non-template controls carrying an <c>ID</c>, so it is exactly the right signal.
+    /// Walks the non-template hierarchy plus the contents of single-instance templates.
+    /// A control inside a multi-instance template genuinely gets no designer field (it is reached
+    /// through <c>FindControl</c> instead), and <c>FieldName</c> is set by the parser only for
+    /// controls that get one, so it is exactly the right signal.
     /// </para>
     /// <para>
     /// A control whose field is already declared by hand in the code-behind is skipped: emitting it
-    /// here too would be a duplicate member. Declarations coming from the designer file being
+    /// here too would be a duplicate member. Declarations coming from a designer file being
     /// regenerated do not count, since that file is about to be replaced.
     /// </para>
     /// </remarks>
     private static List<DesignerField> CollectFields(
-        RootNode root, INamedTypeSymbol codeBehind, string designerPath)
+        RootNode root, INamedTypeSymbol codeBehind, IReadOnlySet<string> designerPaths)
     {
         var fields = new List<DesignerField>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var control in root.AllChildren.OfType<ControlNode>())
+        foreach (var (name, type) in EnumerateDesignerControls(root))
         {
-            if (control.FieldName is not { Length: > 0 } name)
-                continue;
             if (!seen.Add(name))
                 continue;
-            if (IsDeclaredOutsideDesigner(codeBehind, name, designerPath))
+            if (IsDeclaredOutsideDesigner(codeBehind, name, designerPaths))
                 continue;
 
-            fields.Add(new DesignerField(name, control.DisplayControlType));
+            fields.Add(new DesignerField(
+                name, type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)));
         }
 
         return fields;
     }
 
+    /// <summary>
+    /// The union of every group member's controls, in canonical-file-first order. A control that
+    /// is absent from at least one variant comes out nullable: when that variant is the one
+    /// loaded, the field really is null.
+    /// </summary>
+    private static List<DesignerField> CollectUnionFields(
+        List<MarkupFile> group,
+        string canonicalPath,
+        INamedTypeSymbol codeBehind,
+        IReadOnlySet<string> designerPaths)
+    {
+        var ordered = group
+            .OrderBy(file => PathsEqual(file.Path, canonicalPath) ? 0 : 1)
+            .ThenBy(file => file.Path, StringComparer.OrdinalIgnoreCase);
+
+        var names = new List<string>();
+        var types = new Dictionary<string, INamedTypeSymbol>(StringComparer.Ordinal);
+        var occurrences = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var file in ordered)
+        {
+            var seenInFile = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var (name, type) in EnumerateDesignerControls(file.Tree))
+            {
+                if (!seenInFile.Add(name))
+                    continue;
+
+                if (types.TryGetValue(name, out var existing))
+                {
+                    // The same ID declared as different types across variants still needs one
+                    // field both can assign to, so it is typed as their nearest common base.
+                    types[name] = CommonBaseType(existing, type);
+                    occurrences[name]++;
+                }
+                else
+                {
+                    names.Add(name);
+                    types[name] = type;
+                    occurrences[name] = 1;
+                }
+            }
+        }
+
+        var fields = new List<DesignerField>();
+        foreach (var name in names)
+        {
+            if (IsDeclaredOutsideDesigner(codeBehind, name, designerPaths))
+                continue;
+
+            fields.Add(new DesignerField(
+                name,
+                types[name].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                Nullable: occurrences[name] < group.Count));
+        }
+
+        return fields;
+    }
+
+    /// <summary>
+    /// Puts the fields back in the order the designer file already declares them, with fields the
+    /// markup has newly gained appended in markup order.
+    /// </summary>
+    /// <remarks>
+    /// Markup order is the order Visual Studio would emit, but a designer file that has been around
+    /// for a while no longer matches it: controls get moved around the page, and Visual Studio only
+    /// rewrites the file when it happens to be open. Re-sorting on every regeneration produces a
+    /// diff of hundreds of moved lines that says nothing, so the file's own order wins and a real
+    /// change shows up as the addition it is.
+    /// </remarks>
+    private static List<DesignerField> KeepExistingOrder(List<DesignerField> fields, DesignerStyle style)
+    {
+        if (style.FieldOrder.Count == 0)
+            return fields;
+
+        var rank = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < style.FieldOrder.Count; i++)
+            rank.TryAdd(style.FieldOrder[i], i);
+
+        // OrderBy is stable, so the fields with no place yet stay in markup order behind the rest.
+        return [.. fields.OrderBy(field => rank.TryGetValue(field.Name, out var index) ? index : int.MaxValue)];
+    }
+
+    private static IEnumerable<(string Name, INamedTypeSymbol Type)> EnumerateDesignerControls(RootNode root)
+    {
+        foreach (var control in root.AllChildren.OfType<ControlNode>())
+        {
+            if (control.FieldName is { Length: > 0 } name)
+                yield return (name, control.ControlType);
+        }
+
+        // Template contents live on TemplateNode, outside the child hierarchy. Root.Templates is a
+        // flat list of every template in the file; only single-instance ones can contribute fields,
+        // and a control nested in any multi-instance template has no FieldName to contribute.
+        foreach (var template in root.Templates)
+        {
+            if (!template.IsSingleInstance)
+                continue;
+
+            foreach (var control in template.AllChildren.OfType<ControlNode>())
+            {
+                if (control.FieldName is { Length: > 0 } name)
+                    yield return (name, control.ControlType);
+            }
+        }
+    }
+
+    private static INamedTypeSymbol CommonBaseType(INamedTypeSymbol left, INamedTypeSymbol right)
+    {
+        for (var candidate = left; candidate is not null; candidate = candidate.BaseType)
+        {
+            for (var type = right; type is not null; type = type.BaseType)
+            {
+                if (SymbolEqualityComparer.Default.Equals(type, candidate))
+                    return candidate;
+            }
+        }
+
+        return left;
+    }
+
     private static bool IsDeclaredOutsideDesigner(
-        INamedTypeSymbol codeBehind, string memberName, string designerPath)
+        INamedTypeSymbol codeBehind, string memberName, IReadOnlySet<string> designerPaths)
     {
         foreach (var member in codeBehind.GetMembers(memberName))
         {
             foreach (var reference in member.DeclaringSyntaxReferences)
             {
                 var path = reference.SyntaxTree.FilePath;
-                if (!string.IsNullOrEmpty(path) &&
-                    !string.Equals(path, designerPath, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(path) && !designerPaths.Contains(path))
                     return true;
             }
         }
@@ -194,7 +470,8 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
 
     // Visual Studio's designer files come out of CodeDOM, which indents otherwise-blank separator
     // lines to the current nesting level. Reproducing that exactly keeps regeneration from
-    // rewriting every line of a file Visual Studio wrote.
+    // rewriting every line of a file Visual Studio wrote. A file that has since been reformatted
+    // keeps its own conventions instead — see DesignerStyle.
     private const string Header =
         """
         //------------------------------------------------------------------------------
@@ -210,36 +487,43 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         """;
 
     private static string Render(
-        INamedTypeSymbol codeBehind, List<DesignerField> fields, INamedTypeSymbol? masterType)
+        INamedTypeSymbol codeBehind, List<DesignerField> fields, INamedTypeSymbol? masterType,
+        DesignerStyle style, bool nullableDirective = false)
     {
         var ns = codeBehind.ContainingNamespace is { IsGlobalNamespace: false } containing
             ? containing.ToDisplayString()
             : null;
 
         var sb = new StringBuilder();
-        sb.Append(Header);
+        sb.Append(style.Header ?? Header);
+
+        if (nullableDirective)
+        {
+            sb.AppendLine("#nullable enable");
+            sb.AppendLine();
+        }
 
         var indent = ns is null ? "" : "    ";
         if (ns is not null)
         {
-            sb.Append("namespace ").Append(ns).AppendLine(" {");
-            sb.AppendLine(indent);
-            sb.AppendLine(indent);
+            AppendBlockStart(sb, style, "", "namespace " + ns);
+            AppendBlank(sb, style, indent);
+            AppendBlank(sb, style, indent);
         }
 
-        sb.Append(indent).Append("public partial class ").Append(codeBehind.Name).AppendLine(" {");
+        AppendBlockStart(sb, style, indent, "public partial class " + codeBehind.Name);
 
         var memberIndent = indent + "    ";
         foreach (var field in fields)
         {
-            sb.AppendLine(memberIndent);
+            AppendBlank(sb, style, memberIndent);
             AppendField(sb, memberIndent, field);
         }
 
         if (masterType is not null)
         {
-            sb.AppendLine(memberIndent);
-            AppendMasterProperty(sb, memberIndent, masterType);
+            AppendBlank(sb, style, memberIndent);
+            AppendMasterProperty(sb, memberIndent, masterType, style);
         }
 
         sb.Append(indent).AppendLine("}");
@@ -248,6 +532,19 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
 
         return sb.ToString();
     }
+
+    /// <summary>Writes a declaration and its opening brace, on one line or two.</summary>
+    private static void AppendBlockStart(
+        StringBuilder sb, DesignerStyle style, string indent, string declaration)
+    {
+        if (style.BraceOnNewLine)
+            sb.Append(indent).AppendLine(declaration).Append(indent).AppendLine("{");
+        else
+            sb.Append(indent).Append(declaration).AppendLine(" {");
+    }
+
+    private static void AppendBlank(StringBuilder sb, DesignerStyle style, string indent) =>
+        sb.AppendLine(style.IndentBlankLines ? indent : "");
 
     private static void AppendField(StringBuilder sb, string indent, DesignerField field)
     {
@@ -258,10 +555,14 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         sb.Append(indent).AppendLine("/// Auto-generated field.");
         sb.Append(indent).AppendLine("/// To modify move field declaration from designer file to code-behind file.");
         sb.Append(indent).AppendLine("/// </remarks>");
-        sb.Append(indent).Append("protected ").Append(field.TypeName).Append(' ').Append(field.Name).AppendLine(";");
+        sb.Append(indent).Append("protected ").Append(field.TypeName);
+        if (field.Nullable)
+            sb.Append('?');
+        sb.Append(' ').Append(field.Name).AppendLine(";");
     }
 
-    private static void AppendMasterProperty(StringBuilder sb, string indent, INamedTypeSymbol masterType)
+    private static void AppendMasterProperty(
+        StringBuilder sb, string indent, INamedTypeSymbol masterType, DesignerStyle style)
     {
         var name = masterType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
             .Replace("global::", "", StringComparison.Ordinal);
@@ -272,9 +573,9 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         sb.Append(indent).AppendLine("/// <remarks>");
         sb.Append(indent).AppendLine("/// Auto-generated property.");
         sb.Append(indent).AppendLine("/// </remarks>");
-        sb.Append(indent).Append("public new ").Append(name).AppendLine(" Master {");
-        sb.Append(indent).AppendLine("    get {");
-        sb.Append(indent).Append("        return ((").Append(name).AppendLine(")(base.Master));");
+        AppendBlockStart(sb, style, indent, $"public new {name} Master");
+        AppendBlockStart(sb, style, indent + "    ", "get");
+        sb.Append(indent).Append("        ").Append("return ((").Append(name).AppendLine(")(base.Master));");
         sb.Append(indent).AppendLine("    }");
         sb.Append(indent).AppendLine("}");
     }

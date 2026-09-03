@@ -27,5 +27,8 @@ public enum TokenType
     Text,
 
     Attribute,
-    AttributeValue
+    AttributeValue,
+
+    ExpressionBuilderPrefix,
+    ExpressionBuilderArgument
 }

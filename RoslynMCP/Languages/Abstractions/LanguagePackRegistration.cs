@@ -1,0 +1,188 @@
+﻿using Microsoft.Extensions.DependencyInjection;
+using RoslynMCP.Config;
+using RoslynMCP.Languages.AppSettings;
+using RoslynMCP.Languages.Cron;
+using RoslynMCP.Languages.Dbml;
+using RoslynMCP.Languages.DotSettings;
+using RoslynMCP.Languages.DotSettings.Core;
+using RoslynMCP.Languages.Formatting;
+using RoslynMCP.Languages.Logging;
+using RoslynMCP.Languages.Mediator;
+using RoslynMCP.Languages.MsBuild;
+using RoslynMCP.Languages.Proto;
+using RoslynMCP.Languages.Razor;
+using RoslynMCP.Languages.Resources;
+using RoslynMCP.Languages.Routes;
+using RoslynMCP.Languages.Templates;
+using RoslynMCP.Languages.Values;
+using RoslynMCP.Languages.WebConfig;
+using RoslynMCP.Languages.WebConfig.Core;
+using RoslynMCP.Languages.WebForms;
+using RoslynMCP.Services;
+
+namespace RoslynMCP.Languages;
+
+/// <summary>
+/// The one place a language pack is switched on for a process. Three hosts build a container —
+/// the MCP server, the shared-host daemon and the CLI — and all three go through here so a pack
+/// cannot end up registered in one and missing from another.
+/// </summary>
+internal static class LanguagePackRegistration
+{
+    /// <summary>
+    /// The packs <paramref name="settings"/> enables, for a host that has no container. Order is
+    /// registration order and it is what <see cref="LanguageRegistry"/> preserves.
+    /// </summary>
+    public static IReadOnlyList<ILanguagePack> Create(EffectiveSettings settings, IOutputFormatter formatter)
+    {
+        var packs = new List<ILanguagePack>();
+
+        // Published rather than handed to the pack: the markup handlers are static and reached
+        // from the LSP dispatch without a session to carry settings on.
+        MarkupBindingSettings.Current = settings.MarkupBindings;
+
+        if (settings.WebForms)
+            packs.Add(new WebFormsLanguage(formatter));
+        if (settings.Razor)
+            packs.Add(new RazorLanguage(formatter));
+        if (settings.Proto)
+            packs.Add(new ProtoLanguage(formatter));
+        if (settings.Mediator)
+            packs.Add(new MediatorLanguage());
+        if (settings.Resources.Enabled)
+            packs.Add(new ResourcesLanguage(settings));
+        if (settings.Logging.Enabled)
+            packs.Add(new LoggingLanguage(settings));
+
+        // After the logging pack, and it has to stay there. Both claim string literals from the
+        // call around them, the first claim wins, and NLog spells its template parameter `format`
+        // — which is also what makes a string composite. A logging template read as a composite
+        // string would lose the binding to the values, which is the only thing worth saying about
+        // one.
+        if (settings.Formatting)
+            packs.Add(new FormattingLanguage());
+        if (settings.ValueSets.Enabled)
+            packs.Add(new ValuesLanguage(settings));
+
+        // After the two packs that claim a literal from the call around it, and it can stay
+        // anywhere after them: a schedule has no braces and no `format` parameter, so nothing
+        // above could claim one by accident. Below the value sets deliberately, so that a solution
+        // which has bound a schedule argument to a set of its own keeps that binding — the first
+        // claim wins, and an explicit configuration should beat a name this pack recognises.
+        if (settings.Cron.Enabled)
+            packs.Add(new CronLanguage(settings));
+
+        // Position is free: the pack claims no string literal, so nothing above it can be beaten to
+        // a claim and it can beat nobody. Beside the scheduled jobs because the two are siblings —
+        // both answer about what the solution runs rather than about a file it contains.
+        if (settings.Routes.Enabled)
+            packs.Add(new RoutesLanguage(settings));
+
+        // Beside the other two sections, and free of them: this pack reads its own files off the
+        // disk and claims no literal from any call, so nothing above it can be beaten to a claim.
+        if (settings.Templates.Enabled)
+            packs.Add(new TemplatesLanguage(settings));
+        if (settings.MsBuild)
+            packs.Add(new MsBuildLanguage());
+        if (settings.Dbml)
+            packs.Add(new DbmlLanguage());
+        if (settings.AppSettings)
+            packs.Add(new AppSettingsLanguage());
+        if (settings.WebConfig)
+        {
+            WebConfigFile.Configure(settings.WebConfigFiles);
+            packs.Add(new WebConfigLanguage());
+        }
+        if (settings.DotSettings)
+            packs.Add(new DotSettingsLanguage());
+
+        DotSettingsExclusions.Enabled = settings.DotSettings;
+
+        return packs;
+    }
+
+    /// <summary>Registers the enabled packs and the registry over them.</summary>
+    public static void AddLanguagePacks(this IServiceCollection services, EffectiveSettings settings)
+    {
+        // The same publish as Create, and it has to be here too: this is the path the daemon and
+        // the MCP server take, so leaving it to Create alone left every configured data-expression
+        // attribute dead in the only hosts an editor ever talks to.
+        MarkupBindingSettings.Current = settings.MarkupBindings;
+
+        if (settings.WebForms)
+            AddPack<WebFormsLanguage>(services);
+        if (settings.Razor)
+            AddPack<RazorLanguage>(services);
+        if (settings.Proto)
+            AddPack<ProtoLanguage>(services);
+        if (settings.Mediator)
+            AddPack<MediatorLanguage>(services);
+        if (settings.Resources.Enabled)
+            AddPack<ResourcesLanguage>(services);
+        if (settings.Logging.Enabled)
+            AddPack<LoggingLanguage>(services);
+
+        // After the logging pack — see Create for why the order is load-bearing.
+        if (settings.Formatting)
+            AddPack<FormattingLanguage>(services);
+        if (settings.ValueSets.Enabled)
+            AddPack<ValuesLanguage>(services);
+
+        // After the value sets — see Create for why.
+        if (settings.Cron.Enabled)
+            AddPack<CronLanguage>(services);
+        if (settings.Routes.Enabled)
+            AddPack<RoutesLanguage>(services);
+        if (settings.Templates.Enabled)
+            AddPack<TemplatesLanguage>(services);
+        if (settings.MsBuild)
+            AddPack<MsBuildLanguage>(services);
+        if (settings.Dbml)
+            AddPack<DbmlLanguage>(services);
+        if (settings.AppSettings)
+            AddPack<AppSettingsLanguage>(services);
+        if (settings.WebConfig)
+        {
+            // Before the pack is resolved, not after: the pack reads this set for its own
+            // FileNames, and so do the static document cache and watched-file filter.
+            WebConfigFile.Configure(settings.WebConfigFiles);
+            AddPack<WebConfigLanguage>(services);
+        }
+        if (settings.DotSettings)
+            AddPack<DotSettingsLanguage>(services);
+
+        // The .DotSettings pack answers no requests of its own; what it switches on are the
+        // narrowings applied from static helpers on the search and namespace paths, which have no
+        // container to resolve it from. See DotSettingsExclusions.
+        DotSettingsExclusions.Enabled = settings.DotSettings;
+
+        services.AddSingleton(sp => new LanguageRegistry(sp.GetServices<ILanguagePack>()).Publish());
+    }
+
+    /// <summary>
+    /// One instance of the pack, registered as a pack and under every MCP tool-handler interface
+    /// it implements. The tools ask for <c>IEnumerable&lt;I*Handler&gt;</c> and know nothing about
+    /// packs; registering both from one place is what puts a single gate in front of the editor
+    /// features and the AI tools instead of each carrying its own.
+    /// </summary>
+    private static void AddPack<TPack>(IServiceCollection services)
+        where TPack : class, ILanguagePack
+    {
+        services.AddSingleton<TPack>();
+        services.AddSingleton<ILanguagePack>(sp => sp.GetRequiredService<TPack>());
+
+        AddHandler<TPack, IGoToDefinitionHandler>(services);
+        AddHandler<TPack, IFindUsagesHandler>(services);
+        AddHandler<TPack, IOutlineHandler>(services);
+        AddHandler<TPack, IRenameHandler>(services);
+        AddHandler<TPack, IDiagnosticsHandler>(services);
+    }
+
+    private static void AddHandler<TPack, THandler>(IServiceCollection services)
+        where TPack : class, ILanguagePack
+        where THandler : class
+    {
+        if (typeof(THandler).IsAssignableFrom(typeof(TPack)))
+            services.AddSingleton(sp => (THandler)(object)sp.GetRequiredService<TPack>());
+    }
+}

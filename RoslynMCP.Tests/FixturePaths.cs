@@ -41,14 +41,92 @@ internal static class FixturePaths
     public static string ImageHandlerFile => Path.Combine(AspxProjectDir, "ImageHandler.ashx");
     public static string AspxPageHelperFile => Path.Combine(AspxProjectDir, "PageHelper.cs");
     public static string AspxWebConfigFile => Path.Combine(AspxProjectDir, "web.config");
+    public static string AspxSettingsReaderFile => Path.Combine(AspxProjectDir, "SettingsReader.cs");
+    public static string AspxSettingsPageFile => Path.Combine(AspxProjectDir, "Settings.aspx");
     public static string WebFormsSiteDir => Path.Combine(s_fixturesRoot, "WebFormsSite");
     public static string WebFormsSiteFile => Path.Combine(WebFormsSiteDir, "WebFormsSite.csproj");
     public static string DbmlProjectDir => Path.Combine(s_fixturesRoot, "DbmlProject");
     public static string ShopDbmlFile => Path.Combine(DbmlProjectDir, "Shop.dbml");
     public static string DesignerAspxFile => Path.Combine(AspxProjectDir, "Designer.aspx");
     public static string DesignerAspxDesignerFile => Path.Combine(AspxProjectDir, "Designer.aspx.designer.cs");
+    public static string DesignerAspxCodeBehindFile => Path.Combine(AspxProjectDir, "Designer.aspx.cs");
+    public static string UsesUserControlFile => Path.Combine(AspxProjectDir, "UsesUserControl.aspx");
+    public static string OrderItemsCodeBehindFile =>
+        Path.Combine(AspxProjectDir, "Controls", "OrderItems.ascx.cs");
+    public static string EventWiringAspxFile => Path.Combine(AspxProjectDir, "EventWiring.aspx");
+    public static string EventWiringCodeBehindFile => Path.Combine(AspxProjectDir, "EventWiring.aspx.cs");
+    public static string TypedRepeaterAscxFile => Path.Combine(AspxProjectDir, "TypedRepeater.ascx");
     public static string RepeaterAspxFile => Path.Combine(AspxProjectDir, "Repeater.aspx");
+
+    /// <summary>The dbml-backed WebForms trio: a typed repeater whose <c>Eval</c> reads a property
+    /// SqlMetal generated, for the navigation that must land in the model.</summary>
+    public static string SalesGridAspxFile => Path.Combine(AspxProjectDir, "SalesGrid.aspx");
+    public static string SalesDbmlFile => Path.Combine(AspxProjectDir, "Sales.dbml");
+    public static string SalesDesignerFile => Path.Combine(AspxProjectDir, "Sales.designer.cs");
     public static string RepeaterCodeBehindFile => Path.Combine(AspxProjectDir, "Repeater.aspx.cs");
+
+    /// <summary>Two repeaters whose templates declare the same <c>ID</c>, for the FindControl
+    /// naming-container ladder: handler-scoped, page-wide, computed.</summary>
+    public static string NestedControlsAspxFile => Path.Combine(AspxProjectDir, "NestedControls.aspx");
+    public static string OuterPanelAscxFile => Path.Combine(AspxProjectDir, "Controls", "OuterPanel.ascx");
+    public static string InnerPanelAscxFile => Path.Combine(AspxProjectDir, "Controls", "InnerPanel.ascx");
+    public static string NamingScopeAspxFile => Path.Combine(AspxProjectDir, "NamingScope.aspx");
+    public static string NamingScopeCodeBehindFile => Path.Combine(AspxProjectDir, "NamingScope.aspx.cs");
+
+    /// <summary>A repeater inside a repeater, for the row numbers a Predictable ClientID
+    /// carries — one in the middle and one at the end — beside an ID that ends in a number by
+    /// hand.</summary>
+    public static string NestedRepeaterAspxFile =>
+        Path.Combine(AspxProjectDir, "NestedRepeater.aspx");
+
+    /// <summary>The cross-project FindControl fixture: the wrappers (and the Control stubs they
+    /// extend) live in ControlLib, and WebApp reaches its template control only through them.</summary>
+    public static string ControlLibAppDir => Path.Combine(s_fixturesRoot, "ControlLibApp");
+    public static string ControlLibProjectFile => Path.Combine(ControlLibAppDir, "ControlLib", "ControlLib.csproj");
+    public static string ControlLibExtensionsFile => Path.Combine(ControlLibAppDir, "ControlLib", "ControlExtensions.cs");
+    public static string WebAppProjectFile => Path.Combine(ControlLibAppDir, "WebApp", "WebApp.csproj");
+    public static string CrossAspxFile => Path.Combine(ControlLibAppDir, "WebApp", "Cross.aspx");
+    public static string CrossCodeBehindFile => Path.Combine(ControlLibAppDir, "WebApp", "Cross.aspx.cs");
+
+    /// <summary>
+    /// The localization fixture: expression builders in both shapes the parser produces, an
+    /// implicit-localization key in each of its two spellings, and a control that really declares
+    /// a <c>ResourceKey</c> property beside them.
+    /// </summary>
+    public static string LocalizedAspxFile => Path.Combine(AspxProjectDir, "Localized.aspx");
+    public static string LocalizedCodeBehindFile => Path.Combine(AspxProjectDir, "Localized.aspx.cs");
+    public static string DnnLocalizedAscxFile => Path.Combine(AspxProjectDir, "Controls", "DnnLocalized.ascx");
+    public static string AspxResourceHelperFile => Path.Combine(AspxProjectDir, "ResourceHelper.cs");
+
+    public static string GlobalResourcesDir => Path.Combine(AspxProjectDir, "App_GlobalResources");
+    public static string GlobalStringsResxFile => Path.Combine(GlobalResourcesDir, "Strings.resx");
+    public static string GlobalStringsDutchResxFile => Path.Combine(GlobalResourcesDir, "Strings.nl-NL.resx");
+    public static string GlobalStringsDesignerFile => Path.Combine(GlobalResourcesDir, "Strings.Designer.cs");
+
+    public static string LocalResourcesDir => Path.Combine(AspxProjectDir, "App_LocalResources");
+    public static string DefaultAspxResxFile => Path.Combine(LocalResourcesDir, "Default.aspx.resx");
+    public static string SharedResourcesResxFile => Path.Combine(LocalResourcesDir, "SharedResources.resx");
+
+    /// <summary>The five-file family: the neutral file, one translation, DNN's two customization
+    /// ranks, and the combination of a translation with the higher rank.</summary>
+    public static string LocalizedResxFile => Path.Combine(LocalResourcesDir, "Localized.aspx.resx");
+    public static string LocalizedDutchResxFile => Path.Combine(LocalResourcesDir, "Localized.aspx.nl-NL.resx");
+    public static string LocalizedHostResxFile => Path.Combine(LocalResourcesDir, "Localized.aspx.Host.resx");
+    public static string LocalizedPortalResxFile => Path.Combine(LocalResourcesDir, "Localized.aspx.Portal-3.resx");
+    public static string LocalizedDutchPortalResxFile =>
+        Path.Combine(LocalResourcesDir, "Localized.aspx.nl-NL.Portal-3.resx");
+
+    public static string DnnLocalizedResxFile =>
+        Path.Combine(AspxProjectDir, "Controls", "App_LocalResources", "DnnLocalized.ascx.resx");
+
+    /// <summary>
+    /// The implicit-binding fixture: a page whose markup writes no key at all, and a family whose
+    /// entries are composed from a control's <c>ID</c> and a column's <c>UniqueName</c>.
+    /// </summary>
+    public static string ImplicitAspxFile => Path.Combine(AspxProjectDir, "Implicit.aspx");
+    public static string ImplicitResxFile => Path.Combine(LocalResourcesDir, "Implicit.aspx.resx");
+    public static string ImplicitDutchResxFile =>
+        Path.Combine(LocalResourcesDir, "Implicit.aspx.nl-NL.resx");
 
     public static string BlazorProjectDir => Path.Combine(s_fixturesRoot, "BlazorProject");
     public static string BlazorProjectFile => Path.Combine(BlazorProjectDir, "BlazorProject.csproj");
@@ -61,10 +139,59 @@ internal static class FixturePaths
     public static string DebugCalculatorFile => Path.Combine(DebugTestProjectDir, "Calculator.cs");
     public static string DebugCalculatorTestsFile => Path.Combine(DebugTestProjectDir, "CalculatorTests.cs");
 
+    /// <summary>
+    /// Two solutions in separate directories that both include one shared project, plus a third
+    /// that is never loaded. What a daemon looks like when a config preloads a second solution
+    /// alongside the bound one and the two overlap.
+    /// </summary>
+    public static string SharedProjectSolutionsDir => Path.Combine(s_fixturesRoot, "SharedProjectSolutions");
+    public static string AlphaSolutionFile => Path.Combine(SharedProjectSolutionsDir, "Alpha", "Alpha.sln");
+    public static string OnlyAlphaProjectFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Alpha", "OnlyAlpha", "OnlyAlpha.csproj");
+    public static string BetaSolutionFile => Path.Combine(SharedProjectSolutionsDir, "Beta", "Beta.sln");
+    public static string OnlyBetaProjectFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Beta", "OnlyBeta", "OnlyBeta.csproj");
+    public static string SharedProjectFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Shared", "Shared.csproj");
+
+    /// <summary>A real solution file that no test loads, so "bound but not loaded yet" is a state
+    /// a test can reach without depending on what ran before it.</summary>
+    public static string UnloadedSolutionFile =>
+        Path.Combine(SharedProjectSolutionsDir, "Unloaded", "Unloaded.sln");
+
+    /// <summary>
+    /// A solution of one project, for the gestures started inside a decompilation of the assembly
+    /// it builds: an interface with one implementation, and one call into a framework member. Its
+    /// own solution rather than a loose project so a test can bind it — what
+    /// <see cref="RoslynMCP.Services.WorkspaceService.TryGetSessionSolution"/> answers for an
+    /// unbound process is whichever project was touched last, which in a parallel run is whatever
+    /// another collection happened to open.
+    /// </summary>
+    public static string DecompiledConsumerDir => Path.Combine(s_fixturesRoot, "DecompiledConsumer");
+    public static string DecompiledConsumerSolutionFile =>
+        Path.Combine(DecompiledConsumerDir, "DecompiledConsumer.sln");
+    public static string DecompiledConsumerProjectFile =>
+        Path.Combine(DecompiledConsumerDir, "Consumer", "Consumer.csproj");
+
     public static string MultiSolutionDir => Path.Combine(s_fixturesRoot, "MultiSolution");
     public static string MultiSolutionFile => Path.Combine(MultiSolutionDir, "MultiSolution.sln");
     public static string MultiProjectAFile => Path.Combine(MultiSolutionDir, "ProjectA", "ProjectA.csproj");
     public static string MultiProjectBFile => Path.Combine(MultiSolutionDir, "ProjectB", "ProjectB.csproj");
+    public static string MultiProjectAClassFile => Path.Combine(MultiSolutionDir, "ProjectA", "Class1.cs");
+    public static string MultiProjectBClassFile => Path.Combine(MultiSolutionDir, "ProjectB", "Class2.cs");
+
+    public static string SuppressedWarningsDir => Path.Combine(s_fixturesRoot, "SuppressedWarnings");
+    public static string SuppressedWarningsPropsFile => Path.Combine(SuppressedWarningsDir, "Directory.Build.props");
+    public static string SuppressedAlphaFile => Path.Combine(SuppressedWarningsDir, "Alpha", "Alpha.csproj");
+    public static string SuppressedBetaFile => Path.Combine(SuppressedWarningsDir, "Beta", "Beta.csproj");
+
+    /// <summary>Central Package Management. Never restored: the point is that versions resolve
+    /// from the evaluated item model alone.</summary>
+    public static string CpmSolutionDir => Path.Combine(s_fixturesRoot, "CpmSolution");
+    public static string CpmDirectoryPackagesProps => Path.Combine(CpmSolutionDir, "Directory.Packages.props");
+    public static string CpmManagedProjectFile => Path.Combine(CpmSolutionDir, "Managed", "Managed.csproj");
+    public static string CpmOverriddenProjectFile => Path.Combine(CpmSolutionDir, "Overridden", "Overridden.csproj");
+    public static string CpmMultiTfmProjectFile => Path.Combine(CpmSolutionDir, "MultiTfm", "MultiTfm.csproj");
 
     public static string SourceGenFixtureDir => Path.Combine(s_fixturesRoot, "SourceGenFixture");
     public static string SourceGenGeneratorProjectFile => Path.Combine(SourceGenFixtureDir, "Generator", "Generator.csproj");
@@ -72,11 +199,190 @@ internal static class FixturePaths
     public static string SourceGenGeneratorDll => Path.Combine(SourceGenFixtureDir, "Generator", "bin", "Debug", "netstandard2.0", "Generator.dll");
     public static string SourceGenConsumerProjectFile => Path.Combine(SourceGenFixtureDir, "Consumer", "Consumer.csproj");
 
+    /// <summary>Protobuf fixture. The C# under Generated\ is real protoc + grpc_csharp_plugin
+    /// output committed as ordinary source, mirroring the proto directory tree the way
+    /// obj\Debug\&lt;tfm&gt;\ does, so the project builds without Grpc.Tools or protoc.</summary>
+    public static string ProtoProjectDir => Path.Combine(s_fixturesRoot, "ProtoProject");
+    public static string ProtoProjectFile => Path.Combine(ProtoProjectDir, "ProtoProject.csproj");
+    public static string CommonTypesProtoFile => Path.Combine(ProtoProjectDir, "common", "types.proto");
+    public static string WidgetTypesProtoFile => Path.Combine(ProtoProjectDir, "widgets", "types.proto");
+    public static string WidgetsProtoFile => Path.Combine(ProtoProjectDir, "widgets", "widgets.proto");
+    public static string ProtoGeneratedDir => Path.Combine(ProtoProjectDir, "Generated");
+    public static string CommonTypesGeneratedFile => Path.Combine(ProtoGeneratedDir, "common", "Types.cs");
+    public static string WidgetTypesGeneratedFile => Path.Combine(ProtoGeneratedDir, "widgets", "Types.cs");
+    public static string WidgetsGeneratedFile => Path.Combine(ProtoGeneratedDir, "widgets", "Widgets.cs");
+    public static string WidgetsGrpcGeneratedFile => Path.Combine(ProtoGeneratedDir, "widgets", "WidgetsGrpc.cs");
+
+    /// <summary>Hand-written implementation of WidgetService, the go-to-implementation target.</summary>
+    public static string WidgetGrpcServiceFile => Path.Combine(ProtoProjectDir, "WidgetGrpcService.cs");
+
+    /// <summary>Hand-written consumer of the generated client, holding the find-usages call sites.</summary>
+    public static string WidgetClientCallerFile => Path.Combine(ProtoProjectDir, "WidgetClientCaller.cs");
+
+    /// <summary>A valid .proto that nothing imports and nothing generated C# for: the
+    /// "never built" degraded path.</summary>
+    public static string OrphanProtoFile => Path.Combine(ProtoProjectDir, "NoGenerated", "orphan.proto");
+
+    /// <summary>A second protobuf fixture whose index is empty for the whole project: it
+    /// references the runtime and lists its schema as a &lt;Protobuf&gt; item, but nothing has
+    /// generated C# from it. ProtoProject cannot stand in for this — it has generated code for
+    /// its other files, so a project-wide "nothing was built" is never true there.</summary>
+    public static string ProtoNeverBuiltProjectDir => Path.Combine(s_fixturesRoot, "ProtoNeverBuiltProject");
+    public static string ProtoNeverBuiltProjectFile => Path.Combine(ProtoNeverBuiltProjectDir, "ProtoNeverBuiltProject.csproj");
+    public static string ContractsProtoFile => Path.Combine(ProtoNeverBuiltProjectDir, "contracts.proto");
+
+    /// <summary>
+    /// The mediator fixture. Both libraries are stubbed in-tree so it builds offline, but the
+    /// generator emitting <c>SenderExtensions</c> is real — whether a reference search reaches into
+    /// source-generated documents is the assumption the Zapto half of the pack rests on, and
+    /// checked-in output would test nothing.
+    /// </summary>
+    public static string MediatorProjectDir => Path.Combine(s_fixturesRoot, "MediatorProject");
+    public static string MediatorProjectFile => Path.Combine(MediatorProjectDir, "MediatorProject.csproj");
+
+    /// <summary>The requests, their handlers, and the pipeline behaviour that must never be
+    /// mistaken for one.</summary>
+    public static string MediatorOrdersFile => Path.Combine(MediatorProjectDir, "Orders.cs");
+
+    /// <summary>A notification with two handlers, because several is normal rather than
+    /// ambiguous.</summary>
+    public static string MediatorNotificationsFile => Path.Combine(MediatorProjectDir, "Notifications.cs");
+
+    /// <summary>Every dispatch shape, one per line.</summary>
+    public static string MediatorControllerFile => Path.Combine(MediatorProjectDir, "OrderController.cs");
+
+    /// <summary>Things that look like a dispatch and are not.</summary>
+    public static string MediatorDecoysFile => Path.Combine(MediatorProjectDir, "Decoys.cs");
+
+    public static string MediatRStubsFile => Path.Combine(MediatorProjectDir, "MediatRStubs.cs");
+    public static string ZaptoStubsFile => Path.Combine(MediatorProjectDir, "ZaptoStubs.cs");
+
+    /// <summary>
+    /// The multi-project protobuf fixture, laid out the way a real gRPC solution is: the
+    /// <c>.proto</c> and its generated C# in Contracts, the implementation in Server, the callers in
+    /// Client, and one project that references none of it. ProtoProject cannot stand in for this —
+    /// it holds all four roles in one assembly, so a search that never left the owning project would
+    /// still find every answer there and look like it worked.
+    /// </summary>
+    public static string ProtoSolutionDir => Path.Combine(s_fixturesRoot, "ProtoSolution");
+    public static string ProtoSolutionFile => Path.Combine(ProtoSolutionDir, "ProtoSolution.sln");
+
+    public static string ProtoContractsProjectDir => Path.Combine(ProtoSolutionDir, "Contracts");
+    public static string ProtoContractsProjectFile => Path.Combine(ProtoContractsProjectDir, "Contracts.csproj");
+    public static string ProtoSolutionWidgetsProtoFile => Path.Combine(ProtoContractsProjectDir, "widgets", "widgets.proto");
+    public static string ProtoSolutionWidgetsGeneratedFile => Path.Combine(ProtoContractsProjectDir, "Generated", "widgets", "Widgets.cs");
+    public static string ProtoSolutionWidgetsGrpcGeneratedFile => Path.Combine(ProtoContractsProjectDir, "Generated", "widgets", "WidgetsGrpc.cs");
+
+    /// <summary>The implementation, in a project the <c>.proto</c>'s own project knows nothing
+    /// about: it is reached only by walking ProjectReferences backwards.</summary>
+    public static string ProtoServerProjectDir => Path.Combine(ProtoSolutionDir, "Server");
+    public static string ProtoServerProjectFile => Path.Combine(ProtoServerProjectDir, "Server.csproj");
+    public static string ProtoServerServiceFile => Path.Combine(ProtoServerProjectDir, "WidgetGrpcService.cs");
+
+    /// <summary>The call sites, in a third project that references Contracts but not Server.</summary>
+    public static string ProtoClientProjectDir => Path.Combine(ProtoSolutionDir, "Client");
+    public static string ProtoClientProjectFile => Path.Combine(ProtoClientProjectDir, "Client.csproj");
+    public static string ProtoClientCallerFile => Path.Combine(ProtoClientProjectDir, "WidgetCaller.cs");
+
+    /// <summary>The control: in the solution, spelling the same names, referencing nothing.</summary>
+    public static string ProtoUnrelatedProjectDir => Path.Combine(ProtoSolutionDir, "Unrelated");
+    public static string ProtoUnrelatedProjectFile => Path.Combine(ProtoUnrelatedProjectDir, "Unrelated.csproj");
+    public static string ProtoUnrelatedLookupFile => Path.Combine(ProtoUnrelatedProjectDir, "WidgetLookup.cs");
+
+    /// <summary>
+    /// The multi-project mediator fixture, laid out the way a modular solution is: the message in
+    /// Contracts, one handler each in the sibling modules Inventory and Billing, and the dispatch
+    /// in Api — which references only Contracts, so neither handler is in the dispatch project's
+    /// dependency closure. MediatorProject cannot stand in for this: it holds every role in one
+    /// assembly, so a search that never left the caret's own project still finds every answer there.
+    /// </summary>
+    public static string MediatorModulesDir => Path.Combine(s_fixturesRoot, "MediatorModules");
+    public static string MediatorModulesSolutionFile => Path.Combine(MediatorModulesDir, "MediatorModules.sln");
+    public static string MediatorModulesEndpointFile => Path.Combine(MediatorModulesDir, "Api", "CustomerEndpoint.cs");
+    public static string MediatorModulesInventoryHandlerFile => Path.Combine(MediatorModulesDir, "Inventory", "InventorySyncHandler.cs");
+    public static string MediatorModulesBillingHandlerFile => Path.Combine(MediatorModulesDir, "Billing", "BillingSyncHandler.cs");
+
+    /// <summary>
+    /// Two plain C# projects with nothing mediator- or proto-shaped about them: an extension
+    /// method declared in Warehouse and called only from Storefront, the project that references
+    /// it. The one direction lazy loading does not follow — a search started from the declaration
+    /// must widen the solution with the projects that consume it, or answer "0 references".
+    /// </summary>
+    public static string LayeredAppDir => Path.Combine(s_fixturesRoot, "LayeredApp");
+    public static string LayeredAppSolutionFile => Path.Combine(LayeredAppDir, "LayeredApp.sln");
+    public static string LayeredAppStorefrontProjectFile => Path.Combine(LayeredAppDir, "Storefront", "Storefront.csproj");
+    public static string LayeredAppWarehouseModuleFile => Path.Combine(LayeredAppDir, "Warehouse", "WarehouseModule.cs");
+    public static string LayeredAppStartupFile => Path.Combine(LayeredAppDir, "Storefront", "Startup.cs");
+
+    /// <summary>
+    /// The configuration fixture: every read and binding shape the usage index recognizes, over
+    /// stubbed Microsoft.Extensions.* so it compiles offline, plus the settings files they read.
+    /// </summary>
+    public static string ConfigAppDir => Path.Combine(s_fixturesRoot, "ConfigApp");
+    public static string ConfigAppProjectFile => Path.Combine(ConfigAppDir, "ConfigApp.csproj");
+    public static string ConfigAppProgramFile => Path.Combine(ConfigAppDir, "Program.cs");
+    public static string ConfigAppSettingsFile => Path.Combine(ConfigAppDir, "appsettings.json");
+    public static string ConfigAppDevelopmentSettingsFile =>
+        Path.Combine(ConfigAppDir, "appsettings.Development.json");
+
+    /// <summary>
+    /// The shared description of the configuration layering, read by both this suite and the
+    /// extension's. See the file itself for what it pins.
+    /// </summary>
+    public static string ConfigLayeringParityFile =>
+        Path.Combine(s_fixturesRoot, "ConfigLayering", "parity.json");
+
+    /// <summary>
+    /// The VS Code extension folder in the source tree, or null when the tests run from output
+    /// with no repository above them. The theme lives there but has to agree with the token
+    /// legend that lives here, so one test reads across.
+    /// </summary>
+    public static string? VsCodeExtensionDir { get; } = FindRepositoryFolder("vscode-extension");
+
+    private static string? FindRepositoryFolder(string name)
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "RoslynMCP.sln"))
+                && Directory.Exists(Path.Combine(dir.FullName, name)))
+            {
+                return Path.Combine(dir.FullName, name);
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Walks up from the test assembly location to find the Fixtures directory.
     /// Prefer the source-tree fixtures so Roslyn can open the nested sample project
     /// with its real restore/build artifacts; fall back to copied output fixtures.
     /// </summary>
+    /// <summary>
+    /// The checkout this test run came from, or null when the assembly was copied somewhere else.
+    /// </summary>
+    /// <remarks>
+    /// For the handful of tests that assert about files which are checked in rather than shipped —
+    /// a generated schema whose copy must not go stale. A test that needs this skips itself when
+    /// it is null rather than failing: running the assembly outside its checkout is a legitimate
+    /// thing to do, and there is nothing to compare against there.
+    /// </remarks>
+    public static string? RepoRoot { get; } = FindRepoRoot();
+
+    private static string? FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "RoslynMCP.sln")))
+                return dir.FullName;
+
+            dir = dir.Parent;
+        }
+
+        return null;
+    }
+
     private static string FindFixturesRoot()
     {
         string? copiedFixturesRoot = null;

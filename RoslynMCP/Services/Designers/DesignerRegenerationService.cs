@@ -1,3 +1,4 @@
+﻿using System.Text;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Tools;
 
@@ -17,6 +18,12 @@ public enum DesignerOutcome
 
     /// <summary>Generation failed; any existing designer file was left untouched.</summary>
     Failed,
+
+    /// <summary>
+    /// The designer would have been an empty partial class and no file exists yet, so none was
+    /// created.
+    /// </summary>
+    NotNeeded,
 
     /// <summary>No generator claimed the source file.</summary>
     Skipped,
@@ -52,8 +59,12 @@ public sealed class DesignerRegenerationService(IEnumerable<IDesignerGenerator> 
     public static bool IsDesignerFile(string filePath) =>
         filePath.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase);
 
-    public async Task<DesignerRegeneration> RegenerateAsync(
-        string sourcePath, bool dryRun, CancellationToken cancellationToken)
+    public Task<DesignerRegeneration> RegenerateAsync(
+        string sourcePath, bool dryRun, CancellationToken cancellationToken) =>
+        RegenerateAsync(sourcePath, dryRun, cascade: true, cancellationToken);
+
+    private async Task<DesignerRegeneration> RegenerateAsync(
+        string sourcePath, bool dryRun, bool cascade, CancellationToken cancellationToken)
     {
         sourcePath = PathHelper.NormalizePath(sourcePath);
 
@@ -98,8 +109,21 @@ public sealed class DesignerRegenerationService(IEnumerable<IDesignerGenerator> 
 
         var content = MatchLineEndings(rawContent, result.DesignerPath);
 
+        // An empty partial class adds nothing: either the markup declares no server IDs, or the
+        // fields live in the shared designer of the group this file belongs to. Creating the file
+        // just to say so leaves an untracked artefact in the source tree, so only an existing
+        // designer — one Visual Studio or an earlier pass wrote — is kept up to date.
+        if (result.DeclaresNoMembers && !File.Exists(result.DesignerPath))
+        {
+            await RegenerateRelatedAsync(result, sourcePath, dryRun, cascade, cancellationToken);
+            return new DesignerRegeneration(sourcePath, result.DesignerPath, DesignerOutcome.NotNeeded, []);
+        }
+
         if (await MatchesExistingAsync(result.DesignerPath, content, cancellationToken))
+        {
+            await RegenerateRelatedAsync(result, sourcePath, dryRun, cascade, cancellationToken);
             return new DesignerRegeneration(sourcePath, result.DesignerPath, DesignerOutcome.Unchanged, []);
+        }
 
         if (dryRun)
         {
@@ -111,7 +135,11 @@ public sealed class DesignerRegenerationService(IEnumerable<IDesignerGenerator> 
 
         try
         {
-            await File.WriteAllTextAsync(result.DesignerPath, content, cancellationToken);
+            // Preserve the byte order mark the file already has — Visual Studio writes one, and
+            // silently dropping it on the first regeneration shows up as a whole-file diff in tools
+            // that key on encoding. A file that has none keeps none.
+            var encoding = new UTF8Encoding(DesignerStyle.Detect(result.DesignerPath).ByteOrderMark);
+            await File.WriteAllTextAsync(result.DesignerPath, content, encoding, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -119,7 +147,42 @@ public sealed class DesignerRegenerationService(IEnumerable<IDesignerGenerator> 
                 [$"Could not write designer file: {ex.Message}"]);
         }
 
+        await RegenerateRelatedAsync(result, sourcePath, dryRun, cascade, cancellationToken);
         return new DesignerRegeneration(sourcePath, result.DesignerPath, DesignerOutcome.Updated, []);
+    }
+
+    /// <summary>
+    /// Regenerates the designers a result reports as related — the other markup files of a shared
+    /// code-behind class — one level deep, so that regenerating any member of the group converges
+    /// the whole group. A related file that fails must not fail the file the caller asked about.
+    /// </summary>
+    private async Task RegenerateRelatedAsync(
+        DesignerResult result, string sourcePath, bool dryRun, bool cascade,
+        CancellationToken cancellationToken)
+    {
+        if (!cascade || dryRun || result.RelatedSources.Count == 0)
+            return;
+
+        foreach (var related in result.RelatedSources)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (string.Equals(
+                    PathHelper.NormalizePath(related), sourcePath, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
+            {
+                await RegenerateAsync(related, dryRun: false, cascade: false, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+            }
+        }
     }
 
     /// <summary>

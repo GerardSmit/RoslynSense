@@ -1,4 +1,4 @@
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -11,6 +11,8 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using RoslynMCP.Debugger;
+using RoslynMCP.Services.ExternalSource;
 using DecompilerFullTypeName = ICSharpCode.Decompiler.TypeSystem.FullTypeName;
 
 namespace RoslynMCP.Services;
@@ -26,21 +28,22 @@ internal static class DecompiledSourceService
         WriteIndented = true
     };
 
-    private static readonly string s_rootDirectory = Path.Combine(
-        Path.GetTempPath(),
-        "RoslynMCP",
-        "Decompiled");
+    private static readonly string s_rootDirectory = ExternalSourceCache.DecompiledDirectory;
 
     private static readonly UTF8Encoding s_utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
 
-    private static readonly SymbolDisplayFormat s_typeMatchDisplayFormat = new(
-        globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.OmittedAsContaining,
-        typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
-        genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
-        miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
-
     public static bool IsGeneratedProjectPath(string projectPath) =>
         string.Equals(Path.GetFileName(projectPath), ManifestFileName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether a path belongs to the decompiled cache — a source file, or the manifest that
+    /// stands in for its project.
+    /// </summary>
+    public static bool IsDecompiledPath(string? path) =>
+        path is { Length: > 0 } &&
+        // The separator keeps a sibling like "...\DecompiledExtra" from matching by prefix.
+        Path.GetFullPath(path).StartsWith(
+            s_rootDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
     public static string? TryGetGeneratedProjectPath(string filePath)
     {
@@ -57,7 +60,7 @@ internal static class DecompiledSourceService
         Project contextProject,
         CancellationToken cancellationToken = default)
     {
-        var containingType = GetOwningType(symbol);
+        var containingType = SourceMemberLocator.GetOwningType(symbol);
         if (containingType is null)
             return null;
 
@@ -65,14 +68,15 @@ internal static class DecompiledSourceService
         if (string.IsNullOrEmpty(assemblyPath) || !File.Exists(assemblyPath))
             return null;
 
-        string reflectionTypeName = GetReflectionTypeName(containingType);
-        string outputDirectory = GetOutputDirectory(assemblyPath, reflectionTypeName);
-        string sourceFilePath = Path.Combine(outputDirectory, SourceFileName);
-        string manifestPath = Path.Combine(outputDirectory, ManifestFileName);
+        string reflectionTypeName = SourceMemberLocator.GetReflectionTypeName(containingType);
 
-        Directory.CreateDirectory(outputDirectory);
+        // Compilations reference *reference assemblies* (SDK ref packs, nuget ref/ folders),
+        // whose method bodies are all `throw null`. Redirect to the runtime implementation
+        // assembly — following type forwarders (e.g. System.Runtime -> System.Private.CoreLib) —
+        // so the decompiled source shows real bodies.
+        assemblyPath = ReferenceAssemblyRedirector.RedirectToImplementation(assemblyPath, reflectionTypeName);
 
-        string? sourceText;
+        string sourceText;
         try
         {
             sourceText = DecompileType(assemblyPath, reflectionTypeName, cancellationToken);
@@ -84,15 +88,7 @@ internal static class DecompiledSourceService
             return null;
         }
 
-        WriteFileIfChanged(sourceFilePath, sourceText);
-
-        var manifest = new DecompiledSourceManifest
-        {
-            AssemblyPath = assemblyPath,
-            SourceFilePath = sourceFilePath,
-            TypeReflectionName = reflectionTypeName
-        };
-        WriteFileIfChanged(manifestPath, JsonSerializer.Serialize(manifest, s_jsonOptions));
+        var (sourceFilePath, manifestPath) = PersistDecompiledType(assemblyPath, reflectionTypeName, sourceText);
 
         var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
             manifestPath,
@@ -103,12 +99,14 @@ internal static class DecompiledSourceService
         if (document is null)
             return null;
 
-        var sourceSymbol = await FindMatchingSourceSymbolAsync(document, symbol, cancellationToken);
+        var sourceSymbol = await SourceMemberLocator.FindMatchingSourceSymbolAsync(
+            document, symbol, cancellationToken);
         IReadOnlyList<Location> locations = sourceSymbol?.Locations.Where(location => location.IsInSource).ToList()
             ?? [];
 
         if (locations.Count == 0)
-            locations = await FindMatchingLocationsBySyntaxAsync(document, symbol, cancellationToken);
+            locations = await SourceMemberLocator.FindMatchingLocationsBySyntaxAsync(
+                document, symbol, cancellationToken);
 
         if (locations.Count == 0)
             return null;
@@ -122,19 +120,40 @@ internal static class DecompiledSourceService
     {
         var manifest = await ReadManifestAsync(manifestPath, cancellationToken);
 
-        if (!File.Exists(manifest.SourceFilePath))
+        return await OpenSingleFileProjectAsync(
+            manifest.AssemblyPath,
+            manifest.SourceFilePath,
+            BuildProjectName(manifest),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// An ad-hoc project holding one file, referencing everything beside the assembly it came
+    /// from. What gives a file outside the solution hover, navigation and completion.
+    /// </summary>
+    /// <remarks>
+    /// Shared with the fetched-source paths, which have a real file and a real assembly but no
+    /// decompiler in sight. The compilation is not expected to be clean — framework source names
+    /// partial declarations that are not here — but a semantic model does not need it to be, and
+    /// diagnostics are suppressed for these files anyway.
+    /// </remarks>
+    internal static async Task<(Workspace Workspace, Project Project, string? TempDir)> OpenSingleFileProjectAsync(
+        string assemblyPath,
+        string sourceFilePath,
+        string projectName,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(sourceFilePath))
             throw new FileNotFoundException(
-                $"Decompiled source file '{manifest.SourceFilePath}' does not exist.",
-                manifest.SourceFilePath);
+                $"Source file '{sourceFilePath}' does not exist.", sourceFilePath);
 
         var workspace = new AdhocWorkspace();
         string? tempDir = null;
         try
         {
-            string projectName = BuildProjectName(manifest);
             var projectId = ProjectId.CreateNewId(projectName);
 
-            var (metadataReferences, createdTempDir) = CreateMetadataReferences(manifest.AssemblyPath);
+            var (metadataReferences, createdTempDir) = CreateMetadataReferences(assemblyPath);
             tempDir = createdTempDir;
 
             var solution = workspace.CurrentSolution
@@ -150,23 +169,23 @@ internal static class DecompiledSourceService
                     new CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview))
                 .AddMetadataReferences(projectId, metadataReferences);
 
-            string sourceText = await File.ReadAllTextAsync(manifest.SourceFilePath, cancellationToken);
-            var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(manifest.SourceFilePath));
+            string sourceText = await File.ReadAllTextAsync(sourceFilePath, cancellationToken);
+            var documentId = DocumentId.CreateNewId(projectId, Path.GetFileName(sourceFilePath));
             solution = solution.AddDocument(
                 documentId,
-                Path.GetFileName(manifest.SourceFilePath),
+                Path.GetFileName(sourceFilePath),
                 SourceText.From(sourceText, s_utf8NoBom),
-                filePath: manifest.SourceFilePath);
+                filePath: sourceFilePath);
 
             if (!workspace.TryApplyChanges(solution))
             {
                 throw new InvalidOperationException(
-                    $"Failed to create AdhocWorkspace project for decompiled source '{manifest.SourceFilePath}'.");
+                    $"Failed to create AdhocWorkspace project for '{sourceFilePath}'.");
             }
 
             var project = workspace.CurrentSolution.GetProject(projectId)
                 ?? throw new InvalidOperationException(
-                    $"Generated decompiled project '{projectName}' was not found after creation.");
+                    $"Generated project '{projectName}' was not found after creation.");
 
             return (workspace, project, tempDir);
         }
@@ -184,24 +203,135 @@ internal static class DecompiledSourceService
         Path.Combine(Path.GetTempPath(), "RoslynMCP", "DecompileTemp");
 
     /// <summary>
-    /// Deletes all orphaned decompile temp directories from previous runs. Called once at
-    /// startup; safe because the copies only live for the duration of a process's workspaces.
+    /// Where each temp copy came from: the copy's full path, to the assembly it was copied from.
     /// </summary>
-    public static void CleanupOrphanedTempDirs()
+    /// <remarks>
+    /// The copy exists so that a long-lived metadata reference never holds a lock on the user's
+    /// build output, and that is the right trade — but it throws away the one piece of evidence
+    /// several answers downstream are read from. Which framework an assembly belongs to is
+    /// decided from where it sits (<c>...\.NETFramework\v4.7.2\System.Web.dll</c>), because a
+    /// framework reference assembly carries no <c>TargetFrameworkAttribute</c> to ask instead; a
+    /// copy under a GUID directory answers "no framework", and the published sources for that
+    /// framework are then declined for a symbol that has them. So the copy is made and the
+    /// original is remembered.
+    /// </remarks>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
+        s_originalOfCopy = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The assembly a path names, mapped back out of the temp copies when it names one of those.
+    /// </summary>
+    /// <remarks>
+    /// Answers with the path given when it is not a copy, so every caller can ask unconditionally.
+    /// The original having since been deleted or moved is the one case the copy is still the
+    /// better answer, and the caller checks for that the way it always did.
+    /// </remarks>
+    internal static string OriginalAssemblyPath(string assemblyPath)
     {
+        if (assemblyPath is not { Length: > 0 })
+            return assemblyPath;
+
+        string full;
         try
         {
-            if (Directory.Exists(s_decompileTempRoot))
-                Directory.Delete(s_decompileTempRoot, recursive: true);
+            full = Path.GetFullPath(assemblyPath);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            Console.Error.WriteLine($"[DecompiledSourceService] Failed to clean temp root: {ex.Message}");
+            return assemblyPath;
+        }
+
+        return s_originalOfCopy.TryGetValue(full, out string? original) ? original : assemblyPath;
+    }
+
+    /// <summary>
+    /// Deletes the decompile temp directories that no live process is still reading from. Called
+    /// once at startup.
+    /// </summary>
+    /// <remarks>
+    /// One directory at a time, and only the ones nothing claims. This root is shared by every
+    /// RoslynSense process on the machine — an editor session, a second window, a test run — and
+    /// deleting the whole of it reached into workspaces that were still open: the copies a live
+    /// session has mapped cannot be deleted, so the sweep half-emptied a stranger's directory and
+    /// then reported the file it could not remove as a failure to clean anything. What each
+    /// directory is named after is what makes the difference knowable.
+    /// </remarks>
+    public static void CleanupOrphanedTempDirs() => CleanupOrphanedTempDirs(s_decompileTempRoot);
+
+    /// <summary>The sweep, against a named root, so it can be run over a directory of fakes.</summary>
+    internal static void CleanupOrphanedTempDirs(string root)
+    {
+        string[] directories;
+        try
+        {
+            if (!Directory.Exists(root))
+                return;
+
+            directories = Directory.GetDirectories(root);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"[DecompiledSourceService] Failed to read temp root: {ex.Message}");
+            return;
+        }
+
+        foreach (string directory in directories)
+        {
+            if (!IsClaimedByALiveProcess(Path.GetFileName(directory)))
+                TryDeleteTempDir(directory);
+        }
+    }
+
+    /// <summary>
+    /// Whether a temp directory's name says a process that is still running made it.
+    /// </summary>
+    /// <remarks>
+    /// A process id can be reused, so a directory left by a crash can be claimed by an unrelated
+    /// process that happens to inherit the number. That costs one directory until that process
+    /// exits and the next sweep takes it, which is the right way round: the other answer deletes
+    /// files out from under a running editor.
+    /// </remarks>
+    internal static bool IsClaimedByALiveProcess(string directoryName)
+    {
+        int separator = directoryName.IndexOf('-');
+
+        // Written by a build that named its directories after nothing but a GUID, and so says
+        // nothing about who owns it. Left alone rather than guessed at: a version of this process
+        // from before the rename may be reading it this second, and nothing creates these any
+        // more, so what is left of them goes when the last of those exits.
+        if (separator <= 0 || !int.TryParse(directoryName[..separator], out int pid))
+            return true;
+
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            // No process has that id: the one that made this directory is gone.
+            return false;
+        }
+        catch (Exception)
+        {
+            // A protected process inherited the id and will not answer to us, or the id could not
+            // be read at all. Nothing here is worth throwing for — this runs inside a static
+            // constructor, where an escaping exception makes every later use of the workspace
+            // throw a TypeInitializationException — and keeping a directory costs a directory.
+            return true;
         }
     }
 
     internal static void TryDeleteTempDir(string tempDir)
     {
+        // Before the delete rather than after it, because a failed delete leaves files nothing
+        // references any more either — the workspace that held them is gone by the time this runs.
+        foreach (string copy in s_originalOfCopy.Keys)
+        {
+            if (copy.StartsWith(tempDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                s_originalOfCopy.TryRemove(copy, out _);
+        }
+
         try
         {
             if (Directory.Exists(tempDir))
@@ -211,6 +341,356 @@ internal static class DecompiledSourceService
         {
             Console.Error.WriteLine($"[DecompiledSourceService] Failed to delete temp dir '{tempDir}': {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Decompiles one type by name, for callers that already know which assembly to look in —
+    /// the editor opening a <c>roslynsense-metadata:</c> document, rather than a symbol
+    /// navigation that has to work out the assembly first.
+    /// </summary>
+    /// <returns>The source, or <c>null</c> when the assembly or type cannot be read.</returns>
+    public static async Task<string?> TryDecompileTypeAsync(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        string resolved = ReferenceAssemblyRedirector.RedirectToImplementation(
+            assemblyPath, reflectionTypeName);
+
+        try
+        {
+            return await Task.Run(
+                () => DecompileType(resolved, reflectionTypeName, cancellationToken), cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not decompile '{reflectionTypeName}' from '{Path.GetFileName(resolved)}': {ex.Message}",
+                key: $"decompile:{resolved}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Decompiles a type into its cached on-disk file and returns where the declaration sits.
+    /// The search panel's metadata hits resolve through this so that opening one lands in the
+    /// same physical <c>Decompiled.cs</c> that F12 uses — with the manifest beside it, so the
+    /// language services light up — rather than in a read-only virtual buffer.
+    /// </summary>
+    /// <returns>The file and the 0-based position of the type's identifier, or null when the
+    /// assembly or type cannot be decompiled.</returns>
+    public static async Task<(string FilePath, int Line, int Character)?> TryDecompileTypeToFileAsync(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        string resolved = ReferenceAssemblyRedirector.RedirectToImplementation(
+            assemblyPath, reflectionTypeName);
+
+        try
+        {
+            string sourceText = await Task.Run(
+                () => DecompileType(resolved, reflectionTypeName, cancellationToken), cancellationToken);
+
+            var (sourceFilePath, _) = PersistDecompiledType(resolved, reflectionTypeName, sourceText);
+
+            var (line, character) = SourceMemberLocator.FindTypeDeclaration(
+                sourceText, reflectionTypeName, cancellationToken);
+            return (sourceFilePath, line, character);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not decompile '{reflectionTypeName}' from '{Path.GetFileName(resolved)}': {ex.Message}",
+                key: $"decompile:{resolved}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Decompiles the type declaring a stopped frame's method and maps the frame's IL offset to
+    /// a line in the decompiled text, through the sequence points the decompiler emits for its
+    /// own output. This is what makes stepping into a dependency without symbols land on the
+    /// executing statement rather than at the top of the file.
+    /// </summary>
+    /// <returns>The cached decompiled file and the 1-based position of the statement the IL
+    /// offset falls in; the type declaration when the method has no mappable statement there;
+    /// null when the type cannot be decompiled.</returns>
+    public static async Task<(string FilePath, int Line, int Column)?> TryDecompileFrameAsync(
+        string assemblyPath,
+        string reflectionTypeName,
+        int methodToken,
+        int ilOffset,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        try
+        {
+            var map = await Task.Run(
+                () => FrameMapFor(assemblyPath, reflectionTypeName, cancellationToken),
+                cancellationToken);
+
+            if (map.PointsByToken.TryGetValue(methodToken, out var points))
+            {
+                int picked = DebugFrameSource.PickSequencePoint(
+                    [.. points.Select(p => (p.Offset, IsHidden: false))], ilOffset);
+                if (picked >= 0)
+                    return (map.FilePath, points[picked].Line, points[picked].Column);
+            }
+
+            var (line, character) = SourceMemberLocator.FindTypeDeclaration(
+                map.SourceText, reflectionTypeName, cancellationToken);
+            return (map.FilePath, line + 1, character + 1);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not map a frame into '{reflectionTypeName}' from " +
+                $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
+                key: $"decompile-frame:{assemblyPath}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The frame map read backwards: which MethodDef token and IL offset a line of the decompiled
+    /// text corresponds to, so a breakpoint set inside a <c>Decompiled.cs</c> can bind on the IL.
+    /// Slides down to the next line carrying a sequence point, like breakpoints in real source do.
+    /// </summary>
+    /// <returns>The token, offset, and the 1-based line actually mapped; null when no line at or
+    /// below the requested one carries a sequence point, or the on-disk text has drifted from the
+    /// text the map was built for.</returns>
+    public static async Task<(int MethodToken, int IlOffset, int Line, int Column)?> TryMapLineToIlAsync(
+        string assemblyPath,
+        string reflectionTypeName,
+        string filePath,
+        int line,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        try
+        {
+            var map = await Task.Run(
+                () => FrameMapFor(assemblyPath, reflectionTypeName, cancellationToken),
+                cancellationToken);
+
+            // The map's lines are only meaningful against the text it was built from. The cache
+            // file is deterministic, but guard against an edited or stale copy on disk.
+            string onDisk = await File.ReadAllTextAsync(map.FilePath, cancellationToken);
+            if (!string.Equals(onDisk, map.SourceText, StringComparison.Ordinal)
+                || !string.Equals(
+                    Path.GetFullPath(map.FilePath), Path.GetFullPath(filePath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            (int Token, int Offset, int Line, int Column)? best = null;
+            foreach (var (token, points) in map.PointsByToken)
+            {
+                foreach (var (offset, pointLine, column, _, _) in points)
+                {
+                    if (pointLine < line)
+                        continue;
+                    bool better = best is not { } b
+                        || pointLine < b.Line
+                        || (pointLine == b.Line && offset < b.Offset);
+                    if (better)
+                        best = (token, offset, pointLine, column);
+                }
+            }
+
+            return best is { } picked
+                ? (picked.Token, picked.Offset, picked.Line, picked.Column)
+                : null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not map line {line} of a decompiled file back into " +
+                $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
+                key: $"decompile-line:{assemblyPath}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The same decompiled type as symbols the debug engine can read, rather than as an answer for
+    /// one frame.
+    /// </summary>
+    /// <remarks>
+    /// The data is identical either way — this is the map that <see cref="TryDecompileFrameAsync"/>
+    /// already builds and caches. Handing it over means the engine can locate a frame, range a
+    /// step, and bind a breakpoint inside the type itself, instead of the engine giving up and the
+    /// host patching a file and line into the answer afterwards. The second of those covered the
+    /// stack and nothing else: stepping over a line in decompiled code had no statement to run to.
+    /// </remarks>
+    public static async Task<DecompiledSymbolMap?> TrySymbolsForAsync(
+        string assemblyPath,
+        string reflectionTypeName,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(assemblyPath))
+            return null;
+
+        try
+        {
+            var map = await Task.Run(
+                () => FrameMapFor(assemblyPath, reflectionTypeName, cancellationToken),
+                cancellationToken);
+
+            var symbols = new DecompiledSymbolMap { FilePath = map.FilePath };
+            foreach (var (token, points) in map.PointsByToken)
+            {
+                symbols.Methods[token] =
+                    [.. points.Select(p => new DecompiledPoint(
+                        p.Offset, p.Line, p.Column, p.EndLine, p.EndColumn))];
+            }
+
+            return symbols.IsEmpty ? null : symbols;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not build symbols for '{reflectionTypeName}' from " +
+                $"'{Path.GetFileName(assemblyPath)}': {ex.Message}",
+                key: $"decompile-symbols:{assemblyPath}:{reflectionTypeName}");
+            return null;
+        }
+    }
+
+    /// <summary>The manifest beside a decompiled source file, when the path is one.</summary>
+    public static async Task<(string AssemblyPath, string TypeReflectionName)?> TryReadFrameManifestAsync(
+        string filePath, CancellationToken cancellationToken = default)
+    {
+        if (!IsDecompiledPath(filePath) || TryGetGeneratedProjectPath(filePath) is not { } manifestPath)
+            return null;
+
+        try
+        {
+            var manifest = await ReadManifestAsync(manifestPath, cancellationToken);
+            return (manifest.AssemblyPath, manifest.TypeReflectionName);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ServiceLog.Warn(
+                $"Could not read the decompiled manifest beside '{filePath}': {ex.Message}",
+                key: $"decompile-manifest:{filePath}");
+            return null;
+        }
+    }
+
+    /// <summary>One decompiled type with its IL-offset→line map, cached because a stop usually
+    /// steps through the same method many times.</summary>
+    private sealed record DecompiledFrameMap(
+        string FilePath,
+        string SourceText,
+        IReadOnlyDictionary<int, List<(int Offset, int Line, int Column, int EndLine, int EndColumn)>> PointsByToken);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (string Assembly, long Stamp, string Type), DecompiledFrameMap> s_frameMaps = new();
+
+    private static DecompiledFrameMap FrameMapFor(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken)
+    {
+        long stamp;
+        try
+        {
+            stamp = File.GetLastWriteTimeUtc(assemblyPath).Ticks;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            stamp = 0;
+        }
+
+        return s_frameMaps.GetOrAdd(
+            (assemblyPath, stamp, reflectionTypeName),
+            _ => BuildFrameMap(assemblyPath, reflectionTypeName, cancellationToken));
+    }
+
+    /// <remarks>
+    /// The text has to be written through a token writer that records positions back into the
+    /// syntax tree — sequence points are built from those positions, and text produced any other
+    /// way would leave them all at line zero. No reference-assembly redirect happens here, unlike
+    /// the navigation path: the module and token came from the debuggee's loader, and they are
+    /// only meaningful against that exact file.
+    /// </remarks>
+    private static DecompiledFrameMap BuildFrameMap(
+        string assemblyPath, string reflectionTypeName, CancellationToken cancellationToken)
+    {
+        var settings = new DecompilerSettings();
+        var decompiler = new CSharpDecompiler(assemblyPath, CreateLenientResolver(assemblyPath), settings)
+        {
+            CancellationToken = cancellationToken
+        };
+
+        var tree = decompiler.DecompileType(new DecompilerFullTypeName(reflectionTypeName));
+
+        var writer = new StringWriter();
+        var tokenWriter = ICSharpCode.Decompiler.CSharp.OutputVisitor.TokenWriter
+            .CreateWriterThatSetsLocationsInAST(writer);
+        tree.AcceptVisitor(new ICSharpCode.Decompiler.CSharp.OutputVisitor.CSharpOutputVisitor(
+            tokenWriter, settings.CSharpFormattingOptions));
+        string sourceText = writer.ToString();
+
+        var pointsByToken =
+            new Dictionary<int, List<(int Offset, int Line, int Column, int EndLine, int EndColumn)>>();
+        foreach (var (function, points) in decompiler.CreateSequencePoints(tree))
+        {
+            if (function?.Method is not { MetadataToken.IsNil: false } method)
+                continue;
+
+            int token = System.Reflection.Metadata.Ecma335.MetadataTokens.GetToken(method.MetadataToken);
+            // The end of each point as well as its start: a statement's span is what an active
+            // statement is reported as and what a step has to run to, and neither can be recovered
+            // from the start alone.
+            var mapped = points
+                .Where(p => !p.IsHidden)
+                .Select(p => (p.Offset, p.StartLine, p.StartColumn,
+                    p.EndLine == 0 ? p.StartLine : p.EndLine, p.EndColumn))
+                .OrderBy(p => p.Offset)
+                .ToList();
+
+            if (mapped.Count > 0)
+                pointsByToken[token] = mapped;
+        }
+
+        var (filePath, _) = PersistDecompiledType(assemblyPath, reflectionTypeName, sourceText);
+        return new DecompiledFrameMap(filePath, sourceText, pointsByToken);
+    }
+
+    /// <summary>
+    /// One writer for the decompile cache: F12 and the search panel both land here, and the lock
+    /// keeps the two doors from tearing each other's <c>Decompiled.cs</c> or manifest.
+    /// </summary>
+    private static readonly object s_persistLock = new();
+
+    private static (string SourceFilePath, string ManifestPath) PersistDecompiledType(
+        string resolvedAssemblyPath, string reflectionTypeName, string sourceText)
+    {
+        string outputDirectory = GetOutputDirectory(resolvedAssemblyPath, reflectionTypeName);
+        string sourceFilePath = Path.Combine(outputDirectory, SourceFileName);
+        string manifestPath = Path.Combine(outputDirectory, ManifestFileName);
+
+        lock (s_persistLock)
+        {
+            Directory.CreateDirectory(outputDirectory);
+            WriteFileIfChanged(sourceFilePath, sourceText);
+            WriteFileIfChanged(manifestPath, JsonSerializer.Serialize(new DecompiledSourceManifest
+            {
+                AssemblyPath = resolvedAssemblyPath,
+                SourceFilePath = sourceFilePath,
+                TypeReflectionName = reflectionTypeName
+            }, s_jsonOptions));
+        }
+
+        return (sourceFilePath, manifestPath);
     }
 
     private static string DecompileType(
@@ -297,348 +777,6 @@ internal static class DecompiledSourceService
         return null;
     }
 
-    private static async Task<ISymbol?> FindMatchingSourceSymbolAsync(
-        Document document,
-        ISymbol originalSymbol,
-        CancellationToken cancellationToken)
-    {
-        var root = await document.GetSyntaxRootAsync(cancellationToken);
-        var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
-
-        if (root is null || semanticModel is null)
-            return null;
-
-        foreach (var candidate in EnumerateDeclaredSymbols(root, semanticModel, cancellationToken))
-        {
-            if (SymbolsMatch(candidate, originalSymbol))
-                return candidate;
-        }
-
-        return null;
-    }
-
-    private static async Task<IReadOnlyList<Location>> FindMatchingLocationsBySyntaxAsync(
-        Document document,
-        ISymbol originalSymbol,
-        CancellationToken cancellationToken)
-    {
-        var root = await document.GetSyntaxRootAsync(cancellationToken);
-        if (root is null)
-            return [];
-
-        return originalSymbol switch
-        {
-            IMethodSymbol method => FindMethodLocations(root, method),
-            IPropertySymbol property => FindPropertyLocations(root, property),
-            IFieldSymbol field => FindFieldLocations(root, field),
-            IEventSymbol @event => FindEventLocations(root, @event),
-            INamedTypeSymbol type => FindTypeLocations(root, type),
-            _ => []
-        };
-    }
-
-    private static IEnumerable<ISymbol> EnumerateDeclaredSymbols(
-        SyntaxNode root,
-        SemanticModel semanticModel,
-        CancellationToken cancellationToken)
-    {
-        foreach (var node in root.DescendantNodesAndSelf())
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            ISymbol? symbol = node switch
-            {
-                MemberDeclarationSyntax member => semanticModel.GetDeclaredSymbol(member, cancellationToken),
-                VariableDeclaratorSyntax variable when variable.Parent?.Parent is BaseFieldDeclarationSyntax =>
-                    semanticModel.GetDeclaredSymbol(variable, cancellationToken),
-                _ => null
-            };
-
-            if (symbol is not null)
-                yield return symbol;
-        }
-    }
-
-    private static IReadOnlyList<Location> FindMethodLocations(SyntaxNode root, IMethodSymbol method)
-    {
-        if (method.MethodKind == MethodKind.Constructor)
-        {
-            return root.DescendantNodes()
-                .OfType<ConstructorDeclarationSyntax>()
-                .Where(candidate => ParametersLookCompatible(candidate.ParameterList.Parameters, method.Parameters))
-                .Select(candidate => candidate.Identifier.GetLocation())
-                .ToList();
-        }
-
-        return root.DescendantNodes()
-            .OfType<MethodDeclarationSyntax>()
-            .Where(candidate =>
-                string.Equals(candidate.Identifier.ValueText, method.Name, StringComparison.Ordinal) &&
-                ParametersLookCompatible(candidate.ParameterList.Parameters, method.Parameters))
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-    }
-
-    private static IReadOnlyList<Location> FindPropertyLocations(SyntaxNode root, IPropertySymbol property)
-    {
-        var locations = root.DescendantNodes()
-            .OfType<PropertyDeclarationSyntax>()
-            .Where(candidate =>
-                string.Equals(candidate.Identifier.ValueText, property.Name, StringComparison.Ordinal) &&
-                TypesLookCompatible(candidate.Type, property.Type))
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-
-        if (locations.Count > 0)
-            return locations;
-
-        return root.DescendantNodes()
-            .OfType<IndexerDeclarationSyntax>()
-            .Where(candidate => ParametersLookCompatible(candidate.ParameterList.Parameters, property.Parameters))
-            .Select(candidate => candidate.ThisKeyword.GetLocation())
-            .ToList();
-    }
-
-    private static IReadOnlyList<Location> FindFieldLocations(SyntaxNode root, IFieldSymbol field) =>
-        root.DescendantNodes()
-            .OfType<VariableDeclaratorSyntax>()
-            .Where(candidate =>
-                candidate.Parent?.Parent is FieldDeclarationSyntax declaration &&
-                string.Equals(candidate.Identifier.ValueText, field.Name, StringComparison.Ordinal) &&
-                TypesLookCompatible(declaration.Declaration.Type, field.Type))
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-
-    private static IReadOnlyList<Location> FindEventLocations(SyntaxNode root, IEventSymbol @event)
-    {
-        var eventLocations = root.DescendantNodes()
-            .OfType<EventDeclarationSyntax>()
-            .Where(candidate =>
-                string.Equals(candidate.Identifier.ValueText, @event.Name, StringComparison.Ordinal) &&
-                TypesLookCompatible(candidate.Type, @event.Type))
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-
-        if (eventLocations.Count > 0)
-            return eventLocations;
-
-        return root.DescendantNodes()
-            .OfType<VariableDeclaratorSyntax>()
-            .Where(candidate =>
-                candidate.Parent?.Parent is EventFieldDeclarationSyntax declaration &&
-                string.Equals(candidate.Identifier.ValueText, @event.Name, StringComparison.Ordinal) &&
-                TypesLookCompatible(declaration.Declaration.Type, @event.Type))
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-    }
-
-    private static IReadOnlyList<Location> FindTypeLocations(SyntaxNode root, INamedTypeSymbol type)
-    {
-        var locations = root.DescendantNodes()
-            .OfType<BaseTypeDeclarationSyntax>()
-            .Where(candidate =>
-                string.Equals(candidate.Identifier.ValueText, type.Name, StringComparison.Ordinal) &&
-                GetTypeParameterCount(candidate) == type.Arity)
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-
-        if (locations.Count > 0)
-            return locations;
-
-        return root.DescendantNodes()
-            .OfType<DelegateDeclarationSyntax>()
-            .Where(candidate =>
-                string.Equals(candidate.Identifier.ValueText, type.Name, StringComparison.Ordinal) &&
-                candidate.TypeParameterList?.Parameters.Count == type.Arity)
-            .Select(candidate => candidate.Identifier.GetLocation())
-            .ToList();
-    }
-
-    private static bool SymbolsMatch(ISymbol candidate, ISymbol original)
-    {
-        if (candidate.Kind != original.Kind)
-            return false;
-
-        if (!string.Equals(
-            GetContainingTypeIdentity(candidate),
-            GetContainingTypeIdentity(original),
-            StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        return (candidate, original) switch
-        {
-            (INamedTypeSymbol candidateType, INamedTypeSymbol originalType) =>
-                string.Equals(
-                    GetReflectionTypeName(candidateType),
-                    GetReflectionTypeName(originalType),
-                    StringComparison.Ordinal),
-            (IMethodSymbol candidateMethod, IMethodSymbol originalMethod) =>
-                MethodsMatch(candidateMethod, originalMethod),
-            (IPropertySymbol candidateProperty, IPropertySymbol originalProperty) =>
-                MembersMatch(candidateProperty, originalProperty) &&
-                ParametersMatch(candidateProperty.Parameters, originalProperty.Parameters) &&
-                TypesMatch(candidateProperty.Type, originalProperty.Type),
-            (IFieldSymbol candidateField, IFieldSymbol originalField) =>
-                MembersMatch(candidateField, originalField) &&
-                TypesMatch(candidateField.Type, originalField.Type),
-            (IEventSymbol candidateEvent, IEventSymbol originalEvent) =>
-                MembersMatch(candidateEvent, originalEvent) &&
-                TypesMatch(candidateEvent.Type, originalEvent.Type),
-            _ => false
-        };
-    }
-
-    private static bool MethodsMatch(IMethodSymbol candidate, IMethodSymbol original)
-    {
-        if (!MembersMatch(candidate, original) ||
-            candidate.MethodKind != original.MethodKind ||
-            candidate.Arity != original.Arity ||
-            !ParametersMatch(candidate.Parameters, original.Parameters))
-        {
-            return false;
-        }
-
-        return candidate.MethodKind is MethodKind.Constructor or MethodKind.StaticConstructor
-            ? true
-            : TypesMatch(candidate.ReturnType, original.ReturnType);
-    }
-
-    private static bool MembersMatch(ISymbol candidate, ISymbol original) =>
-        string.Equals(candidate.MetadataName, original.MetadataName, StringComparison.Ordinal);
-
-    private static bool ParametersMatch(
-        ImmutableArray<IParameterSymbol> candidateParameters,
-        ImmutableArray<IParameterSymbol> originalParameters)
-    {
-        if (candidateParameters.Length != originalParameters.Length)
-            return false;
-
-        for (int i = 0; i < candidateParameters.Length; i++)
-        {
-            if (candidateParameters[i].RefKind != originalParameters[i].RefKind ||
-                !TypesMatch(candidateParameters[i].Type, originalParameters[i].Type))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static bool ParametersLookCompatible(
-        SeparatedSyntaxList<ParameterSyntax> candidateParameters,
-        ImmutableArray<IParameterSymbol> originalParameters)
-    {
-        if (candidateParameters.Count != originalParameters.Length)
-            return false;
-
-        for (int i = 0; i < candidateParameters.Count; i++)
-        {
-            var candidateParameter = candidateParameters[i];
-            var originalParameter = originalParameters[i];
-
-            if (!ModifiersLookCompatible(candidateParameter.Modifiers, originalParameter.RefKind))
-                return false;
-
-            if (!TypesLookCompatible(candidateParameter.Type, originalParameter.Type))
-                return false;
-        }
-
-        return true;
-    }
-
-    private static bool TypesMatch(ITypeSymbol candidate, ITypeSymbol original)
-    {
-        if (SymbolEqualityComparer.Default.Equals(candidate, original))
-            return true;
-
-        return string.Equals(
-            candidate.ToDisplayString(s_typeMatchDisplayFormat),
-            original.ToDisplayString(s_typeMatchDisplayFormat),
-            StringComparison.Ordinal);
-    }
-
-    private static bool TypesLookCompatible(TypeSyntax? candidateType, ITypeSymbol originalType)
-    {
-        if (candidateType is null)
-            return false;
-
-        string candidateText = NormalizeTypeText(candidateType.ToString());
-        var expectedTexts = GetExpectedTypeTexts(originalType);
-        return expectedTexts.Contains(candidateText);
-    }
-
-    private static HashSet<string> GetExpectedTypeTexts(ITypeSymbol type)
-    {
-        var texts = new HashSet<string>(StringComparer.Ordinal)
-        {
-            NormalizeTypeText(type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)),
-            NormalizeTypeText(type.ToDisplayString(s_typeMatchDisplayFormat))
-        };
-
-        if (type is INamedTypeSymbol namedType)
-        {
-            texts.Add(NormalizeTypeText(namedType.Name));
-
-            if (!namedType.ContainingNamespace.IsGlobalNamespace)
-                texts.Add(NormalizeTypeText($"{namedType.ContainingNamespace.ToDisplayString()}.{namedType.Name}"));
-        }
-
-        return texts;
-    }
-
-    private static string NormalizeTypeText(string text) =>
-        text.Replace("global::", string.Empty, StringComparison.Ordinal)
-            .Replace("?", string.Empty, StringComparison.Ordinal)
-            .Replace("scoped", string.Empty, StringComparison.Ordinal)
-            .Replace(" ", string.Empty, StringComparison.Ordinal);
-
-    private static bool ModifiersLookCompatible(SyntaxTokenList modifiers, RefKind refKind)
-    {
-        bool hasRef = modifiers.Any(modifier => modifier.IsKind(SyntaxKind.RefKeyword));
-        bool hasOut = modifiers.Any(modifier => modifier.IsKind(SyntaxKind.OutKeyword));
-        bool hasIn = modifiers.Any(modifier => modifier.IsKind(SyntaxKind.InKeyword));
-
-        return refKind switch
-        {
-            RefKind.None => !hasRef && !hasOut && !hasIn,
-            RefKind.Ref => hasRef,
-            RefKind.Out => hasOut,
-            RefKind.In => hasIn,
-            _ => true
-        };
-    }
-
-    private static int GetTypeParameterCount(BaseTypeDeclarationSyntax declaration) => declaration switch
-    {
-        TypeDeclarationSyntax typeDeclaration => typeDeclaration.TypeParameterList?.Parameters.Count ?? 0,
-        _ => 0
-    };
-
-    private static string GetContainingTypeIdentity(ISymbol symbol) =>
-        symbol.ContainingType is null ? string.Empty : GetReflectionTypeName(symbol.ContainingType);
-
-    private static INamedTypeSymbol? GetOwningType(ISymbol symbol) => symbol switch
-    {
-        INamedTypeSymbol type => type,
-        _ when symbol.ContainingType is not null => symbol.ContainingType,
-        _ => null
-    };
-
-    private static string GetReflectionTypeName(INamedTypeSymbol type)
-    {
-        var containingTypes = new Stack<string>();
-        for (var current = type; current is not null; current = current.ContainingType)
-            containingTypes.Push(current.MetadataName);
-
-        string typeName = string.Join("+", containingTypes);
-        return type.ContainingNamespace.IsGlobalNamespace
-            ? typeName
-            : $"{type.ContainingNamespace.ToDisplayString()}.{typeName}";
-    }
-
     private static string GetOutputDirectory(string assemblyPath, string reflectionTypeName)
     {
         string assemblyName = SanitizePathSegment(Path.GetFileNameWithoutExtension(assemblyPath));
@@ -693,6 +831,7 @@ internal static class DecompiledSourceService
                     try
                     {
                         File.Copy(normalized, dest, overwrite: true);
+                        s_originalOfCopy[dest] = normalized;
                         references.Add(MetadataReference.CreateFromFile(dest));
                         return;
                     }
@@ -720,7 +859,14 @@ internal static class DecompiledSourceService
 
         AddReference(assemblyPath, copyToTemp: true);
 
-        if (AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") is string trustedPlatformAssemblies)
+        // One framework, not two. This host runs on .NET 10, so its TRUSTED_PLATFORM_ASSEMBLIES
+        // are CoreCLR's — correct for decompiling a Core assembly, and poison for a .NET Framework
+        // one. Mixing them puts two definitions of the core library in a single compilation, and
+        // the result is a decompiled file whose every framework type "does not exist": System.Web
+        // resolves against .NET 10's System.Runtime rather than the mscorlib it was built for.
+        // A Framework assembly's own directory carries the matching set, so that is used instead.
+        if (!IsFrameworkAssembly(assemblyPath) &&
+            AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") is string trustedPlatformAssemblies)
         {
             foreach (string path in trustedPlatformAssemblies.Split(
                          Path.PathSeparator,
@@ -743,9 +889,58 @@ internal static class DecompiledSourceService
         return (references, tempDir);
     }
 
+    /// <summary>
+    /// Whether an assembly targets .NET Framework rather than CoreCLR.
+    /// </summary>
+    /// <remarks>
+    /// Decided from what it references, not from where it sits: a Framework assembly references
+    /// <c>mscorlib</c> as its core library, a Core one references <c>System.Runtime</c>. Paths
+    /// would be a guess — reference assemblies, the GAC, unification directories and NuGet
+    /// packages all hold both kinds.
+    /// </remarks>
+    internal static bool IsFrameworkAssembly(string assemblyPath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(assemblyPath);
+            using var reader = new System.Reflection.PortableExecutable.PEReader(stream);
+            if (!reader.HasMetadata)
+                return false;
+
+            var metadata = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(reader);
+
+            // mscorlib itself references nothing, so it is recognised by its own name.
+            if (metadata.GetString(metadata.GetAssemblyDefinition().Name)
+                    .Equals("mscorlib", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            foreach (var handle in metadata.AssemblyReferences)
+            {
+                string name = metadata.GetString(metadata.GetAssemblyReference(handle).Name);
+                if (name.Equals("mscorlib", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (name.Equals("System.Runtime", StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
+        {
+            // Unreadable: fall back to the host's own framework, which is what this did before.
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A directory of this process's own, named after it so a stranger's sweep leaves it alone.
+    /// </summary>
     private static string CreateTempDir()
     {
-        string dir = Path.Combine(s_decompileTempRoot, Guid.NewGuid().ToString("N"));
+        string dir = Path.Combine(
+            s_decompileTempRoot,
+            $"{Environment.ProcessId}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
         return dir;
     }
@@ -773,6 +968,14 @@ internal static class DecompiledSourceService
         return manifest;
     }
 
+    /// <summary>
+    /// Writes a cache file, leaving it read-only.
+    /// </summary>
+    /// <remarks>
+    /// Read-only because an edit here cannot survive: the next decompile of the same type
+    /// overwrites the file, and losing someone's work silently is worse than refusing it. The
+    /// attribute has to be cleared before the rewrite, or that overwrite throws.
+    /// </remarks>
     private static void WriteFileIfChanged(string path, string content)
     {
         if (File.Exists(path))
@@ -780,9 +983,20 @@ internal static class DecompiledSourceService
             string existing = File.ReadAllText(path);
             if (string.Equals(existing, content, StringComparison.Ordinal))
                 return;
+
+            ExternalSourceCache.ClearReadOnly(path);
         }
 
         File.WriteAllText(path, content, s_utf8NoBom);
+
+        try
+        {
+            File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.ReadOnly);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Not being able to protect the file is no reason not to have written it.
+        }
     }
 
     private static string ComputeHash(string value) =>

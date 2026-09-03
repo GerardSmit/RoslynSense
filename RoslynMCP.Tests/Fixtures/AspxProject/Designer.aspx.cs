@@ -8,6 +8,14 @@ namespace AspxProject
     {
         protected System.Web.UI.WebControls.Label lblHandWritten = null!;
 
-        protected void BtnSave_Click(object sender, System.EventArgs e) { }
+        protected void BtnSave_Click(object sender, System.EventArgs e)
+        {
+            // Two carets for the go-to-definition contributor: one control whose field the
+            // designer generates, and one the class above declares by hand. Deliberately not
+            // btnSave — WebFormsIndexTests.ALensDoesNotCountItsOwnDeclaration needs one control
+            // that nothing uses, and that is the one it picked.
+            lblHeading.Text = "Heading";
+            lblHandWritten.Text = "done";
+        }
     }
 }

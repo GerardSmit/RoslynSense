@@ -26,6 +26,7 @@ public static class SolutionSessionTool
     {
         try
         {
+            RunwayTrace.Mark("OpenSolution entry");
             var resolved = ResolveSolution(solutionPath);
             if (resolved is null)
             {
@@ -35,6 +36,7 @@ public static class SolutionSessionTool
             }
 
             var projects = PathHelper.GetProjectsFromSolution(resolved);
+            RunwayTrace.Mark("solution parsed");
             if (projects.Count == 0)
                 return $"Error: '{Path.GetFileName(resolved)}' contains no projects.";
 
@@ -46,10 +48,37 @@ public static class SolutionSessionTool
 
             session.Open(resolved, directories, watch);
 
-            var classifications = projects.Select(ProjectClassifier.Classify).ToList();
-            await WarmWorkspaceAsync(projects, cancellationToken);
+            // The editor and MCP clients share one daemon, so by the time a chat calls
+            // open_solution the editor has usually loaded some or all of it. Warming only the
+            // projects that are actually missing is what keeps this call from reloading a
+            // solution that is already being served. The warm starts before the classification
+            // pass below, not after: everything under it (host ignition first of all) is what
+            // the caller is actually waiting on, and the classification only feeds the report.
+            var missing = await WorkspaceService.ProjectsNotYetLoadedAsync(projects, cancellationToken);
+            RunwayTrace.Mark("load state checked");
+            var warm = missing.Count > 0
+                ? WarmWorkspaceAsync(missing, cancellationToken)
+                : Task.CompletedTask;
 
-            return Format(resolved, classifications, session, watch, fmt);
+            var classifications = projects.Select(ProjectClassifier.Classify).ToList();
+            RunwayTrace.Mark("projects classified");
+
+            // The toolchain probe walks VS installations and disk state — a quarter second the
+            // report at the end of the open otherwise pays serially, after the workspace is
+            // already warm. Touched here, it resolves while the projects load, and
+            // AppendToolchain reads a memo.
+            if (classifications.Any(p =>
+                    p.BuildTool == BuildTool.VisualStudioMsBuild || p.Kind == AppKind.AspNetClassic))
+            {
+                _ = Task.Run(() => NetFxToolchain.Info);
+            }
+
+            await warm;
+
+            RunwayTrace.Mark("workspace warmed");
+            var report = Format(resolved, classifications, session, watch, fmt, alreadyLoaded: missing.Count == 0);
+            RunwayTrace.Mark("report formatted");
+            return report;
         }
         catch (OperationCanceledException)
         {
@@ -83,7 +112,7 @@ public static class SolutionSessionTool
             return "No solution is open. Call OpenSolution first.";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"# {Path.GetFileName(solutionPath)}");
+        sb.AppendLine($"**{Path.GetFileName(solutionPath)}**");
         sb.AppendLine();
         sb.AppendLine($"- **Path**: {solutionPath}");
         sb.AppendLine($"- **Watching designers**: {(session.IsWatching ? "yes" : "no")}");
@@ -136,30 +165,33 @@ public static class SolutionSessionTool
     }
 
     /// <summary>
-    /// Loads the projects so later tool calls hit a warm workspace. One project is enough to pull
-    /// in its whole solution, and a project that fails to load must not fail the open — the report
-    /// still tells the caller what is there.
+    /// Loads the projects so later tool calls hit a warm workspace.
     /// </summary>
+    /// <remarks>
+    /// One batch rather than a project-at-a-time loop. This is the path that most deserves it:
+    /// <c>open_solution</c> asks for every project by definition, and the loop it replaces paid
+    /// Roslyn's fixed per-call cost — a BuildHost subprocess and a cold MSBuild
+    /// <c>ProjectCollection</c> — once for each of them, in <c>.sln</c> declaration order, which is
+    /// the order least likely to let one project's transitive closure cover the next. A project
+    /// that fails to load must not fail the open; the report still tells the caller what is there.
+    /// </remarks>
     private static async Task WarmWorkspaceAsync(
         IReadOnlyList<string> projects, CancellationToken cancellationToken)
     {
-        foreach (var project in projects)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
+        if (projects.Count == 0)
+            return;
 
-            try
-            {
-                await WorkspaceService.GetOrOpenProjectAsync(project, cancellationToken: cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(
-                    $"[OpenSolution] Could not load '{Path.GetFileName(project)}': {ex.Message}");
-            }
+        try
+        {
+            await WorkspaceService.EnsureProjectsLoadedAsync(projects, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[OpenSolution] Could not warm the workspace: {ex.Message}");
         }
     }
 
@@ -168,11 +200,20 @@ public static class SolutionSessionTool
         List<ProjectClassification> projects,
         SolutionSessionService session,
         bool watch,
-        IOutputFormatter fmt)
+        IOutputFormatter fmt,
+        bool alreadyLoaded)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# Opened {Path.GetFileName(solutionPath)}");
+        sb.AppendLine(alreadyLoaded
+            ? $"**{Path.GetFileName(solutionPath)} is already open**"
+            : $"**Opened {Path.GetFileName(solutionPath)}**");
         sb.AppendLine();
+
+        if (alreadyLoaded)
+        {
+            sb.AppendLine("Every project is already loaded in the shared workspace; nothing was reloaded.");
+            sb.AppendLine();
+        }
 
         sb.AppendLine("| Project | Framework | Kind | Builds with |");
         sb.AppendLine("|---------|-----------|------|-------------|");

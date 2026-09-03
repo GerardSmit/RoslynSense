@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <!--
+          net6.0 is the floor for MetadataUpdater, and an assembly built against it loads on every
+          later runtime, so one build of this hook covers every app the tool can hot reload. It is
+          injected into the user's process through DOTNET_STARTUP_HOOKS, which is why it takes no
+          dependency beyond the BCL: anything else would be forced into their load context too.
+        -->
+        <TargetFramework>net6.0</TargetFramework>
+        <!-- The TFM fixes the runtime floor, not the compiler; the rest of the repo's C# applies. -->
+        <LangVersion>latest</LangVersion>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <AssemblyName>RoslynMCP.HotReloadAgent</AssemblyName>
+        <RootNamespace>RoslynMCP.HotReloadAgent</RootNamespace>
+        <IsPackable>false</IsPackable>
+        <!-- The startup-hook entry point is found by name, not by reference. -->
+        <NoWarn>$(NoWarn);CA1050</NoWarn>
+    </PropertyGroup>
+
+</Project>

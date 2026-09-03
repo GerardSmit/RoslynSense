@@ -1,0 +1,2181 @@
+{
+  "name": "roslyn-sense",
+  "displayName": "RoslynSense",
+  "description": "C# language server backed by the RoslynSense shared daemon — the same loaded solution your MCP-connected AI assistant uses.",
+  "version": "0.2.0",
+  "publisher": "roslyn-sense",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GerardSmit/RoslynSense.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/GerardSmit/RoslynSense/issues"
+  },
+  "homepage": "https://github.com/GerardSmit/RoslynSense",
+  "keywords": [
+    "csharp",
+    "C#",
+    ".NET",
+    "roslyn",
+    "webforms",
+    "asp.net",
+    "resx",
+    "msbuild",
+    "nuget",
+    "solution explorer",
+    "debugger",
+    "test explorer",
+    "mcp",
+    "language server"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers",
+    "Testing"
+  ],
+  "activationEvents": [
+    "onLanguage:csharp",
+    "onLanguage:webforms",
+    "onLanguage:resx",
+    "onLanguage:proto",
+    "onLanguage:msbuild",
+    "workspaceContains:**/*.{sln,slnx,csproj}"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "csharp",
+        "configuration": "./language-configuration/csharp.json"
+      },
+      {
+        "id": "cs-embedded",
+        "aliases": [
+          "Embedded C#"
+        ],
+        "configuration": "./language-configuration/csharp.json"
+      },
+      {
+        "id": "webforms",
+        "aliases": [
+          "WebForms",
+          "ASP.NET WebForms"
+        ],
+        "extensions": [
+          ".aspx",
+          ".ascx",
+          ".master",
+          ".asax",
+          ".ashx",
+          ".asmx"
+        ],
+        "firstLine": "^\\s*<%@",
+        "configuration": "./language-configuration/webforms.json"
+      },
+      {
+        "id": "resx",
+        "aliases": [
+          "RESX"
+        ],
+        "extensions": [
+          ".resx"
+        ],
+        "configuration": "./language-configuration/resx.json"
+      },
+      {
+        "id": "proto",
+        "aliases": [
+          "Protocol Buffers",
+          "protobuf"
+        ],
+        "extensions": [
+          ".proto"
+        ],
+        "configuration": "./language-configuration/proto.json"
+      },
+      {
+        "id": "msbuild",
+        "aliases": [
+          "MSBuild"
+        ],
+        "extensions": [
+          ".csproj",
+          ".fsproj",
+          ".vbproj",
+          ".props",
+          ".targets"
+        ],
+        "filenamePatterns": [
+          "**/[pP]ackages.[cC]onfig",
+          "**/[nN]u[gG]et.[cC]onfig"
+        ],
+        "configuration": "./language-configuration/msbuild.json"
+      },
+      {
+        "id": "dbml",
+        "aliases": [
+          "LINQ to SQL"
+        ],
+        "extensions": [
+          ".dbml"
+        ],
+        "configuration": "./language-configuration/dbml.json"
+      },
+      {
+        "id": "jsonc",
+        "filenamePatterns": [
+          "**/appsettings*.json",
+          "**/secrets.json"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cs-embedded",
+        "scopeName": "source.cs-embedded",
+        "path": "./syntaxes/csharpEmbedded.tmLanguage.json"
+      },
+      {
+        "language": "webforms",
+        "scopeName": "text.html.webforms",
+        "path": "./syntaxes/webforms.tmLanguage.json",
+        "embeddedLanguages": {
+          "text.html": "html",
+          "source.cs-embedded": "cs-embedded",
+          "source.sql": "sql",
+          "text.xml": "xml",
+          "source.js": "javascript",
+          "source.json": "json",
+          "source.css": "css"
+        }
+      },
+      {
+        "language": "resx",
+        "scopeName": "text.xml.resx",
+        "path": "./syntaxes/resx.tmLanguage.json"
+      },
+      {
+        "language": "proto",
+        "scopeName": "source.proto",
+        "path": "./syntaxes/proto.tmLanguage.json"
+      },
+      {
+        "language": "msbuild",
+        "scopeName": "text.xml.msbuild",
+        "path": "./syntaxes/msbuild.tmLanguage.json"
+      },
+      {
+        "language": "dbml",
+        "scopeName": "text.xml.dbml",
+        "path": "./syntaxes/dbml.tmLanguage.json"
+      },
+      {
+        "scopeName": "text.xml.msbuild.expression",
+        "path": "./syntaxes/msbuild.expression.json",
+        "injectTo": [
+          "text.xml.msbuild"
+        ]
+      }
+    ],
+    "xmlLanguageParticipants": [
+      {
+        "languageId": "msbuild"
+      },
+      {
+        "languageId": "dbml"
+      }
+    ],
+    "themes": [
+      {
+        "label": "RoslynSense Rider Islands Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/rider-islands-dark.json"
+      }
+    ],
+    "semanticTokenTypes": [
+      {
+        "id": "field",
+        "superType": "property",
+        "description": "A C# field. Split out from `variable` so it can be coloured apart from locals and parameters."
+      },
+      {
+        "id": "constant",
+        "superType": "variable",
+        "description": "A C# const field or const local."
+      },
+      {
+        "id": "local",
+        "superType": "variable",
+        "description": "A C# local variable, as distinct from a field."
+      },
+      {
+        "id": "delegate",
+        "superType": "type",
+        "description": "A C# delegate type."
+      },
+      {
+        "id": "extensionMethod",
+        "superType": "method",
+        "description": "A method invoked in extension form."
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "reassigned",
+        "description": "A local or parameter that is written to after its initial assignment."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "csharp",
+        "scopes": {
+          "field": [
+            "variable.other.property"
+          ],
+          "constant": [
+            "variable.other.constant"
+          ],
+          "local": [
+            "variable.other.readwrite"
+          ],
+          "delegate": [
+            "entity.name.type.delegate"
+          ],
+          "extensionMethod": [
+            "entity.name.function"
+          ]
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "roslynSense.openSettings",
+        "title": "Settings",
+        "category": "RoslynSense",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "roslynSense.searchEverywhere",
+        "title": "RoslynSense: Search Everywhere"
+      },
+      {
+        "command": "roslynSense.openSolution",
+        "title": "RoslynSense: Pick Solution"
+      },
+      {
+        "command": "roslynSense.pinLaunchUrl",
+        "title": "RoslynSense: Pin Launch URL to launchSettings.json"
+      },
+      {
+        "command": "roslynSense.restartServer",
+        "title": "RoslynSense: Restart Server"
+      },
+      {
+        "command": "roslynSense.installServer",
+        "title": "RoslynSense: Install Language Server"
+      },
+      {
+        "command": "roslynSense.updateServer",
+        "title": "RoslynSense: Update Language Server"
+      },
+      {
+        "command": "roslynSense.reloadValueSets",
+        "title": "RoslynSense: Reload Value Sets"
+      },
+      {
+        "command": "roslynSense.showEmbeddedProjection",
+        "title": "RoslynSense: Show Embedded HTML Projection"
+      },
+      {
+        "command": "roslynSense.restorePackages",
+        "title": "RoslynSense: Restore NuGet Packages"
+      },
+      {
+        "command": "roslynSense.reloadRoslynWorkspace",
+        "title": "RoslynSense: Reload Workspace"
+      },
+      {
+        "command": "roslynSense.showProcesses",
+        "title": "RoslynSense: Show Running Processes"
+      },
+      {
+        "command": "roslynSense.runTest",
+        "title": "RoslynSense: Run Test"
+      },
+      {
+        "command": "roslynSense.showReferences",
+        "title": "RoslynSense: Show References"
+      },
+      {
+        "command": "roslynSense.openLocation",
+        "title": "RoslynSense: Open Location"
+      },
+      {
+        "command": "roslynSense.showInheritance",
+        "title": "RoslynSense: Show Inheritance"
+      },
+      {
+        "command": "roslynSense.showTestsAt",
+        "title": "RoslynSense: Show Tests Covering This Member"
+      },
+      {
+        "command": "roslynSense.runImpactedTests",
+        "title": "RoslynSense: Run Tests for Git Changes",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "roslynSense.buildCoverageMap",
+        "title": "RoslynSense: Build Test Coverage Map",
+        "icon": "$(map)"
+      },
+      {
+        "command": "roslynSense.coverageMapBuilding",
+        "title": "RoslynSense: Building Test Coverage Map…",
+        "icon": "$(loading~spin)",
+        "enablement": "false"
+      },
+      {
+        "command": "roslynSense.refreshCoverage",
+        "title": "RoslynSense: Refresh Coverage View",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "roslynSense.refreshChangedMembers",
+        "title": "RoslynSense: Refresh Changed Members View",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "roslynSense.changedMembers.openFile",
+        "title": "Open File",
+        "category": "RoslynSense",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "roslynSense.changedMembers.openDiff",
+        "title": "Open Changes",
+        "category": "RoslynSense",
+        "icon": "$(compare-changes)"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewSimpleTree",
+        "title": "View as Tree by File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewFullTree",
+        "title": "View as Tree by Namespace",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewFlat",
+        "title": "View as Flat List",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.clickOpensDiff",
+        "title": "Click Opens Git Diff",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.clickOpensEditor",
+        "title": "Click Opens Editor",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.showBlocks",
+        "title": "Individual Changes",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.hideBlocks",
+        "title": "✓ Individual Changes",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.scopeUncommitted",
+        "title": "Compare: Uncommitted Changes",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.scopeBranch",
+        "title": "Compare: Whole Branch",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.showTests",
+        "title": "Test Projects",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.hideTests",
+        "title": "✓ Test Projects",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.showOtherFiles",
+        "title": "Other Files",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.hideOtherFiles",
+        "title": "✓ Other Files",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.showReviewed",
+        "title": "Reviewed",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewSimpleTreeActive",
+        "title": "✓ View as Tree by File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewFullTreeActive",
+        "title": "✓ View as Tree by Namespace",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.viewFlatActive",
+        "title": "✓ View as Flat List",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.clickOpensDiffActive",
+        "title": "✓ Click Opens Git Diff",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.clickOpensEditorActive",
+        "title": "✓ Click Opens Editor",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.scopeUncommittedActive",
+        "title": "✓ Compare: Uncommitted Changes",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.scopeBranchActive",
+        "title": "✓ Compare: Whole Branch",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.hideReviewed",
+        "title": "✓ Reviewed",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.changedMembers.markReviewed",
+        "title": "Mark as Reviewed",
+        "category": "RoslynSense",
+        "icon": "$(check)"
+      },
+      {
+        "command": "roslynSense.changedMembers.unmarkReviewed",
+        "title": "Unmark Reviewed",
+        "category": "RoslynSense",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "roslynSense.changedMembers.nextChange",
+        "title": "RoslynSense: Go to Next Change"
+      },
+      {
+        "command": "roslynSense.changedMembers.previousChange",
+        "title": "RoslynSense: Go to Previous Change"
+      },
+      {
+        "command": "roslynSense.showDebugSession",
+        "title": "RoslynSense: Show AI Debug Session"
+      },
+      {
+        "command": "roslynSense.openAiDebugSession",
+        "title": "RoslynSense: Open AI Debug Session in Debugger"
+      },
+      {
+        "command": "roslynSense.pickProcess",
+        "title": "RoslynSense: Pick .NET Process"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.refresh",
+        "title": "Refresh",
+        "category": "RoslynSense",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showAllFiles",
+        "title": "Show All Files",
+        "category": "RoslynSense",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.hideNonProjectFiles",
+        "title": "Show Project Items Only",
+        "category": "RoslynSense",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showIgnored",
+        "title": "Show Ignored Folders",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.hideIgnored",
+        "title": "Hide Ignored Folders",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.focusCurrentFile",
+        "title": "Focus Current File",
+        "category": "RoslynSense",
+        "icon": "$(target)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.followCurrentFile",
+        "title": "Follow Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.unfollowCurrentFile",
+        "title": "Stop Following Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.revealActiveFile",
+        "title": "Toggle: Follow Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.goToNode",
+        "title": "Search Solution",
+        "category": "RoslynSense",
+        "icon": "$(search)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.revealInExplorer",
+        "title": "Reveal in File Explorer",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.findInFolder",
+        "title": "Find in Folder",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.openProjectFile",
+        "title": "Edit Project File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.buildProject",
+        "title": "Build Project",
+        "category": "RoslynSense",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.rebuildProject",
+        "title": "Rebuild Project",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.cleanProject",
+        "title": "Clean Project",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.manageNuGet",
+        "title": "Manage NuGet Packages",
+        "category": "RoslynSense",
+        "icon": "$(package)"
+      },
+      {
+        "command": "roslynSense.manageNuGetForProject",
+        "title": "Manage NuGet Packages…",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.nuget.updateAll",
+        "title": "NuGet: Review Package Updates",
+        "category": "RoslynSense",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "roslynSense.nuget.clearCredentials",
+        "title": "NuGet: Clear Saved Feed Credentials",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.nuget.openSourcesConfig",
+        "title": "NuGet: Open NuGet.config",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newFile",
+        "title": "New File…",
+        "category": "RoslynSense",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newFolder",
+        "title": "New Folder…",
+        "category": "RoslynSense",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.rename",
+        "title": "Rename…",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.properties",
+        "title": "Properties",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.delete",
+        "title": "Delete",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.runWithHotReload",
+        "title": "Run with Hot Reload",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.applyHotReload",
+        "title": "Apply Hot Reload",
+        "category": "RoslynSense",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "roslynSense.stopHotReload",
+        "title": "Stop Hot Reload Session",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.copy",
+        "title": "Copy",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.cut",
+        "title": "Cut",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.paste",
+        "title": "Paste",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.duplicate",
+        "title": "Duplicate",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newItem",
+        "title": "New…",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.startupAndDebug",
+        "title": "Set as Startup and Debug",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.packageDetails",
+        "title": "Package Details",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.toggleFileNesting",
+        "title": "Toggle File Nesting",
+        "category": "RoslynSense",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.followCurrentFileChecked",
+        "title": "✓ Follow Current File",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showAllFilesChecked",
+        "title": "✓ Show All Files",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.showIgnoredChecked",
+        "title": "✓ Show Ignored Folders",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.fileNesting",
+        "title": "File Nesting",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.fileNestingChecked",
+        "title": "✓ File Nesting",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.runProject",
+        "title": "Run Project",
+        "category": "RoslynSense",
+        "icon": "$(play)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.debugProject",
+        "title": "Debug Project",
+        "category": "RoslynSense",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.startStartupProject",
+        "title": "Start",
+        "category": "RoslynSense",
+        "icon": "$(play)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.debugStartupProject",
+        "title": "Debug",
+        "category": "RoslynSense",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newSolutionFolder",
+        "title": "New Solution Folder",
+        "category": "RoslynSense",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.undo",
+        "title": "Undo",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.redo",
+        "title": "Redo",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.removeReference",
+        "title": "Remove",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.removePackage",
+        "title": "Remove",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.goToProject",
+        "title": "Go to Project",
+        "category": "RoslynSense"
+      },
+      {
+        "command": "roslynSense.discovery.refresh",
+        "title": "Refresh",
+        "category": "RoslynSense",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "roslynSense.discovery.goToDefinition",
+        "title": "Go to Definition",
+        "category": "RoslynSense",
+        "icon": "$(symbol-interface)"
+      },
+      {
+        "command": "roslynSense.discovery.goToImplementation",
+        "title": "Go to Implementation",
+        "category": "RoslynSense",
+        "icon": "$(symbol-class)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.addProjectReference",
+        "title": "Add Project Reference…",
+        "category": "RoslynSense",
+        "icon": "$(references)"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newProject",
+        "title": "New Project…",
+        "category": "RoslynSense",
+        "icon": "$(new-file)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "roslynSense",
+          "title": "RoslynSense",
+          "icon": "media/roslyn-sense.svg"
+        }
+      ]
+    },
+    "views": {
+      "roslynSense": [
+        {
+          "id": "roslynSense.solutionExplorer",
+          "name": "Solution",
+          "contextualTitle": "Solution Explorer",
+          "icon": "media/solution.svg",
+          "initialSize": 4
+        },
+        {
+          "id": "roslynSense.changedMembers",
+          "name": "Changed Members",
+          "contextualTitle": "Changed Members",
+          "icon": "$(git-compare)",
+          "initialSize": 1
+        },
+        {
+          "id": "roslynSense.discovery",
+          "name": "Discovery",
+          "contextualTitle": "Discovery",
+          "icon": "$(compass)",
+          "visibility": "collapsed",
+          "initialSize": 2
+        }
+      ],
+      "test": [
+        {
+          "id": "roslynSense.coverage",
+          "name": "Coverage",
+          "contextualTitle": "Test Coverage",
+          "icon": "media/coverage.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "roslynSense.solutionExplorer",
+        "contents": "The RoslynSense language server (`roslyn-sense`) was not found. It is a dotnet tool and needs the .NET SDK.\n[Install Language Server](command:roslynSense.installServer)\nAlready built it yourself? Point `roslynSense.serverPath` at the binary.\n[Open Settings](command:workbench.action.openSettings?%5B%22roslynSense.serverPath%22%5D)\nThen restart the server.\n[Restart Server](command:roslynSense.restartServer)",
+        "when": "roslynSense.serverMissing"
+      },
+      {
+        "view": "roslynSense.solutionExplorer",
+        "contents": "No solution or C# project found in this workspace. The server starts when a solution is picked or a C# file is opened.\n[Pick Solution](command:roslynSense.openSolution)",
+        "when": "!roslynSense.serverMissing && roslynSense.noDotnetWorkspace"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "csharp"
+      },
+      {
+        "language": "webforms"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "roslynsense",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "type": "string",
+            "enum": [
+              "build",
+              "rebuild",
+              "clean",
+              "test",
+              "watch"
+            ],
+            "description": "What to run."
+          },
+          "project": {
+            "type": "string",
+            "description": "Project or solution path. Omit for the whole solution."
+          },
+          "configuration": {
+            "type": "string",
+            "default": "Debug"
+          }
+        }
+      }
+    ],
+    "jsonValidation": [
+      {
+        "fileMatch": "**/Properties/launchSettings.json",
+        "url": "./schemas/launchSettings.schema.json"
+      },
+      {
+        "fileMatch": "**/[Rr]oslyn[Ss]ense.json",
+        "url": "./schemas/roslynsense.schema.json"
+      },
+      {
+        "fileMatch": "**/[Rr]oslyn[Ss]ense.local.json",
+        "url": "./schemas/roslynsense.schema.json"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "roslynsense",
+        "label": "C# (RoslynSense)",
+        "languages": [
+          "csharp"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "projectPath": {
+                "type": "string",
+                "description": "Project to launch. Omit to be prompted."
+              },
+              "configuration": {
+                "type": "string",
+                "description": "Build configuration.",
+                "default": "Debug"
+              },
+              "launchProfile": {
+                "type": "string",
+                "description": "launchSettings.json profile to launch with. Omit to use the first Project profile."
+              },
+              "program": {
+                "type": "string",
+                "description": "Executable to launch. Resolved from the project when omitted."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "cwd": {
+                "type": "string"
+              },
+              "env": {
+                "type": "object",
+                "default": {}
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Break at the program's entry point."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "default": true
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "processId": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "PID of the .NET process to attach to."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "roslynsense",
+            "request": "launch",
+            "name": "C#: Launch"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "C#: Launch project (RoslynSense)",
+            "description": "Build and debug a .NET project.",
+            "body": {
+              "type": "roslynsense",
+              "request": "launch",
+              "name": "C#: Launch",
+              "projectPath": "^\"\\${workspaceFolder}/${1:Project}/${1:Project}.csproj\"",
+              "stopAtEntry": false
+            }
+          },
+          {
+            "label": "C#: Attach to process (RoslynSense)",
+            "description": "Attach the debugger to a running .NET process.",
+            "body": {
+              "type": "roslynsense",
+              "request": "attach",
+              "name": "C#: Attach",
+              "processId": "^\"\\${command:roslynSense.pickProcess}\""
+            }
+          }
+        ]
+      },
+      {
+        "type": "roslynsense-ai",
+        "label": "RoslynSense AI Session",
+        "languages": [
+          "csharp"
+        ],
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "ownerPid": {
+                "type": "number",
+                "description": "PID of the chat process owning the debug session. Omit to attach to the first one."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "roslynsense-ai",
+            "request": "attach",
+            "name": "Attach to AI Debug Session"
+          }
+        ]
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "roslynSense.runTest",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.openFile",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.openDiff",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewSimpleTree",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFullTree",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFlat",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensDiff",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensEditor",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.showBlocks",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideBlocks",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeUncommitted",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeBranch",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.showTests",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideTests",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.showReviewed",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewSimpleTreeActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFullTreeActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFlatActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensDiffActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensEditorActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeUncommittedActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeBranchActive",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.followCurrentFileChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showAllFilesChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showIgnoredChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNesting",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNestingChecked",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideReviewed",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.markReviewed",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.changedMembers.unmarkReviewed",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.coverageMapBuilding",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.showTestsAt",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.showReferences",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.openLocation",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.removeReference",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.removePackage",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.discovery.goToDefinition",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.discovery.goToImplementation",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.copy",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.cut",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.paste",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.duplicate",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newItem",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.startupAndDebug",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.packageDetails",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.runProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.startStartupProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugStartupProject",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newSolutionFolder",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.removeReference",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRef",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRef",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.removePackage",
+          "when": "view == roslynSense.solutionExplorer && viewItem == package",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.addProjectReference",
+          "when": "false"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newProject",
+          "when": "false"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "roslynSense.applyHotReload",
+          "when": "roslynSense.hotReload.pending",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "roslynSense.showInheritance",
+          "when": "editorLangId == csharp",
+          "group": "navigation@50"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "roslynSense.discovery.refresh",
+          "when": "view == roslynSense.discovery",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.runImpactedTests",
+          "when": "view == workbench.view.testing",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.refreshCoverage",
+          "when": "view == roslynSense.coverage",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.refreshChangedMembers",
+          "when": "view == roslynSense.changedMembers",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewSimpleTree",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView != simpleTree",
+          "group": "1_view@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewSimpleTreeActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView == simpleTree",
+          "group": "1_view@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFullTree",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView != fullTree",
+          "group": "1_view@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFullTreeActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView == fullTree",
+          "group": "1_view@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFlat",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView != flat",
+          "group": "1_view@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.viewFlatActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersView == flat",
+          "group": "1_view@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensDiff",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn != gitDiff",
+          "group": "3_click@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensDiffActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn == gitDiff",
+          "group": "3_click@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensEditor",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn != editor",
+          "group": "3_click@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.clickOpensEditorActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOpenIn == editor",
+          "group": "3_click@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.showBlocks",
+          "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersBlocks",
+          "group": "2_show@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideBlocks",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersBlocks",
+          "group": "2_show@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.showTests",
+          "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersTests",
+          "group": "2_show@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideTests",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersTests",
+          "group": "2_show@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.showOtherFiles",
+          "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersOtherFiles",
+          "group": "2_show@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideOtherFiles",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersOtherFiles",
+          "group": "2_show@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.showReviewed",
+          "when": "view == roslynSense.changedMembers && !roslynSense.changedMembersReviewed",
+          "group": "2_show@4"
+        },
+        {
+          "command": "roslynSense.changedMembers.hideReviewed",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersReviewed",
+          "group": "2_show@4"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeUncommitted",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope != uncommitted",
+          "group": "0_scope@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeUncommittedActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope == uncommitted",
+          "group": "0_scope@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeBranch",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope != branch",
+          "group": "0_scope@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.scopeBranchActive",
+          "when": "view == roslynSense.changedMembers && roslynSense.changedMembersScope == branch",
+          "group": "0_scope@2"
+        },
+        {
+          "command": "roslynSense.buildCoverageMap",
+          "when": "view == roslynSense.coverage && !roslynSense.coverageBuilding",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.coverageMapBuilding",
+          "when": "view == roslynSense.coverage && roslynSense.coverageBuilding",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.startStartupProject",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugStartupProject",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.goToNode",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.focusCurrentFile",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "navigation@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.followCurrentFile",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.revealActiveFile",
+          "group": "1_view@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.followCurrentFileChecked",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.revealActiveFile",
+          "group": "1_view@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showAllFiles",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.showAllFiles",
+          "group": "1_view@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showAllFilesChecked",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.showAllFiles",
+          "group": "1_view@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showIgnored",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.showIgnored",
+          "group": "1_view@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.showIgnoredChecked",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.showIgnored",
+          "group": "1_view@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNesting",
+          "when": "view == roslynSense.solutionExplorer && !roslynSense.fileNesting",
+          "group": "1_view@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.fileNestingChecked",
+          "when": "view == roslynSense.solutionExplorer && roslynSense.fileNesting",
+          "group": "1_view@4"
+        },
+        {
+          "command": "roslynSense.openSettings",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "5_settings"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.refresh",
+          "when": "view == roslynSense.solutionExplorer",
+          "group": "9_refresh"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "roslynSense.discovery.goToDefinition",
+          "when": "view == roslynSense.discovery && viewItem =~ /^(protoService|protoRpc|cronJob|route|templateEntry|templateModule)(Dynamic)?(Target)?$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "roslynSense.discovery.goToImplementation",
+          "when": "view == roslynSense.discovery && viewItem =~ /Target$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "roslynSense.discovery.goToDefinition",
+          "when": "view == roslynSense.discovery && viewItem =~ /^(protoService|protoRpc|cronJob|route|templateEntry|templateModule)(Dynamic)?(Target)?$/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "roslynSense.discovery.goToImplementation",
+          "when": "view == roslynSense.discovery && viewItem =~ /Target$/",
+          "group": "navigation@2"
+        },
+        {
+          "command": "roslynSense.discovery.refresh",
+          "when": "view == roslynSense.discovery",
+          "group": "9_refresh"
+        },
+        {
+          "command": "roslynSense.changedMembers.openDiff",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|Block|OtherFile)(Reviewed|Staged)?$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "roslynSense.changedMembers.openFile",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^changed(Member|Block|OtherFile)(Reviewed|Staged)?$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "roslynSense.changedMembers.markReviewed",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^(changedMember|changedFile|changedOtherFile|namespace|type)$/",
+          "group": "inline@3"
+        },
+        {
+          "command": "roslynSense.changedMembers.unmarkReviewed",
+          "when": "view == roslynSense.changedMembers && viewItem =~ /^(changedMember|changedFile|changedOtherFile|namespace|type)Reviewed$/",
+          "group": "inline@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.buildProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "inline@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.runProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "00_run@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "00_run@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.buildProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "01_build@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.rebuildProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "01_build@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.cleanProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "01_build@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.openProjectFile",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^project(Runnable)?$/",
+          "group": "1_edit"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.findInFolder",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(folder|project|projectRunnable|solutionFolder)$/",
+          "group": "2_search"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.revealInExplorer",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder|project|projectRunnable)$/",
+          "group": "3_os"
+        },
+        {
+          "command": "roslynSense.manageNuGetForProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|dependencies|packages)$/",
+          "group": "1_edit"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newFile",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newFolder",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder)$/",
+          "group": "2_modify@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.rename",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "2_modify@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.delete",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "2_modify@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.properties",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "9_properties"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newItem",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder|project|projectRunnable|folder)$/",
+          "group": "2_modify@0"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.cut",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "4_clipboard@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.copy",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(file|folder)$/",
+          "group": "4_clipboard@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.paste",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(project|projectRunnable|folder|file)$/",
+          "group": "4_clipboard@3"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.duplicate",
+          "when": "view == roslynSense.solutionExplorer && viewItem == file",
+          "group": "4_clipboard@4"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.startupAndDebug",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "1_edit@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.packageDetails",
+          "when": "view == roslynSense.solutionExplorer && viewItem == package",
+          "group": "1_edit"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.runProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "inline@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.debugProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem == projectRunnable",
+          "group": "inline@2"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newSolutionFolder",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder)$/",
+          "group": "2_modify@0"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.addProjectReference",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(dependencies|projects)$/",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "roslynSense.solutionExplorer.newProject",
+          "when": "view == roslynSense.solutionExplorer && viewItem =~ /^(solution|solutionFolder)$/",
+          "group": "2_modify@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "roslynSense.solutionExplorer.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.redo",
+        "key": "ctrl+y",
+        "mac": "cmd+shift+z",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.redo",
+        "key": "ctrl+shift+z",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.searchEverywhere",
+        "key": "ctrl+t",
+        "mac": "cmd+t",
+        "when": "!inQuickOpen && focusedView != roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.showInheritance",
+        "key": "ctrl+alt+u",
+        "when": "editorTextFocus && editorLangId == csharp"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.openProjectFile",
+        "key": "alt+enter",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.findInFolder",
+        "key": "ctrl+shift+f",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.buildProject",
+        "key": "ctrl+shift+b",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.goToNode",
+        "key": "ctrl+t",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.copy",
+        "key": "ctrl+c",
+        "mac": "cmd+c",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.cut",
+        "key": "ctrl+x",
+        "mac": "cmd+x",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.paste",
+        "key": "ctrl+v",
+        "mac": "cmd+v",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.duplicate",
+        "key": "ctrl+d",
+        "mac": "cmd+d",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.newItem",
+        "key": "alt+insert",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      },
+      {
+        "command": "roslynSense.solutionExplorer.startupAndDebug",
+        "key": "f5",
+        "when": "focusedView == roslynSense.solutionExplorer"
+      }
+    ],
+    "configurationDefaults": {
+      "files.associations": {
+        "*.DotSettings": "xml",
+        "*.DotSettings.user": "xml"
+      },
+      "[csharp]": {
+        "editor.formatOnType": true
+      },
+      "workbench.list.defaultFindMode": "filter",
+      "workbench.list.typeNavigationMode": "automatic"
+    },
+    "configuration": {
+      "title": "RoslynSense",
+      "properties": {
+        "roslynSense.serverPath": {
+          "type": "string",
+          "default": "roslyn-sense",
+          "description": "Path to the roslyn-sense executable (dotnet tool). Defaults to 'roslyn-sense' on PATH."
+        },
+        "roslynSense.solutionPath": {
+          "type": "string",
+          "default": "",
+          "description": "Default solution for this workspace. When empty: a single found .sln/.slnx is used automatically, multiple prompt a picker (use 'RoslynSense: Pick Solution' to change), none lets the server resolve from the workspace folder."
+        },
+        "roslynSense.embeddedLanguages": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer JavaScript and CSS IntelliSense inside <script> and <style> blocks in markup files, using the language services VS Code ships for HTML. Server-side code (<% %> and <script runat=\"server\">) is excluded."
+        },
+        "roslynSense.traceProtocolStream": {
+          "type": "boolean",
+          "default": false,
+          "description": "Capture the raw LSP byte stream to disk and validate every message body. For diagnosing 'Header must provide a Content-Length property' and JSON parse errors from the server; the capture goes to %TEMP%/roslyn-mcp-lsp-diagnostics and can grow large. Restart the server after changing this."
+        },
+        "roslynSense.debuggerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to netcoredbg. When empty, the server locates it (PATH, common install locations) and downloads it if needed."
+        },
+        "roslynSense.shareEditorContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tell connected AI chats which file and symbol you are looking at, so they can resolve 'this method' or 'this error'. Sends paths, the cursor position, the current selection, and diagnostics already visible in the editor — never whole file contents."
+        },
+        "roslynSense.changedMembers.view": {
+          "type": "string",
+          "enum": [
+            "simpleTree",
+            "fullTree",
+            "flat"
+          ],
+          "enumDescriptions": [
+            "Group members under the file they are in.",
+            "Group members by namespace and type.",
+            "One flat list of members, ordered by file and line."
+          ],
+          "default": "simpleTree",
+          "description": "How the Changed Members view groups what changed."
+        },
+        "roslynSense.changedMembers.scope": {
+          "type": "string",
+          "enum": [
+            "uncommitted",
+            "branch"
+          ],
+          "enumDescriptions": [
+            "Everything not committed: staged, unstaged, and untracked files.",
+            "Everything this branch changed, from its merge base with the main branch through the working tree."
+          ],
+          "default": "uncommitted",
+          "description": "Which changes the Changed Members view lists."
+        },
+        "roslynSense.changedMembers.showTests": {
+          "type": "boolean",
+          "default": true,
+          "description": "List changes in test projects too. Test files carry a beaker icon so the two halves of a diff stay tellable apart."
+        },
+        "roslynSense.changedMembers.showOtherFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "List changed files that are not C# too — markup like .aspx, contracts like .proto, configs. They have no members to break down, so each is one row that opens the file at its first changed line."
+        },
+        "roslynSense.changedMembers.showReviewed": {
+          "type": "boolean",
+          "default": true,
+          "description": "List changes that are already reviewed — ticked off by hand, or staged. Staged runs count as reviewed, so `git add` on a file, a hunk, or a line takes it off the list when this is off."
+        },
+        "roslynSense.changedMembers.showBlocks": {
+          "type": "boolean",
+          "default": true,
+          "description": "List each separate run of changed lines under its member, so a big method with several edits can be stepped through change by change. A member with a single change stays a single row."
+        },
+        "roslynSense.changedMembers.openIn": {
+          "type": "string",
+          "enum": [
+            "editor",
+            "gitDiff"
+          ],
+          "enumDescriptions": [
+            "Open the file in a normal editor.",
+            "Open the git diff view, with the working tree beside what HEAD has."
+          ],
+          "default": "editor",
+          "description": "What clicking a changed member opens. Either way the member's first changed line is selected; the row's inline actions offer whichever one this is not."
+        },
+        "roslynSense.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace LSP communication between VSCode and roslyn-sense."
+        },
+        "roslynSense.debugger.debuggerDisplay": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show values using their type's [DebuggerDisplay] string instead of the type name. The placeholders are evaluated in the target, so a getter named by one runs while you are stopped."
+        },
+        "roslynSense.debugger.typeProxy": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expand values through their type's [DebuggerTypeProxy] view, so a dictionary shows its entries rather than its bucket arrays. Building the view runs its constructor in the target."
+        },
+        "roslynSense.debugger.browsable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Honour [DebuggerBrowsable]: Never hides a member, RootHidden shows its children in its place. Off lists every field as it is stored."
+        },
+        "roslynSense.debugger.justMyCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Step past code marked [DebuggerStepThrough], [DebuggerHidden] or [DebuggerNonUserCode], and past frames with no symbols. Off steps into everything, including framework code."
+        },
+        "roslynSense.debugger.rawView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add a 'Raw View' child whenever a proxy or a hidden member means the listed children are not the object's own fields."
+        },
+        "roslynSense.debugger.maxChildren": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "How many children of one value to list before truncating."
+        },
+        "roslynSense.debugger.symbolInclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Load symbols only for modules matching these globs, when the list is non-empty. A glob without a path separator matches the module's file name (MyCompany.*.dll); with one, its full path. Empty loads symbols for every module not excluded."
+        },
+        "roslynSense.debugger.symbolExclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Never load symbols for modules matching these globs, taking precedence over the include list. A module without symbols cannot bind source breakpoints. ASP.NET's generated App_Web_*.dll page assemblies are already skipped without configuration."
+        },
+        "roslynSense.debugger.coreClrEngine": {
+          "type": "string",
+          "enum": [
+            "netcoredbg",
+            "icordebug"
+          ],
+          "enumDescriptions": [
+            "The external debugger used for .NET so far. Runs on every platform.",
+            "The engine .NET Framework already uses. Windows only, and newer on this runtime."
+          ],
+          "default": "netcoredbg",
+          "markdownDescription": "Which engine debugs .NET (CoreCLR) targets. .NET Framework always uses `icordebug`, the only engine that can attach to it.\n\n`icordebug` additionally brings Just My Code applied by the runtime, breakpoints that bind against binaries built on another machine, method return values after a step, and stepping through decompiled code with no PDB. It runs on Windows only, and has far less mileage on .NET than on .NET Framework.\n\nTakes effect the next time debugging starts."
+        },
+        "roslynSense.hotReload.applyOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Apply saved C# edits to the running application without restarting it. Rude edits (signature changes, new generic methods) are reported instead and still need a restart."
+        },
+        "roslynSense.loadEntireSolution": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load every project of the solution in the background when the server starts, so Search Everywhere, workspace symbols and find-references cover the whole solution instead of only the projects whose files you have opened. Off loads a project the first time you touch a file in it, which starts faster and uses less memory on a very large solution."
+        },
+        "roslynSense.analyzerDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the project's analyzers (StyleCop, Roslynator, in-house) for editor diagnostics. Off leaves compiler diagnostics only."
+        },
+        "roslynSense.codeStyleDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include Roslyn's built-in IDE code-style rules (IDE0xxx). These are the rules most likely to be noisy on a repo with no .editorconfig."
+        },
+        "roslynSense.analyzerTimeoutSeconds": {
+          "type": "integer",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 300,
+          "description": "How long an ordinary document’s analyzer pass may take before reporting what it has. Large files scale up from this, to at most four times it, because the work grows with the file. A slow analyzer delays squiggles, never typing."
+        },
+        "roslynSense.workspaceDiagnostics": {
+          "type": "string",
+          "enum": [
+            "off",
+            "openProjects",
+            "solution"
+          ],
+          "enumDescriptions": [
+            "Only files you have open report to Problems.",
+            "Projects owning an open file, plus what they reference.",
+            "The whole solution. Expensive on a large one."
+          ],
+          "default": "openProjects",
+          "description": "How much of the solution is swept for the Problems panel."
+        },
+        "roslynSense.externalSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "When navigating into a package or framework type, read the source it was compiled from rather than a decompilation of it. Off decompiles everything and never reaches the network. Source embedded in a PDB is always used, since it needs no network."
+        },
+        "roslynSense.sourceLink": {
+          "type": "boolean",
+          "default": true,
+          "description": "Fetch source from where a PDB's Source Link map points. Downloads are checksum-verified against the PDB, so a file that does not match the assembly is never shown."
+        },
+        "roslynSense.symbolServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Download PDBs from the Microsoft and NuGet symbol servers for assemblies that ship without them — which is all of the shared .NET framework. Without this, Source Link has nothing to read."
+        },
+        "roslynSense.referenceSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "For .NET Framework, read Microsoft's published reference source for the exact version installed. It carries no checksum, so a file is accepted only if it really declares the type; it is labelled as unverified and is never used for debugging."
+        },
+        "roslynSense.languages.webforms": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.aspx`, `.ascx`, `.master` and their siblings: navigation between markup and code-behind, completion for server controls, and markup hits folded into find-references and rename. Off leaves these files to the grammar alone in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.resx": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.resx`: navigation from a generated designer property to the entry that produced it, and resource keys folded into find-references. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.proto": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.proto`: navigation from a `service` or `rpc` to the C# that implements and calls it, references for messages, fields and enums, and a warning on a type reference that resolves to nothing. protoc's generated C# is treated as a pass-through, so it never appears as a definition or a usage. Off leaves these files to the grammar alone in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.mediator": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Resolve `Send`, `Publish` and the generated mediator extension methods to the handler that runs, and count those calls as usages of the handler. Supports MediatR and Zapto.Mediator. Off leaves them resolving to the mediator interface in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.cron": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Colour, explain and check the crontab expressions handed to Hangfire and Quartz — and any string passed to a parameter named `cronExpression` or close to it — and list every scheduled job in the solution under Cron Jobs. Off hides the section and leaves the strings plain in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.routes": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "List every HTTP endpoint the solution serves under Routes — the path, the verb and the method that handles it — reading ASP.NET Core attributes and minimal APIs, ASP.NET Web API attributes, and any attribute or registration method named under `routes` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.templates": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "List the screens an application declares in template files under Templates — nested as the files nest them, with a button to the declaration and one to the control that renders it. Reads `App_Data/Templates` and `App_Data/TemplatesCustom`, and any folder named under `templates` in `roslynsense.json`. Off hides the section in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.logging": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for structured logging message templates — Microsoft.Extensions.Logging, Serilog and NLog. Colours each `{Placeholder}`, completes it from the values the call passes, explains on hover which value it actually prints, and warns when the template and the values disagree or an exception is passed as a value instead of as the first argument. Off leaves the template as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.formatting": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for composite format strings — `string.Format(\"{0:dd-MM-yyyy}\", …)`, an interpolation's `$\"{value:yyyyMMdd}\"`, and the markup attributes listed under `webForms.dataExpressions`. Colours each component of a specifier a different colour, so `dd-MM-yyyy` and `dd-mm-yyyy` no longer look alike, explains on hover what a component prints with a worked example, and completes the components from the type of the value being formatted. Off leaves the specifier as a plain string in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.valuesets": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for a string that is really a code — an order status, a document type, a country — whose list of allowed values lives in a database table rather than in the code. Completes the literal from that list, explains on hover what the code means and where it is defined, and reports one the list does not have. Needs `valueSets` in `roslynsense.json` to have anything to do. Off leaves those literals as plain strings in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.msbuild": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for `.csproj`, `.props`, `.targets`, `packages.config` and `nuget.config`: completion for properties, target frameworks, assembly references and item paths, NuGet package and version completion, hints when a package is outdated, warnings when a pinned version has a published advisory, and go-to-definition from a `PackageReference` to the `Directory.Packages.props` line that sets its version. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.dbml": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Language features for LINQ to SQL models (`.dbml`): an outline of the model, navigation from a generated designer member to the `<Table>`, `<Column>` or `<Association>` it came from, reference counts above each of them, and a lens that refreshes a table from a configured database. Off leaves these files as plain XML in this window; other windows and connected AI chats are unaffected, and `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.appsettings": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Reference counts, navigation and completion in `appsettings*.json` and user secrets, joined to the C# that reads them — `GetSection`, indexers, `GetValue`, `Configure<T>` bindings. Off disables it for this window; `roslynsense.json` is what turns it off for the whole solution. Takes effect on reload."
+        },
+        "roslynSense.languages.webconfig": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Reference counts, navigation and hover over `<appSettings>` and `<connectionStrings>` in `web.config` and `app.config`, joined to the code that reads them — `ConfigurationManager.AppSettings[\"…\"]` in C# and `<%$ AppSettings: … %>` in WebForms markup. Off disables it for this window; `roslynsense.json` is what turns it off for the whole solution. Binding redirects in the same files are unaffected — their warnings, the fix on each one, the installed version on hover over an `<assemblyIdentity>` and the lens that brings the whole file up to date are not this pack's and stay on. Takes effect on reload."
+        },
+        "roslynSense.webforms.codeLens": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show a reference count above every server control in `.aspx`, `.ascx` and the other WebForms markup files. Off by default: markup is close to nothing but control declarations, so a count lands on almost every line and spaces the file out rather than annotating it — the same number is one gesture away on any `ID` through Find All References. Applies to every window on this solution's server."
+        },
+        "roslynSense.solutionExplorer.fileIcons": {
+          "type": "string",
+          "enum": [
+            "roslynSense",
+            "theme"
+          ],
+          "enumDescriptions": [
+            "Icons shipped with RoslynSense: a language badge for C#, F#, Visual Basic and .proto, and a glyph for everything else, so every row is the same width.",
+            "The file icon theme, the way the built-in Explorer draws files. An extension the theme has nothing for is drawn without an icon, which shifts its siblings out of line."
+          ],
+          "default": "roslynSense",
+          "description": "Where the Solution Explorer gets its file icons."
+        },
+        "roslynSense.solutionExplorer.fileNesting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nest generated and companion files under the file they belong to (Form1.Designer.cs under Form1.cs)."
+        },
+        "roslynSense.fileNesting.rules": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "markdownDescription": "Extra nesting rules, in the same shape as `explorer.fileNesting.patterns` — for example `\"*.bicep\": \"${capture}.bicepparam\"`. Only a `*.ext` parent with `${capture}`-prefixed children is honoured; anything else is ignored."
+        },
+        "roslynSense.nuget.alignPlatformPackages": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Keep platform-tracking packages (`Microsoft.Extensions.*`, `Microsoft.AspNetCore.*`, `System.*`, EF Core, …) on the release band matching the project's target framework: a net8.0 project is offered 8.x, with newer bands disclosed but not applied. Turn off to let “latest” cross into a band built for a newer .NET."
+        },
+        "roslynSense.nuget.pageSize": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 200,
+          "description": "How many packages one Browse page requests from the feeds."
+        },
+        "roslynSense.nuget.readme": {
+          "type": "string",
+          "enum": [
+            "rendered",
+            "plain",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Render the package README as formatted text.",
+            "Show the package README as plain text.",
+            "Do not fetch READMEs at all."
+          ],
+          "default": "rendered",
+          "description": "How the NuGet panel shows a package's README."
+        },
+        "roslynSense.nuget.showTransitive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show transitive dependencies in the NuGet panel's details pane."
+        },
+        "roslynSense.nuget.defaultScope": {
+          "type": "string",
+          "enum": [
+            "lastUsed",
+            "openedProject",
+            "none"
+          ],
+          "enumDescriptions": [
+            "Start with the projects that were selected last time.",
+            "Start with all projects unless the panel was opened from a project node.",
+            "Start with all projects."
+          ],
+          "default": "lastUsed",
+          "description": "Which projects the NuGet panel targets when it opens. Selecting none means all projects: Update and Uninstall then act on every project that references the package, while Install still asks you to choose. A single-project solution always selects that project."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "compile:webview": "tsc -p ./tsconfig.webview.json && tsc -p ./tsconfig.webview.search.json && tsc -p ./tsconfig.webview.settings.json && tsc -p ./tsconfig.webview.properties.json",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --main-fields=module,main --external:vscode --outfile=dist/extension.js --sourcemap",
+    "build": "npm run compile && npm run compile:webview && npm run bundle",
+    "vscode:prepublish": "npm run build",
+    "watch": "tsc -watch -p ./",
+    "dev": "npm run build && node scripts/dev.mjs",
+    "package": "vsce package",
+    "check:embedded": "node scripts/checkEmbedded.mjs",
+    "test": "npm run test:unit",
+    "test:unit": "npm run compile && node --test out/test/*.test.js",
+    "test:integration": "npm run build && node out/test/integration/run.js"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "vscode-languageclient": "^9.0.1",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.4.0"
+  }
+}

@@ -48,6 +48,13 @@ public sealed class RunToLocationRequest
 {
     public SourceRange? Location { get; set; }
     public bool Force { get; set; }
+
+    /// <summary>IL form, for locations in decompiled or fetched source that no PDB document
+    /// names: run to this MethodDef token and offset in <see cref="ModulePath"/> instead of
+    /// resolving <see cref="Location"/> through documents. 0 when unused.</summary>
+    public string ModulePath { get; set; } = "";
+    public int MethodToken { get; set; }
+    public int IlOffset { get; set; }
 }
 
 public sealed class RunToLocationResponse
@@ -62,6 +69,11 @@ public sealed class SetNextStatementRequest
 {
     public uint FrameIndex { get; set; }
     public SourceRange? Location { get; set; }
+
+    /// <summary>IL form: move the IP to this offset in the method holding it, verified to be the
+    /// selected frame's method via <see cref="MethodToken"/>. 0 when unused.</summary>
+    public int MethodToken { get; set; }
+    public int IlOffset { get; set; }
 }
 
 public sealed class SetNextStatementResponse

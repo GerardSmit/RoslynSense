@@ -3,7 +3,7 @@ using Microsoft.Data.SqlClient;
 
 namespace RoslynMCP.Services.Database;
 
-public sealed class MssqlDbProvider : DbProviderBase
+public sealed partial class MssqlDbProvider : DbProviderBase
 {
     public MssqlDbProvider(string alias, string connectionString)
         : base(alias, "mssql", ApplyDefaults(connectionString)) { }

@@ -12,8 +12,7 @@ internal static class DockerAvailability
     {
         try
         {
-            using var cfg = new DockerClientConfiguration();
-            using var client = cfg.CreateClient();
+            using var client = new DockerClientBuilder().Build();
             client.System.PingAsync().GetAwaiter().GetResult();
             // Testcontainers' PostgreSQL/MSSQL images are Linux-only; a daemon in
             // Windows-container mode will fail to pull them. Skip in that case.

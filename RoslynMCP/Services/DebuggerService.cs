@@ -209,7 +209,7 @@ internal sealed partial class DebuggerService : IDebugBackend
                 if (!_breakpoints.Values.Any(bp =>
                     bp.FilePath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) && bp.Line == line))
                 {
-                    await SetBreakpointAsync(file, line, condition: null, cancellationToken);
+                    await SetBreakpointAsync(file, line, condition: null, cancellationToken: cancellationToken);
                 }
             }
         }
@@ -303,24 +303,53 @@ internal sealed partial class DebuggerService : IDebugBackend
         return null;
     }
 
-    public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(string filePath, int line, string? condition = null, CancellationToken cancellationToken = default)
+    public async Task<(string Message, int? BreakpointId)> SetBreakpointAsync(
+        string filePath, int line, string? condition = null, string? hitCondition = null,
+        string? logMessage = null, CancellationToken cancellationToken = default)
     {
+        // hitCondition and logMessage are emulated a layer up; netcoredbg has no MI for either.
+        _ = (hitCondition, logMessage);
+
         if (_state == DebugState.NotStarted)
             return ("Error: No active debug session.", null);
 
         var normalizedPath = PathHelper.NormalizePath(filePath);
-        var escapedPath = EscapeMiString(normalizedPath);
         var conditionArg = !string.IsNullOrWhiteSpace(condition)
             ? $" -c \"{EscapeMiString(condition)}\""
             : "";
-        var response = await SendCommandAsync($"-break-insert{conditionArg} \"{escapedPath}:{line}\"", cancellationToken);
+
+        // A decompiled or fetched file names no path netcoredbg's symbol lookup knows. There is
+        // no IL-offset insert over MI, so the closest honest translations are: the path the PDB
+        // itself records for the line (embedded/Source Link — exact), or the method's name
+        // (decompiled/reference source — the entry of the method holding the line).
+        string note = "";
+        string locationArg = $"\"{EscapeMiString(normalizedPath)}:{line}\"";
+        var mapped = await ExternalSource.DebugSourceMapper.TryMapAsync(
+            normalizedPath, line, cancellationToken);
+        if (mapped is not null)
+        {
+            if (mapped.DocumentPath.Length > 0)
+            {
+                locationArg = $"\"{EscapeMiString(mapped.DocumentPath)}:{mapped.Line}\"";
+                line = mapped.Line;
+                note = $" ({mapped.Origin})";
+            }
+            else if (mapped.MethodDisplayName.Length > 0)
+            {
+                locationArg = $"\"{EscapeMiString(mapped.MethodDisplayName)}\"";
+                note = $" ({mapped.Origin}: bound at the entry of {mapped.MethodDisplayName} — " +
+                       "netcoredbg cannot target an IL offset inside it)";
+            }
+        }
+
+        var response = await SendCommandAsync($"-break-insert{conditionArg} {locationArg}", cancellationToken);
 
         var match = BreakpointInsertedRegex().Match(response);
         if (match.Success && int.TryParse(match.Groups[1].Value, out var bpNumber))
         {
             _breakpoints[bpNumber] = new BreakpointInfo(bpNumber, normalizedPath, line);
             var conditionNote = !string.IsNullOrWhiteSpace(condition) ? $" (condition: {condition})" : "";
-            return ($"Breakpoint #{bpNumber} set at {Path.GetFileName(normalizedPath)}:{line}{conditionNote}", bpNumber);
+            return ($"Breakpoint #{bpNumber} set at {Path.GetFileName(normalizedPath)}:{line}{conditionNote}{note}", bpNumber);
         }
 
         if (response.Contains("^error", StringComparison.Ordinal))
@@ -397,7 +426,7 @@ internal sealed partial class DebuggerService : IDebugBackend
 
             var value = ExtractMiField(response, "value");
             if (value is not null)
-                return UnescapeMiString(value);
+                return value;
 
             if (response.Contains("^error", StringComparison.Ordinal))
                 return $"Error: {ExtractError(response)}";
@@ -426,8 +455,7 @@ internal sealed partial class DebuggerService : IDebugBackend
         if (_state != DebugState.Stopped)
             return "Error: Debugger is not stopped.";
 
-        var response = await SendCommandAsync("-stack-list-frames", cancellationToken);
-        return FormatStackTrace(response);
+        return FormatStackTrace(await GetStackFramesAsync(cancellationToken));
     }
 
     public string GetStatus()
@@ -483,7 +511,16 @@ internal sealed partial class DebuggerService : IDebugBackend
     private static readonly string s_toolsDirectory = Path.Combine(
         Path.GetTempPath(), "RoslynMCP", "Tools");
 
-    private static async Task<string?> FindOrProvisionNetcoredbgAsync(CancellationToken cancellationToken)
+    /// <summary>True when the debugger is already on disk, so callers can decide whether to
+    /// announce a download before one happens.</summary>
+    public static bool HasCachedNetcoredbg() => GetCachedNetcoredbgPath() is not null;
+
+    /// <summary>
+    /// Locates netcoredbg — tools cache, PATH, common install locations — downloading it as a
+    /// last resort. Shared by the AI-owned MI sessions and the editor's DAP sessions, which
+    /// both drive the same binary in different interpreter modes.
+    /// </summary>
+    public static async Task<string?> FindOrProvisionNetcoredbgAsync(CancellationToken cancellationToken)
     {
         // 1. Check our tools cache first
         var cachedPath = GetCachedNetcoredbgPath();
@@ -654,7 +691,34 @@ internal sealed partial class DebuggerService : IDebugBackend
             return $"Error: netcoredbg exited immediately. {error}";
         }
 
+        await ApplyViewSettingsAsync(cancellationToken);
+
         return null;
+    }
+
+    /// <summary>
+    /// Tells netcoredbg what it can be told about the debugger attributes.
+    /// </summary>
+    /// <remarks>
+    /// Only Just My Code: netcoredbg implements <c>DebuggerDisplay</c>, <c>DebuggerTypeProxy</c>
+    /// and <c>DebuggerBrowsable</c> itself with no switch to turn them off, so those settings
+    /// govern the ICorDebug engine (.NET Framework targets) alone. Sent only when it differs from
+    /// the default, and failures are ignored — an older build answers <c>^error</c> and keeps its
+    /// own default, which is the behaviour we would fall back to anyway.
+    /// </remarks>
+    private async Task ApplyViewSettingsAsync(CancellationToken cancellationToken)
+    {
+        if (Config.DebuggerViewOptions.Current.JustMyCode)
+            return;
+
+        try
+        {
+            await SendCommandAsync("-gdb-set just-my-code 0", cancellationToken);
+        }
+        catch
+        {
+            // Best effort: the session is usable either way.
+        }
     }
 
     private async Task ReadOutputLoop(CancellationToken cancellationToken)
@@ -721,6 +785,10 @@ internal sealed partial class DebuggerService : IDebugBackend
             else if (parseLine.StartsWith("*stopped", StringComparison.Ordinal))
             {
                 _currentFrame = ParseStoppedFrame(parseLine);
+                // Variable references name objects that only exist for this stop; carrying them
+                // over would answer an expansion with a different object's fields.
+                _handles.Reset();
+                _selectedFrame = 0;
                 // Distinguish exit from actual stop
                 var reason = ExtractMiField(parseLine, "reason");
                 _state = reason is "exited" or "exited-normally" or "exited-signalled"
@@ -845,7 +913,7 @@ internal sealed partial class DebuggerService : IDebugBackend
                 lock (_outputLock) { frame = _currentFrame; }
 
                 if (_state == DebugState.Stopped && frame is not null)
-                    return FormatCurrentPosition(frame);
+                    return FormatCurrentPosition(await EnrichStoppedFrameAsync(frame, cancellationToken));
 
                 if (_state == DebugState.Exited)
                     return "⏹ Test execution completed without hitting a breakpoint.";
@@ -875,7 +943,7 @@ internal sealed partial class DebuggerService : IDebugBackend
             StoppedFrame? frame;
             lock (_outputLock) { frame = _currentFrame; }
             if (_state == DebugState.Stopped && frame is not null)
-                return FormatCurrentPosition(frame);
+                return FormatCurrentPosition(await EnrichStoppedFrameAsync(frame, cancellationToken));
         }
 
         // Otherwise, set state to stopped so the user can interact
@@ -916,12 +984,66 @@ internal sealed partial class DebuggerService : IDebugBackend
         StoppedFrame? frame;
         lock (_outputLock) frame = _currentFrame;
         if (_state == DebugState.Stopped && frame is not null)
-            return FormatCurrentPosition(frame);
+            return FormatCurrentPosition(await EnrichStoppedFrameAsync(frame, cancellationToken));
 
         if (_state == DebugState.Exited)
             return "⏹ Program has exited.";
 
         return "Debugger stopped.";
+    }
+
+    /// <summary>
+    /// A stop with no source — external code, Just My Code off — resolved to the source the
+    /// frame's module can yield: the PDB's own document, the reference source, or a
+    /// decompilation. The stored current frame is updated too, so the editor's fallback frame
+    /// and the status surface agree with what the step just printed.
+    /// </summary>
+    private async Task<StoppedFrame> EnrichStoppedFrameAsync(
+        StoppedFrame frame, CancellationToken cancellationToken)
+    {
+        if (frame.FilePath.Length > 0 || frame.MethodToken == 0
+            || frame.ModuleId.Length == 0 || frame.IlOffset < 0)
+        {
+            return frame;
+        }
+
+        try
+        {
+            if (ModulePathForId(frame.ModuleId) is null)
+                await RefreshModuleMapAsync(cancellationToken);
+
+            if (ModulePathForId(frame.ModuleId) is not { } modulePath)
+                return frame;
+
+            var resolved = await ExternalSource.DebugFrameSource.TryResolveAsync(
+                modulePath, frame.MethodToken, frame.IlOffset, allowDecompile: true,
+                cancellationToken);
+            if (resolved is null)
+                return frame;
+
+            var enriched = frame with
+            {
+                FilePath = resolved.FilePath,
+                Line = resolved.Line,
+                SourceOrigin = resolved.Origin,
+            };
+
+            lock (_outputLock)
+            {
+                if (ReferenceEquals(_currentFrame, frame))
+                    _currentFrame = enriched;
+            }
+
+            return enriched;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            ServiceLog.Warn(
+                $"Could not resolve external source for the stop location: {ex.Message}",
+                key: "debug-stop-source");
+            return frame;
+        }
     }
 
     private static string FormatCurrentPosition(StoppedFrame frame)
@@ -940,7 +1062,8 @@ internal sealed partial class DebuggerService : IDebugBackend
         };
 
         sb.AppendLine(reasonText);
-        sb.AppendLine($"📍 {frame.Function} at {Path.GetFileName(frame.FilePath)}:{frame.Line}");
+        var origin = frame.SourceOrigin.Length > 0 ? $" ({frame.SourceOrigin})" : "";
+        sb.AppendLine($"📍 {frame.Function} at {Path.GetFileName(frame.FilePath)}:{frame.Line}{origin}");
 
         // Show code context if file exists
         if (!string.IsNullOrEmpty(frame.FilePath) && File.Exists(frame.FilePath))
@@ -978,7 +1101,41 @@ internal sealed partial class DebuggerService : IDebugBackend
         var bpNoStr = ExtractMiField(line, "bkptno") ?? "0";
         int.TryParse(bpNoStr, out var bpNo);
 
-        return new StoppedFrame(reason, func, file, lineNum, bpNo);
+        var (moduleId, methodToken, ilOffset) = ParseClrAddress(line);
+
+        return new StoppedFrame(
+            reason, func, file, lineNum, bpNo,
+            ExceptionName: ExtractMiField(line, "exception-name"),
+            ExceptionMessage: ExtractMiField(line, "exception"),
+            ExceptionStage: ExtractMiField(line, "exception-stage"),
+            ModuleId: moduleId,
+            MethodToken: methodToken,
+            IlOffset: ilOffset);
+    }
+
+    /// <summary>
+    /// The <c>clr-addr={module-id=...,method-token=...,il-offset=...}</c> block netcoredbg puts
+    /// on managed frames — the identity external-source resolution needs when the frame has no
+    /// file.
+    /// </summary>
+    internal static (string ModuleId, int MethodToken, int IlOffset) ParseClrAddress(string text)
+    {
+        string moduleId = ExtractMiField(text, "module-id")?.Trim('{', '}') ?? "";
+
+        int methodToken = 0;
+        if (ExtractMiField(text, "method-token") is { Length: > 0 } tokenText)
+        {
+            string digits = tokenText.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                ? tokenText[2..]
+                : tokenText;
+            int.TryParse(digits, System.Globalization.NumberStyles.HexNumber, null, out methodToken);
+        }
+
+        int ilOffset = -1;
+        if (ExtractMiField(text, "il-offset") is { Length: > 0 } offsetText)
+            int.TryParse(offsetText, out ilOffset);
+
+        return (moduleId, methodToken, ilOffset);
     }
 
     internal static string FormatLocals(string response)
@@ -986,46 +1143,17 @@ internal sealed partial class DebuggerService : IDebugBackend
         if (response.Contains("^error", StringComparison.Ordinal))
             return $"Error: {ExtractError(response)}";
 
+        // netcoredbg's -stack-list-variables answers with variables=[]; plain MI uses locals=[].
+        if (!response.Contains("variables=[", StringComparison.Ordinal) &&
+            !response.Contains("locals=[", StringComparison.Ordinal))
+        {
+            return "No local variables.";
+        }
+
         var sb = new StringBuilder();
         sb.AppendLine("**Local Variables:**");
-
-        // Parse locals=[...] or variables=[...] (netcoredbg uses -stack-list-variables)
-        var localsStart = response.IndexOf("variables=[", StringComparison.Ordinal);
-        if (localsStart >= 0)
-            localsStart += 11; // "variables=[".Length
-        else
-        {
-            localsStart = response.IndexOf("locals=[", StringComparison.Ordinal);
-            if (localsStart >= 0)
-                localsStart += 8; // "locals=[".Length
-        }
-
-        if (localsStart < 0)
-            return "No local variables.";
-
-        var content = response[localsStart..];
-        var depth = 0;
-        var current = new StringBuilder();
-
-        foreach (var ch in content)
-        {
-            if (ch == '{') { depth++; current.Clear(); continue; }
-            if (ch == '}')
-            {
-                depth--;
-                if (depth <= 0)
-                {
-                    // Parse the name/value from current
-                    var entry = current.ToString();
-                    var entryName = ExtractMiField(entry, "name") ?? "?";
-                    var entryValue = ExtractMiField(entry, "value") ?? "?";
-                    if (entryName is not "?" and not "")
-                        sb.AppendLine($"  {entryName} = {UnescapeMiString(entryValue)}");
-                }
-                continue;
-            }
-            if (depth > 0) current.Append(ch);
-        }
+        foreach (var (name, value) in ParseNameValueList(response))
+            sb.AppendLine($"  {name} = {value}");
 
         return sb.ToString();
     }
@@ -1035,46 +1163,37 @@ internal sealed partial class DebuggerService : IDebugBackend
         if (response.Contains("^error", StringComparison.Ordinal))
             return $"Error: {ExtractError(response)}";
 
+        return FormatStackTrace(ParseStackFrames(response));
+    }
+
+    internal static string FormatStackTrace(IReadOnlyList<Debugging.StackFrameInfo> frames)
+    {
         var sb = new StringBuilder();
         sb.AppendLine("**Call Stack:**");
 
-        // Parse stack=[frame={level="0",func="...",file="...",line="..."},...]
-        var framePattern = StackFrameRegex();
-        var matches = framePattern.Matches(response);
         var skippedCount = 0;
 
-        foreach (Match match in matches)
+        foreach (var frame in frames)
         {
-            var content = match.Groups[1].Value;
-            var level = ExtractMiField(content, "level") ?? "?";
-            var func = ExtractMiField(content, "func") ?? "";
-            var file = ExtractMiField(content, "file") ?? "";
-            var line = ExtractMiField(content, "line") ?? "?";
-
-            // Skip frames with no useful information (no function name and no file)
-            if (string.IsNullOrEmpty(func) && string.IsNullOrEmpty(file))
+            // Frames with nothing to say, and runtime transitions, collapse into a count. A frame
+            // whose source was resolved externally has plenty to say and stays visible.
+            if (frame.IsExternal && frame.FilePath.Length == 0)
             {
                 skippedCount++;
                 continue;
             }
 
-            // Collapse native/framework transition frames
-            if (func is "[Native Frames]")
-            {
-                skippedCount++;
-                continue;
-            }
-
-            // Flush skipped frame counter
             if (skippedCount > 0)
             {
                 sb.AppendLine($"  ... ({skippedCount} framework frame{(skippedCount == 1 ? "" : "s")})");
                 skippedCount = 0;
             }
 
-            var funcDisplay = string.IsNullOrEmpty(func) ? "unknown" : func;
-            var fileDisplay = string.IsNullOrEmpty(file) ? "" : $" at {Path.GetFileName(file.Replace('\\', '/'))}:{line}";
-            sb.AppendLine($"  #{level} {funcDisplay}{fileDisplay}");
+            var fileDisplay = string.IsNullOrEmpty(frame.FilePath)
+                ? ""
+                : $" at {Path.GetFileName(frame.FilePath.Replace('\\', '/'))}:{frame.Line}";
+            var origin = frame.SourceOrigin.Length > 0 ? $" ({frame.SourceOrigin})" : "";
+            sb.AppendLine($"  #{frame.Id} {frame.Name}{fileDisplay}{origin}");
         }
 
         if (skippedCount > 0)
@@ -1094,7 +1213,21 @@ internal sealed partial class DebuggerService : IDebugBackend
         var escaped = false;
         for (var i = start; i < text.Length; i++)
         {
-            if (escaped) { sb.Append(text[i]); escaped = false; continue; }
+            if (escaped)
+            {
+                // Translate the escape rather than merely dropping the backslash: a Windows path
+                // read as a control character, or a newline read as the letter n, is a value the
+                // caller cannot tell apart from one the target really holds.
+                sb.Append(text[i] switch
+                {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    var other => other,
+                });
+                escaped = false;
+                continue;
+            }
             if (text[i] == '\\') { escaped = true; continue; }
             if (text[i] == '"') break;
             sb.Append(text[i]);
@@ -1223,5 +1356,28 @@ internal sealed partial class DebuggerService : IDebugBackend
     }
 
     public sealed record BreakpointInfo(int Id, string FilePath, int Line);
-    public sealed record StoppedFrame(string Reason, string Function, string FilePath, int Line, int BreakpointNumber);
+    /// <param name="ModuleId">The MVID of the module the stop is in, when the engine said —
+    /// what external-source resolution keys on for a frame with no <paramref name="FilePath"/>.</param>
+    /// <param name="MethodToken">The stopped method's MethodDef token; 0 when unknown.</param>
+    /// <param name="IlOffset">The IP within that method's IL; -1 when unknown.</param>
+    /// <param name="SourceOrigin">Set when <paramref name="FilePath"/> was resolved from
+    /// external source rather than reported by the engine: <c>embedded</c>, <c>source link</c>,
+    /// <c>reference source</c> or <c>decompiled</c>.</param>
+    /// <param name="ThreadId">The OS id of the thread the stop landed on; 0 when the engine does
+    /// not distinguish threads. Everything the stop can be asked about — locals, evaluation,
+    /// stepping — is this thread's, so a client that shows several has to be told which.</param>
+    public sealed record StoppedFrame(
+        string Reason,
+        string Function,
+        string FilePath,
+        int Line,
+        int BreakpointNumber,
+        string? ExceptionName = null,
+        string? ExceptionMessage = null,
+        string? ExceptionStage = null,
+        string ModuleId = "",
+        int MethodToken = 0,
+        int IlOffset = -1,
+        string SourceOrigin = "",
+        int ThreadId = 0);
 }

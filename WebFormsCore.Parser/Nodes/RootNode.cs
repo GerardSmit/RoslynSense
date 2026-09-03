@@ -14,7 +14,16 @@ using TokenType = WebFormsCore.Models.TokenType;
 
 namespace WebFormsCore.Nodes;
 
-public record IncludeFile(string Path, string Hash);
+/// <summary>
+/// A file inlined by a server-side <c><!--#include --></c> directive during the parse.
+/// </summary>
+/// <param name="Path">The path relative to the root directory when one was given, otherwise the
+/// path as written in the directive.</param>
+/// <param name="FullPath">The resolved absolute path of the include target.</param>
+/// <param name="Hash">Content hash of the text that was inlined, or <c>null</c> when the target
+/// could not be read — recorded anyway so a consumer can tell "missing then created" apart from
+/// "unchanged".</param>
+public record IncludeFile(string Path, string FullPath, string? Hash);
 
 public class RootNode : ContainerNode
 {
@@ -92,6 +101,16 @@ public class RootNode : ContainerNode
 
     public List<string> Namespaces { get; set; } = new();
 
+    /// <summary>Tag prefix → the namespaces it resolves against. Kept off the parser so
+    /// completion can offer the prefixes and tag names this file actually has in scope.</summary>
+    public IReadOnlyDictionary<string, List<string>> TagPrefixes { get; set; } =
+        new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>User-control registrations reachable from this file: prefix + tag name → the
+    /// generated type and the <c>.ascx</c> it came from.</summary>
+    public IReadOnlyDictionary<ControlKey, (string Type, string Path)> RegisteredControls { get; set; } =
+        new Dictionary<ControlKey, (string Type, string Path)>();
+
     public List<IncludeFile> IncludeFiles { get; set; } = new();
 
     public List<TokenString> ScriptBlocks { get; set; } = new();
@@ -107,7 +126,8 @@ public class RootNode : ContainerNode
         bool addFields = true,
         string? relativePath = null,
         string? rootDirectory = null,
-        bool generateHash = true)
+        bool generateHash = true,
+        Func<string, string?>? readFile = null)
     {
         if (text == null)
         {
@@ -116,7 +136,7 @@ public class RootNode : ContainerNode
         }
 
         var lexer = new Lexer(fullPath, text.AsSpan());
-        var parser = new Parser(compilation, rootNamespace, addFields, rootDirectory);
+        var parser = new Parser(compilation, rootNamespace, addFields, rootDirectory, readFile);
 
         if (namespaces != null)
         {
@@ -142,6 +162,8 @@ public class RootNode : ContainerNode
             }
         }
 
+        parser.Root.TagPrefixes = parser.TagPrefixes;
+        parser.Root.RegisteredControls = parser.RegisteredControls;
         parser.Root.Path = fullPath;
         parser.Root.RelativePath = relativePath;
         parser.Root.ClassName = Regex.Replace(relativePath, "[^a-zA-Z0-9_]+", "_");
@@ -283,6 +305,61 @@ public class RootNode : ContainerNode
                     if (tagPrefix != null && namespaceName != null)
                     {
                         namespaces.Add(new KeyValuePair<string, string>(tagPrefix, namespaceName));
+                    }
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // TODO: Diagnostic
+        }
+
+        return namespaces.ToImmutableArray();
+    }
+
+    /// <summary>
+    /// Reads the implicit page imports from a web.config:
+    /// <c>&lt;system.web&gt;&lt;pages&gt;&lt;namespaces&gt;&lt;add namespace="..."/&gt;</c>.
+    /// The runtime makes these visible to inline code on every page, the way an
+    /// <c>@Import</c> directive would. <c>&lt;remove&gt;</c> and <c>&lt;clear&gt;</c> are honored
+    /// against the entries collected so far; machine-level inheritance is not modeled.
+    /// </summary>
+    public static ImmutableArray<string> GetPageNamespaces(string? webConfigText)
+    {
+        if (string.IsNullOrEmpty(webConfigText))
+        {
+            return default;
+        }
+
+        var namespaces = new List<string>();
+
+        try
+        {
+            var section = XElement.Parse(webConfigText)
+                .Descendants("system.web").FirstOrDefault()
+                ?.Descendants("pages").FirstOrDefault()
+                ?.Descendants("namespaces").FirstOrDefault();
+
+            if (section != null)
+            {
+                foreach (var element in section.Elements())
+                {
+                    switch (element.Name.LocalName)
+                    {
+                        case "add" when element.Attribute("namespace")?.Value is { Length: > 0 } added:
+                            if (!namespaces.Contains(added))
+                            {
+                                namespaces.Add(added);
+                            }
+                            break;
+
+                        case "remove" when element.Attribute("namespace")?.Value is { } removed:
+                            namespaces.Remove(removed);
+                            break;
+
+                        case "clear":
+                            namespaces.Clear();
+                            break;
                     }
                 }
             }

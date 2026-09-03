@@ -21,7 +21,8 @@ public sealed class AppRunService(AppSessionStore store)
         string configuration,
         string? launchProfile,
         IReadOnlyDictionary<string, string>? environment,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool hotReload = false)
     {
         var spec = RunConfigResolver.Resolve(projectPath, configuration, launchProfile, environment);
         if (!spec.CanRun)
@@ -52,6 +53,21 @@ public sealed class AppRunService(AppSessionStore store)
         foreach (var pair in spec.Environment)
             startInfo.Environment[pair.Key] = pair.Value;
 
+        // A profile that turns hot reload off means it: the app is expected to run without the
+        // startup hook, and injecting one anyway changes what is being tested.
+        bool wantsHotReload =
+            hotReload && spec.HotReloadEnabled != false &&
+            spec.DebugRuntime != DebugRuntime.NetFramework;
+
+        // The daemon's agent server, not this process's: an app has one owner for the rest of its
+        // life, and the daemon is the only one both the editor and every chat can reach.
+        string? agentPipe = wantsHotReload
+            ? await HotReload.HotReloadRouting.SharedPipeNameAsync(spec.ProjectPath, cancellationToken)
+            : null;
+
+        bool hotReloadInjected =
+            wantsHotReload && HotReload.HotReloadLauncher.Inject(startInfo, agentPipe);
+
         var session = new AppSession
         {
             Id = store.NextId(spec.Kind),
@@ -70,6 +86,7 @@ public sealed class AppRunService(AppSessionStore store)
         {
             try { session.MarkExited(session.Process.ExitCode); }
             catch { session.MarkExited(null); }
+            RunningProcessRegistry.Unregister(session);
         };
 
         try
@@ -85,6 +102,44 @@ public sealed class AppRunService(AppSessionStore store)
         }
 
         store.Add(session);
+        RunningProcessRegistry.Register(session);
+
+        if (hotReloadInjected)
+        {
+            // The edit session opens now, not at the first apply: this is the one moment the
+            // built output provably matches the source, so the baseline is captured before the
+            // user edits. A session opened lazily inside the apply would take the already-edited
+            // source as its baseline and report the edit as "no changes to apply".
+            try
+            {
+                // In the process that owns the agent — the daemon when there is one, so that the
+                // session and the connection it applies through are never in different processes.
+                if (agentPipe is not null)
+                {
+                    session.HotReloadOpen =
+                        await HotReload.HotReloadRouting.StartSessionAsync(spec.ProjectPath, cancellationToken)
+                            is not null;
+                }
+                else
+                {
+                    var (opened, _) = await HotReload.HotReloadService.StartAsync(
+                        spec.ProjectPath, cancellationToken);
+                    session.HotReloadOpen = opened is not null;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                session.Append($"[roslyn-sense] Hot reload session did not open: {ex.Message}");
+            }
+        }
+        else if (hotReload)
+        {
+            session.Append(
+                "[roslyn-sense] Hot reload was requested but is not available: " +
+                (spec.DebugRuntime == DebugRuntime.NetFramework
+                    ? "on .NET Framework, edits apply through a debug session instead."
+                    : "the hot reload agent was not found beside the tool."));
+        }
 
         if (spec.Port is { } listenPort)
         {
@@ -138,6 +193,7 @@ public sealed class AppRunService(AppSessionStore store)
 
         await BuildProcessHelper.KillAndDrainAsync(session.Process);
         session.MarkStopped();
+        RunningProcessRegistry.Unregister(session);
         return true;
     }
 }

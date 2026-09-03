@@ -8,9 +8,8 @@ using RoslynMCP.Services;
 using RoslynMCP.Services.Database;
 using RoslynMCP.Services.Designers;
 using RoslynMCP.Services.Run;
-using RoslynMCP.Tools; // IFindUsagesHandler, IGoToDefinitionHandler, etc.
-using RoslynMCP.Tools.Razor;
-using RoslynMCP.Tools.WebForms;
+using RoslynMCP.Tools;
+using RoslynMCP.Languages;
 
 namespace RoslynMCP;
 
@@ -28,6 +27,16 @@ namespace RoslynMCP;
 /// </summary>
 internal static class CliRunner
 {
+    /// <summary>
+    /// Whether this process is a one-shot CLI invocation rather than a long-lived MCP session.
+    /// </summary>
+    /// <remarks>
+    /// Tools that start something meant to outlive the call — a web app, a debug session — have
+    /// to know: everything launched dies with this process, so promising a handle to stop later
+    /// would be a lie.
+    /// </remarks>
+    public static bool IsOneShot { get; private set; }
+
     // DI-injected parameter types that the runner provides automatically.
     private static readonly HashSet<Type> s_diTypes =
     [
@@ -54,6 +63,8 @@ internal static class CliRunner
 
     public static async Task<int> RunAsync(string[] args)
     {
+        IsOneShot = true;
+
         // --cli --help  →  list all tools
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
@@ -61,12 +72,38 @@ internal static class CliRunner
             return 0;
         }
 
+        // The MEF composition every workspace needs, started while the flags are still being
+        // parsed. A one-shot invocation has no earlier moment to hide it in, and paying it inline
+        // puts it squarely in front of whatever the tool was asked to do. MSBuild registration —
+        // WorkspaceService's static initializer — goes to a second thread of its own: the
+        // composition doesn't need it, the flag parsing doesn't either, and the barrier before
+        // the tool invocation below is what everything that does need it waits behind.
+        HostComposition.WarmInBackground();
+        var msbuildRegistration = Task.Run(WorkspaceService.EnsureRegistered);
+        RunwayTrace.Mark("CLI entry");
+
         var toolName = args[0];
 
         // --cli find_usages --help  →  show tool usage
         bool wantHelp = args.Any(a => a is "-h" or "--help");
 
-        var method = FindToolMethod(toolName);
+        // The reflection scan over the tool classes costs real time on a one-shot start, and
+        // nothing the config/settings plumbing does depends on which tool was named — so the
+        // lookup runs beside it.
+        var methodTask = Task.Run(() => FindToolMethod(toolName));
+
+        var parsed = ParseFlags(args[1..]);
+
+        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
+        if (configError is not null)
+            Console.Error.WriteLine($"Warning: {configError}");
+
+        RunwayTrace.Mark("config loaded");
+        var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
+        RunwayTrace.Mark("settings resolved");
+
+        var method = await methodTask;
+        RunwayTrace.Mark("tool resolved");
         if (method is null)
         {
             Console.Error.WriteLine($"Unknown tool '{toolName}'. Run 'roslyn-sense --cli --help' to list available tools.");
@@ -78,22 +115,18 @@ internal static class CliRunner
             PrintToolHelp(method);
             return 0;
         }
-
-        var parsed = ParseFlags(args[1..]);
-
-        var (config, configPath, configError) = RoslynSenseConfigLoader.Load(Directory.GetCurrentDirectory());
-        if (configError is not null)
-            Console.Error.WriteLine($"Warning: roslynsense.json ({configPath}): {configError}");
-
-        var settings = EffectiveSettings.Resolve(args, config, out var settingsWarnings);
         foreach (var w in settingsWarnings)
             Console.Error.WriteLine($"Warning: {w}");
+        DebuggerViewOptions.Current = settings.DebugView;
+        DebugEngineOptions.CoreClr = settings.CoreClrEngine;
 
         bool useToon = string.Equals(settings.TableFormat, "toon", StringComparison.OrdinalIgnoreCase);
         var fmt = useToon ? (IOutputFormatter)new ToonFormatter() : new MarkdownFormatter();
 
         var dbProviders = settings.ExplicitDbProviders;
-        if (settings.Database && settings.ShouldRunAutoDiscovery())
+        bool wantsDb = method.GetParameters()
+            .Any(p => p.ParameterType == typeof(DbConnectionRegistry));
+        if (wantsDb && settings.Database && settings.ShouldRunAutoDiscovery())
         {
             var auto = AutoConnectionStringDiscovery.Discover(Directory.GetCurrentDirectory(), out _);
             var existing = new HashSet<string>(dbProviders.Select(p => p.Alias), StringComparer.OrdinalIgnoreCase);
@@ -110,7 +143,13 @@ internal static class CliRunner
 
         try
         {
-            var result = await InvokeAsync(method, parsed, fmt, dbRegistry, cts.Token);
+            // The barrier for the registration started at entry: no tool may touch an MSBuild
+            // type before the locator hook is in place, so the plumbing above ran alongside it
+            // and the invocation waits for it.
+            await msbuildRegistration;
+            RunwayTrace.Mark("MSBuild registered");
+
+            var result = await InvokeAsync(method, parsed, fmt, dbRegistry, settings, cts.Token);
             Console.WriteLine(result);
             return 0;
         }
@@ -138,8 +177,11 @@ internal static class CliRunner
     private static IReadOnlyList<MethodInfo>? s_allTools;
 
     private static IReadOnlyList<MethodInfo> AllTools =>
+        // Exported types only: every tool class is public by construction (the MCP server finds
+        // them the same way), while GetTypes() would also load the far larger internal half of
+        // the assembly — measurable time on a one-shot CLI start that resolves exactly one tool.
         s_allTools ??= typeof(FindUsagesTool).Assembly
-            .GetTypes()
+            .GetExportedTypes()
             .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
             .Where(m => m.GetCustomAttribute<McpServerToolAttribute>() is not null)
             .OrderBy(m => ToolCommandName(m))
@@ -170,14 +212,11 @@ internal static class CliRunner
 
     private static async Task<string> InvokeAsync(
         MethodInfo method, Dictionary<string, string> parsed,
-        IOutputFormatter fmt, DbConnectionRegistry dbRegistry, CancellationToken ct)
+        IOutputFormatter fmt, DbConnectionRegistry dbRegistry, EffectiveSettings settings,
+        CancellationToken ct)
     {
-        // Build lazily — only create handler instances we actually need
-        IFindUsagesHandler[]? findUsagesHandlers = null;
-        IGoToDefinitionHandler[]? goToDefHandlers = null;
-        IOutlineHandler[]? outlineHandlers = null;
-        IRenameHandler[]? renameHandlers = null;
-        IDiagnosticsHandler[]? diagnosticsHandlers = null;
+        // Build lazily — only create the language packs we actually need
+        LanguageRegistry? languages = null;
         BackgroundTaskStore? taskStore = null;
         BuildWarningsStore? warningsStore = null;
         ProfilingSessionStore? profilingStore = null;
@@ -226,7 +265,7 @@ internal static class CliRunner
             }
             if (pt == typeof(DesignerRegenerationService))
             {
-                values[i] = designerService ??= CreateDesignerService();
+                values[i] = designerService ??= CreateDesignerService(settings);
                 continue;
             }
             if (pt == typeof(AppSessionStore))
@@ -243,32 +282,32 @@ internal static class CliRunner
             {
                 // A CLI invocation is a single shot, so watching would never observe a change.
                 values[i] = solutionSession ??= new SolutionSessionService(
-                    designerService ??= CreateDesignerService());
+                    designerService ??= CreateDesignerService(settings));
                 continue;
             }
             if (pt == typeof(IEnumerable<IFindUsagesHandler>))
             {
-                values[i] = findUsagesHandlers ??= [new AspxFindUsages(fmt)];
+                values[i] = Languages(ref languages, settings, fmt).FindUsagesHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IGoToDefinitionHandler>))
             {
-                values[i] = goToDefHandlers ??= [new AspxGoToDefinition(fmt), new RazorGoToDefinition(fmt)];
+                values[i] = Languages(ref languages, settings, fmt).GoToDefinitionHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IOutlineHandler>))
             {
-                values[i] = outlineHandlers ??= [new AspxOutline(), new RazorOutline()];
+                values[i] = Languages(ref languages, settings, fmt).OutlineHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IRenameHandler>))
             {
-                values[i] = renameHandlers ??= [new AspxRename(), new RazorRename()];
+                values[i] = Languages(ref languages, settings, fmt).RenameHandlers;
                 continue;
             }
             if (pt == typeof(IEnumerable<IDiagnosticsHandler>))
             {
-                values[i] = diagnosticsHandlers ??= [new AspxDiagnostics(), new RazorDiagnostics()];
+                values[i] = Languages(ref languages, settings, fmt).DiagnosticsHandlers;
                 continue;
             }
             if (pt == typeof(DbConnectionRegistry))
@@ -486,8 +525,26 @@ internal static class CliRunner
         return t.Name;
     }
 
-    private static DesignerRegenerationService CreateDesignerService() =>
-        new([new AspxDesignerGenerator(), new DbmlDesignerGenerator()]);
+    /// <summary>
+    /// The designer generators enabled for this invocation. The aspx one is gated the same way the
+    /// MCP server and the shared host gate it, so <c>--no-webforms</c> means the same thing on every
+    /// entry point: nobody rewrites a <c>.designer.cs</c> behind the user's back.
+    /// </summary>
+    internal static DesignerRegenerationService CreateDesignerService(EffectiveSettings settings)
+    {
+        var generators = new List<IDesignerGenerator> { new DbmlDesignerGenerator() };
+        if (settings.WebForms)
+            generators.Add(new AspxDesignerGenerator());
+        return new DesignerRegenerationService(generators);
+    }
+
+    /// <summary>
+    /// The language packs enabled for this invocation, built once. The CLI has no container, so
+    /// the registry is constructed directly rather than resolved — same gate, same order.
+    /// </summary>
+    private static LanguageRegistry Languages(
+        ref LanguageRegistry? cached, EffectiveSettings settings, IOutputFormatter fmt) =>
+        cached ??= new LanguageRegistry(LanguagePackRegistration.Create(settings, fmt)).Publish();
 
     // -------------------------------------------------------------------------
     // Naming helpers

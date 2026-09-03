@@ -1,0 +1,10 @@
+src/**
+tsconfig*.json
+node_modules/**
+out/**
+!out/webview/
+!out/webview/*.js
+**/*.map
+.gitignore
+scripts/**
+.vscode-test/**

@@ -171,6 +171,27 @@ public static class AutoConnectionStringDiscovery
         }
     }
 
+    /// <summary>
+    /// Whether <paramref name="fullPath"/> sits inside a directory the discovery scan skips
+    /// (bin, obj, .git, ...) relative to <paramref name="root"/>. Used by the file watcher so
+    /// a build copying appsettings.json into bin/ does not count as a config change.
+    /// </summary>
+    internal static bool IsUnderIgnoredDirectory(string root, string fullPath)
+    {
+        string rel;
+        try { rel = Path.GetRelativePath(root, Path.GetDirectoryName(fullPath) ?? fullPath); }
+        catch { return false; }
+
+        foreach (var segment in rel.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+        {
+            if (segment.Length == 0 || segment == ".") continue;
+            if (segment == "..") return true; // outside the scanned tree — not a discovery source
+            if (s_skipDirs.Contains(segment)) return true;
+            if (segment[0] == '.') return true;
+        }
+        return false;
+    }
+
     internal static bool IsConfigFile(string fileName)
     {
         var (matched, env) = ClassifyConfigFile(fileName);

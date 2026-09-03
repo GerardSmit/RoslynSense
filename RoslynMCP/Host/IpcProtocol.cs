@@ -9,7 +9,7 @@ internal sealed record DaemonRequest(
     string Tool,
     Dictionary<string, string> Args,
     string Format,
-    string Kind = "tool"); // "tool" | "resource"
+    string Kind = "tool"); // "tool" | "resource" | "lsp" (handshake: connection becomes a raw duplex LSP stream)
 
 /// <summary>The result of a forwarded tool invocation.</summary>
 internal sealed record DaemonResponse(

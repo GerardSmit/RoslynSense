@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Xml;
+using Microsoft.Language.Xml;
 using Microsoft.CodeAnalysis;
 
 namespace RoslynMCP.Services;
@@ -59,42 +61,242 @@ internal static partial class SymbolFormatter
     }
 
     /// <summary>
-    /// Extracts a named section from XML documentation comments.
-    /// Cleans up &lt;see cref="..."/&gt; and &lt;paramref name="..."/&gt; tags.
+    /// Extracts a named section from XML documentation comments, rendered as markdown prose:
+    /// &lt;see cref="..."/&gt; and the other reference tags become code spans naming the symbol
+    /// the way it is written in C#.
     /// </summary>
-    internal static string? ExtractXmlDocSection(string xmlDoc, string sectionName)
+    /// <param name="compilation">
+    /// The compilation the crefs are resolved against. Without one a cref can only be cleaned up
+    /// textually, which gets the name right but not its type parameters.
+    /// </param>
+    internal static string? ExtractXmlDocSection(
+        string xmlDoc, string sectionName, Compilation? compilation = null)
     {
         var match = Regex.Match(
             xmlDoc, $@"<{sectionName}>(.*?)</{sectionName}>",
             RegexOptions.Singleline);
         if (!match.Success) return null;
 
-        var text = match.Groups[1].Value;
-        text = SeeCrefRegex().Replace(text, "$1");
-        text = ParamrefRegex().Replace(text, "`$1`");
-        text = XmlTagRegex().Replace(text, "");
-        text = WhitespaceRunRegex().Replace(text, " ");
-        return text.Trim();
+        return RenderDocFragment(match.Groups[1].Value, compilation);
     }
 
     /// <summary>
     /// Extracts parameter documentation from XML docs.
     /// </summary>
-    internal static List<(string Name, string Description)> ExtractXmlDocParams(string xmlDoc)
+    internal static List<(string Name, string Description)> ExtractXmlDocParams(
+        string xmlDoc, Compilation? compilation = null)
     {
         var results = new List<(string, string)>();
         var matches = ParamDocRegex().Matches(xmlDoc);
 
         foreach (Match match in matches)
-        {
-            var name = match.Groups[1].Value;
-            var desc = match.Groups[2].Value;
-            desc = XmlTagRegex().Replace(desc, "");
-            desc = WhitespaceRunRegex().Replace(desc, " ");
-            results.Add((name, desc.Trim()));
-        }
+            results.Add((match.Groups[1].Value, RenderDocFragment(match.Groups[2].Value, compilation)));
 
         return results;
+    }
+
+    /// <summary>
+    /// The body of one documentation section as a single markdown paragraph.
+    /// </summary>
+    /// <remarks>
+    /// Parsed rather than pattern-matched, because the tags nest and their order matters: a cref
+    /// renders to <c>Dictionary&lt;TKey, TValue&gt;</c>, and stripping "the remaining tags" after
+    /// that would eat the type argument list. The doc comment Roslyn hands back is well-formed
+    /// XML; anything else — a hand-written comment the compiler already warned about — falls back
+    /// to the textual clean-up, which cannot go wrong on malformed input because it never parses.
+    /// </remarks>
+    private static string RenderDocFragment(string inner, Compilation? compilation)
+    {
+        var document = Parser.ParseText($"<doc>{inner}</doc>");
+
+        // The parse never throws, so the fallback is chosen rather than caught. A comment with a
+        // stray angle bracket in it parses into something, and that something is not what the
+        // author wrote — the regex clean-up at least leaves their words intact.
+        if (!document.ContainsDiagnostics && document.RootSyntax is { } root)
+        {
+            var sb = new StringBuilder();
+            RenderDocNodes(root, sb, compilation);
+            return WhitespaceRunRegex().Replace(sb.ToString(), " ").Trim();
+        }
+
+        var text = SeeCrefRegex().Replace(inner, m => CodeSpan(CrefText(m.Groups[1].Value, compilation)));
+        text = ParamrefRegex().Replace(text, "`$1`");
+        text = XmlTagRegex().Replace(text, "");
+        return WhitespaceRunRegex().Replace(text, " ").Trim();
+    }
+
+    /// <remarks>
+    /// Anything that is not an element is prose, and prose is taken as written: entity references
+    /// and CDATA are what an author reaches for to put an angle bracket in a sentence, and both
+    /// decode back to the sentence they meant. Comments are the one thing dropped — they are notes
+    /// to the next author, not documentation for the reader.
+    /// </remarks>
+    private static void RenderDocNodes(
+        XmlElementBaseSyntax parent, StringBuilder sb, Compilation? compilation)
+    {
+        if (parent is not XmlElementSyntax { Content: var content })
+            return;
+
+        foreach (var node in content)
+        {
+            switch (node)
+            {
+                case XmlElementBaseSyntax element:
+                    RenderDocElement(element, sb, compilation);
+                    break;
+
+                case XmlCommentSyntax:
+                    break;
+
+                default:
+                    sb.Append(XmlEscaping.Decode(node.ToFullString()));
+                    break;
+            }
+        }
+    }
+
+    private static void RenderDocElement(
+        XmlElementBaseSyntax element, StringBuilder sb, Compilation? compilation)
+    {
+        switch (element.NameNode?.LocalName)
+        {
+            case "see" or "seealso":
+                RenderReference(element, sb, compilation);
+                break;
+
+            // A name, not prose: the reader is looking for it in the signature above.
+            case "paramref" or "typeparamref":
+                if (element.GetAttributeValue("name") is { Length: > 0 } name)
+                    sb.Append(CodeSpan(name));
+                break;
+
+            case "c" or "code":
+                if (element.Value is { Length: > 0 } code)
+                    sb.Append(CodeSpan(code));
+                break;
+
+            // Structure the paragraph does not have room for; keep the words, drop the layout.
+            case "para" or "list" or "item" or "description" or "term":
+                RenderDocNodes(element, sb, compilation);
+                sb.Append(' ');
+                break;
+
+            default:
+                RenderDocNodes(element, sb, compilation);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// A <c>&lt;see&gt;</c> or <c>&lt;seealso&gt;</c>: what it points at, named the way the author
+    /// asked for.
+    /// </summary>
+    /// <remarks>
+    /// Three targets, and each says where the words come from. <c>href</c> is a URL, so it becomes
+    /// a link rather than a code span. <c>langword</c> is a keyword — <c>null</c>, <c>true</c> —
+    /// and always reads as code. <c>cref</c> names a symbol, but text written between the tags is
+    /// the author's own wording for it and wins over the name we would derive: an
+    /// <c>&lt;see cref="T:System.String"&gt;the name&lt;/see&gt;</c> means to say "the name", not
+    /// "<c>string</c>".
+    /// </remarks>
+    private static void RenderReference(
+        XmlElementBaseSyntax element, StringBuilder sb, Compilation? compilation)
+    {
+        string label = WhitespaceRunRegex().Replace(element.Value, " ").Trim();
+
+        if (element.GetAttributeValue("href") is { Length: > 0 } href)
+        {
+            sb.Append(label.Length > 0 ? $"[{label}]({href})" : href);
+            return;
+        }
+
+        if (element.GetAttributeValue("cref") is { Length: > 0 } cref)
+        {
+            sb.Append(label.Length > 0 ? label : CodeSpan(CrefText(cref, compilation)));
+            return;
+        }
+
+        if (element.GetAttributeValue("langword") is { Length: > 0 } langword)
+        {
+            sb.Append(CodeSpan(label.Length > 0 ? label : langword));
+            return;
+        }
+
+        // No attribute at all is not valid documentation, but the words inside it are still words.
+        sb.Append(label);
+    }
+
+    /// <summary>How a cref is named in the middle of a sentence: short, with its type parameters,
+    /// the way it would be written in code.</summary>
+    private static readonly SymbolDisplayFormat s_crefFormat = new(
+        globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+        typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypes,
+        genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+        memberOptions: SymbolDisplayMemberOptions.IncludeContainingType
+            | SymbolDisplayMemberOptions.IncludeParameters,
+        parameterOptions: SymbolDisplayParameterOptions.IncludeType,
+        miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes
+            | SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers);
+
+    /// <summary>
+    /// A documentation comment id written as the symbol it points at.
+    /// </summary>
+    /// <remarks>
+    /// The id is metadata spelling — <c>T:System.Collections.Generic.Dictionary`2</c> — and
+    /// printing it verbatim is what put a bare <c>T:</c> and a stray backtick in the tooltip.
+    /// Resolving it gives the declared type parameter names back; when it does not resolve (an
+    /// unresolved <c>!:</c> cref, or a symbol from another compilation) the id is trimmed down to
+    /// the same shape by hand.
+    /// </remarks>
+    private static string CrefText(string cref, Compilation? compilation)
+    {
+        if (compilation is not null
+            && DocumentationCommentId.GetFirstSymbolForDeclarationId(cref, compilation) is { } symbol)
+            return symbol.ToDisplayString(s_crefFormat);
+
+        return ShortenCrefId(cref);
+    }
+
+    private static string ShortenCrefId(string cref)
+    {
+        // "T:", "M:", "!:" — the kind prefix says nothing a reader of prose wants.
+        string id = cref.Length > 2 && cref[1] == ':' ? cref[2..] : cref;
+        char kind = cref.Length > 2 && cref[1] == ':' ? cref[0] : 'T';
+
+        // Arity markers are metadata bookkeeping, and without a symbol there are no names to
+        // put in their place.
+        id = GenericArityRegex().Replace(id, "");
+
+        // A namespace is its full name or it is not that namespace; a type needs only its own
+        // name; everything else is a member, which keeps the type it is declared on.
+        if (kind == 'N')
+            return id;
+
+        int cut = id.IndexOf('(');
+        string qualified = cut < 0 ? id : id[..cut];
+        var segments = qualified.Split('.');
+        int keep = kind == 'T' ? 1 : 2;
+        return string.Join('.', segments.Skip(Math.Max(0, segments.Length - keep)));
+    }
+
+    /// <summary>A code span whose content cannot break out of it, however many backticks the
+    /// documentation put inside.</summary>
+    private static string CodeSpan(string text)
+    {
+        string content = WhitespaceRunRegex().Replace(text, " ").Trim();
+        if (content.Length == 0)
+            return "";
+
+        // One more backtick than the longest run inside, per the markdown rules for code spans.
+        int longest = 0, run = 0;
+        foreach (char c in content)
+        {
+            run = c == '`' ? run + 1 : 0;
+            longest = Math.Max(longest, run);
+        }
+
+        string fence = new('`', longest + 1);
+        return longest == 0 ? $"{fence}{content}{fence}" : $"{fence} {content} {fence}";
     }
 
     [GeneratedRegex(@"<see\s+cref=""([^""]*)""\s*/>")]
@@ -108,6 +310,9 @@ internal static partial class SymbolFormatter
 
     [GeneratedRegex(@"\s+")]
     private static partial Regex WhitespaceRunRegex();
+
+    [GeneratedRegex(@"`\d+")]
+    private static partial Regex GenericArityRegex();
 
     [GeneratedRegex(@"<param\s+name=""([^""]+)"">(.*?)</param>", RegexOptions.Singleline)]
     private static partial Regex ParamDocRegex();

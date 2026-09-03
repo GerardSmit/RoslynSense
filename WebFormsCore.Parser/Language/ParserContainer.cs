@@ -29,6 +29,15 @@ internal class ParserContainer
 
     public TemplateNode? Template { get; private set; }
 
+    private int _multiInstanceTemplates;
+
+    /// <summary>
+    /// Whether any enclosing template can be instantiated more than once. Controls there share
+    /// their ID across instances, so they cannot get a designer field; a control nested only in
+    /// single-instance templates (<c>UpdatePanel.ContentTemplate</c>) still can.
+    /// </summary>
+    public bool InMultiInstanceTemplate => _multiInstanceTemplates > 0;
+
     public int ControlId { get; set; }
 
     public int RenderId { get; set; }
@@ -39,6 +48,11 @@ internal class ParserContainer
         {
             _templates.Push(templateNode);
             Template = templateNode;
+
+            if (!templateNode.IsSingleInstance)
+            {
+                _multiInstanceTemplates++;
+            }
         }
         else
         {
@@ -92,6 +106,11 @@ internal class ParserContainer
             var template = _templates.Pop();
             Debug.Assert(template == templateNode);
             Template = _templates.Count > 0 ? _templates.Peek() : null;
+
+            if (!templateNode.IsSingleInstance)
+            {
+                _multiInstanceTemplates--;
+            }
         }
 
         return current;
@@ -106,6 +125,13 @@ internal class ParserContainer
     public void AddExpression(ExpressionNode node)
     {
         SetParentAsRenderMethod();
+        Add(node);
+    }
+
+    /// <summary>Adds a builder without turning the parent into a render method: the value is
+    /// resolved while parsing, so nothing of it reaches generated code.</summary>
+    public void AddExpressionBuilder(ExpressionBuilderNode node)
+    {
         Add(node);
     }
 

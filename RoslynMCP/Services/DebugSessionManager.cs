@@ -1,3 +1,5 @@
+using RoslynMCP.Services.Debugging;
+
 namespace RoslynMCP.Services;
 
 /// <summary>
@@ -7,10 +9,21 @@ namespace RoslynMCP.Services;
 /// Also picks the engine, which the caller never selects by hand: netcoredbg cannot attach to
 /// .NET Framework and ICorDebug is the only thing that can, so choosing wrong just fails. The
 /// runtime is inferred from the project being debugged, or from the target process when attaching.
+/// A CoreCLR target is the one case where both engines can do the job, and
+/// <see cref="Config.DebugEngineOptions"/> says which of them gets it.
+/// Sessions are wrapped so their state is mirrored to <see cref="DebugStateStore"/> and
+/// controllable from the editor via <see cref="DebugCommandPipeServer"/>.
 /// </remarks>
 internal static class DebugSessionManager
 {
+    /// <summary>How long a debuggee gets to shut itself down before it is killed. Read by both
+    /// paths that end a session — the editor's stop button over
+    /// <see cref="DebugCommandPipeServer"/>, and a session torn down here — so a debuggee gets
+    /// the same budget however the stop was asked for.</summary>
+    internal static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(10);
+
     private static IDebugBackend? s_session;
+    private static DebugCommandPipeServer? s_pipeServer;
     private static readonly Lock s_lock = new();
 
     public static IDebugBackend? GetSession()
@@ -34,11 +47,28 @@ internal static class DebugSessionManager
         lock (s_lock)
         {
             s_session?.Dispose();
-            s_session = runtime == DebugRuntime.NetFramework
-                ? new IcorDebugBackend()
-                : new DebuggerService();
+            s_session = new PublishingDebugBackend(EngineFor(runtime));
+            s_pipeServer ??= new DebugCommandPipeServer(GetSession);
             return s_session;
         }
+    }
+
+    /// <summary>
+    /// The engine a target of this runtime is debugged with.
+    /// </summary>
+    /// <remarks>
+    /// .NET Framework has no choice. CoreCLR has two, and the setting decides — read here, when
+    /// the session is created, rather than held by the backend, so a change reaches the next
+    /// session without anything having to notice it changed.
+    /// </remarks>
+    private static IDebugBackend EngineFor(DebugRuntime runtime)
+    {
+        if (runtime == DebugRuntime.NetFramework)
+            return new IcorDebugBackend(Debugger.DebugRuntime.NetFramework);
+
+        return Config.DebugEngineOptions.CoreClr == Config.CoreClrDebugEngine.IcorDebug
+            ? new IcorDebugBackend(Debugger.DebugRuntime.CoreClr)
+            : new DebuggerService();
     }
 
     public static void DisposeSession()
@@ -48,6 +78,8 @@ internal static class DebugSessionManager
             s_session?.Stop();
             s_session?.Dispose();
             s_session = null;
+            s_pipeServer?.Dispose();
+            s_pipeServer = null;
         }
     }
 }

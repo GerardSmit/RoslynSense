@@ -3,6 +3,7 @@ using Xunit;
 
 namespace RoslynMCP.Tests;
 
+[Collection(SharedState.Name)]
 public class WorkspaceServiceTests
 {
     [Fact]
@@ -153,42 +154,136 @@ public class WorkspaceServiceTests
         }
     }
 
+    /// <remarks>
+    /// The pair to <see cref="WhenSourceFileModifiedAfterCacheThenDocumentTextIsRefreshed"/>: that
+    /// one proves the requested file is refreshed, this one proves a file the request did
+    /// <em>not</em> name is refreshed too. It used to assert the opposite — refresh was scoped to
+    /// the named file so that no query paid a stat per document — but an MCP client edits files it
+    /// never names in the next question: diagnostics asked of one file answered with another
+    /// file's load-time text, at load-time line numbers. The workspace's directory watcher
+    /// (<c>WorkspaceDirtyWatcher</c>) is what reconciles the two costs: nothing is stat-ed unless
+    /// the file system itself said it changed.
+    /// <para>
+    /// The materialising read below is load-bearing: Roslyn's <c>FileTextLoader</c> stays lazy,
+    /// and a document nothing has read yet reads whatever is on disk when first asked — which is
+    /// neither a refresh nor a cache hit. Reading first makes the precondition explicit. The
+    /// re-query polls briefly because the watcher's event is delivered asynchronously; the named
+    /// file needs no such grace only because it is stat-ed directly.
+    /// </para>
+    /// </remarks>
     [Fact]
-    public async Task WhenUnrelatedFileModifiedThenCachedContentIsUsed()
+    public async Task WhenAFileTheRequestDoesNotNameChangesOnDiskItIsRefreshedToo()
     {
         await WorkspaceService.EvictAllAsync();
 
-        // Modify the dedicated file but query a different file as targetFilePath.
-        // The modified file should NOT be refreshed in the returned snapshot.
         string originalContent = await File.ReadAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile);
         string modifiedContent = originalContent + "\n// sentinel-change";
 
         try
         {
             // Populate cache via CalculatorFile (not the file we'll modify)
-            await WorkspaceService.GetOrOpenProjectAsync(
+            var (_, populated) = await WorkspaceService.GetOrOpenProjectAsync(
                 FixturePaths.SampleProjectFile,
                 targetFilePath: FixturePaths.CalculatorFile);
 
-            // Modify WorkspaceRefreshTargetFile and advance its timestamp
+            var cachedDoc = WorkspaceService.FindDocumentInProject(
+                populated, FixturePaths.WorkspaceRefreshTargetFile);
+            Assert.NotNull(cachedDoc);
+            Assert.DoesNotContain("sentinel-change", (await cachedDoc!.GetTextAsync()).ToString());
+
             await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, modifiedContent);
             File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
 
-            // Re-query with CalculatorFile as targetFilePath — WorkspaceRefreshTargetFile should NOT refresh
-            var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
-                FixturePaths.SampleProjectFile,
-                targetFilePath: FixturePaths.CalculatorFile);
+            // Re-query with CalculatorFile as targetFilePath: the modified file must show up
+            // fresh regardless, once its watcher event has landed.
+            string text = "";
+            for (int attempt = 0; attempt < 100; attempt++)
+            {
+                var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
+                    FixturePaths.SampleProjectFile,
+                    targetFilePath: FixturePaths.CalculatorFile);
 
-            var doc = WorkspaceService.FindDocumentInProject(project, FixturePaths.WorkspaceRefreshTargetFile);
-            Assert.NotNull(doc);
+                var doc = WorkspaceService.FindDocumentInProject(
+                    project, FixturePaths.WorkspaceRefreshTargetFile);
+                Assert.NotNull(doc);
 
-            var text = (await doc!.GetTextAsync()).ToString();
-            Assert.DoesNotContain("sentinel-change", text);
+                text = (await doc!.GetTextAsync()).ToString();
+                if (text.Contains("sentinel-change", StringComparison.Ordinal))
+                    break;
+                await Task.Delay(50);
+            }
+
+            Assert.Contains("sentinel-change", text);
         }
         finally
         {
             await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
             await WorkspaceService.EvictAllAsync();
         }
+    }
+
+    /// <summary>
+    /// A file that changed on disk is refreshed into a fork once, not once per request.
+    /// </summary>
+    /// <remarks>
+    /// The refresh forks the solution, and the fork used to be discarded with the request that
+    /// made it — so the next request replayed the tree replace and re-bound the project, and did so
+    /// forever after, for a file that had long since stopped changing. Identity of the
+    /// <see cref="Solution"/> is the whole assertion: every downstream cache that survives —
+    /// semantic models, the frozen-partial memo — hangs off that instance and nothing weaker.
+    /// </remarks>
+    [Fact]
+    public async Task WhenSourceFileUnchangedSinceLastRefreshThenTheSameSolutionIsReturned()
+    {
+        await WorkspaceService.EvictAllAsync();
+
+        string originalContent = await File.ReadAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile);
+
+        try
+        {
+            await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+
+            await File.WriteAllTextAsync(
+                FixturePaths.WorkspaceRefreshTargetFile, originalContent + "\n// first edit");
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
+
+            var first = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+            var second = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+
+            // Guard: the fork really happened, so identity below is not identity with the base.
+            Assert.Contains("first edit", (await TargetTextAsync(first.Project)));
+            Assert.Same(first.Project.Solution, second.Project.Solution);
+
+            // And the memo is keyed on the bytes, not on having refreshed once.
+            await File.WriteAllTextAsync(
+                FixturePaths.WorkspaceRefreshTargetFile, originalContent + "\n// second edit");
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(5));
+
+            var third = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile,
+                targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+
+            Assert.NotSame(second.Project.Solution, third.Project.Solution);
+            Assert.Contains("second edit", (await TargetTextAsync(third.Project)));
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    private static async Task<string> TargetTextAsync(Microsoft.CodeAnalysis.Project project)
+    {
+        var document = WorkspaceService.FindDocumentInProject(
+            project, FixturePaths.WorkspaceRefreshTargetFile);
+        Assert.NotNull(document);
+        return (await document!.GetTextAsync()).ToString();
     }
 }

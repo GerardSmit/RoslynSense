@@ -3,12 +3,31 @@ using Microsoft.CodeAnalysis.CSharp;
 
 namespace WebFormsCore.Models;
 
-public record struct AttributeValue(bool IsCode, TokenString Token)
+public enum AttributeValueKind
 {
+    Literal,
+    Code,
+    ExpressionBuilder
+}
+
+public record struct AttributeValue(AttributeValueKind Kind, TokenString Token)
+{
+    /// <summary>The pre-kind shape, kept so every existing construction site compiles untouched.</summary>
+    public AttributeValue(bool isCode, TokenString token)
+        : this(isCode ? AttributeValueKind.Code : AttributeValueKind.Literal, token)
+    {
+    }
+
     public override string ToString()
     {
         return Token.ToString();
     }
+
+    /// <summary>The expression builder prefix, so <see cref="Token"/> stays the argument and its
+    /// range is the exact span of the key.</summary>
+    public TokenString Prefix { get; init; }
+
+    public bool IsCode => Kind == AttributeValueKind.Code;
 
     public string Value => Token.Value;
 

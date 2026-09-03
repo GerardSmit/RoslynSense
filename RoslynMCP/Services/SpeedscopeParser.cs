@@ -46,49 +46,54 @@ public static class SpeedscopeParser
             for (int i = 0; i < frameNames.Length; i++)
                 frameNames[i] = framesArray[i].GetProperty("name").GetString() ?? $"<frame {i}>";
 
-            // Parse profiles — use the first sampled profile
-            var profiles = root.GetProperty("profiles");
-            JsonElement? sampledProfile = null;
-            foreach (var profile in profiles.EnumerateArray())
+            // Parse profiles. A "sampled" profile carries stacks and weights directly. What
+            // dotnet-trace (TraceEvent) actually exports is one "evented" profile per thread —
+            // an openFrame/closeFrame stream — so those are converted: between two consecutive
+            // events the open-frame stack was the thread's stack, and the elapsed time is its
+            // weight. Threads are concatenated; the aggregation neither knows nor cares which
+            // thread a stack ran on.
+            var rawSamples = new List<int[]>();
+            var rawWeights = new List<double>();
+            bool sawProfile = false;
+
+            foreach (var profile in root.GetProperty("profiles").EnumerateArray())
             {
-                if (profile.GetProperty("type").GetString() == "sampled")
+                string? type = profile.GetProperty("type").GetString();
+                if (type == "sampled")
                 {
-                    sampledProfile = profile;
-                    break;
+                    sawProfile = true;
+                    var weightsArray = profile.GetProperty("weights");
+                    int wi = 0;
+                    var weights = new double[weightsArray.GetArrayLength()];
+                    foreach (var w in weightsArray.EnumerateArray())
+                        weights[wi++] = w.GetDouble();
+
+                    int si = 0;
+                    foreach (var sampleEl in profile.GetProperty("samples").EnumerateArray())
+                    {
+                        var stack = new int[sampleEl.GetArrayLength()];
+                        int fi = 0;
+                        foreach (var f in sampleEl.EnumerateArray())
+                            stack[fi++] = f.GetInt32();
+                        rawSamples.Add(stack);
+                        rawWeights.Add(si < weights.Length ? weights[si] : 0);
+                        si++;
+                    }
+                }
+                else if (type == "evented")
+                {
+                    sawProfile = true;
+                    ConvertEvented(profile, rawSamples, rawWeights);
                 }
             }
 
-            if (sampledProfile is null)
+            if (!sawProfile)
                 return new([], 0, 0, "No sampled CPU profile found in trace data.");
 
-            var profileEl = sampledProfile.Value;
-            var samplesArray = profileEl.GetProperty("samples");
-            var weightsArray = profileEl.GetProperty("weights");
-            int sampleCount = samplesArray.GetArrayLength();
-
-            if (sampleCount == 0)
+            if (rawSamples.Count == 0)
                 return new([], 0, 0, "Profile contains no samples — the application may have exited too quickly.");
 
-            // Materialize samples and weights for investigation tools
-            var rawSamples = new int[sampleCount][];
-            var rawWeights = new double[sampleCount];
-
-            int si = 0;
-            foreach (var sampleEl in samplesArray.EnumerateArray())
-            {
-                var stack = new int[sampleEl.GetArrayLength()];
-                int fi = 0;
-                foreach (var f in sampleEl.EnumerateArray())
-                    stack[fi++] = f.GetInt32();
-                rawSamples[si] = stack;
-                si++;
-            }
-
-            si = 0;
-            foreach (var w in weightsArray.EnumerateArray())
-                rawWeights[si++] = w.GetDouble();
-
-            return Aggregate(frameNames, rawSamples, rawWeights, maxResults);
+            return Aggregate(frameNames, [.. rawSamples], [.. rawWeights], maxResults);
         }
         catch (JsonException ex)
         {
@@ -97,6 +102,39 @@ public static class SpeedscopeParser
         catch (Exception ex)
         {
             return new([], 0, 0, $"Error parsing profile data: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Converts one thread's "evented" profile — a time-ordered stream of
+    /// <c>{"type":"O"|"C","frame":n,"at":t}</c> events — into stacks with weights: each interval
+    /// between consecutive events contributes the then-open stack, weighted by the elapsed time.
+    /// An empty stack's interval (the thread idle or off-CPU as the sampler saw it) contributes
+    /// nothing.
+    /// </summary>
+    private static void ConvertEvented(
+        JsonElement profile, List<int[]> samples, List<double> weights)
+    {
+        var stack = new List<int>();
+        double prevAt = double.NaN;
+
+        foreach (var evt in profile.GetProperty("events").EnumerateArray())
+        {
+            double at = evt.GetProperty("at").GetDouble();
+
+            if (!double.IsNaN(prevAt) && at > prevAt && stack.Count > 0)
+            {
+                samples.Add([.. stack]);
+                weights.Add(at - prevAt);
+            }
+
+            prevAt = at;
+
+            string? kind = evt.GetProperty("type").GetString();
+            if (kind is "O" or "openFrame")
+                stack.Add(evt.GetProperty("frame").GetInt32());
+            else if (kind is "C" or "closeFrame" && stack.Count > 0)
+                stack.RemoveAt(stack.Count - 1);
         }
     }
 

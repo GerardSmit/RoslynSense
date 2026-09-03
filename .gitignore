@@ -204,6 +204,9 @@ PublishScripts/
 **/[Pp]ackages/*
 # except build/, which is used as an MSBuild target.
 !**/[Pp]ackages/build/
+# ...and except our own source: this rule is meant for NuGet's restore folder, but it also
+# matches Services/Packages, which silently dropped its files from a commit that claimed them.
+!**/Services/[Pp]ackages/*.cs
 # Uncomment if necessary however generally it will be regenerated when needed
 #!**/[Pp]ackages/repositories.config
 # NuGet v3's project.json files produces more ignorable files
@@ -410,3 +413,12 @@ FodyWeavers.xsd
 
 # Fixture build output (configuration-independent)
 RoslynMCP.Tests/Fixtures/**/lib/
+
+# VSCode extension build output
+vscode-extension/out/
+vscode-extension/*.vsix
+vscode-extension/dist/
+vscode-extension/.vscode-test/
+
+# Personal RoslynSense settings. The committed sibling is roslynsense.json.
+roslynsense.local.json

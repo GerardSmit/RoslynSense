@@ -1,5 +1,6 @@
 ﻿using System.Text;
 using WebFormsCore.Models;
+using WebFormsCore.SourceGenerator.Models;
 
 namespace WebFormsCore.Language;
 
@@ -24,6 +25,22 @@ public ref struct Lexer
     private readonly ReadOnlySpan<char> _runAt;
 
     private readonly Stack<string> _tags;
+
+    // The opening tags that were downgraded to text, so a closing tag that gets the same
+    // treatment can tell "closes a tag the lexer left as text" apart from "closes nothing".
+    // A list rather than a stack: HTML lets <li> and <td> stay open, so a close may match
+    // any entry, not just the top.
+    private readonly List<string> _htmlTags;
+
+    // End of the last downgraded opening tag. Once such a tag is text, the lexer re-enters
+    // at every '<' inside its attribute values as if a new tag started there; anything that
+    // begins before this offset is attribute text, not markup.
+    private int _htmlTagEnd;
+
+    // Whether the file has opened a tag of its own yet, which is what separates a fragment
+    // finishing someone else's wrapper from a close that matches nothing.
+    private bool _sawOpenTag;
+
     private readonly StringBuilder _textBuilder;
     private TokenPosition _textStart;
     private TokenPosition _textEnd;
@@ -36,6 +53,17 @@ public ref struct Lexer
     private int _nodeOffset;
     private bool _ignoreNewLine;
     private bool _isStart;
+
+    // Memo for the tag scan: _scanClose is the first '>' at or after _scanStart (input length
+    // when there is none), _scanRunAt is the first "runat" belonging to the tag that starts
+    // there (-1 when there is none), and _scanNested is where another tag opens inside its
+    // attribute list (-1 when none does).
+    // Inline script is full of '<' with no tag around it, and without this every one of them
+    // re-scanned ahead to the same faraway '>'.
+    private int _scanStart;
+    private int _scanClose;
+    private int _scanRunAt;
+    private int _scanNested;
 
     public Lexer(string file, ReadOnlySpan<char> input)
     {
@@ -59,10 +87,20 @@ public ref struct Lexer
         _textStart = default;
         _textEnd = default;
         _tags = new Stack<string>();
+        _htmlTags = new List<string>();
+        _htmlTagEnd = -1;
+        _sawOpenTag = false;
+        Diagnostics = new List<ReportedDiagnostic>();
         _isStart = true;
+        _scanStart = -1;
+        _scanClose = -1;
+        _scanRunAt = -1;
+        _scanNested = -1;
     }
 
     public string File { get; }
+
+    public List<ReportedDiagnostic> Diagnostics { get; }
 
     public List<int> Lines { get; } = new() { 0 };
 
@@ -220,14 +258,125 @@ public ref struct Lexer
 
     private bool IsWebFormsElement()
     {
-        if (Current != '<')
+        // `<%` opens an inline block, never an element. Saying otherwise let the scan read the
+        // rest of the tag — `Text='<%# Eval("X") %>' runat="server"` — and answer for the runat
+        // belonging to the tag the block is written inside, which turned the block into a tag of
+        // its own and cost the attribute its data binding.
+        if (Current != '<' || Peek('%', 1))
         {
             return false;
         }
 
-        var slice = _input.Slice(_offset);
-        var last = slice.IndexOf('>');
-        return last != -1 && slice.Slice(0, last).Contains(_runAt, StringComparison.OrdinalIgnoreCase);
+        var close = NextTagClose(_offset);
+        return close < _input.Length && _scanRunAt >= _offset;
+    }
+
+    /// <summary>
+    /// The offset of the first '>' at or after <paramref name="offset"/>, or the input length
+    /// when there is none, leaving <see cref="_scanRunAt"/> at the first "runat" belonging to
+    /// the tag that starts there, or -1.
+    /// </summary>
+    private int NextTagClose(int offset)
+    {
+        if (offset >= _scanStart && offset < _scanClose)
+        {
+            // A window with a tag nested in it has to be walked again from the new start: the
+            // nested tag is what bounds the runat search, and whether it still lies ahead
+            // depends on where the walk begins.
+            if (_scanNested == -1 && (_scanRunAt >= offset || _scanRunAt == -1))
+            {
+                return _scanClose;
+            }
+
+            // The memoized hit starts before this window; the window can still hold a later one.
+            var close = _scanClose;
+            ScanTagHeader(offset, close);
+            _scanClose = close;
+            return close;
+        }
+
+        ScanTagHeader(offset, _input.Length);
+        return _scanClose;
+    }
+
+    /// <summary>
+    /// Walks the tag header starting at <paramref name="offset"/> and stopping at
+    /// <paramref name="stop"/>, recording where the tag closes, the first "runat" that belongs to
+    /// it, and where another tag opens inside its attribute list.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The runat search stops at a nested tag because WebForms lets a control write the host tag's
+    /// attribute list — <c>&lt;html &lt;asp:Literal runat="server" /&gt;&gt;</c> — where the runat
+    /// belongs to the literal and not to the html element. Reading it as the host's turned the
+    /// outermost tag of such a page into a server control and inverted the tree beneath it.
+    /// </para>
+    /// <para>
+    /// Quoted values are stepped over rather than read, so neither a '&gt;' nor the word "runat"
+    /// written inside one counts, and so is <c>&lt;% %&gt;</c>, whose "%&gt;" would otherwise end
+    /// the tag. A quote only opens a value when it follows '=': this walk also runs at every
+    /// '&lt;' in inline script, where a lone apostrophe would otherwise swallow the rest of the
+    /// file.
+    /// </para>
+    /// </remarks>
+    private void ScanTagHeader(int offset, int stop)
+    {
+        _scanStart = offset;
+        _scanRunAt = -1;
+        _scanNested = -1;
+
+        // The last character that was not whitespace, which is what tells a quote opening an
+        // attribute value apart from one written inside something else.
+        var last = '\0';
+
+        for (var i = offset; i < stop; i++)
+        {
+            var c = _input[i];
+
+            if ((c == '"' || c == '\'') && last == '=')
+            {
+                var quote = _input.Slice(i + 1).IndexOf(c);
+                i = quote == -1 ? stop : i + 1 + quote;
+                last = '\0';
+                continue;
+            }
+
+            if (c == '<' && i > offset)
+            {
+                if (i + 1 < stop && _input[i + 1] == '%')
+                {
+                    var end = _input.Slice(i).IndexOf(_end);
+                    i = end == -1 ? stop : i + end + 1;
+                    last = '\0';
+                    continue;
+                }
+
+                if (_scanNested == -1 && i + 1 < stop &&
+                    (_input[i + 1] == '/' || char.IsLetter(_input[i + 1])))
+                {
+                    _scanNested = i;
+                }
+            }
+
+            if (c == '>')
+            {
+                _scanClose = i;
+                return;
+            }
+
+            if (_scanRunAt == -1 && _scanNested == -1 &&
+                _input.Slice(i).StartsWith(_runAt, StringComparison.OrdinalIgnoreCase))
+            {
+                _scanRunAt = i;
+            }
+
+            if (!IsSpaceCharacter(c))
+            {
+                last = c;
+            }
+        }
+
+        _scanClose = stop;
     }
 
     private bool ConsumeWebFormsTag()
@@ -242,7 +391,7 @@ public ref struct Lexer
 
     private bool ConsumeElement(bool requireRunAt = false)
     {
-        var isServerTag = IsWebFormsElement(); // TODO: Performance
+        var isServerTag = IsWebFormsElement();
 
         if (requireRunAt && !isServerTag)
         {
@@ -257,17 +406,34 @@ public ref struct Lexer
         }
 
         var isClosingTag = Consume('/');
-        var start = Position;
+        var nameStart = Position;
+        var start = nameStart;
         var name = ReadTagName();
-        var isInvalid = name.Value.Length == 0 ||
-                        (!isServerTag && !isClosingTag && !ShouldParse(name.Value, isClosingTag) && Current != ':');
+        var namespaceName = default(TokenString);
+        var hasNamespace = false;
+
+        // Resolve the prefix before the balance bookkeeping below, so the stack and the
+        // unexpected-closing-tag diagnostic both see "asp:PlaceHolder" instead of "asp".
+        if (name.Value.Length > 0 && Current == ':')
+        {
+            hasNamespace = true;
+            namespaceName = name;
+            start = Position;
+            Forward();
+            name = ReadTagName();
+        }
+
+        var fullName = hasNamespace ? $"{namespaceName.Value}:{name.Value}" : name.Value;
+        var isInvalid = fullName.Length == 0 ||
+                        (!isServerTag && !isClosingTag && !hasNamespace && !ShouldParse(name.Value, isClosingTag));
 
         if (isInvalid || isClosingTag)
         {
-            if (isInvalid || _tags.Count == 0 || name.Value != _tags.Peek())
+            if (isInvalid || _tags.Count == 0 || fullName != _tags.Peek())
             {
-                AddNode(TokenType.Text, tagStart, new TokenString(isClosingTag ? "</" : "<", new TokenRange(File, tagStart, start)));
-                AddNode(TokenType.Text, start, new TokenString(name, new TokenRange(File, start, Position)));
+                TrackHtmlTag(tagStart, new TokenString(fullName, new TokenRange(File, nameStart, Position)), isClosingTag);
+                AddNode(TokenType.Text, tagStart, new TokenString(isClosingTag ? "</" : "<", new TokenRange(File, tagStart, nameStart)));
+                AddNode(TokenType.Text, nameStart, new TokenString(fullName, new TokenRange(File, nameStart, Position)));
                 return true;
             }
 
@@ -275,24 +441,19 @@ public ref struct Lexer
         }
         else
         {
-            _tags.Push(name.Value);
+            _tags.Push(fullName);
         }
 
-        AddNode(isClosingTag ? TokenType.TagOpenSlash : TokenType.TagOpen, new TokenRange(File, tagStart, start));
+        AddNode(isClosingTag ? TokenType.TagOpenSlash : TokenType.TagOpen, new TokenRange(File, tagStart, nameStart));
 
-        if (Current == ':')
+        if (hasNamespace)
         {
-            AddNode(TokenType.ElementNamespace, start, name);
-            start = Position;
-            Forward();
-            name = ReadTagName();
+            AddNode(TokenType.ElementNamespace, namespaceName.Range, namespaceName);
         }
 
         AddNode(TokenType.ElementName, new TokenRange(File, start, Position), name);
 
-        var isVoidTag = name.Value is "area" or "base" or "br" or "col" or "command" or "embed"
-            or "hr" or "img" or "input" or "keygen" or "link" or "meta"
-            or "param" or "source" or "track" or "wbr";
+        var isVoidTag = IsVoidTag(name.Value);
 
         var hasClosing = false;
 
@@ -300,7 +461,9 @@ public ref struct Lexer
         {
             SkipWhiteSpace();
 
-            while (ConsumeWebFormsTag() || ReadAttribute())
+            var nested = 0;
+
+            while (ConsumeNestedTag(ref nested) || ReadAttribute())
             {
                 SkipWhiteSpace();
             }
@@ -384,10 +547,179 @@ public ref struct Lexer
         return true;
     }
 
+    /// <summary>
+    /// A tag written inside another tag's attribute list, which WebForms allows so that a control
+    /// can write the host tag's attributes:
+    /// <c>&lt;html &lt;asp:Literal id="attrs" runat="server"&gt;&lt;/asp:Literal&gt;&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// The opening tag carries its own <c>runat</c> and reads like any other server tag. The
+    /// closing tag carries nothing, so it is only read while one of these is open — otherwise the
+    /// <c>&lt;/div&gt;</c> after an unterminated <c>&lt;div</c> would be read as that tag's
+    /// attributes rather than closing it. Without this the close fell through to
+    /// <see cref="ReadAttribute"/>, which left "asp:Literal&gt;&gt;" behind as text and gave the
+    /// host an attribute named "&lt;".
+    /// </remarks>
+    private bool ConsumeNestedTag(ref int depth)
+    {
+        if (Current != '<')
+        {
+            return false;
+        }
+
+        var open = _tags.Count;
+
+        if (depth > 0 && Peek('/', 1))
+        {
+            if (!ConsumeElement())
+            {
+                return false;
+            }
+
+            if (_tags.Count < open)
+            {
+                depth--;
+            }
+
+            return true;
+        }
+
+        if (ConsumeElement(true))
+        {
+            // A self-closing one leaves the stack alone and never asks for a closing tag.
+            if (_tags.Count > open)
+            {
+                depth++;
+            }
+
+            return true;
+        }
+
+        return ConsumeInline();
+    }
+
+    private static bool IsVoidTag(string name)
+    {
+        return name is "area" or "base" or "br" or "col" or "command" or "embed"
+            or "hr" or "img" or "input" or "keygen" or "link" or "meta"
+            or "param" or "source" or "track" or "wbr";
+    }
+
+    /// <summary>
+    /// Balance bookkeeping for the tags that stay text. An opening tag is remembered; a closing
+    /// tag takes the nearest opening tag of its name off the list, and one that finds no opening
+    /// tag anywhere — not here and not on <see cref="_tags"/> — closes nothing and is reported.
+    /// </summary>
+    /// <remarks>
+    /// Only closing tags are ever reported. HTML lets <c>&lt;li&gt;</c> or <c>&lt;td&gt;</c> stay
+    /// open, so leftover opening tags mean nothing — which is also why a close matches any entry
+    /// instead of unwinding to it. And when nothing is open at all, a fragment may be closing a
+    /// tag that another file opened — the repeater header/footer idiom at file scale — so an
+    /// empty list stays quiet too.
+    /// </remarks>
+    private void TrackHtmlTag(TokenPosition tagStart, TokenString name, bool isClosingTag)
+    {
+        if (name.Value.Length == 0 || tagStart.Offset < _htmlTagEnd)
+        {
+            return;
+        }
+
+        if (!isClosingTag)
+        {
+            var close = NextTagClose(_offset);
+            _htmlTagEnd = close;
+
+            // A '/' before the close is this tag's own only when nothing else opened inside its
+            // attribute list: in `<div <asp:Literal runat="server" />>` that slash closes the
+            // literal, and calling the div self-closed on the strength of it left the later
+            // `</div>` closing nothing.
+            var isSelfClosing = close > 0 && close < _input.Length && _input[close - 1] == '/' &&
+                                _scanNested == -1;
+
+            _sawOpenTag = true;
+
+            if (!isSelfClosing && !IsVoidTag(name.Value))
+            {
+                _htmlTags.Add(name.Value);
+            }
+
+            return;
+        }
+
+        for (var i = _htmlTags.Count - 1; i >= 0; i--)
+        {
+            if (_htmlTags[i].Equals(name.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                _htmlTags.RemoveAt(i);
+                return;
+            }
+        }
+
+        foreach (var tag in _tags)
+        {
+            if (tag.Equals(name.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        if (_htmlTags.Count == 0 && _tags.Count == 0)
+        {
+            // Only before the file has opened anything of its own, where a stray close is a
+            // fragment finishing a wrapper another file opened.
+            if (!_sawOpenTag)
+            {
+                return;
+            }
+
+            Diagnostics.Add(ReportedDiagnostic.Create(
+                Descriptors.ClosingTagWithNothingOpen,
+                new TokenRange(File, tagStart, Position),
+                name.Value));
+            return;
+        }
+
+        var expected = _htmlTags.Count > 0 ? _htmlTags[^1] : _tags.Peek();
+
+        Diagnostics.Add(ReportedDiagnostic.Create(
+            Descriptors.UnexpectedClosingTag,
+            new TokenRange(File, tagStart, Position),
+            expected,
+            name.Value));
+    }
+
+    /// <summary>
+    /// The HTML (and common SVG) element names. A lowercase tag with one of these names is
+    /// literal output; anything else is a property tag like <c>&lt;columns&gt;</c> or
+    /// <c>&lt;itemtemplate&gt;</c>, which ASP.NET matches case-insensitively.
+    /// </summary>
+    private static readonly HashSet<string> HtmlElements = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "html", "body", "head", "title", "base", "basefont", "meta", "noscript", "template", "slot",
+        "address", "article", "aside", "footer", "header", "hgroup", "main", "nav", "section",
+        "search", "h1", "h2", "h3", "h4", "h5", "h6",
+        "blockquote", "dd", "div", "dl", "dt", "figcaption", "figure", "hr", "li", "menu", "ol",
+        "p", "pre", "ul",
+        "a", "abbr", "acronym", "b", "bdi", "bdo", "big", "br", "center", "cite", "code", "data",
+        "dfn", "em", "font", "i", "kbd", "mark", "q", "rp", "rt", "ruby", "s", "samp", "small",
+        "span", "strike", "strong", "sub", "sup", "time", "tt", "u", "var", "wbr",
+        "area", "audio", "map", "track", "video", "embed", "iframe", "object", "param", "picture",
+        "source", "canvas", "svg", "math", "script", "style", "link", "img",
+        "circle", "ellipse", "g", "line", "path", "polygon", "polyline", "rect", "text", "use",
+        "defs", "clippath", "lineargradient", "radialgradient", "stop", "filter", "symbol",
+        "marker", "mask", "pattern", "tspan",
+        "table", "caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr",
+        "button", "datalist", "fieldset", "form", "input", "label", "legend", "meter", "optgroup",
+        "option", "output", "progress", "select", "textarea",
+        "details", "dialog", "summary",
+        "dir", "frame", "frameset", "noframes", "marquee", "applet", "nobr",
+    };
+
     private bool ShouldParse(string name, bool isClosingTag)
     {
-        var isSpecialTag = // Properties
+        var isSpecialTag = // Properties: <ItemTemplate>, <Columns> — in any casing
             char.IsUpper(name[0]) ||
+            (!HtmlElements.Contains(name) && !name.Contains('-')) ||
 
             // Special elements
             name.Equals("html", StringComparison.OrdinalIgnoreCase) ||
@@ -408,16 +740,15 @@ public ref struct Lexer
 
         // It's possible there is a expression in the attribute list.
         // If this it the case, we should not parse the tag since we need to render the expression.
-        var slice = _input.Slice(_offset);
-        var last = slice.IndexOf('>');
+        var last = NextTagClose(_offset);
 
-        if (last == -1)
+        if (last >= _input.Length)
         {
             return true;
         }
 
         // Check for '<%'
-        if (slice.Slice(0, last).Contains(_startStatement, StringComparison.OrdinalIgnoreCase))
+        if (_input.Slice(_offset, last - _offset).Contains(_startStatement, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -455,6 +786,10 @@ public ref struct Lexer
         {
             type = TokenType.EvalExpression;
         }
+        else if (Consume('$'))
+        {
+            return ConsumeExpressionBuilder(start);
+        }
         else if (Consume('@'))
         {
             AddNode(TokenType.StartDirective, start);
@@ -469,6 +804,62 @@ public ref struct Lexer
         }
 
         return ConsumeUntil(_startStatement, end, type, start);
+    }
+
+    /// <summary>
+    /// Reads <c>&lt;%$ Prefix: Argument %&gt;</c> as two tokens. The argument gets its own token
+    /// because its range has to be exact: a builder may span a line, and slicing one token
+    /// afterwards can only add to a column.
+    /// </summary>
+    private bool ConsumeExpressionBuilder(TokenPosition start)
+    {
+        var prefix = ReadExpressionBuilderPart(stopAtColon: true);
+
+        var argument = Consume(':')
+            ? ReadExpressionBuilderPart(stopAtColon: false)
+            : CreateString(Position, Position);
+
+        // ReadAttribute resumes its value scan from wherever the offset lands, so stopping short
+        // of the closing %> folds the tail of the builder into the attribute value.
+        if (Peek(_end))
+        {
+            Forward(_end.Length);
+        }
+
+        var range = new TokenRange(File, start, Position);
+
+        AddNode(TokenType.ExpressionBuilderPrefix, range, prefix);
+        AddNode(TokenType.ExpressionBuilderArgument, range, argument);
+        return true;
+    }
+
+    private TokenString ReadExpressionBuilderPart(bool stopAtColon)
+    {
+        SkipWhiteSpace();
+
+        var start = Position;
+        var end = Position;
+
+        while (_offset < _input.Length && !Peek(_end))
+        {
+            if (stopAtColon && Peek(':'))
+            {
+                break;
+            }
+
+            // Only spaces and tabs are dropped from the end: a newline would move the end onto
+            // another line, and the position is tracked rather than recomputed.
+            var isPadding = Current is ' ' or '\t';
+
+            Forward();
+
+            if (!isPadding)
+            {
+                end = Position;
+            }
+        }
+
+        return CreateString(start, end);
     }
 
     private bool ConsumeInlineSkipWhiteSpace()
@@ -527,14 +918,18 @@ public ref struct Lexer
 
             for (; _offset < _input.Length; Forward())
             {
-                if (Peek(_startStatement) || IsWebFormsElement())
+                // Only `<% %>` interrupts a quoted value. A '<' is an ordinary character inside
+                // one — ASP.NET reads no control there — and treating it as a tag turned
+                // `onload="if (a<b) f()" runat="server"` into a control named "b" with the host
+                // tag nested inside it, taking the rest of the file's structure with it.
+                if (Peek(_startStatement))
                 {
                     if (_offset > start.Offset)
                     {
                         AddNode(TokenType.AttributeValue, start);
                     }
 
-                    ConsumeWebFormsTag();
+                    ConsumeInline();
                     start = Position;
                 }
 
@@ -675,7 +1070,15 @@ public ref struct Lexer
 
     private TokenString CreateString(TokenPosition start, TokenPosition end)
     {
-        return new TokenString(_input.Slice(start.Offset, end.Offset - start.Offset).ToString(), new TokenRange(File, start, end));
+        // Clamped rather than trusted. Every token in the file is cut here, so this is the one
+        // place where a position that ran off the end turns into an exception out of the parse —
+        // and an exception out of the parse costs the file every markup feature at once, plus its
+        // code-behind's C# lenses. A token that reports a slightly short span is a far better
+        // outcome than a page with no hover, no folding and no diagnostics.
+        int from = Math.Clamp(start.Offset, 0, _input.Length);
+        int to = Math.Clamp(end.Offset, from, _input.Length);
+
+        return new TokenString(_input.Slice(from, to - from).ToString(), new TokenRange(File, start, end));
     }
 
     public void SkipWhiteSpace()
@@ -686,14 +1089,35 @@ public ref struct Lexer
         }
     }
 
+    /// <summary>
+    /// The characters a tag name — or the prefix before its colon — is made of.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This used to be ASCII alphanumerics only, following HTML5's tag-name production literally.
+    /// That is too narrow for both of the languages this lexer actually reads. System.Web's own tag
+    /// regex is <c>[\w:.]+</c>, so a server-control tag name is a CLR identifier — underscores and
+    /// non-ASCII letters included — optionally dotted; and a custom element (<c>&lt;my-widget&gt;</c>)
+    /// requires the hyphen by definition. The colon is excluded here because the caller splits the
+    /// prefix on it.
+    /// </para>
+    /// <para>
+    /// Reading a name too narrowly failed silently rather than loudly: <c>&lt;uc:Order_Panel&gt;</c>
+    /// truncated to <c>Order</c>, no longer matched its <c>&lt;%@ Register %&gt;</c> entry, and the
+    /// control degraded to the untyped <c>Control</c> base — which the designer then wrote into the
+    /// user's source tree as a field their code-behind could not compile against.
+    /// </para>
+    /// </remarks>
     private static bool IsTagCharacter(char c)
     {
-        // https://www.w3.org/TR/2011/WD-html5-20110525/syntax.html#syntax-tag-name
         return c
                 is >= (char)0x0030 and <= (char)0x0039 // U+0030 DIGIT ZERO (0) to U+0039 DIGIT NINE (9)
                 or >= (char)0x0061 and <= (char)0x007A // U+0061 LATIN SMALL LETTER A to U+007A LATIN SMALL LETTER Z
                 or >= (char)0x0041 and <= (char)0x005A // U+0041 LATIN CAPITAL LETTER A to U+005A LATIN CAPITAL LETTER Z
-            ;
+                or '_'
+                or '-'
+                or '.'
+            || c > (char)0x007F && char.IsLetterOrDigit(c);
     }
 
     private static bool IsSpaceCharacter(char c)
@@ -878,7 +1302,19 @@ public ref struct Lexer
 
             if (current == '\\')
             {
+                // Skip what the backslash escapes — but only if there is one. `continue` runs the
+                // loop's own Forward() as well, so this branch advances twice against a single
+                // bounds check, and a file whose last character is a backslash ends with the
+                // offset one past the end. The token built from that position then slices past the
+                // buffer and throws out of the middle of parsing, which costs the file every
+                // markup feature it has.
                 Forward();
+
+                if (_offset >= _input.Length)
+                {
+                    break;
+                }
+
                 continue;
             }
 

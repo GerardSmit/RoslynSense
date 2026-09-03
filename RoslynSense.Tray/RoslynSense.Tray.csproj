@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <UseWindowsForms>true</UseWindowsForms>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>RoslynSense.Tray</RootNamespace>
+        <!-- Shipped as a payload beside the tool (see RoslynMCP.csproj), never as its own
+             package: the tool itself stays cross-platform net10.0. -->
+        <IsPackable>false</IsPackable>
+        <!-- Lets the solution restore on a non-Windows machine even though the build of this
+             project is conditioned out there. -->
+        <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    </PropertyGroup>
+
+    <!-- No reference to RoslynMCP on purpose. The tray reads the same temp-directory contracts
+         the daemon writes (host descriptors, the running-process registry) and shares nothing
+         else; a project reference would drag the whole Roslyn dependency graph into a process
+         whose entire job is drawing a menu. -->
+
+</Project>

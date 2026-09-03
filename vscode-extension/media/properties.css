@@ -1,0 +1,136 @@
+/*
+ * The Properties panel. Laid out like the Settings editor — a label, the control, then the
+ * sentence explaining it — so a form nobody has seen before still reads like one they have.
+ * Every colour is a VS Code theme variable.
+ */
+
+body {
+    margin: 0;
+    padding: 0;
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+}
+
+.chrome {
+    padding: 14px 20px 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+#title {
+    margin: 0;
+    font-size: 1.3em;
+    font-weight: 600;
+}
+
+.subtitle {
+    margin: 4px 0 0;
+    font-size: 0.9em;
+    color: var(--vscode-descriptionForeground);
+    word-break: break-all;
+}
+
+main {
+    padding: 4px 20px 20px;
+    max-width: 44em;
+}
+
+.row {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, transparent);
+}
+
+.row:last-child {
+    border-bottom: none;
+}
+
+.label {
+    margin: 0 0 6px;
+    font-size: 1em;
+    font-weight: 600;
+}
+
+.description,
+.note {
+    margin: 6px 0 0;
+    color: var(--vscode-descriptionForeground);
+    line-height: 1.4;
+}
+
+.note {
+    margin: 12px 0;
+}
+
+.value {
+    color: var(--vscode-foreground);
+    word-break: break-all;
+}
+
+select,
+input[type='text'] {
+    min-width: 22em;
+    max-width: 100%;
+    padding: 3px 6px;
+    font-family: inherit;
+    font-size: inherit;
+    color: var(--vscode-settings-textInputForeground, var(--vscode-input-foreground));
+    background: var(--vscode-settings-textInputBackground, var(--vscode-input-background));
+    border: 1px solid var(--vscode-settings-textInputBorder, var(--vscode-input-border, transparent));
+    border-radius: 2px;
+}
+
+select {
+    color: var(--vscode-settings-dropdownForeground, var(--vscode-dropdown-foreground));
+    background: var(--vscode-settings-dropdownBackground, var(--vscode-dropdown-background));
+    border-color: var(--vscode-settings-dropdownBorder, var(--vscode-dropdown-border, transparent));
+}
+
+select:disabled,
+input:disabled {
+    opacity: 0.6;
+}
+
+select:focus,
+input:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.checkbox {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+}
+
+.checkbox input {
+    accent-color: var(--vscode-checkbox-background);
+}
+
+/* A place to click that is a word rather than a button — the Settings editor's own idiom for
+ * "the file this came from". */
+.linklike {
+    padding: 0;
+    font-family: inherit;
+    font-size: inherit;
+    color: var(--vscode-textLink-foreground);
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.linklike:hover {
+    color: var(--vscode-textLink-activeForeground);
+    text-decoration: underline;
+}
+
+.status {
+    padding: 0 20px 16px;
+}
+
+.notice {
+    margin: 0;
+    min-height: 1.2em;
+    color: var(--vscode-descriptionForeground);
+}

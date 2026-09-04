@@ -1,0 +1,76 @@
+name: Publish VS Code extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Extension version"
+        required: true
+        type: string
+      channel:
+        description: "Marketplace channel"
+        required: true
+        type: choice
+        options:
+          - prerelease
+          - stable
+        default: prerelease
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Package
+        working-directory: vscode-extension
+        env:
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          args=(package "$VERSION" --out "roslyn-sense-${VERSION}.vsix" --no-git-tag-version --no-update-package-json)
+          if [[ "$CHANNEL" == "prerelease" ]]; then
+            args+=(--pre-release)
+          fi
+          npx @vscode/vsce "${args[@]}"
+
+      - name: Sign in to Azure using GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Publish
+        working-directory: vscode-extension
+        env:
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          publisher=$(node -p "require('./package.json').publisher")
+          npx @vscode/vsce verify-pat "$publisher" --azure-credential
+          args=(publish --packagePath "roslyn-sense-${VERSION}.vsix" --azure-credential --skip-duplicate)
+          if [[ "$CHANNEL" == "prerelease" ]]; then
+            args+=(--pre-release)
+          fi
+          npx @vscode/vsce "${args[@]}"

@@ -139,7 +139,19 @@ jobs:
         run: npm test
 
       - name: Audit shipped dependencies
-        run: npm audit --omit=dev
+        # A registry outage is not a vulnerability. npm already retries for minutes on its own;
+        # when the audit endpoint still answers 503 after that, the verdict is "unknown", which
+        # is a warning on this run — not a red build that a rerun turns green with nothing changed.
+        run: |
+          set +e
+          output=$(npm audit --omit=dev 2>&1)
+          status=$?
+          echo "$output"
+          if [[ $status -ne 0 ]] && grep -q "audit endpoint returned an error" <<< "$output"; then
+            echo "::warning::npm audit could not reach the registry's audit endpoint; the audit was skipped for this run."
+            exit 0
+          fi
+          exit $status
 
       - name: Package
         run: npx @vscode/vsce package

@@ -247,6 +247,7 @@ internal static class WatchedFilesHandler
         // switch went through here.
         var evicted = new List<string>();
         var applied = new List<string>();
+        var warm = new List<string>();
         foreach (var (path, change) in events.Where(e => IsSourceFile(e.Path)))
         {
             var kind = change switch
@@ -264,6 +265,14 @@ internal static class WatchedFilesHandler
                 {
                     case FileSyncResult.Applied:
                         applied.Add(path);
+                        // Not for a delete. There is no document left to resolve, and resolving a
+                        // path nothing owns is a walk up the directory tree that opens every
+                        // project it passes — a workspace load, off any request, for a file that
+                        // just stopped existing. Removing the document already moved the
+                        // project's checksum, and Roslyn's post-request refresh brings the index
+                        // current the next time completion asks.
+                        if (kind != FileChange.Deleted)
+                            warm.Add(path);
                         break;
 
                     // Nothing moved, so nothing downstream is stale. Counting this as work is how
@@ -295,7 +304,7 @@ internal static class WatchedFilesHandler
         // like a keystroke would — a regenerated designer file (.dbml, .aspx) is the common case
         // — and completion no longer rebuilds that index on its own thread. Immediate, because
         // these arrive post-save behind the coalesce window; nobody is mid-keystroke.
-        foreach (string path in applied)
+        foreach (string path in warm)
             ImportCompletionWarmer.Schedule(path, immediate: true);
 
         return new Outcome(reloadedProjects, [.. evicted, .. projectFiles], invalidatedMarkup, applied);

@@ -1593,10 +1593,19 @@ internal static class WorkspaceService
     }
 
     /// <summary>
-    /// The walk: every ancestor directory, every <c>.csproj</c> in it, in name order. The document
-    /// comes back with the project because finding it is how a candidate is accepted — returning
-    /// only the path is what made every caller open the winner a second time.
+    /// The walk: every ancestor directory, every <c>.csproj</c> in it, loaded ones first and then
+    /// name order. The document comes back with the project because finding it is how a candidate
+    /// is accepted — returning only the path is what made every caller open the winner a second
+    /// time.
     /// </summary>
+    /// <remarks>
+    /// Loaded first because asking a candidate is opening it. A folder that holds two projects —
+    /// a sample beside the library it links, a site beside its tooling — otherwise paid a cold
+    /// MSBuild load of the alphabetically earlier one for every new file the other gained, on a
+    /// request thread, only to be told the file was not in it; and that load then sat in the
+    /// cache as the most recently used workspace for every caller that asks which solution the
+    /// session is about.
+    /// </remarks>
     private static async Task<(string? ProjectPath, Document? Document)> SearchForContainingProjectAsync(
         string filePath, CancellationToken cancellationToken)
     {
@@ -1612,9 +1621,16 @@ internal static class WorkspaceService
 
             if (projectFiles.Count > 0)
             {
+                var loaded = new List<string>();
+                var cold = new List<string>();
                 foreach (var projectFile in projectFiles)
                 {
-                    string projectPath = projectFile.FullName;
+                    bool cached = await IsProjectCachedAsync(projectFile.FullName, cancellationToken);
+                    (cached ? loaded : cold).Add(projectFile.FullName);
+                }
+
+                foreach (string projectPath in loaded.Concat(cold))
+                {
                     try
                     {
                         // The file goes in as the target so a candidate that does hold it hands
@@ -2057,6 +2073,21 @@ internal static class WorkspaceService
     {
         string key = Path.GetFullPath(projectPath);
         s_cacheLock.Wait();
+        try
+        {
+            return s_projectToCacheKey.TryGetValue(key, out var cks) && cks.Any(s_cache.ContainsKey);
+        }
+        finally { s_cacheLock.Release(); }
+    }
+
+    /// <summary>
+    /// Whether some cached workspace already serves <paramref name="projectPath"/>. Cheaper than
+    /// asking for the project, which would load it: this is for deciding whether to.
+    /// </summary>
+    private static async Task<bool> IsProjectCachedAsync(string projectPath, CancellationToken cancellationToken)
+    {
+        string key = Path.GetFullPath(projectPath);
+        await s_cacheLock.WaitAsync(cancellationToken);
         try
         {
             return s_projectToCacheKey.TryGetValue(key, out var cks) && cks.Any(s_cache.ContainsKey);

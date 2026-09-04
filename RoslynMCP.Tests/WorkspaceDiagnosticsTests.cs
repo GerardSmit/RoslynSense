@@ -710,7 +710,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
             var ids = await SweepUntilSettledAsync(FixturePaths.SampleProjectFile, "Calculator.cs");
             Assert.True(ids.Count > 0, "the settled sweep should have reported something to baseline");
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(path), FileChangeType.Changed)], default);
             Assert.False(
                 outcome.DidAnything,
@@ -807,7 +807,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, open);
             OpenDocumentStore.Open(_session, open, SourceText.From(await File.ReadAllTextAsync(open)), 1);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(closed), FileChangeType.Created)], default);
 
             var ids = await SweepUntilSettledAsync(
@@ -816,7 +816,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
             await File.WriteAllTextAsync(closed,
                 "namespace SampleProject; public sealed class CheckoutTarget { public int Value() { return 2; } }");
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(closed), FileChangeType.Changed)], default);
             Assert.Contains(closed, outcome.AppliedDocumentChanges ?? [], StringComparer.OrdinalIgnoreCase);
 
@@ -985,7 +985,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
         try
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile, FixturePaths.CalculatorFile);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(path), FileChangeType.Created)], default);
 
             // Open with an unsaved body edit, so buffer and disk genuinely differ.
@@ -999,7 +999,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
             await File.WriteAllTextAsync(path,
                 "namespace SampleProject; public sealed class ConflictTarget { public int Value() { return 2; } }");
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(path), FileChangeType.Changed)], default);
             Assert.False(outcome.DidAnything);
 
@@ -1055,7 +1055,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
                 _session, FixturePaths.CalculatorFile,
                 SourceText.From(await File.ReadAllTextAsync(FixturePaths.CalculatorFile)), 1);
 
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [.. files.Select(f => new FileEvent(LspConverters.PathToUri(f.Path), FileChangeType.Created))],
                 default);
 
@@ -1072,7 +1072,7 @@ public class WorkspaceDiagnosticsTests : IDisposable
             foreach (var (name, path) in files)
                 await File.WriteAllTextAsync(path, Content(name, 2));
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [.. files.Select(f => new FileEvent(LspConverters.PathToUri(f.Path), FileChangeType.Changed))],
                 default);
             Assert.False(outcome.ReloadedWorkspace);
@@ -1135,14 +1135,14 @@ public class WorkspaceDiagnosticsTests : IDisposable
             OpenDocumentStore.Open(
                 _session, FixturePaths.CalculatorFile,
                 SourceText.From(await File.ReadAllTextAsync(FixturePaths.CalculatorFile)), 1);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(before), FileChangeType.Created)], default);
 
             var ids = await SweepUntilSettledAsync(
                 FixturePaths.SampleProjectFile, Path.GetFileName(before));
 
             File.Move(before, after);
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [
                     new FileEvent(LspConverters.PathToUri(before), FileChangeType.Deleted),
                     new FileEvent(LspConverters.PathToUri(after), FileChangeType.Created),

@@ -24,6 +24,17 @@ class Program
         // Scrubbed here, before anything can spawn, so profiling the tool doesn't hang it.
         Environment.SetEnvironmentVariable("DOTNET_DiagnosticPorts", null);
 
+        // Helper mode: roslyn-sense --console-break <pid>
+        // Raises Ctrl+Break on a debuggee from a throwaway process, for a debugging host that
+        // cannot give up its own console to do it. Ahead of the redirect and of everything else:
+        // it runs on the way out of every debug session and has nothing to load.
+        if (args.Length > 1
+            && args[0].Equals("--console-break", StringComparison.OrdinalIgnoreCase)
+            && int.TryParse(args[1], out int consoleBreakTarget))
+        {
+            return RoslynMCP.Debugger.SuspendedProcess.SendConsoleBreak(consoleBreakTarget);
+        }
+
         // Before anything else, including mode selection: a redirect hands the whole session over
         // as it is, whatever mode the host asked for.
         if (await RoslynMCP.DevBuildRedirect.TryRunAsync(args) is { } redirected)

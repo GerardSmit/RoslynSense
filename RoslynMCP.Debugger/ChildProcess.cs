@@ -216,16 +216,112 @@ public sealed class SuspendedProcess : IDisposable
     }
 
     /// <summary>
+    /// Raises Ctrl+Break on <paramref name="processId"/> from a process with no console of its
+    /// own worth keeping: drops the current one, attaches to the target's and signals it.
+    /// </summary>
+    /// <remarks>
+    /// The body of the helper process <see cref="RequestShutdown"/> spawns when this process
+    /// cannot give up its console — the host answers it as <c>--console-break &lt;pid&gt;</c>.
+    /// Never for a host that still needs its console: the drop is permanent.
+    /// </remarks>
+    /// <returns>0 when the signal was raised, 2 when the target's console could not be attached
+    /// to, 3 when the signal was refused — the same codes the PowerShell fallback reports, so the
+    /// caller reads either the same way.</returns>
+    public static int SendConsoleBreak(int processId)
+    {
+        if (!OperatingSystem.IsWindows())
+            return 1;
+
+        FreeConsole();
+        if (!AttachConsole(processId))
+            return 2;
+
+        return GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, (uint)processId) ? 0 : 3;
+    }
+
+    /// <summary>
     /// Raises the debuggee's console control handler from a short-lived process, for a host that
     /// cannot give up its own console to do it directly.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The helper is free to do what this process is not — drop the console it was born with and
-    /// take the debuggee's — because it exists for the length of one API call. PowerShell hosts
-    /// it because it is on every Windows machine, so a clean shutdown does not depend on a
-    /// component of this product being deployed next to it.
+    /// take the debuggee's — because it exists for the length of one API call.
+    /// </para>
+    /// <para>
+    /// The host's own executable plays the part when it is next to this assembly, and answers in
+    /// the time a .NET process takes to start. PowerShell is the fallback for any other host,
+    /// because it is on every Windows machine — but it compiles the helper's P/Invokes with
+    /// <c>Add-Type</c> on every run, and the first run on a cold machine took ten seconds on a
+    /// good day and past the timeout below on a hosted CI runner, where the timeout is this
+    /// method's whole budget.
+    /// </para>
     /// </remarks>
     private static bool SignalThroughHelper(int processId)
+    {
+        try
+        {
+            if (HostHelperCommand() is { } host)
+                return RunHelper(host.FileName, [.. host.Arguments, "--console-break", processId.ToString()]);
+
+            return SignalThroughPowerShell(processId);
+        }
+        catch
+        {
+            // No helper could be started, or it is locked down enough to refuse: the caller
+            // terminates instead.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The RoslynSense host next to this assembly, as a command that runs its
+    /// <c>--console-break</c> verb: the apphost when one is deployed, otherwise the muxer this
+    /// process itself runs under with the host assembly (a <c>dotnet tool</c> install). Null when
+    /// neither is there — this assembly loaded into some other host — and PowerShell stands in.
+    /// </summary>
+    private static (string FileName, string[] Arguments)? HostHelperCommand()
+    {
+        string directory = AppContext.BaseDirectory;
+
+        string exe = Path.Combine(directory, "RoslynMCP.exe");
+        if (File.Exists(exe))
+            return (exe, []);
+
+        string dll = Path.Combine(directory, "RoslynMCP.dll");
+        if (File.Exists(dll) && Muxer() is { } muxer)
+            return (muxer, [dll]);
+
+        return null;
+    }
+
+    /// <summary>
+    /// The <c>dotnet</c> this process runs on: the one the SDK named for its children, else the
+    /// one that owns the shared framework in use, else this process itself when it is the muxer.
+    /// Null for a self-contained host, which has none.
+    /// </summary>
+    private static string? Muxer()
+    {
+        if (Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") is { Length: > 0 } named
+            && File.Exists(named))
+        {
+            return named;
+        }
+
+        // <root>\shared\Microsoft.NETCore.App\<version>\ — the root is three levels up.
+        string runtime = RuntimeEnvironment.GetRuntimeDirectory();
+        string fromRuntime = Path.GetFullPath(Path.Combine(runtime, "..", "..", "..", "dotnet.exe"));
+        if (File.Exists(fromRuntime))
+            return fromRuntime;
+
+        string? self = Environment.ProcessPath;
+        return self is not null
+            && Path.GetFileNameWithoutExtension(self).Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+            ? self
+            : null;
+    }
+
+    private static bool SignalThroughPowerShell(int processId)
     {
         var script = Path.Combine(
             Path.GetTempPath(), $"roslynsense-shutdown-{Guid.NewGuid():N}.ps1");
@@ -237,43 +333,12 @@ public sealed class SuspendedProcess : IDisposable
             var pwsh = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
                 "PowerShell", "7", "pwsh.exe");
-            using var helper = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                // PowerShell 7's Add-Type uses the bundled Roslyn compiler and starts much faster.
-                // Windows PowerShell remains the universal fallback for machines without it.
-                FileName = File.Exists(pwsh) ? pwsh : "powershell.exe",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                ArgumentList =
-                {
-                    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                    "-File", script, processId.ToString(),
-                },
-            });
 
-            if (helper is null)
-                return false;
-
-            // Drain both pipes while the helper runs. Waiting first can deadlock when Add-Type
-            // writes enough compiler output to fill a redirected pipe—the hosted runner exposed
-            // this as an exact 30-second timeout while stopping at a breakpoint.
-            Task<string> output = helper.StandardOutput.ReadToEndAsync();
-            Task<string> errors = helper.StandardError.ReadToEndAsync();
-            if (!helper.WaitForExit(HelperTimeoutMilliseconds))
-            {
-                try { helper.Kill(entireProcessTree: true); } catch { }
-                return false;
-            }
-
-            Task.WaitAll([output, errors], 5_000);
-            return helper.ExitCode == 0;
-        }
-        catch
-        {
-            // No PowerShell, or it is locked down enough to refuse: the caller terminates instead.
-            return false;
+            // PowerShell 7's Add-Type uses the bundled Roslyn compiler and starts much faster.
+            // Windows PowerShell remains the universal fallback for machines without it.
+            return RunHelper(
+                File.Exists(pwsh) ? pwsh : "powershell.exe",
+                ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, processId.ToString()]);
         }
         finally
         {
@@ -281,7 +346,40 @@ public sealed class SuspendedProcess : IDisposable
         }
     }
 
-    /// <summary>Compiling the helper's P/Invokes costs most of this; the call itself is instant.</summary>
+    /// <summary>Runs one helper to completion and reads its exit code as success or not.</summary>
+    private static bool RunHelper(string fileName, IEnumerable<string> arguments)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = fileName,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (string argument in arguments)
+            info.ArgumentList.Add(argument);
+
+        using var helper = System.Diagnostics.Process.Start(info);
+        if (helper is null)
+            return false;
+
+        // Drain both pipes while the helper runs. Waiting first can deadlock when the helper
+        // writes enough to fill a redirected pipe — Add-Type's compiler output, for one.
+        Task<string> output = helper.StandardOutput.ReadToEndAsync();
+        Task<string> errors = helper.StandardError.ReadToEndAsync();
+        if (!helper.WaitForExit(HelperTimeoutMilliseconds))
+        {
+            try { helper.Kill(entireProcessTree: true); } catch { }
+            return false;
+        }
+
+        Task.WaitAll([output, errors], 5_000);
+        return helper.ExitCode == 0;
+    }
+
+    /// <summary>Generous for the PowerShell fallback, whose first run compiles its P/Invokes;
+    /// the host helper is done in a fraction of it, and the call itself is instant.</summary>
     private const int HelperTimeoutMilliseconds = 30_000;
 
     /// <summary>

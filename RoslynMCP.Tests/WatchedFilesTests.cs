@@ -36,7 +36,7 @@ public class WatchedFilesTests
 
             int loadedBefore = WorkspaceService.CachedEntryCount;
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(newFile), FileChangeType.Created)], default);
 
             Assert.False(outcome.ReloadedWorkspace);
@@ -73,7 +73,7 @@ public class WatchedFilesTests
         await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
         Assert.True(WorkspaceService.IsProjectCachedForTests(FixturePaths.SampleProjectFile));
 
-        var outcome = await WatchedFilesHandler.ProcessAsync(
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
             [new FileEvent(LspConverters.PathToUri(FixturePaths.SampleProjectFile), FileChangeType.Changed)],
             default);
 
@@ -90,7 +90,7 @@ public class WatchedFilesTests
         Assert.True(AnalyzerDiagnosticCache.IsComputed(document, version));
 
         string editorConfig = Path.Combine(FixturePaths.SampleProjectDir, ".editorconfig");
-        var outcome = await WatchedFilesHandler.ProcessAsync(
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
             [new FileEvent(LspConverters.PathToUri(editorConfig), FileChangeType.Changed)], default);
 
         // Severities live in the loaded project's analyzer options, and every cached result was
@@ -110,7 +110,7 @@ public class WatchedFilesTests
         // A markup file is not a Roslyn document, so it evicts no project and reloads nothing.
         // What it must still do is report that something happened — otherwise the diagnostics
         // already on screen were computed from the old markup and nothing asks for them again.
-        var outcome = await WatchedFilesHandler.ProcessAsync(
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
             [new FileEvent(
                 LspConverters.PathToUri(FixturePaths.EventWiringAspxFile), FileChangeType.Changed)],
             default);
@@ -150,7 +150,7 @@ public class WatchedFilesTests
             before[path] = document;
         }
 
-        var outcome = await WatchedFilesHandler.ProcessAsync(
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
             [new FileEvent(
                 LspConverters.PathToUri(FixturePaths.AspxWebConfigFile), FileChangeType.Changed)],
             default);
@@ -173,7 +173,7 @@ public class WatchedFilesTests
         await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
         int before = WorkspaceService.CachedEntryCount;
 
-        var outcome = await WatchedFilesHandler.ProcessAsync(
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
         [
             new FileEvent(LspConverters.PathToUri(
                 Path.Combine(FixturePaths.SampleProjectDir, "obj", "Debug", "Generated.cs")),
@@ -202,7 +202,7 @@ public class WatchedFilesTests
                 FileChangeType.Created))
             .ToArray();
 
-        var outcome = await WatchedFilesHandler.ProcessAsync(events, default);
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(events, default);
 
         // 50 events used to mean the solution's workspace was discarded. It must survive, and no
         // document may be invented for a file that is not there — a loader over a missing file
@@ -234,14 +234,14 @@ public class WatchedFilesTests
         try
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(newFile), FileChangeType.Created)], default);
             Assert.NotNull(await LspDocumentResolver.ResolveAsync(newFile, default));
 
             int loadedBefore = WorkspaceService.CachedEntryCount;
             File.Delete(newFile);
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(newFile), FileChangeType.Deleted)], default);
 
             Assert.Empty(outcome.EvictedProjects);
@@ -323,7 +323,7 @@ public class WatchedFilesTests
 
             SelfWriteTracker.Note(FixturePaths.SampleProjectFile);
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(FixturePaths.SampleProjectFile), FileChangeType.Changed)],
                 default);
 
@@ -353,13 +353,13 @@ public class WatchedFilesTests
         try
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Created)], default);
 
             await File.WriteAllTextAsync(file, "namespace SampleProject; public sealed class AfterEdit { }");
 
             int loadedBefore = WorkspaceService.CachedEntryCount;
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Changed)], default);
 
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
@@ -404,7 +404,7 @@ public class WatchedFilesTests
 
             await File.WriteAllTextAsync(file, original + "\n// saved from outside the editor\n");
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Changed)], default);
 
             Assert.Empty(outcome.EvictedProjects);
@@ -433,7 +433,7 @@ public class WatchedFilesTests
         await RoslynTestHelpers.OpenProjectAsync(FixturePaths.LegacyProjectFile);
         Assert.True(WorkspaceService.IsProjectCachedForTests(FixturePaths.LegacyProjectFile));
 
-        var outcome = await WatchedFilesHandler.ProcessAsync(
+        var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
             [new FileEvent(LspConverters.PathToUri(FixturePaths.SampleProjectFile), FileChangeType.Changed)],
             default);
 
@@ -472,7 +472,7 @@ public class WatchedFilesTests
                 FixturePaths.SampleProjectFile, targetFilePath: file);
             var semanticBefore = await before.GetDependentSemanticVersionAsync();
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Changed)], default);
 
             Assert.False(outcome.DidAnything);
@@ -526,7 +526,7 @@ public class WatchedFilesTests
                 session, open, Microsoft.CodeAnalysis.Text.SourceText.From(await File.ReadAllTextAsync(open)), 1);
 
             // The save echo: a Changed event for a file Aardvark has no document for.
-            var save = await WatchedFilesHandler.ProcessAsync(
+            var save = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(open), FileChangeType.Changed)], default);
             Assert.False(save.DidAnything);
 
@@ -534,7 +534,7 @@ public class WatchedFilesTests
             // the directory and takes the file; Aardvark must not.
             await File.WriteAllTextAsync(created,
                 "namespace SampleProject; public sealed class WatchedExplicitTarget { }");
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(created), FileChangeType.Created)], default);
 
             Assert.Equal(before, await AardvarkDocumentsAsync());
@@ -568,7 +568,7 @@ public class WatchedFilesTests
         try
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Created)], default);
 
             var (_, before) = await WorkspaceService.GetOrOpenProjectAsync(
@@ -579,7 +579,7 @@ public class WatchedFilesTests
             await Task.Delay(20);
             await File.WriteAllTextAsync(file, Content);
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Changed)], default);
 
             Assert.Empty(outcome.AppliedDocumentChanges ?? []);
@@ -613,7 +613,7 @@ public class WatchedFilesTests
 
             await File.WriteAllTextAsync(file, "namespace LegacyProject { public class Fresh { } }");
 
-            var outcome = await WatchedFilesHandler.ProcessAsync(
+            var outcome = await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Created)], default);
 
             // A legacy project compiles what it lists. The file is not listed, so reloading would
@@ -649,7 +649,7 @@ public class WatchedFilesTests
         try
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Created)], default);
             Assert.NotNull(await LspDocumentResolver.ResolveAsync(file, default));
 
@@ -687,12 +687,12 @@ public class WatchedFilesTests
         try
         {
             await RoslynTestHelpers.OpenProjectAsync(FixturePaths.SampleProjectFile);
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Created)], default);
 
             await File.WriteAllTextAsync(file, "namespace SampleProject; public sealed class AfterReplace { }");
 
-            await WatchedFilesHandler.ProcessAsync(
+            await RoslynTestHelpers.ProcessWatchedFilesAsync(
                 [new FileEvent(LspConverters.PathToUri(file), FileChangeType.Deleted)], default);
 
             var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(

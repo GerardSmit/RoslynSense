@@ -1,4 +1,7 @@
 using Microsoft.CodeAnalysis;
+using RoslynMCP.Lsp;
+using RoslynMCP.Lsp.Handlers;
+using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Services;
 using Xunit;
 
@@ -16,6 +19,23 @@ internal static class RoslynTestHelpers
             targetFilePath: targetFilePath,
             cancellationToken: cancellationToken);
         return project;
+    }
+
+    /// <summary>
+    /// <see cref="WatchedFilesHandler.ProcessAsync"/>, then the import-completion warm-up it
+    /// leaves running. The warm-up resolves each applied file's document in the background, and
+    /// for a file no loaded project holds any more — the test's own probe, deleted and evicted in
+    /// its teardown — that is a walk up the directory tree that opens every project it passes.
+    /// Left to itself it landed the fixture's sibling project and then this repository's own
+    /// solution in the cache while a later test was counting entries or sweeping the most
+    /// recently used solution. Waiting keeps it inside the test that caused it.
+    /// </summary>
+    public static async Task<WatchedFilesHandler.Outcome> ProcessWatchedFilesAsync(
+        IReadOnlyList<FileEvent> changes, CancellationToken cancellationToken = default)
+    {
+        var outcome = await WatchedFilesHandler.ProcessAsync(changes, cancellationToken);
+        await ImportCompletionWarmer.DrainForTestsAsync();
+        return outcome;
     }
 
     public static async Task<(Workspace Workspace, Document Document)> OpenDocumentAsync(

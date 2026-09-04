@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion.Providers;
 using RoslynMCP.Services;
@@ -40,12 +41,22 @@ internal static class ImportCompletionWarmer
     internal static volatile Task LastScheduled = Task.CompletedTask;
 
     /// <summary>
+    /// Every warm-up still in flight, not only the last one scheduled. Resolving the document is
+    /// a project lookup, and for a file no loaded project holds it is a walk up the directory
+    /// tree that opens every project it passes — a workspace load running on nobody's request
+    /// thread. A test that leaves one running finds its fixture loaded into the cache a later
+    /// test is counting, or made the most recently used solution a later sweep reads.
+    /// </summary>
+    private static readonly ConcurrentDictionary<Task, byte> s_inFlight = new();
+
+    /// <summary>
     /// Schedules a warm-up of the project that owns <paramref name="filePath"/>. Debounced per
     /// file; <paramref name="immediate"/> skips the quiet period (didOpen — nothing is being
     /// typed, and the sooner a cold project's index exists the better).
     /// </summary>
-    public static void Schedule(string filePath, bool immediate = false) =>
-        LastScheduled = s_debounce.Restart(filePath, immediate ? TimeSpan.Zero : Quiet, async ct =>
+    public static void Schedule(string filePath, bool immediate = false)
+    {
+        var run = s_debounce.Restart(filePath, immediate ? TimeSpan.Zero : Quiet, async ct =>
         {
             try
             {
@@ -62,6 +73,31 @@ internal static class ImportCompletionWarmer
                     key: $"import-warm:{filePath}");
             }
         });
+
+        LastScheduled = run;
+        Track(run);
+    }
+
+    private static void Track(Task run)
+    {
+        s_inFlight[run] = 0;
+        run.ContinueWith(
+            static finished => s_inFlight.TryRemove(finished, out _),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Test seam: completes once every scheduled warm-up has resolved its document and queued
+    /// (or declined) its work, so nothing it does lands in the test that runs next. Roslyn's own
+    /// index build is not waited for; it touches no workspace.
+    /// </summary>
+    internal static async Task DrainForTestsAsync()
+    {
+        while (!s_inFlight.IsEmpty)
+            await Task.WhenAll(s_inFlight.Keys.ToArray());
+    }
 
     /// <summary>
     /// Queues both import-completion indexes of <paramref name="project"/> for a background

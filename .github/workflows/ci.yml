@@ -542,11 +542,14 @@ jobs:
 
   # Claude Code reads .claude-plugin/plugin.json from the DEFAULT BRANCH when a user adds or
   # updates the marketplace, not from the release tag — so the manifest has to be synced on the
-  # branch after a release, or installed plugins never see the new version.
+  # branch after a release, or installed plugins never see the new version. The tool's
+  # VersionPrefix and the extension's package.json are synced in the same commit: the release
+  # builds override both, so they are not load-bearing, but a dev build that reports a version
+  # three releases old is a lie nobody needs to be told.
   #
   # Deliberately a separate job: it pushes a commit, and doing that inside `release` would risk
   # changing the tree that was just packed and published.
-  sync-plugin-manifest:
+  sync-versions:
     if: needs.publish_release.result == 'success'
     needs: publish_release
     runs-on: ubuntu-latest
@@ -559,33 +562,46 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Sync plugin manifest version
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Sync versions on the default branch
         env:
           VERSION: ${{ needs.publish_release.outputs.version }}
         run: |
           set -euo pipefail
 
           manifest=.claude-plugin/plugin.json
-          current=$(jq -r '.version // ""' "$manifest")
-
-          if [[ "$current" == "$VERSION" ]]; then
-            echo "plugin.json is already at $VERSION; nothing to do."
-            exit 0
-          fi
-
           jq --arg v "$VERSION" '.version = $v' "$manifest" > "$manifest.tmp"
           mv "$manifest.tmp" "$manifest"
 
+          # sed rather than an XML rewrite: one line changes and the rest of the file, BOM
+          # included, stays byte-for-byte what it was.
+          sed -i -E "s#<VersionPrefix>[^<]*</VersionPrefix>#<VersionPrefix>$VERSION</VersionPrefix>#" \
+            RoslynMCP/RoslynMCP.csproj
+
+          # npm keeps package.json and package-lock.json agreeing, which a jq edit would not.
+          (cd vscode-extension && npm version "$VERSION" --no-git-tag-version --allow-same-version)
+
+          git add "$manifest" RoslynMCP/RoslynMCP.csproj \
+            vscode-extension/package.json vscode-extension/package-lock.json
+
+          if git diff --cached --quiet; then
+            echo "Everything is already at $VERSION; nothing to do."
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$manifest"
 
           # [skip ci] matters: this workflow triggers on every push, so without it the bot's own
           # commit would start another CI run.
-          git commit -m "chore: sync plugin manifest to v$VERSION [skip ci]"
+          git commit -m "chore: sync versions to v$VERSION [skip ci]"
 
           # The default branch may have moved while the release ran; rebase rather than fail.
           git pull --rebase origin "${{ github.event.repository.default_branch }}"
           git push origin "HEAD:${{ github.event.repository.default_branch }}"
 
-          echo "plugin.json updated $current -> $VERSION"
+          git show --stat --format="synced to v$VERSION" HEAD

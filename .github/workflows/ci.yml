@@ -474,6 +474,13 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Verify Marketplace publisher access
+        working-directory: vscode-extension
+        run: |
+          set -euo pipefail
+          publisher=$(node -p "require('./package.json').publisher")
+          npx @vscode/vsce verify-pat "$publisher" --azure-credential
+
       - name: Publish to NuGet
         run: >
           dotnet nuget push "artifacts/RoslynSense.*.nupkg"

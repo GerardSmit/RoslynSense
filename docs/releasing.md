@@ -13,7 +13,7 @@ Visual Studio Marketplace publishing uses Microsoft Entra workload identity rath
 3. Give the identity at least Reader access to the Azure subscription so `azure/login` can authenticate it.
 4. After signing in as the identity, retrieve its Azure DevOps/Marketplace profile ID with
    `az rest -u https://app.vssps.visualstudio.com/_apis/profile/profiles/me --resource 499b84ac-1321-427f-aa17-267ca6975798`.
-5. In the Visual Studio Marketplace publisher management page, add that returned `id` as a member of the `roslyn-sense` publisher and grant it the **Contributor** role. This profile ID is different from the managed identity's Azure resource ID.
+5. In the Visual Studio Marketplace publisher management page, add that returned `id` as a member of the `GerardSmit` publisher and grant it the **Contributor** role. This profile ID is different from the managed identity's Azure resource ID.
 6. Create a protected GitHub environment named `release` and add these secrets:
    - `AZURE_CLIENT_ID`: managed identity client ID
    - `AZURE_TENANT_ID`: Azure tenant ID
@@ -40,7 +40,7 @@ Marketplace extension versions cannot use SemVer suffixes. A prerelease `0.3.1` 
 
 Maintainers can also push an annotated semantic version tag such as `v0.3.0`. In that case the tag is the version source of truth.
 
-Both publishers use duplicate-safe commands, so a failed run can be retried after correcting credentials or service availability. Confirm that the NuGet and Marketplace publisher IDs in the workflow and `vscode-extension/package.json` still match before transferring ownership.
+Both publication commands are duplicate-safe, so a failed run can be retried after correcting credentials or service availability. Before publishing either artifact, the workflow verifies that the managed identity has access to the Marketplace publisher declared in `vscode-extension/package.json`.
 
 References:
 

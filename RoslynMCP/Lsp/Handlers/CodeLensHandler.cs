@@ -146,9 +146,12 @@ internal static class CodeLensHandler
                 bool likelyHasDown = symbol is INamedTypeSymbol { TypeKind: TypeKind.Interface }
                     || symbol.ContainingType?.TypeKind == TypeKind.Interface
                     || symbol.IsAbstract;
-                if (likelyHasDown
-                    && InheritanceMarkersHandler.ApplicableDownKind(symbol) is { } downKind
-                    && downQueries++ < InheritanceMarkersHandler.MaxDownQueries)
+                // Budgeted before the likelihood filter, or the count drifts from the markers
+                // handler's: that pass spends its budget on every overridable member, and a lens
+                // charged only for the likely ones reached members it never did.
+                if (InheritanceMarkersHandler.ApplicableDownKind(symbol) is { } downKind
+                    && downQueries++ < InheritanceMarkersHandler.MaxDownQueries
+                    && likelyHasDown)
                 {
                     lenses.Add(new LspCodeLens(range, Command: null)
                     {

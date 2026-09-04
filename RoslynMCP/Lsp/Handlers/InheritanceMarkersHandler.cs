@@ -87,30 +87,95 @@ internal static class InheritanceMarkersHandler
 
             var symbol = bridge?.Map(declared) ?? declared;
             var searchScope = bridge?.Solution ?? solution;
-
             var position = text.Lines.GetLinePosition(identifier.Start);
 
-            foreach (string kind in ApplicableUpKinds(symbol))
-            {
-                var targets = ComputeUpTargets(symbol, kind)
-                    .Select(t => ToTarget(t.Symbol, t.Title))
-                    .ToArray();
-                if (targets.Length > 0)
-                    markers.Add(new InheritanceMarker(position.Line, position.Character, kind, targets));
-            }
-
-            if (ApplicableDownKind(symbol) is { } downKind && downQueries++ < MaxDownQueries)
-            {
-                var targets = (await ComputeDownTargetsAsync(symbol, downKind, searchScope, ct))
-                    .Select(t => ToTarget(t.Symbol, t.Title))
-                    .Where(t => t.Uri is not null) // derived/implementing types are source symbols
-                    .Take(MaxTargets)
-                    .ToArray();
-                if (targets.Length > 0)
-                    markers.Add(new InheritanceMarker(position.Line, position.Character, downKind, targets));
-            }
+            // The budget is spent by every overridable member, found or not: the lens list counts
+            // it the same way, and the two have to run out on the same member.
+            bool queryDown = ApplicableDownKind(symbol) is not null && downQueries++ < MaxDownQueries;
+            await AppendMarkersAsync(markers, symbol, position, searchScope, queryDown, ct);
         }
         return markers.ToArray();
+    }
+
+    /// <summary>
+    /// roslynSense/inheritanceAt: the markers for the one declaration around a position — the
+    /// member whose identifier a lens sits above, or the one the cursor is somewhere inside.
+    /// </summary>
+    /// <remarks>
+    /// The click behind a lens used to re-request the whole file's markers and pick the entry on
+    /// its own line, reporting the lens "out of date" when there was none. That was true after an
+    /// edit and false everywhere else it fired: the file-wide pass budgets its downward searches
+    /// over every overridable member, while the lens list budgeted only the members it queried,
+    /// so past fifty overridable members a lens showed a count the file-wide pass had never
+    /// computed. Asked by position there is no array to fall out of step with and no budget to
+    /// run out of: it is one member, on a click.
+    /// </remarks>
+    public static async Task<InheritanceMarker[]> MarkersAtAsync(
+        InheritanceAtParams p, CancellationToken ct)
+    {
+        var resolved = await HandlerHelpers.ResolveAsync(
+            p.TextDocument, new Position(p.Line, p.Character), ct);
+        if (resolved is not var (document, text, offset))
+            return [];
+
+        var root = await document.GetSyntaxRootAsync(ct);
+        var model = await document.GetSemanticModelAsync(ct);
+        if (root is null || model is null)
+            return [];
+
+        // The innermost declaration around the position. A lens's position is the identifier
+        // itself; a cursor can be anywhere in the body; either way the nearest enclosing member is
+        // the one the question is about.
+        var enclosing = root.FindToken(offset).Parent?.AncestorsAndSelf()
+            .Select(DeclarationOf)
+            .FirstOrDefault(d => d is not null);
+        if (enclosing is not var (declaration, identifier)
+            || model.GetDeclaredSymbol(declaration, ct) is not { } declared)
+            return [];
+
+        // Mapped the way the file-wide pass maps, warm-only included: resolveInheritanceTarget
+        // recomputes this list to take one entry out of it by index.
+        var mapped = await ExternalSymbolBridge.TryMapAsync(
+            declared, document, WorkspaceService.TryGetSessionSolution(), ct, warmProjectsOnly: true);
+
+        var markers = new List<InheritanceMarker>();
+        await AppendMarkersAsync(
+            markers,
+            mapped?.Symbol ?? declared,
+            text.Lines.GetLinePosition(identifier.Start),
+            mapped?.Project.Solution ?? document.Project.Solution,
+            queryDown: true,
+            ct);
+        return markers.ToArray();
+    }
+
+    /// <summary>
+    /// The markers for one declaration: every up relation, and the down relation when
+    /// <paramref name="queryDown"/> allows the workspace-wide search it costs.
+    /// </summary>
+    private static async Task AppendMarkersAsync(
+        List<InheritanceMarker> markers, ISymbol symbol, LinePosition position,
+        Solution searchScope, bool queryDown, CancellationToken ct)
+    {
+        foreach (string kind in ApplicableUpKinds(symbol))
+        {
+            var targets = ComputeUpTargets(symbol, kind)
+                .Select(t => ToTarget(t.Symbol, t.Title))
+                .ToArray();
+            if (targets.Length > 0)
+                markers.Add(new InheritanceMarker(position.Line, position.Character, kind, targets));
+        }
+
+        if (queryDown && ApplicableDownKind(symbol) is { } downKind)
+        {
+            var targets = (await ComputeDownTargetsAsync(symbol, downKind, searchScope, ct))
+                .Select(t => ToTarget(t.Symbol, t.Title))
+                .Where(t => t.Uri is not null) // derived/implementing types are source symbols
+                .Take(MaxTargets)
+                .ToArray();
+            if (targets.Length > 0)
+                markers.Add(new InheritanceMarker(position.Line, position.Character, downKind, targets));
+        }
     }
 
     /// <summary>roslynSense/resolveInheritanceTarget: re-resolves one marker target and, for
@@ -278,28 +343,21 @@ internal static class InheritanceMarkersHandler
             .FirstOrDefault(m => SymbolEqualityComparer.Default.Equals(
                 symbol.ContainingType.FindImplementationForInterfaceMember(m), symbol));
 
-    private static IEnumerable<(SyntaxNode Declaration, TextSpan Identifier)> EnumerateDeclarations(SyntaxNode root)
+    private static IEnumerable<(SyntaxNode Declaration, TextSpan Identifier)> EnumerateDeclarations(SyntaxNode root) =>
+        root.DescendantNodes()
+            .Select(DeclarationOf)
+            .Where(d => d is not null)
+            .Select(d => d!.Value);
+
+    /// <summary>The node as a declaration a marker can sit on, with the span the marker anchors
+    /// to, or <see langword="null"/> for any other node.</summary>
+    private static (SyntaxNode Declaration, TextSpan Identifier)? DeclarationOf(SyntaxNode node) => node switch
     {
-        foreach (var node in root.DescendantNodes())
-        {
-            switch (node)
-            {
-                case BaseTypeDeclarationSyntax type:
-                    yield return (type, type.Identifier.Span);
-                    break;
-                case MethodDeclarationSyntax method:
-                    yield return (method, method.Identifier.Span);
-                    break;
-                case PropertyDeclarationSyntax property:
-                    yield return (property, property.Identifier.Span);
-                    break;
-                case EventDeclarationSyntax ev:
-                    yield return (ev, ev.Identifier.Span);
-                    break;
-                case IndexerDeclarationSyntax indexer:
-                    yield return (indexer, indexer.ThisKeyword.Span);
-                    break;
-            }
-        }
-    }
+        BaseTypeDeclarationSyntax type => (type, type.Identifier.Span),
+        MethodDeclarationSyntax method => (method, method.Identifier.Span),
+        PropertyDeclarationSyntax property => (property, property.Identifier.Span),
+        EventDeclarationSyntax ev => (ev, ev.Identifier.Span),
+        IndexerDeclarationSyntax indexer => (indexer, indexer.ThisKeyword.Span),
+        _ => null,
+    };
 }

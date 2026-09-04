@@ -1242,19 +1242,20 @@ function registerOnAutoInsert(context: vscode.ExtensionContext): void {
 }
 
 /**
- * The inheritance relations on one line, as a pick.
+ * The inheritance relations of the declaration at one position, as a pick.
  *
- * @param uri The document the line belongs to. A lens carries its own, and a lens list outlives
- * the editor it was drawn in — a click that arrives after the focus moved would otherwise ask
- * about a line number in whatever file happens to be active, and answer confidently about the
- * wrong member.
+ * Asked by position rather than read out of the file's marker array. That array is budgeted and
+ * memoized for the gutter, and a lens can sit on a member it never reached, so matching the
+ * lens's line against it reported a freshly drawn lens as out of date. The server finds the
+ * enclosing declaration itself, which is also what lets the keyboard command work from anywhere
+ * inside a member rather than only on its signature line.
+ *
+ * @param uri The document the position belongs to. A lens carries its own, and a lens list
+ * outlives the editor it was drawn in — a click that arrives after the focus moved must not ask
+ * about a position in whatever file happens to be active.
  */
-async function showInheritanceForLine(line: number | undefined, uri?: string): Promise<void> {
-    const editor = vscode.window.activeTextEditor;
-    if (!client || !editor || editor.document.languageId !== 'csharp' || line === undefined) {
-        return;
-    }
-    if (uri !== undefined && code2Protocol(editor.document.uri) !== uri) {
+async function showInheritanceAt(uri: string, line: number, character: number): Promise<void> {
+    if (!client) {
         return;
     }
     let markers: InheritanceMarker[];
@@ -1262,15 +1263,16 @@ async function showInheritanceForLine(line: number | undefined, uri?: string): P
         markers = await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Window, title: 'RoslynSense: inheritance…' },
             () =>
-                client!.sendRequest<InheritanceMarker[]>('roslynSense/inheritanceMarkers', {
-                    textDocument: { uri: code2Protocol(editor.document.uri) },
+                client!.sendRequest<InheritanceMarker[]>('roslynSense/inheritanceAt', {
+                    textDocument: { uri },
+                    line,
+                    character,
                 })
         );
     } catch {
         return;
     }
-    const atLine = markers.filter((m) => m.line === line);
-    const items = atLine.flatMap((marker) =>
+    const items = markers.flatMap((marker) =>
         marker.targets.map((t, index) => ({
             label: `${UP_KINDS.has(marker.kind) ? '$(arrow-up)' : '$(arrow-down)'} ${t.title}`,
             marker,
@@ -1280,9 +1282,7 @@ async function showInheritanceForLine(line: number | undefined, uri?: string): P
     );
     if (items.length === 0) {
         void vscode.window.showInformationMessage(
-            markers.length > 0
-                ? 'RoslynSense: that lens is out of date — the file has changed since it was drawn.'
-                : 'RoslynSense: no inheritance relations on this line.'
+            'RoslynSense: no inheritance relations for the member at this position.'
         );
         return;
     }
@@ -1303,7 +1303,7 @@ async function showInheritanceForLine(line: number | undefined, uri?: string): P
     } else {
         await vscode.commands.executeCommand(
             'roslynSense.openInheritanceTarget',
-            code2Protocol(editor.document.uri),
+            uri,
             picked.marker.line,
             picked.marker.character,
             picked.marker.kind,
@@ -1487,15 +1487,19 @@ function registerLensCommands(context: vscode.ExtensionContext): void {
                 );
             }
         ),
-        // Inheritance list for a line: invoked by the inheritance CodeLens, the editor
-        // context menu, and Ctrl+Alt+U (gutter arrows themselves aren't clickable —
+        // Inheritance list for the member at a position: invoked by the inheritance CodeLens,
+        // the editor context menu, and Ctrl+Alt+U (gutter arrows themselves aren't clickable —
         // no VSCode API for gutter clicks).
-        vscode.commands.registerCommand('roslynSense.showInheritance', () =>
-            showInheritanceForLine(vscode.window.activeTextEditor?.selection.active.line)
-        ),
+        vscode.commands.registerCommand('roslynSense.showInheritance', () => {
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.document.languageId === 'csharp') {
+                const { line, character } = editor.selection.active;
+                void showInheritanceAt(code2Protocol(editor.document.uri), line, character);
+            }
+        }),
         vscode.commands.registerCommand(
             'roslynSense.showInheritanceAt',
-            (uri: string, line: number) => showInheritanceForLine(line, uri)
+            (uri: string, line: number, character: number) => showInheritanceAt(uri, line, character)
         ),
         // Gutter marker link for a metadata target: server decompiles and returns a location.
         vscode.commands.registerCommand(

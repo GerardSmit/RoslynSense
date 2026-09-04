@@ -1258,6 +1258,10 @@ internal sealed class LspServer : IDisposable
     public Task<InheritanceMarker[]> InheritanceMarkers(InheritanceMarkersParams p, CancellationToken ct) =>
         Handlers.InheritanceMarkersHandler.MarkersAsync(p, ct);
 
+    [JsonRpcMethod("roslynSense/inheritanceAt", UseSingleObjectParameterDeserialization = true)]
+    public Task<InheritanceMarker[]> InheritanceAt(InheritanceAtParams p, CancellationToken ct) =>
+        Handlers.InheritanceMarkersHandler.MarkersAtAsync(p, ct);
+
     [JsonRpcMethod("roslynSense/resolveInheritanceTarget", UseSingleObjectParameterDeserialization = true)]
     public Task<Location?> ResolveInheritanceTarget(ResolveInheritanceTargetParams p, CancellationToken ct) =>
         Handlers.InheritanceMarkersHandler.ResolveTargetAsync(p, ct);

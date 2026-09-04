@@ -24,6 +24,13 @@ public sealed record InheritanceTarget(
     [property: JsonPropertyName("line")] int Line,
     [property: JsonPropertyName("character")] int Character);
 
+/// <summary>roslynSense/inheritanceAt: the markers for the one declaration around a position —
+/// the member whose identifier a lens sits above, or the one the cursor is inside.</summary>
+public sealed record InheritanceAtParams(
+    [property: JsonPropertyName("textDocument")] TextDocumentIdentifier TextDocument,
+    [property: JsonPropertyName("line")] int Line,
+    [property: JsonPropertyName("character")] int Character);
+
 public sealed record ResolveInheritanceTargetParams(
     [property: JsonPropertyName("textDocument")] TextDocumentIdentifier TextDocument,
     [property: JsonPropertyName("line")] int Line,

@@ -519,7 +519,7 @@ jobs:
           echo "" >> release_notes.md
           echo "**NuGet:** [RoslynSense $VERSION](https://www.nuget.org/packages/RoslynSense/$VERSION)" >> release_notes.md
           echo "" >> release_notes.md
-          echo "**VS Code:** [RoslynSense $VERSION](https://marketplace.visualstudio.com/items?itemName=roslyn-sense.roslyn-sense)" >> release_notes.md
+          echo "**VS Code:** [RoslynSense $VERSION](https://marketplace.visualstudio.com/items?itemName=GerardSmit.roslyn-sense)" >> release_notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

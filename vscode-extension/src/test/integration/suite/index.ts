@@ -18,7 +18,7 @@ async function eventually<T>(probe: () => Thenable<T | undefined>, description: 
 }
 
 export async function run(): Promise<void> {
-    const extension = vscode.extensions.getExtension('roslyn-sense.roslyn-sense');
+    const extension = vscode.extensions.getExtension('GerardSmit.roslyn-sense');
     assert.ok(extension, 'The RoslynSense extension must be installed in the test host.');
     await extension.activate();
     assert.strictEqual(extension.isActive, true);

@@ -3,7 +3,7 @@
   "displayName": "RoslynSense",
   "description": "C# language server backed by the RoslynSense shared daemon — the same loaded solution your MCP-connected AI assistant uses.",
   "version": "0.2.0",
-  "publisher": "roslyn-sense",
+  "publisher": "GerardSmit",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {

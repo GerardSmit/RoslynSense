@@ -2216,16 +2216,16 @@ internal static class WorkspaceService
     }
 
     // File text can be collected between batch publication and the first request. Remember the
-    // equality already established for this exact immutable document and buffer, so a cold
+    // equality already established for this exact immutable text source and buffer, so a cold
     // TryGetText is not mistaken for an edit. Both keys and buffer values are weak: closing a
     // buffer or replacing a document cannot retain its text or any old solution/compilation.
-    private static readonly ConditionalWeakTable<TextDocumentState, WeakReference<SourceText>> s_matchingOpenTexts = new();
+    private static readonly ConditionalWeakTable<object, WeakReference<SourceText>> s_matchingOpenTexts = new();
 
-    private static void RememberMatchingOpenText(Document document, SourceText text) =>
-        s_matchingOpenTexts.GetValue(document.State, _ => new WeakReference<SourceText>(text)).SetTarget(text);
+    internal static void RememberMatchingOpenText(Document document, SourceText text) =>
+        s_matchingOpenTexts.GetValue(document.State.TextAndVersionSource, _ => new WeakReference<SourceText>(text)).SetTarget(text);
 
-    private static bool HasMatchingOpenText(Document document, SourceText text) =>
-        s_matchingOpenTexts.TryGetValue(document.State, out var known)
+    internal static bool HasMatchingOpenText(Document document, SourceText text) =>
+        s_matchingOpenTexts.TryGetValue(document.State.TextAndVersionSource, out var known)
         && known.TryGetTarget(out var matching)
         && ReferenceEquals(matching, text);
 
@@ -2408,7 +2408,10 @@ internal static class WorkspaceService
                                 // avoid. Materializing is cheap for a file already loaded and
                                 // needed anyway for one that is not.
                                 if ((await document.GetTextAsync()).ContentEquals(text))
+                                {
+                                    RememberMatchingOpenText(document, text);
                                     continue;
+                                }
 
                                 Lsp.AnalyzerDiagnosticCache.Evict(id);
                                 live.OnDocumentTextChanged(id, text, PreservationMode.PreserveIdentity);
@@ -3872,19 +3875,38 @@ internal static class WorkspaceService
             {
                 var open = OpenDocumentStore.SnapshotAll();
 
-                // Reusing the previous overlay is only sound while it is a strict subset of what
-                // is open now: a closed buffer has to revert to the text on disk, and the only way
-                // back to that is the base solution.
+                // Keep unchanged project trackers when a tab closes. Restore only closed
+                // documents from the base snapshot instead of rebuilding every open buffer.
                 bool reusable =
                     entry.OverlaySolution is not null
                     && ReferenceEquals(entry.OverlayBase, baseSolution)
-                    && entry.OverlayTexts.Count > 0
-                    && StillCoversEveryOverlaidDocument(entry, open, baseSolution);
+                    && entry.OverlayTexts.Count > 0;
 
                 var solution = reusable ? entry.OverlaySolution! : baseSolution;
                 var applied = reusable
                     ? new Dictionary<DocumentId, SourceText>(entry.OverlayTexts)
                     : new Dictionary<DocumentId, SourceText>();
+
+                if (reusable)
+                {
+                    var stillOpen = open.SelectMany(item => baseSolution.GetDocumentIdsWithFilePath(item.Path)).ToHashSet();
+                    foreach (var id in applied.Keys.Where(id => !stillOpen.Contains(id)).ToArray())
+                    {
+                        if (baseSolution.GetDocument(id) is { } original && original.TryGetText(out var disk))
+                        {
+                            solution = solution.WithDocumentText(id, disk);
+                            applied.Remove(id);
+                        }
+                        else
+                        {
+                            // A cold loader is not read synchronously under the overlay lock.
+                            solution = baseSolution;
+                            applied.Clear();
+                            reusable = false;
+                            break;
+                        }
+                    }
+                }
 
                 bool any = reusable;
                 foreach (var (path, text) in open)
@@ -3932,30 +3954,6 @@ internal static class WorkspaceService
         }
 
         return overlay?.GetProject(project.Id) ?? project;
-    }
-
-    /// <summary>
-    /// Whether every document the memoized overlay has text for is still open. False means a
-    /// buffer was closed (or its project reloaded out from under it) and the overlay has to be
-    /// rebuilt from disk state rather than extended.
-    /// </summary>
-    private static bool StillCoversEveryOverlaidDocument(
-        CachedWorkspaceEntry entry, List<(string Path, SourceText Text)> open, Solution baseSolution)
-    {
-        var live = new HashSet<DocumentId>();
-        foreach (var (path, _) in open)
-        {
-            foreach (var docId in baseSolution.GetDocumentIdsWithFilePath(path))
-                live.Add(docId);
-        }
-
-        foreach (var docId in entry.OverlayTexts.Keys)
-        {
-            if (!live.Contains(docId))
-                return false;
-        }
-
-        return true;
     }
 
     private static void EvictExpiredEntries(object? state)

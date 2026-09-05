@@ -12,6 +12,132 @@ namespace RoslynMCP.Tests;
 public sealed class ColdCompilationPrimerTests
 {
     [Fact]
+    public async Task StoppingARequestDoesNotWaitForAnUncooperativeCompilationOrReleaseItsSlotEarly()
+    {
+        using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);
+        var (root, dependencies) = CreateFanOut(workspace, 9);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var ct = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        int firstCalls = 0;
+        int secondCalls = 0;
+        int active = 0;
+        int peak = 0;
+        var tokens = new ConcurrentBag<CancellationToken>();
+        using var session = ColdCompilationPrimer.Start(root.Solution, dependencies.ToHashSet(), ct.Token,
+            async (_, token) =>
+            {
+                tokens.Add(token);
+                InterlockedExtensions.UpdateMax(ref peak, Interlocked.Increment(ref active));
+                if (Interlocked.Increment(ref firstCalls) == ColdCompilationPrimer.MaxConcurrentRequests)
+                    entered.TrySetResult();
+                try { await release.Task.WaitAsync(ct.Token); } // Deliberately ignores the primer's token.
+                finally { Interlocked.Decrement(ref active); }
+            });
+        Task? second = null;
+        try
+        {
+            await entered.Task.WaitAsync(ct.Token);
+            session.Dispose();
+            Assert.False(session.Stopped.IsCompleted);
+            Assert.All(tokens, token => Assert.True(token.IsCancellationRequested));
+            var stopping = session.Stopped;
+            session.Dispose();
+            Assert.Same(stopping, session.Stopped);
+
+            second = ColdCompilationPrimer.PrimeAsync(root, (_, _) =>
+            {
+                InterlockedExtensions.UpdateMax(ref peak, Interlocked.Increment(ref active));
+                Interlocked.Increment(ref secondCalls);
+                Interlocked.Decrement(ref active);
+                return Task.CompletedTask;
+            }, ct.Token);
+            // Occupied slots remain occupied until the uncooperative work actually ends.
+            Assert.False(second.IsCompleted);
+            Assert.Equal(0, Volatile.Read(ref secondCalls));
+            release.TrySetResult();
+            await session.Stopped.WaitAsync(ct.Token);
+            await second.WaitAsync(ct.Token);
+            Assert.Equal(ColdCompilationPrimer.MaxConcurrentRequests, firstCalls);
+            Assert.Equal(9, secondCalls);
+            Assert.Equal(ColdCompilationPrimer.MaxConcurrentRequests, peak);
+        }
+        finally
+        {
+            release.TrySetResult();
+            session.Dispose();
+            await session.Stopped;
+            if (second is not null) await second;
+        }
+    }
+
+    [Fact]
+    public async Task OptionalFailureIsObservedAndAdmissionCanBeReused()
+    {
+        using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);
+        var (root, dependencies) = CreateFanOut(workspace, 3);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var session = ColdCompilationPrimer.Start(root.Solution, dependencies.ToHashSet(), default,
+            (_, _) =>
+            {
+                entered.TrySetResult();
+                throw new InvalidOperationException("Fail optional priming");
+            });
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        session.Dispose();
+        await session.Stopped.WaitAsync(TimeSpan.FromSeconds(15));
+        await ColdCompilationPrimer.PrimeAsync(root, default).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.All(dependencies, id => Assert.True(root.Solution.GetProject(id)!.TryGetCompilation(out _)));
+    }
+
+    [Fact]
+    public async Task SolutionPrimingUsesTheCapturedSnapshotAndSkipsWarmProjectsAndModules()
+    {
+        using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);
+        var (root, dependencies) = CreateFanOut(workspace, 3);
+        var module = ProjectId.CreateNewId();
+        var unrelated = ProjectId.CreateNewId();
+        var captured = AddProject(root.Solution, unrelated, "OutsideSearchScope")
+            .AddProject(module, "Module", "Module", LanguageNames.CSharp)
+            .WithProjectCompilationOptions(module, new CSharpCompilationOptions(OutputKind.NetModule));
+        Assert.True(workspace.TryApplyChanges(captured));
+        var warm = await captured.GetProject(dependencies[0])!.GetCompilationAsync();
+        var visited = new ConcurrentBag<ProjectId>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var ct = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var priming = ColdCompilationPrimer.PrimeSolutionAsync(captured,
+            captured.ProjectIds.Where(id => id != unrelated).ToHashSet(), async (project, token) =>
+        {
+            Assert.Same(captured, project.Solution);
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+            visited.Add(project.Id);
+        }, ct.Token);
+        try
+        {
+            await entered.Task.WaitAsync(ct.Token);
+            Assert.True(workspace.TryApplyChanges(workspace.CurrentSolution.RemoveProject(dependencies[1])));
+            release.TrySetResult();
+            await priming;
+            Assert.Equal(3, visited.Count);
+            Assert.Equal(3, visited.Distinct().Count());
+            Assert.Contains(root.Id, visited);
+            Assert.Contains(dependencies[1], visited);
+            Assert.Contains(dependencies[2], visited);
+            Assert.Same(warm, await captured.GetProject(dependencies[0])!.GetCompilationAsync());
+            Assert.False(captured.GetProject(module)!.TryGetCompilation(out _));
+            Assert.False(captured.GetProject(unrelated)!.TryGetCompilation(out _));
+        }
+        finally
+        {
+            release.TrySetResult();
+            ct.Cancel();
+            try { await priming; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [Fact]
     public async Task SynchronousDependencyWorkOverlapsWithinTheBound()
     {
         using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);

@@ -863,10 +863,24 @@ internal static class AspxLanguageHandler
         if (resolved is null)
             return null;
 
+        var originalKey = SymbolKey.Create(resolved, ct);
+        var required = await RenameHandler.LoadRenameHierarchyAsync(current, ct);
+        var freshDocument = await AspxDocumentService.GetAsync(document.FilePath, ct);
+        if (freshDocument is null || !document.SourceText.ContentEquals(freshDocument.SourceText))
+            return null;
+        document = freshDocument;
+        resolved = AspxSymbolResolver.ResolveAt(document, offset)?.Symbol
+            ?? await ProjectedSymbolAsync(document, offset, ct);
+        if (resolved is null || !SymbolKey.GetComparer().Equals(originalKey, SymbolKey.Create(resolved, ct)))
+            return null;
+
         // A rename's edits are applied to the buffers the user has now, so they have to be
         // computed against the current solution — the cached document's snapshot may predate
         // body edits that moved every span below them.
         var (project, symbol) = await AspxDocumentService.AnchorAsync(document, resolved, ct);
+        var loaded = project.Solution.Projects.Select(p => p.FilePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (required.Any(path => !loaded.Contains(path)))
+            return null;
 
         var changes = new Dictionary<string, List<TextEdit>>(StringComparer.OrdinalIgnoreCase);
 
@@ -922,13 +936,20 @@ internal static class AspxLanguageHandler
     {
         var edits = new List<(string, TextEdit)>();
 
-        foreach (var reference in await AspxReferenceService.FindAsync(symbol, project, ct))
+        foreach (var candidate in project.Solution.Projects)
         {
-            edits.Add((
-                LspConverters.PathToUri(reference.FilePath),
-                new TextEdit(
-                    LspConverters.ToRange(reference.Text.Lines, reference.Span),
-                    AspxReferenceService.RenamedText(reference, newName))));
+            ct.ThrowIfCancellationRequested();
+            // Most C# projects have no markup. Check that before requesting a compilation.
+            if (!candidate.SupportsCompilation || AspxReferenceService.EnumerateFiles(candidate).Count == 0)
+                continue;
+            foreach (var reference in await AspxReferenceService.FindAsync(symbol, candidate, ct))
+            {
+                edits.Add((
+                    LspConverters.PathToUri(reference.FilePath),
+                    new TextEdit(
+                        LspConverters.ToRange(reference.Text.Lines, reference.Span),
+                        AspxReferenceService.RenamedText(reference, newName))));
+            }
         }
 
         return edits;

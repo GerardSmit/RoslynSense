@@ -28,6 +28,26 @@ namespace RoslynMCP.Lsp.Search;
 /// </remarks>
 internal static class ForegroundGate
 {
+    private static long s_lastActivity = System.Diagnostics.Stopwatch.GetTimestamp();
+    internal static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(2);
+
+    public static void Touch() => Interlocked.Exchange(ref s_lastActivity, System.Diagnostics.Stopwatch.GetTimestamp());
+
+    public static Task WaitForIdleAsync(CancellationToken ct) => WaitForIdleAsync(IdleDelay, ct);
+
+    internal static async Task WaitForIdleAsync(TimeSpan quietPeriod, CancellationToken ct)
+    {
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var remaining = quietPeriod - System.Diagnostics.Stopwatch.GetElapsedTime(Interlocked.Read(ref s_lastActivity));
+            bool paused;
+            lock (s_pauseGate) paused = s_pauses != 0;
+            if (!paused && Volatile.Read(ref s_busy) == 0 && remaining <= TimeSpan.Zero)
+                return;
+            await Task.Delay(TimeSpan.FromMilliseconds(Math.Clamp(remaining.TotalMilliseconds, 10, 100)), ct).ConfigureAwait(false);
+        }
+    }
     /// <summary>What the sweep is allowed while a request is in flight — the ceiling the sweep
     /// used to hold to unconditionally.</summary>
     private const int Narrow = 3;
@@ -41,6 +61,7 @@ internal static class ForegroundGate
     /// <summary>Marks a request the user is waiting on. Disposed when it is answered.</summary>
     public static IDisposable Busy()
     {
+        Touch();
         Interlocked.Increment(ref s_busy);
         return new Idle();
     }
@@ -51,6 +72,7 @@ internal static class ForegroundGate
     /// </summary>
     public static IDisposable PauseBackground()
     {
+        Touch();
         lock (s_pauseGate)
         {
             if (s_pauses++ == 0)
@@ -119,6 +141,7 @@ internal static class ForegroundGate
                 }
             }
             resumed?.TrySetResult();
+            Touch();
         }
     }
 
@@ -129,7 +152,10 @@ internal static class ForegroundGate
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
                 Interlocked.Decrement(ref s_busy);
+                Touch();
+            }
         }
     }
 

@@ -13,6 +13,21 @@ public sealed class FrozenSemanticsFreshnessTests
     private const string Model = "public class Product { public int VersionOne { get; set; } public int Compute() => 1; }";
     private const string Consumer = "public class Consumer { public object Read(Product product) => product; }";
 
+    [Fact]
+    public async Task NeverCompiledProjectUsesCurrentSnapshotAndKeepsSiblingDeclarations()
+    {
+        using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);
+        var (solution, _, consumerId) = CreateSolution(workspace, referencedProject: false);
+        var document = solution.GetDocument(consumerId)!;
+        Assert.False(solution.CompilationState.TryGetCompilationTracker(document.Project.Id, out _));
+
+        var selected = await document.FreezeAsync(default);
+
+        Assert.Same(document, selected);
+        var compilation = await selected.Project.GetCompilationAsync();
+        Assert.NotEmpty(compilation!.GetTypeByMetadataName("Product")!.GetMembers("VersionOne"));
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]

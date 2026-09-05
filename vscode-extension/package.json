@@ -1945,7 +1945,7 @@
         "roslynSense.loadEntireSolution": {
           "type": "boolean",
           "default": true,
-          "description": "Load every project of the solution in the background when the server starts, so Search Everywhere, workspace symbols and find-references cover the whole solution instead of only the projects whose files you have opened. Off loads a project the first time you touch a file in it, which starts faster and uses less memory on a very large solution."
+          "description": "Load the solution and prepare navigation and rename after two seconds of editor inactivity. Background preparation pauses between work items while you type and resumes on the current files. Off keeps project loading on demand and uses less memory on very large solutions."
         },
         "roslynSense.analyzerDiagnostics": {
           "type": "boolean",

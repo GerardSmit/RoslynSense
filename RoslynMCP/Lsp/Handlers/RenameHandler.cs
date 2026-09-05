@@ -106,7 +106,7 @@ internal static class RenameHandler
         if (!localName)
         {
             if (symbol is IMethodSymbol or IPropertySymbol or IEventSymbol or IParameterSymbol)
-                hierarchyProjects = await LoadRenameHierarchyAsync(document.Project, ct);
+                hierarchyProjects = await LoadRenameHierarchyAsync(document.Project, ct, symbol);
             // Loose projects may have no validated solution list. Retain the normal consumer
             // search in that case, as well as for names that do not cascade through a hierarchy.
             if (hierarchyProjects.Count == 0)
@@ -145,8 +145,17 @@ internal static class RenameHandler
 
         var solution = document.Project.Solution;
         timing?.Mark("revalidate symbol");
-        var renamed = await Renamer.RenameSymbolAsync(
-            solution, symbol, new SymbolRenameOptions(), p.NewName, ct);
+        Solution renamed;
+        // Reference discovery cascades through projects serially. Prepare cold compilations
+        // alongside that walk, on this exact snapshot, without changing Roslyn's search scope.
+        var ownerPaths = hierarchyProjects.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var primeIds = solution.Projects.Where(project => project.FilePath is { } path
+            && ownerPaths.Contains(path)).Select(project => project.Id).ToHashSet();
+        using (ColdCompilationPrimer.Start(solution, primeIds, ct))
+        {
+            renamed = await Renamer.RenameSymbolAsync(
+                solution, symbol, new SymbolRenameOptions(), p.NewName, ct);
+        }
         timing?.Mark("Roslyn rename");
 
         var changes = new Dictionary<string, List<TextEdit>>(StringComparer.OrdinalIgnoreCase);
@@ -197,7 +206,8 @@ internal static class RenameHandler
             : new WorkspaceEdit(changes.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()));
     }
 
-    private static async Task<IReadOnlyList<string>> LoadRenameHierarchyAsync(Project origin, CancellationToken ct)
+    internal static async Task<IReadOnlyList<string>> LoadRenameHierarchyAsync(Project origin, CancellationToken ct,
+        ISymbol? symbol = null)
     {
         if (origin.FilePath is not { Length: > 0 } projectPath)
             return [];
@@ -221,6 +231,9 @@ internal static class RenameHandler
             return [];
 
         var loaded = LoadedProjectPaths(origin.Solution);
+        if (symbol is not null && projects.Any(path => !loaded.Contains(path))
+            && RenameScopeIndex.TryNarrow(origin, symbol, solutionPath!, projects, ct) is { } narrowed)
+            projects = narrowed.ToList();
         var missing = projects.Where(path => !loaded.Contains(path)).ToList();
         if (missing.Count == 0)
             return projects;
@@ -231,7 +244,8 @@ internal static class RenameHandler
         // finishes for the next request. Weak workspace ownership cannot retain evicted solutions.
         ct.ThrowIfCancellationRequested();
         var loads = s_hierarchyLoads.GetValue(origin.Solution.Workspace, static _ => new SingleFlight());
-        await loads.Start(solutionPath!, _ =>
+        string loadKey = solutionPath + "|" + string.Join("|", missing.Order(StringComparer.OrdinalIgnoreCase));
+        await loads.Start(loadKey, _ =>
             WorkspaceService.EnsureProjectsLoadedAsync([projectPath, .. missing], CancellationToken.None)).WaitAsync(ct);
         return projects;
     }
@@ -240,4 +254,5 @@ internal static class RenameHandler
         .Where(project => project.FilePath is { Length: > 0 })
         .Select(project => Path.GetFullPath(project.FilePath!))
         .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
 }

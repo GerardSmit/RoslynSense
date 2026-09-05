@@ -35,8 +35,68 @@ internal static class ColdCompilationPrimer
         if (closure.Count == 0)
             return;
 
-        var dependencies = graph.GetTopologicallySortedProjects(ct)
-            .Where(closure.Contains)
+        await PrimeProjectsAsync(solution, graph.GetTopologicallySortedProjects(ct)
+            .Where(closure.Contains), compile, ct).ConfigureAwait(false);
+    }
+
+    internal static Task PrimeSolutionAsync(
+        Solution solution, IReadOnlySet<ProjectId> scope,
+        Func<Project, CancellationToken, Task> compile, CancellationToken ct) =>
+        PrimeProjectsAsync(solution, solution.GetProjectDependencyGraph().GetTopologicallySortedProjects(ct)
+            .Where(scope.Contains), compile, ct);
+
+    /// <summary>
+    /// Primes only the caller's loaded search scope. Disposal requests cancellation without
+    /// making the foreground wait for a generator that is slow to observe cancellation.
+    /// The worker tasks and cancellation callbacks are observed before disposing their source.
+    /// </summary>
+    internal static PrimingSession Start(Solution solution, IReadOnlySet<ProjectId> scope, CancellationToken ct,
+        Func<Project, CancellationToken, Task>? compile = null) => new(solution, scope,
+            compile ?? (static (project, token) => project.GetCompilationAsync(token)), ct);
+
+    internal sealed class PrimingSession : IDisposable
+    {
+        private readonly CancellationTokenSource _cancellation;
+        private readonly Task _work;
+        private int _disposed;
+        internal Task Stopped { get; private set; } = Task.CompletedTask;
+
+        internal PrimingSession(Solution solution, IReadOnlySet<ProjectId> scope,
+            Func<Project, CancellationToken, Task> compile, CancellationToken ct)
+        {
+            _cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            // Capture synchronous setup exceptions in the task too, so an optional primer
+            // cannot prevent the foreground operation or leak its cancellation source.
+            _work = RunAsync();
+            async Task RunAsync() => await PrimeSolutionAsync(solution, scope, compile, _cancellation.Token);
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                Stopped = StopAsync();
+        }
+
+        private async Task StopAsync()
+        {
+            try
+            {
+                await Task.WhenAll(_work, _cancellation.CancelAsync()).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_cancellation.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn($"Could not prime search compilations: {ex.Message}", key: "search-compilation-primer");
+            }
+            finally { _cancellation.Dispose(); }
+        }
+    }
+
+    private static async Task PrimeProjectsAsync(Solution solution, IEnumerable<ProjectId> order,
+        Func<Project, CancellationToken, Task> compile, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var dependencies = order
             .Select(id => solution.GetProject(id))
             .OfType<Project>()
             // Roslyn cannot form a project reference to a netmodule and skips it itself.

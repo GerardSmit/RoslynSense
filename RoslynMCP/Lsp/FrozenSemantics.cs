@@ -46,6 +46,18 @@ internal static class FrozenSemantics
         }
 
         timing?.Mark("current compilation unavailable");
+        // With no tracker there is no prior compilation state for Roslyn to freeze.
+        // Avoid constructing a one-document compilation only to discard it below.
+        // A concurrent build starting after this check is harmless: the current
+        // snapshot shares its tracker with that build and remains fully correct.
+        if (document.Project.DocumentIds.Count > 1
+            && !document.Project.Solution.CompilationState.TryGetCompilationTracker(document.Project.Id, out _))
+        {
+            ct.ThrowIfCancellationRequested();
+            StartColdCompilation(document.Project, ct);
+            timing?.Mark("selected current: no compilation tracker; skipped cold freeze");
+            return document;
+        }
 
         var frozen = document.Project.Solution
             .WithFrozenPartialCompilationIncludingSpecificDocument(document.Id, ct)
@@ -68,24 +80,7 @@ internal static class FrozenSemantics
             timing?.Mark("obtained frozen compilation");
             if (frozenCompilation is not null && frozenCompilation.SyntaxTrees.Count() <= 1)
             {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        // Parse this project while independent dependencies compile. Roslyn's
-                        // own trackers share the work with completion and import-cache warming.
-                        // Cancellation stops optional priming; the original cold compilation
-                        // still finishes so the next keystroke can reuse it.
-                        var priming = ColdCompilationPrimer.PrimeAsync(document.Project, ct);
-                        await Task.WhenAll(priming, document.Project.GetCompilationAsync(CancellationToken.None));
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-                    catch (Exception ex)
-                    {
-                        ServiceLog.Warn($"Could not warm '{document.Project.Name}': {ex.Message}",
-                            key: $"cold-compilation:{document.Project.Id}");
-                    }
-                });
+                StartColdCompilation(document.Project, ct);
                 timing?.Mark("selected current: cold frozen compilation has at most one tree; started current compilation");
                 return document;
             }
@@ -98,6 +93,28 @@ internal static class FrozenSemantics
         bool currentDeclarations = await HasCurrentDeclarationsAsync(document.Project, frozen.Project, ct, timing);
         timing?.Mark(currentDeclarations ? "selected frozen: declarations current" : "selected current: stale frozen declarations");
         return currentDeclarations ? frozen : document;
+    }
+
+    private static void StartColdCompilation(Project project, CancellationToken ct)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Parse this project while independent dependencies compile. Roslyn's
+                // own trackers share the work with completion and import-cache warming.
+                // Cancellation stops optional priming; the original cold compilation
+                // still finishes so the next keystroke can reuse it.
+                var priming = ColdCompilationPrimer.PrimeAsync(project, ct);
+                await Task.WhenAll(priming, project.GetCompilationAsync(CancellationToken.None));
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                ServiceLog.Warn($"Could not warm '{project.Name}': {ex.Message}",
+                    key: $"cold-compilation:{project.Id}");
+            }
+        });
     }
 
     private static async Task<bool> HasCurrentDeclarationsAsync(

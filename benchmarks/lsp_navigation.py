@@ -301,6 +301,21 @@ def run_sample(args, index):
         definition("first_b_property_definition", b, member_reference(b, OLD_NAME), OLD_NAME)
         class_use = buffers.read(b).index("UserInfo user")
         definition("first_b_type_definition", b, class_use, "UserInfo")
+        def idle_preparation(label):
+            started = time.perf_counter()
+            deadline = started + args.timeout
+            while True:
+                status = measure(label + "_status", "roslynSense/diagnosticsCounters")
+                if status.get("solutionPrepared"):
+                    result[label + "_seconds"] = time.perf_counter() - started
+                    check(not status.get("solutionLoading"), label + " finished loading and semantic preparation")
+                    break
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("Idle solution preparation did not finish")
+                time.sleep(1)
+        if args.wait_for_idle_preparation:
+            # No solution-wide search requests the load: the editor simply becomes idle.
+            idle_preparation("initial_idle_preparation")
         measure("workspace_warmup_barrier", "workspace/symbol", {"query": "UserInfo"})
         time.sleep(args.settle_seconds)
         result["memory_before_warm"] = client.memory()
@@ -342,6 +357,8 @@ def run_sample(args, index):
         definition("consumer_edit_new_property_definition", b, member_reference(b, PROBE_NAME), PROBE_NAME)
         completion("consumer_edit_completion", b, [OLD_NAME, PROBE_NAME], resolve=True)
 
+        if args.idle_before_rename:
+            idle_preparation("edited_idle_preparation")
         result["load_counters_before_rename"] = measure("load_counters_before_rename", "roslynSense/diagnosticsCounters")
         result["stderr_bytes_before_rename"] = (args.output / f"sample-{index}.stderr.log").stat().st_size
         result["open_files_before_rename"] = [str(path) for path in sorted(buffers.opened)]
@@ -384,6 +401,25 @@ def run_sample(args, index):
             buffers.change(path, text)
         completion("undo_rename_completion", b, [OLD_NAME, PROBE_NAME], [NEW_NAME], resolve=True)
         definition("undo_rename_definition", b, member_reference(b, OLD_NAME), OLD_NAME)
+        for repeat in range(args.rename_repeats):
+            # Same process, all consumer projects already loaded. Exercise both a changed
+            # snapshot after undo and an identical snapshot before applying the returned edit.
+            for metric in ("hot_after_undo_property_rename", "hot_unchanged_property_rename"):
+                hot_edit = measure(metric, "textDocument/rename", {
+                    **at(b, member_reference(b, OLD_NAME)), "newName": NEW_NAME})
+                hot_changes = workspace_changes(hot_edit, buffers)
+                hot_text = {path: apply_edits(buffers.read(path), edits)
+                            for path, edits in hot_changes.items()}
+                check(hot_text == renamed,
+                      f"Hot rename {repeat + 1} ({metric}) preserves every edit and excludes lookalikes")
+            for path, text in hot_text.items():
+                buffers.change(path, text)
+            completion("hot_renamed_completion", b, [NEW_NAME, PROBE_NAME], [OLD_NAME], NEW_NAME)
+            definition("hot_renamed_definition", b, member_reference(b, NEW_NAME), NEW_NAME)
+            for path, text in before_rename.items():
+                buffers.change(path, text)
+            completion("hot_undo_completion", b, [OLD_NAME, PROBE_NAME], [NEW_NAME])
+            definition("hot_undo_definition", b, member_reference(b, OLD_NAME), OLD_NAME)
         buffers.change(a, original_a)
         buffers.change(b, original_b)
         completion("undo_class_edit_completion", b, [OLD_NAME, "UserID"], [PROBE_NAME, NEW_NAME], resolve=True)
@@ -425,6 +461,10 @@ def main():
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--warm-repeats", type=int, default=7)
     parser.add_argument("--body-repeats", type=int, default=3)
+    parser.add_argument("--rename-repeats", type=int, default=0,
+                        help="Additional same-process rename/apply/undo cycles")
+    parser.add_argument("--wait-for-idle-preparation", action="store_true")
+    parser.add_argument("--idle-before-rename", action="store_true")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--settle-seconds", type=float, default=30)
     parser.add_argument("--lazy", action="store_true")
@@ -438,7 +478,7 @@ def main():
         "DNN Platform/Library/Security/Membership/AspNetMembershipProvider.cs",
         "DNN Platform/DotNetNuke.Abstractions/Users/IUserInfo.cs",
         "Dnn.AdminExperience/Dnn.PersonaBar.Extensions/Components/Users/Dto/UserBasicDto.cs")]
-    if args.samples < 1 or args.warm_repeats < 1 or args.body_repeats < 1 or args.timeout <= 0 or args.settle_seconds < 0:
+    if args.samples < 1 or args.warm_repeats < 1 or args.body_repeats < 1 or args.rename_repeats < 0 or args.timeout <= 0 or args.settle_seconds < 0:
         parser.error("Samples/repeats/timeout must be positive; settling cannot be negative")
     args.output.mkdir(parents=True, exist_ok=True)
     # This read-only manifest is outside request timings and deliberately warms
@@ -452,6 +492,9 @@ def main():
               "platform": platform.platform(), "cpu_count": os.cpu_count(), "python": platform.python_version(),
               "load_entire_solution": not args.lazy, "warm_repeats": args.warm_repeats,
               "body_repeats": args.body_repeats,
+              "rename_repeats": args.rename_repeats,
+              "wait_for_idle_preparation": args.wait_for_idle_preparation,
+              "idle_before_rename": args.idle_before_rename,
               "settle_seconds": args.settle_seconds, "timeout_seconds": args.timeout,
               "runtime_environment": {key: os.environ.get(key) for key in
                   ("DOTNET_gcServer", "DOTNET_PROCESSOR_COUNT", "DOTNET_GCHeapCount")},

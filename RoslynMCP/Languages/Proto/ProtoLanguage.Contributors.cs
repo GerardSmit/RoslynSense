@@ -26,8 +26,9 @@ namespace RoslynMCP.Languages.Proto;
 /// rewriting one from an F2 in C# would change what the service answers to, across every language
 /// that consumes the <c>.proto</c> and with nothing in the C# diff to show it. Renaming the
 /// generated C# alone is meaningless in the other direction, because protoc regenerates the file
-/// on the next build and the edit disappears. F2 therefore behaves exactly as it does with the
-/// pack switched off.
+/// on the next build and the edit disappears. C# F2 therefore behaves exactly as it does with the
+/// pack switched off. The separate document rename provider handles F2 initiated in a schema,
+/// updating that declaration and its handwritten C# consumers together.
 /// </para>
 /// </remarks>
 internal sealed partial class ProtoLanguage :

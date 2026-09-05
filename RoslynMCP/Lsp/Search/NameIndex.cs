@@ -74,14 +74,20 @@ public static class NameIndex
     private static readonly object s_gate = new();
     private static string? s_solutionPath;
     private static Task<NameIndexSnapshot?> s_build = Task.FromResult<NameIndexSnapshot?>(null);
+    private static BuildState? s_active;
 
     /// <summary>
     /// Starts building the index for <paramref name="solutionPath"/> if it is not already being
     /// built, and returns the task that carries it. Never throws: a solution whose names cannot be
     /// read early is one that waits for its load, exactly as it did before.
     /// </summary>
-    public static Task<NameIndexSnapshot?> Start(string solutionPath)
+    public static Task<NameIndexSnapshot?> Start(string solutionPath) => StartCore(solutionPath);
+
+    private static Task<NameIndexSnapshot?> StartCore(
+        string solutionPath, Func<CancellationToken, Task>? beforeExtract = null)
     {
+        BuildState? previous;
+        Task<NameIndexSnapshot?> build;
         lock (s_gate)
         {
             if (s_solutionPath is not null
@@ -90,10 +96,13 @@ public static class NameIndex
                 return s_build;
             }
 
+            previous = s_active;
             s_solutionPath = solutionPath;
-            s_build = Task.Run(() => BuildAsync(solutionPath));
-            return s_build;
+            s_active = new BuildState(solutionPath, beforeExtract);
+            build = s_build = s_active.Task;
         }
+        previous?.Cancel();
+        return build;
     }
 
     /// <summary>
@@ -139,31 +148,98 @@ public static class NameIndex
     /// </remarks>
     public static void Retire()
     {
+        BuildState? retired;
         lock (s_gate)
+        {
+            retired = s_active;
+            s_active = null;
             s_build = Task.FromResult<NameIndexSnapshot?>(null);
+        }
+        retired?.Cancel();
     }
 
     /// <summary>Test seam: forgets the current index, so the next start rebuilds it.</summary>
     internal static void Reset()
     {
+        BuildState? retired;
         lock (s_gate)
         {
+            retired = s_active;
+            s_active = null;
             s_solutionPath = null;
             s_build = Task.FromResult<NameIndexSnapshot?>(null);
+        }
+        retired?.Cancel();
+    }
+
+    internal static Task<NameIndexSnapshot?> StartForTestAsync(
+        string solutionPath, Func<CancellationToken, Task> beforeExtract) => StartCore(solutionPath, beforeExtract);
+
+    private sealed class BuildState
+    {
+        private readonly object _gate = new();
+        private readonly CancellationTokenSource _cancellation = new();
+        private bool _completed;
+        private int _cancelling;
+
+        public Task<NameIndexSnapshot?> Task { get; }
+
+        public BuildState(string path, Func<CancellationToken, Task>? beforeExtract)
+        {
+            // Do not pass the token to Task.Run: even cancellation before the worker starts must
+            // complete with null, like any unavailable provisional index, rather than a canceled task.
+            Task = System.Threading.Tasks.Task.Run(async () =>
+            {
+                try { return await BuildAsync(path, persist: true, _cancellation.Token, beforeExtract); }
+                finally
+                {
+                    lock (_gate)
+                    {
+                        _completed = true;
+                        if (_cancelling == 0)
+                            _cancellation.Dispose();
+                    }
+                }
+            });
+        }
+
+        public void Cancel()
+        {
+            lock (_gate)
+            {
+                if (_completed)
+                    return;
+                _cancelling++;
+            }
+            // Roslyn callbacks can run synchronously. Never invoke them under either state lock,
+            // and keep the source alive until both the worker and cancellation callbacks finish.
+            try { _cancellation.Cancel(); }
+            catch (AggregateException) { /* Cancellation still reached every registered callback. */ }
+            finally
+            {
+                lock (_gate)
+                {
+                    _cancelling--;
+                    if (_completed && _cancelling == 0)
+                        _cancellation.Dispose();
+                }
+            }
         }
     }
 
     /// <summary>Test seam: builds one without the static gate, so a test owns its own index.</summary>
     internal static Task<NameIndexSnapshot?> BuildForTestAsync(string solutionPath, bool persist = false) =>
-        BuildAsync(solutionPath, persist);
+        BuildAsync(solutionPath, persist, default);
 
-    private static async Task<NameIndexSnapshot?> BuildAsync(string solutionPath, bool persist = true)
+    private static async Task<NameIndexSnapshot?> BuildAsync(string solutionPath, bool persist,
+        CancellationToken ct, Func<CancellationToken, Task>? beforeExtract = null)
     {
         try
         {
             var started = Stopwatch.GetTimestamp();
 
-            var files = Walk(solutionPath);
+            ct.ThrowIfCancellationRequested();
+            var files = Walk(solutionPath, ct);
             if (files.Count == 0)
                 return null;
 
@@ -171,16 +247,18 @@ public static class NameIndex
                 .Where(path => path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
-            var cached = persist ? NameIndexStore.TryRead(solutionPath) : null;
-            var (current, stale) = Partition(sources, cached);
+            var cached = persist ? NameIndexStore.TryRead(solutionPath, ct) : null;
+            var (current, stale) = Partition(sources, cached, ct);
 
             if (stale.Count > 0)
-                current.AddRange(await ParseAsync(stale, CancellationToken.None));
+                current.AddRange(await ParseAsync(stale, ct, beforeExtract));
 
+            ct.ThrowIfCancellationRequested();
             var snapshot = new NameIndexSnapshot(files, current);
 
             if (persist && stale.Count > 0)
-                NameIndexStore.TryWrite(solutionPath, current);
+                NameIndexStore.TryWrite(solutionPath, current, ct);
+            ct.ThrowIfCancellationRequested();
 
             ServiceLog.Info(
                 $"Name index for {Path.GetFileNameWithoutExtension(solutionPath)} ready in " +
@@ -189,6 +267,10 @@ public static class NameIndex
                 $"{files.Count} files searchable by name.");
 
             return snapshot;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return null; // The real solution or a newer provisional build replaced this work.
         }
         catch (Exception ex)
         {
@@ -212,13 +294,14 @@ public static class NameIndex
     /// later anyway.
     /// </remarks>
     private static (List<NameSource> Current, List<string> Stale) Partition(
-        IReadOnlyList<string> sources, IReadOnlyDictionary<string, NameSource>? cached)
+        IReadOnlyList<string> sources, IReadOnlyDictionary<string, NameSource>? cached, CancellationToken ct)
     {
         var current = new List<NameSource>(sources.Count);
         var stale = new List<string>();
 
         foreach (string path in sources)
         {
+            ct.ThrowIfCancellationRequested();
             FileInfo info;
             try
             {
@@ -267,8 +350,9 @@ public static class NameIndex
     /// </para>
     /// </remarks>
     private static async Task<List<NameSource>> ParseAsync(
-        IReadOnlyList<string> paths, CancellationToken ct)
+        IReadOnlyList<string> paths, CancellationToken ct, Func<CancellationToken, Task>? beforeExtract)
     {
+        ct.ThrowIfCancellationRequested();
         using var workspace = new AdhocWorkspace();
 
         var projectId = ProjectId.CreateNewId("names");
@@ -303,6 +387,8 @@ public static class NameIndex
             },
             async (document, token) =>
             {
+                if (beforeExtract is not null)
+                    await beforeExtract(token);
                 if (await ExtractAsync(document, token) is { } source)
                     found.Add(source);
             });
@@ -325,6 +411,7 @@ public static class NameIndex
             var declarations = new List<NameDeclaration>(index.DeclaredSymbolInfos.Length);
             foreach (var info in index.DeclaredSymbolInfos)
             {
+                ct.ThrowIfCancellationRequested();
                 if (info.Span.End > text.Length)
                     continue;
 
@@ -361,7 +448,7 @@ public static class NameIndex
     /// the exclusions — build output, tooling folders, whatever a <c>.DotSettings</c> layer adds —
     /// are the ones every other search already obeys.
     /// </remarks>
-    private static IReadOnlyList<string> Walk(string solutionPath)
+    private static IReadOnlyList<string> Walk(string solutionPath, CancellationToken ct)
     {
         var roots = new List<string>();
 
@@ -370,6 +457,7 @@ public static class NameIndex
 
         foreach (string project in PathHelper.GetProjectsFromSolution(solutionPath))
         {
+            ct.ThrowIfCancellationRequested();
             if (Path.GetDirectoryName(Path.GetFullPath(project)) is not { Length: > 0 } directory)
                 continue;
 
@@ -384,8 +472,9 @@ public static class NameIndex
 
         foreach (string root in roots)
         {
-            foreach (string file in SolutionFileIndex.FilesUnder(root, CancellationToken.None))
+            foreach (string file in SolutionFileIndex.FilesUnder(root, ct))
             {
+                ct.ThrowIfCancellationRequested();
                 if (SearchFileRules.IsExcluded(file)
                     || DotSettingsExclusions.IsExcluded(solutionPath, file))
                     continue;
@@ -427,10 +516,11 @@ internal static class NameIndexStore
     private const uint Magic = 0x494E5352; // "RSNI"
     private const int Version = 1;
 
-    public static IReadOnlyDictionary<string, NameSource>? TryRead(string solutionPath)
+    public static IReadOnlyDictionary<string, NameSource>? TryRead(string solutionPath, CancellationToken ct = default)
     {
         try
         {
+            ct.ThrowIfCancellationRequested();
             string file = PathFor(solutionPath);
             if (!File.Exists(file))
                 return null;
@@ -446,6 +536,7 @@ internal static class NameIndexStore
 
             for (int i = 0; i < count; i++)
             {
+                ct.ThrowIfCancellationRequested();
                 string path = reader.ReadString();
                 long length = reader.ReadInt64();
                 long ticks = reader.ReadInt64();
@@ -454,6 +545,7 @@ internal static class NameIndexStore
                 var declarations = new List<NameDeclaration>(declarationCount);
                 for (int d = 0; d < declarationCount; d++)
                 {
+                    ct.ThrowIfCancellationRequested();
                     declarations.Add(new NameDeclaration(
                         reader.ReadString(),
                         reader.ReadString(),
@@ -478,13 +570,14 @@ internal static class NameIndexStore
         }
     }
 
-    public static void TryWrite(string solutionPath, IReadOnlyList<NameSource> sources)
+    public static void TryWrite(string solutionPath, IReadOnlyList<NameSource> sources, CancellationToken ct = default)
     {
         string file = PathFor(solutionPath);
-        string temporary = file + ".tmp";
+        string temporary = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
         try
         {
+            ct.ThrowIfCancellationRequested();
             Directory.CreateDirectory(Path.GetDirectoryName(file)!);
 
             using (var stream = File.Create(temporary))
@@ -496,6 +589,7 @@ internal static class NameIndexStore
 
                 foreach (var source in sources)
                 {
+                    ct.ThrowIfCancellationRequested();
                     writer.Write(source.Path);
                     writer.Write(source.Length);
                     writer.Write(source.ModifiedUtcTicks);
@@ -503,6 +597,7 @@ internal static class NameIndexStore
 
                     foreach (var declaration in source.Declarations)
                     {
+                        ct.ThrowIfCancellationRequested();
                         writer.Write(declaration.Name);
                         writer.Write(declaration.Container);
                         writer.Write((byte)declaration.Kind);
@@ -516,9 +611,13 @@ internal static class NameIndexStore
 
             // Written aside and moved, so a daemon killed mid-write leaves the previous index
             // rather than a half-file the next start has to detect and discard.
+            ct.ThrowIfCancellationRequested();
             File.Move(temporary, file, overwrite: true);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+        finally
         {
             try { File.Delete(temporary); } catch { }
         }

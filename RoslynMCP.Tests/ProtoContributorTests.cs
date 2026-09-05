@@ -289,13 +289,15 @@ public class ProtoContributorTests
     }
 
     [Fact]
-    public void ThePackRegistersNothingThatCouldRewriteADeclaration()
+    public void SchemaRenameIsDocumentOnlyAndNeverJoinsCSharpRenameContributors()
     {
         var registry = new LanguageRegistry([new ProtoLanguage(new MarkdownFormatter())]);
 
-        // Nothing to route a rename through on either front-end. IRenameHandler in particular has
-        // no CanHandle — every registered handler runs on every rename in the solution — so
-        // implementing it would put this pack in the path of every F2 to do nothing.
+        // Schema-initiated rename is explicitly routed by extension. C# rename must never
+        // modify the schema contract through the global contributor lists.
+        Assert.IsAssignableFrom<ILanguageRenameProvider>(Assert.Single(registry.Packs));
+        Assert.NotNull(registry.Resolve<ILanguageRenameProvider>("contract.proto"));
+        Assert.Null(registry.Resolve<ILanguageRenameProvider>("Consumer.cs"));
         Assert.Empty(registry.RenameHandlers);
         Assert.Empty(registry.Contributors<ILanguageRenameContributor>());
         Assert.Empty(registry.Contributors<ISymbolFreeRenameProvider>());

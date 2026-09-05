@@ -42,7 +42,7 @@ internal sealed class CachingProjectFileInfoProvider(
     ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>> inFlight)
     : IProjectFileInfoProvider
 {
-    /// <summary>Evaluations served from disk during this load, by full project path.</summary>
+    /// <summary>Evaluations reused from disk or another provider in this load, by full project path.</summary>
     private readonly ConcurrentDictionary<string, ImmutableArray<ProjectFileInfo>> _served =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -73,7 +73,8 @@ internal sealed class CachingProjectFileInfoProvider(
     /// </summary>
     private readonly SemaphoreSlim _hostGate = new(1, 1);
 
-    /// <summary>How many evaluations the cache answered during this load.</summary>
+    /// <summary>How many evaluations this provider reused, including shared results from other
+    /// providers in this load. This is not the number of physical disk cache reads.</summary>
     public int Hits => _served.Count;
 
     /// <summary>
@@ -109,12 +110,46 @@ internal sealed class CachingProjectFileInfoProvider(
             }
 
             if (EvaluationCache.TryGet(path, properties, out var infos, out _, FingerprintOf(path)))
-                _served[full] = infos;
+                ShareCacheHit(full, infos);
             else
                 misses.Add(path);
         }
 
         return misses;
+    }
+
+    private Lazy<Task<ImmutableArray<ProjectFileInfo>>> ShareCacheHit(
+        string full, ImmutableArray<ProjectFileInfo> infos)
+    {
+        // A warm prewarm used to keep its disk hits only in _served, then return without giving
+        // the batch anything to reuse. Publish the same immutable evaluation in the map already
+        // shared by the prewarm and all conversion shards, scoped to this one load.
+        var cached = new Lazy<Task<ImmutableArray<ProjectFileInfo>>>(() => Task.FromResult(infos));
+        while (true)
+        {
+            var shared = inFlight.GetOrAdd(full, cached);
+            if (ReferenceEquals(shared, cached))
+            {
+                _served[full] = infos;
+                return shared;
+            }
+
+            // A competing provider may have claimed this project while disk was being read.
+            // Adopt that winner, never a different locally read snapshot, and do not start its
+            // host work merely by publishing a cache hit: the actual consumer awaits it later.
+            if (!shared.IsValueCreated)
+                return shared;
+            var task = shared.Value;
+            if (task.IsCompletedSuccessfully)
+            {
+                _served[full] = task.Result;
+                return shared;
+            }
+            if (!task.IsFaulted && !task.IsCanceled)
+                return shared;
+
+            inFlight.TryRemove(new KeyValuePair<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>>(full, shared));
+        }
     }
 
     public async Task<ImmutableArray<ProjectFileInfo>> LoadProjectFileInfosAsync(
@@ -217,8 +252,7 @@ internal sealed class CachingProjectFileInfoProvider(
 
         if (EvaluationCache.TryGet(projectPath, properties, out infos, out _, FingerprintOf(projectPath)))
         {
-            _served[full] = infos;
-            return OutputsOf(infos);
+            return OutputsOf(await ShareCacheHit(full, infos).Value);
         }
 
         ImmutableArray<string> paths;

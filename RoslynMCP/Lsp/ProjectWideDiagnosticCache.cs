@@ -48,11 +48,19 @@ internal static class ProjectWideDiagnosticCache
 
     private sealed record Entry(string Version, FrozenDictionary<string, ImmutableArray<Diagnostic>> ByPath);
 
-    private static readonly ConcurrentDictionary<ProjectId, Entry> s_entries = new();
+    private sealed class ProjectState
+    {
+        public readonly object Gate = new();
+        public readonly Dictionary<string, Lazy<Task<bool>>> InFlight = new();
+        public Entry? Cached;
+        public string? LatestRequested;
+    }
 
-    // Lazy, not Task: ConcurrentDictionary may run a GetOrAdd factory more than once under
-    // contention, and this factory is a full compilation pass.
-    private static readonly ConcurrentDictionary<(ProjectId, string), Lazy<Task<Entry>>> s_inFlight = new();
+    // A clear detaches the entire state, including pending writes. Work already running can
+    // finish for its callers, but cannot repopulate the cache after configuration invalidation.
+    private static readonly ConcurrentDictionary<ProjectId, ProjectState> s_projects = new();
+
+    internal static Func<Project, Task>? BeforeComputeAsyncForTesting { get; set; }
 
     public static async Task<string?> GetVersionAsync(Project project, CancellationToken ct)
     {
@@ -76,10 +84,14 @@ internal static class ProjectWideDiagnosticCache
         }
     }
 
-    public static bool IsComputed(Project project, string? version) =>
-        version is not null
-        && s_entries.TryGetValue(project.Id, out var entry)
-        && entry.Version == version;
+    public static bool IsComputed(Project project, string? version)
+    {
+        if (version is null || !s_projects.TryGetValue(project.Id, out var state))
+            return false;
+
+        lock (state.Gate)
+            return state.Cached?.Version == version;
+    }
 
     /// <summary>
     /// The previous pass's answer, used while the current one is still missing.
@@ -94,14 +106,12 @@ internal static class ProjectWideDiagnosticCache
 
     private static ImmutableArray<Diagnostic> Lookup(Project project, string? filePath)
     {
-        if (filePath is not { Length: > 0 }
-            || !s_entries.TryGetValue(project.Id, out var entry)
-            || !entry.ByPath.TryGetValue(filePath, out var found))
-        {
+        if (filePath is not { Length: > 0 } || !s_projects.TryGetValue(project.Id, out var state))
             return [];
-        }
 
-        return found;
+        lock (state.Gate)
+            return state.Cached is { } entry && entry.ByPath.TryGetValue(filePath, out var found)
+                ? found : [];
     }
 
     /// <summary>Runs the pass, or joins the one already running for this version.</summary>
@@ -111,36 +121,52 @@ internal static class ProjectWideDiagnosticCache
         if (version is null)
             return false;
 
-        if (IsComputed(project, version))
-            return false;
+        var state = s_projects.GetOrAdd(project.Id, static _ => new ProjectState());
+        Lazy<Task<bool>> work;
+        lock (state.Gate)
+        {
+            state.LatestRequested = version;
+            if (state.Cached?.Version == version)
+                return false;
 
-        var before = s_entries.TryGetValue(project.Id, out var previous) ? previous : null;
+            if (!state.InFlight.TryGetValue(version, out work!))
+            {
+                work = new Lazy<Task<bool>>(() => ComputeAndStoreAsync(project, version, state));
+                state.InFlight.Add(version, work);
+            }
+        }
 
-        var key = (project.Id, version);
-        var lazy = s_inFlight.GetOrAdd(key, _ => new Lazy<Task<Entry>>(
-            () => ComputeAsync(project, version, CancellationToken.None),
-            LazyThreadSafetyMode.ExecutionAndPublication));
+        // Cancellation belongs to this waiter. Only the computation removes its flight, so
+        // canceling a sweep cannot start a duplicate full compilation on the next sweep.
+        return await work.Value.WaitAsync(ct);
+    }
 
+    private static async Task<bool> ComputeAndStoreAsync(Project project, string version, ProjectState state)
+    {
         try
         {
-            var computed = await lazy.Value.WaitAsync(ct);
+            if (BeforeComputeAsyncForTesting is { } beforeCompute)
+                await beforeCompute(project);
+            var computed = await ComputeAsync(project, version, CancellationToken.None);
 
-            // Last writer only if it is not the older one. Two versions can be in flight together
-            // when a declaration change lands while a pass is running, and the earlier pass
-            // finishing second must not overwrite the later one's answer.
-            s_entries.AddOrUpdate(
-                project.Id,
-                computed,
-                (_, existing) => existing.Version == version ? existing : computed);
+            lock (state.Gate)
+            {
+                // Version strings have no ordering. Compare the requested version while holding
+                // the same lock as the write, otherwise an older pass can overwrite a new one.
+                if (state.LatestRequested != version
+                    || !s_projects.TryGetValue(project.Id, out var current)
+                    || !ReferenceEquals(current, state))
+                    return false;
 
-            // An empty first pass is not news. Most projects have nothing in this family, and
-            // treating "no previous entry" as movement asked the editor to re-pull every one of
-            // them on the first sweep of the session.
-            return !Same(before ?? Empty, computed);
+                bool changed = !Same(state.Cached ?? Empty, computed);
+                state.Cached = computed;
+                return changed;
+            }
         }
         finally
         {
-            s_inFlight.TryRemove(key, out _);
+            lock (state.Gate)
+                state.InFlight.Remove(version);
         }
     }
 
@@ -190,7 +216,6 @@ internal static class ProjectWideDiagnosticCache
 
     public static void Clear()
     {
-        s_entries.Clear();
-        s_inFlight.Clear();
+        s_projects.Clear();
     }
 }

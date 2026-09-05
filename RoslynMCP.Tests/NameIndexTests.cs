@@ -13,6 +13,7 @@ namespace RoslynMCP.Tests;
 /// a project, and never touch <see cref="WorkspaceService"/>. If any of that were required, the
 /// index would not be able to do its job, which is to answer before any of it has happened.
 /// </remarks>
+[Collection(SharedState.Name)]
 public class NameIndexTests
 {
     [Fact]
@@ -119,6 +120,66 @@ public class NameIndexTests
         Assert.Null(await NameIndex.ReadyBeforeAsync(Task.CompletedTask, default));
 
         NameIndex.Reset();
+    }
+
+    [Theory]
+    [InlineData("retire")]
+    [InlineData("reset")]
+    [InlineData("replace")]
+    public async Task AbandonedBuildCancelsItsParseAndPreservesThePreviousDiskIndex(string action)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "name-index-cancel-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string solution = Path.Combine(directory, "First.slnx");
+        string replacement = Path.Combine(directory, "Second.slnx");
+        string source = Path.Combine(directory, "Names.cs");
+        var entered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<NameIndexSnapshot?>? oldBuild = null, newBuild = null;
+        NameIndex.Reset();
+
+        try
+        {
+            await File.WriteAllTextAsync(solution, "<Solution />");
+            await File.WriteAllTextAsync(replacement, "<Solution />");
+            await File.WriteAllTextAsync(source, "public class CurrentName { }");
+            // This previous entry is deliberately stale. Cancellation must leave its complete
+            // persisted snapshot intact, rather than overwrite it with partially collected names.
+            NameIndexStore.TryWrite(solution, [new NameSource(source, -1, 0, [])]);
+            byte[] previous = await File.ReadAllBytesAsync(NameIndexStore.PathFor(solution));
+            oldBuild = NameIndex.StartForTestAsync(solution, async ct =>
+            {
+                entered.TrySetResult(ct);
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            });
+            var parseToken = await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.False(parseToken.IsCancellationRequested);
+
+            if (action == "retire")
+                NameIndex.Retire();
+            else if (action == "reset")
+                NameIndex.Reset();
+            else
+                newBuild = NameIndex.StartForTestAsync(replacement,
+                    ct => Task.Delay(Timeout.InfiniteTimeSpan, ct));
+
+            Assert.Null(await oldBuild.WaitAsync(TimeSpan.FromSeconds(30)));
+            Assert.True(parseToken.IsCancellationRequested);
+            Assert.True(oldBuild.IsCompletedSuccessfully);
+            Assert.Equal(previous, await File.ReadAllBytesAsync(NameIndexStore.PathFor(solution)));
+            if (action == "retire")
+                Assert.Null(await NameIndex.Start(solution)); // Retirement also prevents rebuilding.
+        }
+        finally
+        {
+            NameIndex.Reset();
+            if (oldBuild is not null)
+                await oldBuild.WaitAsync(TimeSpan.FromSeconds(30));
+            if (newBuild is not null)
+                await newBuild.WaitAsync(TimeSpan.FromSeconds(30));
+            try { File.Delete(NameIndexStore.PathFor(solution)); } catch { }
+            try { File.Delete(NameIndexStore.PathFor(replacement)); } catch { }
+            try { Directory.Delete(directory, recursive: true); } catch { }
+        }
     }
 
     private static async Task<NameIndexSnapshot> BuildAsync()

@@ -35,8 +35,7 @@ namespace RoslynMCP.Services;
 internal static class GeneratorBuildService
 {
     /// <summary>Generator project path → the build currently in flight for it.</summary>
-    private static readonly ConcurrentDictionary<string, Task> s_inflight =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SingleFlight s_inflight = new();
 
     /// <summary>
     /// Generator projects built successfully this session. Only consulted when the output probe
@@ -92,7 +91,7 @@ internal static class GeneratorBuildService
 
             report?.Invoke($"Building source generator {Path.GetFileNameWithoutExtension(generator)}");
 
-            var run = s_inflight.GetOrAdd(generator, static key => RunBuildAsync(key));
+            var run = s_inflight.Start(generator, RunBuildAsync);
             try
             {
                 await run.WaitAsync(cancellationToken);
@@ -105,12 +104,6 @@ internal static class GeneratorBuildService
             {
                 // Reported by RunBuildAsync and then let go: the consumer loads without its
                 // generated code, which is a degraded project rather than a failed request.
-            }
-            finally
-            {
-                // Removed so the next load retries rather than joining a completed run; keyed on
-                // task identity so a newer concurrent run is not dropped out from under its waiters.
-                s_inflight.TryRemove(new KeyValuePair<string, Task>(generator, run));
             }
         }
     }

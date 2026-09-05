@@ -214,6 +214,27 @@ public class WorkspaceServiceTests
             }
 
             Assert.Contains("sentinel-change", text);
+
+            // Consuming a watcher event must not make the next request fall back to the
+            // load-time solution. Queries without a target file need the same refreshed text.
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                var (_, again) = await WorkspaceService.GetOrOpenProjectAsync(
+                    FixturePaths.SampleProjectFile,
+                    targetFilePath: attempt == 0 ? null : FixturePaths.CalculatorFile);
+                Assert.Contains("sentinel-change", await TargetTextAsync(again));
+            }
+
+            // A checkout that restores the original bytes is still a change from the last
+            // refreshed snapshot. It must not resurrect a memoized intermediate edit.
+            await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
+            File.SetLastWriteTimeUtc(FixturePaths.WorkspaceRefreshTargetFile, DateTime.UtcNow.AddMinutes(6));
+            var (_, restored) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile, targetFilePath: FixturePaths.WorkspaceRefreshTargetFile);
+            Assert.Equal(originalContent, await TargetTextAsync(restored));
+            var (_, restoredAgain) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile, targetFilePath: FixturePaths.CalculatorFile);
+            Assert.Equal(originalContent, await TargetTextAsync(restoredAgain));
         }
         finally
         {
@@ -275,6 +296,48 @@ public class WorkspaceServiceTests
         finally
         {
             await File.WriteAllTextAsync(FixturePaths.WorkspaceRefreshTargetFile, originalContent);
+            await WorkspaceService.EvictAllAsync();
+        }
+    }
+
+    [Fact]
+    public async Task AnOverflowDuringALoadIsRetriedAndCommittedAfterTheLoad()
+    {
+        await WorkspaceService.EvictAllAsync();
+        string path = FixturePaths.WorkspaceRefreshTargetFile;
+        string original = await File.ReadAllTextAsync(path);
+        var stamp = File.GetLastWriteTimeUtc(path);
+        try
+        {
+            var (_, initial) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile, targetFilePath: FixturePaths.CalculatorFile);
+            Assert.Equal(original, await TargetTextAsync(initial));
+            var (gate, watcher) = await WorkspaceService.RefreshStateForTests(FixturePaths.SampleProjectFile);
+            await gate.WaitAsync();
+            try
+            {
+                await File.WriteAllTextAsync(path, original + "\n// overflow edit");
+                File.SetLastWriteTimeUtc(path, stamp); // a checkout can preserve timestamps
+                watcher.MarkOverflow();
+                var (_, deferred) = await WorkspaceService.GetOrOpenProjectAsync(
+                    FixturePaths.SampleProjectFile, targetFilePath: FixturePaths.CalculatorFile);
+                Assert.Contains("overflow edit", await TargetTextAsync(deferred));
+                Assert.True(watcher.TakeOverflow());
+                watcher.MarkOverflow();
+            }
+            finally { gate.Release(); }
+
+            var (workspace, committed) = await WorkspaceService.GetOrOpenProjectAsync(
+                FixturePaths.SampleProjectFile, targetFilePath: FixturePaths.CalculatorFile);
+            Assert.Contains("overflow edit", await TargetTextAsync(committed));
+            Assert.Contains("overflow edit", await TargetTextAsync(workspace.CurrentSolution.GetProject(committed.Id)!));
+            var (_, again) = await WorkspaceService.GetOrOpenProjectAsync(FixturePaths.SampleProjectFile);
+            Assert.Contains("overflow edit", await TargetTextAsync(again));
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(path, original);
+            File.SetLastWriteTimeUtc(path, stamp);
             await WorkspaceService.EvictAllAsync();
         }
     }

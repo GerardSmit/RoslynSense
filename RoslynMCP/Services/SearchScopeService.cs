@@ -105,7 +105,7 @@ internal static class SearchScopeService
                 // Un-memoised on failure: a faulted task left in the cache is awaited by every
                 // later navigation from this project and re-throws the same failure for the life
                 // of the process.
-                s_consumers.TryRemove(path, out _);
+                ForgetConsumerLoad(path, workspace, consumers);
             }
 
             // Re-read: the load added projects to the workspace, and the snapshot taken above
@@ -129,14 +129,14 @@ internal static class SearchScopeService
     /// The consumer-loading task for this project in this workspace, started if there is not one
     /// already, and restarted when the workspace it was started against has been replaced.
     /// </summary>
-    private static Task ConsumerLoadFor(string path, Workspace workspace)
+    internal static Task ConsumerLoadFor(string path, Workspace workspace, Func<Task>? load = null)
     {
         while (true)
         {
             if (s_consumers.TryGetValue(path, out var existing))
             {
                 if (ReferenceEquals(existing.Workspace, workspace))
-                    return existing.Load;
+                    return existing.Load.Value;
 
                 // Stale: the workspace this was loaded into is gone. Drop it and fall through to
                 // start a fresh one. A racing caller that gets there first wins, and this loop
@@ -148,14 +148,27 @@ internal static class SearchScopeService
             // Detached from the caller's token deliberately: a load abandoned half way leaves the
             // workspace in the state the next caller would have to redo, and this task outlives
             // any one request by design.
-            var started = new ConsumerLoad(workspace, LoadConsumersAsync(path, CancellationToken.None));
+            // Constructing a losing candidate must not start a second project scan/load. The
+            // winning lazy also publishes the same task to callers arriving during its startup.
+            var started = new ConsumerLoad(workspace, new Lazy<Task>(
+                load ?? (() => LoadConsumersAsync(path, CancellationToken.None)),
+                LazyThreadSafetyMode.ExecutionAndPublication));
 
             if (s_consumers.TryAdd(path, started))
-                return started.Load;
+                return started.Load.Value;
         }
     }
 
-    private sealed record ConsumerLoad(Workspace Workspace, Task Load);
+    internal static void ForgetConsumerLoad(string path, Workspace workspace, Task? expectedLoad = null)
+    {
+        // Another waiter may already have retired this failure and installed a retry in the
+        // same workspace. Only the task that failed may remove its memoized entry.
+        if (s_consumers.TryGetValue(path, out var existing) && ReferenceEquals(existing.Workspace, workspace)
+            && (expectedLoad is null || (existing.Load.IsValueCreated && ReferenceEquals(existing.Load.Value, expectedLoad))))
+            s_consumers.TryRemove(new KeyValuePair<string, ConsumerLoad>(path, existing));
+    }
+
+    private sealed record ConsumerLoad(Workspace Workspace, Lazy<Task> Load);
 
     private static readonly ConcurrentDictionary<string, ConsumerLoad> s_consumers =
         new(StringComparer.OrdinalIgnoreCase);

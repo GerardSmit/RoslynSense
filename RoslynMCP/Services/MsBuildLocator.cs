@@ -15,22 +15,19 @@ internal static class MsBuildLocator
     private static readonly string s_toolsDirectory = Path.Combine(
         Path.GetTempPath(), "RoslynMCP", "Tools");
 
-    private static string? _cachedPath;
-    private static bool _searched;
-    private static string? _cachedVsWherePath;
-    private static bool _vsWhereSearched;
+    // Publish completed discoveries only. Marking a search as done before its subprocess or
+    // download returned allowed concurrent startup callers to observe null and permanently
+    // cache "Visual Studio unavailable" while its discovery was still running.
+    private static readonly Lazy<string?> s_msbuildPath =
+        new(LocateMsBuild, LazyThreadSafetyMode.ExecutionAndPublication);
+    private static readonly Lazy<string?> s_vsWherePath =
+        new(FindOrDownloadVsWhere, LazyThreadSafetyMode.ExecutionAndPublication);
 
     /// <summary>
     /// Returns the full path to MSBuild.exe, or null if not found.
     /// Result is cached after the first call.
     /// </summary>
-    public static string? FindMsBuild()
-    {
-        if (_searched) return _cachedPath;
-        _searched = true;
-        _cachedPath = LocateMsBuild();
-        return _cachedPath;
-    }
+    public static string? FindMsBuild() => s_msbuildPath.Value;
 
     /// <summary>
     /// Returns the path to vswhere.exe, downloading it from GitHub if not already installed.
@@ -40,10 +37,7 @@ internal static class MsBuildLocator
     public static string? EnsureVsWhere()
     {
         if (!OperatingSystem.IsWindows()) return null;
-        if (_vsWhereSearched) return _cachedVsWherePath;
-        _vsWhereSearched = true;
-        _cachedVsWherePath = FindOrDownloadVsWhere();
-        return _cachedVsWherePath;
+        return s_vsWherePath.Value;
     }
 
     private static string? FindOrDownloadVsWhere()

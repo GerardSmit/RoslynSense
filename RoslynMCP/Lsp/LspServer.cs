@@ -314,6 +314,7 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("textDocument/didOpen", UseSingleObjectParameterDeserialization = true)]
     public void DidOpen(DidOpenTextDocumentParams p)
     {
+        SolutionWarmup.NotifyActivity();
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         OpenDocumentStore.Open(SessionId, path,
             SourceText.From(p.TextDocument.Text), p.TextDocument.Version);
@@ -343,6 +344,7 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("textDocument/didChange", UseSingleObjectParameterDeserialization = true)]
     public void DidChange(DidChangeTextDocumentParams p)
     {
+        SolutionWarmup.NotifyActivity();
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         string? diverged = null;
 
@@ -722,7 +724,8 @@ internal sealed class LspServer : IDisposable
     /// scrolls, for instance — never silently pulls another project into the workspace.
     /// </summary>
     [JsonRpcMethod("roslynSense/diagnosticsCounters")]
-    public DiagnosticsCounters DiagnosticsCounters() => new(Services.WorkspaceService.IncrementalLoadCount);
+    public DiagnosticsCounters DiagnosticsCounters() => new(Services.WorkspaceService.IncrementalLoadCount,
+        SolutionWarmup.IsLoading, SolutionWarmup.IsPrepared);
 
     [JsonRpcMethod("roslynSense/searchEverywhere", UseSingleObjectParameterDeserialization = true)]
     public Task<SearchEverywhereResult> SearchEverywhere(SearchEverywhereParams p, CancellationToken ct) =>
@@ -773,6 +776,7 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("textDocument/didClose", UseSingleObjectParameterDeserialization = true)]
     public void DidClose(DidCloseTextDocumentParams p)
     {
+        SolutionWarmup.NotifyActivity();
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         OpenDocumentStore.Close(SessionId, path);
         _diagnostics?.Clear(path);
@@ -860,6 +864,7 @@ internal sealed class LspServer : IDisposable
     private static async Task<T> Guarded<T>(
         string uri, Func<Task<T>> body, Func<T>? whenBroken = null, [CallerMemberName] string method = "")
     {
+        using var foreground = Search.ForegroundGate.Busy();
         try
         {
             return await body();
@@ -1361,6 +1366,7 @@ internal sealed class LspServer : IDisposable
     public void Dispose()
     {
         LspSessionRegistry.Unregister(SessionId);
+        if (!LspSessionRegistry.HasSessions) SolutionWarmup.Reset();
         OpenDocumentStore.CloseSession(SessionId);
         Handlers.SemanticTokensHandler.Forget(SessionId);
         _diagnostics?.Dispose();

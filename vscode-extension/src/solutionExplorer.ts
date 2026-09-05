@@ -610,7 +610,10 @@ export function registerSolutionExplorer(
     /// which is also the only way to collapse a subtree, since VS Code exposes no collapse API.
     const refresh = (node?: SolutionTreeNode) => changeEmitter.fire(node);
 
+    // Project loading and restores change the rows. Subscribe once for the view's lifetime:
+    // registering here for every active-client change multiplies refreshes after root switches.
     context.subscriptions.push(
+        onProjectSetChanged(() => refresh()),
         vscode.workspace.onDidChangeConfiguration((event) => {
             if (event.affectsConfiguration('roslynSense.solutionExplorer.fileIcons')) {
                 fileIconsFromTheme = readFileIconSource();
@@ -625,26 +628,20 @@ export function registerSolutionExplorer(
     // up blank and stayed blank: not slowness, no answer. The roots themselves cost a .sln parse
     // on the server and no MSBuild at all, so this is one cheap re-ask as soon as there is
     // somebody to ask.
+    let clientStateChanges: vscode.Disposable | undefined;
+    context.subscriptions.push({ dispose: () => clientStateChanges?.dispose() });
     onClientReady(context, getClient, (client) => {
         refresh();
-
-        // Which projects are loaded is drawn on the rows, and the server loads them in the
-        // background — so without this the tree keeps saying "loading…" over a solution that
-        // finished loading a minute ago, until somebody presses refresh. Through the shared
-        // signal rather than the notification, because the settings panel needs it too and
-        // `onNotification` would hand it to whichever of them subscribed last.
-        context.subscriptions.push(onProjectSetChanged(() => refresh()));
 
         // And again on every transition into Running. Binding to another solution, or a restart,
         // puts the client through Starting — during which fetchChildren has nothing to ask and
         // answers empty. Without this the view stays empty until the user touches it.
-        context.subscriptions.push(
-            client.onDidChangeState((e) => {
-                if (e.newState === State.Running) {
-                    refresh();
-                }
-            })
-        );
+        clientStateChanges?.dispose();
+        clientStateChanges = client.onDidChangeState((e) => {
+            if (e.newState === State.Running) {
+                refresh();
+            }
+        });
     });
 
     /**

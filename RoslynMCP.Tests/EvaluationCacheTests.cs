@@ -201,6 +201,104 @@ public class EvaluationCacheTests : IDisposable
     }
 
     [Fact]
+    public void AbsentAncestorPropsDiffersFromAnEmptyFile()
+    {
+        string props = Path.Combine(_projectDir, "Directory.Build.props");
+        string absent = EvaluationCache.Fingerprint(_projectPath, Properties);
+        File.WriteAllText(props, "");
+        Assert.NotEqual(absent, EvaluationCache.Fingerprint(_projectPath, Properties));
+        File.Delete(props);
+        Assert.Equal(absent, EvaluationCache.Fingerprint(_projectPath, Properties));
+    }
+
+    [Fact]
+    public async Task PrewarmDiskHitIsReusedByOtherProvidersOnlyWithinTheSameLoad()
+    {
+        await StoreThenGetAsync(Properties);
+        var shared = SharedBuildHost.NewEvaluationMap();
+        var hostResult = MakeInfo();
+        var host = new RecordingEvaluationProvider([hostResult]);
+        var inner = new Lazy<IProjectFileInfoProvider>(() => host);
+        var prewarm = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        Assert.Empty(prewarm.Probe([_projectPath]));
+        var first = await prewarm.LoadProjectFileInfosAsync(_projectPath, default, default);
+
+        // A second disk lookup would now reject the old fingerprint and reach the host. Providers
+        // in this batch must share the already validated immutable result instead of re-reading it.
+        File.WriteAllText(_projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup /></Project>");
+        var conversion = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        Assert.Empty(conversion.Probe([_projectPath]));
+        var reused = await conversion.LoadProjectFileInfosAsync(_projectPath, default, default);
+        Assert.Same(first[0], reused[0]);
+        var reference = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        var outputs = await reference.GetProjectOutputPathsAsync(_projectPath, default);
+        Assert.Contains(first[0].OutputFilePath!, outputs);
+        Assert.False(inner.IsValueCreated);
+        Assert.Empty(prewarm.HostEvaluated);
+        Assert.Empty(conversion.HostEvaluated);
+
+        // A later load gets its own map, revalidates changed inputs, and evaluates afresh.
+        var reload = new CachingProjectFileInfoProvider(Properties, inner, SharedBuildHost.NewEvaluationMap());
+        Assert.Equal<string>([_projectPath], reload.Probe([_projectPath]));
+        var changed = await reload.LoadProjectFileInfosAsync(_projectPath, default, default);
+        Assert.Same(hostResult, changed[0]);
+        Assert.Equal(1, host.LoadCalls);
+        await EvaluationCache.WhenStoresIdleAsync();
+    }
+
+    [Fact]
+    public async Task OutputPathDiskHitIsSharedWithLaterProjectConversion()
+    {
+        await StoreThenGetAsync(Properties);
+        var shared = SharedBuildHost.NewEvaluationMap();
+        var inner = new Lazy<IProjectFileInfoProvider>(() => throw new InvalidOperationException("Unexpected host evaluation"));
+        var reference = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        var outputs = await reference.GetProjectOutputPathsAsync(_projectPath, default);
+        File.WriteAllText(_projectPath, "<Project />");
+
+        var conversion = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        var reused = await conversion.LoadProjectFileInfosAsync(_projectPath, default, default);
+        Assert.Contains(reused[0].OutputFilePath!, outputs);
+        Assert.False(inner.IsValueCreated);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProbeRetiresFailedSharedWorkAndPublishesTheDiskHit(bool cancelled)
+    {
+        await StoreThenGetAsync(Properties);
+        var shared = SharedBuildHost.NewEvaluationMap();
+        var failed = new Lazy<Task<ImmutableArray<ProjectFileInfo>>>(() => cancelled
+            ? Task.FromCanceled<ImmutableArray<ProjectFileInfo>>(new CancellationToken(canceled: true))
+            : Task.FromException<ImmutableArray<ProjectFileInfo>>(new IOException("Evaluation failed")));
+        shared[_projectPath] = failed;
+        var inner = new Lazy<IProjectFileInfoProvider>(() => throw new InvalidOperationException("Unexpected host evaluation"));
+        var prewarm = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        Assert.Empty(prewarm.Probe([_projectPath]));
+        Assert.NotSame(failed, shared[_projectPath]);
+        File.WriteAllText(_projectPath, "<Project />");
+        var conversion = new CachingProjectFileInfoProvider(Properties, inner, shared);
+        Assert.Single(await conversion.LoadProjectFileInfosAsync(_projectPath, default, default));
+        Assert.False(inner.IsValueCreated);
+    }
+
+    private sealed class RecordingEvaluationProvider(ImmutableArray<ProjectFileInfo> infos) : IProjectFileInfoProvider
+    {
+        public int LoadCalls { get; private set; }
+
+        public Task<ImmutableArray<ProjectFileInfo>> LoadProjectFileInfosAsync(
+            string projectPath, DiagnosticReportingOptions reportingOptions, CancellationToken cancellationToken)
+        {
+            LoadCalls++;
+            return Task.FromResult(infos);
+        }
+
+        public Task<ImmutableArray<string>> GetProjectOutputPathsAsync(string projectPath, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Unexpected output path evaluation");
+    }
+
+    [Fact]
     public async Task MissesAfterTheRestoreGraphChanges()
     {
         var (hit, _, _) = await StoreThenGetAsync(Properties);

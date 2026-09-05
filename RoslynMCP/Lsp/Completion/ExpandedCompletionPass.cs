@@ -28,12 +28,11 @@ namespace RoslynMCP.Lsp.Completion;
 /// moves off the keystroke.
 /// </para>
 /// <para>
-/// The background pass is memoized on (document, completion span start, text checksum), so the
+/// The background pass is memoized on the exact document snapshot, position and text, so the
 /// request that pays for it is rarely the one that started it: the list is marked
 /// <c>isIncomplete</c> whenever a prefix exists, the client re-queries at the same position, and
-/// the finished pass merges into that request instead. The checksum in the key is the invalidation
-/// — one keystroke gives a different key, and the stale entry is dropped rather than merged into a
-/// buffer it no longer describes.
+/// the finished pass merges into that request instead. Snapshot identity also covers dependencies
+/// and project options: their changes can alter the offered names while this buffer stays untouched.
 /// </para>
 /// </remarks>
 internal static class ExpandedCompletionPass
@@ -50,12 +49,13 @@ internal static class ExpandedCompletionPass
     /// test holds an expanded pass open instead of racing it.</summary>
     internal static volatile Task Gate = Task.CompletedTask;
 
-    /// <summary>What a memoized pass is keyed by. The checksum is the document version: any edit
-    /// produces a different one, and with it a different key.</summary>
-    internal readonly record struct PassKey(DocumentId? Document, int SpanStart, string Checksum);
+    /// <summary>The text and position inputs, in addition to the exact document snapshot.</summary>
+    internal readonly record struct PassKey(
+        DocumentId? Document, int SpanStart, string Checksum, int Caret, CompletionTrigger Trigger);
 
     private static readonly object s_gate = new();
     private static PassKey s_key;
+    private static WeakReference<Document>? s_document;
     private static Task<RoslynCompletionList?>? s_task;
 
     /// <summary>Test seam: the memoized task, or <c>null</c> if none has been started.</summary>
@@ -76,6 +76,7 @@ internal static class ExpandedCompletionPass
         lock (s_gate)
         {
             s_key = default;
+            s_document = null;
             s_task = null;
         }
     }
@@ -93,16 +94,19 @@ internal static class ExpandedCompletionPass
         RoslynCompletionOptions options,
         CompletionTrigger trigger)
     {
-        var key = new PassKey(document.Id, spanStart, Checksum(text));
+        var key = new PassKey(document.Id, spanStart, Checksum(text), caret, trigger);
 
         lock (s_gate)
         {
             // A faulted pass is not memoized: the next request should try again rather than
             // inherit a failure for as long as the buffer stays untouched.
-            if (s_task is { } existing && s_key == key && !existing.IsFaulted && !existing.IsCanceled)
+            if (s_task is { } existing && s_key == key && !existing.IsFaulted && !existing.IsCanceled
+                && s_document is { } weak && weak.TryGetTarget(out var cachedDocument)
+                && ReferenceEquals(cachedDocument, document))
                 return existing;
 
             s_key = key;
+            s_document = new WeakReference<Document>(document);
             return s_task = Task.Run(() => RunAsync(service, document, caret, options, trigger));
         }
     }
@@ -174,6 +178,7 @@ internal static class ExpandedCompletionPass
             {
                 s_task = null;
                 s_key = default;
+                s_document = null;
             }
         }
 

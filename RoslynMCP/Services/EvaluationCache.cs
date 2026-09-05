@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -88,6 +89,7 @@ internal static class EvaluationCache
         ImmutableArray<string> ExtraExtensions = default);
 
     private static readonly JsonSerializerOptions s_json = new() { WriteIndented = false };
+    private static readonly bool s_timing = Environment.GetEnvironmentVariable("ROSLYNMCP_EVAL_TIMING") == "1";
 
     /// <summary>
     /// Whether an entry for this project exists on disk at all — no deserialization, no
@@ -134,6 +136,9 @@ internal static class EvaluationCache
         if (!Enabled)
             return false;
 
+        var timing = s_timing ? Stopwatch.StartNew() : null;
+        double readMs = 0, fingerprintMs = 0;
+        bool hit = false;
         try
         {
             string file = EntryPath(projectPath, properties);
@@ -141,18 +146,21 @@ internal static class EvaluationCache
                 return false;
 
             var entry = JsonSerializer.Deserialize<Entry>(File.ReadAllBytes(file), s_json);
+            readMs = timing?.Elapsed.TotalMilliseconds ?? 0;
             if (entry is null || entry.Version != FormatVersion || entry.Infos.IsDefault)
                 return false;
 
             var extras = entry.ExtraExtensions.IsDefault ? [] : entry.ExtraExtensions;
             string current = fingerprintOf?.Invoke(extras)
                 ?? Fingerprint(projectPath, properties, extras);
+            fingerprintMs = (timing?.Elapsed.TotalMilliseconds ?? 0) - readMs;
             if (entry.Fingerprint != current)
                 return false;
 
             infos = entry.Infos;
             outputPaths = entry.OutputPaths.IsDefault ? [] : entry.OutputPaths;
             Interlocked.Increment(ref HitCount);
+            hit = true;
             return true;
         }
         catch (Exception)
@@ -160,6 +168,13 @@ internal static class EvaluationCache
             // A torn write, a JSON shape from a different tool version, a file lock — every one of
             // them means "evaluate normally", never "fail the load".
             return false;
+        }
+        finally
+        {
+            if (timing is not null)
+                Console.Error.WriteLine(
+                    $"[EvalCacheTiming] {Path.GetFileName(projectPath)} hit={hit} "
+                    + $"read={readMs:F1}ms fingerprint={fingerprintMs:F1}ms total={timing.Elapsed.TotalMilliseconds:F1}ms");
         }
     }
 
@@ -268,7 +283,12 @@ internal static class EvaluationCache
             AddText(label);
             try
             {
-                sha.AppendData(File.ReadAllBytes(path));
+                // Most ancestors have neither Directory.Build.props nor .targets. Their normal
+                // absence should not allocate and throw FileNotFoundException on every probe.
+                if (File.Exists(path))
+                    sha.AppendData(File.ReadAllBytes(path));
+                else
+                    AddText("<absent>");
             }
             catch (Exception)
             {

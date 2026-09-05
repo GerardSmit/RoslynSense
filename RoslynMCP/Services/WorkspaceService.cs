@@ -291,16 +291,11 @@ internal static class WorkspaceService
     /// <inheritdoc cref="HostComposition.WarmInBackground"/>
     public static void WarmHostServicesInBackground() => HostComposition.WarmInBackground();
 
-    private static Dictionary<string, string> CreateDefaultProperties() => new()
-    {
-        { "AlwaysUseNETSdkDefaults", "true" },
-        { "DesignTimeBuild", "true" }
-    };
+    private static Dictionary<string, string> CreateDefaultProperties() =>
+        WorkspaceBuildProperties.Create(isLegacy: false, BoundSolutionPath);
 
-    private static Dictionary<string, string> CreateLegacyProperties() => new()
-    {
-        { "DesignTimeBuild", "true" }
-    };
+    private static Dictionary<string, string> CreateLegacyProperties() =>
+        WorkspaceBuildProperties.Create(isLegacy: true, BoundSolutionPath);
 
     /// <summary>
     /// One-time static initializer that registers a Visual Studio MSBuild instance
@@ -635,6 +630,7 @@ internal static class WorkspaceService
         Workspace workspace;
         Project openedProject;
         ShadowCopyAnalyzerAssemblyLoader? shadowLoader = null;
+        List<SourceText>? loadedOpenTexts = null;
         bool notifyLoaded = false;
         HashSet<string>? shadowDirs = null;
         string? decompileTempDir = null;
@@ -720,22 +716,9 @@ internal static class WorkspaceService
                         // later are added to THIS same workspace incrementally — sharing
                         // already-loaded references — instead of loading the whole solution up front.
                         //
-                        // Deliberately still OpenProjectAsync, even though the shared BuildHost
-                        // evaluates the same project about a second faster — measured, on this very
-                        // path: 1,429 ms through a fresh host against 276 ms through a warm one.
-                        //
-                        // Routing the seed through the pool passes in isolation and fails under a
-                        // parallel test run: seven tests covering rename, file operations, document
-                        // formatting and completion break together, and only when other tests are
-                        // loading projects at the same time. UpdateReferencesAfterAdd — the obvious
-                        // candidate, and the thing OpenProjectAsync does that a bare OnProjectAdded
-                        // does not — is not the difference; adding it changed nothing.
-                        //
-                        // Something about a first, workspace-creating load is not reproduced by
-                        // adding project models to an empty workspace, and until that is understood
-                        // the second is not worth a second. The batch path below does use the pool:
-                        // it adds to a workspace this call already created, which is a different and
-                        // demonstrably safe situation.
+                        // Cached evaluations and the batch path share this loader. Rewire and
+                        // heal references after adding the returned models, including references
+                        // to projects whose output assemblies have not been built yet.
                         var solutionForMap = msbuildWorkspace.CurrentSolution;
                         var seedInfos = await SharedBuildHost.LoadAsync(
                             msbuildWorkspace, msbuildWorkspace.Properties, [normalizedPath],
@@ -760,6 +743,8 @@ internal static class WorkspaceService
                     var openedId = openedProject.Id;
                     (shadowLoader, shadowDirs) = ApplyPostOpenPipeline(
                         msbuildWorkspace, newProjects: null, existingLoader: null);
+                    loadedOpenTexts = await PrepareLoadedOpenBuffersAsync(
+                        msbuildWorkspace, newProjects: null, cancellationToken);
                     phases.Mark(ref phases.PipelineMs);
                     openedProject = msbuildWorkspace.CurrentSolution.GetProject(openedId)!;
 
@@ -864,6 +849,7 @@ internal static class WorkspaceService
         }
 
         ourTcs!.TrySetResult(result);
+        GC.KeepAlive(loadedOpenTexts);
 
         // After the waiters are released and the lock is gone: the client re-pulls in response,
         // and re-pulling must not queue behind the load it is reacting to.
@@ -987,6 +973,7 @@ internal static class WorkspaceService
                 return; // already present transitively; mappings unchanged
 
             var (loader, dirs) = ApplyPostOpenPipeline(ws, newIds, entry.ShadowLoader);
+            var loadedOpenTexts = await PrepareLoadedOpenBuffersAsync(ws, newIds, cancellationToken);
             phases.Mark(ref phases.PipelineMs);
 
             await s_cacheLock.WaitAsync(cancellationToken);
@@ -1007,6 +994,7 @@ internal static class WorkspaceService
             {
                 s_cacheLock.Release();
             }
+            GC.KeepAlive(loadedOpenTexts);
         }
         finally
         {
@@ -1442,11 +1430,12 @@ internal static class WorkspaceService
 
             gateMs = watch.ElapsedMilliseconds - evaluateMs;
 
-            // A project the ProjectMap matched to one already in the solution comes back with that
-            // project's own id; AddProjectsAndRewireReferences skips those, so this counts what
-            // genuinely arrived.
-            added = loaded.Count(i => !live.CurrentSolution.ContainsProject(i.Id));
+            // Include projects the reference healer adds as well as the evaluated batch. Existing
+            // projects retain their models, so only the actual additions need the post-open work.
+            var beforeIds = live.CurrentSolution.ProjectIds.ToHashSet();
             await AddProjectsRewireAndHealAsync(live, loaded, cancellationToken);
+            var newIds = live.CurrentSolution.ProjectIds.Where(id => !beforeIds.Contains(id)).ToHashSet();
+            added = newIds.Count;
 
             if (added == 0)
             {
@@ -1460,7 +1449,8 @@ internal static class WorkspaceService
             // Over the newly added projects only, and while they are still unreachable by any other
             // caller: the analyzer rebind has to happen before anything asks them for a compilation.
             var (loader, dirs) = ApplyPostOpenPipeline(
-                live, [.. loaded.Select(i => i.Id)], entry.ShadowLoader);
+                live, newIds, entry.ShadowLoader);
+            var loadedOpenTexts = await PrepareLoadedOpenBuffersAsync(live, newIds, cancellationToken);
 
             await s_cacheLock.WaitAsync(cancellationToken);
             try
@@ -1476,6 +1466,7 @@ internal static class WorkspaceService
             {
                 s_cacheLock.Release();
             }
+            GC.KeepAlive(loadedOpenTexts);
 
             // The gutter beside the caret was computed against the smaller solution.
             ReconcileOpenBuffersAfterLoad();
@@ -1816,8 +1807,14 @@ internal static class WorkspaceService
             RestoreService.StartSolutionRestoreInBackground(BoundSolutionPath);
             WarmHostServicesInBackground();
 
-            if (PathHelper.GetProjectsFromSolution(BoundSolutionPath).FirstOrDefault() is { } anyProject)
-                SharedBuildHost.WarmInBackground(CreateDefaultProperties().ToImmutableDictionary(), anyProject);
+            // A cached solution can load without an MSBuild process. Starting synthetic builds
+            // anyway competes with the first completion and can hold a pool gate a cached load
+            // needs. Entry presence is only a warm-up hint: the real load still validates every
+            // fingerprint and starts a host on demand if an entry is stale or unreadable.
+            var properties = CreateDefaultProperties().ToImmutableDictionary();
+            if (PathHelper.GetProjectsFromSolution(BoundSolutionPath)
+                    .FirstOrDefault(project => !EvaluationCache.HasEntry(project, properties)) is { } uncachedProject)
+                SharedBuildHost.WarmInBackground(properties, uncachedProject);
         }
     }
 
@@ -2115,6 +2112,20 @@ internal static class WorkspaceService
     /// <summary>Evicts only the single entry serving <paramref name="projectPath"/> (no global sweep).</summary>
     internal static Task EvictProjectForTests(string projectPath) => EvictProjectAsync(projectPath);
 
+    internal static async Task<(SemaphoreSlim Gate, WorkspaceDirtyWatcher Watcher)> RefreshStateForTests(
+        string projectPath)
+    {
+        await s_cacheLock.WaitAsync();
+        try
+        {
+            if (!TryGetValidCachedEntryLocked(Path.GetFullPath(projectPath), out var entry)
+                || entry!.DirtyWatcher is not { } watcher)
+                throw new InvalidOperationException("The test needs a loaded workspace with a file watcher.");
+            return (entry.LoadGate, watcher);
+        }
+        finally { s_cacheLock.Release(); }
+    }
+
     /// <summary>
     /// Evicts the cached workspace entry serving <paramref name="projectPath"/>, leaving other
     /// solutions loaded. Used when a change is known to be local to one project — a source file
@@ -2165,6 +2176,60 @@ internal static class WorkspaceService
     }
 
     /// <summary>
+    /// Materializes and reconciles open documents before publishing newly loaded projects.
+    /// Called on an unpublished workspace or while its load gate is held, never under the cache lock.
+    /// </summary>
+    private static async Task<List<SourceText>> PrepareLoadedOpenBuffersAsync(
+        MSBuildWorkspace workspace, IReadOnlySet<ProjectId>? newProjects, CancellationToken ct)
+    {
+        var retained = new List<SourceText>();
+        foreach (string path in OpenDocumentStore.OpenPaths())
+        {
+            foreach (var id in workspace.CurrentSolution.GetDocumentIdsWithFilePath(path))
+            {
+                if (newProjects is not null && !newProjects.Contains(id.ProjectId))
+                    continue;
+                var document = workspace.CurrentSolution.GetDocument(id);
+                if (document is null)
+                    continue;
+
+                // TryGetText in the synchronous overlay cannot distinguish a cold file from
+                // an actual edit. Publishing first therefore forked even an unchanged didOpen;
+                // its first compilation was then discarded when another project joined the base.
+                var disk = await document.GetTextAsync(ct);
+                retained.Add(disk);
+
+                // A change or close can arrive while the loader reads the file. Read the latest
+                // buffer only after that await; never hold a store/path lock across asynchronous work.
+                if (!OpenDocumentStore.TryGet(path, out var text))
+                    continue;
+                if (disk.ContentEquals(text))
+                    RememberMatchingOpenText(document, text);
+                else
+                    workspace.OnDocumentTextChanged(id, text, PreservationMode.PreserveIdentity);
+            }
+        }
+
+        // Roslyn may hold file text weakly. The caller retains these only until publication so
+        // the first overlay sees the materialized texts without extending workspace lifetimes.
+        return retained;
+    }
+
+    // File text can be collected between batch publication and the first request. Remember the
+    // equality already established for this exact immutable document and buffer, so a cold
+    // TryGetText is not mistaken for an edit. Both keys and buffer values are weak: closing a
+    // buffer or replacing a document cannot retain its text or any old solution/compilation.
+    private static readonly ConditionalWeakTable<TextDocumentState, WeakReference<SourceText>> s_matchingOpenTexts = new();
+
+    private static void RememberMatchingOpenText(Document document, SourceText text) =>
+        s_matchingOpenTexts.GetValue(document.State, _ => new WeakReference<SourceText>(text)).SetTarget(text);
+
+    private static bool HasMatchingOpenText(Document document, SourceText text) =>
+        s_matchingOpenTexts.TryGetValue(document.State, out var known)
+        && known.TryGetTarget(out var matching)
+        && ReferenceEquals(matching, text);
+
+    /// <summary>
     /// Re-applies every open buffer once a load has finished with the gate.
     /// </summary>
     /// <remarks>
@@ -2175,8 +2240,8 @@ internal static class WorkspaceService
     /// quietly took over again. Every load path has to close that window, not just the first one:
     /// the incremental adds are the F12-into-an-unloaded-project case the bridge is really for.
     ///
-    /// Not awaited: the request that triggered the load is waiting on it, and re-applying N buffers
-    /// across M workspaces has nothing to tell that request.
+    /// Newly loaded documents were reconciled before publication. This asynchronous pass covers
+    /// buffers opened or changed during that handoff and other already loaded workspaces.
     /// </remarks>
     private static void ReconcileOpenBuffersAfterLoad() =>
         _ = Task.Run(async () =>
@@ -3038,9 +3103,8 @@ internal static class WorkspaceService
 
 
     /// <summary>
-    /// Returns an immutable project snapshot with refreshed text for
-    /// <paramref name="filePath"/> when the file on disk really differs from what the workspace
-    /// holds. The workspace's internal solution is unchanged.
+    /// Refreshes changed disk text in memory and returns the current immutable project snapshot.
+    /// A concurrent load defers the in-memory update and receives a refreshed fork instead.
     /// </summary>
     /// <remarks>
     /// The content check is what makes this affordable. The trigger is a modification timestamp,
@@ -3054,10 +3118,33 @@ internal static class WorkspaceService
     private static Project RefreshDocumentIfStale(
         CachedWorkspaceEntry entry, Project project, string? filePath, DateTime cacheTime)
     {
+        // Commit disk text through Roslyn's in-memory notification API so every later request
+        // sees it and shares the same compilation. Never wait for MSBuild while holding the
+        // cache lock: a load that owns this gate also needs that lock to publish its projects.
+        if (entry.Workspace is not MSBuildWorkspace live || !entry.LoadGate.Wait(0))
+            return RefreshDocumentSnapshot(entry, project, filePath, cacheTime, live: null);
+
+        try
+        {
+            project = ApplyOpenDocumentOverlay(entry, live.CurrentSolution.GetProject(project.Id) ?? project);
+            return RefreshDocumentSnapshot(entry, project, filePath, cacheTime, live);
+        }
+        finally
+        {
+            entry.LoadGate.Release();
+        }
+    }
+
+    private static Project RefreshDocumentSnapshot(
+        CachedWorkspaceEntry entry, Project project, string? filePath, DateTime cacheTime,
+        MSBuildWorkspace? live)
+    {
         var solution = project.Solution;
         List<(DocumentId Id, SourceText Text)>? stale = null;
+        List<KeyValuePair<string, long>>? handledChanges = null;
         var watcher = entry.DirtyWatcher;
-        bool watching = watcher is not null && !watcher.TakeOverflow();
+        bool overflowed = watcher?.TakeOverflow() == true;
+        bool watching = watcher is not null && !overflowed;
 
         if (watching)
         {
@@ -3069,6 +3156,7 @@ internal static class WorkspaceService
             foreach (var evt in watcher!.Snapshot())
             {
                 bool retry = false;
+                bool changed = false;
                 foreach (var documentId in solution.GetDocumentIdsWithFilePath(evt.Key))
                 {
                     if (solution.GetDocument(documentId) is not { } document)
@@ -3078,6 +3166,7 @@ internal static class WorkspaceService
                     {
                         case ReadOutcome.Changed:
                             (stale ??= []).Add((documentId, text!));
+                            changed = true;
                             break;
                         case ReadOutcome.Unreadable:
                             // Mid-write. Leave the event marked so the next request retries.
@@ -3086,8 +3175,10 @@ internal static class WorkspaceService
                     }
                 }
 
-                if (!retry)
+                if (!retry && !changed)
                     watcher.Clear(evt);
+                else if (!retry)
+                    (handledChanges ??= []).Add(evt);
             }
         }
         else
@@ -3096,7 +3187,7 @@ internal static class WorkspaceService
             // document of the requested project, throttled per workspace. A request with no
             // named file is asking about the project as a whole and always sweeps — there is
             // no precise fallback that could cover for it.
-            bool sweepDue = filePath is null;
+            bool sweepDue = filePath is null || overflowed;
             long now = Environment.TickCount64;
             long last = Interlocked.Read(ref entry.LastStaleSweepTicks);
             if (now - last >= StaleSweepInterval
@@ -3107,18 +3198,33 @@ internal static class WorkspaceService
 
             if (sweepDue)
             {
-                foreach (var document in project.Documents)
+                // Overflow can hide changes anywhere in this workspace, including files
+                // copied with their original timestamps. It must bypass the normal throttle.
+                var documents = overflowed
+                    ? solution.Projects.SelectMany(p => p.Documents)
+                    : project.Documents;
+                foreach (var document in documents)
                 {
                     if (document.FilePath is not { Length: > 0 } path)
                         continue;
-                    if (TryReadChanged(document, path, cacheTime, requireNewerMtime: true, out var text)
-                        == ReadOutcome.Changed)
+                    var outcome = TryReadChanged(document, path, cacheTime,
+                        requireNewerMtime: !overflowed, out var text);
+                    if (outcome == ReadOutcome.Changed)
                     {
                         (stale ??= []).Add((document.Id, text!));
+                    }
+                    else if (overflowed && outcome == ReadOutcome.Unreadable)
+                    {
+                        watcher!.MarkOverflow();
                     }
                 }
             }
         }
+
+        // A fork is temporary. Preserve the only notification of lost events until a sweep
+        // can write into the live workspace after the concurrent load finishes.
+        if (overflowed && live is null)
+            watcher!.MarkOverflow();
 
         // The named file is always checked precisely, watcher or not: a watcher event is
         // delivered asynchronously, and the write this request is about may have beaten it here.
@@ -3135,6 +3241,27 @@ internal static class WorkspaceService
         if (stale is null)
             return project;
 
+        if (live is not null)
+        {
+            foreach (var (id, text) in stale)
+            {
+                // An editor can open the file during the disk read. Its buffer takes precedence.
+                if (live.CurrentSolution.GetDocument(id) is not { FilePath: { } path }
+                    || OpenDocumentStore.IsOpen(path))
+                    continue;
+
+                live.OnDocumentTextChanged(id, text, PreservationMode.PreserveIdentity);
+            }
+
+            if (handledChanges is not null)
+                foreach (var evt in handledChanges)
+                    watcher!.Clear(evt);
+
+            return ApplyOpenDocumentOverlay(entry, live.CurrentSolution.GetProject(project.Id) ?? project);
+        }
+
+        // A concurrent load prevented a write-through. Keep the changed watcher events until
+        // a later request can commit them; consuming them here loses edits after this fork dies.
         var updatedSolution = MemoizedRefresh(entry, solution, stale);
         return updatedSolution.GetProject(project.Id) ?? project;
     }
@@ -3695,8 +3822,7 @@ internal static class WorkspaceService
 
         project = ApplyOpenDocumentOverlay(entry, project);
 
-        if (targetFilePath != null)
-            project = RefreshDocumentIfStale(entry, project, targetFilePath, entry.CachedAtUtc);
+        project = RefreshDocumentIfStale(entry, project, targetFilePath, entry.CachedAtUtc);
 
         return (entry.Workspace, project);
     }
@@ -3780,9 +3906,10 @@ internal static class WorkspaceService
                         // the file. Comparing identity would fork for every such buffer and undo
                         // the reconcile's whole point.
                         if (solution.GetDocument(docId) is { } live
-                            && live.TryGetText(out var inWorkspace)
-                            && inWorkspace.ContentEquals(text))
+                            && (HasMatchingOpenText(live, text)
+                                || (live.TryGetText(out var inWorkspace) && inWorkspace.ContentEquals(text))))
                         {
+                            RememberMatchingOpenText(live, text);
                             applied[docId] = text;
                             continue;
                         }
@@ -4152,18 +4279,18 @@ internal static class WorkspaceService
     /// project and grows with the source, not with the question.
     /// </para>
     /// <para>
-    /// A bare <c>CSharpCompilation</c> over the same references gives the identical verdict:
-    /// <c>GetSpecialType</c> reads the corlib's metadata and nothing else, and no syntax tree is
-    /// involved either way. The reference metadata it touches is the same memory-mapped, globally
-    /// cached metadata a real compilation of this project would touch, so the work is not repeated
-    /// later — it is only no longer accompanied by a full parse.
+    /// A bare <c>CSharpCompilation</c> avoids parsing source, but binding its references still
+    /// reads every assembly supplied to it. Try the conventional core assembly names first so
+    /// this probe does not force all otherwise deferred metadata reads during project loading.
+    /// The name is only a candidate filter: System.Object must actually resolve. Unusual core
+    /// assemblies retain the full-reference fallback.
     /// </para>
     /// <para>
     /// Not language-conditional: the probe is about metadata, and a VB or F# project's references
     /// resolve or fail to resolve exactly the same way when read through a C# compilation.
     /// </para>
     /// </remarks>
-    private static bool ResolvesCorlib(Project project)
+    internal static bool ResolvesCorlib(Project project)
     {
         // No references at all means MSBuild evaluation produced nothing — ProjectFileInfo.CreateEmpty,
         // the shape Roslyn leaves behind for a project whose evaluation failed. Short-circuited
@@ -4173,6 +4300,20 @@ internal static class WorkspaceService
 
         try
         {
+            var coreReferences = project.MetadataReferences.Where(reference =>
+                reference is PortableExecutableReference { FilePath: { } path }
+                && Path.GetFileName(path) is { } name
+                && (name.Equals("mscorlib.dll", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("System.Runtime.dll", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("netstandard.dll", StringComparison.OrdinalIgnoreCase))).ToArray();
+            if (coreReferences.Length > 0 && coreReferences.Length < project.MetadataReferences.Count)
+            {
+                var coreProbe = CSharpCompilation.Create("corlib-probe", references: coreReferences);
+                if (coreProbe.GetSpecialType(SpecialType.System_Object).TypeKind != TypeKind.Error)
+                    return true;
+            }
+
             var probe = CSharpCompilation.Create("corlib-probe", references: project.MetadataReferences);
             return probe.GetSpecialType(SpecialType.System_Object).TypeKind != TypeKind.Error;
         }

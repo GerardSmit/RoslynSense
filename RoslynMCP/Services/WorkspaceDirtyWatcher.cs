@@ -23,7 +23,7 @@ internal sealed class WorkspaceDirtyWatcher : IDisposable
     private readonly FileSystemWatcher _watcher;
     private readonly ConcurrentDictionary<string, long> _dirty = new(StringComparer.OrdinalIgnoreCase);
     private long _generation;
-    private volatile bool _overflowed;
+    private int _overflowed;
 
     private WorkspaceDirtyWatcher(FileSystemWatcher watcher) => _watcher = watcher;
 
@@ -52,7 +52,7 @@ internal sealed class WorkspaceDirtyWatcher : IDisposable
             };
             // Deletions matter to project structure, not to document text; WatchedFilesHandler
             // owns that. Overflow means events were dropped, so only a full sweep is safe.
-            fsw.Error += (_, _) => watcher._overflowed = true;
+            fsw.Error += (_, _) => watcher.MarkOverflow();
             fsw.EnableRaisingEvents = true;
             return watcher;
         }
@@ -66,13 +66,10 @@ internal sealed class WorkspaceDirtyWatcher : IDisposable
 
     /// <summary>True once per overflow: the caller must fall back to a full sweep, because an
     /// unknown number of events never made it into the dirty set.</summary>
-    public bool TakeOverflow()
-    {
-        if (!_overflowed)
-            return false;
-        _overflowed = false;
-        return true;
-    }
+    public bool TakeOverflow() => Interlocked.Exchange(ref _overflowed, 0) != 0;
+
+    /// <summary>Requests a full sweep, also used when a sweep could not commit its changes.</summary>
+    public void MarkOverflow() => Interlocked.Exchange(ref _overflowed, 1);
 
     /// <summary>The paths currently marked dirty, each with the stamp to hand back to
     /// <see cref="Clear"/> once handled.</summary>

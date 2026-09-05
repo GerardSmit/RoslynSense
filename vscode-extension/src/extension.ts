@@ -38,7 +38,8 @@ import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
 import { bindNestedCodeActions, registerNestedCodeActions } from './nestedCodeActions';
-import { lensesToPreResolve } from './codeLensPrewarm';
+import { preResolveVisibleLenses } from './visibleCodeLenses';
+import { registerOnAutoInsert } from './autoInsert';
 import { globalToolPath, installGlobalTool, updateGlobalTool } from './toolManagement';
 
 let client: LanguageClient | undefined;
@@ -335,6 +336,9 @@ function enabledFileLanguages(): readonly ExtraLanguage[] {
  * which is what already happens on the server side, since the daemon is per solution.
  */
 const clientsBySolution = new Map<string, LanguageClient>();
+
+// synchronize.fileEvents only owns the listeners, not the watchers supplied by the extension.
+const watchersByClient = new Map<LanguageClient, vscode.FileSystemWatcher[]>();
 
 /** One trace channel for every client; created lazily so a session that never traces has none. */
 let redactingTrace: vscode.OutputChannel | undefined;
@@ -834,7 +838,7 @@ async function startClient(
         // VS Code globs cannot express "not under bin/obj", so build output is filtered
         // server-side instead; the events are cheap and the server drops them before it does
         // any work.
-        return [
+        const patterns = [
             '**/*.cs',
             '**/*.{csproj,vbproj,fsproj,props,targets,sln,slnx,slnf}',
             '**/{.editorconfig,.globalconfig,Directory.Packages.props}',
@@ -844,9 +848,12 @@ async function startClient(
             '**/[wW]eb.config',
             ...additionalConfigPatterns(binding?.folder),
             ...enabledFileLanguages().flatMap(watchGlobs),
-        ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
+        ];
+        return [...new Set(patterns)].map((pattern) => vscode.workspace.createFileSystemWatcher(
+            binding?.folder ? new vscode.RelativePattern(binding.folder, pattern) : pattern));
     }
     const clientKey = bindingKey(solutionPath, binding?.folder);
+    const workspaceWatchers = createWorkspaceWatchers();
 
     const clientOptions: LanguageClientOptions = {
         // Source-generated documents are C# too. Without them here VS Code sends the server
@@ -912,7 +919,7 @@ async function startClient(
             // the list over closes that window. See codeLensPrewarm.ts.
             provideCodeLenses: async (document, token, next) => {
                 const lenses = await next(document, token);
-                return lenses ? preResolveVisibleLenses(document, lenses, token) : lenses;
+                return lenses ? preResolveVisibleLenses(connection, document, lenses, token) : lenses;
             },
         },
         // Sent at initialize so the very first analyzer pass already runs under the user's
@@ -924,7 +931,7 @@ async function startClient(
         // Content changes to open files arrive via didChange; these watchers cover what the
         // editor never sees — files created, deleted, or rewritten outside it (git checkout,
         // scaffolding, another agent). The server coalesces the burst a branch switch produces.
-        synchronize: { fileEvents: createWorkspaceWatchers() },
+        synchronize: { fileEvents: workspaceWatchers },
         // A cold daemon spawn (first window on a solution) can lose the very first
         // connection attempt; a failed initialize must retry, not surface an error toast.
         initializationFailedHandler: () => {
@@ -955,16 +962,18 @@ async function startClient(
         },
     };
 
-    client = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
-    clientsBySolution.set(clientKey, client);
-    wireEditorDebugCommandHandler(client);
-    wireNuGetCredentials(client, context);
+    const connection = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
+    client = connection;
+    clientsBySolution.set(clientKey, connection);
+    watchersByClient.set(connection, workspaceWatchers);
+    wireEditorDebugCommandHandler(connection);
+    wireNuGetCredentials(connection, context);
     // The server's self-diagnostics (roslynSense/debugLog) land in the shared debug channel
     // rather than the main output: they are about the tool's health, not the user's solution.
-    client.onNotification('roslynSense/debugLog', (params: { message: string }) =>
+    connection.onNotification('roslynSense/debugLog', (params: { message: string }) =>
         extensionDebug().appendLine(`[server] ${params.message}`));
-    client.onDidChangeState((e) => {
-        if (!statusItem) {
+    connection.onDidChangeState((e) => {
+        if (!statusItem || client !== connection) {
             return;
         }
         if (e.newState === State.Starting) {
@@ -987,14 +996,17 @@ async function startClient(
     statusItem.command = { title: 'Pick Solution', command: 'roslynSense.openSolution' };
 
     try {
-        await client.start();
+        await connection.start();
+        if (client !== connection) {
+            return;
+        }
         void vscode.commands.executeCommand('setContext', 'roslynSense.serverMissing', false);
         statusItem.busy = false;
         statusItem.severity = vscode.LanguageStatusSeverity.Information;
         statusItem.text = solutionPath
             ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
             : 'RoslynSense: running';
-        warnOnOutdatedServer(client.initializeResult?.serverInfo?.version);
+        warnOnOutdatedServer(connection.initializeResult?.serverInfo?.version);
         refreshInheritanceMarkers?.();
         sendBreakpointSnapshot();
     } catch (err) {
@@ -1002,8 +1014,14 @@ async function startClient(
         // restart/pick-solution paths start clean instead of rejecting forever. Out of the map as
         // well as out of `client`: a dead entry left in it holds the executeCommand claim above,
         // so every later client in the window would connect without its commands.
-        clientsBySolution.delete(bindingKey(solutionPath, binding?.folder));
-        void client.dispose().then(undefined, () => undefined);
+        if (clientsBySolution.get(clientKey) === connection) {
+            clientsBySolution.delete(clientKey);
+        }
+        disposeClientWatchers(connection);
+        void connection.dispose().then(undefined, () => undefined);
+        if (client !== connection) {
+            return;
+        }
         client = undefined;
         statusItem.busy = false;
         statusItem.severity = vscode.LanguageStatusSeverity.Error;
@@ -1087,6 +1105,7 @@ async function stopClient(): Promise<void> {
     client = undefined; // clear first: a failed stop must not wedge future restarts
 
     for (const current of running) {
+        disposeClientWatchers(current);
         try {
             if (current.needsStop()) {
                 await current.stop();
@@ -1097,6 +1116,13 @@ async function stopClient(): Promise<void> {
             // Already stopped or never started — nothing to do.
         }
     }
+}
+
+function disposeClientWatchers(connection: LanguageClient): void {
+    for (const watcher of watchersByClient.get(connection) ?? []) {
+        watcher.dispose();
+    }
+    watchersByClient.delete(connection);
 }
 
 /**
@@ -1179,66 +1205,6 @@ function updateStatusText(solutionPath: string | undefined): void {
             ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
             : 'RoslynSense: running';
     }
-}
-
-// After the user types "///" on an empty line, ask the server for an XML doc skeleton
-// (custom roslynSense/onAutoInsert) and place the caret inside <summary>.
-function registerOnAutoInsert(context: vscode.ExtensionContext): void {
-    context.subscriptions.push(
-        vscode.workspace.onDidChangeTextDocument(async (e) => {
-            if (
-                !client ||
-                e.document.languageId !== 'csharp' ||
-                e.contentChanges.length !== 1 ||
-                !e.contentChanges[0].text.endsWith('/')
-            ) {
-                return;
-            }
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document !== e.document) {
-                return;
-            }
-            const change = e.contentChanges[0];
-            const position = change.range.start.translate(0, change.text.length);
-            const linePrefix = e.document.lineAt(position.line).text.substring(0, position.character);
-            if (linePrefix.trimStart() !== '///') {
-                return;
-            }
-
-            interface AutoInsertResult {
-                edit: { range: unknown; newText: string };
-                cursor: { line: number; character: number };
-            }
-            const result = await client.sendRequest<AutoInsertResult | null>(
-                'roslynSense/onAutoInsert',
-                {
-                    textDocument: { uri: code2Protocol(e.document.uri) },
-                    position: { line: position.line, character: position.character },
-                }
-            );
-            if (!result) {
-                return;
-            }
-            // The request round-tripped the server; bail if the buffer moved on meanwhile,
-            // otherwise the skeleton lands at a stale offset.
-            if (
-                editor.document.version !== e.document.version ||
-                editor.document.lineAt(position.line).text.substring(0, position.character) !==
-                    linePrefix
-            ) {
-                return;
-            }
-
-            const applied = await editor.edit(
-                (builder) => builder.insert(position, result.edit.newText),
-                { undoStopBefore: true, undoStopAfter: true }
-            );
-            if (applied) {
-                const cursor = new vscode.Position(result.cursor.line, result.cursor.character);
-                editor.selection = new vscode.Selection(cursor, cursor);
-            }
-        })
-    );
 }
 
 /**
@@ -1327,87 +1293,6 @@ async function runTestFromLens(
     terminal.show();
     const project = projectPath ? ` "${projectPath}"` : '';
     terminal.sendText(`dotnet test${project} --filter "FullyQualifiedName~${fullyQualifiedName}"`);
-}
-
-/**
- * How long the lens list waits for the pre-resolve before going out unresolved.
- *
- * The failure this guards is worse than the one it fixes: a resolve that blocks on the project
- * load gate would hold back every lens in the document, so a file that showed stale-but-visible
- * lenses would show none at all. Past the deadline the list goes out as it came, the editor
- * resolves it the usual way, and the requests already in flight are not wasted — the server
- * memoizes a resolve, so the editor's own round trip finds the answer waiting.
- */
-const LENS_PRE_RESOLVE_TIMEOUT_MS = 400;
-
-/**
- * Resolve the lenses on screen before the editor is handed the list they belong to.
- *
- * See codeLensPrewarm.ts for why this exists and what it costs. The one rule that matters here is
- * that nothing in it may reject: a middleware that throws loses every lens in the document, which
- * is a far louder bug than the one being fixed.
- */
-async function preResolveVisibleLenses(
-    document: vscode.TextDocument,
-    lenses: vscode.CodeLens[],
-    token: vscode.CancellationToken,
-): Promise<vscode.CodeLens[]> {
-    const active = client;
-
-    if (!active) {
-        return lenses;
-    }
-
-    const visible = vscode.window.visibleTextEditors
-        .filter((editor) => editor.document === document)
-        .flatMap((editor) => editor.visibleRanges);
-
-    const chosen = lensesToPreResolve(lenses, visible);
-
-    if (chosen.length === 0) {
-        return lenses;
-    }
-
-    const resolving = Promise.allSettled(
-        chosen.map(async (index) => {
-            // asCodeLens carries `data` across only for the client's own ProtocolCodeLens, which is
-            // what `next` returned; anything else round-trips as a bare range and comes back
-            // uncommanded, which the merge below then declines to take.
-            const sent = active.code2ProtocolConverter.asCodeLens(lenses[index]);
-            const answer = (await active.sendRequest('codeLens/resolve', sent, token)) as typeof sent;
-
-            return [index, active.protocol2CodeConverter.asCodeLens(answer)] as const;
-        }),
-    );
-
-    let expire: ReturnType<typeof setTimeout> | undefined;
-
-    const outcomes = await Promise.race([
-        resolving,
-        new Promise<undefined>((resolve) => {
-            expire = setTimeout(() => resolve(undefined), LENS_PRE_RESOLVE_TIMEOUT_MS);
-        }),
-    ]);
-
-    if (expire !== undefined) {
-        clearTimeout(expire);
-    }
-
-    if (outcomes === undefined) {
-        return lenses;
-    }
-
-    const merged = lenses.slice();
-
-    for (const outcome of outcomes) {
-        // A lens that came back without a command is no better than the one already in the list,
-        // and swapping it in would only discard the `data` the editor still needs to resolve it.
-        if (outcome.status === 'fulfilled' && outcome.value[1]?.command) {
-            merged[outcome.value[0]] = outcome.value[1];
-        }
-    }
-
-    return merged;
 }
 
 function registerLensCommands(context: vscode.ExtensionContext): void {
@@ -3602,7 +3487,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerConfigurationSync(context);
     registerConfigFileWatch(context);
     registerLensCommands(context);
-    registerOnAutoInsert(context);
+    registerOnAutoInsert(context, () => client, code2Protocol);
     registerProcessStatusBar(context);
     registerInheritanceMarkers(context);
     registerDebugBridge(context);

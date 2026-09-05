@@ -371,9 +371,13 @@ internal static class AnalyzerDiagnosticCache
     private const int MaxEntriesCeiling = 16384;
 
     private static readonly ConcurrentDictionary<DocumentId, Entry> s_entries = new();
-    // Lazy, not Task: ConcurrentDictionary may invoke a GetOrAdd factory more than once under
-    // contention, and an analyzer pass is far too expensive to run twice for one version.
-    private static readonly ConcurrentDictionary<(DocumentId, string), Lazy<Task<ImmutableArray<Diagnostic>>>> s_inFlight = new();
+    private static readonly object s_gate = new();
+    private static readonly Dictionary<(DocumentId, string), DiagnosticFlight<ImmutableArray<Diagnostic>>> s_inFlight = new();
+
+    internal static Func<Document, Task>? BeforeComputeAsyncForTesting { get; set; }
+    internal static Func<Task>? BeforeRetireAsyncForTesting { get; set; }
+    internal static Func<Task, Task>? WaitForRetirementAsyncForTesting { get; set; }
+    private static long s_invalidationGeneration;
 
     /// <summary>
     /// The last version each document was fully analyzed as — the fact the result id is built
@@ -409,22 +413,10 @@ internal static class AnalyzerDiagnosticCache
     /// </remarks>
     private static readonly ConcurrentDictionary<DocumentId, string> s_latestRequested = new();
     private static long s_clock;
-    private static long s_writeClock;
 
-    /// <summary>
-    /// <paramref name="Stamp"/> orders <em>use</em> and is what <see cref="Trim"/> evicts by;
-    /// <paramref name="Written"/> orders <em>writes</em> and is what decides whether a finishing
-    /// analyzer pass has been overtaken.
-    /// </summary>
-    /// <remarks>
-    /// Two counters because one cannot mean both. While the LRU touch and the write generation
-    /// were the same field, a concurrent read of the previous entry — the sweep looking up a
-    /// document while a pass for the next version was running — advanced it, and the finishing pass
-    /// could not tell that from someone having stored something newer. It stepped aside and threw
-    /// its own strictly-newer result away, which is the squiggle flicker this cache exists to stop.
-    /// </remarks>
-    private sealed record Entry(
-        string Version, ImmutableArray<Diagnostic> Diagnostics, long Stamp, long Written);
+    /// <summary>Stamp orders use for eviction. Request ordering is tracked separately, under
+    /// the same lock as result publication, so a cache read cannot invalidate a pending write.</summary>
+    private sealed record Entry(string Version, ImmutableArray<Diagnostic> Diagnostics, long Stamp);
 
     /// <summary>The cache key for a document, or null when it cannot be versioned.</summary>
     public static async Task<string?> GetVersionAsync(Document document, CancellationToken ct)
@@ -619,89 +611,120 @@ internal static class AnalyzerDiagnosticCache
         // exactly the case a recompute is queued for, and answering it "already computed" with
         // the empty set would make the eviction permanent.
         var version = await GetVersionAsync(document, ct);
-        if (HasStoredFindings(document, version))
-            return TryGet(document, version);
-
         if (version is null)
             return await AnalyzerService.RunDocumentAnalyzersAsync(document, ct);
 
-        // A pull-diagnostics client re-requests on every keystroke; without this guard each
-        // request would start its own analyzer pass over the same unchanged document.
-        s_latestRequested[document.Id] = version;
-
+        ct.ThrowIfCancellationRequested();
         var key = (document.Id, version);
-        var work = s_inFlight.GetOrAdd(key,
-            _ => new Lazy<Task<ImmutableArray<Diagnostic>>>(() => ComputeAsync(document, version, ct)));
-        try
+        long invalidationGeneration = Volatile.Read(ref s_invalidationGeneration);
+        DiagnosticFlight<ImmutableArray<Diagnostic>>? retiring = null;
+        while (true)
         {
-            return await work.Value;
-        }
-        finally
-        {
-            s_inFlight.TryRemove(key, out _);
+            ct.ThrowIfCancellationRequested();
+            DiagnosticFlight<ImmutableArray<Diagnostic>> work;
+            bool joined;
+            lock (s_gate)
+            {
+                if (retiring is not null && (retiring.Invalidated || s_invalidationGeneration != invalidationGeneration))
+                    return ImmutableArray<Diagnostic>.Empty;
+                s_latestRequested[document.Id] = version;
+                if (HasStoredFindings(document, version))
+                    return TryGet(document, version);
+                if (!s_inFlight.TryGetValue(key, out work!))
+                    s_inFlight.Add(key, work = new(flight => ComputeAsync(document, version, flight)));
+                joined = !work.Abandoned;
+                if (joined)
+                    work.Waiters++;
+            }
+
+            if (!joined)
+            {
+                Task retirement = work.Work.Value;
+                await (WaitForRetirementAsyncForTesting is { } wait ? wait(retirement) : retirement).WaitAsync(ct);
+                retiring = work;
+                continue;
+            }
+
+            bool released = false;
+            void ReleaseWaiter()
+            {
+                bool cancel;
+                lock (s_gate)
+                {
+                    if (released)
+                        return;
+                    released = true;
+                    cancel = --work.Waiters == 0 && !work.Completed;
+                    if (cancel)
+                        work.Abandoned = true;
+                }
+                if (cancel)
+                    work.Cancel();
+            }
+
+            // Register before starting the lazy: Roslyn can bind synchronously before its first
+            // incomplete await, and cancellation must still stop that work on the caller thread.
+            using var registration = ct.Register(ReleaseWaiter);
+            try { return await work.Work.Value.WaitAsync(ct); }
+            finally { ReleaseWaiter(); }
         }
     }
 
     private static async Task<ImmutableArray<Diagnostic>> ComputeAsync(
-        Document document, string version, CancellationToken ct)
+        Document document, string version, DiagnosticFlight<ImmutableArray<Diagnostic>> work)
     {
-        // The stamp of whatever is cached before this run starts. Stamps come from a monotonic
-        // counter, so they order writes; the version string does not — it is a checksum and an
-        // opaque semantic stamp, and comparing versions for inequality cannot tell "someone stored
-        // something newer" from "the entry holds the previous version". Treating the second as the
-        // first rejected almost every legitimate result, freezing each document at whatever it was
-        // analysed as first and making every later pass run and be thrown away.
-        long observed = s_entries.TryGetValue(document.Id, out var before) ? before.Written : long.MinValue;
-
-        var run = await RunAsync(document, version, ct);
-
-        // A run that gave up is not a result. Storing it would say "this version is analysed and
-        // clean", so nothing would ever look at the file again.
-        if (run.Failed)
-            return run.Diagnostics;
-
-        // Against what is cached, not against the snapshot we were handed. A Document is immutable,
-        // so re-deriving its version here would always agree with itself — the check has to ask
-        // whether someone else has since stored a newer answer. A pass queued while the file was at
-        // V1 can finish long after the editor moved it to V2, because it waits for an analyzer
-        // slot, and writing V1 back over V2 makes the cache miss again and the squiggles blink out.
-        var replacement = new Entry(
-            version,
-            run.Diagnostics,
-            Interlocked.Increment(ref s_clock),
-            Interlocked.Increment(ref s_writeClock));
-
-        while (true)
+        var key = (document.Id, version);
+        try
         {
-            if (!s_entries.TryGetValue(document.Id, out var existing))
-            {
-                if (s_entries.TryAdd(document.Id, replacement))
-                    break;
-                continue;
-            }
+            if (BeforeComputeAsyncForTesting is { } beforeCompute)
+                await beforeCompute(document).WaitAsync(work.Token);
 
-            // Only step aside for a write that landed after this run began. That is the case the
-            // guard is for: a pass queued while the file was at V1 can finish long after the editor
-            // moved it to V2, because it waits for an analyzer slot, and V1 must not overwrite V2.
-            if (s_latestRequested.TryGetValue(document.Id, out var latest)
-                && latest != version
-                && existing.Written > observed)
+            // One waiter only cancels its wait; the last waiter, eviction or configuration change
+            // cancels shared work. The token covers compilation and the analyzer-slot wait,
+            // where AnalyzerService's per-analysis time budget has not started yet.
+            work.Token.ThrowIfCancellationRequested();
+            var run = await RunAsync(document, version, work.Token);
+
+            lock (s_gate)
             {
+                // Both checks must be atomic with the write. A detached flight was invalidated
+                // by Clear/Evict; a different latest version was superseded by an editor request.
+                if (run.Failed || work.Abandoned
+                    || !s_inFlight.TryGetValue(key, out var current) || !ReferenceEquals(current, work)
+                    || !s_latestRequested.TryGetValue(document.Id, out var latest) || latest != version)
+                    return run.Diagnostics;
+
+                s_entries[document.Id] = new Entry(version, run.Diagnostics, Interlocked.Increment(ref s_clock));
+                if (s_analyzedVersions.Count > MaxAnalyzedVersions)
+                    s_analyzedVersions.Clear();
+                s_analyzedVersions[document.Id] = version;
+                Trim();
                 return run.Diagnostics;
             }
-
-            if (s_entries.TryUpdate(document.Id, replacement, existing))
-                break;
         }
-
-        // Only after a real store, so the id can never claim an answer that was never written.
-        // The guard mirrors s_declaredInterest's: reloads mint new DocumentIds, entries accumulate.
-        if (s_analyzedVersions.Count > MaxAnalyzedVersions)
-            s_analyzedVersions.Clear();
-        s_analyzedVersions[document.Id] = version;
-
-        Trim();
-        return run.Diagnostics;
+        catch (OperationCanceledException) when (work.Token.IsCancellationRequested)
+        {
+            // Expected abandonment/invalidation, not a failed analyzer. Nothing is stored or marked analyzed,
+            // so background callers have no result to publish and no reason to request refresh.
+            return ImmutableArray<Diagnostic>.Empty;
+        }
+        finally
+        {
+            if (BeforeRetireAsyncForTesting is { } beforeRetire)
+                await beforeRetire();
+            lock (s_gate)
+            {
+                work.Completed = true;
+                if (s_inFlight.TryGetValue(key, out var current) && ReferenceEquals(current, work))
+                {
+                    s_inFlight.Remove(key);
+                    if (!s_entries.ContainsKey(document.Id)
+                        && !s_inFlight.Keys.Any(key => key.Item1 == document.Id))
+                        s_latestRequested.TryRemove(document.Id, out _);
+                }
+            }
+            work.Dispose();
+        }
     }
 
     /// <summary>
@@ -749,22 +772,45 @@ internal static class AnalyzerDiagnosticCache
 
     public static void Evict(DocumentId documentId)
     {
-        s_entries.TryRemove(documentId, out _);
-        s_analyzedVersions.TryRemove(documentId, out _);
-        s_latestRequested.TryRemove(documentId, out _);
-        MemberEditAnalysis.Forget(documentId);
-        CompilerDiagnosticCache.Evict(documentId);
+        List<DiagnosticFlight<ImmutableArray<Diagnostic>>> invalidated = [];
+        lock (s_gate)
+        {
+            s_invalidationGeneration++;
+            s_entries.TryRemove(documentId, out _);
+            s_analyzedVersions.TryRemove(documentId, out _);
+            s_latestRequested.TryRemove(documentId, out _);
+            foreach (var key in s_inFlight.Keys.Where(key => key.Item1 == documentId).ToArray())
+            {
+                s_inFlight[key].Invalidated = true;
+                invalidated.Add(s_inFlight[key]);
+                s_inFlight.Remove(key);
+            }
+            MemberEditAnalysis.Forget(documentId);
+            CompilerDiagnosticCache.Evict(documentId);
+        }
+        foreach (var work in invalidated)
+            work.Cancel();
     }
 
     /// <summary>Drops everything — used when analyzer configuration changes (.editorconfig edits).</summary>
     public static void Clear()
     {
-        s_entries.Clear();
-        s_analyzedVersions.Clear();
-        s_inFlight.Clear();
-        s_latestRequested.Clear();
-        MemberEditAnalysis.Clear();
-        CompilerDiagnosticCache.Clear();
+        DiagnosticFlight<ImmutableArray<Diagnostic>>[] invalidated;
+        lock (s_gate)
+        {
+            s_invalidationGeneration++;
+            s_entries.Clear();
+            s_analyzedVersions.Clear();
+            invalidated = [.. s_inFlight.Values];
+            foreach (var work in invalidated)
+                work.Invalidated = true;
+            s_inFlight.Clear();
+            s_latestRequested.Clear();
+            MemberEditAnalysis.Clear();
+            CompilerDiagnosticCache.Clear();
+        }
+        foreach (var work in invalidated)
+            work.Cancel();
     }
 
     /// <summary>Test seam: a tiny ceiling makes eviction reachable without 2048 real documents.</summary>
@@ -812,7 +858,8 @@ internal static class AnalyzerDiagnosticCache
         // dereferences into a NullReferenceException.
         foreach (var stale in s_entries.ToArray().OrderBy(e => e.Value.Stamp).Take(trimming))
         {
-            s_entries.TryRemove(stale.Key, out _);
+            if (!s_entries.TryRemove(stale))
+                continue;
 
             // The guard record goes with the entry. s_latestRequested is written on every compute
             // request and was only ever cleared wholesale, so the closed documents the sweep queues
@@ -821,10 +868,10 @@ internal static class AnalyzerDiagnosticCache
             //
             // Only here, and never as a general "drop any key with no entry" rule: the guard is
             // written before the entry exists, so such a rule could delete a newer pass's guard
-            // between its TryAdd and the older pass's completion — and the older pass would then
-            // overwrite the newer, which is the squiggle flicker the Stamp/Written split exists to
-            // prevent. A key reached by this loop belongs to a cold document by construction.
-            s_latestRequested.TryRemove(stale.Key, out _);
+            // between registration and completion. A trimmed document may still have a newer
+            // version running; keep its guard until that flight finishes.
+            if (!s_inFlight.Keys.Any(key => key.Item1 == stale.Key))
+                s_latestRequested.TryRemove(stale.Key, out _);
             MemberEditAnalysis.Forget(stale.Key);
         }
     }

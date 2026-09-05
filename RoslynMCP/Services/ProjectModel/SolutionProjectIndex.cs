@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis;
+
 namespace RoslynMCP.Services.ProjectModel;
 
 /// <summary>
@@ -59,23 +61,12 @@ public static class SolutionProjectIndex
 
         string normalized = PathHelper.NormalizePath(filePath);
 
-        foreach (var project in WorkspaceService.TryGetSessionSolution()?.Projects ?? [])
-        {
-            if (project.FilePath is not { Length: > 0 } projectPath)
-                continue;
-
-            foreach (var document in project.Documents)
-            {
-                if (document.FilePath is { Length: > 0 } documentPath &&
-                    string.Equals(
-                        PathHelper.NormalizePath(documentPath), normalized, StringComparison.OrdinalIgnoreCase))
-                {
-                    return projectPath;
-                }
-            }
-        }
+        if (WorkspaceService.TryGetSessionSolution() is { } solution
+            && LoadedProjectForFile(solution, normalized) is { } loaded)
+            return loaded;
 
         string? best = null;
+        int bestDirectoryLength = -1;
         foreach (string projectPath in ProjectPaths())
         {
             string? directory = System.IO.Path.GetDirectoryName(projectPath);
@@ -86,14 +77,41 @@ public static class SolutionProjectIndex
             if (!normalized.StartsWith(prefix + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            if (best is null || prefix.Length > PathHelper.NormalizePath(
-                    System.IO.Path.GetDirectoryName(best) ?? "").Length)
+            if (prefix.Length > bestDirectoryLength)
             {
                 best = projectPath;
+                bestDirectoryLength = prefix.Length;
             }
         }
 
         return best;
+    }
+
+    internal static string? LoadedProjectForFile(Solution solution, string normalized)
+    {
+        // Roslyn already indexes linked documents by path. Resolving the active file's launch
+        // target should not scan every document in the solution.
+        foreach (var id in solution.GetDocumentIdsWithFilePath(normalized))
+        {
+            if (solution.GetProject(id.ProjectId)?.FilePath is { Length: > 0 } projectPath)
+                return projectPath;
+        }
+
+        // Keep accepting equivalent spellings (including relative paths and dot segments)
+        // that do not match the raw FilePath used to construct Roslyn's index.
+        foreach (var project in solution.Projects)
+        {
+            if (project.FilePath is not { Length: > 0 } projectPath)
+                continue;
+            foreach (var document in project.Documents)
+            {
+                if (document.FilePath is { Length: > 0 } documentPath
+                    && string.Equals(PathHelper.NormalizePath(documentPath), normalized, StringComparison.OrdinalIgnoreCase))
+                    return projectPath;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>The same set, paired with the name each project should be shown under.</summary>

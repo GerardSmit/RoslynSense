@@ -15,9 +15,9 @@ namespace RoslynMCP.Lsp.Search;
 /// </para>
 /// <para>
 /// A gate rather than a fixed degree of parallelism because the answer changes inside one sweep.
-/// Idle admits every document; busy admits <see cref="Narrow"/>. The check is per document, so the
-/// sweep gives way within one document's work of a search starting, and takes the machine back
-/// within one of it finishing.
+/// Idle admits every document; searches admit <see cref="Narrow"/>. Completion pauses new index
+/// work entirely until the last completion finishes. Already admitted work can finish, so the
+/// foreground never waits for a background operation to acknowledge the pause.
 /// </para>
 /// <para>
 /// Racy by construction and deliberately so: a search that starts between a document's check and
@@ -34,6 +34,9 @@ internal static class ForegroundGate
 
     private static int s_busy;
     private static readonly SemaphoreSlim s_narrow = new(Narrow, Narrow);
+    private static readonly object s_pauseGate = new();
+    private static int s_pauses;
+    private static TaskCompletionSource? s_resumed;
 
     /// <summary>Marks a request the user is waiting on. Disposed when it is answered.</summary>
     public static IDisposable Busy()
@@ -43,16 +46,80 @@ internal static class ForegroundGate
     }
 
     /// <summary>
+    /// Pauses new background index items while completion runs. Nested and concurrent callers
+    /// resume the sweep only when their last scope ends; the foreground itself never waits.
+    /// </summary>
+    public static IDisposable PauseBackground()
+    {
+        lock (s_pauseGate)
+        {
+            if (s_pauses++ == 0)
+                s_resumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        return new Resume();
+    }
+
+    /// <summary>
     /// Admits one item of background work: immediately when nothing is in flight, behind the
-    /// narrow gate when something is. The returned scope is null when nothing was taken.
+    /// narrow gate during a search, or after completion's pause ends. The returned scope is null
+    /// when no narrow slot was taken. Cancellation only abandons this background item's wait.
     /// </summary>
     public static async ValueTask<IDisposable?> AdmitAsync(CancellationToken ct)
     {
+        await WaitUntilResumedAsync(ct).ConfigureAwait(false);
         if (Volatile.Read(ref s_busy) == 0)
             return null;
 
         await s_narrow.WaitAsync(ct).ConfigureAwait(false);
-        return new Slot();
+        try
+        {
+            // Completion may have started while this item was queued behind the narrow gate.
+            await WaitUntilResumedAsync(ct).ConfigureAwait(false);
+            return new Slot();
+        }
+        catch
+        {
+            s_narrow.Release();
+            throw;
+        }
+    }
+
+    private static async ValueTask WaitUntilResumedAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            Task? resumed;
+            lock (s_pauseGate)
+                resumed = s_pauses == 0 ? null : s_resumed!.Task;
+
+            if (resumed is null)
+                return;
+
+            await resumed.WaitAsync(ct).ConfigureAwait(false);
+            // A new completion can pause the sweep before an older resume's continuations run.
+        }
+    }
+
+    private sealed class Resume : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            TaskCompletionSource? resumed = null;
+            lock (s_pauseGate)
+            {
+                if (--s_pauses == 0)
+                {
+                    resumed = s_resumed;
+                    s_resumed = null;
+                }
+            }
+            resumed?.TrySetResult();
+        }
     }
 
     private sealed class Idle : IDisposable

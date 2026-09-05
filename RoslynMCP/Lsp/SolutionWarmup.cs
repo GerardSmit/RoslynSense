@@ -343,6 +343,9 @@ internal static class SolutionWarmup
             {
                 ct.ThrowIfCancellationRequested();
 
+                // Compilation warm-up is background work too. Do not start another project's
+                // bind while completion is waiting for its own semantic model.
+                using var admitted = await ForegroundGate.AdmitAsync(ct).ConfigureAwait(false);
                 await project.GetCompilationAsync(ct);
 
                 // With the compilation in hand this is just the type walk — build each project's

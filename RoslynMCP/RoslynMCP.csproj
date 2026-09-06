@@ -75,6 +75,8 @@
          internals break at build on a Roslyn upgrade instead of silently at runtime. -->
     <ItemGroup>
       <Publicize Include="Microsoft.CodeAnalysis.Features" />
+      <Publicize Include="Microsoft.CodeAnalysis.CSharp:Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions.WithTopLevelBinderFlags" />
+      <Publicize Include="Microsoft.CodeAnalysis.CSharp:Microsoft.CodeAnalysis.CSharp.BinderFlags" />
       <Publicize Include="Microsoft.CodeAnalysis.CSharp.Features" />
       <Publicize Include="Microsoft.CodeAnalysis.Workspaces" />
       <!-- BuildHost reuse. MSBuildProjectLoader builds a fresh BuildHostProcessManager for every

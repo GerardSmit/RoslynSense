@@ -46,6 +46,10 @@ async function main(): Promise<void> {
     const server = publishedServer(extensionRoot);
     if (!fs.existsSync(server)) throw new Error(`Test server was not found at ${server}.`);
 
+    const fixture = cp.spawnSync('dotnet', ['build', path.join(extensionRoot, 'src/test/integration/fixture/Fixture.csproj'), '--nologo'],
+        { stdio: 'inherit', shell: false });
+    if (fixture.status !== 0) throw new Error(`Integration fixture build failed with ${fixture.status}.`);
+
     const version = cp.spawnSync(server, ['--version'], { encoding: 'utf8', shell: false });
     if (version.status !== 0 || !/^\d+\.\d+\.\d+\s*$/.test(version.stdout)) {
         throw new Error(`Test server version probe failed: ${version.stderr || version.stdout}`);

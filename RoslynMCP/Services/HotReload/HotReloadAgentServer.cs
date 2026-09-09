@@ -55,7 +55,7 @@ internal sealed class HotReloadAgentServer : IDisposable
         BinaryReader Reader,
         SemaphoreSlim Gate);
 
-    private HotReloadAgentServer(string pipeName)
+    internal HotReloadAgentServer(string pipeName)
     {
         _pipeName = pipeName;
         _ = AcceptLoopAsync(_cts.Token);

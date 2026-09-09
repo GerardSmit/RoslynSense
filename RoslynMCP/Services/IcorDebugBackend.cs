@@ -40,21 +40,25 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     /// updater.
     /// </summary>
     /// <remarks>
-    /// Only .NET Framework, which has no updater of its own. Asked before a delta is routed here,
-    /// so a session that would refuse it is not mistaken for the one that will take it.
+    /// Always, for this engine. .NET Framework has no updater of its own, and a .NET runtime
+    /// refuses its updater's <c>ApplyUpdate</c> for as long as a debugger is attached — the
+    /// debugger owns edit-and-continue then, and <c>ICorDebugModule2::ApplyChanges</c> is how VS
+    /// applies to a .NET process under F5. Asked before a delta is routed here, so a session that
+    /// would refuse it is not mistaken for the one that will take it.
     /// </remarks>
-    public bool AppliesDeltas => _runtime == EngineRuntime.NetFramework;
+    public bool AppliesDeltas => true;
 
     /// <summary>
-    /// The refusal a session that does not apply deltas answers with.
+    /// The refusal a session whose debugger cannot apply deltas answers with: a netcoredbg
+    /// session reached over the command pipe, which has no apply path of its own.
     /// </summary>
     /// <remarks>
-    /// A constant because two things have to agree on it: this backend produces it, and the hot
+    /// A constant because two things have to agree on it: the pipe produces it, and the hot
     /// reload fan-out matches it to tell a skip from a failure. Worded apart, a working reload
     /// would start reporting errors for every module while still applying every edit.
     /// </remarks>
     public const string NotADeltaTarget =
-        "this session does not debug .NET Framework, so it cannot apply a delta";
+        "this session's debugger cannot apply a delta";
 
 
     /// <summary>How long to wait for the target to stop again after a resume.</summary>
@@ -66,8 +70,13 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
 
     /// <summary>Maps the numbers DAP calls variable references onto the engine's value paths.</summary>
     private readonly VariableHandles _handles = new();
-    private readonly SemaphoreSlim _stopped = new(0);
+    // A stop belongs to every command waiting for it. In particular, a hot reload's Pause
+    // must complete even while the earlier Continue is still waiting for a breakpoint.
+    private TaskCompletionSource<DebuggerService.StoppedFrame?> _stopped = NewStopSignal();
     private readonly Lock _gate = new();
+
+    private static TaskCompletionSource<DebuggerService.StoppedFrame?> NewStopSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private DebuggerService.StoppedFrame? _currentFrame;
     private DebuggerService.DebugState _state = DebuggerService.DebugState.NotStarted;
@@ -320,20 +329,21 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     /// </summary>
     private async Task<string> ResumeAsync(Action resume, CancellationToken cancellationToken)
     {
-        if (_state == DebuggerService.DebugState.NotStarted)
-            return "Error: No debug session is active.";
-        if (_exited)
-            return "The process has exited.";
-
-        lock (_gate) _currentFrame = null;
+        cancellationToken.ThrowIfCancellationRequested();
+        Task<DebuggerService.StoppedFrame?> stopped;
+        lock (_gate)
+        {
+            if (_state == DebuggerService.DebugState.NotStarted)
+                return "Error: No debug session is active.";
+            if (_exited)
+                return "The process has exited.";
+            _currentFrame = null;
+            stopped = _stopped.Task;
+        }
 
         // Every path a reference points at describes a value in the frame that is about to be
         // left, so the numbers must not survive the resume that invalidates them.
         _handles.Reset();
-
-        // Drain any stop signalled before this command so the wait below cannot return instantly.
-        while (_stopped.CurrentCount > 0)
-            await _stopped.WaitAsync(0, cancellationToken);
 
         try
         {
@@ -344,14 +354,20 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             return $"Error: {ex.Message}";
         }
 
-        _state = DebuggerService.DebugState.Running;
+        lock (_gate)
+        {
+            // A fast stop can arrive before the engine's command returns.
+            if (!_exited && ReferenceEquals(stopped, _stopped.Task))
+                _state = DebuggerService.DebugState.Running;
+        }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(StopTimeout);
 
+        DebuggerService.StoppedFrame? frame;
         try
         {
-            await _stopped.WaitAsync(timeoutCts.Token);
+            frame = await stopped.WaitAsync(timeoutCts.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -362,7 +378,6 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (_exited)
             return "The process exited.";
 
-        var frame = CurrentFrame;
         if (frame is null)
             return "Stopped.";
 
@@ -409,6 +424,15 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                 key: "debug-stop-source");
             return frame;
         }
+    }
+
+    public async Task<(bool Ok, VariableInfo? Variable, string Error)> EvaluateVariableAsync(
+        string expression, int frameId, CancellationToken cancellationToken = default)
+    {
+        if (CurrentFrame is null || frameId < 0)
+            return (false, null, "The debugger is not stopped in a valid frame.");
+        var (ok, variable, error) = await Engine.EvaluateVariableAsync((uint)frameId, expression);
+        return (ok, variable is null ? null : Describe([variable], frameId)[0], error);
     }
 
     public Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default) =>
@@ -680,9 +704,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
             var frame = (uint)Math.Max(0, frameId);
             return Describe(await Engine.VariablesAsync(frame), frameId);
         }
-        catch
+        catch (Exception ex)
         {
-            return [];
+            throw new InvalidOperationException("Could not read the frame's variables: " + ex.Message, ex);
         }
     }
 
@@ -695,13 +719,26 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     /// this session's number for one <c>frame|path</c> pair. Paths are stable across stops in a
     /// way handles are not, which is why the reference is minted here rather than in the engine.
     /// </remarks>
+    public async Task<(bool Ok, string Value, string Error)> SetVariableChildAsync(
+        int parentReference, string name, string value, CancellationToken cancellationToken = default)
+    {
+        if (_handles.Expression(parentReference) is not { } handle)
+            return (false, "", "The variable reference has expired.");
+        var (frameId, _) = DecodeHandle(handle);
+        var child = (await GetVariableChildrenAsync(parentReference, cancellationToken))
+            .FirstOrDefault(v => v.Name == name);
+        if (child is not { Evaluable: true, EvaluateName.Length: > 0 })
+            return (false, "", "The member is unavailable or read-only.");
+        return await SetVariableAsync(child.EvaluateName, value, frameId, cancellationToken);
+    }
+
     public async Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
         int variablesReference, CancellationToken cancellationToken = default)
     {
         if (CurrentFrame is null)
             return [];
         if (_handles.Expression(variablesReference) is not { } handle)
-            return [];
+            throw new InvalidOperationException("The variable reference has expired; refresh the Variables view.");
 
         var (frameId, path) = DecodeHandle(handle);
 
@@ -709,9 +746,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         {
             return Describe(await Engine.ExpandAsync((uint)Math.Max(0, frameId), path), frameId);
         }
-        catch
+        catch (Exception ex)
         {
-            return [];
+            throw new InvalidOperationException("Could not expand the value: " + ex.Message, ex);
         }
     }
 
@@ -728,7 +765,9 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                 // second round trip to learn what the client discovers by expanding anyway.
                 NamedChildCount: 0,
                 IndexedChildCount: 0,
-                Evaluable: v.Settable))
+                Evaluable: v.Settable,
+                EvaluateName: v.EvaluateName.Length > 0 ? v.EvaluateName : null,
+                Kind: v.Kind.Length > 0 ? v.Kind : null))
             .ToList();
 
     private static (int FrameId, string Path) DecodeHandle(string handle)
@@ -746,6 +785,13 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         if (frameId < 0)
             return "Error: frame numbers start at 0 (the innermost frame).";
 
+        if (frameId >= 100_000)
+        {
+            try { await Engine.VariablesAsync((uint)frameId); }
+            catch (Exception ex) { return "Error: " + ex.Message; }
+            _selectedFrame = frameId;
+            return $"Selected frame #{frameId}.";
+        }
         var frames = await GetStackFramesAsync(cancellationToken);
         if (frames.Count > 0 && frameId >= frames.Count)
             return $"Error: the stack has {frames.Count} frames; #{frameId} does not exist.";
@@ -997,16 +1043,12 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This is the only route onto the desktop runtime: .NET Framework has no in-process metadata
-    /// updater, so the edit has to go through the debugger that is already attached. The engine
-    /// enabled EnC JIT flags on every module as it loaded, which is what makes the apply possible
-    /// at all — a module JITted without them refuses the change.
-    /// </para>
-    /// <para>
-    /// A .NET target on this engine is refused rather than served. It has an in-process updater and
-    /// the agent has already applied the same generation, and a generation applied twice fails the
-    /// second time — which would leave every later edit diffing against one the debuggee never
-    /// took. The wording is the one the hot reload fan-out reads as a skip rather than a failure.
+    /// The only route onto the desktop runtime, which has no in-process metadata updater, and the
+    /// only route onto a .NET process while a debugger is attached, since the runtime refuses its
+    /// updater for as long as one is. The engine enabled EnC JIT flags on the user's modules as
+    /// they loaded, which is what makes the apply possible at all — a module JITted without them
+    /// is not registered as a target, which is why an attached .NET session cannot be hot
+    /// reloaded and a launched one can.
     /// </para>
     /// </remarks>
     public async Task<(bool Ok, string Error)> ApplyDeltaAsync(
@@ -1014,13 +1056,6 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         string? symbolMap = null,
         CancellationToken cancellationToken = default)
     {
-        if (!AppliesDeltas)
-        {
-            return (false,
-                $"{NotADeltaTarget} — a .NET target takes its updates through the in-process " +
-                "updater instead.");
-        }
-
         if (_engine is null)
             return (false, "No debug session is attached to this engine.");
 
@@ -1220,9 +1255,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                     case DebugEventKind.Step:
                     case DebugEventKind.Paused:
                     case DebugEventKind.Exception:
+                        TaskCompletionSource<DebuggerService.StoppedFrame?> stopSignal;
+                        DebuggerService.StoppedFrame frame;
                         lock (_gate)
                         {
-                            _currentFrame = new DebuggerService.StoppedFrame(
+                            frame = _currentFrame = new DebuggerService.StoppedFrame(
                                 Reason: e.Kind.ToString().ToLowerInvariant(),
                                 Function: e.MethodName,
                                 FilePath: e.FilePath,
@@ -1239,9 +1276,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                                     ? (IsUnhandled(e.Message) ? "unhandled" : "throw")
                                     : null,
                                 ThreadId: e.ThreadId);
+                            _state = DebuggerService.DebugState.Stopped;
+                            stopSignal = _stopped;
+                            _stopped = NewStopSignal();
                         }
                         _selectedFrame = 0;
-                        _state = DebuggerService.DebugState.Stopped;
                         // The one moment the engine can safely re-mark modules, and the moment a
                         // workspace opened since the attach first matters.
                         RefreshUserAssemblies();
@@ -1249,15 +1288,21 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
                         // Raised before the release so a listener sees the stop even when nothing
                         // was waiting for one — which is every breakpoint hit in a running app.
                         Raise(DebugNoticeKind.Stopped, e, StopReason(e.Kind));
-                        _stopped.Release();
+                        stopSignal.TrySetResult(frame);
                         break;
 
                     case DebugEventKind.Exited:
-                        _exited = true;
-                        _state = DebuggerService.DebugState.Exited;
-                        lock (_gate) _currentFrame = null;
+                        TaskCompletionSource<DebuggerService.StoppedFrame?> exitSignal;
+                        lock (_gate)
+                        {
+                            _exited = true;
+                            _state = DebuggerService.DebugState.Exited;
+                            _currentFrame = null;
+                            exitSignal = _stopped;
+                            _stopped = NewStopSignal();
+                        }
                         Raise(DebugNoticeKind.Exited, e);
-                        _stopped.Release();
+                        exitSignal.TrySetResult(null);
                         break;
 
                     case DebugEventKind.Output:
@@ -1349,6 +1394,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
     {
         try { _engine?.Dispose(); } catch { }
         _engine = null;
-        try { _stopped.Dispose(); } catch { }
+        lock (_gate)
+        {
+            _exited = true;
+            _currentFrame = null;
+            _stopped.TrySetResult(null);
+        }
     }
 }

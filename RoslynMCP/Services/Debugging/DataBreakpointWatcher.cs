@@ -1,32 +1,13 @@
 namespace RoslynMCP.Services.Debugging;
 
-/// <summary>
-/// Data breakpoints, built out of stepping and evaluation because neither engine has them.
-/// </summary>
-/// <remarks>
-/// <para>
-/// A real data breakpoint is a CPU debug register: the processor traps the write and the debugger
-/// costs nothing until it fires. Neither engine here exposes that. netcoredbg has no
-/// <c>setDataBreakpoints</c> at all and nothing in MI to express one; ICorDebug's value-change
-/// support ended with the .NET Framework 1.x <c>ICorDebugValue</c> breakpoints, which no runtime
-/// still honors.
-/// </para>
-/// <para>
-/// So this steps and compares: step one line, evaluate every watched expression, and stop when one
-/// of them reads back differently. That is a genuine data breakpoint in the only sense the user
-/// cares about — execution stops on the statement that changed the value — and it costs a debugger
-/// round trip per statement, which is why it is off unless a watch exists and why
-/// <see cref="StepBudget"/> bounds it.
-/// </para>
-/// <para>
-/// Two honest consequences follow from the mechanism, and both are reported rather than hidden:
-/// only <c>write</c> access is detectable, since a read leaves the value alone; and the stop lands
-/// on the statement <em>after</em> the write, because a change can only be observed once it has
-/// happened.
-/// </para>
-/// </remarks>
+/// <summary>Explicit sampled value watches. This is not a native data-breakpoint engine.</summary>
+/// <remarks>Stepping compares observations after execution. Same-value writes, changes that are
+/// reverted between observations, and changes hidden by display formatting are not observable.
+/// The DAP adapter must not advertise this as write-breakpoint support.</remarks>
 internal sealed class DataBreakpointWatcher
 {
+    internal const string UnsupportedNativeMessage = "This debugger backend does not implement native data breakpoints. " +
+        "Sampled value watches cannot reliably detect every write and are not offered as write breakpoints.";
     /// <summary>How many steps to take before giving up. A watch inside a long-running loop would
     /// otherwise hold the caller forever with nothing to show for it.</summary>
     public const int StepBudget = 20_000;
@@ -81,7 +62,7 @@ internal sealed class DataBreakpointWatcher
 
             _watches[spec.DataId] = spec;
             _values[spec.DataId] = value;
-            results.Add(new DataBreakpointStatus(spec.DataId, true, ""));
+            results.Add(new DataBreakpointStatus(spec.DataId, true, "Sampled value watch: changes are checked between steps; not every write can be detected."));
         }
 
         return results;

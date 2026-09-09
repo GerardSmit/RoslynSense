@@ -80,12 +80,17 @@ public sealed class AppRunService(AppSessionStore store)
             DebugRuntime = spec.DebugRuntime,
         };
 
+        string hotReloadOwner = "run:" + Guid.NewGuid().ToString("N");
+        session.HotReloadOwner = hotReloadOwner;
+        session.HotReloadRemote = agentPipe is not null;
+
         session.Process.OutputDataReceived += (_, e) => { if (e.Data is not null) session.Append(e.Data); };
         session.Process.ErrorDataReceived += (_, e) => { if (e.Data is not null) session.Append(e.Data); };
         session.Process.Exited += (_, _) =>
         {
             try { session.MarkExited(session.Process.ExitCode); }
             catch { session.MarkExited(null); }
+            _ = ReleaseHotReloadAsync(session);
             RunningProcessRegistry.Unregister(session);
         };
 
@@ -117,13 +122,13 @@ public sealed class AppRunService(AppSessionStore store)
                 if (agentPipe is not null)
                 {
                     session.HotReloadOpen =
-                        await HotReload.HotReloadRouting.StartSessionAsync(spec.ProjectPath, cancellationToken)
+                        await HotReload.HotReloadRouting.StartSessionAsync(spec.ProjectPath, cancellationToken, hotReloadOwner, session.Pid)
                             is not null;
                 }
                 else
                 {
                     var (opened, _) = await HotReload.HotReloadService.StartAsync(
-                        spec.ProjectPath, cancellationToken);
+                        spec.ProjectPath, cancellationToken, hotReloadOwner, session.Pid);
                     session.HotReloadOpen = opened is not null;
                 }
             }
@@ -148,6 +153,7 @@ public sealed class AppRunService(AppSessionStore store)
                 session.Append("[roslyn-sense] The port never started accepting connections.");
         }
 
+        if (session.Process.HasExited) await ReleaseHotReloadAsync(session);
         session.MarkRunning();
         return new RunOutcome(session, null, spec);
     }
@@ -188,12 +194,26 @@ public sealed class AppRunService(AppSessionStore store)
         if (!AppSessionStore.IsLive(session))
         {
             session.MarkStopped();
+            await ReleaseHotReloadAsync(session);
             return false;
         }
 
         await BuildProcessHelper.KillAndDrainAsync(session.Process);
         session.MarkStopped();
+        await ReleaseHotReloadAsync(session);
         RunningProcessRegistry.Unregister(session);
         return true;
     }
+    private static async Task ReleaseHotReloadAsync(AppSession session)
+    {
+        if (session.HotReloadOwner is not { } owner) return;
+        try
+        {
+            if (session.HotReloadRemote) await HotReload.HotReloadRouting.ReleaseSessionAsync(session.ProjectPath, owner);
+            else await HotReload.HotReloadService.ReleaseOwnerAsync(session.ProjectPath, owner);
+            session.HotReloadOpen = false;
+        }
+        catch (Exception ex) { session.Append($"[HotReload] Cleanup failed: {ex.Message}"); }
+    }
+
 }

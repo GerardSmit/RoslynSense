@@ -28,7 +28,7 @@ namespace RoslynMCP.Services.HotReload;
 /// that would have to emit them, rather than guessed at here.
 /// </para>
 /// </remarks>
-internal sealed class HotReloadService
+internal sealed partial class HotReloadService
 {
     /// <summary>
     /// What .NET Framework's EnC accepts. It predates the capability strings entirely, so there is
@@ -92,9 +92,9 @@ internal sealed class HotReloadService
 
     /// <summary>Whether a session is open for a project — an apply without one has no baseline to
     /// compare against and would report the whole project as changed.</summary>
-    public static bool IsRunning(string projectPath) => s_sessions.ContainsKey(projectPath);
+    public static bool IsRunning(string projectPath) => s_sessions.ContainsKey(PathHelper.NormalizePath(projectPath));
 
-    public static HotReloadService? Get(string projectPath) => s_sessions.GetValueOrDefault(projectPath);
+    public static HotReloadService? Get(string projectPath) => s_sessions.GetValueOrDefault(PathHelper.NormalizePath(projectPath));
 
     /// <summary>Projects with an open edit session, which is what makes an apply incremental.</summary>
     public static IReadOnlyList<string> OpenSessions => [.. s_sessions.Keys];
@@ -104,15 +104,21 @@ internal sealed class HotReloadService
     /// computed against.
     /// </summary>
     public static async Task<(HotReloadService? Session, string Message)> StartAsync(
-        string projectPath, CancellationToken cancellationToken = default)
+        string projectPath, CancellationToken cancellationToken = default, string? ownerId = null, int? ownerPid = null)
     {
+        projectPath = PathHelper.NormalizePath(projectPath);
+        var owner = SessionOwner.Create(ownerId ?? "manual", ownerPid);
         // Serialised: two concurrent starts would each open a Roslyn EnC session, and the
         // loser's would be overwritten in the table without ever being ended.
         await s_startGate.WaitAsync(cancellationToken);
         try
         {
             if (s_sessions.TryGetValue(projectPath, out var existing))
+            {
+                if (existing._stopping) throw new InvalidOperationException("The previous Hot Reload session is still stopping.");
+                existing._owners[owner.Id] = owner;
                 return (existing, "A hot reload session is already open for this project.");
+            }
 
             var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
                 projectPath, cancellationToken: cancellationToken);
@@ -137,8 +143,23 @@ internal sealed class HotReloadService
                 cancellationToken);
 
             var session = new HotReloadService(service, projectPath);
-            session.RecordStamps(project.Solution);
-            s_sessions[projectPath] = session;
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                session.RecordStamps(project.Solution);
+                session._owners[owner.Id] = owner;
+                s_sessions[projectPath] = session;
+                Services.Memory.MemoryCacheRegistry.Register(session);
+            }
+            catch (Exception initializationFailure)
+            {
+                // If ending fails, keep a discoverable stopping entry for bounded cleanup retries.
+                s_sessions[projectPath] = session;
+                Services.Memory.MemoryCacheRegistry.Register(session);
+                try { await session.EndLockedAsync().ConfigureAwait(false); }
+                catch (Exception endFailure) { throw new AggregateException(initializationFailure, endFailure); }
+                throw;
+            }
 
             return (session, $"Hot reload session open with {capabilities.Count} runtime capabilities.");
         }
@@ -162,6 +183,7 @@ internal sealed class HotReloadService
         await _applyGate.WaitAsync(cancellationToken);
         try
         {
+            if (_stopping) throw new InvalidOperationException("The Hot Reload session has stopped.");
             return await ApplyLockedAsync(cancellationToken);
         }
         finally
@@ -217,12 +239,19 @@ internal sealed class HotReloadService
         {
             (applied, errors) = await HotReloadAgentServer.Instance.ApplyAsync(deltas, cancellationToken);
 
-            var (frameworkApplied, frameworkQueued, frameworkErrors) = await ApplyToFrameworkSessionAsync(
+            var (debuggerApplied, debuggerQueued, debuggerErrors) = await ApplyThroughDebuggerAsync(
                 solution, deltas, cancellationToken);
 
-            applied = [.. applied, .. frameworkApplied];
-            errors = [.. errors, .. frameworkErrors];
-            queued = frameworkQueued;
+            // A .NET runtime under a debugger turns its own updater away — "cannot apply while a
+            // debugger is attached" — and the debugger session is the route that took the edit
+            // instead. Once it has, the updater's refusal is the expected shape of a debugged
+            // process, not a failure to report.
+            if (debuggerApplied.Count > 0 || debuggerQueued.Count > 0)
+                errors = [.. errors.Where(e => !e.Contains("debugger is attached", StringComparison.OrdinalIgnoreCase))];
+
+            applied = [.. applied, .. debuggerApplied];
+            errors = [.. errors, .. debuggerErrors];
+            queued = debuggerQueued;
         }
         catch
         {
@@ -270,25 +299,23 @@ internal sealed class HotReloadService
     }
 
     /// <summary>
-    /// Routes deltas into a live .NET Framework debug session, which is the only way onto the
-    /// desktop runtime — there is no in-process updater there.
+    /// Routes deltas into a live ICorDebug session: the only way onto the desktop runtime, which
+    /// has no in-process updater, and the only way onto a .NET process while a debugger is
+    /// attached, since the runtime refuses its updater for as long as one is.
     /// </summary>
     /// <remarks>
     /// ICorDebug addresses modules by name rather than by MVID, so the ids Roslyn returns are
     /// mapped back through the built output. A module that is not loaded in the debuggee is
     /// skipped rather than reported as a failure: a solution can easily contain projects the
-    /// running app never loads.
+    /// running app never loads. netcoredbg is not an applier: a .NET process debugged with it
+    /// cannot be hot reloaded at all, and the updater's refusal is what reports that.
     /// </remarks>
     private static async Task<(IReadOnlyList<string> Applied, IReadOnlyList<string> Queued, IReadOnlyList<string> Errors)>
-        ApplyToFrameworkSessionAsync(
+        ApplyThroughDebuggerAsync(
             Solution solution, IReadOnlyList<HotReloadDelta> deltas, CancellationToken cancellationToken)
     {
         var local = DebugSessionManager.GetSession() as Debugging.PublishingDebugBackend;
 
-        // Only a .NET Framework session takes this route. A .NET one on the same engine refuses
-        // every delta — its updates go through the in-process updater — so treating it as the
-        // local applier would suppress the fan-out below and strand a Framework session running
-        // in another process.
         var icor = local?.Inner is IcorDebugBackend backend && backend.AppliesDeltas
             ? backend
             : null;
@@ -353,8 +380,8 @@ internal sealed class HotReloadService
             else if (!error.Contains("is not loaded", StringComparison.OrdinalIgnoreCase) &&
                      !error.Contains(IcorDebugBackend.NotADeltaTarget, StringComparison.OrdinalIgnoreCase))
             {
-                // A CoreCLR session refusing a Framework-only route is a skip, not a failure:
-                // the fan-out reaches every published session, related to this edit or not.
+                // A session without the module is a skip, not a failure: the fan-out reaches
+                // every published session, related to this edit or not.
                 errors.Add($"{assemblyName}: {error}");
             }
         }
@@ -389,17 +416,9 @@ internal sealed class HotReloadService
         }.ToJson();
     }
 
-    public void Stop()
-    {
-        s_sessions.TryRemove(_projectPath, out _);
-        try { _encService.EndSession(); } catch { }
-    }
+    public void Stop() => StopAsync().GetAwaiter().GetResult();
 
-    public static void StopAll()
-    {
-        foreach (var session in s_sessions.Values.ToList())
-            session.Stop();
-    }
+    public static void StopAll() => StopAllAsync().GetAwaiter().GetResult();
 
     /// <summary>
     /// Asks whatever is running what it will accept, so an edit is judged against the real

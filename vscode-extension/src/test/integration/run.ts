@@ -3,12 +3,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { runTests } from '@vscode/test-electron';
 
-function publishedServer(extensionRoot: string): string {
+function publishedServer(extensionRoot: string, runRoot: string): string {
     const explicit = process.env.ROSLYNSENSE_TEST_SERVER;
     if (explicit) return path.resolve(explicit);
 
     const repositoryRoot = path.resolve(extensionRoot, '..');
-    const output = path.join(extensionRoot, '.vscode-test', 'roslyn-sense-server');
+    const output = path.join(runRoot, 'server');
     fs.mkdirSync(output, { recursive: true });
 
     // RoslynMCP's build targets invoke projects that are not regular project
@@ -37,16 +37,35 @@ function publishedServer(extensionRoot: string): string {
         { stdio: 'inherit', shell: false }
     );
     if (result.status !== 0) throw new Error(`Temporary server publish failed with ${result.status}.`);
+    const agent = path.join(output, 'hotreload', 'RoslynMCP.HotReloadAgent.dll');
+    if (!fs.existsSync(agent)) throw new Error(`Published server is missing its hot reload startup hook: ${agent}.`);
     // `ToolCommandName` names the NuGet shim; a direct publish keeps the assembly/apphost name.
     return path.join(output, process.platform === 'win32' ? 'RoslynMCP.exe' : 'RoslynMCP');
 }
 
 async function main(): Promise<void> {
     const extensionRoot = path.resolve(__dirname, '../../..');
-    const server = publishedServer(extensionRoot);
+    const runs = path.join(extensionRoot, '.vscode-test', 'integration-runs');
+    fs.mkdirSync(runs, { recursive: true });
+    const runRoot = fs.mkdtempSync(path.join(runs, 'run-'));
+    const workspace = path.join(runRoot, 'workspace');
+    const userData = path.join(runRoot, 'user-data');
+    const temp = path.join(runRoot, 'temp');
+    fs.mkdirSync(temp, { recursive: true });
+    fs.mkdirSync(path.join(userData, 'User'), { recursive: true });
+    fs.writeFileSync(path.join(userData, 'User', 'settings.json'), JSON.stringify({
+        'files.autoSave': 'off', 'files.hotExit': 'off', 'roslynSense.hotReload.applyOnSave': false,
+    }));
+    // Keep source edits, recovered editor buffers and personal server settings out of later
+    // runs. Retain this directory for diagnostics when the real editor test fails.
+    fs.cpSync(path.join(extensionRoot, 'src/test/integration/fixture'), workspace, {
+        recursive: true, filter: source => !['bin', 'obj', '.vscode'].includes(path.basename(source)),
+    });
+    console.log(`VS Code integration workspace and diagnostics: ${runRoot}`);
+    const server = publishedServer(extensionRoot, runRoot);
     if (!fs.existsSync(server)) throw new Error(`Test server was not found at ${server}.`);
 
-    const fixture = cp.spawnSync('dotnet', ['build', path.join(extensionRoot, 'src/test/integration/fixture/Fixture.csproj'), '--nologo'],
+    const fixture = cp.spawnSync('dotnet', ['build', path.join(workspace, 'Fixture.csproj'), '--nologo'],
         { stdio: 'inherit', shell: false });
     if (fixture.status !== 0) throw new Error(`Integration fixture build failed with ${fixture.status}.`);
 
@@ -64,9 +83,13 @@ async function main(): Promise<void> {
             ROSLYNSENSE_LSP_TRACE: '1',
             ROSLYNMCP_SHARED_HOST: '0',
             ROSLYNMCP_NO_UPDATE_CHECK: '1',
+            ROSLYNSENSE_HOME: path.join(runRoot, 'roslynsense-home'),
+            TEMP: temp, TMP: temp, TMPDIR: temp,
         },
         launchArgs: [
-            path.join(extensionRoot, 'src', 'test', 'integration', 'fixture'),
+            workspace,
+            `--user-data-dir=${userData}`,
+            `--extensions-dir=${path.join(runRoot, 'extensions')}`,
             '--skip-welcome',
             '--skip-release-notes',
         ],

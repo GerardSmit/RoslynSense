@@ -64,6 +64,12 @@ public static class OpenDocumentStore
 
     public static bool IsEmpty => s_docs.IsEmpty;
 
+    public static int? VersionOf(string filePath)
+    {
+        if (!s_docs.TryGetValue(PathHelper.NormalizePath(filePath), out var doc)) return null;
+        lock (doc) return doc.Version;
+    }
+
     public static bool TryGet(string filePath, out SourceText text)
     {
         if (s_docs.TryGetValue(PathHelper.NormalizePath(filePath), out var doc))
@@ -100,7 +106,8 @@ public static class OpenDocumentStore
     }
 
     /// <summary>Applies incremental (or full) changes. Returns the resulting text, or null if
-    /// the document is not open (client protocol error — didChange before didOpen).</summary>
+    /// the document is not open, the version is stale, or the edit is rejected. Returning null
+    /// from <paramref name="apply"/> rejects the edit without changing its text or version.</summary>
     /// <remarks>
     /// <para>
     /// The version is checked rather than merely recorded. StreamJsonRpc dispatches notification
@@ -123,11 +130,11 @@ public static class OpenDocumentStore
     /// discard the second window's edits.
     /// </para>
     /// </remarks>
-    public static SourceText? Change(string filePath, int version, Func<SourceText, SourceText> apply)
+    public static SourceText? Change(string filePath, int version, Func<SourceText, SourceText?> apply)
     {
         if (!s_docs.TryGetValue(PathHelper.NormalizePath(filePath), out var doc))
             return null;
-        SourceText updated;
+        SourceText? updated;
         lock (doc)
         {
             // Null, not an exception: this runs inside a notification handler, where a throw has
@@ -136,6 +143,8 @@ public static class OpenDocumentStore
                 return null;
 
             updated = apply(doc.Text);
+            if (updated is null)
+                return null;
             doc.Text = updated;
             doc.Version = version;
         }
@@ -188,6 +197,8 @@ public static class OpenDocumentStore
         // that no longer exists anywhere.
         foreach (string path in closed)
         {
+            Memory.MemoryCacheRegistry.DocumentChanged(path);
+            Languages.WebForms.Core.AspxDocumentService.Invalidate(path);
             if (!IsOverlayable(path))
                 continue;
 
@@ -210,6 +221,9 @@ public static class OpenDocumentStore
     /// <summary>Records that a buffer moved, on both counters or only the general one.</summary>
     private static void Bump(string normalizedPath)
     {
+        Memory.MemoryCacheRegistry.DocumentChanged(normalizedPath);
+        if (!TryGet(normalizedPath, out _) && Languages.WebForms.Core.AspxDocumentService.IsAspxFile(normalizedPath))
+            Languages.WebForms.Core.AspxDocumentService.Invalidate(normalizedPath);
         Interlocked.Increment(ref s_generation);
         if (!IsOverlayable(normalizedPath))
             return;

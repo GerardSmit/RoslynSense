@@ -99,7 +99,7 @@ public class DebugAttributeTests : IAsyncLifetime
 
         var order = Find(await Session.ExpandAsync(0, ""), "order");
 
-        Assert.Equal("FxTarget.Order", order.Value);
+        Assert.Equal("{FxTarget.Order}", order.Value);
     }
 
     [RequiresNetFrameworkFact]
@@ -266,6 +266,20 @@ public class DebuggerDisplayFormatTests
         var parts = DebuggerDisplayFormat.Parse("{{literal}}");
 
         Assert.Equal(new DisplayPart("{literal}", false, false), Assert.Single(parts));
+    }
+
+    [Fact]
+    public void WhenABraceIsBackslashEscapedThenItIsLiteral()
+    {
+        // The compiler's own display string for an anonymous type.
+        var parts = DebuggerDisplayFormat.Parse(@"\{ A = {A}, B = {B} }");
+
+        Assert.Collection(parts,
+            p => Assert.Equal(new DisplayPart("{ A = ", false, false), p),
+            p => Assert.Equal(new DisplayPart("A", true, false), p),
+            p => Assert.Equal(new DisplayPart(", B = ", false, false), p),
+            p => Assert.Equal(new DisplayPart("B", true, false), p),
+            p => Assert.Equal(new DisplayPart(" }", false, false), p));
     }
 
     [Fact]

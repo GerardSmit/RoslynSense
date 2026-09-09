@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net.Sockets;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Debugging;
 using RoslynMCP.Services.HotReload;
 using Xunit;
 
@@ -15,10 +16,8 @@ public sealed class IisExpressHotReloadFactAttribute : FactAttribute
 {
     public IisExpressHotReloadFactAttribute()
     {
-        if (Environment.GetEnvironmentVariable("ROSLYNSENSE_TEST_FX_HOTRELOAD") != "1")
-            Skip = "Set ROSLYNSENSE_TEST_FX_HOTRELOAD=1 to run; ApplyChanges can crash the host.";
-        else if (!OperatingSystem.IsWindows() || FrameworkHotReloadTests.FrameworkDirectory() is null)
-            Skip = "No .NET Framework installation was found.";
+        if (FrameworkHotReloadFactAttribute.SkipReason is { } reason)
+            Skip = reason;
         else if (NetFxToolchain.Info.IisExpressX86.Length == 0)
             Skip = "The 32-bit IIS Express is not installed on this machine.";
     }
@@ -140,7 +139,7 @@ public class IisExpressHotReloadTests : IDisposable
     }
 
     /// <summary>The site on disk plus the launched, warmed-up IIS Express hosting it.</summary>
-    private sealed record Site(string Csproj, string SourcePath, string Url);
+    private sealed record Site(string Csproj, string SourcePath, string Url, int Pid, long StartTicks);
 
     /// <summary>
     /// Writes the site and its code project, builds it, launches x86 IIS Express under the
@@ -183,7 +182,9 @@ public class IisExpressHotReloadTests : IDisposable
         string url = $"http://localhost:{port}/Handler.ashx";
         Assert.Equal("6", await GetWithRetriesAsync(http, url, TimeSpan.FromSeconds(120)));
 
-        return new Site(csproj, sourcePath, url);
+        Assert.NotNull(backend.DebuggeePid);
+        using var target = Process.GetProcessById(backend.DebuggeePid.Value);
+        return new Site(csproj, sourcePath, url, target.Id, target.StartTime.ToUniversalTime().Ticks);
     }
 
     /// <summary>
@@ -212,6 +213,8 @@ public class IisExpressHotReloadTests : IDisposable
                 bound.TrySetResult();
         };
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        using var pingCts = new CancellationTokenSource();
+        Task? pinger = null;
 
         string? csproj = null;
         try
@@ -234,6 +237,7 @@ public class IisExpressHotReloadTests : IDisposable
             // The queue must leave a live, resumed debuggee behind — the crash it replaces left
             // a dead worker — and the old code still runs because nothing has applied yet.
             Assert.Equal("6", await GetWithRetriesAsync(http, site.Url, TimeSpan.FromSeconds(30)));
+            AssertSameProcess(backend, site);
 
             // A breakpoint hit is the safe stop the queue waits for. The edit applies before
             // the stop is reported; on resume the stopped frame is remapped to the edited version.
@@ -254,8 +258,7 @@ public class IisExpressHotReloadTests : IDisposable
             // Requests keep coming until the stop is observed — the runtime occasionally
             // delivers a first breakpoint event stale (thread already ran on), which the engine
             // resumes past, and only the next hit stops. One of these will stop at Compute.
-            using var pingCts = new CancellationTokenSource();
-            var pinger = Task.Run(async () =>
+            pinger = Task.Run(async () =>
             {
                 while (!pingCts.IsCancellationRequested)
                 {
@@ -294,12 +297,17 @@ public class IisExpressHotReloadTests : IDisposable
             Assert.True(last == "30",
                 $"The queued edit never took effect (last answer: '{last}'):\n" +
                 backend.GetStatus() + "\n--- notices ---\n" + string.Join("\n", notices));
+            AssertSameProcess(backend, site);
         }
         finally
         {
-            if (csproj is not null)
-                HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            pingCts.Cancel();
+            try
+            {
+                if (pinger is not null)
+                    await pinger.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            finally { await StopSiteAsync(csproj, backend); }
         }
     }
 
@@ -341,12 +349,11 @@ public class IisExpressHotReloadTests : IDisposable
                 "\n--- engine ---\n" + backend.GetStatus());
 
             Assert.Equal("30", await GetWithRetriesAsync(http, site.Url, TimeSpan.FromSeconds(30)));
+            AssertSameProcess(backend, site);
         }
         finally
         {
-            if (csproj is not null)
-                HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            await StopSiteAsync(csproj, backend);
         }
     }
 
@@ -415,12 +422,52 @@ public class IisExpressHotReloadTests : IDisposable
             Assert.Equal("30", await inFlight);
 
             Assert.Equal("30", await GetWithRetriesAsync(http, site.Url, TimeSpan.FromSeconds(30)));
+            AssertSameProcess(backend, site);
         }
         finally
         {
-            if (csproj is not null)
-                HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            await StopSiteAsync(csproj, backend);
+        }
+    }
+
+    private static void AssertSameProcess(PublishingDebugBackend backend, Site site)
+    {
+        Assert.Equal(site.Pid, backend.DebuggeePid);
+        using var target = Process.GetProcessById(site.Pid);
+        Assert.False(target.HasExited, "The IIS Express process must survive hot reload.");
+        Assert.Equal(site.StartTicks, target.StartTime.ToUniversalTime().Ticks);
+    }
+
+    private static async Task StopSiteAsync(string? csproj, PublishingDebugBackend backend)
+    {
+        Process? target = null;
+        if (backend.DebuggeePid is { } pid)
+        {
+            try { target = Process.GetProcessById(pid); }
+            catch (ArgumentException) { }
+        }
+
+        try
+        {
+            if (csproj is not null && HotReloadService.Get(csproj) is { } session)
+                await session.StopAsync();
+        }
+        finally
+        {
+            try { backend.Stop(); }
+            finally
+            {
+                DebugSessionManager.DisposeSession();
+                if (target is not null)
+                {
+                    using (target)
+                    {
+                        if (!target.HasExited)
+                            target.Kill(entireProcessTree: true);
+                        await target.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+                    }
+                }
+            }
         }
     }
 
@@ -454,21 +501,33 @@ public class IisExpressHotReloadTests : IDisposable
 
     private static async Task<bool> BuildAsync(string csproj)
     {
-        var build = Process.Start(new ProcessStartInfo
+        using var build = Process.Start(new ProcessStartInfo
         {
             FileName = "dotnet",
             WorkingDirectory = Path.GetDirectoryName(csproj),
             UseShellExecute = false,
+            CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             ArgumentList = { "build", csproj, "-c", "Debug", "--nologo" },
         })!;
 
-        string output = await build.StandardOutput.ReadToEndAsync();
-        await build.WaitForExitAsync();
+        var output = build.StandardOutput.ReadToEndAsync();
+        var error = build.StandardError.ReadToEndAsync();
+        try
+        {
+            await build.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(2));
+        }
+        catch
+        {
+            if (!build.HasExited)
+                build.Kill(entireProcessTree: true);
+            await build.WaitForExitAsync();
+            throw;
+        }
 
         if (build.ExitCode != 0)
-            Assert.Fail(output);
+            Assert.Fail(await output + "\n" + await error);
 
         return true;
     }

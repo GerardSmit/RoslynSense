@@ -44,8 +44,10 @@ public static class PathVariableExpander
         bool hasPlaceholder = s_varPattern.IsMatch(value);
         var expanded = hasPlaceholder ? Expand(value, baseDir) : value;
 
-        if (hasPlaceholder || Path.IsPathRooted(expanded))
+        if (Path.IsPathRooted(expanded))
             return expanded;
+        if (hasPlaceholder)
+            return Path.GetFullPath(Path.Combine(baseDir, expanded));
 
         var candidates = new List<string> { Path.GetFullPath(Path.Combine(baseDir, expanded)) };
 

@@ -1,5 +1,6 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp;
@@ -52,23 +53,80 @@ public class ExternalSourceAccessibilityTests
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void BrowsingRedirectRequiresMatchingAssemblyIdentity(bool matching)
+    [InlineData("Library", "1.0.0.0", true)]
+    [InlineData("Other", "1.0.0.0", false)]
+    [InlineData("Library", "2.0.0.0", false)]
+    public void BrowsingRedirectRequiresMatchingAssemblyIdentity(string implementationName, string implementationVersion, bool matching)
     {
         string directory = Path.Combine(ExternalSourceCache.ReferenceSourceDirectory, "tests", Guid.NewGuid().ToString("N"));
         string reference = Path.Combine(directory, "ref", "net10.0", "Library.dll");
         string implementation = Path.Combine(directory, "lib", "net10.0", "Library.dll");
-        foreach (var (path, name) in new[] { (reference, "Library"), (implementation, matching ? "Library" : "Other") })
+        foreach (var (path, name, version) in new[]
+                 { (reference, "Library", "1.0.0.0"), (implementation, implementationName, implementationVersion) })
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             var compilation = CSharpCompilation.Create(name,
-                [CSharpSyntaxTree.ParseText("public class Library { }")],
+                [CSharpSyntaxTree.ParseText($"[assembly: System.Reflection.AssemblyVersion(\"{version}\")] public class Library {{ }}")],
                 [MetadataReference.CreateFromFile(typeof(object).Assembly.Location)],
                 new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
             Assert.True(compilation.Emit(path).Success);
         }
         Assert.Equal(matching ? implementation : reference, ReferenceAssemblyRedirector.RedirectForBrowsing(reference));
+    }
+
+    [Fact]
+    public async Task PackageImplementationMembersBindAndKeepReferenceAssemblyProvenance()
+    {
+        using var offline = ExternalSourceScope.Offline();
+        string directory = Path.Combine(ExternalSourceCache.ReferenceSourceDirectory, "tests", Guid.NewGuid().ToString("N"));
+        string reference = Path.Combine(directory, "ref", "net10.0", "BrowsingPackage.dll");
+        string implementation = Path.Combine(directory, "lib", "net10.0", "BrowsingPackage.dll");
+        Directory.CreateDirectory(Path.GetDirectoryName(reference)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(implementation)!);
+        var library = CSharpCompilation.Create("BrowsingPackage",
+            [CSharpSyntaxTree.ParseText("public class Library { private int PrivateField = 42; internal int InternalProperty => PrivateField; }")],
+            [MetadataReference.CreateFromFile(typeof(object).Assembly.Location)],
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+        var implementationResult = library.Emit(implementation);
+        Assert.True(implementationResult.Success, string.Join("\n", implementationResult.Diagnostics));
+        using (var referenceStream = File.Create(reference))
+        {
+            var referenceResult = library.Emit(referenceStream, options: new EmitOptions(metadataOnly: true, includePrivateMembers: false));
+            Assert.True(referenceResult.Success, string.Join("\n", referenceResult.Diagnostics));
+        }
+
+        // Even importing all metadata cannot recover members omitted from the reference image.
+        var referenceConsumer = CSharpCompilation.Create("Consumer",
+            references: [MetadataReference.CreateFromFile(typeof(object).Assembly.Location), MetadataReference.CreateFromFile(reference)],
+            options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+                .WithMetadataImportOptions(MetadataImportOptions.All));
+        var referenceType = referenceConsumer.GetTypeByMetadataName("Library")!;
+        Assert.Empty(referenceType.GetMembers("PrivateField"));
+        Assert.Empty(referenceType.GetMembers("InternalProperty"));
+
+        const string source = "class Reader { int Read(Library value) => value.PrivateField + value.InternalProperty; }";
+        string file = WriteSource(directory, reference, source, "Reader");
+        var document = (await WorkspaceService.FindDocumentAsync(file, default))!;
+        var model = (await document.GetSemanticModelAsync())!;
+        Assert.DoesNotContain(model.GetDiagnostics(), d => d.Severity == DiagnosticSeverity.Error);
+
+        foreach (string name in new[] { "PrivateField", "InternalProperty" })
+        {
+            int offset = source.IndexOf(name, StringComparison.Ordinal);
+            var symbol = await SymbolFinder.FindSymbolAtPositionAsync(document, offset, default);
+            Assert.NotNull(symbol);
+            Assert.Equal(name, symbol!.Name);
+            Assert.All(symbol.Locations, location => Assert.True(location.IsInMetadata));
+            Assert.Equal(reference, await SourceMemberLocator.AssemblyPathAsync(symbol, document.Project, default), ignoreCase: true);
+
+            var position = new TextDocumentPositionParams(new TextDocumentIdentifier(LspConverters.PathToUri(file)), new Position(0, offset));
+            var hover = await HoverHandler.HoverAsync(position, default);
+            Assert.NotNull(hover);
+            Assert.Contains(name, hover!.Contents.Value);
+            var locations = await NavigationHandlers.DefinitionAsync(position, false, default);
+            Assert.Contains(locations, location => File.ReadAllLines(LspConverters.UriToPath(location.Uri))[location.Range.Start.Line]
+                .Contains(name, StringComparison.Ordinal));
+        }
     }
 
     [Fact]

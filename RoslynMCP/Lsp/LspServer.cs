@@ -1,4 +1,4 @@
-﻿using System.Collections.Immutable;
+using System.Collections.Immutable;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis.Text;
@@ -317,7 +317,8 @@ internal sealed class LspServer : IDisposable
         SolutionWarmup.NotifyActivity();
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         OpenDocumentStore.Open(SessionId, path,
-            SourceText.From(p.TextDocument.Text), p.TextDocument.Version);
+            // Roslyn needs an encoding when emitting Hot Reload's PDB delta from this buffer.
+            SourceText.From(p.TextDocument.Text, System.Text.Encoding.UTF8), p.TextDocument.Version);
         if (!_clientPullsDiagnostics)
             _diagnostics?.Schedule(path, immediate: true);
 
@@ -355,7 +356,7 @@ internal sealed class LspServer : IDisposable
             {
                 if (change.Range is null)
                 {
-                    text = SourceText.From(change.Text);
+                    text = SourceText.From(change.Text, text.Encoding ?? System.Text.Encoding.UTF8);
                     continue;
                 }
 
@@ -368,9 +369,9 @@ internal sealed class LspServer : IDisposable
                     // The batch as a whole, not the part of it that happened to land. The changes
                     // in one notification are a single edit expressed in pieces — each range is
                     // stated against the text the piece before it produced — so half of them is not
-                    // a smaller edit, it is a different document. Committing that prefix would hand
-                    // the other owner of this entry text no editor has.
-                    return original;
+                    // a smaller edit, it is a different document. Reject the version too: after
+                    // this owner leaves, its version must not block the remaining window's edits.
+                    return null;
                 }
 
                 text = text.WithChanges(new TextChange(span, change.Text));
@@ -456,11 +457,11 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/debuggerPath")]
     public Task<DebuggerPathResult> DebuggerPath(CancellationToken ct) =>
-        Handlers.LaunchHandler.DebuggerPathAsync(ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DebuggerPath", () => Handlers.LaunchHandler.DebuggerPathAsync(ct));
 
     [JsonRpcMethod("roslynSense/launchTargets", UseSingleObjectParameterDeserialization = true)]
     public Task<LaunchTarget[]> LaunchTargets(LaunchTargetsParams p, CancellationToken ct) =>
-        Handlers.LaunchHandler.LaunchTargetsAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("LaunchTargets", () => Handlers.LaunchHandler.LaunchTargetsAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/targetForFile", UseSingleObjectParameterDeserialization = true)]
     public LaunchTarget? TargetForFile(TargetForFileParams p) =>
@@ -469,18 +470,24 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/attachTargets")]
     public AttachTarget[] AttachTargets() => Handlers.LaunchHandler.AttachTargets();
 
+    [JsonRpcMethod("roslynSense/memory")]
+    public object MemorySummary() => Services.Memory.HostMemoryTelemetry.Capture();
+
     // ---- Hot reload ---------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/hotReloadStart", UseSingleObjectParameterDeserialization = true)]
     public Task<HotReloadResultDto> HotReloadStart(HotReloadParams p, CancellationToken ct) =>
-        Handlers.HotReloadHandler.StartAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("HotReloadStart", () => Handlers.HotReloadHandler.StartAsync(OwnedHotReload(p), ct));
 
     [JsonRpcMethod("roslynSense/hotReloadApply", UseSingleObjectParameterDeserialization = true)]
     public Task<HotReloadResultDto> HotReloadApply(HotReloadParams p, CancellationToken ct) =>
-        Handlers.HotReloadHandler.ApplyAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("HotReloadApply", () => Handlers.HotReloadHandler.ApplyAsync(OwnedHotReload(p), ct));
 
     [JsonRpcMethod("roslynSense/hotReloadStop", UseSingleObjectParameterDeserialization = true)]
-    public HotReloadResultDto HotReloadStop(HotReloadParams p) => Handlers.HotReloadHandler.Stop(p);
+    public Task<HotReloadResultDto> HotReloadStop(HotReloadParams p) => Services.Memory.HostMemoryTelemetry.TrackAsync("HotReloadStop", () => Handlers.HotReloadHandler.StopAsync(OwnedHotReload(p)));
+
+    private HotReloadParams OwnedHotReload(HotReloadParams p) =>
+        p with { OwnerId = $"lsp:{SessionId}:{p.OwnerId ?? "manual"}" };
 
     [JsonRpcMethod("roslynSense/hotReloadStatus")]
     public HotReloadStatusDto HotReloadStatus() => Handlers.HotReloadHandler.Status();
@@ -492,7 +499,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/solutionTree", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeNode[]> SolutionTree(SolutionTreeParams p, CancellationToken ct) =>
-        Handlers.SolutionTreeHandler.ChildrenAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SolutionTree", () => Handlers.SolutionTreeHandler.ChildrenAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/solutionProjects")]
     public SolutionProjectInfo[] SolutionProjects() => Handlers.SolutionTreeHandler.Projects();
@@ -503,27 +510,27 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/projectTemplates")]
     public Task<ProjectTemplateChoices> ProjectTemplates(CancellationToken ct) =>
-        Handlers.SolutionTreeHandler.TemplatesAsync(ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ProjectTemplates", () => Handlers.SolutionTreeHandler.TemplatesAsync(ct));
 
     [JsonRpcMethod("roslynSense/solutionTreeSearch", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeNode[]> SolutionTreeSearch(SolutionTreeSearchParams p, CancellationToken ct) =>
-        Handlers.SolutionTreeSearchHandler.SearchAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SolutionTreeSearch", () => Handlers.SolutionTreeSearchHandler.SearchAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/solutionTreeReveal", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeRevealResult> SolutionTreeReveal(
         SolutionTreeRevealParams p, CancellationToken ct) =>
-        Handlers.SolutionTreeSearchHandler.RevealAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SolutionTreeReveal", () => Handlers.SolutionTreeSearchHandler.RevealAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/solutionTreeEdit", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeEditResult> SolutionTreeEdit(SolutionTreeEditParams p, CancellationToken ct) =>
-        Handlers.SolutionTreeEditHandler.EditAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SolutionTreeEdit", () => Handlers.SolutionTreeEditHandler.EditAsync(p, ct));
 
     /// <summary>
     /// What the project says about one file or folder — the Properties panel's form.
     /// </summary>
     [JsonRpcMethod("roslynSense/itemProperties", UseSingleObjectParameterDeserialization = true)]
     public Task<ItemPropertiesResult> ItemProperties(ItemPropertiesParams p, CancellationToken ct) =>
-        Handlers.ItemPropertiesHandler.GetAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ItemProperties", () => Handlers.ItemPropertiesHandler.GetAsync(p, ct));
 
     /// <summary>
     /// Writes one of those back, and answers with the form as it now reads — the panel shows
@@ -532,7 +539,7 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/setItemProperties", UseSingleObjectParameterDeserialization = true)]
     public Task<SetItemPropertiesResult> SetItemProperties(
         SetItemPropertiesParams p, CancellationToken ct) =>
-        Handlers.ItemPropertiesHandler.SetAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SetItemProperties", () => Handlers.ItemPropertiesHandler.SetAsync(p, ct));
 
     /// <summary>
     /// What can be added on this node. The list depends on the project — a Form where WinForms is
@@ -541,20 +548,20 @@ internal sealed class LspServer : IDisposable
     /// </summary>
     [JsonRpcMethod("roslynSense/itemTemplates", UseSingleObjectParameterDeserialization = true)]
     public Task<ItemTemplatesResult> ItemTemplates(ItemTemplatesParams p, CancellationToken ct) =>
-        Handlers.ItemTemplatesHandler.ListAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ItemTemplates", () => Handlers.ItemTemplatesHandler.ListAsync(p, ct));
 
     /// <summary>
     /// Creates one, and answers with every file it made so the editor can open the right one.
     /// </summary>
     [JsonRpcMethod("roslynSense/createItem", UseSingleObjectParameterDeserialization = true)]
     public Task<CreateItemResult> CreateItem(CreateItemParams p, CancellationToken ct) =>
-        Handlers.ItemTemplatesHandler.CreateAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("CreateItem", () => Handlers.ItemTemplatesHandler.CreateAsync(p, ct));
 
     // ---- Discovery ----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/discoveryTree", UseSingleObjectParameterDeserialization = true)]
     public Task<SolutionTreeNode[]> DiscoveryTree(SolutionTreeParams p, CancellationToken ct) =>
-        Handlers.DiscoveryTreeHandler.ChildrenAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DiscoveryTree", () => Handlers.DiscoveryTreeHandler.ChildrenAsync(p, ct, _languages));
 
     /// <summary>
     /// What implements the declaration a Discovery row points at. Routed by the row's own document,
@@ -569,47 +576,47 @@ internal sealed class LspServer : IDisposable
     [JsonRpcMethod("roslynSense/discoveryImplementations", UseSingleObjectParameterDeserialization = true)]
     public Task<DiscoveryImplementationsResult> DiscoveryImplementations(
         TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<Languages.ILanguageDiscoveryImplementationResolver, DiscoveryImplementationsResult>(
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DiscoveryImplementations", () => Route<Languages.ILanguageDiscoveryImplementationResolver, DiscoveryImplementationsResult>(
             p.TextDocument,
             resolver => resolver.DiscoveryImplementationsAsync(p, ct),
             () => Task.FromResult(DiscoveryImplementationsResult.None(
                 "No implementation. Nothing in this solution knows how to resolve one for this row.")),
             whenBroken: () => DiscoveryImplementationsResult.None(
-                "The implementation could not be looked up. See the RoslynSense output for why."));
+                "The implementation could not be looked up. See the RoslynSense output for why.")));
 
     // ---- Virtual documents (generated and decompiled sources) ----------------------------
 
     [JsonRpcMethod("roslynSense/virtualDocument", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.VirtualDocumentResult?> VirtualDocument(
         Handlers.VirtualDocumentParams p, CancellationToken ct) =>
-        Handlers.VirtualDocumentHandler.ResolveAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("VirtualDocument", () => Handlers.VirtualDocumentHandler.ResolveAsync(p, ct));
 
     // ---- Packages -----------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/nuget/search", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetSearchResultDto> NuGetSearch(Handlers.NuGetSearchParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.SearchAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetSearch", () => Handlers.NuGetHandler.SearchAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/versions", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetVersionsResultDto> NuGetVersions(Handlers.NuGetVersionsParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.VersionsAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetVersions", () => Handlers.NuGetHandler.VersionsAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/installed")]
     public Task<Handlers.ProjectPackagesDto[]> NuGetInstalled(CancellationToken ct) =>
-        Handlers.NuGetHandler.InstalledAsync(ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetInstalled", () => Handlers.NuGetHandler.InstalledAsync(ct));
 
     [JsonRpcMethod("roslynSense/nuget/updates", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetUpdatesResultDto> NuGetUpdates(Handlers.NuGetUpdatesParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.UpdatesAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetUpdates", () => Handlers.NuGetHandler.UpdatesAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/packageSources", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetPackageSourcesDto> NuGetPackageSources(
         Handlers.NuGetPackageSourcesParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.PackageSourcesAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetPackageSources", () => Handlers.NuGetHandler.PackageSourcesAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/consolidations")]
     public Task<Handlers.ConsolidationDto[]> NuGetConsolidations(CancellationToken ct) =>
-        Handlers.NuGetHandler.ConsolidationsAsync(ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetConsolidations", () => Handlers.NuGetHandler.ConsolidationsAsync(ct));
 
     [JsonRpcMethod("roslynSense/nuget/sources")]
     public Handlers.PackageSourceDto[] NuGetSources() => Handlers.NuGetHandler.Sources();
@@ -620,16 +627,16 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/nuget/icon", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetIconDto> NuGetIcon(Handlers.NuGetIconParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.IconAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetIcon", () => Handlers.NuGetHandler.IconAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/metadata", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageMetadataDto?> NuGetMetadata(Handlers.NuGetMetadataParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.MetadataAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetMetadata", () => Handlers.NuGetHandler.MetadataAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/checkFramework", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetFrameworkCheckDto> NuGetCheckFramework(
         Handlers.NuGetFrameworkCheckParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.CheckFrameworkAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetCheckFramework", () => Handlers.NuGetHandler.CheckFrameworkAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/transitive", UseSingleObjectParameterDeserialization = true)]
     public Handlers.NuGetTransitiveDto NuGetTransitive(Handlers.NuGetTransitiveParams p) =>
@@ -637,51 +644,51 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/nuget/audit", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetAuditDto> NuGetAudit(Handlers.NuGetAuditParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.AuditAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetAudit", () => Handlers.NuGetHandler.AuditAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/install", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetInstall(Handlers.NuGetOperationParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.InstallAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetInstall", () => Handlers.NuGetHandler.InstallAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/update", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetUpdate(Handlers.NuGetOperationParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.InstallAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetUpdate", () => Handlers.NuGetHandler.InstallAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/updatePlan", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetUpdatePlanResultDto> NuGetUpdatePlan(
         Handlers.NuGetUpdatePlanParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.UpdatePlanAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetUpdatePlan", () => Handlers.NuGetHandler.UpdatePlanAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/updateAll", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.NuGetUpdateAllResultDto> NuGetUpdateAll(
         Handlers.NuGetUpdateAllParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.UpdateAllAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetUpdateAll", () => Handlers.NuGetHandler.UpdateAllAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/uninstall", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetUninstall(Handlers.NuGetOperationParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.UninstallAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetUninstall", () => Handlers.NuGetHandler.UninstallAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/nuget/consolidate", UseSingleObjectParameterDeserialization = true)]
     public Task<Handlers.PackageOperationDto> NuGetConsolidate(Handlers.NuGetOperationParams p, CancellationToken ct) =>
-        Handlers.NuGetHandler.ConsolidateAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("NuGetConsolidate", () => Handlers.NuGetHandler.ConsolidateAsync(p, ct));
 
     // ---- Tests ------------------------------------------------------------------------
 
     [JsonRpcMethod("roslynSense/testProjects")]
     public Task<TestProjectInfo[]> TestProjects(CancellationToken ct) =>
-        Handlers.TestHandler.ProjectsAsync(ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("TestProjects", () => Handlers.TestHandler.ProjectsAsync(ct));
 
     [JsonRpcMethod("roslynSense/testDiscover", UseSingleObjectParameterDeserialization = true)]
     public Task<TestInfo[]> TestDiscover(TestDiscoverParams p, CancellationToken ct) =>
-        Handlers.TestHandler.DiscoverAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("TestDiscover", () => Handlers.TestHandler.DiscoverAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/testRun", UseSingleObjectParameterDeserialization = true)]
     public Task<TestRunResponse> TestRun(TestRunParams p, CancellationToken ct) =>
-        Handlers.TestHandler.RunAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("TestRun", () => Handlers.TestHandler.RunAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/testDebug", UseSingleObjectParameterDeserialization = true)]
     public Task<TestDebugResult> TestDebug(TestDebugParams p, CancellationToken ct) =>
-        Handlers.TestHandler.DebugAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("TestDebug", () => Handlers.TestHandler.DebugAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/testCancel", UseSingleObjectParameterDeserialization = true)]
     public void TestCancel(TestCancelParams p) => Handlers.TestHandler.Cancel(p);
@@ -692,7 +699,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/testsCovering", UseSingleObjectParameterDeserialization = true)]
     public Task<CoveringTestInfo[]> TestsCovering(TestsCoveringParams p, CancellationToken ct) =>
-        Handlers.TestHandler.TestsCoveringAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("TestsCovering", () => Handlers.TestHandler.TestsCoveringAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/coverageSnapshot", UseSingleObjectParameterDeserialization = true)]
     public CoverageSnapshotResult CoverageSnapshot(CoverageSnapshotParams p) =>
@@ -700,22 +707,22 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/buildCoverageMap", UseSingleObjectParameterDeserialization = true)]
     public Task<BuildCoverageMapResult> BuildCoverageMap(BuildCoverageMapParams p, CancellationToken ct) =>
-        Handlers.TestHandler.BuildCoverageMapAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("BuildCoverageMap", () => Handlers.TestHandler.BuildCoverageMapAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/impactedTests", UseSingleObjectParameterDeserialization = true)]
     public Task<ImpactedTestsResult> ImpactedTests(ImpactedTestsParams p, CancellationToken ct) =>
-        Handlers.TestHandler.ImpactedAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ImpactedTests", () => Handlers.TestHandler.ImpactedAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/changedMembers", UseSingleObjectParameterDeserialization = true)]
     public Task<ChangedMembersResult> ChangedMembers(ChangedMembersParams p, CancellationToken ct) =>
-        Handlers.ChangedMembersHandler.GetAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ChangedMembers", () => Handlers.ChangedMembersHandler.GetAsync(p, ct));
 
     [JsonRpcMethod("workspace/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceDiagnosticReport> WorkspaceDiagnostic(
         WorkspaceDiagnosticParams p, CancellationToken ct) =>
-        Guarded(uri: "",
+        Services.Memory.HostMemoryTelemetry.TrackAsync("WorkspaceDiagnostic", () => Guarded(uri: "",
             () => Handlers.WorkspaceDiagnosticsHandler.DiagnoseAsync(p, ct, _languages),
-            whenBroken: () => new WorkspaceDiagnosticReport([]));
+            whenBroken: () => new WorkspaceDiagnosticReport([])));
 
     /// <summary>
     /// A test seam, not a feature a real editor calls: exposes
@@ -729,15 +736,15 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/searchEverywhere", UseSingleObjectParameterDeserialization = true)]
     public Task<SearchEverywhereResult> SearchEverywhere(SearchEverywhereParams p, CancellationToken ct) =>
-        Handlers.SearchEverywhereHandler.SearchAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SearchEverywhere", () => Handlers.SearchEverywhereHandler.SearchAsync(p, ct, _languages));
 
     [JsonRpcMethod("roslynSense/searchText", UseSingleObjectParameterDeserialization = true)]
     public Task<SearchTextResult> SearchText(SearchTextParams p, CancellationToken ct) =>
-        Handlers.SearchEverywhereHandler.SearchTextAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SearchText", () => Handlers.SearchEverywhereHandler.SearchTextAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/resolveMetadataTarget", UseSingleObjectParameterDeserialization = true)]
     public Task<ResolveMetadataResult?> ResolveMetadataTarget(ResolveMetadataParams p, CancellationToken ct) =>
-        Handlers.SearchEverywhereHandler.ResolveMetadataAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ResolveMetadataTarget", () => Handlers.SearchEverywhereHandler.ResolveMetadataAsync(p, ct));
 
     // ---- Settings page ------------------------------------------------------------------
 
@@ -747,7 +754,7 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/memberShape", UseSingleObjectParameterDeserialization = true)]
     public Task<MemberShapeResult> MemberShape(MemberShapeParams p, CancellationToken ct) =>
-        Handlers.SettingsAssistHandler.MemberShapeAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("MemberShape", () => Handlers.SettingsAssistHandler.MemberShapeAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/editorContext", UseSingleObjectParameterDeserialization = true)]
     public void EditorContext(Handlers.EditorContextParams p) =>
@@ -755,11 +762,11 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("workspace/willRenameFiles", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceEdit?> WillRenameFiles(Handlers.RenameFilesParams p, CancellationToken ct) =>
-        Handlers.FileOperationsHandler.WillRenameAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("WillRenameFiles", () => Handlers.FileOperationsHandler.WillRenameAsync(p, ct, _languages));
 
     [JsonRpcMethod("workspace/didChangeConfiguration", UseSingleObjectParameterDeserialization = true)]
     public Task DidChangeConfiguration(DidChangeConfigurationParams p, CancellationToken ct) =>
-        Handlers.ConfigurationHandler.HandleAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DidChangeConfiguration", () => Handlers.ConfigurationHandler.HandleAsync(p, ct));
 
     [JsonRpcMethod("workspace/didChangeWatchedFiles", UseSingleObjectParameterDeserialization = true)]
     public void DidChangeWatchedFiles(DidChangeWatchedFilesParams p) =>
@@ -767,11 +774,11 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("workspace/didCreateFiles", UseSingleObjectParameterDeserialization = true)]
     public Task DidCreateFiles(CreateFilesParams p, CancellationToken ct) =>
-        Handlers.FileOperationsHandler.DidCreateAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DidCreateFiles", () => Handlers.FileOperationsHandler.DidCreateAsync(p, ct, _languages));
 
     [JsonRpcMethod("workspace/didDeleteFiles", UseSingleObjectParameterDeserialization = true)]
     public Task DidDeleteFiles(DeleteFilesParams p, CancellationToken ct) =>
-        Handlers.FileOperationsHandler.DidDeleteAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DidDeleteFiles", () => Handlers.FileOperationsHandler.DidDeleteAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/didClose", UseSingleObjectParameterDeserialization = true)]
     public void DidClose(DidCloseTextDocumentParams p)
@@ -980,31 +987,32 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/definition", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> Definition(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageDefinitionProvider, Location[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Definition", () => Route<ILanguageDefinitionProvider, Location[]>(p.TextDocument,
             l => l.DefinitionAsync(p, typeDefinition: false, ct),
-            () => Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: false, ct, _languages));
+            () => Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: false, ct, _languages)));
 
     [JsonRpcMethod("textDocument/typeDefinition", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> TypeDefinition(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageDefinitionProvider, Location[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("TypeDefinition", () => Route<ILanguageDefinitionProvider, Location[]>(p.TextDocument,
             l => l.DefinitionAsync(p, typeDefinition: true, ct),
-            () => Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: true, ct, _languages));
+            () => Handlers.NavigationHandlers.DefinitionAsync(p, typeDefinition: true, ct, _languages)));
 
     [JsonRpcMethod("textDocument/references", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> References(ReferenceParams p, CancellationToken ct) =>
-        Route<ILanguageReferencesProvider, Location[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("References", () => Route<ILanguageReferencesProvider, Location[]>(p.TextDocument,
             l => l.ReferencesAsync(p, ct),
-            () => Handlers.NavigationHandlers.ReferencesAsync(p, ct, _languages));
+            () => Handlers.NavigationHandlers.ReferencesAsync(p, ct, _languages)));
 
     [JsonRpcMethod("textDocument/implementation", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> Implementation(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageImplementationProvider, Location[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Implementation", () => Route<ILanguageImplementationProvider, Location[]>(p.TextDocument,
             l => l.ImplementationAsync(p, ct),
-            () => Handlers.NavigationHandlers.ImplementationAsync(p, ct, _languages));
+            () => Handlers.NavigationHandlers.ImplementationAsync(p, ct, _languages)));
 
     [JsonRpcMethod("textDocument/hover", UseSingleObjectParameterDeserialization = true)]
     public async Task<Hover?> Hover(TextDocumentPositionParams p, CancellationToken ct)
     {
+        using var memoryOperation = Services.Memory.HostMemoryTelemetry.Operation("Hover");
         // Ahead of the pack rather than instead of it: only an assemblyIdentity's name answers
         // here, and every other position in the same web.config is still the webconfig pack's.
         if (Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri)) &&
@@ -1021,43 +1029,43 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("textDocument/documentHighlight", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentHighlight[]> DocumentHighlight(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageDocumentHighlightProvider, DocumentHighlight[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DocumentHighlight", () => Route<ILanguageDocumentHighlightProvider, DocumentHighlight[]>(p.TextDocument,
             l => l.DocumentHighlightAsync(p, ct),
-            () => Handlers.NavigationHandlers.DocumentHighlightAsync(p, ct));
+            () => Handlers.NavigationHandlers.DocumentHighlightAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/documentSymbol", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentSymbol[]> DocumentSymbol(DocumentSymbolParams p, CancellationToken ct) =>
-        Route<ILanguageDocumentSymbolProvider, DocumentSymbol[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DocumentSymbol", () => Route<ILanguageDocumentSymbolProvider, DocumentSymbol[]>(p.TextDocument,
             l => l.DocumentSymbolAsync(p, ct),
-            () => Handlers.SymbolHandlers.DocumentSymbolsAsync(p, ct));
+            () => Handlers.SymbolHandlers.DocumentSymbolsAsync(p, ct)));
 
     [JsonRpcMethod("workspace/symbol", UseSingleObjectParameterDeserialization = true)]
     public Task<SymbolInformation[]> WorkspaceSymbol(WorkspaceSymbolParams p, CancellationToken ct) =>
-        Handlers.SymbolHandlers.WorkspaceSymbolsAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("WorkspaceSymbol", () => Handlers.SymbolHandlers.WorkspaceSymbolsAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/prepareRename", UseSingleObjectParameterDeserialization = true)]
     public Task<PrepareRenameResult?> PrepareRename(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageRenameProvider, PrepareRenameResult?>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("PrepareRename", () => Route<ILanguageRenameProvider, PrepareRenameResult?>(p.TextDocument,
             l => l.PrepareRenameAsync(p, ct),
-            () => Handlers.RenameHandler.PrepareRenameAsync(p, ct, _languages));
+            () => Handlers.RenameHandler.PrepareRenameAsync(p, ct, _languages)));
 
     [JsonRpcMethod("textDocument/rename", UseSingleObjectParameterDeserialization = true)]
     public Task<WorkspaceEdit?> Rename(RenameParams p, CancellationToken ct) =>
-        Route<ILanguageRenameProvider, WorkspaceEdit?>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Rename", () => Route<ILanguageRenameProvider, WorkspaceEdit?>(p.TextDocument,
             l => l.RenameAsync(p, ct),
-            () => Handlers.RenameHandler.RenameAsync(p, ct, _languages));
+            () => Handlers.RenameHandler.RenameAsync(p, ct, _languages)));
 
     [JsonRpcMethod("textDocument/signatureHelp", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.SignatureHelp?> SignatureHelp(SignatureHelpParams p, CancellationToken ct) =>
-        Route<ILanguageSignatureHelpProvider, Protocol.SignatureHelp?>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SignatureHelp", () => Route<ILanguageSignatureHelpProvider, Protocol.SignatureHelp?>(p.TextDocument,
             l => l.SignatureHelpAsync(p, ct),
-            () => Handlers.SignatureHelpHandler.SignatureHelpAsync(p, ct));
+            () => Handlers.SignatureHelpHandler.SignatureHelpAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/completion", UseSingleObjectParameterDeserialization = true)]
     public Task<CompletionList> Completion(CompletionParams p, CancellationToken ct) =>
-        Route<ILanguageCompletionProvider, CompletionList>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Completion", () => Route<ILanguageCompletionProvider, CompletionList>(p.TextDocument,
             l => l.CompletionAsync(p, _resolveCache, ct),
-            () => Handlers.CompletionHandler.CompletionAsync(p, _resolveCache, ct));
+            () => Handlers.CompletionHandler.CompletionAsync(p, _resolveCache, ct)));
 
     /// <summary>
     /// Resolve carries no document, so it cannot be routed by URI. Items from a pack are
@@ -1066,11 +1074,12 @@ internal sealed class LspServer : IDisposable
     /// </summary>
     [JsonRpcMethod("completionItem/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<CompletionItem> CompletionResolve(CompletionItem item, CancellationToken ct) =>
-        Handlers.CompletionHandler.ResolveAsync(item, _resolveCache, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("CompletionResolve", () => Handlers.CompletionHandler.ResolveAsync(item, _resolveCache, ct, _languages));
 
     [JsonRpcMethod("textDocument/codeAction", UseSingleObjectParameterDeserialization = true)]
     public async Task<Protocol.CodeAction[]> CodeAction(CodeActionParams p, CancellationToken ct)
     {
+        using var memoryOperation = Services.Memory.HostMemoryTelemetry.Operation("CodeAction");
         if (!Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri)))
         {
             return await Route<ILanguageCodeActionProvider, Protocol.CodeAction[]>(p.TextDocument,
@@ -1095,122 +1104,123 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("codeAction/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeAction> CodeActionResolve(Protocol.CodeAction action, CancellationToken ct) =>
-        Handlers.CodeActionHandler.ResolveAsync(action, _resolveCache, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("CodeActionResolve", () => Handlers.CodeActionHandler.ResolveAsync(action, _resolveCache, ct));
 
     [JsonRpcMethod("textDocument/formatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> Formatting(DocumentFormattingParams p, CancellationToken ct) =>
-        Route<ILanguageFormattingProvider, TextEdit[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Formatting", () => Route<ILanguageFormattingProvider, TextEdit[]>(p.TextDocument,
             l => l.FormatAsync(p, ct),
-            () => Handlers.FormattingHandler.FormatAsync(p, ct));
+            () => Handlers.FormattingHandler.FormatAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/rangeFormatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> RangeFormatting(DocumentRangeFormattingParams p, CancellationToken ct) =>
-        Route<ILanguageFormattingProvider, TextEdit[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("RangeFormatting", () => Route<ILanguageFormattingProvider, TextEdit[]>(p.TextDocument,
             l => l.FormatRangeAsync(p, ct),
-            () => Handlers.FormattingHandler.FormatRangeAsync(p, ct));
+            () => Handlers.FormattingHandler.FormatRangeAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/onTypeFormatting", UseSingleObjectParameterDeserialization = true)]
     public Task<TextEdit[]> OnTypeFormatting(DocumentOnTypeFormattingParams p, CancellationToken ct) =>
-        Handlers.FormattingHandler.FormatOnTypeAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("OnTypeFormatting", () => Handlers.FormattingHandler.FormatOnTypeAsync(p, ct));
 
     [JsonRpcMethod("textDocument/foldingRange", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.FoldingRange[]> FoldingRange(FoldingRangeParams p, CancellationToken ct) =>
-        Route<ILanguageFoldingRangeProvider, Protocol.FoldingRange[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("FoldingRange", () => Route<ILanguageFoldingRangeProvider, Protocol.FoldingRange[]>(p.TextDocument,
             l => l.FoldingRangeAsync(p, ct),
-            () => Handlers.FoldingRangeHandler.FoldingRangesAsync(p, ct));
+            () => Handlers.FoldingRangeHandler.FoldingRangesAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/prepareCallHierarchy", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> PrepareCallHierarchy(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("PrepareCallHierarchy", () => Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.TextDocument,
             l => l.PrepareCallHierarchyAsync(p, ct),
-            () => Handlers.CallHierarchyHandler.PrepareAsync(p, ct));
+            () => Handlers.CallHierarchyHandler.PrepareAsync(p, ct)));
 
     [JsonRpcMethod("callHierarchy/incomingCalls", UseSingleObjectParameterDeserialization = true)]
     public Task<CallHierarchyIncomingCall[]> IncomingCalls(CallHierarchyCallsParams p, CancellationToken ct) =>
-        Route<ILanguageHierarchyProvider, CallHierarchyIncomingCall[]>(p.Item.Uri,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("IncomingCalls", () => Route<ILanguageHierarchyProvider, CallHierarchyIncomingCall[]>(p.Item.Uri,
             l => l.IncomingCallsAsync(p, ct),
-            () => Handlers.CallHierarchyHandler.IncomingCallsAsync(p, ct, _languages));
+            () => Handlers.CallHierarchyHandler.IncomingCallsAsync(p, ct, _languages)));
 
     [JsonRpcMethod("callHierarchy/outgoingCalls", UseSingleObjectParameterDeserialization = true)]
     public Task<CallHierarchyOutgoingCall[]> OutgoingCalls(CallHierarchyCallsParams p, CancellationToken ct) =>
-        Route<ILanguageHierarchyProvider, CallHierarchyOutgoingCall[]>(p.Item.Uri,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("OutgoingCalls", () => Route<ILanguageHierarchyProvider, CallHierarchyOutgoingCall[]>(p.Item.Uri,
             l => l.OutgoingCallsAsync(p, ct),
-            () => Handlers.CallHierarchyHandler.OutgoingCallsAsync(p, ct));
+            () => Handlers.CallHierarchyHandler.OutgoingCallsAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/prepareTypeHierarchy", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> PrepareTypeHierarchy(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("PrepareTypeHierarchy", () => Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.TextDocument,
             l => l.PrepareTypeHierarchyAsync(p, ct),
-            () => Handlers.TypeHierarchyHandler.PrepareAsync(p, ct));
+            () => Handlers.TypeHierarchyHandler.PrepareAsync(p, ct)));
 
     [JsonRpcMethod("typeHierarchy/supertypes", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> Supertypes(TypeHierarchyItemParams p, CancellationToken ct) =>
-        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.Item.Uri,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Supertypes", () => Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.Item.Uri,
             l => l.SupertypesAsync(p, ct),
-            () => Handlers.TypeHierarchyHandler.SupertypesAsync(p, ct));
+            () => Handlers.TypeHierarchyHandler.SupertypesAsync(p, ct)));
 
     [JsonRpcMethod("typeHierarchy/subtypes", UseSingleObjectParameterDeserialization = true)]
     public Task<HierarchyItem[]> Subtypes(TypeHierarchyItemParams p, CancellationToken ct) =>
-        Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.Item.Uri,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Subtypes", () => Route<ILanguageHierarchyProvider, HierarchyItem[]>(p.Item.Uri,
             l => l.SubtypesAsync(p, ct),
-            () => Handlers.TypeHierarchyHandler.SubtypesAsync(p, ct));
+            () => Handlers.TypeHierarchyHandler.SubtypesAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/semanticTokens/full", UseSingleObjectParameterDeserialization = true)]
     public Task<SemanticTokens> SemanticTokensFull(SemanticTokensParams p, CancellationToken ct) =>
-        Route<ILanguageSemanticTokensProvider, SemanticTokens>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SemanticTokensFull", () => Route<ILanguageSemanticTokensProvider, SemanticTokens>(p.TextDocument,
             l => l.SemanticTokensFullAsync(p, _languages, ct),
-            () => Handlers.SemanticTokensHandler.SemanticTokensFullAsync(SessionId, p, ct));
+            () => Handlers.SemanticTokensHandler.SemanticTokensFullAsync(SessionId, p, ct)));
 
     /// <summary>A pack that declines delta answers full instead, which the protocol allows and
     /// clients handle — the same fallback the C# handler takes when it has no baseline.</summary>
     [JsonRpcMethod("textDocument/semanticTokens/full/delta", UseSingleObjectParameterDeserialization = true)]
     public Task<object> SemanticTokensDelta(SemanticTokensDeltaParams p, CancellationToken ct) =>
-        Route<ILanguageSemanticTokensProvider, object>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SemanticTokensDelta", () => Route<ILanguageSemanticTokensProvider, object>(p.TextDocument,
             async l => await l.SemanticTokensFullAsync(new SemanticTokensParams(p.TextDocument), _languages, ct),
-            () => Handlers.SemanticTokensHandler.SemanticTokensDeltaAsync(SessionId, p, ct));
+            () => Handlers.SemanticTokensHandler.SemanticTokensDeltaAsync(SessionId, p, ct)));
 
     [JsonRpcMethod("textDocument/semanticTokens/range", UseSingleObjectParameterDeserialization = true)]
     public Task<SemanticTokens> SemanticTokensRange(SemanticTokensRangeParams p, CancellationToken ct) =>
-        Route<ILanguageSemanticTokensProvider, SemanticTokens>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SemanticTokensRange", () => Route<ILanguageSemanticTokensProvider, SemanticTokens>(p.TextDocument,
             l => l.SemanticTokensRangeAsync(p, _languages, ct),
-            () => Handlers.SemanticTokensHandler.SemanticTokensRangeAsync(p, ct));
+            () => Handlers.SemanticTokensHandler.SemanticTokensRangeAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/selectionRange", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.SelectionRange[]> SelectionRange(SelectionRangeParams p, CancellationToken ct) =>
-        Route<ILanguageSelectionRangeProvider, Protocol.SelectionRange[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("SelectionRange", () => Route<ILanguageSelectionRangeProvider, Protocol.SelectionRange[]>(p.TextDocument,
             l => l.SelectionRangesAsync(p, ct),
-            () => Handlers.SelectionRangeHandler.SelectionRangesAsync(p, ct));
+            () => Handlers.SelectionRangeHandler.SelectionRangesAsync(p, ct)));
 
     [JsonRpcMethod("textDocument/linkedEditingRange", UseSingleObjectParameterDeserialization = true)]
     public Task<LinkedEditingRanges?> LinkedEditingRange(TextDocumentPositionParams p, CancellationToken ct) =>
-        Route<ILanguageLinkedEditingProvider, LinkedEditingRanges?>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("LinkedEditingRange", () => Route<ILanguageLinkedEditingProvider, LinkedEditingRanges?>(p.TextDocument,
             l => l.LinkedEditingRangesAsync(p, ct),
-            () => Handlers.LinkedEditingHandler.RangesAsync(p, ct));
+            () => Handlers.LinkedEditingHandler.RangesAsync(p, ct)));
 
     /// <summary>Advertised only while a pack contributes links, but still routed unconditionally:
     /// a client that cached the capability from an earlier session must get an empty answer rather
     /// than a method-not-found fault.</summary>
     [JsonRpcMethod("textDocument/documentLink", UseSingleObjectParameterDeserialization = true)]
     public Task<DocumentLink[]> DocumentLink(DocumentLinkParams p, CancellationToken ct) =>
-        Route<ILanguageDocumentLinkProvider, DocumentLink[]>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DocumentLink", () => Route<ILanguageDocumentLinkProvider, DocumentLink[]>(p.TextDocument,
             l => l.DocumentLinksAsync(p, ct),
-            () => Task.FromResult<DocumentLink[]>([]));
+            () => Task.FromResult<DocumentLink[]>([])));
 
     [JsonRpcMethod("textDocument/inlineValue", UseSingleObjectParameterDeserialization = true)]
     public Task<object[]> InlineValue(InlineValueParams p, CancellationToken ct) =>
-        Handlers.InlineValueHandler.InlineValuesAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("InlineValue", () => Handlers.InlineValueHandler.InlineValuesAsync(p, ct));
 
     [JsonRpcMethod("textDocument/diagnostic", UseSingleObjectParameterDeserialization = true)]
     public Task<object> Diagnostic(DocumentDiagnosticParams p, CancellationToken ct) =>
-        Guarded<object>(p.TextDocument.Uri,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("Diagnostic", () => Guarded<object>(p.TextDocument.Uri,
             () => Handlers.DiagnosticsHandler.PullAsync(p, ct, _languages),
             // A report with no items, rather than null: the client treats the response as a
             // complete answer for this document, and null is not one of the shapes it accepts.
-            whenBroken: () => new FullDocumentDiagnosticReport("full", []));
+            whenBroken: () => new FullDocumentDiagnosticReport("full", [])));
 
     [JsonRpcMethod("textDocument/codeLens", UseSingleObjectParameterDeserialization = true)]
     public async Task<Protocol.CodeLens[]> CodeLens(CodeLensParams p, CancellationToken ct)
     {
+        using var memoryOperation = Services.Memory.HostMemoryTelemetry.Operation("CodeLens");
         if (!Handlers.BindingRedirectHandler.IsConfigPath(LspConverters.UriToPath(p.TextDocument.Uri)))
         {
             return await Route<ILanguageCodeLensProvider, Protocol.CodeLens[]>(p.TextDocument,
@@ -1238,43 +1248,43 @@ internal sealed class LspServer : IDisposable
     /// carries the URI it came from.</summary>
     [JsonRpcMethod("codeLens/resolve", UseSingleObjectParameterDeserialization = true)]
     public Task<Protocol.CodeLens> CodeLensResolve(Protocol.CodeLens lens, CancellationToken ct) =>
-        Route<ILanguageCodeLensProvider, Protocol.CodeLens>(lens.Data?.Uri ?? "",
+        Services.Memory.HostMemoryTelemetry.TrackAsync("CodeLensResolve", () => Route<ILanguageCodeLensProvider, Protocol.CodeLens>(lens.Data?.Uri ?? "",
             l => CodeLensResolveMemo.ResolveAsync(l, lens, ct),
             () => Handlers.CodeLensHandler.ResolveAsync(lens, ct, _languages),
             // A lens that cannot be counted goes back uncommanded rather than as null, which the
             // client would treat as a protocol violation on top of whatever actually went wrong.
-            whenBroken: () => lens);
+            whenBroken: () => lens));
 
     [JsonRpcMethod("workspace/executeCommand", UseSingleObjectParameterDeserialization = true)]
     public Task<object> ExecuteCommand(ExecuteCommandParams p, CancellationToken ct) =>
-        Handlers.ExecuteCommandHandler.ExecuteAsync(p, ct, _languages);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ExecuteCommand", () => Handlers.ExecuteCommandHandler.ExecuteAsync(p, ct, _languages));
 
     [JsonRpcMethod("textDocument/inlayHint", UseSingleObjectParameterDeserialization = true)]
     public Task<InlayHint[]> InlayHint(InlayHintParams p, CancellationToken ct) =>
-        Handlers.InlayHintHandler.InlayHintsAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("InlayHint", () => Handlers.InlayHintHandler.InlayHintsAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/onAutoInsert", UseSingleObjectParameterDeserialization = true)]
     public Task<OnAutoInsertResult?> OnAutoInsert(OnAutoInsertParams p, CancellationToken ct) =>
-        Route<ILanguageAutoInsertProvider, OnAutoInsertResult?>(p.TextDocument,
+        Services.Memory.HostMemoryTelemetry.TrackAsync("OnAutoInsert", () => Route<ILanguageAutoInsertProvider, OnAutoInsertResult?>(p.TextDocument,
             l => l.OnAutoInsertAsync(p, ct),
-            () => Handlers.OnAutoInsertHandler.OnAutoInsertAsync(p, ct));
+            () => Handlers.OnAutoInsertHandler.OnAutoInsertAsync(p, ct)));
 
     [JsonRpcMethod("roslynSense/inheritanceMarkers", UseSingleObjectParameterDeserialization = true)]
     public Task<InheritanceMarker[]> InheritanceMarkers(InheritanceMarkersParams p, CancellationToken ct) =>
-        Handlers.InheritanceMarkersHandler.MarkersAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("InheritanceMarkers", () => Handlers.InheritanceMarkersHandler.MarkersAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/inheritanceAt", UseSingleObjectParameterDeserialization = true)]
     public Task<InheritanceMarker[]> InheritanceAt(InheritanceAtParams p, CancellationToken ct) =>
-        Handlers.InheritanceMarkersHandler.MarkersAtAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("InheritanceAt", () => Handlers.InheritanceMarkersHandler.MarkersAtAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/resolveInheritanceTarget", UseSingleObjectParameterDeserialization = true)]
     public Task<Location?> ResolveInheritanceTarget(ResolveInheritanceTargetParams p, CancellationToken ct) =>
-        Handlers.InheritanceMarkersHandler.ResolveTargetAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ResolveInheritanceTarget", () => Handlers.InheritanceMarkersHandler.ResolveTargetAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/externalConfigReads", UseSingleObjectParameterDeserialization = true)]
     public Task<Location[]> ExternalConfigReads(
         Handlers.ExternalConfigReadsParams p, CancellationToken ct) =>
-        Handlers.ExternalConfigReadsHandler.ReadsAsync(p, ct);
+        Services.Memory.HostMemoryTelemetry.TrackAsync("ExternalConfigReads", () => Handlers.ExternalConfigReadsHandler.ReadsAsync(p, ct));
 
     [JsonRpcMethod("roslynSense/runningProcesses")]
     public RunningProcess[] RunningProcesses() =>
@@ -1343,11 +1353,11 @@ internal sealed class LspServer : IDisposable
 
     [JsonRpcMethod("roslynSense/debugCommand", UseSingleObjectParameterDeserialization = true)]
     public Task<DebugCommandResult> DebugCommand(DebugCommandParams p, CancellationToken ct) =>
-        DebuggerEnabled
+        Services.Memory.HostMemoryTelemetry.TrackAsync("DebugCommand", () => DebuggerEnabled
             ? Handlers.DebugBridgeHandler.CommandAsync(p, ct)
             : Task.FromResult(new DebugCommandResult(
                 false,
-                "The debugger is disabled (tools.debugger / --no-debugger)."));
+                "The debugger is disabled (tools.debugger / --no-debugger).")));
 
     [JsonRpcMethod("roslynSense/editorDebugState", UseSingleObjectParameterDeserialization = true)]
     public void EditorDebugState(EditorDebugStateParams p)
@@ -1363,8 +1373,16 @@ internal sealed class LspServer : IDisposable
             Handlers.DebugBridgeHandler.SyncBreakpoints(p);
     }
 
+    private async Task ReleaseHotReloadAsync()
+    {
+        try { await Services.HotReload.HotReloadService.ReleaseClientAsync($"lsp:{SessionId}:"); }
+        catch (Exception ex) { Console.Error.WriteLine($"[HotReload] Disconnect cleanup failed: {ex.Message}"); }
+    }
+
     public void Dispose()
     {
+        _resolveCache.Dispose();
+        _ = ReleaseHotReloadAsync();
         LspSessionRegistry.Unregister(SessionId);
         if (!LspSessionRegistry.HasSessions) SolutionWarmup.Reset();
         OpenDocumentStore.CloseSession(SessionId);

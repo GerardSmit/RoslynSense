@@ -393,6 +393,22 @@ public sealed class WorkerDebugEngine : IDebugEngine
             DecompiledSymbols = map.ToJson(),
         });
 
+    public async Task<(bool Ok, DebugVariable? Variable, string Error)> EvaluateVariableAsync(uint frameIndex, string expression)
+    {
+        try
+        {
+            var response = await SendAsync(new WorkerRequest
+            {
+                Op = "evaluateVariable", FrameIndex = frameIndex, Expression = expression,
+            });
+            return (true, response.Variable, "");
+        }
+        catch (Exception ex)
+        {
+            return (false, null, ex.Message);
+        }
+    }
+
     public async Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression)
     {
         try

@@ -111,8 +111,20 @@ public sealed partial class DebugSession
         if (string.IsNullOrWhiteSpace(path))
             return FrameVariables(ilFrame);
 
-        var value = ResolvePath(ilFrame, path, out _);
-        return value is null ? new List<DebugVariable>() : ChildrenOf(value, path);
+        var value = ResolvePath(ilFrame, path, out var error);
+        if (value is null) throw new InvalidOperationException(error.Length > 0 ? error : "The value is unavailable.");
+        return ChildrenOf(value, path);
+    });
+
+    public Task<(bool Ok, DebugVariable? Variable, string Error)> EvaluateVariableAsync(
+        uint frameIndex, string expression) => InvokeAsync<(bool, DebugVariable?, string)>(() =>
+    {
+        if (_stoppedThread is not { } thread || FrameAt(thread, frameIndex) is not CorDebugILFrame frame)
+            return (false, null, "no managed frame");
+        var value = ResolvePath(frame, expression, out var error);
+        return value is null
+            ? (false, null, error)
+            : (true, Row(expression, value, "evaluation", expression), string.Empty);
     });
 
     private List<DebugVariable> ChildrenOf(CorDebugValue value, string path)
@@ -161,27 +173,60 @@ public sealed partial class DebugSession
         // browsable states apply to it.
         var raw = basePath.EndsWith("." + RawMarker, StringComparison.Ordinal);
 
-        if (!raw && _display.TypeProxy && ProxyTypeNameOf(value) is not null)
+        // A Nullable<T> is its value, never its hasValue/value plumbing: null has nothing to
+        // expand, and a value expands to the members of the value itself.
+        if (!raw && NullableStateOf(value) is { } nullable)
         {
-            AppendProxyMembers(children, value, basePath);
+            if (!nullable.HasValue || nullable.Value is null)
+                return children;
+            return ChildrenOf(nullable.Value, $"{basePath}.Value");
+        }
+
+        if (basePath.EndsWith("." + NonPublicMarker, StringComparison.Ordinal))
+        {
+            AppendFields(children, value, basePath,
+                applyBrowsable: _display.Browsable, includeProperties: true, MemberVisibility.NonPublic);
+            return children;
+        }
+
+        if (!raw && _display.TypeProxy && ProxyTypeNameOf(value) is not null &&
+            AppendProxyMembers(children, value, basePath))
+        {
             if (_display.RawView)
                 children.Add(RawViewRow(basePath));
             return children;
         }
 
-        var hidNothing = AppendFields(
+        // VS folds a framework type's private state away and shows a user type's inline; the
+        // split is Just My Code's, since that is what says whose code a type is.
+        var visibility = !raw && _display.JustMyCode && IsFrameworkType(value)
+            ? MemberVisibility.Public
+            : MemberVisibility.All;
+
+        var listing = AppendFields(
             children, value, basePath,
             applyBrowsable: !raw && _display.Browsable,
-            includeProperties: !raw);
+            includeProperties: !raw,
+            visibility);
 
         if (!raw && HasStaticMembers(value))
             children.Add(new DebugVariable
             {
                 Name = "Static members",
-                Value = "the type's static state",
+                Value = string.Empty,
                 Kind = "statics",
                 Type = string.Empty,
                 VariablesReference = $"{basePath}.{StaticsMarker}",
+            });
+
+        if (listing.SkippedNonPublic)
+            children.Add(new DebugVariable
+            {
+                Name = "Non-Public members",
+                Value = string.Empty,
+                Kind = "nonpublic",
+                Type = string.Empty,
+                VariablesReference = $"{basePath}.{NonPublicMarker}",
             });
 
         // A lazy enumerable — a LINQ query, an iterator — shows its internals above; the elements
@@ -196,10 +241,23 @@ public sealed partial class DebugSession
                 VariablesReference = $"{basePath}.{ResultsMarker}",
             });
 
-        if (!raw && !hidNothing && _display.RawView)
+        if (!raw && !listing.Complete && _display.RawView)
             children.Add(RawViewRow(basePath));
 
         return children;
+    }
+
+    /// <summary>A <c>Nullable&lt;T&gt;</c>'s state, or null for any other value.</summary>
+    private static (bool HasValue, CorDebugValue? Value)? NullableStateOf(CorDebugValue value)
+    {
+        var typeName = TypeNameOf(value);
+        if (typeName is not "System.Nullable`1" && !typeName.StartsWith("System.Nullable<", StringComparison.Ordinal))
+            return null;
+
+        var flag = Safe(() => FieldValue(value, "hasValue"));
+        var hasValue = flag is not null && TryReadScalar(Dereference(flag)) is { } text &&
+                       string.Equals(text, bool.TrueString, StringComparison.OrdinalIgnoreCase);
+        return (hasValue, hasValue ? Safe(() => FieldValue(value, "value")) : null);
     }
 
     /// <summary>Whether the value's type declares any static field — the gate for offering a
@@ -519,7 +577,7 @@ public sealed partial class DebugSession
     private DebugVariable RawViewRow(string path) => new()
     {
         Name = "Raw View",
-        Value = "the object's own fields, unfiltered",
+        Value = string.Empty,
         Kind = "raw",
         Type = string.Empty,
         VariablesReference = $"{path}.{RawMarker}",
@@ -547,7 +605,9 @@ public sealed partial class DebugSession
         var count = Safe(() => (int?)array.Count) ?? 0;
         var rank = Safe(() => (int?)array.Rank) ?? 1;
         var dimensions = rank > 1 ? Safe(() => array.GetDimensions(rank)) : null;
-        var page = Math.Max(1, _display.MaxChildren);
+        // A range tree needs at least two children to narrow its span. With a branching
+        // factor of one, the step below never grows and expanding any longer array hangs.
+        var page = Math.Max(2, _display.MaxChildren);
 
         // The array may have been reallocated since the range row was handed out, so the span is
         // clamped to what is actually there rather than trusted.
@@ -579,16 +639,17 @@ public sealed partial class DebugSession
             return;
         }
 
-        // The largest power-of-page step that still splits this span into at most one page of
+        // A power-of-page step that splits this span into at most one page of
         // rows. Whole powers keep the boundaries at round numbers, so [1000..1999] rather than
         // [937..1836] — a range the user can predict is a range they can navigate.
         var step = page;
-        while (total / step > page)
+        // Include the partial final range without overflowing on very large arrays.
+        while ((long)step * page < total)
             step *= page;
 
-        for (var start = from; start < to; start += step)
+        for (var start = from; start < to;)
         {
-            var end = Math.Min(to, start + step);
+            var end = (int)Math.Min(to, (long)start + step);
             into.Add(new DebugVariable
             {
                 Name = $"[{start}..{end - 1}]",
@@ -597,6 +658,7 @@ public sealed partial class DebugSession
                 Type = string.Empty,
                 VariablesReference = $"{path}.{MoreMarker}:{start}:{end}",
             });
+            start = end;
         }
     }
 
@@ -614,51 +676,88 @@ public sealed partial class DebugSession
         return indices;
     }
 
+    /// <summary>Which members a listing shows, by accessibility.</summary>
+    /// <remarks>
+    /// VS shows a user type's members inline, private ones included, and folds a framework type's
+    /// non-public state under a "Non-Public members" node: an exception's <c>_message</c> is not
+    /// what somebody stopped on an exception wants to read first, while a user's own <c>_seed</c>
+    /// is exactly what they want. The split follows Just My Code, which is what decides whose
+    /// code a type is.
+    /// </remarks>
+    private enum MemberVisibility
+    {
+        All,
+        Public,
+        NonPublic,
+    }
+
+    /// <summary>What <see cref="AppendFields"/> left out.</summary>
+    /// <param name="Complete">Whether the list is exactly the object's own fields — false when
+    /// something was hidden, inlined, or computed, which is what decides whether Raw View is
+    /// worth offering.</param>
+    /// <param name="SkippedNonPublic">Whether a non-public member was held back for the
+    /// "Non-Public members" node.</param>
+    private readonly record struct MemberListing(bool Complete, bool SkippedNonPublic);
+
     /// <summary>
     /// Lists an object's instance fields and properties, applying <c>DebuggerBrowsable</c>.
     /// </summary>
     /// <remarks>
-    /// Fields first — they read without running the debuggee. Properties follow, VS-style: an
-    /// auto-property already stands in the list as its backing field, so only computed getters
-    /// are evaluated, and one that throws shows the failure in place of a value. A Raw View
-    /// expansion lists neither properties nor hidden members.
+    /// <para>
+    /// Members are listed the way VS lists them: fields and properties together, alphabetically,
+    /// base types included. An auto-property stands in the list as its backing field under the
+    /// property's name, so only computed getters are evaluated, and one that throws shows the
+    /// failure in place of a value. A Raw View expansion lists neither properties nor hidden
+    /// members.
+    /// </para>
+    /// <para>
+    /// Every getter and every <c>ToString</c> runs the debuggee, and the runtime invalidates the
+    /// object being listed each time it does. The object is re-read after any step that ran an
+    /// evaluation — without that, a listing silently ended at the first member with a display
+    /// string, and everything after it (including the user's own public fields) was missing.
+    /// </para>
     /// </remarks>
-    /// <returns>Whether the list is exactly the object's own fields — false when something was
-    /// hidden, inlined, or computed, which is what decides whether Raw View is worth offering.</returns>
-    private bool AppendFields(
-        List<DebugVariable> into, CorDebugValue value, string path, bool applyBrowsable, bool includeProperties)
+    private MemberListing AppendFields(
+        List<DebugVariable> into, CorDebugValue value, string path, bool applyBrowsable, bool includeProperties,
+        MemberVisibility visibility = MemberVisibility.All)
     {
         var target = Safe(() => Dereference(value));
         if (target is not CorDebugObjectValue obj)
-            return true;
+            return new MemberListing(Complete: true, SkippedNonPublic: false);
 
         var complete = true;
-        var budget = Math.Max(1, _display.MaxChildren);
+        var skippedNonPublic = false;
+        var budget = Math.Max(1, _display.MaxChildren) - into.Count;
+        var rows = new List<DebugVariable>();
         // A name is listed once: the nearest type's member wins over a shadowed base member, and
         // a property whose backing field is already shown is not evaluated again.
         var emitted = new HashSet<string>(into.Select(row => row.Name), StringComparer.Ordinal);
 
-        foreach (var (cls, metadata, typeDef) in TypeChain(value))
+        // Materialized up front: the chain is walked through runtime types, which survive an
+        // evaluation, but the walk starts from the object, which does not.
+        foreach (var (cls, metadata, typeDef) in TypeChain(value).ToList())
         {
-            // Browsable states declared on the type's properties, which also govern the
-            // backing-field rows that stand in for auto-properties.
+            // Browsable states and accessibility declared on the type's properties, which also
+            // govern the backing-field rows that stand in for auto-properties.
             var propertyStates = new Dictionary<string, BrowsableState>(StringComparer.Ordinal);
-            if (applyBrowsable)
+            var propertyIsPublic = new Dictionary<string, bool>(StringComparer.Ordinal);
+            foreach (var property in Properties(metadata, typeDef))
             {
-                foreach (var property in Properties(metadata, typeDef))
-                {
-                    var declared = Safe<GetPropertyPropsResult?>(() => metadata.GetPropertyProps(property));
-                    if (declared is null || string.IsNullOrEmpty(declared.Value.szProperty))
-                        continue;
-                    propertyStates[declared.Value.szProperty] =
-                        DebuggerAttributes.BrowsableOf(metadata, property);
-                }
+                var declared = Safe<GetPropertyPropsResult?>(() => metadata.GetPropertyProps(property));
+                if (declared is null || string.IsNullOrEmpty(declared.Value.szProperty))
+                    continue;
+                if (applyBrowsable)
+                    propertyStates[declared.Value.szProperty] = DebuggerAttributes.BrowsableOf(metadata, property);
+                propertyIsPublic[declared.Value.szProperty] = IsPublicMethod(metadata, declared.Value.pmdGetter);
             }
 
             foreach (var field in Fields(metadata, typeDef))
             {
-                if (into.Count >= budget)
-                    return false;
+                if (rows.Count >= budget)
+                {
+                    complete = false;
+                    break;
+                }
 
                 var props = Safe<GetFieldPropsResult?>(() => metadata.GetFieldProps(field));
                 if (props is null)
@@ -670,11 +769,18 @@ public sealed partial class DebugSession
                     continue;
 
                 var name = DisplayFieldName(props.Value.szField);
+                var isBacking = name != props.Value.szField;
+                // The compiler's own fields — a state machine's "<>1__state", a closure's
+                // "<>4__this" — are the Raw View's; the listing shows the user's names.
+                if (applyBrowsable && !isBacking && IsCompilerOwnedField(name))
+                {
+                    complete = false;
+                    continue;
+                }
                 var state = applyBrowsable
                     ? DebuggerAttributes.BrowsableOf(metadata, field)
                     : BrowsableState.Collapsed;
-                if (applyBrowsable && name != props.Value.szField &&
-                    propertyStates.TryGetValue(name, out var propertyState))
+                if (applyBrowsable && isBacking && propertyStates.TryGetValue(name, out var propertyState))
                     state = propertyState;
                 if (state == BrowsableState.Never)
                 {
@@ -682,30 +788,35 @@ public sealed partial class DebugSession
                     continue;
                 }
 
+                var isPublic = isBacking && propertyIsPublic.TryGetValue(name, out var declaredPublic)
+                    ? declaredPublic
+                    : (attributes & CorFieldAttr.fdFieldAccessMask) == CorFieldAttr.fdPublic;
+                if (!Admits(visibility, isPublic, ref skippedNonPublic))
+                    continue;
+
                 var member = Safe(() => obj.GetFieldValue(cls.Raw, field));
                 if (member is null)
                     continue;
 
+                var generation = _evalGeneration;
                 if (state == BrowsableState.RootHidden)
                 {
                     // The member vanishes and its own children take its place — how a List<T>
                     // shows elements rather than the array it keeps them in.
                     complete = false;
-                    foreach (var grandchild in ChildrenOf(member, $"{path}.{name}"))
-                    {
-                        if (into.Count >= budget)
-                            return false;
-                        into.Add(grandchild);
-                    }
-                    continue;
+                    rows.AddRange(ChildrenOf(member, $"{path}.{name}"));
                 }
-
-                if (!emitted.Add(name))
+                else if (!emitted.Add(name))
                 {
                     complete = false;
-                    continue;
                 }
-                into.Add(Row(name, member, "field", $"{path}.{name}"));
+                else
+                {
+                    rows.Add(Row(name, member, "field", $"{path}.{name}"));
+                }
+
+                if (_evalGeneration != generation)
+                    (value, obj) = Reacquire(value, path, obj);
             }
 
             if (!includeProperties)
@@ -713,17 +824,23 @@ public sealed partial class DebugSession
 
             foreach (var property in Properties(metadata, typeDef))
             {
-                if (into.Count >= budget)
-                    return false;
+                if (rows.Count >= budget)
+                {
+                    complete = false;
+                    break;
+                }
 
                 var props = Safe<GetPropertyPropsResult?>(() => metadata.GetPropertyProps(property));
                 if (props is null || props.Value.pmdGetter.Rid == 0)
                     continue;
 
                 var name = props.Value.szProperty;
-                // Indexers need an index to mean anything, and a static getter is not this
+                if (string.IsNullOrEmpty(name) || emitted.Contains(name))
+                    continue;
+                // Indexers need an index to mean anything, an explicit interface implementation
+                // is reachable only through the interface, and a static getter is not this
                 // instance's state.
-                if (string.IsNullOrEmpty(name) || name == "Item" || emitted.Contains(name))
+                if (name == "Item" || name.Contains('.') || IsIndexer(props.Value))
                     continue;
                 if (Safe(() => metadata.GetMethodProps(props.Value.pmdGetter).pdwAttr.HasFlag(CorMethodAttr.mdStatic)) == true)
                     continue;
@@ -737,47 +854,134 @@ public sealed partial class DebugSession
                     continue;
                 }
 
+                var isPublic = propertyIsPublic.TryGetValue(name, out var declaredPublic) && declaredPublic;
+                if (!Admits(visibility, isPublic, ref skippedNonPublic))
+                    continue;
+
                 // A computed row means the list is no longer "exactly the fields".
                 complete = false;
                 emitted.Add(name);
 
+                var generation = _evalGeneration;
                 var member = MemberValue(value, name, callOnly: false, out var error);
                 if (member is null)
                 {
-                    into.Add(new DebugVariable
+                    rows.Add(new DebugVariable
                     {
                         Name = name,
                         Value = error.Length == 0 ? "could not be evaluated" : error,
                         Kind = "property",
                     });
-                    continue;
                 }
-
-                if (state == BrowsableState.RootHidden)
+                else if (state == BrowsableState.RootHidden)
                 {
-                    foreach (var grandchild in ChildrenOf(member, $"{path}.{name}"))
-                    {
-                        if (into.Count >= budget)
-                            return false;
-                        into.Add(grandchild);
-                    }
-                    continue;
+                    rows.AddRange(ChildrenOf(member, $"{path}.{name}"));
+                }
+                else
+                {
+                    var row = Row(name, member, "property", $"{path}.{name}");
+                    row.Settable = props.Value.pmdSetter.Rid != 0;
+                    rows.Add(row);
                 }
 
-                into.Add(Row(name, member, "property", $"{path}.{name}"));
+                if (_evalGeneration != generation)
+                    (value, obj) = Reacquire(value, path, obj);
             }
         }
 
-        return complete;
+        into.AddRange(rows
+            .Take(Math.Max(0, budget))
+            .OrderBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(row => row.Name, StringComparer.Ordinal));
+        return new MemberListing(complete, skippedNonPublic);
+    }
+
+    private static bool IsCompilerOwnedField(string name) =>
+        name.StartsWith("<>", StringComparison.Ordinal) || name.StartsWith("CS$", StringComparison.Ordinal);
+
+    /// <summary>Whether a member of the given accessibility belongs in this listing, noting when
+    /// it was held back for the "Non-Public members" node.</summary>
+    private static bool Admits(MemberVisibility visibility, bool isPublic, ref bool skippedNonPublic)
+    {
+        switch (visibility)
+        {
+            case MemberVisibility.Public when !isPublic:
+                skippedNonPublic = true;
+                return false;
+            case MemberVisibility.NonPublic when isPublic:
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    private static bool IsPublicMethod(MetaDataImport metadata, mdMethodDef method) =>
+        method.Rid != 0 &&
+        Safe(() => (CorMethodAttr?)(metadata.GetMethodProps(method).pdwAttr & CorMethodAttr.mdMemberAccessMask))
+            == CorMethodAttr.mdPublic;
+
+    /// <summary>Whether a property takes parameters — an indexer, whatever its name. The
+    /// property signature's second byte is its parameter count (ECMA-335 II.23.2.5).</summary>
+    private static bool IsIndexer(GetPropertyPropsResult props) =>
+        props.ppvSig != IntPtr.Zero && props.pbSig > 1 && Marshal.ReadByte(props.ppvSig, 1) > 0;
+
+    /// <summary>
+    /// The object behind <paramref name="value"/>, read again after an evaluation ran.
+    /// </summary>
+    /// <remarks>
+    /// A reference is dereferenced afresh — the reference itself stays readable, it is the
+    /// object snapshot behind it that the runtime retires. A value type has no reference to
+    /// follow: it lives inside a frame or another object, so it is resolved again by its path.
+    /// When neither works the previous object is kept, which fails the same way it always did
+    /// rather than any worse.
+    /// </remarks>
+    private (CorDebugValue Value, CorDebugObjectValue Object) Reacquire(
+        CorDebugValue value, string path, CorDebugObjectValue previous)
+    {
+        if (value is not CorDebugReferenceValue && _inspectionFrame is { } frame)
+            value = ResolvePath(frame, path, out _) ?? value;
+        return (value, Safe(() => Dereference(value)) as CorDebugObjectValue ?? previous);
+    }
+
+    /// <summary>Path segment that lists a framework type's non-public members — the
+    /// "Non-Public members" node.</summary>
+    internal const string NonPublicMarker = "$nonpublic";
+
+    /// <summary>
+    /// Whether a type is the framework's rather than the user's, which is what decides whether
+    /// its non-public members are folded away.
+    /// </summary>
+    /// <remarks>
+    /// Two answers, either of which suffices: the namespace is one the framework owns, or the
+    /// module is not one the open solution builds. The second is fail-open — with no solution,
+    /// every module could be the user's — which is why the first is asked at all.
+    /// </remarks>
+    private bool IsFrameworkType(CorDebugValue value)
+    {
+        foreach (var (cls, metadata, typeDef) in TypeChain(value))
+        {
+            var name = Safe(() => metadata.GetTypeDefProps(typeDef).szTypeDef) ?? string.Empty;
+            if (name.StartsWith("System.", StringComparison.Ordinal) ||
+                name.StartsWith("Microsoft.", StringComparison.Ordinal))
+                return true;
+            var module = Safe(() => cls.Module.Name) ?? string.Empty;
+            return module.Length > 0 && !IsUserModule(module);
+        }
+        return false;
     }
 
     /// <summary>
     /// Lists the members of the value's <c>DebuggerTypeProxy</c>, which is what the type's author
     /// wants seen in place of its fields.
     /// </summary>
-    private void AppendProxyMembers(List<DebugVariable> into, CorDebugValue value, string path)
+    /// <returns>False when the proxy type is not loaded in the debuggee, in which case nothing
+    /// was added and the members are listed the ordinary way — what VS does, rather than showing
+    /// an error where the user expected a collection.</returns>
+    private bool AppendProxyMembers(List<DebugVariable> into, CorDebugValue value, string path)
     {
         var proxy = ProxyValue(value, out var error);
+        if (proxy is null && error.Contains("was not found in any loaded module", StringComparison.Ordinal))
+            return false;
         if (proxy is null)
         {
             into.Add(new DebugVariable
@@ -786,7 +990,7 @@ public sealed partial class DebugSession
                 Value = error.Length == 0 ? "the debugger view type could not be constructed" : error,
                 Kind = "diagnostic",
             });
-            return;
+            return true;
         }
 
         var budget = Math.Max(1, _display.MaxChildren);
@@ -796,7 +1000,7 @@ public sealed partial class DebugSession
             foreach (var property in Properties(metadata, typeDef))
             {
                 if (into.Count >= budget)
-                    return;
+                    return true;
 
                 var props = Safe<GetPropertyPropsResult?>(() => metadata.GetPropertyProps(property));
                 if (props is null || props.Value.pmdGetter.Rid == 0)
@@ -822,7 +1026,7 @@ public sealed partial class DebugSession
                     foreach (var grandchild in ChildrenOf(member, childPath))
                     {
                         if (into.Count >= budget)
-                            return;
+                            return true;
                         into.Add(grandchild);
                     }
                     continue;
@@ -831,6 +1035,7 @@ public sealed partial class DebugSession
                 into.Add(Row(name, member, "proxy", childPath));
             }
         }
+        return true;
     }
 
     /// <summary>A frame's arguments and locals, as expandable rows — led, on an exception stop,
@@ -845,42 +1050,50 @@ public sealed partial class DebugSession
     {
         _inspectionFrame = ilFrame;
         var variables = new List<DebugVariable>();
-        if (CurrentExceptionValue() is { } exception)
+        if ((_inspectionThread is null || ThreadId(_inspectionThread) == ThreadId(_stoppedThread!)) && CurrentExceptionValue() is { } exception)
             variables.Add(Row(ExceptionMarker, exception, "exception", ExceptionMarker));
         if (ReturnValueRow(ilFrame) is { } returned)
             variables.Add(returned);
 
         var (argNames, localNames) = FrameSymbolNames(ilFrame);
-        var slots = new List<(string Name, CorDebugValue Value, string Kind)>();
-        CollectSlots(slots, "arg", Safe(() => ilFrame.Arguments), argNames);
-        CollectSlots(slots, "local", Safe(() => ilFrame.LocalVariables), localNames);
+        var slots = new List<(string Name, CorDebugValue Value, string Kind, bool Named)>();
+        CollectSlots(slots, "arg", ilFrame.Arguments, argNames);
+        CollectSlots(slots, "local", ilFrame.LocalVariables, localNames);
 
-        foreach (var (name, value, kind) in slots)
+        foreach (var (name, value, kind, named) in slots)
         {
             if (name == "this" && IsStateMachine(value))
             {
                 HoistStateMachine(value, variables);
                 continue;
             }
-            if (IsCompilerGeneratedName(name))
+            // Captures can live in `this` (inside a lambda) or in an unnamed IL slot.
+            // Their runtime type identifies them even when the PDB supplies no local name.
+            if (IsDisplayClass(value))
             {
-                if (IsDisplayClass(value))
-                    HoistDisplayClass(name, value, variables);
+                HoistDisplayClass(name, value, variables);
                 continue;
             }
+            // A slot the symbols do not name at this point is the compiler's — a temporary, or
+            // a local of a scope the frame is not in — and no debugger lists those.
+            if (!named || IsCompilerGeneratedName(name))
+                continue;
             variables.Add(Row(name, value, kind, name));
         }
         return variables;
     }
 
     private static void CollectSlots(
-        List<(string Name, CorDebugValue Value, string Kind)> into,
+        List<(string Name, CorDebugValue Value, string Kind, bool Named)> into,
         string kind, CorDebugValue[]? values, Dictionary<int, string> names)
     {
         if (values is null)
             return;
         for (var i = 0; i < values.Length; i++)
-            into.Add((names.TryGetValue(i, out var symbol) ? symbol : $"{kind}{i}", values[i], kind));
+        {
+            var named = names.TryGetValue(i, out var symbol);
+            into.Add((named ? symbol! : $"{kind}{i}", values[i], kind, named));
+        }
     }
 
     private static bool IsCompilerGeneratedName(string name) =>
@@ -915,7 +1128,7 @@ public sealed partial class DebugSession
         if (target is not CorDebugObjectValue obj)
             return;
 
-        foreach (var (cls, metadata, typeDef) in TypeChain(machine))
+        foreach (var (cls, metadata, typeDef) in TypeChain(machine).ToList())
         {
             foreach (var field in Fields(metadata, typeDef))
             {
@@ -927,6 +1140,7 @@ public sealed partial class DebugSession
                 if (value is null)
                     continue;
 
+                var generation = _evalGeneration;
                 if (fieldName == "<>4__this")
                     into.Add(Row("this", value, "arg", $"this.{fieldName}"));
                 else if (HoistedLocalName(fieldName) is { } source)
@@ -934,6 +1148,9 @@ public sealed partial class DebugSession
                 else if (!fieldName.StartsWith("<", StringComparison.Ordinal) &&
                          !fieldName.StartsWith("CS$", StringComparison.Ordinal))
                     into.Add(Row(fieldName, value, "arg", $"this.{fieldName}"));
+
+                if (_evalGeneration != generation)
+                    (machine, obj) = Reacquire(machine, "this", obj);
             }
             // Only the machine's own fields; its base holds nothing of the user's.
             break;
@@ -948,7 +1165,7 @@ public sealed partial class DebugSession
         if (target is not CorDebugObjectValue obj)
             return;
 
-        foreach (var (cls, metadata, typeDef) in TypeChain(value))
+        foreach (var (cls, metadata, typeDef) in TypeChain(value).ToList())
         {
             foreach (var field in Fields(metadata, typeDef))
             {
@@ -960,6 +1177,7 @@ public sealed partial class DebugSession
                 if (member is null)
                     continue;
 
+                var generation = _evalGeneration;
                 if (fieldName == "<>4__this")
                 {
                     if (!into.Any(row => row.Name == "this"))
@@ -968,8 +1186,24 @@ public sealed partial class DebugSession
                 else if (!fieldName.StartsWith("<", StringComparison.Ordinal) &&
                          !fieldName.StartsWith("CS$", StringComparison.Ordinal))
                 {
-                    into.Add(Row(fieldName, member, "local", $"{localName}.{fieldName}"));
+                    // A captured parameter also still has its IL slot, but that slot is a copy
+                    // taken on entry: the capture is where every later assignment went, so it
+                    // is the one the user is looking for — listed once, in the slot's place.
+                    var captured = Row(fieldName, member, "local", $"{localName}.{fieldName}");
+                    var existing = into.FindIndex(row => row.Name == fieldName);
+                    if (existing >= 0)
+                    {
+                        captured.Kind = into[existing].Kind;
+                        into[existing] = captured;
+                    }
+                    else
+                    {
+                        into.Add(captured);
+                    }
                 }
+
+                if (_evalGeneration != generation)
+                    (value, obj) = Reacquire(value, localName, obj);
             }
             break;
         }
@@ -997,6 +1231,7 @@ public sealed partial class DebugSession
             Kind = kind,
             Type = type,
             VariablesReference = Expandable(value) ? path : string.Empty,
+            EvaluateName = path,
             Settable = kind is "field" or "element" or "local" or "arg",
         };
     }
@@ -1008,11 +1243,18 @@ public sealed partial class DebugSession
     private bool Expandable(CorDebugValue value)
     {
         var target = Safe(() => Dereference(value));
+        if (target is not null && TryReadScalar(target) is not null) return false;
         return target switch
         {
             null => false,
             CorDebugStringValue => false,
             CorDebugArrayValue array => (Safe(() => (int?)array.Count) ?? 0) > 0,
+            // A decimal is a number, however many fields it takes to store one; a null
+            // Nullable<T> has nothing behind it.
+            CorDebugObjectValue when TypeNameOf(target) == "System.Decimal" => false,
+            CorDebugObjectValue when NullableStateOf(target) is { HasValue: false } => false,
+            // An enum is its name; the integer under it is the Raw View of nothing.
+            CorDebugObjectValue when IsEnumValue(target) => false,
             CorDebugObjectValue => true,
             _ => false,
         };
@@ -1020,6 +1262,13 @@ public sealed partial class DebugSession
 
     /// <summary>Auto-property backing fields are shown under the property's name, which is also
     /// the name that resolves back to them.</summary>
+    private static bool IsEnumValue(CorDebugValue value)
+    {
+        foreach (var (_, metadata, typeDef) in TypeChain(value))
+            return ExtendsSystemEnum(metadata, typeDef);
+        return false;
+    }
+
     private static string DisplayFieldName(string field)
     {
         if (field.StartsWith('<') && field.Contains(">k__BackingField", StringComparison.Ordinal))
@@ -1413,7 +1662,7 @@ public sealed partial class DebugSession
 
         foreach (var (_, metadata, typeDef) in TypeChain(value))
         {
-            var name = Safe(() => metadata.GetTypeDefProps(typeDef).szTypeDef);
+            var name = QualifiedTypeName(metadata, typeDef);
             if (name is { Length: > 0 })
                 return name;
         }
@@ -1446,6 +1695,8 @@ public sealed partial class DebugSession
             CorElementType.R8 => "double",
             CorElementType.String => "string",
             CorElementType.Object => "object",
+            CorElementType.I => "System.IntPtr",
+            CorElementType.U => "System.UIntPtr",
             _ => null,
         };
         if (primitive is not null)
@@ -1459,12 +1710,43 @@ public sealed partial class DebugSession
 
         var cls = Safe(() => type.Class);
         var metadata = cls is null ? null : Safe(() => Extensions.GetMetaDataInterface<MetaDataImport>(cls.Module));
-        var name = metadata is null ? null : Safe(() => metadata.GetTypeDefProps(cls!.Token).szTypeDef);
+        var name = metadata is null ? null : QualifiedTypeName(metadata, cls!.Token);
         return name is { Length: > 0 } ? WithTypeArguments(name, type) : element?.ToString() ?? "object";
     }
 
+    /// <summary>
+    /// A type's name as C# would qualify it: a nested type spelled through its enclosing types,
+    /// <c>Outer.Inner</c>, where the metadata table stores only <c>Inner</c>.
+    /// </summary>
+    private static string? QualifiedTypeName(MetaDataImport metadata, mdTypeDef typeDef)
+    {
+        var props = Safe<GetTypeDefPropsResult?>(() => metadata.GetTypeDefProps(typeDef));
+        if (props is null || string.IsNullOrEmpty(props.Value.szTypeDef))
+            return null;
+
+        var name = props.Value.szTypeDef;
+        for (var depth = 0; depth < MaxTypeDepth && IsNested(props.Value.pdwTypeDefFlags); depth++)
+        {
+            var enclosing = Safe<mdTypeDef?>(() => metadata.GetNestedClassProps(typeDef));
+            if (enclosing is not { } outer || outer.Rid == 0)
+                break;
+            var outerProps = Safe<GetTypeDefPropsResult?>(() => metadata.GetTypeDefProps(outer));
+            if (outerProps is null || string.IsNullOrEmpty(outerProps.Value.szTypeDef))
+                break;
+            name = outerProps.Value.szTypeDef + "." + name;
+            typeDef = outer;
+            props = outerProps;
+        }
+        return name;
+    }
+
+    private static bool IsNested(CorTypeAttr flags) =>
+        (flags & CorTypeAttr.tdVisibilityMask) >= CorTypeAttr.tdNestedPublic;
+
     /// <summary>Replaces a metadata arity suffix with the instantiation it stands for:
     /// <c>List`1</c> plus <c>[int]</c> is <c>List&lt;int&gt;</c>.</summary>
+    /// <remarks>A nested generic carries its arity on the outer name — <c>Dictionary`2.Enumerator</c>
+    /// — so the arguments replace the first suffix and any further suffix is dropped.</remarks>
     private static string WithTypeArguments(string name, CorDebugType type)
     {
         var tick = name.IndexOf('`');
@@ -1473,10 +1755,16 @@ public sealed partial class DebugSession
 
         var arguments = Safe(() => type.TypeParameters);
         if (arguments is not { Length: > 0 })
-            return name;
+            return StripArity(name);
 
-        return name[..tick] + "<" + string.Join(", ", arguments.Select(NameOfType)) + ">";
+        var end = tick + 1;
+        while (end < name.Length && char.IsDigit(name[end]))
+            end++;
+        return StripArity(name[..tick] + "<" + string.Join(", ", arguments.Select(NameOfType)) + ">" + name[end..]);
     }
+
+    private static string StripArity(string name) =>
+        name.Contains('`') ? System.Text.RegularExpressions.Regex.Replace(name, "`\\d+", string.Empty) : name;
 
     // --- Just My Code ---------------------------------------------------------------------------
 

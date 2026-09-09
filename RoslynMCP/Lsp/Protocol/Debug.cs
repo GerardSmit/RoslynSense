@@ -39,7 +39,8 @@ public sealed record DebugCommandParams(
     [property: JsonPropertyName("variablesReference")] int VariablesReference = 0,
     [property: JsonPropertyName("value")] string? Value = null,
     [property: JsonPropertyName("filters")] string[]? Filters = null,
-    [property: JsonPropertyName("dataBreakpoints")] DataBreakpointParams[]? DataBreakpoints = null);
+    [property: JsonPropertyName("dataBreakpoints")] DataBreakpointParams[]? DataBreakpoints = null,
+    [property: JsonPropertyName("threadId")] int ThreadId = 0);
 
 /// <summary>One value watch in a <c>set_data_breakpoints</c> command.</summary>
 public sealed record DataBreakpointParams(

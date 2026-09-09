@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
@@ -74,7 +74,7 @@ internal static class WorkspaceDiagnosticsHandler
         // never be reproduced by either group alone: both saw a mismatch, both re-bound and
         // re-reported it on every sweep, and the merged report handed back one project's view at a
         // time, so a finding present in only one of them appeared and vanished by turns.
-        var versionsByUri = new ConcurrentDictionary<string, ConcurrentBag<(Project Project, Document Document, string Version)>>(
+        var versionsByUri = new ConcurrentDictionary<string, List<(DocumentId Document, string Version)>>(
             StringComparer.OrdinalIgnoreCase);
 
         await Parallel.ForEachAsync(
@@ -108,9 +108,8 @@ internal static class WorkspaceDiagnosticsHandler
                         ? $"unversioned:{Guid.NewGuid():N}"
                         : $"{version}:{DiagnosticsHandler.AnalyzerMarker(document, version)}";
 
-                    versionsByUri
-                        .GetOrAdd(LspConverters.PathToUri(path), _ => [])
-                        .Add((project, document, stamped));
+                    var owners = versionsByUri.GetOrAdd(LspConverters.PathToUri(path), _ => new(1));
+                    lock (owners) owners.Add((document.Id, stamped));
                 }
             });
 
@@ -163,10 +162,16 @@ internal static class WorkspaceDiagnosticsHandler
         // was re-bound and re-reported forever, its diagnostics alternating between the two.
         foreach (var report in await DiagnoseDocumentsAsync(
             composed,
-            versionsByUri.ToDictionary(
-                kv => kv.Key,
-                kv => (IReadOnlyList<(Project, Document, string)>)[.. kv.Value],
-                StringComparer.OrdinalIgnoreCase),
+            versionsByUri
+                .Where(kv => !previous.TryGetValue(kv.Key, out var prior) || !Matches(prior, composed[kv.Key]))
+                .ToDictionary(
+                    kv => kv.Key,
+                    kv => (IReadOnlyList<(Project, Document, string)>)kv.Value.Select(owner =>
+                    {
+                        var document = solution.GetDocument(owner.Document)!;
+                        return (document.Project, document, owner.Version);
+                    }).ToArray(),
+                    StringComparer.OrdinalIgnoreCase),
             previous,
             ct))
         {
@@ -938,6 +943,7 @@ internal static class WorkspaceDiagnosticsHandler
 
         _ = Task.Run(async () =>
         {
+            using var operation = RoslynMCP.Services.Memory.HostMemoryTelemetry.Operation("workspace-diagnostics-background");
             try
             {
                 await s_recomputeSlots.WaitAsync();
@@ -984,6 +990,7 @@ internal static class WorkspaceDiagnosticsHandler
 
         _ = Task.Run(async () =>
         {
+            using var operation = RoslynMCP.Services.Memory.HostMemoryTelemetry.Operation("workspace-diagnostics-background");
             try
             {
                 // Capped as well as deduplicated: the documents are distinct, so the guard above

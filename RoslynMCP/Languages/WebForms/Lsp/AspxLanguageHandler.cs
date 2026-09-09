@@ -671,9 +671,11 @@ internal static class AspxLanguageHandler
     /// file in the project and should not rebuild the include graph per file.
     /// </summary>
     public static async Task<Protocol.Diagnostic[]> DiagnosticsAsync(
-        string filePath, AspxIncludeGraph? graph, CancellationToken ct)
+        string filePath, AspxIncludeGraph? graph, CancellationToken ct, Project? project = null)
     {
-        var document = await AspxDocumentService.GetAsync(filePath, ct);
+        var document = project is null
+            ? await AspxDocumentService.GetAsync(filePath, ct)
+            : await AspxDocumentService.GetAsync(filePath, project, ct);
         if (document is null)
             return [];
 
@@ -775,7 +777,7 @@ internal static class AspxLanguageHandler
 
         foreach (string includer in includers)
         {
-            var parent = await AspxDocumentService.GetAsync(includer, ct);
+            var parent = await AspxDocumentService.GetAsync(includer, document.Project, ct);
             if (parent is null)
                 continue;
 

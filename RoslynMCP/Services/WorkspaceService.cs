@@ -77,13 +77,14 @@ internal static class WorkspaceService
         // Before the subscriber, and unconditionally: the answers this drops were derived from the
         // set that just moved, and a subscriber that throws must not leave them behind.
         s_containingProject.Clear();
+        Memory.MemoryCacheRegistry.WorkspaceChanged();
 
         try { ProjectSetChanged?.Invoke(); }
         catch { /* an editor that cannot be told is not a reason to fail the load */ }
     }
 
     /// <summary>
-    /// Normalized file path → the project that compiles it, or <see langword="null"/> for "none
+    /// Normalized file path â†’ the project that compiles it, or <see langword="null"/> for "none
     /// does". Filled by <see cref="FindContainingProjectAsync"/>.
     /// </summary>
     /// <remarks>
@@ -97,7 +98,7 @@ internal static class WorkspaceService
     /// every time.
     /// </para>
     /// <para>
-    /// Only the path→project mapping is kept, deliberately, and never the <see cref="Document"/>.
+    /// Only the pathâ†’project mapping is kept, deliberately, and never the <see cref="Document"/>.
     /// A document pins the whole <see cref="Solution"/> snapshot it came from, so a memo over one
     /// would hand out yesterday's text after every keystroke; which project owns a file changes
     /// only when the project set or its file list does, which is exactly what
@@ -162,7 +163,7 @@ internal static class WorkspaceService
     private static readonly Timer s_evictionTimer;
 
     /// <summary>
-    /// Reverse index: analyzer / source-generator source directory → set of cached
+    /// Reverse index: analyzer / source-generator source directory â†’ set of cached
     /// project paths whose workspace pinned an ALC for that directory. Used to evict
     /// affected workspaces when <see cref="ShadowCopyManager"/> reports a rebuild.
     /// </summary>
@@ -171,7 +172,7 @@ internal static class WorkspaceService
 
     /// <summary>
     /// Reverse index: normalized project (.csproj) path — or a decompiled manifest path —
-    /// → the <see cref="s_cache"/> keys of the workspaces that can serve it. One solution
+    /// â†’ the <see cref="s_cache"/> keys of the workspaces that can serve it. One solution
     /// workspace serves all its member projects, so this maps every project in a loaded
     /// solution's transitive closure to that entry. This is what gives both solution-wide dedup
     /// and reuse-by-membership for loose projects.
@@ -540,7 +541,7 @@ internal static class WorkspaceService
                 if (TryGetValidCachedEntryLocked(normalizedPath, out var cachedEntry))
                     return CreateProjectSnapshot(cachedEntry!, normalizedPath, targetFilePath);
 
-                // Cache miss → resolve the owning solution once (brief I/O, miss-path only).
+                // Cache miss â†’ resolve the owning solution once (brief I/O, miss-path only).
                 if (!ownerResolved)
                 {
                     if (!isDecompile)
@@ -2112,6 +2113,21 @@ internal static class WorkspaceService
     /// <summary>Evicts only the single entry serving <paramref name="projectPath"/> (no global sweep).</summary>
     internal static Task EvictProjectForTests(string projectPath) => EvictProjectAsync(projectPath);
 
+    internal static void AgeProjectForMemoryTests(string projectPath)
+    {
+        s_cacheLock.Wait();
+        try
+        {
+            if (s_projectToCacheKey.TryGetValue(Path.GetFullPath(projectPath), out var keys))
+                foreach (var key in keys)
+                    if (s_cache.TryGetValue(key, out var entry))
+                        entry.LastAccessedUtc = DateTime.UtcNow - IdleTimeout - TimeSpan.FromMinutes(1);
+        }
+        finally { s_cacheLock.Release(); }
+    }
+    internal static void SweepIdleForMemoryTests() => EvictExpiredEntries(null);
+
+
     internal static async Task<(SemaphoreSlim Gate, WorkspaceDirtyWatcher Watcher)> RefreshStateForTests(
         string projectPath)
     {
@@ -2221,13 +2237,46 @@ internal static class WorkspaceService
     // buffer or replacing a document cannot retain its text or any old solution/compilation.
     private static readonly ConditionalWeakTable<object, WeakReference<SourceText>> s_matchingOpenTexts = new();
 
-    internal static void RememberMatchingOpenText(Document document, SourceText text) =>
+    // The same equality, remembered against the file rather than the document state: the buffer
+    // instance was found equal to the disk file as it stood at this stamp and size. A document
+    // whose state was replaced after the proof was taken — a reloaded loader, a reference swap
+    // that rebuilt the project — keys the table above by an object nobody holds any more, and a
+    // cold text behind it then reads as an edit. The file proof survives that: for a document
+    // that still loads its text from that file, an unchanged stamp and size mean the text it
+    // would load is the one the buffer was compared against.
+    private sealed record DiskProof(string Path, long Ticks, long Length);
+    private static readonly ConditionalWeakTable<SourceText, DiskProof> s_diskProofs = new();
+
+    internal static void RememberMatchingOpenText(Document document, SourceText text)
+    {
         s_matchingOpenTexts.GetValue(document.State.TextAndVersionSource, _ => new WeakReference<SourceText>(text)).SetTarget(text);
 
+        if (document.FilePath is not { Length: > 0 } path)
+            return;
+        var info = new FileInfo(path);
+        if (info.Exists)
+            s_diskProofs.AddOrUpdate(text, new DiskProof(path, info.LastWriteTimeUtc.Ticks, info.Length));
+    }
+
     internal static bool HasMatchingOpenText(Document document, SourceText text) =>
-        s_matchingOpenTexts.TryGetValue(document.State.TextAndVersionSource, out var known)
-        && known.TryGetTarget(out var matching)
-        && ReferenceEquals(matching, text);
+        (s_matchingOpenTexts.TryGetValue(document.State.TextAndVersionSource, out var known)
+            && known.TryGetTarget(out var matching)
+            && ReferenceEquals(matching, text))
+        || HasDiskProof(document, text);
+
+    private static bool HasDiskProof(Document document, SourceText text)
+    {
+        if (!s_diskProofs.TryGetValue(text, out var proof)
+            || document.FilePath is not { Length: > 0 } path
+            || !string.Equals(path, proof.Path, StringComparison.OrdinalIgnoreCase)
+            || !document.State.TextAndVersionSource.CanReloadText)
+        {
+            return false;
+        }
+
+        var info = new FileInfo(path);
+        return info.Exists && info.LastWriteTimeUtc.Ticks == proof.Ticks && info.Length == proof.Length;
+    }
 
     /// <summary>
     /// Re-applies every open buffer once a load has finished with the gate.
@@ -2955,11 +3004,11 @@ internal static class WorkspaceService
                 Path.GetDirectoryName(Path.GetFullPath(fp)), directory, StringComparison.OrdinalIgnoreCase));
     }
 
-    /// <summary>Project file path → (stamp it was read at, whether its compile glob is unqualified).</summary>
+    /// <summary>Project file path â†’ (stamp it was read at, whether its compile glob is unqualified).</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, bool Plain)>
         s_plainGlob = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Project file path → (stamp it was read at, whether it turns default items off).</summary>
+    /// <summary>Project file path â†’ (stamp it was read at, whether it turns default items off).</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Ticks, bool Explicit)>
         s_explicitItems = new(StringComparer.OrdinalIgnoreCase);
 
@@ -3468,7 +3517,8 @@ internal static class WorkspaceService
         // Analyzer host entries are keyed per project FilePath, so evict for every project
         // this workspace served (a solution entry served many).
         foreach (var projectPath in entry.ProjectIds.Keys)
-            AnalyzerService.EvictAnalyzersForProject(projectPath);
+            if (!s_projectToCacheKey.ContainsKey(projectPath))
+                AnalyzerService.EvictAnalyzersForProject(projectPath);
 
         // The funnel every eviction goes through — the idle sweep, the LRU cap, EvictAllAsync, a
         // .csproj change, an analyzer rebuild. Everything the editor holds was derived from a
@@ -3956,6 +4006,46 @@ internal static class WorkspaceService
         return overlay?.GetProject(project.Id) ?? project;
     }
 
+    private static bool HasWorkspaceOwner(CachedWorkspaceEntry entry, IReadOnlyCollection<string> openPaths)
+    {
+        if (entry.LoadGate.CurrentCount == 0) return true;
+        if (Lsp.LspSessionRegistry.HasSessions && string.Equals(entry.CacheKey, BoundSolutionPath, StringComparison.OrdinalIgnoreCase)) return true;
+        if (HotReload.HotReloadService.OpenSessions.Any(entry.ProjectIds.ContainsKey)) return true;
+        foreach (var path in openPaths)
+        {
+            if (entry.Workspace.CurrentSolution.GetDocumentIdsWithFilePath(path).Length > 0) return true;
+            // Markup is not a Roslyn document. Keep its containing standalone project available.
+            if (entry.ProjectIds.Keys.Any(projectPath => Path.GetDirectoryName(projectPath) is { } directory
+                && path.StartsWith(directory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))) return true;
+        }
+        return false;
+    }
+
+    internal static object[] MemoryInventory()
+    {
+        // Scalars only; the caller must not receive Workspace/Project/Solution objects.
+        return s_cache.Values.Select(entry => (object)new
+        {
+            entry.CacheKey, entry.CachedAtUtc, entry.LastAccessedUtc, entry.IsDisposed,
+            Owned = HasWorkspaceOwner(entry, OpenDocumentStore.OpenPaths()),
+            Projects = entry.Workspace.CurrentSolution.Projects.Select(p => new
+            {
+                Id = p.Id.Id, p.FilePath, p.Name, p.Language,
+                TargetFramework = p.AnalyzerOptions.AnalyzerConfigOptionsProvider.GlobalOptions.TryGetValue("build_property.TargetFramework", out var tfm) ? tfm : null,
+                Configuration = p.AnalyzerOptions.AnalyzerConfigOptionsProvider.GlobalOptions.TryGetValue("build_property.Configuration", out var config) ? config : null,
+                Platform = p.CompilationOptions?.Platform.ToString(),
+                OutputKind = p.CompilationOptions?.OutputKind.ToString(),
+                Optimization = p.CompilationOptions?.OptimizationLevel.ToString(),
+                ParseOptions = p.ParseOptions is Microsoft.CodeAnalysis.CSharp.CSharpParseOptions cs
+                    ? new { LanguageVersion = cs.LanguageVersion.ToString(), Symbols = cs.PreprocessorSymbolNames.ToArray() } : null,
+                Assembly = p.AssemblyName, Output = p.OutputFilePath,
+                Documents = p.Documents.Select(d => d.FilePath).ToArray(),
+                References = p.MetadataReferences.Select(r => r.Display).ToArray(),
+                ProjectReferences = p.ProjectReferences.Select(r => r.ProjectId.Id).ToArray(),
+            }).ToArray(),
+        }).ToArray();
+    }
+
     private static void EvictExpiredEntries(object? state)
     {
         // This runs on a ThreadPool thread from a Timer: any exception that escapes here is
@@ -3969,37 +4059,28 @@ internal static class WorkspaceService
             catch (ObjectDisposedException) { return; } // shutting down
             if (!acquired)
                 return; // another operation holds the lock — skip this cycle
+            using var maintenance = Memory.HostMemoryTelemetry.TryBeginIdleMaintenance();
+            if (maintenance is null) return;
 
-            // Idle eviction is for the MCP case, where a workspace is loaded to answer a question
-            // and then nobody comes back. An editor is the opposite: quiet means the user is
-            // reading, or was in a meeting, and the files are still open in front of them.
-            //
-            // Evicting under a connected editor is what "I didn't use it for a while and now it
-            // doesn't work" was. Ten minutes of not typing threw the solution away, silently —
-            // the sweep says so on Console.Error, which in the shared-daemon setup is a process
-            // the user is not looking at — and the next request had to load it all again from
-            // cold, with nothing on screen to say why the editor had gone dead.
-            //
-            // The LRU cap below still runs, so memory stays bounded either way. That one is
-            // deliberate: it evicts because there are too many solutions open at once, which is a
-            // real reason, rather than because time passed.
-            if (!Lsp.LspSessionRegistry.HasSessions)
+            // Keep the bound editor solution, open files, loads and Hot Reload baselines alive.
+            // An unrelated editor session must not retain every previously visited standalone project.
+            if (Memory.HostMemoryTelemetry.ActiveOperations == 0)
             {
                 var now = DateTime.UtcNow;
+                var openPaths = OpenDocumentStore.OpenPaths();
                 var expired = s_cache
-                    .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout)
-                    .Select(kvp => kvp.Key)
-                    .ToList();
-
-                foreach (var key in expired)
-                    TryEvictLoggedLocked(key, "idle workspace");
+                    .Where(kvp => (now - kvp.Value.LastAccessedUtc) > IdleTimeout
+                        && !HasWorkspaceOwner(kvp.Value, openPaths))
+                    .Select(kvp => kvp.Key).ToList();
+                foreach (var key in expired) TryEvictLoggedLocked(key, "idle unowned workspace");
             }
 
             // LRU cap: after the idle sweep, if still over the cap, evict the
             // least-recently-used entries down to MaxCachedWorkspaces.
-            if (s_cache.Count > MaxCachedWorkspaces)
+            if (s_cache.Count > MaxCachedWorkspaces && Memory.HostMemoryTelemetry.ActiveOperations == 0)
             {
                 var overflow = s_cache
+                    .Where(kvp => !HasWorkspaceOwner(kvp.Value, OpenDocumentStore.OpenPaths()))
                     .OrderBy(kvp => kvp.Value.LastAccessedUtc)
                     .Take(s_cache.Count - MaxCachedWorkspaces)
                     .Select(kvp => kvp.Key)
@@ -4469,7 +4550,7 @@ internal static class WorkspaceService
         /// (e.g. a decompiled project whose FilePath is null).</summary>
         public ProjectId PrimaryProjectId { get; }
 
-        /// <summary>Normalized .csproj path → ProjectId, for every project this workspace
+        /// <summary>Normalized .csproj path â†’ ProjectId, for every project this workspace
         /// holds (the whole solution closure for a solution entry).</summary>
         /// <remarks>
         /// Concurrent because it is read outside <c>s_cacheLock</c> — by the snapshot path and by

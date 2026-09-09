@@ -197,6 +197,7 @@ public static class ProjectMutationService
         string projectPath, string relativePath, FileKind kind = FileKind.Class,
         CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         if (!File.Exists(projectPath))
             return new MutationResult(false, $"Project not found: {projectPath}");
 
@@ -207,11 +208,12 @@ public static class ProjectMutationService
         if (!fullPath.StartsWith(projectDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             return new MutationResult(false, "The file must be inside the project directory.");
 
-        if (File.Exists(fullPath))
-            return new MutationResult(false, $"{relativePath} already exists.");
-
         if (!Path.HasExtension(fullPath))
             fullPath += ".cs";
+
+        // Check the final destination: an extensionless name still writes a .cs file.
+        if (File.Exists(fullPath))
+            return new MutationResult(false, $"{Path.GetRelativePath(projectDirectory, fullPath)} already exists.");
 
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         await File.WriteAllTextAsync(
@@ -228,6 +230,7 @@ public static class ProjectMutationService
     public static async Task<MutationResult> DeleteFileAsync(
         string filePath, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         if (!File.Exists(filePath))
             return new MutationResult(false, $"File not found: {filePath}");
 

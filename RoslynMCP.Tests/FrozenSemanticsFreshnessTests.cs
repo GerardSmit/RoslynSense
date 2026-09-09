@@ -1,5 +1,8 @@
+using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Collections;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp;
 using RoslynMCP.Services;
@@ -121,6 +124,121 @@ public sealed class FrozenSemanticsFreshnessTests
         var product = compilation!.GetTypeByMetadataName("Product");
         Assert.NotEmpty(product!.GetMembers("VersionTwo"));
         Assert.Empty(product.GetMembers("VersionOne"));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ChangedGeneratorInputsRemainCurrentWhenFreezingAnUneditedConsumer(
+        bool referencedProject, bool analyzerConfiguration)
+    {
+        using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);
+        var (solution, modelId, consumerId) = CreateSolution(workspace, referencedProject);
+        var inputId = DocumentId.CreateNewId(modelId.ProjectId);
+        solution = solution.RemoveDocument(modelId)
+            .AddAnalyzerReference(modelId.ProjectId, new ProductGeneratorReference(analyzerConfiguration));
+        solution = analyzerConfiguration
+            ? solution.AddAnalyzerConfigDocument(inputId, ".globalconfig", GeneratorConfiguration("VersionOne"),
+                filePath: Path.Combine(Path.GetTempPath(), "frozen-generator", ".globalconfig"))
+            : solution.AddAdditionalDocument(inputId, "member.txt", SourceText.From("VersionOne"));
+        var before = await solution.GetDocument(consumerId)!.Project.GetCompilationAsync();
+        Assert.Single(before!.GetTypeByMetadataName("Product")!.GetMembers("VersionOne"));
+
+        var changed = analyzerConfiguration
+            ? solution.WithAnalyzerConfigDocumentText(inputId, GeneratorConfiguration("VersionTwo"))
+            : solution.WithAdditionalDocumentText(inputId, SourceText.From("VersionTwo"));
+        var document = changed.GetDocument(consumerId)!;
+        Assert.False(document.Project.TryGetCompilation(out _));
+        Assert.Same(await solution.GetDocument(consumerId)!.GetSyntaxTreeAsync(), await document.GetSyntaxTreeAsync());
+
+        var selected = await document.FreezeAsync(default);
+
+        // No C# declaration was edited, but freezing the previous generator inputs would
+        // silently restore the old API when save/build next requests generation.
+        Assert.Same(document, selected);
+        var selectedInput = analyzerConfiguration
+            ? selected.Project.Solution.GetAnalyzerConfigDocument(inputId)
+            : selected.Project.Solution.GetAdditionalDocument(inputId);
+        Assert.Contains("VersionTwo", (await selectedInput!.GetTextAsync()).ToString());
+
+        // Balanced generator execution waits for this explicit save/build transition.
+        Assert.True(workspace.TryApplyChanges(selected.Project.Solution));
+        await workspace.ProcessUpdateSourceGeneratorRequestAsync(
+            ImmutableSegmentedList.Create<(ProjectId?, bool)>((modelId.ProjectId, true)), default);
+        var after = await workspace.CurrentSolution.GetDocument(consumerId)!.Project.GetCompilationAsync();
+        var product = after!.GetTypeByMetadataName("Product")!;
+        Assert.Single(product.GetMembers("VersionTwo"));
+        Assert.Empty(product.GetMembers("VersionOne"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TransitiveDependencyDocumentChangesCannotLeaveStaleDeclarations(bool removeDocument)
+    {
+        using var workspace = new AdhocWorkspace(WorkspaceService.HostServices);
+        var (solution, modelId, consumerId) = CreateSolution(workspace, referencedProject: true);
+        var leafId = ProjectId.CreateNewId();
+        var leafDocumentId = DocumentId.CreateNewId(leafId);
+        const string declaration = "public class LeafContract { public int Value; }";
+        solution = solution.AddProject(leafId, "Leaf", "Leaf", LanguageNames.CSharp)
+            .WithProjectCompilationOptions(leafId, new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+            .AddMetadataReference(leafId, MetadataReference.CreateFromFile(typeof(object).Assembly.Location))
+            .AddProjectReference(modelId.ProjectId, new ProjectReference(leafId));
+        if (removeDocument)
+            solution = solution.AddDocument(leafDocumentId, "LeafContract.cs", SourceText.From(declaration));
+        await solution.GetDocument(consumerId)!.Project.GetCompilationAsync();
+        var before = await solution.GetProject(leafId)!.GetCompilationAsync();
+        Assert.Equal(removeDocument, before!.GetTypeByMetadataName("LeafContract") is not null);
+
+        var changed = removeDocument
+            ? solution.RemoveDocument(leafDocumentId)
+            : solution.AddDocument(leafDocumentId, "LeafContract.cs", SourceText.From(declaration));
+        var document = changed.GetDocument(consumerId)!;
+        Assert.False(document.Project.TryGetCompilation(out _));
+        var selected = await document.FreezeAsync(default);
+        Assert.Same(document, selected);
+        var after = await selected.Project.Solution.GetProject(leafId)!.GetCompilationAsync();
+
+        Assert.Equal(!removeDocument, after!.GetTypeByMetadataName("LeafContract") is not null);
+    }
+
+    private static SourceText GeneratorConfiguration(string member) =>
+        SourceText.From($"is_global = true\nbuild_property.GeneratedMember = {member}\n");
+
+    private sealed class ProductGeneratorReference(bool analyzerConfiguration) : AnalyzerReference
+    {
+        private readonly ImmutableArray<ISourceGenerator> _generators =
+            [new ProductGenerator(analyzerConfiguration).AsSourceGenerator()];
+        public override string? FullPath => null;
+        public override object Id => this;
+        public override ImmutableArray<DiagnosticAnalyzer> GetAnalyzers(string language) => [];
+        public override ImmutableArray<DiagnosticAnalyzer> GetAnalyzersForAllLanguages() => [];
+        public override ImmutableArray<ISourceGenerator> GetGenerators(string language) => _generators;
+        public override ImmutableArray<ISourceGenerator> GetGeneratorsForAllLanguages() => _generators;
+    }
+
+    private sealed class ProductGenerator(bool analyzerConfiguration) : IIncrementalGenerator
+    {
+        public void Initialize(IncrementalGeneratorInitializationContext context)
+        {
+            if (analyzerConfiguration)
+            {
+                var member = context.AnalyzerConfigOptionsProvider.Select(static (options, _) =>
+                    options.GlobalOptions.TryGetValue("build_property.GeneratedMember", out var value) ? value : "MissingConfiguration");
+                context.RegisterSourceOutput(member, static (output, name) => AddProduct(output, name));
+            }
+            else
+            {
+                var member = context.AdditionalTextsProvider.Select(static (text, ct) => text.GetText(ct)!.ToString());
+                context.RegisterSourceOutput(member, static (output, name) => AddProduct(output, name));
+            }
+        }
+
+        private static void AddProduct(SourceProductionContext output, string member) =>
+            output.AddSource("Product.g.cs", $"public class Product {{ public int {member} {{ get; set; }} }}");
     }
 
     private static (Solution Solution, DocumentId Model, DocumentId Consumer) CreateSolution(

@@ -2610,9 +2610,33 @@ interface StructuredVariable {
     value: string;
     type: string;
     variablesReference: number;
+    evaluateName?: string;
     namedChildCount: number;
     indexedChildCount: number;
     evaluable: boolean;
+    /** What the row is — "property", "field", "static", "raw", ... — when the backend says. */
+    kind?: string;
+}
+
+/**
+ * The DAP presentation hint for a row, mirroring DapServer.PresentationHint: VS Code draws a
+ * property, a field and a virtual node ("Raw View", "Static members") with different glyphs,
+ * and greys out what cannot be edited.
+ */
+function presentationHintFor(v: StructuredVariable): { kind: string; attributes?: string[] } | undefined {
+    if (!v.kind) { return undefined; }
+    let kind: string | undefined;
+    switch (v.kind) {
+        case 'property': case 'proxy': kind = 'property'; break;
+        case 'field': case 'local': case 'arg': case 'element': case 'static': case 'constant': case 'exception': kind = 'data'; break;
+        case 'raw': case 'results': case 'statics': case 'nonpublic': case 'diagnostic': case 'return': kind = 'virtual'; break;
+        default: return undefined;
+    }
+    const attributes: string[] = [];
+    if (v.kind === 'static') { attributes.push('static'); }
+    if (v.kind === 'constant') { attributes.push('constant'); }
+    if (!v.evaluable && ['property', 'field', 'static', 'constant', 'proxy'].includes(v.kind)) { attributes.push('readOnly'); }
+    return attributes.length > 0 ? { kind, attributes } : { kind };
 }
 
 function parseJson<T>(text: string): T | undefined {
@@ -2634,6 +2658,18 @@ class AiDebugAdapter implements vscode.DebugAdapter {
     // cannot tell two stops on the same line apart, and a chat-issued step lands on a new stop
     // faster than the poll can see the running state in between.
     private lastStopSeq = 0;
+    private readonly scopeFrames = new Map<number, number>();
+    private nextScope = 0x7fffffff;
+    private scopeFrame(reference: number): number | undefined {
+        return reference >= SCOPE_BASE && reference < SCOPE_BASE + SCOPE_RANGE
+            ? reference - SCOPE_BASE : this.scopeFrames.get(reference);
+    }
+    private scopeFor(frame: number): number {
+        if (frame >= 0 && frame < SCOPE_RANGE) return SCOPE_BASE + frame;
+        const reference = --this.nextScope;
+        this.scopeFrames.set(reference, frame);
+        return reference;
+    }
     private pollTimer: NodeJS.Timeout | undefined;
     private disposed = false;
 
@@ -2665,6 +2701,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
     }
 
     private event(event: string, body?: unknown): void {
+        if (event === 'continued' || event === 'stopped' || event === 'terminated') this.scopeFrames.clear();
         this.send({ type: 'event', event, body });
     }
 
@@ -2681,9 +2718,12 @@ class AiDebugAdapter implements vscode.DebugAdapter {
 
     /// Runs a command whose result is a JSON payload, returning undefined when it failed or
     /// came back as something other than JSON.
-    private async structured<T>(action: string, extra?: Record<string, unknown>): Promise<T | undefined> {
+    private async structured<T>(action: string, extra?: Record<string, unknown>, required = false): Promise<T | undefined> {
         const result = await this.command(action, extra);
-        return result.ok ? parseJson<T>(result.result) : undefined;
+        if (!result.ok && required) throw new Error(result.result);
+        const value = result.ok ? parseJson<T>(result.result) : undefined;
+        if (required && value === undefined) throw new Error('The debugger returned an invalid inspection response.');
+        return value;
     }
 
     private async currentSession(): Promise<DebugSessionInfo | undefined> {
@@ -2724,7 +2764,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                     // All three are emulated server-side; neither engine implements them.
                     supportsHitConditionalBreakpoints: true,
                     supportsLogPoints: true,
-                    supportsDataBreakpoints: true,
+                    supportsDataBreakpoints: false,
                     supportsExceptionInfoRequest: true,
                     supportsExceptionFilterOptions: true,
                     exceptionBreakpointFilters: [
@@ -2784,7 +2824,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
             }
 
             case 'stackTrace': {
-                const frames = await this.structured<StructuredFrame[]>('frames');
+                const frames = await this.structured<StructuredFrame[]>('frames', { threadId: request.arguments?.threadId ?? 0 });
                 if (frames?.length) {
                     this.respond(request, {
                         stackFrames: frames.map((f) => ({
@@ -2829,7 +2869,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.respond(request, {
                     scopes: [{
                         name: 'Locals',
-                        variablesReference: SCOPE_BASE + (request.arguments?.frameId ?? 0),
+                        variablesReference: this.scopeFor(request.arguments?.frameId ?? 0),
                         expensive: false,
                     }],
                 });
@@ -2837,13 +2877,10 @@ class AiDebugAdapter implements vscode.DebugAdapter {
 
             case 'variables': {
                 const reference: number = request.arguments?.variablesReference ?? SCOPE_BASE;
-                const variables = reference >= SCOPE_BASE && reference < SCOPE_BASE + SCOPE_RANGE
-                    ? await this.structured<StructuredVariable[]>('variables', {
-                        frameId: reference - SCOPE_BASE,
-                    })
-                    : await this.structured<StructuredVariable[]>('children', {
-                        variablesReference: reference,
-                    });
+                const frame = this.scopeFrame(reference);
+                const variables = frame !== undefined
+                    ? await this.structured<StructuredVariable[]>('variables', { frameId: frame }, true)
+                    : await this.structured<StructuredVariable[]>('children', { variablesReference: reference }, true);
 
                 this.respond(request, {
                     variables: (variables ?? []).map((v) => ({
@@ -2853,17 +2890,21 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                         variablesReference: v.variablesReference,
                         namedVariables: v.namedChildCount || undefined,
                         indexedVariables: v.indexedChildCount || undefined,
-                        evaluateName: v.name,
+                        evaluateName: v.evaluateName,
+                        presentationHint: presentationHintFor(v),
                     })),
                 });
                 return;
             }
 
             case 'setVariable': {
+                const reference = request.arguments?.variablesReference ?? SCOPE_BASE;
+                const frame = this.scopeFrame(reference);
                 const result = await this.command('set_variable', {
+                    frameId: frame ?? 0,
+                    variablesReference: frame !== undefined ? 0 : reference,
                     expression: request.arguments?.name,
                     value: request.arguments?.value,
-                    frameId: 0,
                 });
                 if (!result.ok) {
                     this.respond(request, undefined, false, result.result);
@@ -2938,11 +2979,18 @@ class AiDebugAdapter implements vscode.DebugAdapter {
             }
 
             case 'evaluate': {
-                const result = await this.command('evaluate', {
+                const result = await this.structured<{ ok: boolean; variable?: StructuredVariable; error: string }>('evaluate_variable', {
                     expression: request.arguments?.expression,
+                    frameId: request.arguments?.frameId ?? 0,
                 });
-                this.respond(request, { result: result.result, variablesReference: 0 }, result.ok,
-                    result.ok ? undefined : result.result);
+                const variable = result?.variable;
+                this.respond(request, variable ? {
+                    result: variable.value,
+                    type: variable.type || undefined,
+                    variablesReference: variable.variablesReference,
+                    presentationHint: presentationHintFor(variable),
+                } : undefined, result?.ok ?? false,
+                    result?.ok ? undefined : result?.error ?? 'Evaluation failed.');
                 return;
             }
 
@@ -2988,48 +3036,14 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 return;
             }
 
-            case 'dataBreakpointInfo': {
-                // The id has to survive a round trip through VSCode, so it carries the frame the
-                // name was read in rather than a handle the server would have to remember.
-                const name: string = request.arguments?.name ?? '';
-                const frameId: number = request.arguments?.frameId ?? 0;
-                this.respond(request, name.length === 0
-                    ? { dataId: null, description: 'Break on value change needs a named value.' }
-                    : {
-                        dataId: `${frameId}:${name}`,
-                        description: `${name} (break when the value changes)`,
-                        // A read leaves the value alone, so it cannot be seen by comparing one.
-                        accessTypes: ['write'],
-                        canPersist: false,
-                    });
+            case 'dataBreakpointInfo':
+                this.respond(request, { dataId: null, description: 'This backend does not implement native data breakpoints.' });
                 return;
-            }
-
-            case 'setDataBreakpoints': {
-                const wanted: { dataId: string; accessType?: string; condition?: string; hitCondition?: string }[] =
-                    request.arguments?.breakpoints ?? [];
-
-                const result = await this.command('set_data_breakpoints', {
-                    dataBreakpoints: wanted.map((bp) => ({
-                        dataId: bp.dataId,
-                        expression: bp.dataId.slice(bp.dataId.indexOf(':') + 1),
-                        accessType: bp.accessType ?? 'write',
-                        condition: bp.condition,
-                        hitCondition: bp.hitCondition,
-                    })),
-                });
-
-                const statuses = result.ok
-                    ? parseJson<{ verified: boolean; message: string }[]>(result.result) ?? []
-                    : [];
-                this.respond(request, {
-                    breakpoints: wanted.map((_, i) => ({
-                        verified: statuses[i]?.verified ?? false,
-                        message: statuses[i]?.message || undefined,
-                    })),
-                }, result.ok, result.ok ? undefined : result.result);
+            case 'setDataBreakpoints':
+                this.respond(request, { breakpoints: (request.arguments?.breakpoints ?? []).map(() => ({
+                    verified: false, message: 'Sampled watches cannot reliably detect every write.',
+                })) });
                 return;
-            }
 
             case 'pause': {
                 const result = await this.command('pause');

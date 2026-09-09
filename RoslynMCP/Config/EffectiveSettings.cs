@@ -107,7 +107,7 @@ public sealed record EffectiveSettings(
     /// Which engine debugs a CoreCLR target. Init-only for the same reason as
     /// <see cref="Resources"/>.
     /// </summary>
-    public CoreClrDebugEngine CoreClrEngine { get; init; } = CoreClrDebugEngine.NetCoreDbg;
+    public CoreClrDebugEngine CoreClrEngine { get; init; } = DebugEngineOptions.DefaultFor(OperatingSystem.IsWindows());
 
     public static EffectiveSettings Resolve(string[] args, RoslynSenseConfig? config, out List<string> warnings)
     {

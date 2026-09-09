@@ -109,6 +109,65 @@ public class TestingServicesTests
     }
 
     [Fact]
+    public void TrxParserUsesTestDefinitionsInsteadOfAmbiguousDisplayNames()
+    {
+        string trx = WriteTrx("""
+            <t:TestRun xmlns:t="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+              <t:Results>
+                <t:UnitTestResult testId="second" testName="Checks input" outcome="Failed" />
+                <t:UnitTestResult testId="first" testName="Checks input" outcome="Passed" />
+                <t:UnitTestResult testId="first" testName="Checks input (second row)" outcome="Failed" />
+              </t:Results>
+              <t:TestDefinitions>
+                <t:UnitTest id="first" name="Checks input">
+                  <t:TestMethod className="Tests.First, Tests, Version=1.0.0.0, Culture=neutral" name="ChecksInput" />
+                </t:UnitTest>
+                <t:UnitTest id="second" name="Checks input">
+                  <t:TestMethod className="Tests.Second" name="ChecksInput" />
+                </t:UnitTest>
+              </t:TestDefinitions>
+            </t:TestRun>
+            """);
+        try
+        {
+            var results = TrxParser.Parse(trx);
+
+            Assert.Equal(["Tests.Second.ChecksInput", "Tests.First.ChecksInput", "Tests.First.ChecksInput"],
+                results.Select(result => result.FullyQualifiedName));
+            Assert.Equal(["Failed", "Passed", "Failed"], results.Select(result => result.Outcome));
+        }
+        finally
+        {
+            File.Delete(trx);
+        }
+    }
+
+    [Fact]
+    public void TrxParserFallsBackToDisplayNameWhenTheDefinitionIsIncomplete()
+    {
+        string trx = WriteTrx("""
+            <TestRun>
+              <Results>
+                <UnitTestResult testId="incomplete" testName="Tests.Sample.Theory(value: 1)" outcome="Failed" />
+              </Results>
+              <TestDefinitions>
+                <UnitTest id="incomplete"><TestMethod className="Tests.Sample" /></UnitTest>
+              </TestDefinitions>
+            </TestRun>
+            """);
+        try
+        {
+            var result = Assert.Single(TrxParser.Parse(trx));
+            Assert.Equal("Tests.Sample.Theory", result.FullyQualifiedName);
+            Assert.True(result.Failed);
+        }
+        finally
+        {
+            File.Delete(trx);
+        }
+    }
+
+    [Fact]
     public void TrxParserStripsDataDrivenArgumentsFromTestNames()
     {
         // TRX reports theory cases as "Name(x: 1)"; results are matched to discovered tests by
@@ -134,7 +193,23 @@ public class TestingServicesTests
 
         string filter = TestRunService.BuildFilter(["N.C.A", "N.C.B", "N.C.A"])!;
 
-        Assert.Equal("FullyQualifiedName~N.C.A | FullyQualifiedName~N.C.B", filter);
+        Assert.Equal("FullyQualifiedName=N.C.A | FullyQualifiedName=N.C.B", filter);
+    }
+
+    [Fact]
+    public async Task FilterBuilderRunsOnlySelectedMethodsAndAllTheirTheoryRows()
+    {
+        const string fact = "DebugTestProject.FilterSelectionTests.ChoosesOne";
+        const string theory = "DebugTestProject.FilterSelectionTests.TheoryWithRows";
+        var outcome = await TestRunService.RunAsync(FixturePaths.DebugTestProjectFile,
+            TestRunService.BuildFilter([fact, theory]), build: false);
+
+        Assert.Null(outcome.Error);
+        Assert.Equal(0, outcome.ExitCode);
+        Assert.Equal(3, outcome.Results.Count);
+        Assert.Single(outcome.Results, result => result.FullyQualifiedName == fact);
+        Assert.Equal(2, outcome.Results.Count(result => result.FullyQualifiedName == theory));
+        Assert.All(outcome.Results, result => Assert.True(result.Passed));
     }
 
     [Fact]

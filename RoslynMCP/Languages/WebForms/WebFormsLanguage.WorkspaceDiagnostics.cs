@@ -1,4 +1,4 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using RoslynMCP.Languages.WebForms.Core;
@@ -61,7 +61,7 @@ internal sealed partial class WebFormsLanguage : ILanguageWorkspaceDiagnosticCon
                 continue;
             }
 
-            var items = await AspxLanguageHandler.DiagnosticsAsync(file, graph, ct);
+            var items = await AspxLanguageHandler.DiagnosticsAsync(file, graph, ct, project);
             reports.Add(new WorkspaceFullDocumentDiagnosticReport("full", uri, items)
             {
                 ResultId = resultId,

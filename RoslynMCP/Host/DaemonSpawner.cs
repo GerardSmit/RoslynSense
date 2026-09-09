@@ -94,7 +94,7 @@ internal static class DaemonSpawner
         }
     }
 
-    private static async Task<NamedPipeClientStream?> TryConnectAsync(string pipeName, CancellationToken ct)
+    internal static async Task<NamedPipeClientStream?> TryConnectAsync(string pipeName, CancellationToken ct)
     {
         var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         try

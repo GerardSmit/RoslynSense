@@ -3,7 +3,9 @@ using System.Text.Json.Serialization;
 namespace RoslynMCP.Lsp.Protocol;
 
 public sealed record HotReloadParams(
-    [property: JsonPropertyName("projectPath")] string ProjectPath);
+    [property: JsonPropertyName("projectPath")] string ProjectPath,
+    [property: JsonPropertyName("ownerId")] string? OwnerId = null,
+    [property: JsonPropertyName("ownerPid")] int? OwnerPid = null);
 
 public sealed record HotReloadDiagnosticDto(
     [property: JsonPropertyName("id")] string Id,

@@ -31,13 +31,34 @@ public static class TrxParser
         {
             var document = Parser.ParseText(File.ReadAllText(trxPath));
             var results = new List<TestResult>();
+            var namesById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            // testName is adapter-controlled display text (a short MSTest name, a theory's
+            // arguments, or a custom display name). The definition carries the method identity
+            // discovery uses, and testId associates it with the result regardless of ordering.
+            foreach (var definition in document.DescendantsByLocalName("UnitTest"))
+            {
+                var method = definition.GetElementByLocalName("TestMethod");
+                string? id = definition.GetAttributeValue("id");
+                string? className = method?.GetAttributeValue("className");
+                string? methodName = method?.GetAttributeValue("name");
+                if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(className)
+                    && !string.IsNullOrWhiteSpace(methodName))
+                {
+                    // Some adapters qualify the declaring type with its assembly identity.
+                    string typeName = className.Split(',')[0].Trim();
+                    namesById.TryAdd(id, $"{typeName}.{NormalizeTestName(methodName)}");
+                }
+            }
 
             foreach (var result in document.DescendantsByLocalName("UnitTestResult"))
             {
                 // A result with no name is the tail of a truncated file: the parse is error
                 // tolerant, so half of an element still comes back as an element, and what marks
                 // it as the fragment it is is having nothing in it.
-                if (ParseResult(result) is { FullyQualifiedName.Length: > 0 } parsed)
+                string? identity = result.GetAttributeValue("testId") is { } id
+                    && namesById.TryGetValue(id, out var name) ? name : null;
+                if (ParseResult(result, identity) is { FullyQualifiedName.Length: > 0 } parsed)
                     results.Add(parsed);
             }
 
@@ -69,13 +90,13 @@ public static class TrxParser
     /// written through a tool that binds it to a prefix instead says the same thing, and matching
     /// on the local name reads both.
     /// </remarks>
-    private static TestResult ParseResult(XmlElementBaseSyntax result)
+    private static TestResult ParseResult(XmlElementBaseSyntax result, string? identity)
     {
         var output = result.GetElementByLocalName("Output");
         var errorInfo = output?.GetElementByLocalName("ErrorInfo");
 
         return new TestResult(
-            FullyQualifiedName: NormalizeTestName(result.GetAttributeValue("testName") ?? ""),
+            FullyQualifiedName: identity ?? NormalizeTestName(result.GetAttributeValue("testName") ?? ""),
             Outcome: result.GetAttributeValue("outcome") ?? "None",
             DurationMs: ParseDuration(result.GetAttributeValue("duration")),
             ErrorMessage: errorInfo?.GetElementByLocalName("Message")?.Value.Trim(),

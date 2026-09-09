@@ -4,7 +4,8 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>
-/// The opt-in that sends a .NET target to the ICorDebug engine instead of netcoredbg.
+/// The choice of engine for a .NET target: the tool's own on Windows, netcoredbg elsewhere, and a
+/// setting or environment variable to send it the other way.
 /// </summary>
 /// <remarks>
 /// Resolution is tested through the seam that takes the environment and the platform as arguments,
@@ -21,10 +22,23 @@ public class DebugEngineOptionTests
     }
 
     [Fact]
-    public void WithNothingConfiguredTheEngineIsTheOneCoreClrAlwaysUsed()
+    public void WithNothingConfiguredTheEngineIsTheOneTheHostCanRun()
     {
-        // The whole point of an opt-in: a user who never heard of this keeps what they had.
-        var engine = Resolve(environment: null, configured: null, onWindows: true, out var warnings);
+        // The tool's own engine wherever it runs, because it is the one that can hot reload a
+        // debugged process; the external one where it cannot, without a word said about it.
+        var onWindows = Resolve(environment: null, configured: null, onWindows: true, out var warnings);
+        Assert.Equal(CoreClrDebugEngine.IcorDebug, onWindows);
+        Assert.Empty(warnings);
+
+        var elsewhere = Resolve(environment: null, configured: null, onWindows: false, out warnings);
+        Assert.Equal(CoreClrDebugEngine.NetCoreDbg, elsewhere);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void TheSettingCanSendAWindowsHostBackToTheExternalEngine()
+    {
+        var engine = Resolve(null, "netcoredbg", onWindows: true, out var warnings);
 
         Assert.Equal(CoreClrDebugEngine.NetCoreDbg, engine);
         Assert.Empty(warnings);
@@ -66,7 +80,7 @@ public class DebugEngineOptionTests
         // that refuses to start is a worse answer than one that starts on the default.
         var engine = Resolve(null, "vsdbg", onWindows: true, out var warnings);
 
-        Assert.Equal(CoreClrDebugEngine.NetCoreDbg, engine);
+        Assert.Equal(CoreClrDebugEngine.IcorDebug, engine);
         Assert.Contains(warnings, w => w.Contains("vsdbg") && w.Contains("debugger.coreClrEngine"));
     }
 
@@ -100,35 +114,28 @@ public class DebugEngineOptionTests
     }
 
     [Fact]
-    public async Task ADotNetTargetOnThisEngineDoesNotAlsoTakeDeltasThroughTheDebugger()
+    public async Task ThisEngineTakesDeltasForBothRuntimes()
     {
-        // Its in-process updater has already applied the same generation through the agent, and a
-        // generation applied twice fails the second time — after which every later edit diffs
-        // against one the debuggee never took. The refusal has to read as a skip to the fan-out,
-        // not as an error, or a working hot reload would start reporting failures.
-        using var backend = new RoslynMCP.Services.IcorDebugBackend(
-            RoslynMCP.Debugger.DebugRuntime.CoreClr);
+        // The debugger is the only way onto a .NET process while it is attached — the runtime
+        // refuses the in-process updater for as long as any debugger is — just as it is the only
+        // way onto the desktop runtime. So neither session may answer with the refusal the
+        // fan-out reads as a skip: that is reserved for a session whose debugger has no apply
+        // path at all, and a .NET session claiming it would have its edits silently dropped.
+        foreach (var runtime in new[]
+                 {
+                     RoslynMCP.Debugger.DebugRuntime.CoreClr,
+                     RoslynMCP.Debugger.DebugRuntime.NetFramework,
+                 })
+        {
+            using var backend = new RoslynMCP.Services.IcorDebugBackend(runtime);
+            Assert.True(backend.AppliesDeltas);
 
-        var (ok, error) = await backend.ApplyDeltaAsync("Sample", [1], [2], [3]);
-
-        Assert.False(ok);
-        Assert.Contains(
-            RoslynMCP.Services.IcorDebugBackend.NotADeltaTarget, error, StringComparison.OrdinalIgnoreCase);
-
-        // Both halves of the contract, not just the wording: the session that refuses says so, and
-        // the session that applies does not claim the refusal. Asserted against the same constant
-        // the fan-out matches on, so a reworded message cannot leave this green while every .NET
-        // hot reload starts reporting errors for modules it applied cleanly.
-        using var framework = new RoslynMCP.Services.IcorDebugBackend(
-            RoslynMCP.Debugger.DebugRuntime.NetFramework);
-        Assert.True(framework.AppliesDeltas);
-        Assert.False(backend.AppliesDeltas);
-
-        var (_, frameworkError) = await framework.ApplyDeltaAsync("Sample", [1], [2], [3]);
-        Assert.DoesNotContain(
-            RoslynMCP.Services.IcorDebugBackend.NotADeltaTarget,
-            frameworkError,
-            StringComparison.OrdinalIgnoreCase);
+            // Nothing is attached, so the apply fails — but as a session problem, not a refusal.
+            var (ok, error) = await backend.ApplyDeltaAsync("Sample", [1], [2], [3]);
+            Assert.False(ok);
+            Assert.DoesNotContain(
+                RoslynMCP.Services.IcorDebugBackend.NotADeltaTarget, error, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     [Theory]

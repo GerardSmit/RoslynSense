@@ -236,6 +236,10 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<string> StepOutAsync(CancellationToken cancellationToken = default) =>
         ResumeAsync(() => _inner.StepOutAsync(cancellationToken), cancellationToken);
 
+    public Task<(bool Ok, VariableInfo? Variable, string Error)> EvaluateVariableAsync(
+        string expression, int frameId, CancellationToken cancellationToken = default) =>
+        _inner.EvaluateVariableAsync(expression, frameId, cancellationToken);
+
     public Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default) =>
         _inner.EvaluateAsync(expression, cancellationToken);
 
@@ -268,6 +272,10 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
         int variablesReference, CancellationToken cancellationToken = default) =>
         _inner.GetVariableChildrenAsync(variablesReference, cancellationToken);
+
+    public Task<(bool Ok, string Value, string Error)> SetVariableChildAsync(
+        int parentReference, string name, string value, CancellationToken cancellationToken = default) =>
+        _inner.SetVariableChildAsync(parentReference, name, value, cancellationToken);
 
     public Task<(bool Ok, string Value, string Error)> SetVariableAsync(
         string name, string value, int frameId = 0, CancellationToken cancellationToken = default) =>

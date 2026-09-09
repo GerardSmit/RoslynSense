@@ -1,4 +1,4 @@
-﻿using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages;
@@ -79,10 +79,13 @@ internal static class CompletionHandler
         CompletionParams p, LspResolveCache cache, CancellationToken ct)
     {
         using var paused = ForegroundGate.PauseBackground();
+        var bufferGeneration = OpenDocumentStore.Generation;
         var timing = RunwayTrace.Begin("completion request");
         if (await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct) is not
             var (document, text, offset) || document is null)
             return new CompletionList(false, Array.Empty<CompletionItem>());
+        var generation = cache.Generation;
+        if (OpenDocumentStore.Generation != bufferGeneration) throw LspResolveCache.Expired("completion");
         timing?.Mark("resolve document");
 
         // A caret inside a string literal that Roslyn can tell holds another language — a route
@@ -97,7 +100,7 @@ internal static class CompletionHandler
 
         var result = await CompleteAsync(
             document, text, offset, p.Context, cache,
-            span => LspConverters.ToRange(text.Lines, span), ct);
+            span => LspConverters.ToRange(text.Lines, span), ct, generation);
         timing?.Mark("complete");
         return result;
     }
@@ -116,11 +119,12 @@ internal static class CompletionHandler
         LspCompletionContext? context,
         LspResolveCache cache,
         Func<TextSpan, Protocol.Range?> toRange,
-        CancellationToken ct)
+        CancellationToken ct, long? expectedGeneration = null)
     {
         // Projected C# completion can enter here directly. Pause startup's background index
         // sweep while the editor is waiting; this never puts completion itself behind a gate.
         using var paused = ForegroundGate.PauseBackground();
+        var generation = expectedGeneration ?? cache.Generation;
         var timing = RunwayTrace.Begin("completion semantics");
         document = await document.FreezeAsync(ct);
         timing?.Mark("select semantic snapshot");
@@ -213,7 +217,8 @@ internal static class CompletionHandler
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
         var cachedItems = ranked.Items.Select(r => r.Item).ToList();
-        long cacheId = cache.StoreCompletions(document, cachedItems);
+        long cacheId = cache.StoreCompletions(document, cachedItems, generation);
+        if (cacheId < 0) throw LspResolveCache.Expired("completion");
 
         // Every item in this list replaces the same span, so the range is the list's, not the
         // item's. A client that reads itemDefaults gets it once; the rest still get a full
@@ -274,7 +279,7 @@ internal static class CompletionHandler
     /// own fuzzy score is the same for every item and cannot re-order the list.
     /// </summary>
     /// <remarks>
-    /// VS Code sorts by <c>score → wordDistance → index-in-sortText-order</c>, and the score is
+    /// VS Code sorts by <c>score â†’ wordDistance â†’ index-in-sortText-order</c>, and the score is
     /// computed against filterText: leaving the plain name there lets the client's notion of a
     /// good match override the ranking computed here (a camel-hump hit scores below a literal
     /// prefix hit however relevant it is). Prepending the typed text equalises the score, which
@@ -306,9 +311,10 @@ internal static class CompletionHandler
         CompletionItem item, LspResolveCache cache, CancellationToken ct,
         LanguageSession? languages = null)
     {
-        if (item.Data is null || cache.GetCompletion(item.Data.CacheId, item.Data.Index) is not
+        if (item.Data is not { } data) return item;
+        if (cache.GetCompletion(data.CacheId, data.Index) is not
             var (document, roslynItem) || document is null)
-            return item;
+            throw LspResolveCache.Expired("completion");
 
         var service = CompletionService.GetService(document);
         if (service is null)
@@ -353,6 +359,8 @@ internal static class CompletionHandler
             item = item with { Documentation = new MarkupContent("markdown", markdown) };
         }
 
+        if (cache.GetCompletion(data.CacheId, data.Index) is null)
+            throw LspResolveCache.Expired("completion");
         return item;
     }
 

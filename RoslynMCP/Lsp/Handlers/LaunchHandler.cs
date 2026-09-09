@@ -12,9 +12,12 @@ namespace RoslynMCP.Lsp.Handlers;
 /// Everything the editor needs to launch and debug the user's own app: where the debug adapter
 /// is, what can be launched, and a build that reports structured errors.
 ///
-/// The adapter itself is netcoredbg in its DAP mode (<c>--interpreter=vscode</c>), so the
-/// editor talks to a real debugger directly and we contribute no adapter code — watch windows,
-/// conditional breakpoints, and setVariable all come from netcoredbg.
+/// The adapter is the server's own (<c>roslyn-sense --dap</c>, the ICorDebug engine) for .NET
+/// Framework and, on Windows, for .NET; elsewhere, or when <c>debugger.coreClrEngine</c> asks
+/// for it, it is netcoredbg in its DAP mode (<c>--interpreter=vscode</c>). Either way the editor
+/// talks to a real debugger directly — watch windows, conditional breakpoints, and setVariable
+/// come from the engine. Which one a target gets is reported per target so the client never reads
+/// the setting itself.
 /// </summary>
 internal static partial class LaunchHandler
 {

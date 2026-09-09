@@ -1931,11 +1931,11 @@
             "icordebug"
           ],
           "enumDescriptions": [
-            "The external debugger used for .NET so far. Runs on every platform.",
-            "The engine .NET Framework already uses. Windows only, and newer on this runtime."
+            "The external debugger. Runs on every platform, and is what macOS and Linux use. Cannot hot reload a process it is debugging.",
+            "The tool's own engine, the one .NET Framework already uses. The default on Windows; Windows only."
           ],
-          "default": "netcoredbg",
-          "markdownDescription": "Which engine debugs .NET (CoreCLR) targets. .NET Framework always uses `icordebug`, the only engine that can attach to it.\n\n`icordebug` additionally brings Just My Code applied by the runtime, breakpoints that bind against binaries built on another machine, method return values after a step, and stepping through decompiled code with no PDB. It runs on Windows only, and has far less mileage on .NET than on .NET Framework.\n\nTakes effect the next time debugging starts."
+          "default": "icordebug",
+          "markdownDescription": "Which engine debugs .NET (CoreCLR) targets. .NET Framework always uses `icordebug`, the only engine that can attach to it.\n\n`icordebug` is the engine that can hot reload a debugged process (the runtime refuses in-process updates while a debugger is attached, and `netcoredbg` has no way to apply one), and it brings Just My Code applied by the runtime, breakpoints that bind against binaries built on another machine, method return values after a step, and stepping through decompiled code with no PDB. It runs on Windows only; on macOS and Linux `netcoredbg` is used whatever this says.\n\nTakes effect the next time debugging starts."
         },
         "roslynSense.hotReload.applyOnSave": {
           "type": "boolean",

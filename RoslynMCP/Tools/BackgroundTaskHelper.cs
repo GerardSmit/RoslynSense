@@ -38,6 +38,10 @@ internal static class BackgroundTaskHelper
         string args;
         string description;
 
+        // On-disk casing, so the output matches a build started from anywhere else; see
+        // PathHelper.WithOnDiskCasing.
+        string buildPath = PathHelper.WithOnDiskCasing(resolvedPath);
+
         if (PathHelper.RequiresMsBuild(resolvedPath))
         {
             var msbuild = MsBuildLocator.FindMsBuild();
@@ -45,14 +49,14 @@ internal static class BackgroundTaskHelper
                 return "Error: This project requires MSBuild (legacy .NET Framework project) but " +
                        "MSBuild could not be found. Install Visual Studio or Build Tools for Visual Studio.";
             fileName = msbuild;
-            args = $"\"{resolvedPath}\" /p:Configuration={configuration} /nologo /v:minimal " +
+            args = $"\"{buildPath}\" /p:Configuration={configuration} /nologo /v:minimal " +
                    BuildProcessHelper.NoNodeReuseArg;
             description = $"msbuild {Path.GetFileName(resolvedPath)}";
         }
         else
         {
             fileName = "dotnet";
-            args = $"build \"{resolvedPath}\" --nologo";
+            args = $"build \"{buildPath}\" --nologo";
             if (!string.IsNullOrWhiteSpace(configuration))
                 args += $" -c {configuration}";
             description = $"dotnet build {Path.GetFileName(resolvedPath)}";
@@ -146,7 +150,7 @@ internal static class BackgroundTaskHelper
 
             if (build)
             {
-                var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
+                var buildArgs = $"\"{PathHelper.WithOnDiskCasing(csprojPath)}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
                 var (buildExitCode, buildOutput, buildErrors) = await RunProcessAsync(
                     msbuild, buildArgs, workingDirectory, Math.Max(60, timeoutSeconds / 2));
 

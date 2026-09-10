@@ -1901,6 +1901,11 @@
           "default": true,
           "description": "Add a 'Raw View' child whenever a proxy or a hidden member means the listed children are not the object's own fields."
         },
+        "roslynSense.debugger.enumerateResults": {
+          "type": "boolean",
+          "default": true,
+          "description": "List a lazy enumerable's elements (a LINQ query, an iterator method) when it is expanded, with the iterator's own state under 'Raw View'. Off shows the iterator's members and puts the elements behind a 'Results View', as Visual Studio does. Expanding runs the sequence either way."
+        },
         "roslynSense.debugger.maxChildren": {
           "type": "integer",
           "default": 100,

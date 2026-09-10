@@ -927,6 +927,14 @@ internal static class WorkspaceDiagnosticsHandler
     private static readonly ConcurrentDictionary<ProjectId, byte> s_refreshingWide = new();
 
     /// <summary>
+    /// One refresh per settled batch of background passes rather than one per changed document,
+    /// with an interim refresh every so often while a long batch is still running. A rebuild that
+    /// moves a large project's semantic version queues a pass for every closed file in it, and
+    /// refreshing per completion made every sweep start the next before the last had landed.
+    /// </summary>
+    private static readonly RefreshBatch s_backgroundBatch = new(TimeSpan.FromSeconds(15));
+
+    /// <summary>
     /// Brings a project's whole-compilation-only warnings up to date, off the request path.
     /// </summary>
     /// <remarks>
@@ -941,13 +949,14 @@ internal static class WorkspaceDiagnosticsHandler
         if (!s_refreshingWide.TryAdd(project.Id, 0))
             return;
 
+        s_backgroundBatch.Enter();
         _ = Task.Run(async () =>
         {
             using var operation = RoslynMCP.Services.Memory.HostMemoryTelemetry.Operation("workspace-diagnostics-background");
+            bool moved = false;
             try
             {
                 await s_recomputeSlots.WaitAsync();
-                bool moved;
                 try
                 {
                     moved = await ProjectWideDiagnosticCache.RefreshAsync(project, CancellationToken.None);
@@ -956,11 +965,6 @@ internal static class WorkspaceDiagnosticsHandler
                 {
                     s_recomputeSlots.Release();
                 }
-
-                // Only when the answer moved, or the refresh runs the sweep that starts the pass
-                // that asks for the refresh.
-                if (moved)
-                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "project-wide-pass-stored");
             }
             catch (Exception ex)
             {
@@ -974,6 +978,11 @@ internal static class WorkspaceDiagnosticsHandler
             finally
             {
                 s_refreshingWide.TryRemove(project.Id, out _);
+
+                // Only when the answer moved, or the refresh runs the sweep that starts the pass
+                // that asks for the refresh — and only once the batch it belongs to has settled.
+                if (s_backgroundBatch.Leave(moved))
+                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "project-wide-pass-stored");
             }
         });
     }
@@ -988,9 +997,11 @@ internal static class WorkspaceDiagnosticsHandler
         if (!s_recomputing.TryAdd(document.Id, 0))
             return;
 
+        s_backgroundBatch.Enter();
         _ = Task.Run(async () =>
         {
             using var operation = RoslynMCP.Services.Memory.HostMemoryTelemetry.Operation("workspace-diagnostics-background");
+            bool changed = false;
             try
             {
                 // Capped as well as deduplicated: the documents are distinct, so the guard above
@@ -1014,8 +1025,7 @@ internal static class WorkspaceDiagnosticsHandler
                 // lands here; refreshing unconditionally meant each of those completions asked the
                 // editor to re-pull, which ran another sweep, which missed again. Editing a
                 // signature never converged — the very symptom this was meant to remove.
-                if (!AnalyzerDiagnosticCache.SameFindings(before, after))
-                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "analyzer-recompute-stored");
+                changed = !AnalyzerDiagnosticCache.SameFindings(before, after);
             }
             catch (Exception ex)
             {
@@ -1028,6 +1038,12 @@ internal static class WorkspaceDiagnosticsHandler
             finally
             {
                 s_recomputing.TryRemove(document.Id, out _);
+
+                // And only once per settled batch, not per document: a rebuild of the analyzers
+                // queues one of these for every closed file in the solution, and refreshing as
+                // each landed ran the sweep hundreds of times over the same results.
+                if (s_backgroundBatch.Leave(changed))
+                    LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "analyzer-recompute-stored");
             }
         });
     }

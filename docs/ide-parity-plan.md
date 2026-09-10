@@ -1211,6 +1211,20 @@ Three pieces:
      a genuine debug-event stop — or at a stop whose thread is not in user code of the edited
      module's own app domain — is queued, reported as queued, and flushed at the next
      breakpoint, step or exception stop. The alternative to that queue is a dead process.
+
+     **A queue that waits only for the user's breakpoints is indistinguishable from doing
+     nothing.** The ordinary ASP.NET inner loop — edit, apply, refresh the page — has no
+     breakpoint in it, and an idle site never has a user-code thread stopped in it, so every
+     edit in that loop was queued and then sat there: the site kept serving the built code
+     until the process was restarted, while the editor had already reported the apply as done.
+     While a delta is queued the engine now arms its own breakpoints on the entry of every
+     method the edit changes, in every loaded instance of the assembly. Entering an edited
+     method is by definition a stop in that module's own user code, so the first call after the
+     edit is both the earliest safe moment and the one the user is already waiting on: the
+     engine applies there, disarms, and resumes without ever reporting a stop, and the frame
+     that triggered it is remapped onto the edited version like any other. The method tokens
+     come from the same symbol map that carries the compiler's line movements, which is why
+     that map is now sent even for an edit that moved no lines.
    - **`TrySetJITCompilerFlags(CORDEBUG_JIT_ENABLE_ENC)` had its result thrown away.** A module
      that fails to flag is not updatable, and `ApplyChanges` faults on it rather than failing, so
      the one signal that predicts a crash was being discarded. The HRESULT is now checked and an

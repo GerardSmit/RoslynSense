@@ -197,6 +197,25 @@ public sealed partial class DebugSession
             return children;
         }
 
+        // A lazy enumerable — a LINQ query, an iterator method — is its elements, which is what
+        // whoever expanded it came to see; a `Current` that has nothing in it yet and a `_source`
+        // are not. So the elements are listed here, the way Rider lists them, with the iterator's
+        // own state one click away under Raw View. The VS shape — the state inline and the
+        // elements behind a Results View — is the switch's other position, and the fallback when
+        // the sequence cannot be run. A user's own enumerable takes this route only when it has
+        // no public state of its own: a class that is nothing but a sequence is its elements, while
+        // one with a Count or a Name beside them keeps those inline, with the Results View beside
+        // them, since its author put them there to be seen.
+        if (!raw && _display.TypeProxy && _display.EnumerateResults &&
+            ImplementsEnumerable(value) && (IsAnonymousEnumerable(value) || HasNoPublicState(value)) &&
+            EnumerableItems(value, out _) is { } items)
+        {
+            children.AddRange(ChildrenOf(items, $"{basePath}.{ResultsMarker}"));
+            if (_display.RawView)
+                children.Add(RawViewRow(basePath));
+            return children;
+        }
+
         // VS folds a framework type's private state away and shows a user type's inline; the
         // split is Just My Code's, since that is what says whose code a type is.
         var visibility = !raw && _display.JustMyCode && IsFrameworkType(value)
@@ -387,6 +406,58 @@ public sealed partial class DebugSession
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Whether an enumerable's internals are nobody's business: a framework type (a LINQ
+    /// operator's iterator) or a compiler-generated one (an iterator method's state machine,
+    /// named <c>&lt;Method&gt;d__N</c>). A user's own collection class is neither, and its
+    /// fields are what its author expects to see when it is expanded.
+    /// </summary>
+    private bool IsAnonymousEnumerable(CorDebugValue value)
+    {
+        if (IsFrameworkType(value))
+            return true;
+        var name = TypeNameOf(value);
+        return name.Contains('<', StringComparison.Ordinal) && name.Contains(">d__", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Whether the value's type, base types included, declares no public instance field or
+    /// property beyond what enumerating requires — <c>Current</c> is the one an enumerator has to
+    /// have. Such a type has nothing to show but its elements.
+    /// </summary>
+    private static bool HasNoPublicState(CorDebugValue value)
+    {
+        foreach (var (_, metadata, typeDef) in TypeChain(value))
+        {
+            foreach (var field in Fields(metadata, typeDef))
+            {
+                var props = Safe<GetFieldPropsResult?>(() => metadata.GetFieldProps(field));
+                if (props is null)
+                    continue;
+                var attributes = props.Value.pdwAttr;
+                if (attributes.HasFlag(CorFieldAttr.fdStatic) || attributes.HasFlag(CorFieldAttr.fdLiteral))
+                    continue;
+                if ((attributes & CorFieldAttr.fdFieldAccessMask) == CorFieldAttr.fdPublic)
+                    return false;
+            }
+
+            foreach (var property in Properties(metadata, typeDef))
+            {
+                var props = Safe<GetPropertyPropsResult?>(() => metadata.GetPropertyProps(property));
+                if (props is null || props.Value.pmdGetter.Rid == 0)
+                    continue;
+                var name = props.Value.szProperty;
+                if (string.IsNullOrEmpty(name) || name == "Current" || name.Contains('.') || IsIndexer(props.Value))
+                    continue;
+                if (Safe(() => metadata.GetMethodProps(props.Value.pmdGetter).pdwAttr.HasFlag(CorMethodAttr.mdStatic)) == true)
+                    continue;
+                if (IsPublicMethod(metadata, props.Value.pmdGetter))
+                    return false;
+            }
+        }
+        return true;
     }
 
     private static IEnumerable<mdInterfaceImpl> InterfaceImpls(MetaDataImport metadata, mdTypeDef typeDef)

@@ -37,6 +37,7 @@ import { createRedactingTraceChannel, wireNuGetCredentials } from './nuget/crede
 import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
+import { restartDelayMs, waitToRestart } from './serverRestart';
 import { bindNestedCodeActions, registerNestedCodeActions } from './nestedCodeActions';
 import { preResolveVisibleLenses } from './visibleCodeLenses';
 import { registerOnAutoInsert } from './autoInsert';
@@ -528,6 +529,7 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
             browsable: config.get('debugger.browsable'),
             justMyCode: config.get('debugger.justMyCode'),
             rawView: config.get('debugger.rawView'),
+            enumerateResults: config.get('debugger.enumerateResults'),
             maxChildren: config.get('debugger.maxChildren'),
             symbolInclude: config.get('debugger.symbolInclude'),
             symbolExclude: config.get('debugger.symbolExclude'),
@@ -940,7 +942,7 @@ async function startClient(
         },
         errorHandler: {
             error: () => ({ action: ErrorAction.Continue }),
-            closed: () => {
+            closed: async () => {
                 const now = Date.now();
                 restartTimes.push(now);
                 while (restartTimes.length > 0 && now - restartTimes[0] > 3 * 60_000) {
@@ -956,6 +958,27 @@ async function startClient(
                         };
                     }
                     return { action: CloseAction.DoNotRestart };
+                }
+
+                // The first exit restarts at once; repeated ones back off, and none restarts
+                // while the server binary is missing — a reinstall of the tool removes it and
+                // writes it back, and restarting into that gap spawned a proxy, then a daemon,
+                // against a half-replaced store, over and over. See serverRestart.ts.
+                const delayMs = restartDelayMs(restartTimes.length);
+                if (delayMs > 0) {
+                    if (statusItem && client === connection) {
+                        statusItem.busy = true;
+                        statusItem.severity = vscode.LanguageStatusSeverity.Warning;
+                        statusItem.text = `RoslynSense: restarting in ${Math.round(delayMs / 1000)}s`;
+                    }
+                    await waitToRestart(serverPath, delayMs);
+
+                    // Stopped or replaced while waiting: the library does not look again after
+                    // the handler returns, so a Restart here would revive a client the user
+                    // shut down.
+                    if (![...clientsBySolution.values()].includes(connection)) {
+                        return { action: CloseAction.DoNotRestart, handled: true };
+                    }
                 }
                 return { action: CloseAction.Restart };
             },

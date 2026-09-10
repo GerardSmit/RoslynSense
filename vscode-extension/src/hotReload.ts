@@ -349,9 +349,21 @@ async function apply(
     publish(diagnostics, result);
 
     if (result.ok) {
+        // "Queued" means the delta exists but the running process has not taken it: it was idle,
+        // with no thread of the user's stopped in the edited module, so the engine holds the edit
+        // until the app next runs that code. Reported like an apply — a four-second status bar
+        // message and the button going dark — it read as "hot reload did nothing", because the
+        // page still served the old code and nothing on screen said why.
+        const queued = result.appliedTo.some((target) => target.endsWith('(queued)'));
+
         // An edit arriving while the request was running still needs its own apply.
-        if (version === editVersion) {
+        if (version === editVersion && !queued) {
             setPending(false);
+        }
+
+        if (queued) {
+            void vscode.window.showWarningMessage(result.summary);
+            return;
         }
 
         // A silent success on every save would be noise; an explicit invocation deserves an answer.

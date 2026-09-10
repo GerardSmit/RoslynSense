@@ -381,7 +381,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
     }
 
     [RequiresX86WorkerFact]
-    public async Task WhenALazyEnumerableIsExpandedThenAResultsViewIsOffered()
+    public async Task WhenALazyEnumerableIsExpandedThenItsElementsAreListed()
     {
         var locals = await fixture.LocalsAsync();
         var filtered = Assert.Single(locals, v => v.Name == "filtered");
@@ -389,23 +389,36 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
 
         var children = await fixture.ExpandAsync(filtered.VariablesReference);
 
-        var results = Assert.Single(children, c => c.Name == "Results View");
-        Assert.False(string.IsNullOrEmpty(results.VariablesReference), "the Results View is not expandable");
+        // Where(x => x < 9) over { 7, 8, 9 } produces 7 and 8, run when the value is expanded —
+        // the elements are the listing, and the iterator's own state is under Raw View.
+        Assert.Equal(["[0]", "[1]", "Raw View"], children.Select(c => c.Name));
+        Assert.Equal("7", children[0].Value);
+        Assert.Equal("8", children[1].Value);
     }
 
     [RequiresX86WorkerFact]
-    public async Task WhenTheResultsViewIsExpandedThenTheElementsAreEnumerated()
+    public async Task WhenResultsAreNotEnumeratedThenTheyAreBehindAResultsView()
     {
-        var locals = await fixture.LocalsAsync();
-        var filtered = Assert.Single(locals, v => v.Name == "filtered");
-        var children = await fixture.ExpandAsync(filtered.VariablesReference);
-        var results = Assert.Single(children, c => c.Name == "Results View");
+        try
+        {
+            fixture.SetDisplayOptions(new DebugDisplayOptions { EnumerateResults = false });
+            var locals = await fixture.LocalsAsync();
+            var filtered = Assert.Single(locals, v => v.Name == "filtered");
+            var children = await fixture.ExpandAsync(filtered.VariablesReference);
 
-        var elements = await fixture.ExpandAsync(results.VariablesReference);
+            // The VS shape: the iterator's members, and the elements one expansion further.
+            Assert.DoesNotContain(children, c => c.Name == "[0]");
+            var results = Assert.Single(children, c => c.Name == "Results View");
+            Assert.False(string.IsNullOrEmpty(results.VariablesReference), "the Results View is not expandable");
 
-        // Where(x => x < 9) over { 7, 8, 9 } produces 7 and 8, materialized on demand.
-        Assert.Equal("7", Assert.Single(elements, e => e.Name == "[0]").Value);
-        Assert.Equal("8", Assert.Single(elements, e => e.Name == "[1]").Value);
+            var elements = await fixture.ExpandAsync(results.VariablesReference);
+            Assert.Equal("7", Assert.Single(elements, e => e.Name == "[0]").Value);
+            Assert.Equal("8", Assert.Single(elements, e => e.Name == "[1]").Value);
+        }
+        finally
+        {
+            fixture.RestoreDisplayOptions();
+        }
     }
 
     [RequiresX86WorkerFact]
@@ -783,7 +796,10 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         public Task<List<DebugVariable>> ExpandAsync(string path) => Stopped().Engine.ExpandAsync(0, path);
 
         public void SetMaxChildren(int maxChildren) =>
-            Stopped().Engine.SetDisplayOptions(new DebugDisplayOptions { MaxChildren = maxChildren });
+            SetDisplayOptions(new DebugDisplayOptions { MaxChildren = maxChildren });
+
+        public void SetDisplayOptions(DebugDisplayOptions options) =>
+            Stopped().Engine.SetDisplayOptions(options);
 
         public void RestoreDisplayOptions()
         {

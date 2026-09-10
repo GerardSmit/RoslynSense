@@ -8,7 +8,7 @@ emission or mocked acknowledgement alone does not prove that the edit reached th
 | --- | --- | --- |
 | `CoreClrHotReloadTests` | Startup hook and `MetadataUpdater.ApplyUpdate`, using an apphost or `dotnet app.dll`; the ICorDebug engine's `ApplyChanges` for a launched and for an attached debuggee; unsaved full-text and ranged edits through the LSP handlers | .NET 10 SDK; netcoredbg for the attached-debugger rejection test |
 | `FrameworkHotReloadTests` | Desktop CLR Edit and Continue through x86 and x64 debug workers; portable and Windows PDBs; SDK and classic non-SDK projects | Windows, Visual Studio or Build Tools MSBuild, .NET Framework 4.8 runtime/reference assemblies, both published workers, x86 and x64 .NET 10 runtimes |
-| `IisExpressHotReloadTests` | 32-bit IIS Express with shadow-copied assemblies and secondary AppDomains; running, paused, and queued idle-site edits | Framework prerequisites plus 32-bit IIS Express |
+| `IisExpressHotReloadTests` | 32-bit IIS Express with shadow-copied assemblies and secondary AppDomains; running, paused, and queued idle-site edits, including one with no breakpoint anywhere in the session | Framework prerequisites plus 32-bit IIS Express |
 
 CoreCLR updates reach a process either through its in-process `MetadataUpdater`, when no
 debugger is attached, or through the debugger's `ICorDebugModule2::ApplyChanges` when the
@@ -25,6 +25,26 @@ the edited method both already compiled and not yet compiled at attach time (the
 regressed, because the engine remapped every call back into the old code). A process started
 without the variable reports that hot reload needs it. .NET Framework applies always go through
 the debugger and cover breakpoint and stepping behavior after an edit.
+
+An idle ASP.NET site is the one target that cannot take an edit when it arrives: no user-code
+thread is stopped in it, so `ApplyChanges` would fault and the delta is queued instead. What
+lands it is the site's next request, through breakpoints the engine arms on the edited methods
+themselves and removes again once the edit is in.
+`AQueuedEditLandsOnTheNextRequestWithoutABreakpoint` is the case that holds this honest: it
+sets no breakpoint at all, because a test that sets one proves only that the queue works for a
+loop the user is not in. Without the arming it fails with the site still answering from the
+built code, which is exactly how the bug was reported.
+
+`AQueuedEditLandsPromptlyWithABreakpointInsideTheEditedMethod` covers what those invisible stops
+cost. It sets its breakpoint inside the edited method *before* applying, unlike the cases above,
+so the user's binding names a version `ApplyChanges` replaces while the engine's flush breakpoint
+sits at that same method's entry, and it holds the clock as well as the outcome: the edit has to
+land inside a budget, because the failure it came from was reported as a site that stopped
+answering rather than as an apply that failed.
+
+An engine that goes wrong now leaves something to read: every notice except the debuggee's own
+console output is appended to `%TEMP%oslyn-sense\debug\<owner-pid>.log`, beside the session's
+state file, which is where to look first when an apply reports success and the app disagrees.
 
 `UnsavedEditorChangesReachTheRunningProcessThroughTheLspHandler` calls the actual LSP open,
 change, apply, and stop handlers against a live CoreCLR process. It verifies consecutive

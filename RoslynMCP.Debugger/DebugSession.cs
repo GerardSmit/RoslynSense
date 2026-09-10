@@ -145,6 +145,11 @@ public sealed partial class DebugSession : IDebugSession
     /// <summary>Whether the current stop is an exception stop — the only time the frame list
     /// carries a <c>$exception</c> row, exactly as VS's Locals window does.</summary>
     private volatile bool _stoppedOnException;
+
+    /// <summary>A Break All that suspended the debuggee without finding a managed frame to adopt.
+    /// The stop is real and still owes the runtime a <c>Continue</c>, but there is no thread for
+    /// <see cref="_stoppedThread"/> to hold, so it is the one stop that flag cannot record.</summary>
+    private volatile bool _suspendedWithoutThread;
     /// Module that produced each bound breakpoint key, so an unload (app-domain recycle) can
     /// return those breakpoints to pending and let the next LoadModule rebind them.
     private readonly ConcurrentDictionary<string, string> _boundModule = new(StringComparer.OrdinalIgnoreCase);
@@ -265,7 +270,9 @@ public sealed partial class DebugSession : IDebugSession
         // responding in the middle of rather than that something did.
         _watchdog.Starting(what);
 
-        if (_stoppedThread is not null)
+        // Including the Break All that adopted no thread: the debuggee is stopped either way, and
+        // stopping it again only unbalances the count.
+        if (_stoppedThread is not null || _suspendedWithoutThread)
         {
             work();
             return;
@@ -589,6 +596,21 @@ public sealed partial class DebugSession : IDebugSession
 
     public void Continue() => Enqueue(() =>
     {
+        // Continue is counted exactly as Stop is, so one issued against a debuggee that is not
+        // stopped spends a stop the runtime has not delivered yet: the next real stop is resumed
+        // the instant it arrives, and from there the session cannot be stopped again. While every
+        // stop was the user's own this could not happen, because a client only offers Continue
+        // once it has been told about one. The engine takes stops of its own now — the hot reload
+        // flush enters and leaves one without ever reporting it — and Continue pressed against a
+        // request that looks hung lands in exactly that window.
+        if (_stoppedThread is null && !_suspendedWithoutThread)
+        {
+            Emit(
+                DebugEventKind.Diagnostic,
+                "continue: the debuggee is already running; nothing to resume", string.Empty, 0);
+            return;
+        }
+        _suspendedWithoutThread = false;
         _stoppedOnException = false;
         _stoppedThread = null;
         // The value the last step captured belongs to that step. Once the target runs on, the next
@@ -649,6 +671,7 @@ public sealed partial class DebugSession : IDebugSession
 
         var thread = FindThreadForBreak();
         _stoppedThread = thread;
+        _suspendedWithoutThread = thread is null;
 
         if (thread is null)
         {
@@ -1609,9 +1632,12 @@ public sealed partial class DebugSession : IDebugSession
         // A method declared on a generic type must be called with the instantiation's type
         // arguments — plain CallFunction makes the runtime throw TypeLoadException ("used with
         // the wrong number of generic arguments") inside the evaluation, which is how every
-        // List<T>.Count on .NET Framework used to come back as an eval fault.
+        // List<T>.Count on .NET Framework used to come back as an eval fault. And they have to
+        // be the declaring type's arguments, not the instance's: a method inherited from a
+        // generic base takes the base's, which differ in number as soon as the derived type adds
+        // a parameter of its own.
         var typeArguments = DeclaringTypeIsGeneric(function) && args.Length > 0
-            ? TypeArgumentsOf(args[0])
+            ? DeclaringTypeArgumentsOf(args[0], function) ?? TypeArgumentsOf(args[0])
             : null;
 
         return RunEval(
@@ -1624,6 +1650,43 @@ public sealed partial class DebugSession : IDebugSession
                     eval.CallFunction(function.Raw, raw.Length, raw);
             },
             out error);
+    }
+
+    /// <summary>
+    /// The type arguments of the instantiation of <paramref name="function"/>'s declaring type
+    /// that <paramref name="instance"/> is: the instance's exact type is walked up its base chain
+    /// to the class that declares the method, and that level's arguments are the answer.
+    /// </summary>
+    /// <remarks>
+    /// The instance's own arguments are the wrong ones whenever the method was inherited from a
+    /// generic base. A LINQ iterator's <c>Current</c> is declared on <c>Iterator&lt;TResult&gt;</c>,
+    /// one argument; calling it with the two of <c>WhereSelectEnumerableIterator&lt;TSource,
+    /// TResult&gt;</c> faulted the evaluation with a <c>TargetParameterCountException</c>, which
+    /// is what every LINQ query showed in place of its current element.
+    /// </remarks>
+    private static ICorDebugType[]? DeclaringTypeArgumentsOf(CorDebugValue instance, CorDebugFunction function)
+    {
+        var declaring = Safe(() => function.Class);
+        if (declaring is null)
+            return null;
+        var declaringToken = Safe(() => (int)declaring.Token);
+        var declaringModule = Safe(() => declaring.Module.Name) ?? string.Empty;
+
+        var type = Safe(() => Dereference(instance) is CorDebugObjectValue obj ? obj.ExactType : null);
+        for (var depth = 0; type is not null && depth < MaxTypeDepth; depth++)
+        {
+            var current = type;
+            var cls = Safe(() => current.Class);
+            if (cls is not null &&
+                Safe(() => (int)cls.Token) == declaringToken &&
+                string.Equals(Safe(() => cls.Module.Name), declaringModule, StringComparison.OrdinalIgnoreCase))
+            {
+                var parameters = Safe(() => current.TypeParameters);
+                return parameters is { Length: > 0 } ? parameters.Select(p => p.Raw).ToArray() : null;
+            }
+            type = Safe(() => current.Base);
+        }
+        return null;
     }
 
     private static bool DeclaringTypeIsGeneric(CorDebugFunction function) =>
@@ -2227,6 +2290,7 @@ public sealed partial class DebugSession : IDebugSession
                         bound.DeactivateAll();
                     _bound.Clear();
                     _boundSpecs.Clear();
+                    DisarmEncFlushBreakpoints();
                     DeactivateSteppers();
                     lock (_specLock) _specs.Clear();
 
@@ -2389,6 +2453,7 @@ public sealed partial class DebugSession : IDebugSession
                 bound.DeactivateAll();
             _bound.Clear();
             _boundSpecs.Clear();
+            DisarmEncFlushBreakpoints();
             DeactivateSteppers();
             // The handle keeping the last step's return value readable is a strong handle in the
             // debuggee, and the debuggee survives this. Left behind it pins that object and
@@ -2574,6 +2639,53 @@ public sealed partial class DebugSession : IDebugSession
                     Emit(DebugEventKind.Diagnostic,
                         "a breakpoint event arrived after its thread had moved on; resuming", string.Empty, 0);
                     try { e.Controller.Continue(false); } catch { }
+                    return;
+                }
+                // The engine's own breakpoint, armed at the entry of a method a queued edit
+                // changes. The app was idle when the edit arrived, so this call is the first
+                // moment it can be applied safely: the thread is in the edited module's own user
+                // code, which is the stop shape ApplyChanges survives. Not a stop the user asked
+                // for — apply and resume without ever reporting it. Resumed from the session
+                // thread rather than here, because the apply has to run there and the process
+                // must stay stopped until it has.
+                if (IsEncFlushBreakpoint(e.Breakpoint))
+                {
+                    Enqueue(() =>
+                    {
+                        _stoppedThread = e.Thread;
+                        try
+                        {
+                            FlushPendingDeltas(atFlushBreakpoint: true);
+                            // Still waiting means the flush declined this stop. Keeping them armed
+                            // for the next call is right up to a point: an edited method the app
+                            // calls in a loop would take this stop on every call, and a debuggee
+                            // that spends a whole request suspended is one the user watches hang.
+                            if (_pendingDeltas.Count == 0 && _replayDeltas.IsEmpty)
+                            {
+                                _encFlushDeclines = 0;
+                                DisarmEncFlushBreakpoints();
+                            }
+                            else if (++_encFlushDeclines >= MaxEncFlushDeclines)
+                            {
+                                DisarmEncFlushBreakpoints();
+                                Emit(DebugEventKind.Diagnostic,
+                                    "hot reload: the queued edit could not be applied where the " +
+                                    "app entered the edited code, so it goes back to waiting for " +
+                                    "a breakpoint hit in the app's own code", string.Empty, 0);
+                            }
+                            else
+                            {
+                                ArmEncFlushBreakpoints();
+                            }
+                        }
+                        finally
+                        {
+                            // The user's own stop state is untouched by this: there was none, and
+                            // any stepper still in flight belongs to a step that is still running.
+                            _stoppedThread = null;
+                            try { _process?.Continue(false); } catch { }
+                        }
+                    });
                     return;
                 }
                 // Function evaluation needs this callback to return before its completion
@@ -3511,6 +3623,11 @@ public sealed partial class DebugSession : IDebugSession
         if (assemblyName.Length > 0)
             _encModules.TryRemove(assemblyName, out _);
 
+        // The flush breakpoints armed in this image went with it. Forgotten rather than
+        // deactivated — there is nothing left to deactivate them in — and the replay queued by
+        // the next load arms its own in whatever image replaces this one.
+        ForgetEncFlushBreakpoints(instanceKey);
+
         // The symbols went with it. Kept, they hold the PDB open for the rest of the session —
         // one handle per app-domain recycle, which a site rebuilt all afternoon does often — and
         // a module that reloads from the same path would be read through its predecessor's PDB.
@@ -3594,6 +3711,51 @@ public sealed partial class DebugSession : IDebugSession
 
     private long _deltaSequence;
 
+    /// <summary>
+    /// Breakpoints the engine arms at the entry of every method a queued edit changes, so the
+    /// app reaches a stop the edit can be applied from without the user setting one.
+    /// </summary>
+    /// <remarks>
+    /// The queue exists because <c>ApplyChanges</c> faults unless a thread in the edited module's
+    /// app domain is stopped in user code, which an idle server never is. Waiting for the user's
+    /// next breakpoint made that queue indistinguishable from doing nothing: the ordinary web
+    /// inner loop — edit, apply, refresh the page — has no breakpoint in it at all, so the edit
+    /// sat in the queue until the process was restarted. Entering an edited method is by
+    /// definition a stop in that module's own user code, so the first call after the edit is
+    /// both the earliest safe moment and the one the user is already waiting on.
+    /// </remarks>
+    private readonly List<EncFlushBreakpoint> _encFlushBreakpoints = [];
+
+    /// <summary>Guards <see cref="_encFlushBreakpoints"/>: armed and disarmed on the session
+    /// thread, matched against on the runtime's callback thread.</summary>
+    private readonly Lock _encFlushLock = new();
+
+    /// <summary>How many flush stops in a row have failed to place the edit.</summary>
+    private int _encFlushDeclines;
+
+    /// <summary>
+    /// How many refusals the flush breakpoints get before they come back out.
+    /// </summary>
+    /// <remarks>
+    /// A flush stop that cannot apply the edit is not free: the debuggee is suspended for as long
+    /// as the engine takes to decide, and an edited method the app calls in a loop pays that on
+    /// every call. A handful of requests spent finding out is diagnosis; a whole request spent
+    /// stopping and resuming is a hang, and it is the user's request. Past this the edit goes back
+    /// to waiting for a stop in the app's own code, which is where it waited before any of this.
+    /// </remarks>
+    private const int MaxEncFlushDeclines = 4;
+
+    /// <summary>One armed entry point of an edited method, in one module instance.</summary>
+    private sealed record EncFlushBreakpoint(
+        string InstanceKey, int Token, CorDebugFunctionBreakpoint Breakpoint)
+    {
+        /// <summary>The deactivate did not take, so this is still armed in the debuggee and the
+        /// engine can no longer turn it off. Remembered so its hits are still recognised and
+        /// resumed silently, but no longer counted as covering its method: a later edit to the
+        /// same method has to be free to arm one it can actually control.</summary>
+        public bool Abandoned { get; init; }
+    }
+
     /// Apply one EnC metadata+IL delta to a live module (by simple assembly name), marshalled
     /// onto the session thread. Applied immediately from a safe break state, queued otherwise.
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(
@@ -3631,9 +3793,17 @@ public sealed partial class DebugSession : IDebugSession
         {
             _pendingDeltas.Enqueue(new PendingDelta(
                 NextDeltaSequence(), assemblyName, metadata, il, pdb, symbolMap));
-            return (true, DeltaQueuedPrefix +
-                "no user code is stopped in the edited module's app domain, so the edit is " +
-                "queued and will be applied at the next breakpoint hit in the app's own code");
+
+            // Without this the queue waits for a stop the user may never make. Arming the edited
+            // methods themselves turns "at the next breakpoint" into "the next time the app runs
+            // this code", which is the thing they are about to do anyway.
+            _encFlushDeclines = 0;
+            int armed = ArmEncFlushBreakpoints();
+            return (true, DeltaQueuedPrefix + (armed > 0
+                ? "no user code is stopped in the edited module's app domain, so the edit is " +
+                  "queued and will be applied the next time the app runs one of the edited methods"
+                : "no user code is stopped in the edited module's app domain, so the edit is " +
+                  "queued and will be applied at the next breakpoint hit in the app's own code"));
         }
 
         return ApplyDeltaCore(
@@ -3665,6 +3835,173 @@ public sealed partial class DebugSession : IDebugSession
         _pendingDeltas.Clear();
         foreach (var delta in ordered)
             _pendingDeltas.Enqueue(delta);
+    }
+
+    /// <summary>
+    /// Arms an entry breakpoint on every method a queued edit changes, in every loaded instance
+    /// of its assembly.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent: a method already armed in an instance is left alone, so this can be called
+    /// again whenever the queue grows without disturbing what is already standing.
+    /// </remarks>
+    /// <returns>How many entry points are armed once this returns.</returns>
+    private int ArmEncFlushBreakpoints()
+    {
+        var wanted = PendingEditedMethods();
+        if (wanted.Count == 0)
+            return 0;
+
+        WhileSynchronized("arm the hot reload flush breakpoints", () =>
+        {
+            foreach (var (assemblyName, tokens) in wanted)
+            {
+                // The registered module is the one the delta was computed against; its MVID is
+                // what tells a second app domain's copy from a different build of the same name.
+                if (!_encModules.TryGetValue(assemblyName, out var registered))
+                    continue;
+                var mvid = MvidOf(registered);
+
+                foreach (var module in ModuleInstances(assemblyName, mvid))
+                {
+                    if (Safe(() => InstanceKey(module)) is not { } instanceKey)
+                        continue;
+
+                    foreach (int token in tokens)
+                    {
+                        lock (_encFlushLock)
+                        {
+                            if (_encFlushBreakpoints.Any(b => !b.Abandoned && b.Token == token &&
+                                    string.Equals(b.InstanceKey, instanceKey, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                continue;
+                            }
+                        }
+
+                        try
+                        {
+                            var function = module.GetFunctionFromToken(new mdMethodDef(token));
+                            var breakpoint = function.CreateBreakpoint();
+                            breakpoint.Activate(true);
+                            lock (_encFlushLock)
+                                _encFlushBreakpoints.Add(new EncFlushBreakpoint(instanceKey, token, breakpoint));
+                        }
+                        catch
+                        {
+                            // A method this image does not have — an edit that adds one, or a
+                            // token from a build that is not loaded here. Nothing to stop at, and
+                            // the edit still lands at the next ordinary stop.
+                        }
+                    }
+                }
+            }
+        });
+
+        int count;
+        lock (_encFlushLock)
+            count = _encFlushBreakpoints.Count;
+        return count;
+    }
+
+    /// <summary>Every method any waiting edit changes, by assembly.</summary>
+    /// <remarks>
+    /// Read from the symbol map rather than carried separately, because that is where the
+    /// compiler's method tokens already travel to reach the debugger's symbol store.
+    /// </remarks>
+    private Dictionary<string, HashSet<int>> PendingEditedMethods()
+    {
+        var wanted = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var delta in _pendingDeltas.Concat(_replayDeltas))
+        {
+            if (EncSymbolMap.Parse(delta.Map) is not { UpdatedMethods.Length: > 0 } map)
+                continue;
+            if (!wanted.TryGetValue(delta.AssemblyName, out var tokens))
+                wanted[delta.AssemblyName] = tokens = [];
+            foreach (int token in map.UpdatedMethods)
+                tokens.Add(token);
+        }
+
+        return wanted;
+    }
+
+    /// <summary>Every loaded instance of an assembly, without the stop-shape filtering
+    /// <see cref="InstancesOf"/> applies — arming a breakpoint is safe in any domain, and the
+    /// domain that will serve the next request is not knowable in advance.</summary>
+    private IEnumerable<CorDebugModule> ModuleInstances(string assemblyName, Guid? mvid)
+    {
+        foreach (var module in LoadedModules())
+        {
+            var name = Safe(() => module.Name) ?? string.Empty;
+            if (!string.Equals(
+                    Path.GetFileNameWithoutExtension(name), assemblyName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (mvid is { } expected && MvidOf(module) is { } actual && actual != expected)
+                continue;
+            yield return module;
+        }
+    }
+
+    /// <summary>Whether a breakpoint event is one of the engine's own flush breakpoints, which
+    /// the user never set and must never see reported as a stop.</summary>
+    private bool IsEncFlushBreakpoint(CorDebugBreakpoint? breakpoint)
+    {
+        if (breakpoint is not CorDebugFunctionBreakpoint hit)
+            return false;
+        lock (_encFlushLock)
+            return _encFlushBreakpoints.Any(b => b.Breakpoint.Equals(hit));
+    }
+
+    /// <summary>Takes the flush breakpoints back out, keeping the ones that would not go.</summary>
+    /// <remarks>
+    /// Left armed, these keep stopping the debuggee at a breakpoint nobody set, and a leaked
+    /// native breakpoint is what later makes detach fail. The caller owns the stopped process:
+    /// every disarm here already has one — the stop the edit landed at, or the one a shutdown and
+    /// a detach each take first — and deactivating unsynchronized fails silently, which would
+    /// leave the breakpoints armed with nothing left to remember them by.
+    /// <para>
+    /// A deactivate that does not take keeps its entry rather than dropping it. The native
+    /// breakpoint is still armed in the debuggee, and this list is the only thing that knows the
+    /// engine put it there: forget it and <see cref="IsEncFlushBreakpoint"/> stops recognising its
+    /// next hit, which then arrives as a stop the user never set, on a line they never chose.
+    /// Kept, it is still resumed silently, and the next disarm gets another chance at it.
+    /// </para>
+    /// </remarks>
+    private void DisarmEncFlushBreakpoints()
+    {
+        lock (_encFlushLock)
+        {
+            for (int i = _encFlushBreakpoints.Count - 1; i >= 0; i--)
+            {
+                var armed = _encFlushBreakpoints[i];
+                if (armed.Abandoned)
+                    continue;
+
+                bool off;
+                try { off = armed.Breakpoint.TryActivate(false) == HRESULT.S_OK; }
+                catch { off = false; /* the module went away underneath it */ }
+
+                if (off)
+                    _encFlushBreakpoints.RemoveAt(i);
+                else
+                    _encFlushBreakpoints[i] = armed with { Abandoned = true };
+            }
+        }
+    }
+
+    /// <summary>Forgets the flush breakpoints that lived in a module instance that has unloaded.
+    /// Not deactivated: the image they were armed in is gone.</summary>
+    private void ForgetEncFlushBreakpoints(string instanceKey)
+    {
+        if (instanceKey.Length == 0)
+            return;
+        lock (_encFlushLock)
+        {
+            _encFlushBreakpoints.RemoveAll(
+                b => string.Equals(b.InstanceKey, instanceKey, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     /// <summary>The apply itself plus everything the runtime does not do for the debugger:
@@ -3787,9 +4124,14 @@ public sealed partial class DebugSession : IDebugSession
         foreach (var delta in replays)
             _replayDeltas.Enqueue(delta with { Target = module });
 
+        // Same reason as the ordinary queue: a recycled app domain is running the built code
+        // again, and waiting for a breakpoint to notice would leave it that way. Enqueued
+        // because arming belongs on the session thread and this is the runtime's callback thread.
+        Enqueue(() => ArmEncFlushBreakpoints());
+
         Emit(DebugEventKind.Diagnostic,
             $"hot reload: {assemblyName} was loaded again; its {replays.Length} applied edit(s) " +
-            "will be re-applied at the next breakpoint hit in the app's own code",
+            "will be re-applied the next time the app runs one of the edited methods",
             string.Empty, 0);
     }
 
@@ -3902,7 +4244,23 @@ public sealed partial class DebugSession : IDebugSession
     /// recording the stop context, so it runs ahead of any continue or step the user can issue
     /// — by the time execution resumes, the code they edited is the code that runs.
     /// </summary>
-    private void FlushPendingDeltas()
+    private void FlushPendingDeltas() => FlushPendingDeltas(atFlushBreakpoint: false);
+
+    /// <param name="atFlushBreakpoint">Whether this stop is one the engine took for the edit
+    /// itself rather than one of the user's. Those are invisible, and they are paid for out of a
+    /// request somebody is waiting on, so they are given far less patience.</param>
+    private void FlushPendingDeltas(bool atFlushBreakpoint)
+    {
+        FlushPendingDeltasCore(atFlushBreakpoint);
+
+        // Nothing is waiting any more, so the entry breakpoints that were holding the door open
+        // come back out. Only from a stopped process: disarming a running one fails silently and
+        // would leave the native breakpoints armed with nothing left to remember them by.
+        if (_stoppedThread is not null && _pendingDeltas.Count == 0 && _replayDeltas.IsEmpty)
+            DisarmEncFlushBreakpoints();
+    }
+
+    private void FlushPendingDeltasCore(bool atFlushBreakpoint)
     {
         DrainReplays();
         if (_pendingDeltas.Count == 0)
@@ -3950,8 +4308,14 @@ public sealed partial class DebugSession : IDebugSession
             // callback thread, and until it returns, inspecting the stopped thread from here
             // can transiently fail — which must read as "not yet", not "unsafe", or the edit
             // misses the exact stop it was queued for. Hence the brief retry.
+            // The wait is for a callback that is still unwinding, which is a matter of
+            // milliseconds. Forty tries is generous at a stop of the user's, where the debuggee is
+            // suspended anyway and nobody is waiting on it; at one of the engine's own it is a
+            // second of a live request spent on every call into the edited method, so it is cut
+            // short.
             var safe = false;
-            for (int attempt = 0; attempt < 40 && _stoppedThread is not null; attempt++)
+            int attempts = atFlushBreakpoint ? 8 : 40;
+            for (int attempt = 0; attempt < attempts && _stoppedThread is not null; attempt++)
             {
                 safe = StoppedThreadIsUserCodeIn(module) || UserCodeIsStoppedIn(module);
                 if (safe)

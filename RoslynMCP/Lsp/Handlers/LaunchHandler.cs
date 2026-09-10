@@ -294,11 +294,16 @@ internal static partial class LaunchHandler
                 "Install Visual Studio or the Build Tools for Visual Studio.", [], []);
         }
 
+        // Spelled as the disk spells it, so this build's output is byte-identical to the one
+        // Visual Studio or a terminal produces from the same sources: the compiler bakes the
+        // path into the image, and a path that differs only in case is a different image.
+        string buildPath = PathHelper.WithOnDiskCasing(projectPath);
+
         var startInfo = msbuild is not null
             ? new ProcessStartInfo(msbuild,
-                $"\"{projectPath}\" /nologo /v:minimal /p:Configuration={configuration} " +
+                $"\"{buildPath}\" /nologo /v:minimal /p:Configuration={configuration} " +
                 $"/t:{MsBuildTarget(target)}")
-            : new ProcessStartInfo("dotnet", DotnetArguments(projectPath, configuration, target));
+            : new ProcessStartInfo("dotnet", DotnetArguments(buildPath, configuration, target));
 
         startInfo.RedirectStandardOutput = true;
         startInfo.RedirectStandardError = true;

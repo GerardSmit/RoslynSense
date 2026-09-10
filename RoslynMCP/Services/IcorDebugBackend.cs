@@ -1065,11 +1065,11 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         // ICorDebugProcess::Stop faults inside ApplyChanges instead of failing. When even the
         // Break All produces no usable stop, the engine is still asked: it queues the delta and
         // applies it at the next real breakpoint instead of losing the edit.
-        bool paused = false;
+        bool interrupted = false;
         if (CurrentFrame is null)
         {
             await InterruptAsync(cancellationToken);
-            paused = CurrentFrame is not null;
+            interrupted = true;
         }
 
         try
@@ -1079,8 +1079,12 @@ internal sealed class IcorDebugBackend : IDebugBackend, IDebugNoticeSource
         finally
         {
             // Back to where it was. A hot reload that silently leaves the app suspended looks
-            // exactly like a hot reload that hung it.
-            if (paused)
+            // exactly like a hot reload that hung it — and an idle site is the one that ends
+            // up suspended, because a Break All into it adopts no managed frame and the missing
+            // frame used to read as "never suspended it". The engine drops a resume it does not
+            // owe, so asking whenever the break was taken costs nothing and covers the stop that
+            // has no frame to show for itself.
+            if (interrupted)
                 _ = ContinueAsync(CancellationToken.None);
         }
     }

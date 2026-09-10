@@ -278,19 +278,20 @@ internal sealed partial class HotReloadService
             _encService.Discard();
 
         // A queued edit is a success with a different tense: the debuggee could not take it
-        // safely right now (nothing of the user's is stopped in it), so the debug engine holds
-        // it and lands it at the next breakpoint. Saying "applied" for it would be a lie the
-        // user discovers mid-debugging.
+        // safely right now (nothing of the user's is stopped in it), so the debug engine holds it
+        // and lands it the next time the app runs one of the edited methods. Saying "applied" for
+        // it would be a lie the user discovers the next time they refresh the page.
         string summary = (applied.Count, queued.Count) switch
         {
             (0, 0) => errors.Count > 0
                 ? "The delta was computed but no running target accepted it."
                 : "The delta was computed but nothing is running to apply it to.",
             (0, _) =>
-                $"Edit queued for {string.Join(", ", queued)}; it will be applied at the next breakpoint.",
+                $"Edit queued for {string.Join(", ", queued)}; the running process is still on the " +
+                "old code and takes the edit the next time it runs one of the edited methods.",
             (_, 0) => $"Applied {deltas.Count} module update(s) to {string.Join(", ", applied)}.",
             _ => $"Applied to {string.Join(", ", applied)}; queued for {string.Join(", ", queued)} " +
-                 "(applies at the next breakpoint).",
+                 "(lands the next time the app runs one of the edited methods).",
         };
 
         return new HotReloadOutcome(
@@ -394,8 +395,15 @@ internal sealed partial class HotReloadService
     /// The runtime takes metadata and IL and nothing else, but the debugger also has to know where
     /// the edit moved the source — otherwise only the methods the delta describes report the right
     /// lines and everything below them in the same file drifts a little further with every edit.
-    /// Null when the compiler reported no movement, so nothing is sent for an edit that moved
-    /// nothing.
+    /// <para>
+    /// The method tokens travel even when nothing moved. They started out as the list of methods
+    /// <em>not</em> to shift twice, which is meaningless with no shifts, so an edit that kept the
+    /// line count sent no map at all. The engine now also uses them to arm the entry breakpoints
+    /// that let a queued edit land without the user setting one, and an edit that replaces a line
+    /// in place — the commonest kind — is exactly the one that was arriving with nothing to arm.
+    /// </para>
+    /// Null only when the compiler described neither, so nothing is sent for an edit the debugger
+    /// can make no use of.
     /// </remarks>
     private static string? SymbolMapOf(HotReloadDelta delta)
     {
@@ -406,12 +414,13 @@ internal sealed partial class HotReloadService
                 [.. m.Shifts.Select(s => new Debugger.EncLineShift(s.OldLine, s.NewLine))]))
             .ToArray();
 
-        if (files.Length == 0)
+        var methods = delta.UpdatedMethods ?? [];
+        if (files.Length == 0 && methods.Length == 0)
             return null;
 
         return new Debugger.EncSymbolMap
         {
-            UpdatedMethods = delta.UpdatedMethods ?? [],
+            UpdatedMethods = methods,
             Files = files,
         }.ToJson();
     }

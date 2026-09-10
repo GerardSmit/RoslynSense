@@ -322,4 +322,32 @@ describe('hot reload lifecycle', () => {
         assert.equal(state.contexts.at(-1), false);
         assert.equal(state.requests.filter(r => r.method === 'roslynSense/hotReloadApply').length, 2);
     });
+
+    // A queued edit exists as a delta but has not reached the running process: it was idle, with
+    // no thread of the user's stopped in the edited module, so the engine holds it until the app
+    // next runs that code. Cleared like an apply, it read as hot reload having done nothing —
+    // the page still served the old code and the button had already gone dark.
+    it('keeps a queued edit pending and says so rather than reporting it as applied', async () => {
+        const state = setup();
+        state.bind();
+        state.edit();
+        state.applyWith(async () => ({
+            ok: true,
+            summary: 'Edit queued for App (debuggee); the running process is still on the old code.',
+            diagnostics: [],
+            appliedTo: ['App (debuggee) (queued)'],
+            errors: [],
+        }));
+
+        await state.apply();
+
+        assert.equal(state.contexts.at(-1), true);
+        assert.match(state.errors.at(-1)!, /queued/);
+
+        // And an apply that does reach the process still settles the button, so the queued case
+        // is the exception rather than a button that never goes out again.
+        state.applyWith(async () => success);
+        await state.apply();
+        assert.equal(state.contexts.at(-1), false);
+    });
 });

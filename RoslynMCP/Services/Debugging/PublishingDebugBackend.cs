@@ -54,12 +54,21 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
             {
                 if (notice.Kind == DebugNoticeKind.Logpoint)
                     Log(notice.Message);
+                else if (notice.Kind != DebugNoticeKind.Output)
+                    DebugStateStore.Trace(Environment.ProcessId, Describe(notice));
             };
         }
     }
 
     /// <summary>The wrapped engine — for engine-selection assertions and diagnostics.</summary>
     public IDebugBackend Inner => _inner;
+
+    /// <summary>One notice as a trace line: the kind, what it said, and where, when there is a
+    /// where. Debuggee console output is left out — it is the app's log, not the engine's.</summary>
+    private static string Describe(DebugNotice notice) =>
+        notice.FilePath is { Length: > 0 } file
+            ? $"{notice.Kind}: {notice.Message} [{file}:{notice.Line}]"
+            : $"{notice.Kind}: {notice.Message}";
 
     /// <summary>The engine's notices pass straight through, unchanged; the decorator adds only
     /// <see cref="DebugNoticeKind.Resumed"/>, which no engine reports. An engine that reports

@@ -371,11 +371,14 @@ public static class BuildProjectTool
         return order.Select(k => (groups[k].Label, groups[k].Lines)).ToList();
     }
 
+    // On-disk casing in both: the compiler bakes the project path into its output, so a build
+    // from "d:\..." and one from "D:\..." are two different images of the same sources, and
+    // everything that compares output bytes sees a change on every build.
     private static string BuildDotnetArgs(string resolved, string configuration) =>
-        $"build \"{resolved}\" --configuration \"{configuration}\" --nologo";
+        $"build \"{PathHelper.WithOnDiskCasing(resolved)}\" --configuration \"{configuration}\" --nologo";
 
     private static string BuildMsBuildArgs(string resolved, string configuration) =>
-        $"\"{resolved}\" /p:Configuration=\"{configuration}\" /nologo /v:minimal " +
+        $"\"{PathHelper.WithOnDiskCasing(resolved)}\" /p:Configuration=\"{configuration}\" /nologo /v:minimal " +
         BuildProcessHelper.NoNodeReuseArg;
 
     /// <summary>

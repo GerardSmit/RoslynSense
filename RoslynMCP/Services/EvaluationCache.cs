@@ -333,8 +333,10 @@ internal static class EvaluationCache
             // The restore graph is the one input measured in megabytes — 19MB across an
             // 80-project solution, dwarfing every project file combined — so it is stamped, not
             // read. A restore that changes anything rewrites it; one that changes nothing still
-            // bumps its timestamp, which costs a re-evaluation, not a wrong answer.
-            AddStamp("assets", Path.Combine(projectDir, "obj", "project.assets.json"));
+            // bumps its timestamp, which costs a re-evaluation, not a wrong answer. Resolved
+            // rather than assumed under obj/: a project that relocates its intermediates was
+            // stamping a file that did not exist, so its restores never moved the fingerprint.
+            AddStamp("assets", ProjectAssetsFile.Resolve(full));
 
             AddText("files");
             foreach (string relative in SourceShapedFiles(projectDir, watched))

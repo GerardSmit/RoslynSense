@@ -110,12 +110,24 @@ internal static class DaemonSpawner
         }
     }
 
+    /// <summary>How long a spawn waits for the tool's own files to be back on disk. A
+    /// <c>dotnet tool update</c> removes and rewrites the store in well under this.</summary>
+    private static readonly TimeSpan ToolStoreWait = TimeSpan.FromSeconds(20);
+
     private static bool TrySpawnDaemon(string solutionKey)
     {
         try
         {
             string exe = Environment.ProcessPath
                 ?? throw new InvalidOperationException("Cannot determine current executable path.");
+
+            // A reinstall of the tool deletes its store and writes it back, and a daemon started
+            // in between dies with "the application to execute does not exist" — after which the
+            // editor restarts its client, which spawns another, five cold starts in one minute.
+            // The client that outlived the removal (its own image stays mapped) waits for the
+            // files to return instead of spawning from a half-replaced store.
+            if (!WaitForToolStore(exe))
+                return false;
 
             var psi = new ProcessStartInfo
             {
@@ -157,5 +169,37 @@ internal static class DaemonSpawner
             Console.Error.WriteLine($"[DaemonSpawner] Failed to spawn host: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Whether the executable and the assembly a daemon would run from are on disk, waiting up
+    /// to <see cref="ToolStoreWait"/> for them when they are not.
+    /// </summary>
+    private static bool WaitForToolStore(string exe)
+    {
+        // The entry assembly is what the shim actually runs; for a framework-dependent launch it
+        // is the .dll beside the muxer's argument, and for an apphost it is the .dll beside it.
+        string? assembly = Assembly.GetEntryAssembly()?.Location;
+        var required = new List<string> { exe };
+        if (!string.IsNullOrEmpty(assembly))
+            required.Add(assembly);
+
+        if (required.All(File.Exists))
+            return true;
+
+        Console.Error.WriteLine(
+            "[DaemonSpawner] The tool's files are being replaced; waiting for them before spawning a host.");
+
+        var deadline = DateTime.UtcNow + ToolStoreWait;
+        while (DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(500);
+            if (required.All(File.Exists))
+                return true;
+        }
+
+        Console.Error.WriteLine(
+            $"[DaemonSpawner] Not spawning a host: '{required.First(f => !File.Exists(f))}' is missing.");
+        return false;
     }
 }

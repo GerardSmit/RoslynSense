@@ -25,6 +25,7 @@ public class DebuggerClassDisplayTests
         using System;
         using System.Collections.Generic;
         using System.Diagnostics;
+        using System.Linq;
         using System.Text;
         using System.Threading.Tasks;
         namespace Shop
@@ -78,6 +79,15 @@ public class DebuggerClassDisplayTests
                 public override string ToString() { return First + "\n" + Last; }
             }
             public class Box<T> { public T Value; public T[] Many; }
+            public class Counter<T> { protected int _n = 5; public int Doubled { get { int d = _n; return d * 2; } } }
+            public class Tally : Counter<string> { }
+            public class Bag : IEnumerable<int>
+            {
+                private readonly int[] _items = { 4, 5 };
+                public IEnumerator<int> GetEnumerator() { return ((IEnumerable<int>)_items).GetEnumerator(); }
+                System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() { return GetEnumerator(); }
+            }
+            public class Ledger : Bag { public int Count = 2; }
             public class Inspector
             {
                 private readonly int _seed = 7;
@@ -99,7 +109,11 @@ public class DebuggerClassDisplayTests
                     Func<int, int> fn = x => x * factor;
                     Money money = order.Total;
                     object boxedStruct = money;
-                    Use(entity, order, person, box, tuple, kv, ex, sb, nullableAddress, nullableStatus, anon, dto, fn, money, boxedStruct); // BREAK
+                    IEnumerable<string> lazy = customer.Orders.Where(o => o.Number > 0).Select(o => "#" + o.Number);
+                    Tally tally = new Tally();
+                    Bag bag = new Bag();
+                    Ledger ledger = new Ledger();
+                    Use(entity, order, person, box, tuple, kv, ex, sb, nullableAddress, nullableStatus, anon, dto, fn, money, boxedStruct, lazy, tally, bag, ledger); // BREAK
                 }
                 private static void Use(params object[] values) { }
             }
@@ -215,6 +229,36 @@ public class DebuggerClassDisplayTests
             // A struct keeps its shape through a box, and a delegate reads as its method.
             Assert.Equal("{Shop.Money}", Local("boxedStruct").Value);
             Assert.StartsWith("{Method = {", Local("fn").Value);
+
+            // A LINQ query is its elements, with the iterator's state under Raw View — none of
+            // it inline, least of all a Current that has nothing in it before the sequence runs.
+            var lazy = await Expand(Local("lazy"));
+            Assert.Equal(["[0]", "Raw View"], lazy.Select(m => m.Name));
+            Assert.Equal("\"#10\"", lazy[0].Value);
+            // The runtimes spell the iterator's source field differently; either way it is there.
+            Assert.Contains(await Expand(lazy[1]), m => m.Name is "_source" or "source");
+
+            // A user's enumerable with nothing public but its sequence is its elements too; one
+            // with public state of its own keeps that inline and the elements behind a Results View.
+            var bag = await Expand(Local("bag"));
+            Assert.Equal(["[0]", "[1]", "Raw View"], bag.Select(m => m.Name));
+            Assert.Equal("4", bag[0].Value);
+            var ledger = await Expand(Local("ledger"));
+            Assert.Equal(["Count", "_items", "Results View"], ledger.Select(m => m.Name));
+
+            // With the switch off, the VS shape: the iterator's members and a Results View.
+            var asVs = engine.DisplayOptions.Clone();
+            asVs.EnumerateResults = false;
+            engine.DisplayOptions = asVs;
+            var lazyAsVs = await Expand(Local("lazy"));
+            Assert.Contains(lazyAsVs, m => m.Name == "Results View");
+            Assert.DoesNotContain(lazyAsVs, m => m.Name == "[0]");
+            engine.DisplayOptions = new DebugDisplayOptions();
+
+            // A property inherited from a generic base is called with the base's type arguments,
+            // not the derived type's — a mismatch faults the call with TargetParameterCountException.
+            var tally = await Expand(Local("tally"));
+            Assert.Equal("10", Assert.Single(tally, m => m.Name == "Doubled").Value);
         }
         finally
         {

@@ -312,6 +312,29 @@ public class EvaluationCacheTests : IDisposable
         Assert.False(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
     }
 
+    /// <summary>
+    /// The same, for a project that keeps its intermediates elsewhere. Stamping a file under
+    /// <c>obj/</c> that such a project never writes meant its restores never moved the
+    /// fingerprint, and a stale evaluation was served after every one of them.
+    /// </summary>
+    [Fact]
+    public async Task MissesAfterTheRestoreGraphChangesInARelocatedObj()
+    {
+        File.WriteAllText(_projectPath,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>" +
+            "<BaseIntermediateOutputPath>obj\\$(MSBuildProjectName)\\</BaseIntermediateOutputPath>" +
+            "</PropertyGroup></Project>");
+
+        var (hit, _, _) = await StoreThenGetAsync(Properties);
+        Assert.True(hit);
+
+        string relocated = Path.Combine(_projectDir, "obj", "App");
+        Directory.CreateDirectory(relocated);
+        File.WriteAllText(Path.Combine(relocated, "project.assets.json"), "{}");
+
+        Assert.False(EvaluationCache.TryGet(_projectPath, Properties, out _, out _));
+    }
+
     [Fact]
     public async Task MissesAfterAFileOfARecordedExtensionAppears()
     {

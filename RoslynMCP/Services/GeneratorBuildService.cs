@@ -377,11 +377,14 @@ internal static class GeneratorBuildService
         // behaviour: a generator outside the loaded solution may not have been covered by the
         // solution restore that just ran. -nr:false for the same reason as RestoreService — a
         // lingering worker node holds handles the next git operation trips over.
+        // On-disk casing: the generator's image is fingerprinted by content, and a path that
+        // differs only in case from the user's own build produces a different image.
+        string buildPath = PathHelper.WithOnDiskCasing(generatorProjectPath);
         var (fileName, arguments) = legacy
             ? (Path.Combine(WorkspaceService.LegacyMsBuildDirectory!, "MSBuild.exe"),
-                $"\"{generatorProjectPath}\" -t:Restore;Build -v:quiet -nologo -nr:false")
+                $"\"{buildPath}\" -t:Restore;Build -v:quiet -nologo -nr:false")
             : ("dotnet",
-                $"build \"{generatorProjectPath}\" --verbosity quiet --nologo -nr:false -tl:false");
+                $"build \"{buildPath}\" --verbosity quiet --nologo -nr:false -tl:false");
 
         using var process = new Process
         {

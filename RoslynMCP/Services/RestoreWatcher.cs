@@ -48,6 +48,14 @@ internal static class RestoreWatcher
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Watched directory → the names of the entries a first restore creates in it on the way to
+    /// an assets file that does not exist yet: <c>obj</c> under a project directory, or the
+    /// project's own name under <c>obj</c> for a project that relocates its intermediates.
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, HashSet<string>> s_awaitedByDirectory =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// A ceiling on handles, because the number of projects is not bounded by anything this class
     /// controls: a solution with hundreds of projects would otherwise open hundreds of directory
     /// handles for a signal that matters most on the handful somebody is actually editing.
@@ -123,31 +131,59 @@ internal static class RestoreWatcher
 
         s_fingerprints[full] = Fingerprint(full);
 
-        // The assets file lives in obj/, which does not exist until the first restore. Watching the
-        // project directory instead — for obj/ appearing — is what makes the never-restored project
-        // work, and it is the case that matters most: that project is the one showing errors.
-        string objDir = Path.Combine(projectDir, "obj");
-        Register(Directory.Exists(objDir) ? objDir : projectDir, full);
+        // The assets file's directory — obj/, or wherever the project relocates its
+        // intermediates — does not exist until the first restore. Watching the nearest directory
+        // that does exist, for the missing one to appear in it, is what makes the never-restored
+        // project work, and it is the case that matters most: that project is the one showing
+        // errors.
+        string watched = Path.GetDirectoryName(ProjectAssetsFile.Resolve(full)) ?? projectDir;
+        string? awaited = null;
+        while (!Directory.Exists(watched))
+        {
+            string? parent = Path.GetDirectoryName(watched);
+            if (parent is null)
+            {
+                watched = projectDir;
+                awaited = null;
+                break;
+            }
+
+            awaited = Path.GetFileName(watched);
+            watched = parent;
+        }
+
+        Register(watched, full, awaited);
 
         if (PackagesConfigService.Uses(full))
         {
             string packagesRoot = PackagesConfigService.PackagesRootFor(full);
             if (Directory.Exists(packagesRoot))
-                Register(packagesRoot, full);
+                Register(packagesRoot, full, awaited: null);
         }
     }
 
     /// <summary>
     /// Associates <paramref name="projectPath"/> with <paramref name="directory"/> and makes sure
-    /// exactly one watcher exists on it.
+    /// exactly one watcher exists on it. <paramref name="awaited"/> names the entry a restore has
+    /// yet to create in it, when the directory is being watched for that rather than for the
+    /// assets file itself.
     /// </summary>
-    private static void Register(string directory, string projectPath)
+    private static void Register(string directory, string projectPath, string? awaited)
     {
         var projects = s_projectsByDirectory.GetOrAdd(
             directory, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
 
         lock (projects)
             projects.Add(projectPath);
+
+        if (awaited is not null)
+        {
+            var names = s_awaitedByDirectory.GetOrAdd(
+                directory, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+            lock (names)
+                names.Add(awaited);
+        }
 
         if (s_watchers.ContainsKey(directory))
             return;
@@ -232,6 +268,8 @@ internal static class RestoreWatcher
             dead.Dispose();
         }
 
+        s_awaitedByDirectory.TryRemove(directory, out _);
+
         if (!s_projectsByDirectory.TryRemove(directory, out var projects))
             return;
 
@@ -272,12 +310,14 @@ internal static class RestoreWatcher
     {
         // Everything a restore writes into obj/ except the assets file — nuget.g.props,
         // nuget.g.targets, project.nuget.cache, dgspec.json — is rewritten by a no-op restore too,
-        // and none of them changes what Roslyn resolves. The directory names are for the two
-        // "nothing has ever been restored here" cases.
+        // and none of them changes what Roslyn resolves. The directory names are for the
+        // "nothing has ever been restored here" cases: obj/ appearing, or the directory a project
+        // relocates its intermediates to — which can carry a dot, as project names do.
         bool interesting = name is null
             || name.EndsWith("project.assets.json", StringComparison.OrdinalIgnoreCase)
             || name.Equals("obj", StringComparison.OrdinalIgnoreCase)
-            || !Path.HasExtension(name);
+            || !Path.HasExtension(name)
+            || IsAwaited(directory, name);
 
         if (!interesting)
             return;
@@ -291,6 +331,15 @@ internal static class RestoreWatcher
 
         foreach (string project in affected)
             Debounced(project);
+    }
+
+    private static bool IsAwaited(string directory, string name)
+    {
+        if (!s_awaitedByDirectory.TryGetValue(directory, out var names))
+            return false;
+
+        lock (names)
+            return names.Contains(name);
     }
 
     /// <summary>
@@ -328,11 +377,7 @@ internal static class RestoreWatcher
     {
         try
         {
-            string? projectDir = Path.GetDirectoryName(Path.GetFullPath(projectPath));
-            if (projectDir is null)
-                return "";
-
-            string assets = Path.Combine(projectDir, "obj", "project.assets.json");
+            string assets = ProjectAssetsFile.Resolve(projectPath);
             string assetsHash = File.Exists(assets)
                 ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(assets)))
                 : "none";
@@ -382,6 +427,7 @@ internal static class RestoreWatcher
         }
 
         s_projectsByDirectory.Clear();
+        s_awaitedByDirectory.Clear();
         s_fingerprints.Clear();
 
         // Pending debounces are left to expire on their own: each re-reads the fingerprint and asks

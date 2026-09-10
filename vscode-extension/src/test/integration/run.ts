@@ -1,5 +1,6 @@
 import * as cp from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { runTests } from '@vscode/test-electron';
 
@@ -61,6 +62,21 @@ async function main(): Promise<void> {
     fs.cpSync(path.join(extensionRoot, 'src/test/integration/fixture'), workspace, {
         recursive: true, filter: source => !['bin', 'obj', '.vscode'].includes(path.basename(source)),
     });
+    // A Unix domain socket path cannot exceed 108 bytes, and .NET puts a named pipe under
+    // TMPDIR/.dotnet/corefx/pipe/. This run root is nested six directories deep inside the
+    // checkout, so pointing TMPDIR straight at it left the hot reload agent's pipe unbindable —
+    // the server's listener and the agent's connect both failed silently and every apply came
+    // back with nothing running to apply it to. The link keeps the path short while the files
+    // themselves still land in the run root, where the CI job collects them.
+    const shortTemp = process.platform === 'win32'
+        ? temp
+        : path.join(os.tmpdir(), `rs-${path.basename(runRoot)}`);
+    if (shortTemp !== temp) {
+        try { fs.unlinkSync(shortTemp); } catch { /* first run for this name */ }
+        fs.symlinkSync(temp, shortTemp, 'dir');
+        const budget = shortTemp.length + '/.dotnet/corefx/pipe/'.length + 'roslyn-sense-hotreload-000000'.length;
+        if (budget >= 108) throw new Error(`Temp link '${shortTemp}' leaves no room for a pipe path (${budget} bytes).`);
+    }
     console.log(`VS Code integration workspace and diagnostics: ${runRoot}`);
     const server = publishedServer(extensionRoot, runRoot);
     if (!fs.existsSync(server)) throw new Error(`Test server was not found at ${server}.`);
@@ -84,7 +100,7 @@ async function main(): Promise<void> {
             ROSLYNMCP_SHARED_HOST: '0',
             ROSLYNMCP_NO_UPDATE_CHECK: '1',
             ROSLYNSENSE_HOME: path.join(runRoot, 'roslynsense-home'),
-            TEMP: temp, TMP: temp, TMPDIR: temp,
+            TEMP: temp, TMP: temp, TMPDIR: shortTemp,
         },
         launchArgs: [
             workspace,

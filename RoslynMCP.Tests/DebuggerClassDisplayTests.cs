@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -198,8 +198,13 @@ public class DebuggerClassDisplayTests
             var amount = Assert.Single(total, m => m.Name == "Amount");
             Assert.Equal("19.95", amount.Value);
             Assert.Empty(amount.VariablesReference);
-            Assert.StartsWith("{02", Local("dto").Value);
-            Assert.EndsWith("+02:00}", Local("dto").Value);
+            // The offset reads as its own text, in whatever the debuggee's culture spells a
+            // date in — it is the target's ToString() that produces it, so the day and month
+            // may lead in either order and the assertion cannot pin the pattern.
+            var dto = Local("dto").Value;
+            Assert.EndsWith("+02:00}", dto);
+            Assert.Contains("2020", dto);
+            Assert.DoesNotContain("DateTimeOffset", dto);
 
             // Tuples, pairs, anonymous types and exceptions have their own VS spellings.
             Assert.Equal("(1, \"one\")", Local("tuple").Value);

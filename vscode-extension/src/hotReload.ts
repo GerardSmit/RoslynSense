@@ -376,15 +376,18 @@ async function apply(
     const rude = result.diagnostics.find((d) => d.severity === 'error');
     const message = rude ? `${result.summary} ${rude.message}` : result.summary;
 
-    const choice = await vscode.window.showWarningMessage(message, 'Restart', 'Show Problems');
-    if (session !== sessionVersion) {
-        return;
-    }
-    if (choice === 'Restart') {
-        await vscode.commands.executeCommand('workbench.action.debug.restart');
-    } else if (choice === 'Show Problems') {
-        await vscode.commands.executeCommand('workbench.actions.view.problems');
-    }
+    // The prompt is not awaited: the apply is over either way, and holding the command open
+    // until someone clicks makes a failed apply indistinguishable from one that never returned.
+    void vscode.window.showWarningMessage(message, 'Restart', 'Show Problems').then(async (choice) => {
+        if (session !== sessionVersion) {
+            return;
+        }
+        if (choice === 'Restart') {
+            await vscode.commands.executeCommand('workbench.action.debug.restart');
+        } else if (choice === 'Show Problems') {
+            await vscode.commands.executeCommand('workbench.actions.view.problems');
+        }
+    });
 }
 
 /// Rude edits are reported as diagnostics rather than only as a popup, so the user can see which

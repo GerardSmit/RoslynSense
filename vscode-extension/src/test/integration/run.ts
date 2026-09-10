@@ -66,16 +66,15 @@ async function main(): Promise<void> {
     // TMPDIR/.dotnet/corefx/pipe/. This run root is nested six directories deep inside the
     // checkout, so pointing TMPDIR straight at it left the hot reload agent's pipe unbindable —
     // the server's listener and the agent's connect both failed silently and every apply came
-    // back with nothing running to apply it to. The link keeps the path short while the files
-    // themselves still land in the run root, where the CI job collects them.
+    // back with nothing running to apply it to. A real directory rather than a link into this
+    // one, because the external-source tests read os.tmpdir() and its real path as the same
+    // place; what lands there is copied into the run root at the end for the CI job to collect.
     const shortTemp = process.platform === 'win32'
         ? temp
-        : path.join(os.tmpdir(), `rs-${path.basename(runRoot)}`);
+        : fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'rs-')));
     if (shortTemp !== temp) {
-        try { fs.unlinkSync(shortTemp); } catch { /* first run for this name */ }
-        fs.symlinkSync(temp, shortTemp, 'dir');
         const budget = shortTemp.length + '/.dotnet/corefx/pipe/'.length + 'roslyn-sense-hotreload-000000'.length;
-        if (budget >= 108) throw new Error(`Temp link '${shortTemp}' leaves no room for a pipe path (${budget} bytes).`);
+        if (budget >= 108) throw new Error(`Temp dir '${shortTemp}' leaves no room for a pipe path (${budget} bytes).`);
     }
     console.log(`VS Code integration workspace and diagnostics: ${runRoot}`);
     const server = publishedServer(extensionRoot, runRoot);
@@ -90,26 +89,34 @@ async function main(): Promise<void> {
         throw new Error(`Test server version probe failed: ${version.stderr || version.stdout}`);
     }
 
-    await runTests({
-        version: process.env.VSCODE_VERSION || 'stable',
-        extensionDevelopmentPath: extensionRoot,
-        extensionTestsPath: path.join(__dirname, 'suite', 'index'),
-        extensionTestsEnv: {
-            ROSLYNSENSE_SERVER: server,
-            ROSLYNSENSE_LSP_TRACE: '1',
-            ROSLYNMCP_SHARED_HOST: '0',
-            ROSLYNMCP_NO_UPDATE_CHECK: '1',
-            ROSLYNSENSE_HOME: path.join(runRoot, 'roslynsense-home'),
-            TEMP: temp, TMP: temp, TMPDIR: shortTemp,
-        },
-        launchArgs: [
-            workspace,
-            `--user-data-dir=${userData}`,
-            `--extensions-dir=${path.join(runRoot, 'extensions')}`,
-            '--skip-welcome',
-            '--skip-release-notes',
-        ],
-    });
+    try {
+        await runTests({
+            version: process.env.VSCODE_VERSION || 'stable',
+            extensionDevelopmentPath: extensionRoot,
+            extensionTestsPath: path.join(__dirname, 'suite', 'index'),
+            extensionTestsEnv: {
+                ROSLYNSENSE_SERVER: server,
+                ROSLYNSENSE_LSP_TRACE: '1',
+                ROSLYNMCP_SHARED_HOST: '0',
+                ROSLYNMCP_NO_UPDATE_CHECK: '1',
+                ROSLYNSENSE_HOME: path.join(runRoot, 'roslynsense-home'),
+                TEMP: temp, TMP: temp, TMPDIR: shortTemp,
+            },
+            launchArgs: [
+                workspace,
+                `--user-data-dir=${userData}`,
+                `--extensions-dir=${path.join(runRoot, 'extensions')}`,
+                '--skip-welcome',
+                '--skip-release-notes',
+            ],
+        });
+    } finally {
+        // The diagnostics the server wrote to its temp directory belong with the rest of the run.
+        if (shortTemp !== temp) {
+            try { fs.cpSync(shortTemp, temp, { recursive: true }); } catch { /* nothing was written */ }
+            try { fs.rmSync(shortTemp, { recursive: true, force: true }); } catch { /* still in use */ }
+        }
+    }
 }
 
 void main().catch((error) => {

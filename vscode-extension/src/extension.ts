@@ -20,7 +20,7 @@ import { registerTestController, runTestById } from './testController';
 import { registerImpactedTests } from './impactedTests';
 import { registerCoverageMapProgress } from './coverageMapProgress';
 import { registerProjectSet } from './projectSet';
-import { externalSourceGlob } from './paths';
+import { externalSourceGlobs } from './paths';
 import { registerSolutionReady } from './solutionReady';
 import { registerCoverageExplorer } from './coverageExplorer';
 import { registerChangedMembers } from './changedMembers';
@@ -37,8 +37,10 @@ import { createRedactingTraceChannel, wireNuGetCredentials } from './nuget/crede
 import { registerTaskProvider } from './taskProvider';
 import { registerEditorContext } from './editorContext';
 import { registerHotReload } from './hotReload';
+import { restartDelayMs, waitToRestart } from './serverRestart';
 import { bindNestedCodeActions, registerNestedCodeActions } from './nestedCodeActions';
-import { lensesToPreResolve } from './codeLensPrewarm';
+import { preResolveVisibleLenses } from './visibleCodeLenses';
+import { registerOnAutoInsert } from './autoInsert';
 import { globalToolPath, installGlobalTool, updateGlobalTool } from './toolManagement';
 
 let client: LanguageClient | undefined;
@@ -336,6 +338,9 @@ function enabledFileLanguages(): readonly ExtraLanguage[] {
  */
 const clientsBySolution = new Map<string, LanguageClient>();
 
+// synchronize.fileEvents only owns the listeners, not the watchers supplied by the extension.
+const watchersByClient = new Map<LanguageClient, vscode.FileSystemWatcher[]>();
+
 /** One trace channel for every client; created lazily so a session that never traces has none. */
 let redactingTrace: vscode.OutputChannel | undefined;
 
@@ -524,6 +529,7 @@ function serverSettings(registerCommands = true): Record<string, unknown> {
             browsable: config.get('debugger.browsable'),
             justMyCode: config.get('debugger.justMyCode'),
             rawView: config.get('debugger.rawView'),
+            enumerateResults: config.get('debugger.enumerateResults'),
             maxChildren: config.get('debugger.maxChildren'),
             symbolInclude: config.get('debugger.symbolInclude'),
             symbolExclude: config.get('debugger.symbolExclude'),
@@ -834,7 +840,7 @@ async function startClient(
         // VS Code globs cannot express "not under bin/obj", so build output is filtered
         // server-side instead; the events are cheap and the server drops them before it does
         // any work.
-        return [
+        const patterns = [
             '**/*.cs',
             '**/*.{csproj,vbproj,fsproj,props,targets,sln,slnx,slnf}',
             '**/{.editorconfig,.globalconfig,Directory.Packages.props}',
@@ -844,9 +850,12 @@ async function startClient(
             '**/[wW]eb.config',
             ...additionalConfigPatterns(binding?.folder),
             ...enabledFileLanguages().flatMap(watchGlobs),
-        ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
+        ];
+        return [...new Set(patterns)].map((pattern) => vscode.workspace.createFileSystemWatcher(
+            binding?.folder ? new vscode.RelativePattern(binding.folder, pattern) : pattern));
     }
     const clientKey = bindingKey(solutionPath, binding?.folder);
+    const workspaceWatchers = createWorkspaceWatchers();
 
     const clientOptions: LanguageClientOptions = {
         // Source-generated documents are C# too. Without them here VS Code sends the server
@@ -866,7 +875,7 @@ async function startClient(
             // never claims it, and F12 into a dependency opened a buffer VS Code sent the server
             // nothing about: no hover, no navigation, and no find-references. Claimed by the same
             // client as the generated scheme and for the same reason.
-            ...(ownsCommands ? [externalSourceFilter()] : []),
+            ...(ownsCommands ? externalSourceFilters() : []),
             // The other languages the same server serves — WebForms markup, whose controls,
             // properties and event handlers are C# symbols, and whose <% %> blocks are C#.
             // A language switched off still highlights, it just answers nothing.
@@ -912,7 +921,7 @@ async function startClient(
             // the list over closes that window. See codeLensPrewarm.ts.
             provideCodeLenses: async (document, token, next) => {
                 const lenses = await next(document, token);
-                return lenses ? preResolveVisibleLenses(document, lenses, token) : lenses;
+                return lenses ? preResolveVisibleLenses(connection, document, lenses, token) : lenses;
             },
         },
         // Sent at initialize so the very first analyzer pass already runs under the user's
@@ -924,7 +933,7 @@ async function startClient(
         // Content changes to open files arrive via didChange; these watchers cover what the
         // editor never sees — files created, deleted, or rewritten outside it (git checkout,
         // scaffolding, another agent). The server coalesces the burst a branch switch produces.
-        synchronize: { fileEvents: createWorkspaceWatchers() },
+        synchronize: { fileEvents: workspaceWatchers },
         // A cold daemon spawn (first window on a solution) can lose the very first
         // connection attempt; a failed initialize must retry, not surface an error toast.
         initializationFailedHandler: () => {
@@ -933,7 +942,7 @@ async function startClient(
         },
         errorHandler: {
             error: () => ({ action: ErrorAction.Continue }),
-            closed: () => {
+            closed: async () => {
                 const now = Date.now();
                 restartTimes.push(now);
                 while (restartTimes.length > 0 && now - restartTimes[0] > 3 * 60_000) {
@@ -950,21 +959,44 @@ async function startClient(
                     }
                     return { action: CloseAction.DoNotRestart };
                 }
+
+                // The first exit restarts at once; repeated ones back off, and none restarts
+                // while the server binary is missing — a reinstall of the tool removes it and
+                // writes it back, and restarting into that gap spawned a proxy, then a daemon,
+                // against a half-replaced store, over and over. See serverRestart.ts.
+                const delayMs = restartDelayMs(restartTimes.length);
+                if (delayMs > 0) {
+                    if (statusItem && client === connection) {
+                        statusItem.busy = true;
+                        statusItem.severity = vscode.LanguageStatusSeverity.Warning;
+                        statusItem.text = `RoslynSense: restarting in ${Math.round(delayMs / 1000)}s`;
+                    }
+                    await waitToRestart(serverPath, delayMs);
+
+                    // Stopped or replaced while waiting: the library does not look again after
+                    // the handler returns, so a Restart here would revive a client the user
+                    // shut down.
+                    if (![...clientsBySolution.values()].includes(connection)) {
+                        return { action: CloseAction.DoNotRestart, handled: true };
+                    }
+                }
                 return { action: CloseAction.Restart };
             },
         },
     };
 
-    client = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
-    clientsBySolution.set(clientKey, client);
-    wireEditorDebugCommandHandler(client);
-    wireNuGetCredentials(client, context);
+    const connection = new LanguageClient('roslynSense', 'RoslynSense', serverOptions, clientOptions);
+    client = connection;
+    clientsBySolution.set(clientKey, connection);
+    watchersByClient.set(connection, workspaceWatchers);
+    wireEditorDebugCommandHandler(connection);
+    wireNuGetCredentials(connection, context);
     // The server's self-diagnostics (roslynSense/debugLog) land in the shared debug channel
     // rather than the main output: they are about the tool's health, not the user's solution.
-    client.onNotification('roslynSense/debugLog', (params: { message: string }) =>
+    connection.onNotification('roslynSense/debugLog', (params: { message: string }) =>
         extensionDebug().appendLine(`[server] ${params.message}`));
-    client.onDidChangeState((e) => {
-        if (!statusItem) {
+    connection.onDidChangeState((e) => {
+        if (!statusItem || client !== connection) {
             return;
         }
         if (e.newState === State.Starting) {
@@ -987,14 +1019,17 @@ async function startClient(
     statusItem.command = { title: 'Pick Solution', command: 'roslynSense.openSolution' };
 
     try {
-        await client.start();
+        await connection.start();
+        if (client !== connection) {
+            return;
+        }
         void vscode.commands.executeCommand('setContext', 'roslynSense.serverMissing', false);
         statusItem.busy = false;
         statusItem.severity = vscode.LanguageStatusSeverity.Information;
         statusItem.text = solutionPath
             ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
             : 'RoslynSense: running';
-        warnOnOutdatedServer(client.initializeResult?.serverInfo?.version);
+        warnOnOutdatedServer(connection.initializeResult?.serverInfo?.version);
         refreshInheritanceMarkers?.();
         sendBreakpointSnapshot();
     } catch (err) {
@@ -1002,8 +1037,14 @@ async function startClient(
         // restart/pick-solution paths start clean instead of rejecting forever. Out of the map as
         // well as out of `client`: a dead entry left in it holds the executeCommand claim above,
         // so every later client in the window would connect without its commands.
-        clientsBySolution.delete(bindingKey(solutionPath, binding?.folder));
-        void client.dispose().then(undefined, () => undefined);
+        if (clientsBySolution.get(clientKey) === connection) {
+            clientsBySolution.delete(clientKey);
+        }
+        disposeClientWatchers(connection);
+        void connection.dispose().then(undefined, () => undefined);
+        if (client !== connection) {
+            return;
+        }
         client = undefined;
         statusItem.busy = false;
         statusItem.severity = vscode.LanguageStatusSeverity.Error;
@@ -1058,8 +1099,8 @@ function fileFilter(language: string, folder: vscode.WorkspaceFolder | undefined
  * since the two run as the same user on the same machine. Every kind lives under it: decompiled
  * output, Source Link downloads, sources extracted from a PDB, and reference source.
  */
-function externalSourceFilter(): { scheme: string; language: string; pattern: string } {
-    return { scheme: 'file', language: 'csharp', pattern: externalSourceGlob(os.tmpdir()) };
+function externalSourceFilters(): { scheme: string; language: string; pattern: string }[] {
+    return externalSourceGlobs(os.tmpdir()).map(pattern => ({ scheme: 'file', language: 'csharp', pattern }));
 }
 
 /**
@@ -1087,6 +1128,7 @@ async function stopClient(): Promise<void> {
     client = undefined; // clear first: a failed stop must not wedge future restarts
 
     for (const current of running) {
+        disposeClientWatchers(current);
         try {
             if (current.needsStop()) {
                 await current.stop();
@@ -1097,6 +1139,13 @@ async function stopClient(): Promise<void> {
             // Already stopped or never started — nothing to do.
         }
     }
+}
+
+function disposeClientWatchers(connection: LanguageClient): void {
+    for (const watcher of watchersByClient.get(connection) ?? []) {
+        watcher.dispose();
+    }
+    watchersByClient.delete(connection);
 }
 
 /**
@@ -1179,66 +1228,6 @@ function updateStatusText(solutionPath: string | undefined): void {
             ? `RoslynSense: ${vscode.workspace.asRelativePath(solutionPath)}`
             : 'RoslynSense: running';
     }
-}
-
-// After the user types "///" on an empty line, ask the server for an XML doc skeleton
-// (custom roslynSense/onAutoInsert) and place the caret inside <summary>.
-function registerOnAutoInsert(context: vscode.ExtensionContext): void {
-    context.subscriptions.push(
-        vscode.workspace.onDidChangeTextDocument(async (e) => {
-            if (
-                !client ||
-                e.document.languageId !== 'csharp' ||
-                e.contentChanges.length !== 1 ||
-                !e.contentChanges[0].text.endsWith('/')
-            ) {
-                return;
-            }
-            const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document !== e.document) {
-                return;
-            }
-            const change = e.contentChanges[0];
-            const position = change.range.start.translate(0, change.text.length);
-            const linePrefix = e.document.lineAt(position.line).text.substring(0, position.character);
-            if (linePrefix.trimStart() !== '///') {
-                return;
-            }
-
-            interface AutoInsertResult {
-                edit: { range: unknown; newText: string };
-                cursor: { line: number; character: number };
-            }
-            const result = await client.sendRequest<AutoInsertResult | null>(
-                'roslynSense/onAutoInsert',
-                {
-                    textDocument: { uri: code2Protocol(e.document.uri) },
-                    position: { line: position.line, character: position.character },
-                }
-            );
-            if (!result) {
-                return;
-            }
-            // The request round-tripped the server; bail if the buffer moved on meanwhile,
-            // otherwise the skeleton lands at a stale offset.
-            if (
-                editor.document.version !== e.document.version ||
-                editor.document.lineAt(position.line).text.substring(0, position.character) !==
-                    linePrefix
-            ) {
-                return;
-            }
-
-            const applied = await editor.edit(
-                (builder) => builder.insert(position, result.edit.newText),
-                { undoStopBefore: true, undoStopAfter: true }
-            );
-            if (applied) {
-                const cursor = new vscode.Position(result.cursor.line, result.cursor.character);
-                editor.selection = new vscode.Selection(cursor, cursor);
-            }
-        })
-    );
 }
 
 /**
@@ -1327,87 +1316,6 @@ async function runTestFromLens(
     terminal.show();
     const project = projectPath ? ` "${projectPath}"` : '';
     terminal.sendText(`dotnet test${project} --filter "FullyQualifiedName~${fullyQualifiedName}"`);
-}
-
-/**
- * How long the lens list waits for the pre-resolve before going out unresolved.
- *
- * The failure this guards is worse than the one it fixes: a resolve that blocks on the project
- * load gate would hold back every lens in the document, so a file that showed stale-but-visible
- * lenses would show none at all. Past the deadline the list goes out as it came, the editor
- * resolves it the usual way, and the requests already in flight are not wasted — the server
- * memoizes a resolve, so the editor's own round trip finds the answer waiting.
- */
-const LENS_PRE_RESOLVE_TIMEOUT_MS = 400;
-
-/**
- * Resolve the lenses on screen before the editor is handed the list they belong to.
- *
- * See codeLensPrewarm.ts for why this exists and what it costs. The one rule that matters here is
- * that nothing in it may reject: a middleware that throws loses every lens in the document, which
- * is a far louder bug than the one being fixed.
- */
-async function preResolveVisibleLenses(
-    document: vscode.TextDocument,
-    lenses: vscode.CodeLens[],
-    token: vscode.CancellationToken,
-): Promise<vscode.CodeLens[]> {
-    const active = client;
-
-    if (!active) {
-        return lenses;
-    }
-
-    const visible = vscode.window.visibleTextEditors
-        .filter((editor) => editor.document === document)
-        .flatMap((editor) => editor.visibleRanges);
-
-    const chosen = lensesToPreResolve(lenses, visible);
-
-    if (chosen.length === 0) {
-        return lenses;
-    }
-
-    const resolving = Promise.allSettled(
-        chosen.map(async (index) => {
-            // asCodeLens carries `data` across only for the client's own ProtocolCodeLens, which is
-            // what `next` returned; anything else round-trips as a bare range and comes back
-            // uncommanded, which the merge below then declines to take.
-            const sent = active.code2ProtocolConverter.asCodeLens(lenses[index]);
-            const answer = (await active.sendRequest('codeLens/resolve', sent, token)) as typeof sent;
-
-            return [index, active.protocol2CodeConverter.asCodeLens(answer)] as const;
-        }),
-    );
-
-    let expire: ReturnType<typeof setTimeout> | undefined;
-
-    const outcomes = await Promise.race([
-        resolving,
-        new Promise<undefined>((resolve) => {
-            expire = setTimeout(() => resolve(undefined), LENS_PRE_RESOLVE_TIMEOUT_MS);
-        }),
-    ]);
-
-    if (expire !== undefined) {
-        clearTimeout(expire);
-    }
-
-    if (outcomes === undefined) {
-        return lenses;
-    }
-
-    const merged = lenses.slice();
-
-    for (const outcome of outcomes) {
-        // A lens that came back without a command is no better than the one already in the list,
-        // and swapping it in would only discard the `data` the editor still needs to resolve it.
-        if (outcome.status === 'fulfilled' && outcome.value[1]?.command) {
-            merged[outcome.value[0]] = outcome.value[1];
-        }
-    }
-
-    return merged;
 }
 
 function registerLensCommands(context: vscode.ExtensionContext): void {
@@ -2725,9 +2633,33 @@ interface StructuredVariable {
     value: string;
     type: string;
     variablesReference: number;
+    evaluateName?: string;
     namedChildCount: number;
     indexedChildCount: number;
     evaluable: boolean;
+    /** What the row is — "property", "field", "static", "raw", ... — when the backend says. */
+    kind?: string;
+}
+
+/**
+ * The DAP presentation hint for a row, mirroring DapServer.PresentationHint: VS Code draws a
+ * property, a field and a virtual node ("Raw View", "Static members") with different glyphs,
+ * and greys out what cannot be edited.
+ */
+function presentationHintFor(v: StructuredVariable): { kind: string; attributes?: string[] } | undefined {
+    if (!v.kind) { return undefined; }
+    let kind: string | undefined;
+    switch (v.kind) {
+        case 'property': case 'proxy': kind = 'property'; break;
+        case 'field': case 'local': case 'arg': case 'element': case 'static': case 'constant': case 'exception': kind = 'data'; break;
+        case 'raw': case 'results': case 'statics': case 'nonpublic': case 'diagnostic': case 'return': kind = 'virtual'; break;
+        default: return undefined;
+    }
+    const attributes: string[] = [];
+    if (v.kind === 'static') { attributes.push('static'); }
+    if (v.kind === 'constant') { attributes.push('constant'); }
+    if (!v.evaluable && ['property', 'field', 'static', 'constant', 'proxy'].includes(v.kind)) { attributes.push('readOnly'); }
+    return attributes.length > 0 ? { kind, attributes } : { kind };
 }
 
 function parseJson<T>(text: string): T | undefined {
@@ -2749,6 +2681,18 @@ class AiDebugAdapter implements vscode.DebugAdapter {
     // cannot tell two stops on the same line apart, and a chat-issued step lands on a new stop
     // faster than the poll can see the running state in between.
     private lastStopSeq = 0;
+    private readonly scopeFrames = new Map<number, number>();
+    private nextScope = 0x7fffffff;
+    private scopeFrame(reference: number): number | undefined {
+        return reference >= SCOPE_BASE && reference < SCOPE_BASE + SCOPE_RANGE
+            ? reference - SCOPE_BASE : this.scopeFrames.get(reference);
+    }
+    private scopeFor(frame: number): number {
+        if (frame >= 0 && frame < SCOPE_RANGE) return SCOPE_BASE + frame;
+        const reference = --this.nextScope;
+        this.scopeFrames.set(reference, frame);
+        return reference;
+    }
     private pollTimer: NodeJS.Timeout | undefined;
     private disposed = false;
 
@@ -2780,6 +2724,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
     }
 
     private event(event: string, body?: unknown): void {
+        if (event === 'continued' || event === 'stopped' || event === 'terminated') this.scopeFrames.clear();
         this.send({ type: 'event', event, body });
     }
 
@@ -2796,9 +2741,12 @@ class AiDebugAdapter implements vscode.DebugAdapter {
 
     /// Runs a command whose result is a JSON payload, returning undefined when it failed or
     /// came back as something other than JSON.
-    private async structured<T>(action: string, extra?: Record<string, unknown>): Promise<T | undefined> {
+    private async structured<T>(action: string, extra?: Record<string, unknown>, required = false): Promise<T | undefined> {
         const result = await this.command(action, extra);
-        return result.ok ? parseJson<T>(result.result) : undefined;
+        if (!result.ok && required) throw new Error(result.result);
+        const value = result.ok ? parseJson<T>(result.result) : undefined;
+        if (required && value === undefined) throw new Error('The debugger returned an invalid inspection response.');
+        return value;
     }
 
     private async currentSession(): Promise<DebugSessionInfo | undefined> {
@@ -2839,7 +2787,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                     // All three are emulated server-side; neither engine implements them.
                     supportsHitConditionalBreakpoints: true,
                     supportsLogPoints: true,
-                    supportsDataBreakpoints: true,
+                    supportsDataBreakpoints: false,
                     supportsExceptionInfoRequest: true,
                     supportsExceptionFilterOptions: true,
                     exceptionBreakpointFilters: [
@@ -2899,7 +2847,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
             }
 
             case 'stackTrace': {
-                const frames = await this.structured<StructuredFrame[]>('frames');
+                const frames = await this.structured<StructuredFrame[]>('frames', { threadId: request.arguments?.threadId ?? 0 });
                 if (frames?.length) {
                     this.respond(request, {
                         stackFrames: frames.map((f) => ({
@@ -2944,7 +2892,7 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 this.respond(request, {
                     scopes: [{
                         name: 'Locals',
-                        variablesReference: SCOPE_BASE + (request.arguments?.frameId ?? 0),
+                        variablesReference: this.scopeFor(request.arguments?.frameId ?? 0),
                         expensive: false,
                     }],
                 });
@@ -2952,13 +2900,10 @@ class AiDebugAdapter implements vscode.DebugAdapter {
 
             case 'variables': {
                 const reference: number = request.arguments?.variablesReference ?? SCOPE_BASE;
-                const variables = reference >= SCOPE_BASE && reference < SCOPE_BASE + SCOPE_RANGE
-                    ? await this.structured<StructuredVariable[]>('variables', {
-                        frameId: reference - SCOPE_BASE,
-                    })
-                    : await this.structured<StructuredVariable[]>('children', {
-                        variablesReference: reference,
-                    });
+                const frame = this.scopeFrame(reference);
+                const variables = frame !== undefined
+                    ? await this.structured<StructuredVariable[]>('variables', { frameId: frame }, true)
+                    : await this.structured<StructuredVariable[]>('children', { variablesReference: reference }, true);
 
                 this.respond(request, {
                     variables: (variables ?? []).map((v) => ({
@@ -2968,17 +2913,21 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                         variablesReference: v.variablesReference,
                         namedVariables: v.namedChildCount || undefined,
                         indexedVariables: v.indexedChildCount || undefined,
-                        evaluateName: v.name,
+                        evaluateName: v.evaluateName,
+                        presentationHint: presentationHintFor(v),
                     })),
                 });
                 return;
             }
 
             case 'setVariable': {
+                const reference = request.arguments?.variablesReference ?? SCOPE_BASE;
+                const frame = this.scopeFrame(reference);
                 const result = await this.command('set_variable', {
+                    frameId: frame ?? 0,
+                    variablesReference: frame !== undefined ? 0 : reference,
                     expression: request.arguments?.name,
                     value: request.arguments?.value,
-                    frameId: 0,
                 });
                 if (!result.ok) {
                     this.respond(request, undefined, false, result.result);
@@ -3053,11 +3002,18 @@ class AiDebugAdapter implements vscode.DebugAdapter {
             }
 
             case 'evaluate': {
-                const result = await this.command('evaluate', {
+                const result = await this.structured<{ ok: boolean; variable?: StructuredVariable; error: string }>('evaluate_variable', {
                     expression: request.arguments?.expression,
+                    frameId: request.arguments?.frameId ?? 0,
                 });
-                this.respond(request, { result: result.result, variablesReference: 0 }, result.ok,
-                    result.ok ? undefined : result.result);
+                const variable = result?.variable;
+                this.respond(request, variable ? {
+                    result: variable.value,
+                    type: variable.type || undefined,
+                    variablesReference: variable.variablesReference,
+                    presentationHint: presentationHintFor(variable),
+                } : undefined, result?.ok ?? false,
+                    result?.ok ? undefined : result?.error ?? 'Evaluation failed.');
                 return;
             }
 
@@ -3103,48 +3059,14 @@ class AiDebugAdapter implements vscode.DebugAdapter {
                 return;
             }
 
-            case 'dataBreakpointInfo': {
-                // The id has to survive a round trip through VSCode, so it carries the frame the
-                // name was read in rather than a handle the server would have to remember.
-                const name: string = request.arguments?.name ?? '';
-                const frameId: number = request.arguments?.frameId ?? 0;
-                this.respond(request, name.length === 0
-                    ? { dataId: null, description: 'Break on value change needs a named value.' }
-                    : {
-                        dataId: `${frameId}:${name}`,
-                        description: `${name} (break when the value changes)`,
-                        // A read leaves the value alone, so it cannot be seen by comparing one.
-                        accessTypes: ['write'],
-                        canPersist: false,
-                    });
+            case 'dataBreakpointInfo':
+                this.respond(request, { dataId: null, description: 'This backend does not implement native data breakpoints.' });
                 return;
-            }
-
-            case 'setDataBreakpoints': {
-                const wanted: { dataId: string; accessType?: string; condition?: string; hitCondition?: string }[] =
-                    request.arguments?.breakpoints ?? [];
-
-                const result = await this.command('set_data_breakpoints', {
-                    dataBreakpoints: wanted.map((bp) => ({
-                        dataId: bp.dataId,
-                        expression: bp.dataId.slice(bp.dataId.indexOf(':') + 1),
-                        accessType: bp.accessType ?? 'write',
-                        condition: bp.condition,
-                        hitCondition: bp.hitCondition,
-                    })),
-                });
-
-                const statuses = result.ok
-                    ? parseJson<{ verified: boolean; message: string }[]>(result.result) ?? []
-                    : [];
-                this.respond(request, {
-                    breakpoints: wanted.map((_, i) => ({
-                        verified: statuses[i]?.verified ?? false,
-                        message: statuses[i]?.message || undefined,
-                    })),
-                }, result.ok, result.ok ? undefined : result.result);
+            case 'setDataBreakpoints':
+                this.respond(request, { breakpoints: (request.arguments?.breakpoints ?? []).map(() => ({
+                    verified: false, message: 'Sampled watches cannot reliably detect every write.',
+                })) });
                 return;
-            }
 
             case 'pause': {
                 const result = await this.command('pause');
@@ -3602,7 +3524,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerConfigurationSync(context);
     registerConfigFileWatch(context);
     registerLensCommands(context);
-    registerOnAutoInsert(context);
+    registerOnAutoInsert(context, () => client, code2Protocol);
     registerProcessStatusBar(context);
     registerInheritanceMarkers(context);
     registerDebugBridge(context);

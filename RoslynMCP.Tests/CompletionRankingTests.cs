@@ -399,14 +399,16 @@ public class CompletionRankingTests
             }
             """;
 
-        var (items, cache) = await CompleteWithCacheAsync(source, "return value.Shout");
+        CompletionItem? resolved = null;
+        var (items, cache) = await CompleteWithCacheAsync(source, "return value.Shout", async (list, activeCache) =>
+            resolved = await CompletionHandler.ResolveAsync(list.Items.First(i => i.Label == "ShoutRanking"), activeCache, default));
 
         var shout = Array.Find(items, i => i.Label == "ShoutRanking");
         Assert.True(shout is not null,
             $"import completion missed the extension; got: {string.Join(", ", items.Take(10).Select(i => i.Label))}");
         Assert.Equal("SampleProject.Ranking", shout!.Detail);
 
-        var resolved = await CompletionHandler.ResolveAsync(shout, cache, default);
+        Assert.NotNull(resolved);
         Assert.NotNull(resolved.AdditionalTextEdits);
         Assert.Contains(resolved.AdditionalTextEdits!, e => e.NewText.Contains("using SampleProject.Ranking", StringComparison.Ordinal));
     }
@@ -499,8 +501,10 @@ public class CompletionRankingTests
             }
             """;
 
+        CompletionItem? resolved = null;
         var (list, cache) = await WithEditRangeDefaultAsync(
-            true, () => CompleteListAsync(source, "return value.Shout"));
+            true, () => CompleteListAsync(source, "return value.Shout", async (activeList, activeCache) =>
+                resolved = await CompletionHandler.ResolveAsync(activeList.Items.First(i => i.Label == "ShoutRanking"), activeCache, default)));
 
         var shout = Array.Find(list.Items, i => i.Label == "ShoutRanking");
         Assert.True(shout is not null,
@@ -508,7 +512,7 @@ public class CompletionRankingTests
         Assert.Null(shout!.TextEdit);
 
         // The resolve key rides in per-item data, which no default replaced.
-        var resolved = await CompletionHandler.ResolveAsync(shout, cache, default);
+        Assert.NotNull(resolved);
         Assert.NotNull(resolved.AdditionalTextEdits);
         Assert.Contains(resolved.AdditionalTextEdits!, e => e.NewText.Contains("using SampleProject.Ranking", StringComparison.Ordinal));
     }
@@ -651,14 +655,14 @@ public class CompletionRankingTests
         (await CompleteWithCacheAsync(source, anchor)).Items;
 
     private static async Task<(CompletionItem[] Items, LspResolveCache Cache)> CompleteWithCacheAsync(
-        string source, string anchor)
+        string source, string anchor, Func<CompletionList, LspResolveCache, Task>? inspect = null)
     {
-        var (list, cache) = await CompleteListAsync(source, anchor);
+        var (list, cache) = await CompleteListAsync(source, anchor, inspect);
         return (list.Items, cache);
     }
 
     private static async Task<(CompletionList List, LspResolveCache Cache)> CompleteListAsync(
-        string source, string anchor)
+        string source, string anchor, Func<CompletionList, LspResolveCache, Task>? inspect = null)
     {
         string path = FixturePaths.CalculatorFile;
         string sessionId = $"ranking-{Guid.NewGuid():N}";
@@ -696,6 +700,7 @@ public class CompletionRankingTests
                 default);
 
             Assert.NotEmpty(list.Items);
+            if (inspect is not null) await inspect(list, cache);
             return (list, cache);
         }
         finally

@@ -19,6 +19,48 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
     : IClassFixture<NetFxLocalsDisplayTests.StoppedTargetFixture>
 {
     [RequiresX86WorkerFact]
+    public async Task CompiledExpressionsWorkInsideTheThirtyTwoBitWorker()
+    {
+        var arithmetic = await fixture.EvaluateAsync("a.Child.Number + 5 * 2");
+        Assert.True(arithmetic.Ok, arithmetic.Error);
+        Assert.Equal("27", arithmetic.Value);
+        var query = await fixture.EvaluateAsync("orderIds.Where(x => x > 7).Count()");
+        Assert.True(query.Ok, query.Error);
+        Assert.Equal("2", query.Value);
+    }
+
+    [RequiresX86WorkerFact]
+    public async Task HoverEvaluationSurvivesTheWorkerWithAnExpandableObject()
+    {
+        var result = await fixture.EvaluateVariableAsync("a.Child");
+        Assert.True(result.Ok, result.Error);
+        Assert.NotNull(result.Variable);
+        Assert.NotEmpty(result.Variable.VariablesReference);
+        var members = await fixture.ExpandAsync(result.Variable.VariablesReference);
+        Assert.Equal("17", Assert.Single(members, v => v.Name == "Number").Value);
+        var missing = await fixture.EvaluateVariableAsync("doesNotExist");
+        Assert.False(missing.Ok);
+        Assert.Null(missing.Variable);
+        Assert.NotEmpty(missing.Error);
+    }
+
+    [RequiresX86WorkerFact]
+    public async Task ForeachVariableIsNamedAndCanBeTraversed()
+    {
+        var locals = await fixture.LocalsAsync();
+        var item = Assert.Single(locals, v => v.Name == "a");
+        Assert.NotEmpty(item.VariablesReference);
+        var children = await fixture.ExpandAsync(item.VariablesReference);
+        var nested = Assert.Single(children, v => v.Name == "Child");
+        Assert.NotEmpty(nested.VariablesReference);
+        var members = await fixture.ExpandAsync(nested.VariablesReference);
+        Assert.Equal("17", Assert.Single(members, v => v.Name == "Number").Value);
+        var (ok, value, error) = await fixture.EvaluateAsync("a.Child.Number");
+        Assert.True(ok, error);
+        Assert.Equal("17", value);
+    }
+
+    [RequiresX86WorkerFact]
     public async Task WhenAListLocalIsShownThenItsDisplayStringHasTheRealCount()
     {
         var locals = await fixture.LocalsAsync();
@@ -84,7 +126,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var array = Assert.Single(locals, v => v.Name == "scores");
-        Assert.Equal("int[2]", array.Value);
+        Assert.Equal("{int[2]}", array.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -123,8 +165,12 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
 
         var members = await fixture.ExpandAsync(entry.VariablesReference);
 
-        Assert.Equal("\"a\"", Assert.Single(members, m => m.Name == "key").Value);
-        Assert.Equal("1", Assert.Single(members, m => m.Name == "value").Value);
+        // The pair's properties, as VS lists them; the fields behind them are the Raw View's.
+        Assert.Equal("\"a\"", Assert.Single(members, m => m.Name == "Key").Value);
+        Assert.Equal("1", Assert.Single(members, m => m.Name == "Value").Value);
+        var raw = Assert.Single(members, m => m.Name == "Raw View");
+        var fields = await fixture.ExpandAsync(raw.VariablesReference);
+        Assert.Equal("\"a\"", Assert.Single(fields, m => m.Name == "key").Value);
     }
 
     [RequiresX86WorkerFact]
@@ -160,7 +206,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var when = Assert.Single(locals, v => v.Name == "when");
-        Assert.Equal("01/02/2020 03:04:05", when.Value);
+        Assert.Equal("{01/02/2020 03:04:05}", when.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -169,7 +215,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var wait = Assert.Single(locals, v => v.Name == "wait");
-        Assert.Equal("00:05:00", wait.Value);
+        Assert.Equal("{00:05:00}", wait.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -178,7 +224,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var id = Assert.Single(locals, v => v.Name == "id");
-        Assert.Equal("11111111-2222-3333-4444-555555555555", id.Value);
+        Assert.Equal("{11111111-2222-3333-4444-555555555555}", id.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -205,7 +251,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var point = Assert.Single(locals, v => v.Name == "point");
-        Assert.Equal("(3, 4)", point.Value);
+        Assert.Equal("{(3, 4)}", point.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -269,8 +315,15 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
 
         var members = await fixture.ExpandAsync(error.VariablesReference);
 
+        // The exception reads as its message, and its public surface is listed the way VS
+        // lists a framework type: Message inline, and the fields under "Non-Public members".
+        Assert.Equal("{\"bad\"}", error.Value);
+        Assert.Equal("\"bad\"", Assert.Single(members, m => m.Name == "Message").Value);
+        Assert.DoesNotContain(members, m => m.Name == "_message");
+        var nonPublic = Assert.Single(members, m => m.Name == "Non-Public members");
+        var hidden = await fixture.ExpandAsync(nonPublic.VariablesReference);
         // _message is declared on System.Exception, one assembly away from the leaf type.
-        Assert.Equal("\"bad\"", Assert.Single(members, m => m.Name == "_message").Value);
+        Assert.Equal("\"bad\"", Assert.Single(hidden, m => m.Name == "_message").Value);
     }
 
     [RequiresX86WorkerFact]
@@ -328,7 +381,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
     }
 
     [RequiresX86WorkerFact]
-    public async Task WhenALazyEnumerableIsExpandedThenAResultsViewIsOffered()
+    public async Task WhenALazyEnumerableIsExpandedThenItsElementsAreListed()
     {
         var locals = await fixture.LocalsAsync();
         var filtered = Assert.Single(locals, v => v.Name == "filtered");
@@ -336,23 +389,36 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
 
         var children = await fixture.ExpandAsync(filtered.VariablesReference);
 
-        var results = Assert.Single(children, c => c.Name == "Results View");
-        Assert.False(string.IsNullOrEmpty(results.VariablesReference), "the Results View is not expandable");
+        // Where(x => x < 9) over { 7, 8, 9 } produces 7 and 8, run when the value is expanded —
+        // the elements are the listing, and the iterator's own state is under Raw View.
+        Assert.Equal(["[0]", "[1]", "Raw View"], children.Select(c => c.Name));
+        Assert.Equal("7", children[0].Value);
+        Assert.Equal("8", children[1].Value);
     }
 
     [RequiresX86WorkerFact]
-    public async Task WhenTheResultsViewIsExpandedThenTheElementsAreEnumerated()
+    public async Task WhenResultsAreNotEnumeratedThenTheyAreBehindAResultsView()
     {
-        var locals = await fixture.LocalsAsync();
-        var filtered = Assert.Single(locals, v => v.Name == "filtered");
-        var children = await fixture.ExpandAsync(filtered.VariablesReference);
-        var results = Assert.Single(children, c => c.Name == "Results View");
+        try
+        {
+            fixture.SetDisplayOptions(new DebugDisplayOptions { EnumerateResults = false });
+            var locals = await fixture.LocalsAsync();
+            var filtered = Assert.Single(locals, v => v.Name == "filtered");
+            var children = await fixture.ExpandAsync(filtered.VariablesReference);
 
-        var elements = await fixture.ExpandAsync(results.VariablesReference);
+            // The VS shape: the iterator's members, and the elements one expansion further.
+            Assert.DoesNotContain(children, c => c.Name == "[0]");
+            var results = Assert.Single(children, c => c.Name == "Results View");
+            Assert.False(string.IsNullOrEmpty(results.VariablesReference), "the Results View is not expandable");
 
-        // Where(x => x < 9) over { 7, 8, 9 } produces 7 and 8, materialized on demand.
-        Assert.Equal("7", Assert.Single(elements, e => e.Name == "[0]").Value);
-        Assert.Equal("8", Assert.Single(elements, e => e.Name == "[1]").Value);
+            var elements = await fixture.ExpandAsync(results.VariablesReference);
+            Assert.Equal("7", Assert.Single(elements, e => e.Name == "[0]").Value);
+            Assert.Equal("8", Assert.Single(elements, e => e.Name == "[1]").Value);
+        }
+        finally
+        {
+            fixture.RestoreDisplayOptions();
+        }
     }
 
     [RequiresX86WorkerFact]
@@ -369,7 +435,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var grid = Assert.Single(locals, v => v.Name == "grid");
-        Assert.Equal("int[2,3]", grid.Value);
+        Assert.Equal("{int[2,3]}", grid.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -408,7 +474,7 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var locals = await fixture.LocalsAsync();
 
         var jagged = Assert.Single(locals, v => v.Name == "jagged");
-        Assert.Equal("int[2][]", jagged.Value);
+        Assert.Equal("{int[2][]}", jagged.Value);
     }
 
     [RequiresX86WorkerFact]
@@ -425,8 +491,54 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         var elements = await fixture.ExpandAsync(middle.VariablesReference);
 
         // Expanding a range starts at that range, not back at the beginning of the array.
-        Assert.DoesNotContain(elements, c => c.Name == "[0]");
+        Assert.Equal(Enumerable.Range(100, 100).Select(index => $"[{index}]"), elements.Select(c => c.Name));
         Assert.Equal("55", Assert.Single(elements, c => c.Name == "[100]").Value);
+    }
+
+    [RequiresX86WorkerFact]
+    public async Task WhenTheChildLimitIsOneThenArrayRangesStillReachEveryElement()
+    {
+        fixture.SetMaxChildren(1);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try
+        {
+            var pending = new Queue<string>(["many"]);
+            var visited = new HashSet<string>();
+            var elements = new Dictionary<string, string>();
+            while (pending.TryDequeue(out var path))
+            {
+                Assert.True(visited.Add(path), $"The range {path} did not narrow the array.");
+                var children = await fixture.ExpandAsync(path).WaitAsync(deadline.Token);
+                Assert.InRange(children.Count, 1, 2);
+                foreach (var child in children)
+                {
+                    if (child.Name.Contains("..", StringComparison.Ordinal))
+                    {
+                        Assert.False(string.IsNullOrEmpty(child.VariablesReference));
+                        pending.Enqueue(child.VariablesReference);
+                    }
+                    else
+                    {
+                        Assert.True(elements.TryAdd(child.Name, child.Value), $"Duplicate element {child.Name}.");
+                    }
+                }
+            }
+
+            Assert.Equal(250, elements.Count);
+            for (int index = 0; index < 250; index++)
+                Assert.Equal(index == 100 ? "55" : "0", elements[$"[{index}]"]);
+        }
+        catch
+        {
+            // A regressed page=1 loop spins inside the worker. Kill that process directly,
+            // so neither teardown nor the next test waits for it to service another request.
+            fixture.AbortWorker();
+            throw;
+        }
+        finally
+        {
+            fixture.RestoreDisplayOptions();
+        }
     }
 
     [RequiresX86WorkerFact]
@@ -637,7 +749,11 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
                         int captured = 123;
                         Func<int, bool> predicate = delegate(int v) { return v > captured; };
                         Tagged[] tags = new Tagged[] { new Tagged(5) };
+                        foreach (var a in new[] { new Node { Child = new Node { Number = 17 } } })
+                        {
                         Use(orderIds, someValue, noValue, scores, pairs, day, flavors, price, when, wait, id, letter, boxed, point, error, multiline, huge, half, handle, filtered, grid, jagged, many, captured, predicate, tags);
+                            GC.KeepAlive(a);
+                        }
                     }
 
                     private static bool IsSmall(int value)
@@ -648,6 +764,12 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
                     private static void Use(params object[] values)
                     {
                     }
+                }
+
+                public class Node
+                {
+                    public Node Child { get; set; }
+                    public int Number { get; set; }
                 }
 
                 public static class Program
@@ -672,6 +794,31 @@ public class NetFxLocalsDisplayTests(NetFxLocalsDisplayTests.StoppedTargetFixtur
         public Task<List<DebugVariable>> LocalsAsync() => Stopped().Engine.VariablesAsync(0);
 
         public Task<List<DebugVariable>> ExpandAsync(string path) => Stopped().Engine.ExpandAsync(0, path);
+
+        public void SetMaxChildren(int maxChildren) =>
+            SetDisplayOptions(new DebugDisplayOptions { MaxChildren = maxChildren });
+
+        public void SetDisplayOptions(DebugDisplayOptions options) =>
+            Stopped().Engine.SetDisplayOptions(options);
+
+        public void RestoreDisplayOptions()
+        {
+            lock (_gate)
+                _session?.Engine.SetDisplayOptions(new DebugDisplayOptions());
+        }
+
+        public void AbortWorker()
+        {
+            lock (_gate)
+            {
+                _session?.Engine.Dispose();
+                _session?.Dispose();
+                _session = null;
+            }
+        }
+
+        public Task<(bool Ok, DebugVariable? Variable, string Error)> EvaluateVariableAsync(string expression) =>
+            Stopped().Engine.EvaluateVariableAsync(0, expression);
 
         public Task<(bool Ok, string Value, string Error)> EvaluateAsync(string expression) =>
             Stopped().Engine.EvaluateAsync(0, expression);

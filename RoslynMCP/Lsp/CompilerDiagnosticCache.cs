@@ -46,7 +46,13 @@ internal static class CompilerDiagnosticCache
     // Lazy, not Task: ConcurrentDictionary may invoke a GetOrAdd factory more than once under
     // contention, and the whole point here is that one version is bound once. The push phases and
     // the pull path routinely arrive at the same document within milliseconds of each other.
-    private static readonly ConcurrentDictionary<(DocumentId, string), Lazy<Task<Result>>> s_inFlight = new();
+    private static readonly object s_gate = new();
+    private static readonly Dictionary<(DocumentId, string), DiagnosticFlight<Result>> s_inFlight = new();
+
+    internal static Func<Document, Task>? BeforeComputeAsyncForTesting { get; set; }
+    internal static Func<Task>? BeforeRetireAsyncForTesting { get; set; }
+    internal static Func<Task, Task>? WaitForRetirementAsyncForTesting { get; set; }
+    private static long s_invalidationGeneration;
 
     private static long s_clock;
     private static long s_computations;
@@ -84,6 +90,7 @@ internal static class CompilerDiagnosticCache
         if (version is null)
             return await ComputeAsync(document, version: null, ct);
 
+        ct.ThrowIfCancellationRequested();
         if (s_entries.TryGetValue(document.Id, out var entry) && entry.Version == version)
         {
             // Conditional: a plain assignment is a read-modify-write, and the sweep runs in
@@ -93,25 +100,97 @@ internal static class CompilerDiagnosticCache
         }
 
         var key = (document.Id, version);
-        var work = s_inFlight.GetOrAdd(key,
-            _ => new Lazy<Task<Result>>(() => ComputeAndStoreAsync(document, version, ct)));
-        try
+        long invalidationGeneration = Volatile.Read(ref s_invalidationGeneration);
+        DiagnosticFlight<Result>? retiring = null;
+        while (true)
         {
-            return await work.Value;
-        }
-        finally
-        {
-            s_inFlight.TryRemove(key, out _);
+            ct.ThrowIfCancellationRequested();
+            DiagnosticFlight<Result> work;
+            bool joined;
+            lock (s_gate)
+            {
+                if (retiring is not null && (retiring.Invalidated || s_invalidationGeneration != invalidationGeneration))
+                    return Result.Empty;
+                // The bind may have completed between the fast lookup and acquiring the lock.
+                if (s_entries.TryGetValue(document.Id, out entry) && entry.Version == version)
+                    return entry.Result;
+
+                if (!s_inFlight.TryGetValue(key, out work!))
+                    s_inFlight.Add(key, work = new(flight => ComputeAndStoreAsync(document, version, flight)));
+                joined = !work.Abandoned;
+                if (joined)
+                    work.Waiters++;
+            }
+
+            if (!joined)
+            {
+                Task retirement = work.Work.Value;
+                await (WaitForRetirementAsyncForTesting is { } wait ? wait(retirement) : retirement).WaitAsync(ct);
+                retiring = work;
+                continue;
+            }
+
+            bool released = false;
+            void ReleaseWaiter()
+            {
+                bool cancel;
+                lock (s_gate)
+                {
+                    if (released)
+                        return;
+                    released = true;
+                    cancel = --work.Waiters == 0 && !work.Completed;
+                    if (cancel)
+                        work.Abandoned = true;
+                }
+                if (cancel)
+                    work.Cancel();
+            }
+
+            using var registration = ct.Register(ReleaseWaiter);
+            try { return await work.Work.Value.WaitAsync(ct); }
+            finally { ReleaseWaiter(); }
         }
     }
 
     private static async Task<Result> ComputeAndStoreAsync(
-        Document document, string version, CancellationToken ct)
+        Document document, string version, DiagnosticFlight<Result> work)
     {
-        var result = await ComputeAsync(document, version, ct);
-        s_entries[document.Id] = new Entry(version, result, Interlocked.Increment(ref s_clock));
-        Trim();
-        return result;
+        var key = (document.Id, version);
+        try
+        {
+            if (BeforeComputeAsyncForTesting is { } beforeCompute)
+                await beforeCompute(document).WaitAsync(work.Token);
+            work.Token.ThrowIfCancellationRequested();
+            var result = await ComputeAsync(document, version, work.Token);
+            lock (s_gate)
+            {
+                // Clear/Evict can invalidate a flight while its bind is running. Its original
+                // callers can still use the answer, but the invalidated cache must stay empty.
+                if (!work.Abandoned && s_inFlight.TryGetValue(key, out var current) && ReferenceEquals(current, work))
+                {
+                    s_entries[document.Id] = new Entry(version, result, Interlocked.Increment(ref s_clock));
+                    Trim();
+                }
+            }
+            return result;
+        }
+        catch (OperationCanceledException) when (work.Token.IsCancellationRequested)
+        {
+            return Result.Empty;
+        }
+        finally
+        {
+            if (BeforeRetireAsyncForTesting is { } beforeRetire)
+                await beforeRetire();
+            lock (s_gate)
+            {
+                work.Completed = true;
+                if (s_inFlight.TryGetValue(key, out var current) && ReferenceEquals(current, work))
+                    s_inFlight.Remove(key);
+            }
+            work.Dispose();
+        }
     }
 
     private static async Task<Result> ComputeAsync(Document document, string? version, CancellationToken ct)
@@ -166,14 +245,40 @@ internal static class CompilerDiagnosticCache
             static _ => true);
     }
 
-    public static void Evict(DocumentId documentId) => s_entries.TryRemove(documentId, out _);
+    public static void Evict(DocumentId documentId)
+    {
+        List<DiagnosticFlight<Result>> invalidated = [];
+        lock (s_gate)
+        {
+            s_invalidationGeneration++;
+            s_entries.TryRemove(documentId, out _);
+            foreach (var key in s_inFlight.Keys.Where(key => key.Item1 == documentId).ToArray())
+            {
+                s_inFlight[key].Invalidated = true;
+                invalidated.Add(s_inFlight[key]);
+                s_inFlight.Remove(key);
+            }
+        }
+        foreach (var work in invalidated)
+            work.Cancel();
+    }
 
     /// <summary>Drops everything — .editorconfig can change a compiler diagnostic's severity, so
     /// the same bind of the same text is entitled to a different answer afterwards.</summary>
     public static void Clear()
     {
-        s_entries.Clear();
-        s_inFlight.Clear();
+        DiagnosticFlight<Result>[] invalidated;
+        lock (s_gate)
+        {
+            s_invalidationGeneration++;
+            s_entries.Clear();
+            invalidated = [.. s_inFlight.Values];
+            foreach (var work in invalidated)
+                work.Invalidated = true;
+            s_inFlight.Clear();
+        }
+        foreach (var work in invalidated)
+            work.Cancel();
     }
 
     private static void Trim()
@@ -183,7 +288,8 @@ internal static class CompilerDiagnosticCache
 
         foreach (var stale in s_entries.OrderBy(e => e.Value.Stamp).Take(s_entries.Count - MaxEntries).ToList())
         {
-            s_entries.TryRemove(stale.Key, out _);
+            if (!s_entries.TryRemove(stale))
+                continue;
 
             // The member-edit record is written before either cache has an entry, and is only
             // useful while one of them does. Dropped here as well as from the analyzer cache's

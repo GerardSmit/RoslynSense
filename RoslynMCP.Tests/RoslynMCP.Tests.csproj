@@ -14,6 +14,7 @@
           <PrivateAssets>all</PrivateAssets>
         </PackageReference>
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+        <PackageReference Include="Grpc.Tools" Version="2.72.0" PrivateAssets="all" GeneratePathProperty="true" />
         <PackageReference Include="Testcontainers.MsSql" Version="4.14.0" />
         <PackageReference Include="Testcontainers.PostgreSql" Version="4.14.0" />
         <PackageReference Include="xunit" Version="2.9.3" />
@@ -22,6 +23,10 @@
             <PrivateAssets>all</PrivateAssets>
         </PackageReference>
         <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="all" ExcludeAssets="runtime" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <AssemblyMetadata Include="GrpcToolsPath" Value="$(PkgGrpc_Tools)" />
     </ItemGroup>
 
     <!-- Mirror of RoslynMCP's publicized assemblies so tests can reach the same internals. -->
@@ -128,6 +133,7 @@
         <MSBuild Projects="Fixtures\LayeredApp\Storefront\Storefront.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
         <!-- WebApp covers ControlLib through its ProjectReference. -->
         <MSBuild Projects="Fixtures\ControlLibApp\WebApp\WebApp.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
+        <MSBuild Projects="Fixtures\ControlLibApp\Unrelated\Unrelated.csproj" Targets="Restore;Build" Properties="Configuration=Debug" />
     </Target>
 
     <!-- Some tests exercise the artifacts produced by the configuration under test, while the

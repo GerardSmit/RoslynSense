@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
-import { withHotReloadEnvironment } from './hotReload';
 
 /**
  * Build/rebuild/clean/test/watch tasks per project, so `preLaunchTask`, `Ctrl+Shift+B`, and
@@ -112,9 +111,9 @@ export function registerTaskProvider(
                             legacy)
                     );
 
-                    // Hot reload for the ASP.NET inner loop. Real Edit-and-Continue is not on
-                    // offer: netcoredbg has no EnC support at all, so `dotnet watch` is the
-                    // honest version of this feature.
+                    // Hot reload for the ASP.NET inner loop without a debugger attached, for
+                    // whoever prefers it to Run with Hot Reload or to editing under the
+                    // ICorDebug engine.
                     if (project.runnable) {
                         tasks.push(makeTask(
                             { type: TASK_TYPE, task: 'watch', project: project.projectPath },
@@ -198,21 +197,28 @@ export function registerTaskProvider(
                 return;
             }
 
-            // `dotnet run` rather than `dotnet watch`: the deltas come from Roslyn through
-            // roslynSense/hotReloadApply, so the process only has to be started in a state that
-            // accepts them. Watch would rebuild and restart, which is the thing hot reload avoids.
-            const task = makeTask(
-                { type: TASK_TYPE, task: 'watch', project: picked.projectPath },
-                `run ${picked.projectName} (hot reload)`,
-                ['run', '--project', picked.projectPath]);
-
-            task.execution = new vscode.ShellExecution(
-                'dotnet',
-                ['run', '--project', picked.projectPath].map(
-                    (arg) => ({ value: arg, quoting: vscode.ShellQuoting.Strong })),
-                { env: await withHotReloadEnvironment(client, {}, picked.projectPath) });
-
-            await vscode.tasks.executeTask(task);
+            // The launch provider builds before opening the baseline and owns its lifetime.
+            // A shell `dotnet run` builds after baseline creation, invalidating its MVID, and
+            // never reports the session/process events that release the hot reload owner.
+            // Framework applies through its debugger; CoreCLR's runtime updater requires no
+            // attached debugger. Reuse the same supported paths as F5 and Ctrl+F5.
+            const started = await vscode.debug.startDebugging(
+                undefined,
+                {
+                    type: 'roslynsense',
+                    request: 'launch',
+                    name: `${picked.projectName} (hot reload)`,
+                    projectPath: picked.projectPath,
+                    hotReload: true,
+                    ...(picked.isNetFramework ? {} : { console: 'integratedTerminal' }),
+                },
+                { noDebug: !picked.isNetFramework }
+            );
+            if (!started) {
+                void vscode.window.showErrorMessage(
+                    `RoslynSense: could not start ${picked.projectName} with Hot Reload.`
+                );
+            }
         })
     );
 }

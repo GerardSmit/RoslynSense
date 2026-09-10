@@ -28,7 +28,8 @@ internal readonly record struct MetadataConfigurationCandidate(
     string? ReceiverMemberName,
     string? ReceiverTypeName,
     string ContainingTypeName,
-    string ContainingMethodName);
+    string ContainingMethodName,
+    bool IsPrefix = false);
 
 /// <summary>A type and a method, which is all a call site says about what it is calling.</summary>
 internal readonly record struct MetadataForwarderKey(string TypeName, string MethodName);
@@ -215,15 +216,17 @@ internal static class MetadataConfigurationScanner
 
             var candidates = ImmutableArray.CreateBuilder<MetadataConfigurationCandidate>();
             var forwarders = ImmutableArray.CreateBuilder<MetadataConfigurationForwarder>();
+            var constants = new MetadataConstantStrings(pe, md);
 
             foreach (var (method, il) in Bodies(pe, md))
             {
                 ReadBody(
                     md, il, TypeName(md, method.GetDeclaringType()), md.GetString(method.Name),
-                    (method.Attributes & MethodAttributes.Static) != 0, candidates, forwarders);
+                    (method.Attributes & MethodAttributes.Static) != 0, candidates, forwarders, constants);
             }
 
-            return new MetadataConfigurationScan(candidates.ToImmutable(), forwarders.ToImmutable());
+            candidates.AddRange(MetadataConfigurationFlow.Scan(pe, md, constants));
+            return new MetadataConfigurationScan([.. candidates.Distinct()], forwarders.ToImmutable());
         }
         catch (Exception ex)
             when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
@@ -253,12 +256,13 @@ internal static class MetadataConfigurationScanner
                 return [];
 
             var candidates = ImmutableArray.CreateBuilder<MetadataConfigurationCandidate>();
+            var constants = new MetadataConstantStrings(pe, md);
 
             foreach (var (method, il) in Bodies(pe, md))
             {
                 ReadForwardedBody(
                     md, il, TypeName(md, method.GetDeclaringType()), md.GetString(method.Name),
-                    wanted, candidates);
+                    wanted, candidates, constants);
             }
 
             return candidates.ToImmutable();
@@ -368,7 +372,8 @@ internal static class MetadataConfigurationScanner
         MetadataReader md, byte[] il, string containingType, string containingMethod,
         bool isStatic,
         ImmutableArray<MetadataConfigurationCandidate>.Builder candidates,
-        ImmutableArray<MetadataConfigurationForwarder>.Builder forwarders)
+        ImmutableArray<MetadataConfigurationForwarder>.Builder forwarders,
+        MetadataConstantStrings constants)
     {
         string? pending = null;
         int? pendingArgument = null;
@@ -391,6 +396,11 @@ internal static class MetadataConfigurationScanner
 
                 case Call or Callvirt:
                 {
+                    if (constants.Resolve(BitConverter.ToInt32(il, i)) is { } literal)
+                    {
+                        pending = literal;
+                        break;
+                    }
                     var (member, declaring) = Member(md, BitConverter.ToInt32(il, i));
 
                     if (member is { Length: > 0 } && declaring is { Length: > 0 }
@@ -448,7 +458,8 @@ internal static class MetadataConfigurationScanner
     private static void ReadForwardedBody(
         MetadataReader md, byte[] il, string containingType, string containingMethod,
         ILookup<string, MetadataForwarderKey> wrappers,
-        ImmutableArray<MetadataConfigurationCandidate>.Builder candidates)
+        ImmutableArray<MetadataConfigurationCandidate>.Builder candidates,
+        MetadataConstantStrings constants)
     {
         string? pending = null;
 
@@ -468,6 +479,11 @@ internal static class MetadataConfigurationScanner
 
                 case Call or Callvirt:
                 {
+                    if (constants.Resolve(BitConverter.ToInt32(il, i)) is { } constant)
+                    {
+                        pending = constant;
+                        break;
+                    }
                     var (member, declaring) = Member(md, BitConverter.ToInt32(il, i));
 
                     if (pending is { Length: > 0 } literal && member is { Length: > 0 }
@@ -541,7 +557,7 @@ internal static class MetadataConfigurationScanner
     }
 
     /// <summary>The called member's name, and the metadata name of the type declaring it.</summary>
-    private static (string? Member, string? DeclaringType) Member(MetadataReader md, int token)
+    internal static (string? Member, string? DeclaringType) Member(MetadataReader md, int token)
     {
         try
         {
@@ -589,7 +605,7 @@ internal static class MetadataConfigurationScanner
         }
     }
 
-    private static string TypeName(MetadataReader md, TypeDefinitionHandle handle)
+    internal static string TypeName(MetadataReader md, TypeDefinitionHandle handle)
     {
         var type = md.GetTypeDefinition(handle);
         return Join(md.GetString(type.Namespace), md.GetString(type.Name));

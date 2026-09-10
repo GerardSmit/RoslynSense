@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using RoslynMCP.Services.Memory;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
@@ -20,6 +21,8 @@ internal sealed record AspxDocument(
     Compilation Compilation,
     AspxParseResult Parse)
 {
+    private static long s_nextBinding;
+    public long BindingId { get; } = Interlocked.Increment(ref s_nextBinding);
     public RootNode? Tree => Parse.ParseTree;
 
     /// <summary>The code-behind class the <c>Inherits</c> directive names, when it resolved.</summary>
@@ -61,8 +64,11 @@ internal static class AspxDocumentService
         ImmutableArray<(DocumentId Id, VersionStamp Version)> CodeBehindVersions,
         AspxDocument Document);
 
-    private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly WeakSnapshotCache<(ProjectId Project, string Path), CacheEntry> s_cache =
+        new("aspx.bound", strongLimit: 16);
+
+    internal static CacheMemoryInfo MemoryInfo => s_cache.Inspect();
+    internal static void ReleaseStrong() => s_cache.ReleaseStrong();
 
     private sealed record WebConfigEntry(
         DateTime WriteTimeUtc,
@@ -85,9 +91,7 @@ internal static class AspxDocumentService
 
         string path = PathHelper.NormalizePath(filePath);
 
-        var sourceText = ReadSourceText(path);
-        if (sourceText is null)
-            return null;
+        if (!OpenDocumentStore.IsOpen(path) && !File.Exists(path)) return null;
 
         string? projectPath = await NonCSharpProjectFinder.FindProjectAsync(path, ct);
         if (string.IsNullOrEmpty(projectPath))
@@ -96,42 +100,60 @@ internal static class AspxDocumentService
         var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
             projectPath, targetFilePath: path, cancellationToken: ct);
 
-        // The staleness test runs before the compilation is asked for: on a hit, a hover in
-        // markup after a C# body edit no longer waits for that edit to compile. The text is
-        // compared by the buffer's own checksum — materializing an open buffer into a string
-        // costs a full copy, and this runs on every request.
-        var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
-        var checksum = sourceText.GetChecksum();
+        return await GetAsync(path, project, ct, retain: OpenDocumentStore.TryGet(path, out _));
+    }
 
-        if (s_cache.TryGetValue(path, out var cached)
-            && cached.SemanticVersion.Equals(semanticVersion)
-            && cached.Checksum.SequenceEqual(checksum)
-            && await UnchangedAsync(project, cached.CodeBehindVersions, ct)
-            && IncludesUnchanged(cached.Document))
+    internal static async Task<AspxDocument?> GetAsync(string filePath, Project project, CancellationToken ct,
+        bool retain = false)
+    {
+        string path = PathHelper.NormalizePath(filePath);
+        var key = (project.Id, path.ToUpperInvariant());
+        long generation = s_cache.Generation;
+        var gate = s_cache.BuildGate(key);
+        await gate.WaitAsync(ct);
+        try
         {
-            return cached.Document;
+            var sourceText = ReadSourceText(path);
+            if (sourceText is null) return null;
+            string? projectPath = project.FilePath;
+            // The staleness test runs before the compilation is asked for: on a hit, a hover in
+            // markup after a C# body edit no longer waits for that edit to compile. The text is
+            // compared by the buffer's own checksum — materializing an open buffer into a string
+            // costs a full copy, and this runs on every request.
+            var semanticVersion = await project.GetDependentSemanticVersionAsync(ct);
+            var checksum = sourceText.GetChecksum();
+
+            if (s_cache.TryGet(key, out var cached, retain)
+                && cached.SemanticVersion.Equals(semanticVersion)
+                && cached.Checksum.SequenceEqual(checksum)
+                && await UnchangedAsync(project, cached.CodeBehindVersions, ct)
+                && IncludesUnchanged(cached.Document))
+            {
+                return cached.Document;
+            }
+
+            var compilation = await project.GetCompilationAsync(ct);
+            if (compilation is null)
+                return null;
+
+            string? projectDir = projectPath is null ? null : Path.GetDirectoryName(projectPath);
+            var (namespaces, imports) = projectDir is null ? default : WebConfigEntries(projectDir);
+
+            string text = sourceText.ToString();
+            var parse = AspxSourceMappingService.Parse(
+                path, text, compilation,
+                namespaces: namespaces.IsDefaultOrEmpty ? null : namespaces,
+                rootDirectory: projectDir,
+                imports: imports);
+
+            var document = new AspxDocument(
+                path, text, sourceText, project, compilation, parse);
+
+            s_cache.Set(key, new CacheEntry(
+                checksum, semanticVersion, await CodeBehindVersionsAsync(project, document, ct), document), generation, retain);
+            return document;
         }
-
-        var compilation = await project.GetCompilationAsync(ct);
-        if (compilation is null)
-            return null;
-
-        string? projectDir = Path.GetDirectoryName(projectPath);
-        var (namespaces, imports) = projectDir is null ? default : WebConfigEntries(projectDir);
-
-        string text = sourceText.ToString();
-        var parse = AspxSourceMappingService.Parse(
-            path, text, compilation,
-            namespaces: namespaces.IsDefaultOrEmpty ? null : namespaces,
-            rootDirectory: projectDir,
-            imports: imports);
-
-        var document = new AspxDocument(
-            path, text, sourceText, project, compilation, parse);
-
-        s_cache[path] = new CacheEntry(
-            checksum, semanticVersion, await CodeBehindVersionsAsync(project, document, ct), document);
-        return document;
+        finally { gate.Release(); }
     }
 
     /// <summary>The text versions of the files declaring the code-behind class, so an edit in
@@ -285,7 +307,7 @@ internal static class AspxDocumentService
 
     /// <summary>Drops a file's memoized parse — used when the file changes on disk under us.</summary>
     public static void Invalidate(string filePath) =>
-        s_cache.TryRemove(PathHelper.NormalizePath(filePath), out _);
+        s_cache.RemoveWhere(k => k.Path == PathHelper.NormalizePath(filePath).ToUpperInvariant());
 
     /// <summary>
     /// Drops every memoized parse. For a <c>web.config</c> change, which is the one edit that
@@ -298,6 +320,7 @@ internal static class AspxDocumentService
     {
         s_cache.Clear();
         s_webConfig.Clear();
+        AspxProjectionService.InvalidateProjects();
     }
 
     /// <summary>
@@ -320,11 +343,7 @@ internal static class AspxDocumentService
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             + Path.DirectorySeparatorChar;
 
-        foreach (var key in s_cache.Keys)
-        {
-            if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                s_cache.TryRemove(key, out _);
-        }
+        s_cache.RemoveWhere(k => k.Path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
 
         foreach (var key in s_webConfig.Keys)
         {

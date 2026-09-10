@@ -137,6 +137,7 @@ internal static class ConfigurationHandler
         updated.Browsable = Bool(debugger, "browsable") ?? current.Browsable;
         updated.JustMyCode = Bool(debugger, "justMyCode") ?? current.JustMyCode;
         updated.RawView = Bool(debugger, "rawView") ?? current.RawView;
+        updated.EnumerateResults = Bool(debugger, "enumerateResults") ?? current.EnumerateResults;
         if (debugger.TryGetProperty("maxChildren", out var max)
             && max.ValueKind == JsonValueKind.Number
             && max.TryGetInt32(out var count) && count > 0)

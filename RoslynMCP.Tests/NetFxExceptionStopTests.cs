@@ -106,8 +106,14 @@ public class NetFxExceptionStopTests
             var exception = Assert.Single(locals, v => v.Name == "$exception");
             Assert.False(string.IsNullOrEmpty(exception.VariablesReference), "the exception is not expandable");
 
+            // The exception reads as its message; its public surface is listed inline and the
+            // fields sit under "Non-Public members", the way VS lists a framework type.
+            Assert.Equal("{\"boom-unhandled\"}", exception.Value);
             var members = await engine.ExpandAsync(0, exception.VariablesReference);
-            Assert.Equal("\"boom-unhandled\"", Assert.Single(members, m => m.Name == "_message").Value);
+            Assert.Equal("\"boom-unhandled\"", Assert.Single(members, m => m.Name == "Message").Value);
+            var nonPublic = Assert.Single(members, m => m.Name == "Non-Public members");
+            var hidden = await engine.ExpandAsync(0, nonPublic.VariablesReference);
+            Assert.Equal("\"boom-unhandled\"", Assert.Single(hidden, m => m.Name == "_message").Value);
 
             engine.Terminate();
         }

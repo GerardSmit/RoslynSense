@@ -229,7 +229,7 @@ public static class CoverageService
         // Build the project
         if (!noBuild)
         {
-            var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
+            var buildArgs = $"\"{PathHelper.WithOnDiskCasing(csprojPath)}\" /nologo /v:minimal " + BuildProcessHelper.NoNodeReuseArg;
             using var buildProcess = new Process
             {
                 StartInfo = new ProcessStartInfo

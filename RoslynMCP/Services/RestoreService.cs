@@ -200,7 +200,9 @@ internal static class RestoreService
         if (PackagesConfigService.Uses(projectPath) && PackagesConfigNeedsRestore(projectPath))
             return RestoreNeed.PackagesConfig;
 
-        if (File.Exists(Path.Combine(projectDir, "obj", "project.assets.json")))
+        // Wherever the project puts it: a project that relocates its intermediates was restored
+        // before every single load, because the file was looked for in obj/ and never found.
+        if (File.Exists(ProjectAssetsFile.Resolve(projectPath)))
             return RestoreNeed.None;
 
         // An SDK project always has a NuGet graph, even with no PackageReference of its own: the
@@ -487,6 +489,11 @@ internal static class RestoreService
     private static async Task<(int ExitCode, string Output)> RunOnceAsync(
         string target, bool staticGraph, RestoreEngine engine, RestoreNeed need)
     {
+        // On-disk casing: the assets file records the project path, and the restore watcher
+        // hashes the assets file, so a restore from "d:\..." after a build from "D:\..."
+        // read as a change of graph and evicted every project the solution had loaded.
+        string restorePath = PathHelper.WithOnDiskCasing(target);
+
         var (fileName, arguments) = engine switch
         {
             // -nr:false so no worker node is left behind holding the project files: a lingering node
@@ -495,12 +502,12 @@ internal static class RestoreService
             // inert on a project that has no packages.config.
             RestoreEngine.VisualStudioMsBuild => (
                 Path.Combine(WorkspaceService.LegacyMsBuildDirectory!, "MSBuild.exe"),
-                $"\"{target}\" -t:Restore -v:quiet -nologo -nr:false"
+                $"\"{restorePath}\" -t:Restore -v:quiet -nologo -nr:false"
                     + (need == RestoreNeed.PackagesConfig ? " -p:RestorePackagesConfig=true" : "")),
 
             _ => (
                 "dotnet",
-                $"restore \"{target}\" --verbosity quiet"
+                $"restore \"{restorePath}\" --verbosity quiet"
                     + (staticGraph ? " /p:RestoreUseStaticGraphEvaluation=true" : "")),
         };
 

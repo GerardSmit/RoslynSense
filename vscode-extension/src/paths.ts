@@ -12,6 +12,8 @@
  * it carries exactly the same bug while looking like it does not.
  */
 
+import * as fs from 'fs';
+
 /** A path reduced to the form that every spelling of the same file shares. */
 export function normalisePath(value: string): string {
     return value.split('\\').join('/').toLowerCase();
@@ -40,6 +42,17 @@ export function isUnder(path: string, directory: string): boolean {
 export function externalSourceGlob(tempDirectory: string): string {
     const root = `${normaliseSeparators(tempDirectory).replace(/\/$/, '')}/RoslynMCP`;
     return `${/^[A-Za-z]:/.test(root) ? root[0].toLowerCase() + root.slice(1) : root}/**/*`;
+}
+
+/** Claim both the environment's cache path and its real spelling (Windows TEMP can use 8.3 names). */
+export function externalSourceGlobs(tempDirectory: string): string[] {
+    const roots = [tempDirectory];
+    try {
+        roots.push(fs.realpathSync.native(tempDirectory));
+    } catch {
+        // Keep the original filter if the temp directory is temporarily unavailable.
+    }
+    return [...new Set(roots.map(externalSourceGlob))];
 }
 
 function normaliseSeparators(value: string): string {

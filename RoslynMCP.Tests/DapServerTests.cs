@@ -13,6 +13,87 @@ namespace RoslynMCP.Tests;
 public class DapServerTests
 {
     [Fact]
+    public async Task ChildEditIsRoutedUsingItsParentReference()
+    {
+        var backend = new FakeBackend();
+        var replies = await ConverseAsync(new PublishingDebugBackend(backend), [Request(1, "setVariable", new JsonObject
+        { ["variablesReference"] = 1007, ["name"] = "Name", ["value"] = "\"new\"" })]);
+        Assert.True(replies.Single()["success"]!.GetValue<bool>());
+        Assert.Equal(1007, backend.LastEditedParent);
+        Assert.Equal("Name", backend.LastEditedName);
+    }
+
+    [Fact]
+    public async Task WatchUsesTheCompletePathEvenForALeaf()
+    {
+        var replies = await ConverseAsync(new FakeBackend(), [Request(1, "variables", new JsonObject { ["variablesReference"] = 1007 })]);
+        var row = replies.Single()["body"]!["variables"]!.AsArray().Single()!;
+        Assert.Equal("order.Customer.Name", row["evaluateName"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task FailedInspectionIsAnErrorResponse()
+    {
+        var replies = await ConverseAsync(new FakeBackend { FailInspection = true }, [Request(1, "variables", new JsonObject { ["variablesReference"] = 1 })]);
+        Assert.False(replies.Single()["success"]!.GetValue<bool>());
+        Assert.Contains("unavailable", replies.Single()["message"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task OtherThreadFramesCanBeEvaluatedAndHaveLocals()
+    {
+        var backend = new FakeBackend { Frames = [new StackFrameInfo(100123, "Other", "", 0, 0, false)] };
+        var replies = await ConverseAsync(backend, [
+            Request(1, "stackTrace", new JsonObject { ["threadId"] = 7 }),
+            Request(2, "scopes", new JsonObject { ["frameId"] = 100000 }),
+            Request(3, "variables", new JsonObject { ["variablesReference"] = int.MaxValue - 1 }),
+            Request(4, "evaluate", new JsonObject { ["frameId"] = 100000, ["expression"] = "otherLocal" }),
+        ]);
+        Assert.All(replies, reply => Assert.True(reply["success"]!.GetValue<bool>(), reply.ToJsonString()));
+        Assert.Equal(100123, backend.LastRequestedFrame);
+        var scopes = replies.Single(r => r["command"]!.GetValue<string>() == "scopes")["body"]!["scopes"]!.AsArray();
+        Assert.True(scopes.Single()!["variablesReference"]!.GetValue<int>() > 0);
+    }
+
+    [Fact]
+    public async Task NativeDataBreakpointRequestsAreExplicitlyUnverified()
+    {
+        var replies = await ConverseAsync(new FakeBackend(), [Request(1, "setDataBreakpoints", new JsonObject
+        { ["breakpoints"] = new JsonArray(new JsonObject { ["dataId"] = "0:total" }) })]);
+        var row = replies.Single()["body"]!["breakpoints"]!.AsArray().Single()!;
+        Assert.False(row["verified"]!.GetValue<bool>());
+        Assert.Contains("native", row["message"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task MirroredHoverPreservesTheStructuredValueThroughTheCommandPipe()
+    {
+        var backend = new FakeBackend();
+        using var pipe = new DebugCommandPipeServer(() => backend, "debug-hover-" + Guid.NewGuid().ToString("N"));
+        var response = await pipe.ExecuteAsync(new DebugPipeRequest("evaluate_variable", "a.Child", FrameId: 3), CancellationToken.None);
+        Assert.True(response.Ok, response.Error);
+        var result = JsonNode.Parse(response.Result!)!;
+        Assert.True(result["ok"]!.GetValue<bool>());
+        Assert.Equal(1007, result["variable"]!["variablesReference"]!.GetValue<int>());
+        Assert.Equal(3, backend.LastRequestedFrame);
+    }
+
+    [Fact]
+    public async Task HoverRetainsExpansionAndRequestedFrameThroughPublishingBackend()
+    {
+        var backend = new FakeBackend();
+        var responses = await ConverseAsync(new PublishingDebugBackend(backend), [
+            Request(1, "evaluate", new JsonObject { ["expression"] = "a.Child", ["frameId"] = 2, ["context"] = "hover" }),
+            Request(2, "variables", new JsonObject { ["variablesReference"] = 1007 }),
+        ]);
+        var body = responses.Single(r => r["command"]!.GetValue<string>() == "evaluate")["body"]!;
+        Assert.Equal("Node", body["type"]!.GetValue<string>());
+        Assert.Equal(1007, body["variablesReference"]!.GetValue<int>());
+        Assert.Equal(2, backend.LastRequestedFrame);
+        Assert.Equal(1007, backend.LastChildReference);
+    }
+
+    [Fact]
     public async Task InitializeAdvertisesWhatTheBackendCanActuallyDo()
     {
         var responses = await ConverseAsync(new FakeBackend(), [
@@ -26,11 +107,11 @@ public class DapServerTests
         // Emulated a layer up rather than by the engine, but true from the client's side.
         Assert.True(capabilities["supportsHitConditionalBreakpoints"]!.GetValue<bool>());
         Assert.True(capabilities["supportsLogPoints"]!.GetValue<bool>());
-        Assert.True(capabilities["supportsDataBreakpoints"]!.GetValue<bool>());
+        Assert.False(capabilities["supportsDataBreakpoints"]!.GetValue<bool>());
     }
 
     [Fact]
-    public async Task DataBreakpointInfoOffersWriteOnlyAndAnIdThatCarriesTheFrame()
+    public async Task DataBreakpointInfoDoesNotMisrepresentSamplingAsWriteDetection()
     {
         var backend = new FakeBackend
         {
@@ -43,8 +124,8 @@ public class DapServerTests
 
         var body = responses.Single(r => r["command"]?.GetValue<string>() == "dataBreakpointInfo")["body"];
 
-        Assert.Equal("2:total", body!["dataId"]!.GetValue<string>());
-        Assert.Equal("write", body["accessTypes"]!.AsArray().Single()!.GetValue<string>());
+        Assert.Null(body!["dataId"]);
+        Assert.Contains("native data breakpoints", body["description"]!.GetValue<string>());
     }
 
     [Fact]
@@ -760,6 +841,16 @@ public class DapServerTests
 
     private class FakeBackend : IDebugBackend
     {
+        public bool FailInspection { get; init; }
+        public int LastEditedParent { get; private set; }
+        public string? LastEditedName { get; private set; }
+        public Task<(bool Ok, string Value, string Error)> SetVariableChildAsync(int parentReference, string name, string value, CancellationToken cancellationToken = default)
+        {
+            LastEditedParent = parentReference;
+            LastEditedName = name;
+            return Task.FromResult((true, value, ""));
+        }
+
         public DebuggerService.StoppedFrame? Frame;
         public IReadOnlyList<StackFrameInfo> Frames = [];
         public int LastRequestedFrame = -1;
@@ -828,6 +919,14 @@ public class DapServerTests
         public Task<string> StepOutAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult("stepped");
 
+        public Task<(bool Ok, VariableInfo? Variable, string Error)> EvaluateVariableAsync(
+            string expression, int frameId, CancellationToken cancellationToken = default)
+        {
+            LastRequestedFrame = frameId;
+            return Task.FromResult<(bool, VariableInfo?, string)>((true,
+                new VariableInfo(expression, "{Node}", "Node", 1007, 0, 0, true), ""));
+        }
+
         public Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default) =>
             Task.FromResult($"eval:{expression}");
         public Task<string> GetLocalsAsync(CancellationToken cancellationToken = default) =>
@@ -844,6 +943,7 @@ public class DapServerTests
             int frameId, CancellationToken cancellationToken = default)
         {
             LastRequestedFrame = frameId;
+            if (FailInspection) throw new InvalidOperationException("The frame is unavailable.");
             return Task.FromResult<IReadOnlyList<VariableInfo>>(
                 [new VariableInfo("total", "42", "int", 0, 0, 0, true)]);
         }
@@ -852,7 +952,7 @@ public class DapServerTests
             int variablesReference, CancellationToken cancellationToken = default)
         {
             LastChildReference = variablesReference;
-            return Task.FromResult<IReadOnlyList<VariableInfo>>([]);
+            return Task.FromResult<IReadOnlyList<VariableInfo>>([new VariableInfo("Name", "old", "string", 0, 0, 0, true, "order.Customer.Name")]);
         }
 
         public Task<(bool Ok, string Value, string Error)> SetVariableAsync(

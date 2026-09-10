@@ -32,19 +32,23 @@ internal sealed class EncEditSession
 {
     private readonly IEditAndContinueService _service;
     private readonly DebuggingSessionId _sessionId;
+    private readonly EncPdbDocumentPaths _documentPaths;
 
     /// <summary>Whether an emit is waiting to be committed or discarded. Roslyn holds exactly one
     /// pending update per session, and leaving it pending blocks the next emit.</summary>
     private bool _pending;
+    private bool _ended;
 
     /// <summary>Whether Roslyn currently believes the debuggee is stopped. Starts false because
     /// that is what <c>StartDebuggingSession</c> assumes.</summary>
     private bool _inBreakState;
 
-    private EncEditSession(IEditAndContinueService service, DebuggingSessionId sessionId)
+    private EncEditSession(
+        IEditAndContinueService service, DebuggingSessionId sessionId, EncPdbDocumentPaths documentPaths)
     {
         _service = service;
         _sessionId = sessionId;
+        _documentPaths = documentPaths;
     }
 
     /// <summary>
@@ -62,6 +66,9 @@ internal sealed class EncEditSession
         Func<CancellationToken, ValueTask<ImmutableArray<ManagedActiveStatementDebugInfo>>>? activeStatements,
         CancellationToken cancellationToken)
     {
+        var documentPaths = EncPdbDocumentPaths.Read(solution, cancellationToken);
+        solution = documentPaths.Apply(solution, cancellationToken);
+
         // Roslyn reads the documents' text and checksums up front; without this the first emit
         // pays for the whole solution and can see a torn view of it.
         await EditAndContinueService.HydrateDocumentsAsync(solution, cancellationToken)
@@ -74,7 +81,7 @@ internal sealed class EncEditSession
             NullPdbMatchingSourceTextProvider.Instance,
             reportDiagnostics: false);
 
-        return new EncEditSession(service, sessionId);
+        return new EncEditSession(service, sessionId, documentPaths);
     }
 
     /// <summary>
@@ -105,7 +112,7 @@ internal sealed class EncEditSession
 
         var results = await _service.EmitSolutionUpdateAsync(
             _sessionId,
-            solution,
+            _documentPaths.Apply(solution, cancellationToken),
             ImmutableDictionary<ProjectId, RunningProjectOptions>.Empty,
             NoActiveStatementSpans,
             cancellationToken).ConfigureAwait(false);
@@ -161,8 +168,13 @@ internal sealed class EncEditSession
 
     public void EndSession()
     {
-        Discard();
-        _service.EndDebuggingSession(_sessionId);
+        if (_ended) return;
+        try { Discard(); }
+        finally
+        {
+            _service.EndDebuggingSession(_sessionId);
+            _ended = true;
+        }
     }
 
     /// <summary>

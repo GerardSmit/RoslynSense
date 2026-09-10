@@ -3,22 +3,33 @@ using Xunit;
 namespace RoslynMCP.Tests;
 
 /// <summary>
-/// Opt-in gate for the .NET Framework Edit-and-Continue test.
+/// Opt-in gate for the .NET Framework Edit-and-Continue tests.
 /// </summary>
 /// <remarks>
-/// Ordinary skip conditions guard tests that would <em>fail</em>. This one guards a test that can
-/// take the test host down: <c>ICorDebugModule2::ApplyChanges</c> faults on a delta it dislikes
-/// rather than returning an error, and a crashed host aborts every other test in the run rather
-/// than reporting one failure. It stays in the suite because it is the only thing that can answer
-/// whether the desktop CLR accepts a Roslyn-emitted delta — but it runs when asked, not by default.
+/// These tests build real desktop applications and require the packaged architecture-matched
+/// debug workers. ApplyChanges runs in those workers because the desktop CLR can fault on an
+/// invalid delta. Enable them with ROSLYNSENSE_TEST_FX_HOTRELOAD=1 after building with
+/// BuildDebugWorkers=true; missing workers then fail the tests instead of silently skipping them.
 /// </remarks>
 public sealed class FrameworkHotReloadFactAttribute : FactAttribute
 {
-    public FrameworkHotReloadFactAttribute()
+    public FrameworkHotReloadFactAttribute() => Skip = SkipReason;
+
+    internal static string? SkipReason
     {
-        if (Environment.GetEnvironmentVariable("ROSLYNSENSE_TEST_FX_HOTRELOAD") != "1")
-            Skip = "Set ROSLYNSENSE_TEST_FX_HOTRELOAD=1 to run; ApplyChanges can crash the host.";
-        else if (!OperatingSystem.IsWindows() || FrameworkHotReloadTests.FrameworkDirectory() is null)
-            Skip = "No .NET Framework installation was found.";
+        get
+        {
+            if (Environment.GetEnvironmentVariable("ROSLYNSENSE_TEST_FX_HOTRELOAD") != "1")
+                return "Set ROSLYNSENSE_TEST_FX_HOTRELOAD=1 and build with BuildDebugWorkers=true to run.";
+            return !OperatingSystem.IsWindows() || FrameworkHotReloadTests.FrameworkDirectory() is null
+                ? "No .NET Framework installation was found."
+                : null;
+        }
     }
+}
+
+/// <summary>The same explicit runtime gate for the architecture and PDB-format matrix.</summary>
+public sealed class FrameworkHotReloadTheoryAttribute : TheoryAttribute
+{
+    public FrameworkHotReloadTheoryAttribute() => Skip = FrameworkHotReloadFactAttribute.SkipReason;
 }

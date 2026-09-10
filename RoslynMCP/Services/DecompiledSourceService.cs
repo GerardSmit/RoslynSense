@@ -163,7 +163,9 @@ internal static class DecompiledSourceService
                     new CSharpCompilationOptions(
                         OutputKind.DynamicallyLinkedLibrary,
                         allowUnsafe: true,
-                        nullableContextOptions: NullableContextOptions.Enable))
+                        nullableContextOptions: NullableContextOptions.Enable)
+                        .WithMetadataImportOptions(MetadataImportOptions.All)
+                        .WithTopLevelBinderFlags(BinderFlags.IgnoreAccessibility))
                 .WithProjectParseOptions(
                     projectId,
                     new CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview))
@@ -827,10 +829,14 @@ internal static class DecompiledSourceService
             {
                 if (copyToTemp)
                 {
+                    // Reference assemblies omit implementation-only members. Browse against the
+                    // matching implementation when available, but retain the original reference
+                    // path for source provenance and framework snapshot selection.
+                    string bindingPath = ReferenceAssemblyRedirector.RedirectForBrowsing(normalized);
                     string dest = Path.Combine(EnsureTempDir(), Path.GetFileName(normalized));
                     try
                     {
-                        File.Copy(normalized, dest, overwrite: true);
+                        File.Copy(bindingPath, dest, overwrite: true);
                         s_originalOfCopy[dest] = normalized;
                         references.Add(MetadataReference.CreateFromFile(dest));
                         return;
@@ -842,7 +848,7 @@ internal static class DecompiledSourceService
                         Console.Error.WriteLine(
                             $"[DecompiledSourceService] Temp-copy failed for '{normalized}', using in-memory image: {copyEx.Message}");
                         using var stream = new FileStream(
-                            normalized, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                            bindingPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                         references.Add(MetadataReference.CreateFromStream(stream, filePath: normalized));
                         return;
                     }
@@ -884,6 +890,45 @@ internal static class DecompiledSourceService
 
             foreach (string path in Directory.EnumerateFiles(directory, "*.exe"))
                 AddReference(path, copyToTemp: true);
+        }
+
+        // A Framework NuGet package usually contains only its own DLL, not mscorlib or
+        // System.Web. Resolve its dependency closure using the target-aware decompiler
+        // resolver instead of borrowing this server's CoreCLR framework.
+        if (IsFrameworkAssembly(assemblyPath))
+        {
+            var resolver = CreateLenientResolver(assemblyPath);
+            var pending = new Queue<string>();
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var pathsByName = seenPaths.GroupBy(p => Path.GetFileNameWithoutExtension(p), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+            pending.Enqueue(assemblyPath);
+            while (pending.TryDequeue(out var dependency))
+            {
+                if (!visited.Add(dependency))
+                    continue;
+                try
+                {
+                    using var pe = new PEFile(dependency, PEStreamOptions.PrefetchMetadata);
+                    foreach (var reference in pe.AssemblyReferences)
+                    {
+                        if (pathsByName.TryGetValue(reference.Name, out var existing))
+                        {
+                            pending.Enqueue(existing);
+                            continue;
+                        }
+                        if (resolver.FindAssemblyFile(reference) is not { } resolved || !File.Exists(resolved))
+                            continue;
+                        pathsByName[reference.Name] = resolved;
+                        AddReference(resolved, copyToTemp: true);
+                        pending.Enqueue(resolved);
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or BadImageFormatException or UnauthorizedAccessException)
+                {
+                    ServiceLog.Warn($"Could not resolve browsing dependencies for '{dependency}': {ex.Message}");
+                }
+            }
         }
 
         return (references, tempDir);

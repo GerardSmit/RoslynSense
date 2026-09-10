@@ -573,6 +573,60 @@ internal static class SourceMemberLocator
         return fallback is null ? null : Position(tree, fallback, cancellationToken);
     }
 
+    /// <summary>
+    /// Locates a configuration read, preferring its literal inside the reading member. A key
+    /// supplied by a constant-returning getter need not occur in that member (or even this type),
+    /// so the member declaration is a better fallback than a literal in an unrelated getter.
+    /// </summary>
+    public static (int Line, int Character)? FindConfigurationRead(
+        string sourceText, string literal, string? methodName, CancellationToken cancellationToken)
+    {
+        var tree = CSharpSyntaxTree.ParseText(sourceText, cancellationToken: cancellationToken);
+        var root = tree.GetRoot(cancellationToken);
+        SyntaxToken? memberFallback = null;
+        LiteralExpressionSyntax? literalFallback = null;
+
+        foreach (var node in root.DescendantNodes())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (literal.Length > 0 && node is LiteralExpressionSyntax
+                { RawKind: (int)SyntaxKind.StringLiteralExpression } candidate
+                && candidate.Token.ValueText == literal)
+            {
+                if (methodName is { Length: > 0 } && InMethod(candidate, methodName))
+                    return Position(tree, candidate, cancellationToken);
+
+                literalFallback ??= candidate;
+            }
+
+            if (memberFallback is not null || string.IsNullOrEmpty(methodName))
+                continue;
+
+            var identifier = node switch
+            {
+                MethodDeclarationSyntax method when method.Identifier.ValueText == methodName => method.Identifier,
+                LocalFunctionStatementSyntax local when local.Identifier.ValueText == methodName => local.Identifier,
+                PropertyDeclarationSyntax property when property.Identifier.ValueText == methodName
+                    || "get_" + property.Identifier.ValueText == methodName
+                    || "set_" + property.Identifier.ValueText == methodName => property.Identifier,
+                ConstructorDeclarationSyntax constructor when methodName ==
+                    (constructor.Modifiers.Any(SyntaxKind.StaticKeyword) ? ".cctor" : ".ctor") => constructor.Identifier,
+                _ => default,
+            };
+            if (identifier.RawKind != 0)
+                memberFallback = identifier;
+        }
+
+        if (memberFallback is { } token)
+        {
+            var position = token.GetLocation().GetLineSpan().StartLinePosition;
+            return (position.Line, position.Character);
+        }
+
+        return literalFallback is null ? null : Position(tree, literalFallback, cancellationToken);
+    }
+
     private static (int Line, int Character) Position(
         SyntaxTree tree, SyntaxNode node, CancellationToken cancellationToken)
     {

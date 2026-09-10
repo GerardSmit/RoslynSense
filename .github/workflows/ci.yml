@@ -62,7 +62,8 @@ jobs:
         run: dotnet restore RoslynMCP.sln
 
       - name: Build
-        run: dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo
+        # Pass this globally so the test project also copies both worker payloads.
+        run: dotnet build RoslynMCP.sln --configuration Release --no-restore --nologo -p:BuildDebugWorkers=true
 
       - name: Cache netcoredbg
         id: cache-netcoredbg
@@ -97,14 +98,68 @@ jobs:
         shell: pwsh
         run: echo "C:\netcoredbg\netcoredbg" | Out-File -Append -FilePath $env:GITHUB_PATH
 
+      - name: Install x86 runtime for Framework debug worker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-install.ps1'
+          $runtimePath = Join-Path ${env:ProgramFiles(x86)} 'dotnet'
+          Invoke-WebRequest 'https://dot.net/v1/dotnet-install.ps1' -OutFile $installer
+          # Workers clear the parent's runtime overrides and resolve their own architecture.
+          # Install to the standard apphost search location rather than only changing PATH.
+          & $installer -Channel 10.0 -Runtime dotnet -Architecture x86 -InstallDir $runtimePath -NoPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $runtimePath 'dotnet.exe') --list-runtimes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test
         run: >-
           dotnet test RoslynMCP.sln --configuration Release --no-build --nologo
           -p:UseAppHost=false
+          --filter "FullyQualifiedName!~CoreClrHotReloadTests&FullyQualifiedName!~FrameworkHotReloadTests&FullyQualifiedName!~IisExpressHotReloadTests"
           --blame-hang --blame-hang-timeout 3m --blame-hang-dump-type mini
           --logger "console;verbosity=normal"
           --logger "trx;LogFileName=tests.trx"
           --results-directory TestResults
+
+      - name: Hot reload E2E (.NET and .NET Framework)
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          ROSLYNSENSE_TEST_FX_HOTRELOAD: '1'
+        run: |
+          $suites = @('CoreClrHotReloadTests', 'FrameworkHotReloadTests')
+          $iisExpress = Join-Path ${env:ProgramFiles(x86)} 'IIS Express/iisexpress.exe'
+          if (Test-Path -LiteralPath $iisExpress) {
+            $suites += 'IisExpressHotReloadTests'
+          } else {
+            Write-Host '::warning::32-bit IIS Express is unavailable; IIS hot reload E2E coverage did not run.'
+          }
+          foreach ($arch in @('x64', 'x86')) {
+            $worker = "RoslynMCP.Tests/bin/Release/net10.0/workers/$arch/RoslynMCP.DebugWorker.exe"
+            if (-not (Test-Path -LiteralPath $worker)) { throw "Missing hot reload test worker: $worker" }
+          }
+          $filter = ($suites | ForEach-Object { "FullyQualifiedName~RoslynMCP.Tests.$_" }) -join '|'
+          dotnet test RoslynMCP.Tests/RoslynMCP.Tests.csproj --configuration Release --no-build --nologo `
+            -p:UseAppHost=false --filter $filter `
+            --blame-hang --blame-hang-timeout 3m --blame-hang-dump-type mini `
+            --logger 'console;verbosity=normal' --logger 'trx;LogFileName=hot-reload-e2e.trx' `
+            --results-directory TestResults/hot-reload
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # An opt-in gate or missing prerequisite must not turn required E2Es green by skipping.
+          [xml]$trx = Get-Content -LiteralPath TestResults/hot-reload/hot-reload-e2e.trx -Raw
+          foreach ($suite in $suites) {
+            $results = @($trx.TestRun.Results.UnitTestResult | Where-Object {
+              $_.testName.StartsWith("RoslynMCP.Tests.$suite.", [StringComparison]::Ordinal)
+            })
+            if ($results.Count -eq 0) { throw "No E2E results were recorded for $suite." }
+            $incomplete = @($results | Where-Object outcome -ne 'Passed')
+            if ($incomplete.Count -gt 0) {
+              throw "E2E tests must pass without skips: $($incomplete.testName -join ', ')"
+            }
+            Write-Host "$suite`: $($results.Count) passed, none skipped."
+          }
 
       - name: Upload test diagnostics
         if: always()
@@ -211,6 +266,18 @@ jobs:
         env:
           VSCODE_VERSION: ${{ matrix.vscode }}
         run: xvfb-run -a npm run test:integration
+
+      - name: Upload VS Code integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vscode-integration-${{ matrix.os }}-${{ matrix.vscode }}
+          include-hidden-files: true
+          path: |
+            vscode-extension/.vscode-test/integration-runs/**/user-data/logs/**
+            vscode-extension/.vscode-test/integration-runs/**/temp/roslyn-mcp-lsp-diagnostics/**
+            vscode-extension/.vscode-test/integration-runs/**/workspace/bin/Debug/net10.0/hotreload-values.txt
+          if-no-files-found: warn
 
   release_artifacts:
     if: >-

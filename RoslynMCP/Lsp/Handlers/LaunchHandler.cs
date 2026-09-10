@@ -12,9 +12,12 @@ namespace RoslynMCP.Lsp.Handlers;
 /// Everything the editor needs to launch and debug the user's own app: where the debug adapter
 /// is, what can be launched, and a build that reports structured errors.
 ///
-/// The adapter itself is netcoredbg in its DAP mode (<c>--interpreter=vscode</c>), so the
-/// editor talks to a real debugger directly and we contribute no adapter code — watch windows,
-/// conditional breakpoints, and setVariable all come from netcoredbg.
+/// The adapter is the server's own (<c>roslyn-sense --dap</c>, the ICorDebug engine) for .NET
+/// Framework and, on Windows, for .NET; elsewhere, or when <c>debugger.coreClrEngine</c> asks
+/// for it, it is netcoredbg in its DAP mode (<c>--interpreter=vscode</c>). Either way the editor
+/// talks to a real debugger directly — watch windows, conditional breakpoints, and setVariable
+/// come from the engine. Which one a target gets is reported per target so the client never reads
+/// the setting itself.
 /// </summary>
 internal static partial class LaunchHandler
 {
@@ -291,11 +294,16 @@ internal static partial class LaunchHandler
                 "Install Visual Studio or the Build Tools for Visual Studio.", [], []);
         }
 
+        // Spelled as the disk spells it, so this build's output is byte-identical to the one
+        // Visual Studio or a terminal produces from the same sources: the compiler bakes the
+        // path into the image, and a path that differs only in case is a different image.
+        string buildPath = PathHelper.WithOnDiskCasing(projectPath);
+
         var startInfo = msbuild is not null
             ? new ProcessStartInfo(msbuild,
-                $"\"{projectPath}\" /nologo /v:minimal /p:Configuration={configuration} " +
+                $"\"{buildPath}\" /nologo /v:minimal /p:Configuration={configuration} " +
                 $"/t:{MsBuildTarget(target)}")
-            : new ProcessStartInfo("dotnet", DotnetArguments(projectPath, configuration, target));
+            : new ProcessStartInfo("dotnet", DotnetArguments(buildPath, configuration, target));
 
         startInfo.RedirectStandardOutput = true;
         startInfo.RedirectStandardError = true;

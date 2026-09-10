@@ -40,6 +40,15 @@ internal sealed class ShadowCopyManager : IDisposable
     /// writes its outputs in bursts, and each burst used to be its own eviction.</summary>
     private static readonly TimeSpan RebuildQuiet = TimeSpan.FromMilliseconds(1000);
 
+    /// <summary>Source directory → how many quiet periods in a row it has been unreadable. See
+    /// <see cref="OnQuiet"/>.</summary>
+    private readonly Dictionary<string, int> _unreadableRetries = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How many further quiet periods an unreadable directory is given before it is
+    /// invalidated anyway — five seconds, against a compiler that writes its output in under
+    /// one.</summary>
+    private const int MaxUnreadableRetries = 5;
+
     private readonly string _nugetPackagesDir;
 
     /// <summary>Directory trees a build never writes to, so analyzers in them can be loaded in
@@ -440,24 +449,39 @@ internal sealed class ShadowCopyManager : IDisposable
         lock (_lock)
         {
             if (_disposed) return;
-
-            if (_debounceTimers.TryGetValue(directory, out var existing))
-                existing.Dispose();
-
-            _debounceTimers[directory] = new Timer(
-                _ => OnQuiet(directory), null, RebuildQuiet, Timeout.InfiniteTimeSpan);
+            ArmQuietTimer(directory);
         }
+    }
+
+    /// <summary>Starts (or restarts) the quiet period for <paramref name="directory"/>. Callers
+    /// hold <see cref="_lock"/>.</summary>
+    private void ArmQuietTimer(string directory)
+    {
+        if (_debounceTimers.TryGetValue(directory, out var existing))
+            existing.Dispose();
+
+        _debounceTimers[directory] = new Timer(
+            _ => OnQuiet(directory), null, RebuildQuiet, Timeout.InfiniteTimeSpan);
     }
 
     /// <summary>
     /// The directory stopped changing. Invalidate only if what it holds is actually different.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The watcher fires on writes, and a build writes an analyzer's DLL whether or not the
     /// analyzer changed — so building anything evicted every workspace that had pinned it, which
     /// meant a full MSBuild reload of the solution after every build. The compiler is deterministic
     /// for unchanged input, so comparing content tells a real rebuild from a rewrite of the same
     /// bytes, and only a real one is worth throwing a workspace away for.
+    /// </para>
+    /// <para>
+    /// A directory that cannot be read yet is not judged at all: the compiler holds its output
+    /// exclusively until it is done, and invalidating on that used to re-copy half a file. The
+    /// quiet period is re-armed instead, a bounded number of times — a directory that stays locked
+    /// is invalidated regardless, because the alternative is an analyzer the user rebuilt never
+    /// taking effect.
+    /// </para>
     /// </remarks>
     private void OnQuiet(string directory)
     {
@@ -467,6 +491,22 @@ internal sealed class ShadowCopyManager : IDisposable
         {
             if (_disposed)
                 return;
+
+            if (fingerprint is null)
+            {
+                _unreadableRetries.TryGetValue(directory, out int retries);
+                if (retries < MaxUnreadableRetries)
+                {
+                    _unreadableRetries[directory] = retries + 1;
+                    Console.Error.WriteLine(
+                        $"[ShadowCopy] '{directory}' is still being written; waiting for it to settle " +
+                        $"({retries + 1}/{MaxUnreadableRetries}).");
+                    ArmQuietTimer(directory);
+                    return;
+                }
+            }
+
+            _unreadableRetries.Remove(directory);
 
             if (fingerprint is not null
                 && _fingerprints.TryGetValue(directory, out var previous)
@@ -488,8 +528,9 @@ internal sealed class ShadowCopyManager : IDisposable
     }
 
     /// <summary>
-    /// A content hash over the directory's DLLs, or null if it could not be read — mid-build the
-    /// files are locked, and an unreadable directory must not be mistaken for an unchanged one.
+    /// A content hash over the directory's DLLs — by what a compilation would observe in each,
+    /// see <see cref="AssemblyContentFingerprint"/> — or null if it could not be read: mid-build
+    /// the files are locked, and an unreadable directory must not be mistaken for an unchanged one.
     /// </summary>
     private static string? TryFingerprint(string directory)
     {
@@ -505,10 +546,7 @@ internal sealed class ShadowCopyManager : IDisposable
 
                 using var stream = new FileStream(
                     file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                var buffer = new byte[81920];
-                int read;
-                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
-                    hash.AppendData(buffer, 0, read);
+                AssemblyContentFingerprint.Append(hash, stream);
             }
 
             return Convert.ToHexString(hash.GetHashAndReset());
@@ -518,6 +556,9 @@ internal sealed class ShadowCopyManager : IDisposable
             return null;
         }
     }
+
+    /// <summary>The fingerprint <see cref="OnQuiet"/> would judge <paramref name="directory"/> by.</summary>
+    internal static string? FingerprintForTests(string directory) => TryFingerprint(directory);
 
     // ───────────────────────── NuGet cache detection ─────────────────────────
 

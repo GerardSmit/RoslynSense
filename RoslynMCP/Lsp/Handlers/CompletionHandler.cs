@@ -1,9 +1,11 @@
-﻿using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Languages;
 using RoslynMCP.Lsp.Completion;
+using RoslynMCP.Lsp.Search;
 using RoslynMCP.Lsp.Protocol;
+using RoslynMCP.Services;
 using CompletionItem = RoslynMCP.Lsp.Protocol.CompletionItem;
 using CompletionList = RoslynMCP.Lsp.Protocol.CompletionList;
 using RoslynCompletionOptions = Microsoft.CodeAnalysis.Completion.CompletionOptions;
@@ -76,9 +78,15 @@ internal static class CompletionHandler
     public static async Task<CompletionList> CompletionAsync(
         CompletionParams p, LspResolveCache cache, CancellationToken ct)
     {
+        using var paused = ForegroundGate.PauseBackground();
+        var bufferGeneration = OpenDocumentStore.Generation;
+        var timing = RunwayTrace.Begin("completion request");
         if (await HandlerHelpers.ResolveAsync(p.TextDocument, p.Position, ct) is not
             var (document, text, offset) || document is null)
             return new CompletionList(false, Array.Empty<CompletionItem>());
+        var generation = cache.Generation;
+        if (OpenDocumentStore.Generation != bufferGeneration) throw LspResolveCache.Expired("completion");
+        timing?.Mark("resolve document");
 
         // A caret inside a string literal that Roslyn can tell holds another language — a route
         // template, a GraphQL document — belongs to that language, not to C#: the C# pass has
@@ -90,9 +98,11 @@ internal static class CompletionHandler
             return await embedded.CompletionAsync(embeddedContext, p, ct);
         }
 
-        return await CompleteAsync(
+        var result = await CompleteAsync(
             document, text, offset, p.Context, cache,
-            span => LspConverters.ToRange(text.Lines, span), ct);
+            span => LspConverters.ToRange(text.Lines, span), ct, generation);
+        timing?.Mark("complete");
+        return result;
     }
 
     /// <summary>
@@ -109,9 +119,15 @@ internal static class CompletionHandler
         LspCompletionContext? context,
         LspResolveCache cache,
         Func<TextSpan, Protocol.Range?> toRange,
-        CancellationToken ct)
+        CancellationToken ct, long? expectedGeneration = null)
     {
+        // Projected C# completion can enter here directly. Pause startup's background index
+        // sweep while the editor is waiting; this never puts completion itself behind a gate.
+        using var paused = ForegroundGate.PauseBackground();
+        var generation = expectedGeneration ?? cache.Generation;
+        var timing = RunwayTrace.Begin("completion semantics");
         document = await document.FreezeAsync(ct);
+        timing?.Mark("select semantic snapshot");
 
         var service = CompletionService.GetService(document);
         if (service is null)
@@ -145,18 +161,22 @@ internal static class CompletionHandler
         // recompute below covers the contexts where Roslyn widens the span past the default.
         int predictedStart = service.GetDefaultCompletionListSpan(text, offset).Start;
         var semanticsTask = CompletionSemanticContext.CreateAsync(document, predictedStart, ct);
+        timing?.Mark("start semantic context");
 
         // The import-completion providers, started first so they run alongside the pass that is
         // actually awaited, and memoized so that the request which does not get to wait for them
         // still pays for them only once (see ExpandedCompletionPass).
         var expandedPass = ExpandedCompletionPass.Start(
             service, document, text, offset, predictedStart, s_expandedOptions, trigger);
+        timing?.Mark("start expanded providers");
 
         var completions = await service.GetCompletionsAsync(
             document, offset, s_nonExpandedOptions, document.Project.Solution.Options, trigger,
             roles: null, cancellationToken: ct);
+        timing?.Mark("providers and semantic context");
 
         var expanded = await ExpandedCompletionPass.WithinGraceAsync(expandedPass, ct);
+        timing?.Mark("expanded grace");
 
         var itemsList = completions.ItemsList;
         var span = completions.Span;
@@ -190,13 +210,15 @@ internal static class CompletionHandler
         var semantics = span.Start == predictedStart
             ? await semanticsTask
             : await CompletionSemanticContext.CreateAsync(document, span.Start, ct);
+        timing?.Mark("await semantic context");
 
         var ranked = CompletionRanker.Rank(itemsList, prefix, contextId, MaxItems, semantics);
         if (ranked.Items.Count == 0)
             return new CompletionList(false, Array.Empty<CompletionItem>());
 
         var cachedItems = ranked.Items.Select(r => r.Item).ToList();
-        long cacheId = cache.StoreCompletions(document, cachedItems);
+        long cacheId = cache.StoreCompletions(document, cachedItems, generation);
+        if (cacheId < 0) throw LspResolveCache.Expired("completion");
 
         // Every item in this list replaces the same span, so the range is the list's, not the
         // item's. A client that reads itemDefaults gets it once; the rest still get a full
@@ -243,6 +265,7 @@ internal static class CompletionHandler
 
         // Ranking (and the typo tier) depends on the typed prefix, so a narrowed list is not a
         // subset the client can compute on its own — ask for a fresh request per keystroke.
+        timing?.Mark("rank and convert items");
         return new CompletionList(ranked.Truncated || prefix.Length > 0, items)
         {
             // data stays per item: the resolve key is an index into the cached Roslyn list, so
@@ -256,7 +279,7 @@ internal static class CompletionHandler
     /// own fuzzy score is the same for every item and cannot re-order the list.
     /// </summary>
     /// <remarks>
-    /// VS Code sorts by <c>score → wordDistance → index-in-sortText-order</c>, and the score is
+    /// VS Code sorts by <c>score â†’ wordDistance â†’ index-in-sortText-order</c>, and the score is
     /// computed against filterText: leaving the plain name there lets the client's notion of a
     /// good match override the ranking computed here (a camel-hump hit scores below a literal
     /// prefix hit however relevant it is). Prepending the typed text equalises the score, which
@@ -288,9 +311,10 @@ internal static class CompletionHandler
         CompletionItem item, LspResolveCache cache, CancellationToken ct,
         LanguageSession? languages = null)
     {
-        if (item.Data is null || cache.GetCompletion(item.Data.CacheId, item.Data.Index) is not
+        if (item.Data is not { } data) return item;
+        if (cache.GetCompletion(data.CacheId, data.Index) is not
             var (document, roslynItem) || document is null)
-            return item;
+            throw LspResolveCache.Expired("completion");
 
         var service = CompletionService.GetService(document);
         if (service is null)
@@ -335,6 +359,8 @@ internal static class CompletionHandler
             item = item with { Documentation = new MarkupContent("markdown", markdown) };
         }
 
+        if (cache.GetCompletion(data.CacheId, data.Index) is null)
+            throw LspResolveCache.Expired("completion");
         return item;
     }
 

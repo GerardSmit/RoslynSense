@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using RoslynMCP.Services;
 
 namespace RoslynMCP.Lsp.Completion;
 
@@ -55,27 +56,34 @@ public sealed class CompletionSemanticContext
     public static async Task<CompletionSemanticContext> CreateAsync(
         Document document, int position, CancellationToken ct)
     {
+        var timing = RunwayTrace.Begin("completion ranking context");
         try
         {
             var semanticModel = await document.GetSemanticModelAsync(ct);
+            timing?.Mark("get semantic model");
             var root = await document.GetSyntaxRootAsync(ct);
+            timing?.Mark("get syntax root");
             if (semanticModel is null || root is null)
                 return Empty;
 
             var members = new Dictionary<string, MemberProvenance>(StringComparer.Ordinal);
             var qualifierType = QualifierType(semanticModel, root, position, ct);
+            timing?.Mark("bind qualifier type");
 
             if (qualifierType is not null)
             {
                 // After a dot: everything in the list is a member of that type (or an extension).
                 CollectMembers(qualifierType, members);
+                timing?.Mark("collect qualifier members");
                 return new CompletionSemanticContext(members, null);
             }
 
             if (semanticModel.GetEnclosingSymbol(position, ct)?.ContainingType is { } enclosingType)
                 CollectMembers(enclosingType, members);
 
-            return new CompletionSemanticContext(members, ClosestLocal(semanticModel, position, ct));
+            var closestLocal = ClosestLocal(semanticModel, position, ct);
+            timing?.Mark("collect enclosing members and closest local");
+            return new CompletionSemanticContext(members, closestLocal);
         }
         catch (OperationCanceledException) { throw; }
         catch

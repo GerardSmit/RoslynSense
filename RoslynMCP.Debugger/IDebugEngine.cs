@@ -98,6 +98,12 @@ public interface IDebugEngine : IDisposable
     /// code itself reported, which is the only place some of them can be known.</returns>
     Task<(bool Ok, string Detail)> InjectAgentAsync(
         string assemblyPath, string typeName, string methodName, string? argument);
+    async Task<(bool Ok, DebugVariable? Variable, string Error)> EvaluateVariableAsync(uint frameIndex, string expression)
+    {
+        var (ok, value, error) = await EvaluateAsync(frameIndex, expression);
+        return (ok, ok ? new DebugVariable { Name = expression, Value = value } : null, error);
+    }
+
     Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression);
     Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(
         uint frameIndex, string name, string value);

@@ -88,7 +88,7 @@ public static class DatabaseTool
                 fmt.AppendTruncation(sb, result.Rows.Count, result.Rows.Count + 1, "maxRows");
             return sb.ToString();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return SqlError(ex, sql);
         }
@@ -122,7 +122,7 @@ public static class DatabaseTool
             fmt.AppendField(sb, "Rows affected", affected);
             return sb.ToString();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return SqlError(ex, sql);
         }
@@ -165,7 +165,7 @@ public static class DatabaseTool
         {
             await newProvider.GetTablesAsync(schema: null, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return $"Error: connection test failed: {ex.Message}";
         }
@@ -239,7 +239,7 @@ public static class DatabaseTool
             fmt.AppendTable(sb, "Tables", result.Columns, result.Rows);
             return sb.ToString();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return SqlError(ex, "GetTables");
         }
@@ -272,7 +272,7 @@ public static class DatabaseTool
             fmt.AppendTable(sb, "Columns", result.Columns, result.Rows);
             return sb.ToString();
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return SqlError(ex, $"DescribeTable {tableName}");
         }
@@ -523,7 +523,7 @@ public static class DatabaseTool
         {
             hypopg = await provider.IsHypopgInstalledAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             fmt.AppendField(sb, "hypopg check error", ex.Message);
             return sb.ToString();
@@ -552,7 +552,7 @@ public static class DatabaseTool
             evals = await provider.EvaluateHypotheticalIndexesAsync(
                 session.Sql, session.Parameters, pairs, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             fmt.AppendField(sb, "hypopg evaluation error", ex.Message);
             return sb.ToString();
@@ -641,12 +641,26 @@ public static class DatabaseTool
     private static object? JsonElementToValue(JsonElement el) => el.ValueKind switch
     {
         JsonValueKind.String => el.GetString(),
-        JsonValueKind.Number => el.TryGetInt64(out var l) ? l : el.GetDouble(),
+        JsonValueKind.Number => NumberParameter(el),
         JsonValueKind.True => true,
         JsonValueKind.False => false,
         JsonValueKind.Null => null,
         _ => el.GetRawText(),
     };
+
+    private static object NumberParameter(JsonElement element)
+    {
+        // A conditional expression mixing long and double promotes even integer values to
+        // double, silently rounding database keys above 2^53 before parameter binding.
+        if (element.TryGetInt64(out long integer)) return integer;
+        double floating = element.GetDouble();
+        // Decimal parsing can succeed while rounding small magnitudes at its 28-digit scale
+        // limit (1.5e-28 becomes 2e-28). Prefer it only when that does not lose double precision.
+        if (element.TryGetDecimal(out decimal number) && (double)number == floating) return number;
+        if (!double.IsFinite(floating))
+            throw new JsonException("Numeric parameter is outside the supported finite range.");
+        return floating;
+    }
 
     private static string SqlError(Exception ex, string context)
     {

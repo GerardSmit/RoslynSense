@@ -18,13 +18,13 @@ internal static class StartupHook
         if (string.IsNullOrEmpty(pipeName))
             return;
 
-        // `dotnet run` and the MSBuild nodes it spawns are managed apps too, and they inherit
-        // the environment. Registering them would send deltas to processes that do not host the
-        // edited module, and their runtimes would join the capability vote for an app they are
-        // not. The real target is the apphost child, which passes this check.
-        string host = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
-        if (host.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
-            host.StartsWith("MSBuild", StringComparison.OrdinalIgnoreCase))
+        // The native host is also named dotnet for `dotnet App.dll` (the debugger's
+        // normal launch). Identify inherited SDK tooling by its managed entry point,
+        // so framework-dependent applications receive the agent as well as apphosts.
+        string entry = Path.GetFileNameWithoutExtension(Environment.GetCommandLineArgs().FirstOrDefault() ?? "");
+        if (entry.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
+            entry.Equals("MSBuild", StringComparison.OrdinalIgnoreCase) ||
+            entry.Equals("VBCSCompiler", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }

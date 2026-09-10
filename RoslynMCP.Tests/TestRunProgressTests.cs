@@ -72,6 +72,30 @@ public class TestRunProgressTests
     }
 
     [Fact]
+    public void ParameterizedTestNamesKeepTheirArgumentsAndUseOnlyTheTrailingDuration()
+    {
+        var cases = new (string Kind, string Name, string Duration, double DurationMs)[]
+        {
+            ("Passed", "A.B.Theory(value: 1)", " [12 ms]", 12),
+            ("Failed", "A.B.Theory(message: \"a value with spaces\")", " [0.5 s]", 500),
+            ("Passed", "A.B.Theory(values: [1, 2, 3])", " [1.5 m]", 90_000),
+            ("Passed", "A.B.Theory(message: \"[12 ms] trailing\")", " [< 1 ms]", 1),
+            ("Skipped", "A.B.Theory(message: \"skip [1, 2]\")", "", 0),
+            ("Passed", "A.B.Theory(message: \"[12 ms]\")", " [250 ms]   ", 250),
+            ("Passed", "A.B.Theory(message: \"values (a, b)\")", " [2 s]", 2000),
+        };
+
+        foreach (var (kind, name, duration, durationMs) in cases)
+        {
+            var outcome = Assert.Single(CollectFrom($"  {kind} {name}{duration}"));
+
+            Assert.Equal(kind.ToLowerInvariant(), outcome.Kind);
+            Assert.Equal(name, outcome.FullyQualifiedName);
+            Assert.Equal(durationMs, outcome.DurationMs);
+        }
+    }
+
+    [Fact]
     public void DurationUnitsAreNormalisedToMilliseconds()
     {
         var events = CollectFrom(

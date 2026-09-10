@@ -7,8 +7,7 @@ using RoslynMCP.Services;
 namespace RoslynMCP.Lsp;
 
 /// <summary>
-/// Loads every project the bound solution lists, once, in the background, as soon as an editor
-/// connects.
+/// Loads the bound solution when the editor becomes idle, then maintains prepared semantic state.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -40,6 +39,38 @@ internal static class SolutionWarmup
     private static readonly object s_gate = new();
     private static string? s_solutionPath;
     private static Task s_warm = Task.CompletedTask;
+    private static CancellationTokenSource s_lifetime = new();
+    private static TaskCompletionSource s_demand = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Roslyn may keep compilations weakly. Retain a bounded set (open projects first)
+    // so ordinary GC does not immediately discard the work just prepared while idle.
+    private const int RetainedCompilationLimit = 64;
+    private static readonly Dictionary<ProjectId, Compilation> s_preparedCompilations = [];
+    private static Solution? s_preparedSnapshot;
+
+    public static bool IsPrepared
+    {
+        get
+        {
+            var current = WorkspaceService.TryGetSessionSolution();
+            lock (s_gate)
+                return current is not null && s_warm.IsCompleted
+                    && ReferenceEquals(current, s_preparedSnapshot);
+        }
+    }
+
+    /// <summary>Typing postpones optional work; after edits, prepare the current snapshot again.</summary>
+    public static void NotifyActivity()
+    {
+        ForegroundGate.Touch();
+        lock (s_gate)
+        {
+            if (s_solutionPath is null || !s_warm.IsCompleted || !s_warmedSymbols.IsCompleted
+                || !LspFeatureOptions.LoadEntireSolution)
+                return;
+            var token = s_lifetime.Token;
+            s_warmedSymbols = Task.Run(() => WarmSymbolsAsync(token));
+        }
+    }
 
     /// <summary>
     /// Whether the solution is being loaded right now — what tells the Solution Explorer to say
@@ -75,17 +106,19 @@ internal static class SolutionWarmup
                 return s_warm;
             }
 
+            if (s_solutionPath is not null)
+            {
+                var old = s_lifetime;
+                _ = old.CancelAsync().ContinueWith(_ => old.Dispose(), TaskScheduler.Default);
+                s_lifetime = new();
+                s_demand = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                s_preparedCompilations.Clear();
+            }
             s_solutionPath = solution;
 
-            // Before the load, not after it, and never awaited by it: reading the names off disk
-            // is what makes the first Ctrl+T answerable during the seconds MSBuild is busy. It
-            // needs the solution file and nothing the load produces. See Search.NameIndex.
-            _ = NameIndex.Start(solution);
-
-            // Task.Run, not a bare async call: this runs from the initialized notification, and
-            // the first thing the load does — reading the solution file — must not sit on the
-            // JSON-RPC dispatch thread while the editor is waiting to send its first request.
-            s_warm = Task.Run(() => LoadAsync(solution));
+            // The initialized notification never waits for the quiet period or project loading.
+            var token = s_lifetime.Token;
+            s_warm = Task.Run(() => LoadWhenIdleAsync(solution, token));
             return s_warm;
         }
     }
@@ -112,6 +145,7 @@ internal static class SolutionWarmup
     /// </remarks>
     public static void EnsureLoaded()
     {
+        if (!LspFeatureOptions.LoadEntireSolution) return;
         string solution;
         lock (s_gate)
         {
@@ -138,7 +172,9 @@ internal static class SolutionWarmup
                 {
                     if (!s_warm.IsCompleted)
                         return;
-                    s_warm = Task.Run(() => LoadAsync(solution));
+                    s_demand = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var token = s_lifetime.Token;
+                    s_warm = Task.Run(() => LoadWhenIdleAsync(solution, token));
                 }
             }
             catch (Exception ex)
@@ -163,7 +199,10 @@ internal static class SolutionWarmup
     {
         Task warm;
         lock (s_gate)
+        {
             warm = s_warm;
+            s_demand.TrySetResult(); // An explicit solution-wide request need not wait for idle.
+        }
 
         if (warm.IsCompleted)
             return;
@@ -185,7 +224,10 @@ internal static class SolutionWarmup
         get
         {
             lock (s_gate)
+            {
+                s_demand.TrySetResult();
                 return s_warm;
+            }
         }
     }
 
@@ -211,7 +253,25 @@ internal static class SolutionWarmup
         }
     }
 
-    private static async Task LoadAsync(string solutionPath)
+    private static async Task LoadWhenIdleAsync(string solutionPath, CancellationToken ct)
+    {
+        try
+        {
+            using var waiting = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task demand;
+            lock (s_gate) demand = s_demand.Task;
+            var idle = ForegroundGate.WaitForIdleAsync(waiting.Token);
+            await Task.WhenAny(idle, demand).WaitAsync(ct);
+            await waiting.CancelAsync();
+            try { await idle; } catch (OperationCanceledException) { }
+            ct.ThrowIfCancellationRequested();
+            _ = NameIndex.Start(solutionPath);
+            await LoadAsync(solutionPath, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+    }
+
+    private static async Task LoadAsync(string solutionPath, CancellationToken ct)
     {
         try
         {
@@ -228,12 +288,12 @@ internal static class SolutionWarmup
                 await using var progress = await ProgressReporter.BeginAsync(
                     $"Loading {name} ({missing.Count} project{(missing.Count == 1 ? "" : "s")})");
 
-                await WorkspaceService.EnsureProjectsLoadedAsync(missing);
+                await WorkspaceService.EnsureProjectsLoadedAsync(missing, ct);
             }
         }
         catch (OperationCanceledException)
         {
-            // Server shutting down mid-load.
+            return;
         }
         catch (Exception ex)
         {
@@ -244,7 +304,10 @@ internal static class SolutionWarmup
         }
 
         lock (s_gate)
+        {
+            if (ct.IsCancellationRequested) return;
             s_loadedOnce = true;
+        }
 
         // The stand-in has done its job and is now only a few megabytes of declarations nobody
         // will read again this session.
@@ -259,9 +322,9 @@ internal static class SolutionWarmup
 
         // Deliberately outside the try and outside anything a caller awaits: a solution that was
         // already loaded still needs this, and a search must never wait for it.
-        var warm = Task.Run(WarmSymbolsAsync);
         lock (s_gate)
-            s_warmedSymbols = warm;
+            if (!ct.IsCancellationRequested)
+                s_warmedSymbols = Task.Run(() => WarmSymbolsAsync(ct));
     }
 
     private static Task s_warmedSymbols = Task.CompletedTask;
@@ -323,42 +386,64 @@ internal static class SolutionWarmup
     /// shutdown, for the same reason: the keystroke that would cancel it is the one that needed it.
     /// </para>
     /// </remarks>
-    private static Task WarmSymbolsAsync() => WarmSymbolsAsync(CancellationToken.None);
-
     /// <summary>Test seam: the warm pass, with a token a test can stop the sweep with.</summary>
     internal static async Task WarmSymbolsAsync(CancellationToken ct)
     {
         try
         {
-            if (WorkspaceService.TryGetSessionSolution() is not { } solution)
-                return;
-
-            var order = WarmOrder(solution);
-
-            // Before the compilations: see the remarks. Cheap where storage is warm, and the
-            // gestures that block on it block on nothing else.
-            await SweepIndexesAsync(solution, order, ct);
-
-            foreach (var project in order)
+            while (true)
             {
-                ct.ThrowIfCancellationRequested();
+                await ForegroundGate.WaitForIdleAsync(ct);
+                if (WorkspaceService.TryGetSessionSolution() is not { } solution)
+                    return;
+                lock (s_gate)
+                    if (ReferenceEquals(solution, s_preparedSnapshot)) return;
 
-                await project.GetCompilationAsync(ct);
+                var order = WarmOrder(solution);
+                var retained = order.Take(RetainedCompilationLimit).Select(p => p.Id).ToHashSet();
+                lock (s_gate)
+                    foreach (var id in s_preparedCompilations.Keys.Where(id => !retained.Contains(id)).ToArray())
+                        s_preparedCompilations.Remove(id);
 
-                // With the compilation in hand this is just the type walk — build each project's
-                // import-completion index now, so the first Ctrl+Space anywhere in the solution
-                // gets unimported types without having to wait for (or miss) them.
-                ImportCompletionWarmer.Queue(project);
+                // Before the compilations: see the remarks. Cheap where storage is warm, and the
+                // gestures that block on it block on nothing else.
+                await SweepIndexesAsync(solution, order, ct);
 
-                // Hand the pool back between projects, so a burst of keystrokes that arrives
-                // mid-warm is dispatched rather than queued behind the next compilation.
-                await Task.Delay(Breath, ct);
+                foreach (var project in order)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await ForegroundGate.WaitForIdleAsync(ct);
+                    if (!ReferenceEquals(solution, WorkspaceService.TryGetSessionSolution()))
+                        break; // Resume on the new snapshot, reusing its unchanged project trackers.
+
+                    // Compilation warm-up is background work too. Do not start another project's
+                    // bind while completion is waiting for its own semantic model.
+                    using var admitted = await ForegroundGate.AdmitAsync(ct).ConfigureAwait(false);
+                    if (await project.GetCompilationAsync(ct) is { } compilation && retained.Contains(project.Id))
+                    {
+                        lock (s_gate)
+                            if (!ct.IsCancellationRequested)
+                                s_preparedCompilations[project.Id] = compilation;
+                    }
+
+                    // With the compilation in hand this is just the type walk — build each project's
+                    // import-completion index now, so the first Ctrl+Space anywhere in the solution
+                    // gets unimported types without having to wait for (or miss) them.
+                    ImportCompletionWarmer.Queue(project);
+
+                    // Hand the pool back between projects, so a burst of keystrokes that arrives
+                    // mid-warm is dispatched rather than queued behind the next compilation.
+                    await Task.Delay(Breath, ct);
+                }
+
+                if (ReferenceEquals(solution, WorkspaceService.TryGetSessionSolution()))
+                {
+                    lock (s_gate)
+                        if (!ct.IsCancellationRequested) s_preparedSnapshot = solution;
+                    return;
+                }
             }
 
-            // The never-true-predicate FindSourceDeclarationsAsync that used to sit here primed
-            // the declaration search Search Everywhere ran on. That search now reads
-            // TopLevelSyntaxTreeIndex directly — built by the index sweep above, before the
-            // compilation loop — so the call had nothing left to warm.
         }
         catch (OperationCanceledException)
         {
@@ -476,17 +561,16 @@ internal static class SolutionWarmup
             }
         }
 
-        // Wide, and narrowed per item by the gate: on a cold open there is nobody to yield to and
-        // the sweep should finish as early as it can, while a sweep still running when the user
-        // starts typing drops back to IndexConcurrency within one document's work.
+        // Bound queued work as well as admitted work; new items wait whenever the editor is busy.
         var options = new ParallelOptions
         {
-            MaxDegreeOfParallelism = Environment.ProcessorCount,
+            MaxDegreeOfParallelism = IndexConcurrency,
             CancellationToken = ct,
         };
 
         await Parallel.ForEachAsync(documents, options, async (document, token) =>
         {
+            await ForegroundGate.WaitForIdleAsync(token);
             using var admitted = await ForegroundGate.AdmitAsync(token).ConfigureAwait(false);
             await SyntaxTreeIndex.GetIndexAsync(document, token).ConfigureAwait(false);
             // Derives TopLevelSyntaxTreeIndex on the way through, and leaves behind the flat
@@ -498,6 +582,7 @@ internal static class SolutionWarmup
 
         await Parallel.ForEachAsync(references, options, async (reference, token) =>
         {
+            await ForegroundGate.WaitForIdleAsync(token);
             using var admitted = await ForegroundGate.AdmitAsync(token).ConfigureAwait(false);
             var checksum = SymbolTreeInfo.GetMetadataChecksum(solution.Services, reference, token);
             await SymbolTreeInfo
@@ -523,10 +608,16 @@ internal static class SolutionWarmup
 
         lock (s_gate)
         {
+            var old = s_lifetime;
+            _ = old.CancelAsync().ContinueWith(_ => old.Dispose(), TaskScheduler.Default);
+            s_lifetime = new();
+            s_demand = new(TaskCreationOptions.RunContinuationsAsynchronously);
             s_solutionPath = null;
             s_warm = Task.CompletedTask;
             s_warmedSymbols = Task.CompletedTask;
             s_loadedOnce = false;
+            s_preparedCompilations.Clear();
+            s_preparedSnapshot = null;
         }
     }
 }

@@ -95,13 +95,7 @@ internal sealed class DapServer
     /// <summary>
     /// Frame ids of a thread other than the stopped one start here.
     /// </summary>
-    /// <remarks>
-    /// Their stacks can be read, but nothing else about them can: locals, evaluation and stepping
-    /// all go through the frame the stop established, so a frame id from another thread reaching
-    /// the variables path would silently answer with the stopped thread's locals. Putting them in
-    /// their own band makes that case recognisable, and <c>scopes</c> hands out no reference for
-    /// it rather than the wrong one.
-    /// </remarks>
+    /// <remarks>Maps UI frame identities to the backend's opaque, thread-aware frame handles.</remarks>
     private const int ForeignFrameBase = 100_000;
 
     /// <summary>How many frame ids each foreign thread is given inside that band.</summary>
@@ -118,6 +112,69 @@ internal sealed class DapServer
     /// </remarks>
     private readonly Dictionary<int, int> _foreignFrameBands = [];
     private int _nextForeignBand;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> _foreignFrames = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> _scopeFrames = new();
+    private int _nextScope = int.MaxValue;
+
+    private bool TryScopeFrame(int reference, out int frame)
+    {
+        if (reference >= ScopeBase && reference < ScopeBase + ScopeLimit)
+        { frame = reference - ScopeBase; return true; }
+        return _scopeFrames.TryGetValue(reference, out frame);
+    }
+
+    /// <summary>
+    /// The DAP presentation hint for a row: what kind of member it is and how it may be used,
+    /// which is what the client renders as the icon beside the name.
+    /// </summary>
+    /// <remarks>
+    /// VS Code shows a property, a field, and a virtual node ("Raw View", "Static members")
+    /// each with its own glyph, and greys out what cannot be edited. A backend that does not
+    /// classify its rows gets no hint, and the client falls back to plain rows as before.
+    /// </remarks>
+    internal static JsonObject? PresentationHint(VariableInfo variable)
+    {
+        if (variable.Kind is null)
+            return null;
+
+        string? kind = variable.Kind switch
+        {
+            "property" or "proxy" => "property",
+            "field" or "local" or "arg" or "element" or "static" or "constant" => "data",
+            "raw" or "results" or "statics" or "nonpublic" or "diagnostic" => "virtual",
+            "return" => "virtual",
+            "exception" => "data",
+            _ => null,
+        };
+        if (kind is null)
+            return null;
+
+        var attributes = new JsonArray();
+        if (variable.Kind == "static")
+            attributes.Add("static");
+        if (variable.Kind == "constant")
+            attributes.Add("constant");
+        if (!variable.Evaluable && variable.Kind is "property" or "field" or "static" or "constant" or "proxy")
+            attributes.Add("readOnly");
+
+        var hint = new JsonObject { ["kind"] = kind };
+        if (attributes.Count > 0)
+            hint["attributes"] = attributes;
+        return hint;
+    }
+
+    private int BackendFrame(int frame) => frame < ForeignFrameBase ? frame
+        : _foreignFrames.TryGetValue(frame, out var backend) ? backend
+        : throw new InvalidOperationException("The stack frame has expired; refresh the call stack.");
+
+    private int ScopeFor(int frame)
+    {
+        var backend = BackendFrame(frame);
+        if (backend >= 0 && backend < ScopeLimit) return ScopeBase + backend;
+        var reference = Interlocked.Decrement(ref _nextScope);
+        _scopeFrames[reference] = backend;
+        return reference;
+    }
 
     /// <summary>The DAP frame id for a frame of a thread the stop did not land on.</summary>
     private int ForeignFrameId(int threadId, int frameIndex)
@@ -130,10 +187,14 @@ internal sealed class DapServer
                 _foreignFrameBands[threadId] = band;
             }
 
-            // A stack deeper than the stride would wrap into the next thread's band; clamping
-            // keeps the id inside this thread's own range, and the frame is unreadable either way.
-            return ForeignFrameBase + (band * ForeignFrameStride) +
-                   Math.Min(frameIndex, ForeignFrameStride - 1);
+            // Backend frame ids can already be opaque. Allocate one UI id per backend frame.
+            foreach (var pair in _foreignFrames)
+                if (pair.Value == frameIndex && pair.Key / ForeignFrameStride == (ForeignFrameBase / ForeignFrameStride) + band)
+                    return pair.Key;
+            var id = ForeignFrameBase + band * ForeignFrameStride +
+                _foreignFrames.Keys.Count(k => k / ForeignFrameStride == (ForeignFrameBase / ForeignFrameStride) + band);
+            _foreignFrames[id] = frameIndex;
+            return id;
         }
     }
 
@@ -290,85 +351,24 @@ internal sealed class DapServer
                 }
 
                 case "dataBreakpointInfo":
-                {
-                    // The client asks this about a name it saw in the Variables view; the frame is
-                    // part of the id so the same name in two frames is two watches.
-                    string name = arguments?["name"]?.GetValue<string>() ?? "";
-                    int frameId = arguments?["frameId"]?.GetValue<int>() ?? 0;
-
-                    if (name.Length == 0 || _backend.CurrentFrame is null)
-                    {
-                        await RespondAsync(message, new JsonObject
-                        {
-                            ["dataId"] = null,
-                            ["description"] = "Break on value change needs a suspended target and a named value.",
-                        });
-                        break;
-                    }
-
                     await RespondAsync(message, new JsonObject
                     {
-                        ["dataId"] = DataBreakpointId.For(name, frameId),
-                        ["description"] = $"{name} (break when the value changes)",
-                        // Reads are not detectable by comparing values, so they are not offered.
-                        ["accessTypes"] = new JsonArray { "write" },
-                        ["canPersist"] = false,
+                        ["dataId"] = null,
+                        ["description"] = DataBreakpointWatcher.UnsupportedNativeMessage,
                     });
                     break;
-                }
 
                 case "setDataBreakpoints":
                 {
-                    await _sessionStarted.Task;
-                    if (_backend is not PublishingDebugBackend watching)
-                    {
-                        await RespondAsync(message, null, false, "This adapter cannot watch values.");
-                        break;
-                    }
-
                     var requested = arguments?["breakpoints"]?.AsArray() ?? [];
-                    var specs = new List<DataBreakpointSpec>();
-                    // DAP wants one answer per requested breakpoint, so an entry with no data id
-                    // has to occupy its slot rather than shift every later answer up one.
-                    var armed = new List<bool>(requested.Count);
-                    foreach (var entry in requested)
+                    await RespondAsync(message, new JsonObject
                     {
-                        string dataId = entry?["dataId"]?.GetValue<string>() ?? "";
-                        armed.Add(dataId.Length > 0);
-                        if (dataId.Length == 0)
-                            continue;
-
-                        specs.Add(new DataBreakpointSpec(
-                            dataId,
-                            DataBreakpointId.ExpressionOf(dataId),
-                            entry?["accessType"]?.GetValue<string>() ?? "write",
-                            entry?["condition"]?.GetValue<string>(),
-                            entry?["hitCondition"]?.GetValue<string>()));
-                    }
-
-                    var statuses = await watching.SetDataBreakpointsAsync(specs, ct);
-                    var verified = new JsonArray();
-                    int next = 0;
-                    foreach (bool hasId in armed)
-                    {
-                        if (!hasId)
+                        ["breakpoints"] = new JsonArray(requested.Select(_ => (JsonNode)new JsonObject
                         {
-                            verified.Add(new JsonObject
-                            {
-                                ["verified"] = false,
-                                ["message"] = "The breakpoint carried no data id.",
-                            });
-                            continue;
-                        }
-
-                        var status = next < statuses.Count ? statuses[next++] : null;
-                        var result = new JsonObject { ["verified"] = status?.Verified ?? false };
-                        if (status is null || !status.Verified)
-                            result["message"] = status?.Message ?? "The value could not be watched.";
-                        verified.Add(result);
-                    }
-
-                    await RespondAsync(message, new JsonObject { ["breakpoints"] = verified });
+                            ["verified"] = false,
+                            ["message"] = DataBreakpointWatcher.UnsupportedNativeMessage,
+                        }).ToArray()),
+                    });
                     break;
                 }
 
@@ -506,9 +506,7 @@ internal sealed class DapServer
                 {
                     int frameId = arguments?["frameId"]?.GetValue<int>() ?? 0;
 
-                    // A frame belonging to a thread the stop did not land on has no readable
-                    // locals — reference 0 is DAP's way of saying "nothing to expand here",
-                    // which is the truth rather than another thread's variables.
+                    // Preserve the backend frame context, including its owning thread.
                     await RespondAsync(message, new JsonObject
                     {
                         ["scopes"] = new JsonArray
@@ -516,9 +514,7 @@ internal sealed class DapServer
                             new JsonObject
                             {
                                 ["name"] = "Locals",
-                                ["variablesReference"] = frameId >= ForeignFrameBase
-                                    ? 0
-                                    : ScopeBase + frameId,
+                                ["variablesReference"] = ScopeFor(frameId),
                                 ["expensive"] = false,
                             },
                         },
@@ -529,8 +525,8 @@ internal sealed class DapServer
                 case "variables":
                 {
                     int reference = arguments?["variablesReference"]?.GetValue<int>() ?? ScopeBase;
-                    var variables = reference >= ScopeBase && reference < ScopeBase + ScopeLimit
-                        ? await _backend.GetVariablesAsync(reference - ScopeBase, ct)
+                    var variables = TryScopeFrame(reference, out var scopeFrame)
+                        ? await _backend.GetVariablesAsync(scopeFrame, ct)
                         : await _backend.GetVariableChildrenAsync(reference, ct);
 
                     var array = new JsonArray();
@@ -541,7 +537,7 @@ internal sealed class DapServer
                             ["name"] = variable.Name,
                             ["value"] = variable.Value,
                             ["variablesReference"] = variable.VariablesReference,
-                            ["evaluateName"] = variable.Name,
+                            ["evaluateName"] = variable.EvaluateName,
                         };
                         if (variable.Type.Length > 0)
                             entry["type"] = variable.Type;
@@ -549,6 +545,8 @@ internal sealed class DapServer
                             entry["namedVariables"] = variable.NamedChildCount;
                         if (variable.IndexedChildCount > 0)
                             entry["indexedVariables"] = variable.IndexedChildCount;
+                        if (PresentationHint(variable) is { } hint)
+                            entry["presentationHint"] = hint;
                         array.Add(entry);
                     }
                     await RespondAsync(message, new JsonObject { ["variables"] = array });
@@ -560,14 +558,13 @@ internal sealed class DapServer
                     // The reference names the scope being edited, and a scope's reference carries
                     // its frame — writing frame 0 regardless edits the wrong frame's local.
                     int reference = arguments?["variablesReference"]?.GetValue<int>() ?? ScopeBase;
-                    int frameId = reference >= ScopeBase && reference < ScopeBase + ScopeLimit
-                        ? reference - ScopeBase
-                        : 0;
+                    var isScope = TryScopeFrame(reference, out var frameId);
 
-                    var (ok, stored, error) = await _backend.SetVariableAsync(
-                        arguments?["name"]?.GetValue<string>() ?? "",
-                        arguments?["value"]?.GetValue<string>() ?? "",
-                        frameId, ct);
+                    var name = arguments?["name"]?.GetValue<string>() ?? "";
+                    var value = arguments?["value"]?.GetValue<string>() ?? "";
+                    var (ok, stored, error) = isScope
+                        ? await _backend.SetVariableAsync(name, value, frameId, ct)
+                        : await _backend.SetVariableChildAsync(reference, name, value, ct);
 
                     await RespondAsync(
                         message,
@@ -578,27 +575,19 @@ internal sealed class DapServer
 
                 case "evaluate":
                 {
-                    // Evaluation runs in the frame the stop established. Asked about a frame of
-                    // another thread it would answer from the stopped one — a plausible value for
-                    // the wrong frame, which is worse than saying it cannot be read.
-                    if ((arguments?["frameId"]?.GetValue<int>() ?? 0) >= ForeignFrameBase)
-                    {
-                        const string unavailable =
-                            "Only the stopped thread's frames can be evaluated in.";
-                        await RespondAsync(
-                            message,
-                            new JsonObject { ["result"] = unavailable, ["variablesReference"] = 0 },
-                            success: false, unavailable);
-                        break;
-                    }
-
-                    string result = await _backend.EvaluateAsync(
-                        arguments?["expression"]?.GetValue<string>() ?? "", ct);
-                    bool ok = !result.StartsWith("Error", StringComparison.OrdinalIgnoreCase);
+                    var (ok, variable, error) = await _backend.EvaluateVariableAsync(
+                        arguments?["expression"]?.GetValue<string>() ?? "",
+                        BackendFrame(arguments?["frameId"]?.GetValue<int>() ?? 0), ct);
                     await RespondAsync(
                         message,
-                        new JsonObject { ["result"] = result, ["variablesReference"] = 0 },
-                        ok, ok ? null : result);
+                        variable is null ? null : new JsonObject
+                        {
+                            ["result"] = variable.Value,
+                            ["type"] = variable.Type,
+                            ["variablesReference"] = variable.VariablesReference,
+                            ["presentationHint"] = PresentationHint(variable),
+                        },
+                        ok, ok ? null : error);
                     break;
                 }
 
@@ -1184,7 +1173,7 @@ internal sealed class DapServer
         // way — neither runtime has hardware watchpoints to offer.
         ["supportsHitConditionalBreakpoints"] = true,
         ["supportsLogPoints"] = true,
-        ["supportsDataBreakpoints"] = true,
+        ["supportsDataBreakpoints"] = false,
         // Set Next Statement and Run to Cursor, which the ICorDebug engine has always had.
         ["supportsGotoTargetsRequest"] = true,
         ["supportsStepBack"] = false,
@@ -1244,6 +1233,8 @@ internal sealed class DapServer
         {
             _foreignFrameBands.Clear();
             _nextForeignBand = 0;
+            _foreignFrames.Clear();
+            _scopeFrames.Clear();
         }
 
         // A value change outranks the reason the resume was started with: the user pressed

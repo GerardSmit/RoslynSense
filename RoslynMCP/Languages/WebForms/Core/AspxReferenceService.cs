@@ -66,20 +66,21 @@ internal static class AspxReferenceService
     {
         var results = new List<AspxReference>();
 
-        // Nothing in a project that cannot host WebForms markup is worth a directory walk, and
-        // every find-references in the solution would otherwise pay for one.
+        // Reject projects with no possible mention before compiling all their projected code.
+        // The filter admits encoded/escaped identifiers and unknown text conservatively.
+        var mentions = AspxMentionFilter.For(symbol);
+        var files = EnumerateFiles(project).Where(mentions.MayMention).ToArray();
+        if (files.Length == 0)
+            return results;
+
         if (!await HostsWebFormsAsync(project, ct))
             return results;
 
         var definition = symbol.OriginalDefinition;
-        var mentions = AspxMentionFilter.For(symbol);
 
-        foreach (string file in EnumerateFiles(project))
+        foreach (string file in files)
         {
             ct.ThrowIfCancellationRequested();
-
-            if (!mentions.MayMention(file))
-                continue;
 
             var document = await AspxDocumentService.GetAsync(file, ct);
             if (document?.Tree is not { } root)
@@ -130,7 +131,7 @@ internal static class AspxReferenceService
 
         var target = SymbolFinder
             .FindSimilarSymbols(symbol.OriginalDefinition, compilation, ct)
-            .FirstOrDefault();
+            .FirstOrDefault(candidate => Same(candidate, symbol));
         if (target is null)
             return results;
 
@@ -277,7 +278,7 @@ internal static class AspxReferenceService
             return results;
 
         var target = SymbolFinder.FindSimilarSymbols(symbol.OriginalDefinition, projection.Compilation, ct)
-            .FirstOrDefault();
+            .FirstOrDefault(candidate => Same(candidate, symbol));
         if (target is null)
             return results;
 
@@ -403,6 +404,7 @@ internal static class AspxReferenceService
             return true;
 
         if (candidate.Kind != symbol.Kind
+            || !Equals(candidate.ContainingAssembly?.Identity, symbol.ContainingAssembly?.Identity)
             || !string.Equals(candidate.MetadataName, symbol.MetadataName, StringComparison.Ordinal))
             return false;
 

@@ -279,9 +279,15 @@ public class SourceGeneratorShadowCopyTests
             string oldPath2 = GeneratorReferencePath(workspace, project.Id, "Generator2.dll");
 
             // Each output directory fires its own refresh; two rebuilt generators must cost
-            // two in-place reference swaps and still zero workspace reloads.
-            File.AppendAllText(Path.Combine(tempDir, "Generator", "HelloGenerator.cs"), "\n// rebuilt\n");
-            File.AppendAllText(Path.Combine(tempDir, "Generator2", "HelloGenerator.cs"), "\n// rebuilt\n");
+            // two in-place reference swaps and still zero workspace reloads. A real change to
+            // each, not a comment: the fingerprint compares what a compilation observes, and a
+            // comment-only rebuild moves nothing but the PDB — which is, correctly, no rebuild.
+            foreach (string generator in new[] { "Generator", "Generator2" })
+            {
+                string source = Path.Combine(tempDir, generator, "HelloGenerator.cs");
+                File.WriteAllText(source, File.ReadAllText(source).Replace("V1", "V2"));
+            }
+
             await RunDotnetBuildAsync(gen1Project);
             await RunDotnetBuildAsync(gen2Project);
 

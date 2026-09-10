@@ -180,7 +180,7 @@ public static class RunTestsTool
 
         if (build)
         {
-            var buildArgs = $"\"{csprojPath}\" /nologo /v:minimal";
+            var buildArgs = $"\"{PathHelper.WithOnDiskCasing(csprojPath)}\" /nologo /v:minimal";
             var (buildExitCode, buildOut, buildErr) = await BackgroundTaskHelper.RunProcessAsync(
                 msbuild, buildArgs, workingDirectory, Math.Max(60, timeoutSeconds / 2));
 

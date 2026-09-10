@@ -1,4 +1,4 @@
-﻿using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CodeRefactorings;
@@ -49,11 +49,14 @@ internal static class CodeActionHandler
         CodeActionParams p, LspResolveCache cache, CancellationToken ct,
         bool clientPicksNestedActions = false)
     {
+        var bufferGeneration = OpenDocumentStore.Generation;
         var document = await LspDocumentResolver.ResolveAsync(
             LspConverters.UriToPath(p.TextDocument.Uri), ct);
         if (document is null)
             return Array.Empty<LspCodeAction>();
 
+        using var requestGroup = cache.BeginActions(document);
+        if (OpenDocumentStore.Generation != bufferGeneration) throw LspResolveCache.Expired("code action");
         var text = await document.GetTextAsync(ct);
         var span = LspConverters.ToTextSpan(text, p.Range);
 
@@ -99,7 +102,7 @@ internal static class CodeActionHandler
 
             configuration.AddRange(await ConfigurationActionsAsync(
                 document, span, diagnostics,
-                new Nesting(clientPicksNestedActions, cache, document.Project.Solution), ct));
+                new Nesting(clientPicksNestedActions, cache, document.Project.Solution, requestGroup.Id), ct));
         }
 
         // Refactorings at the selection.
@@ -128,7 +131,7 @@ internal static class CodeActionHandler
                 }
                 : new LspCodeAction(a.Title, a.Kind, Edit: null)
                 {
-                    Data = new CodeActionData(cache.StoreAction(a.Action!, document.Project.Solution)),
+                    Data = new CodeActionData(cache.StoreAction(a.Action!, document.Project.Solution, requestGroup.Id)),
                 })
             .ToArray();
     }
@@ -202,14 +205,14 @@ internal static class CodeActionHandler
         var nested = action.NestedActions;
         return nested.IsDefaultOrEmpty
             ? new NestedCodeActionGroup(
-                action.Title, nesting.Cache.StoreAction(action, nesting.Solution), null)
+                action.Title, nesting.Cache.StoreAction(action, nesting.Solution, nesting.GroupId), null)
             : new NestedCodeActionGroup(
                 action.Title, null, nested.Select(child => Group(child, nesting)).ToArray());
     }
 
     /// <summary>Whether this connection can render a group, and what a group's leaves are
     /// cached against.</summary>
-    private readonly record struct Nesting(bool ClientPicks, LspResolveCache Cache, Solution Solution);
+    private readonly record struct Nesting(bool ClientPicks, LspResolveCache Cache, Solution Solution, long GroupId);
 
     /// <summary>
     /// One entry in the lightbulb: either a single <see cref="Action"/> or a collapsed
@@ -230,10 +233,13 @@ internal static class CodeActionHandler
     public static async Task<LspCodeAction> ResolveAsync(
         LspCodeAction action, LspResolveCache cache, CancellationToken ct)
     {
-        if (action.Data is null || cache.GetAction(action.Data.Id) is not var (roslynAction, oldSolution) || roslynAction is null)
-            return action; // evicted/unknown — client will surface "no edit" on apply
+        if (action.Data is null) return action;
+        var generation = cache.Generation;
+        if (cache.GetAction(action.Data.Id) is not var (roslynAction, oldSolution) || roslynAction is null)
+            throw LspResolveCache.Expired("code action");
 
         var edit = await TryResolveEditAsync(oldSolution, roslynAction, ct);
+        if (cache.Generation != generation) throw LspResolveCache.Expired("code action");
         return action with { Edit = edit };
     }
 
@@ -249,6 +255,7 @@ internal static class CodeActionHandler
 
             var changes = new Dictionary<string, TextEdit[]>();
             var created = new List<string>();
+            var versions = new Dictionary<string, int?>();
 
             foreach (var projectChange in changed.GetChanges(oldSolution).GetProjectChanges())
             {
@@ -280,7 +287,7 @@ internal static class CodeActionHandler
                 return null;
 
             // No new files means no resource operations, and the simple form every client reads.
-            if (created.Count == 0)
+            if (created.Count == 0 && versions.Values.All(v => v is null))
                 return new WorkspaceEdit(changes);
 
             // Creations first: the edits that follow write into the files they make.
@@ -288,7 +295,7 @@ internal static class CodeActionHandler
             [
                 .. created.Select(uri => (object)new CreateFile(uri)),
                 .. changes.Select(entry => (object)new TextDocumentEdit(
-                    new OptionalVersionedTextDocumentIdentifier(entry.Key), entry.Value)),
+                    new OptionalVersionedTextDocumentIdentifier(entry.Key, versions.GetValueOrDefault(entry.Key)), entry.Value)),
             ];
             return new WorkspaceEdit(changes, documentChanges);
 
@@ -298,6 +305,11 @@ internal static class CodeActionHandler
                     return;
 
                 var oldText = await oldDoc.GetTextAsync(ct);
+                var version = OpenDocumentStore.VersionOf(path);
+                var currentText = OpenDocumentStore.TryGet(path, out var openText) ? openText
+                    : File.Exists(path) ? SourceText.From(await File.ReadAllTextAsync(path, ct)) : null;
+                if (currentText is null || !currentText.ContentEquals(oldText)) throw LspResolveCache.Expired("code action");
+                versions[LspConverters.PathToUri(path)] = version;
                 var newText = await newDoc.GetTextAsync(ct);
 
                 // Documents carry tracked changes and give a tighter diff than comparing texts;
@@ -326,6 +338,7 @@ internal static class CodeActionHandler
             }
         }
         catch (OperationCanceledException) { throw; }
+        catch (StreamJsonRpc.LocalRpcException) { throw; }
         catch
         {
             return null; // action can't produce a preview — drop it

@@ -33,7 +33,7 @@ namespace RoslynMCP.Services;
 /// </remarks>
 internal sealed class SingleFlight
 {
-    private readonly ConcurrentDictionary<string, Task> _inflight = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Lazy<Task>> _inflight = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// The run in flight for <paramref name="key"/>, starting one with <paramref name="run"/> if
@@ -42,16 +42,29 @@ internal sealed class SingleFlight
     /// </summary>
     public Task Start(string key, Func<string, Task> run)
     {
-        var started = _inflight.GetOrAdd(key, run);
+        // GetOrAdd can invoke its factory concurrently for the same key. Only the winning
+        // lazy may start work; discarded factories must never launch a second restore/build.
+        var entry = _inflight.GetOrAdd(key, static (target, factory) =>
+            new Lazy<Task>(() => factory(target), LazyThreadSafetyMode.ExecutionAndPublication), run);
+        Task started;
+        try
+        {
+            started = entry.Value;
+        }
+        catch
+        {
+            _inflight.TryRemove(new KeyValuePair<string, Lazy<Task>>(key, entry));
+            throw;
+        }
 
-        // Keyed on the task identity, so a caller that has already started a *newer* run does not
+        // Keyed on the entry identity, so a caller that has already started a *newer* run does not
         // have it dropped out from under it by this one's completion.
         //
         // Attaching once per caller rather than once per run is deliberate and harmless: removal is
         // idempotent, and by the time GetOrAdd has returned the entry is in the dictionary — so a
         // run that finished before its first caller could attach still evicts itself here.
         _ = started.ContinueWith(
-            finished => _inflight.TryRemove(new KeyValuePair<string, Task>(key, finished)),
+            _ => _inflight.TryRemove(new KeyValuePair<string, Lazy<Task>>(key, entry)),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);

@@ -56,11 +56,24 @@ export function registerNestedCodeActions(
                 // The same request the editor would have sent had this been an ordinary entry.
                 // `kind` is not read back by the server; it is here because the protocol's
                 // CodeAction requires it.
-                const resolved = await client.sendRequest<ResolvedCodeAction>('codeAction/resolve', {
-                    title: leaf.title,
-                    kind: 'quickfix',
-                    data: { id: leaf.id },
-                });
+                let resolved: ResolvedCodeAction;
+                try {
+                    resolved = await client.sendRequest<ResolvedCodeAction>('codeAction/resolve', {
+                        title: leaf.title,
+                        kind: 'quickfix',
+                        data: { id: leaf.id },
+                    });
+                } catch (error) {
+                    // Ordinary resolves use languageclient's cancellation handling. This command
+                    // sends the request directly, so handle LSP ContentModified explicitly.
+                    if (typeof error === 'object' && error !== null && 'code' in error && error.code === -32801) {
+                        void vscode.window.showWarningMessage(
+                            `'${leaf.title}' expired or the document changed. Reopen the lightbulb menu to request it again.`
+                        );
+                        return;
+                    }
+                    throw error;
+                }
 
                 if (!resolved?.edit) {
                     void vscode.window.showWarningMessage(

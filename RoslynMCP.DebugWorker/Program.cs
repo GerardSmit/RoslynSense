@@ -191,6 +191,15 @@ internal static class Program
                         session.AddDecompiledSymbols(request.ModulePath ?? "", decompiled);
                     break;
 
+                case "evaluateVariable":
+                {
+                    var (ok, variable, error) = await session.EvaluateVariableAsync(request.FrameIndex, request.Expression ?? "");
+                    response.Ok = ok;
+                    response.Variable = variable;
+                    response.Error = error;
+                    break;
+                }
+
                 case "evaluate":
                 {
                     var (ok, value, error) = await session.EvaluateAsync(request.FrameIndex, request.Expression ?? "");

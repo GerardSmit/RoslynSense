@@ -36,6 +36,7 @@ namespace RoslynMCP.Languages.WebForms.Core;
 /// </remarks>
 internal readonly struct AspxMentionFilter
 {
+    private const string EncodedIdentifier = "\0";
     private sealed record IndexEntry(DateTime WriteTimeUtc, long Length, FrozenSet<string> Tokens);
 
     private static readonly ConcurrentDictionary<string, IndexEntry> s_index =
@@ -96,6 +97,7 @@ internal readonly struct AspxMentionFilter
 
         var tokens = TokensOf(file);
         return tokens is null
+            || tokens.Contains(EncodedIdentifier)
             || tokens.Contains(_token)
             || (_eventToken is not null && tokens.Contains(_eventToken));
     }
@@ -143,10 +145,18 @@ internal readonly struct AspxMentionFilter
     private static FrozenSet<string> Tokenize(string text)
     {
         var tokens = new HashSet<string>(StringComparer.Ordinal);
+        // Projected C# can spell an identifier with Unicode escapes; markup can encode
+        // characters as entities. Plain token absence cannot exclude either representation.
+        if (text.Contains("\\u", StringComparison.Ordinal) || text.Contains("\\U", StringComparison.Ordinal)
+            || text.Contains("&#", StringComparison.Ordinal))
+            tokens.Add(EncodedIdentifier);
 
         int start = -1;
         for (int i = 0; i <= text.Length; i++)
         {
+            if (i < text.Length && text[i] > 127
+                && char.GetUnicodeCategory(text[i]) == System.Globalization.UnicodeCategory.Format)
+                tokens.Add(EncodedIdentifier);
             if (i < text.Length && IsTokenChar(text[i]))
             {
                 if (start < 0)

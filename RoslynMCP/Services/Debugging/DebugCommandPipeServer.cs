@@ -26,7 +26,8 @@ internal sealed record DebugPipeRequest(
     string? MetadataDelta = null,
     string? IlDelta = null,
     string? PdbDelta = null,
-    string? SymbolMap = null);
+    string? SymbolMap = null,
+    int ThreadId = 0);
 
 internal sealed record DebugPipeResponse(bool Ok, string? Result, string? Error);
 
@@ -113,7 +114,7 @@ internal sealed class DebugCommandPipeServer : IDisposable
         }
     }
 
-    private async Task<DebugPipeResponse> ExecuteAsync(DebugPipeRequest request, CancellationToken ct)
+    internal async Task<DebugPipeResponse> ExecuteAsync(DebugPipeRequest request, CancellationToken ct)
     {
         var session = _sessionProvider();
         if (session is null)
@@ -141,14 +142,16 @@ internal sealed class DebugCommandPipeServer : IDisposable
 
                 // Structured actions answer with JSON so the editor's views get real data rather
                 // than a regex reading the markdown surface back apart.
-                "frames" => Json(await session.GetStackFramesAsync(ct)),
+                "evaluate_variable" => await EvaluateVariableAsync(session, request, ct),
+                "frames" => Json(await session.GetStackFramesAsync(request.ThreadId, ct)),
                 "variables" => Json(await session.GetVariablesAsync(request.FrameId, ct)),
                 "children" => Json(await session.GetVariableChildrenAsync(request.VariablesReference, ct)),
                 "threads" => Json(await session.GetThreadsAsync(ct)),
                 "exception_info" => Json(await session.GetExceptionInfoAsync(ct)),
                 "set_variable" when request.Expression is not null =>
-                    Json(await session.SetVariableAsync(
-                        request.Expression, request.Value ?? "", request.FrameId, ct)),
+                    Json(request.VariablesReference > 0
+                        ? await session.SetVariableChildAsync(request.VariablesReference, request.Expression, request.Value ?? "", ct)
+                        : await session.SetVariableAsync(request.Expression, request.Value ?? "", request.FrameId, ct)),
                 "exception_filters" => await session.SetExceptionFiltersAsync(
                     ExceptionFilters.FromIds(request.Filters ?? []), ct),
                 // Value watches live in the decorator, not the engine, so both are answered by
@@ -225,6 +228,12 @@ internal sealed class DebugCommandPipeServer : IDisposable
         var (_, message) = await managed.ShutdownAsync(timeout);
         DebugSessionManager.DisposeSession();
         return message;
+    }
+
+    private static async Task<string> EvaluateVariableAsync(IDebugBackend session, DebugPipeRequest request, CancellationToken ct)
+    {
+        var (ok, variable, error) = await session.EvaluateVariableAsync(request.Expression ?? "", request.FrameId, ct);
+        return Json(new { ok, variable, error });
     }
 
     /// <summary>Connects to the command pipe of the debug session owned by

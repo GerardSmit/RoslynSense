@@ -72,6 +72,7 @@ internal static partial class ToolInvoker
         IOutputFormatter fmt,
         CancellationToken ct)
     {
+        using var memoryOperation = Services.Memory.HostMemoryTelemetry.Operation("tool:" + method.Name);
         var parameters = method.GetParameters();
         var values = new object?[parameters.Length];
 

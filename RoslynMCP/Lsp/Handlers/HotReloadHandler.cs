@@ -19,7 +19,7 @@ internal static class HotReloadHandler
         if (Resolve(p.ProjectPath) is not { } project)
             return Failed($"Could not find a .csproj for '{p.ProjectPath}'.");
 
-        var (session, message) = await HotReloadService.StartAsync(project, ct);
+        var (session, message) = await HotReloadService.StartAsync(project, ct, p.OwnerId, p.OwnerPid);
         return new HotReloadResultDto(session is not null, message, [], [], []);
     }
 
@@ -34,7 +34,7 @@ internal static class HotReloadHandler
         bool openedNow = session is null;
         if (session is null)
         {
-            var (started, message) = await HotReloadService.StartAsync(project, ct);
+            var (started, message) = await HotReloadService.StartAsync(project, ct, p.OwnerId, p.OwnerPid);
             if (started is null)
                 return Failed(message);
             session = started;
@@ -64,7 +64,7 @@ internal static class HotReloadHandler
             [.. outcome.Errors]);
     }
 
-    public static HotReloadResultDto Stop(HotReloadParams p)
+    public static async Task<HotReloadResultDto> StopAsync(HotReloadParams p)
     {
         if (Resolve(p.ProjectPath) is not { } project)
             return Failed($"Could not find a .csproj for '{p.ProjectPath}'.");
@@ -72,7 +72,8 @@ internal static class HotReloadHandler
         if (HotReloadService.Get(project) is not { } session)
             return new HotReloadResultDto(true, "No hot reload session was open.", [], [], []);
 
-        session.Stop();
+        if (p.OwnerId is { } owner) await HotReloadService.ReleaseOwnerAsync(project, owner);
+        else await session.StopAsync();
         return new HotReloadResultDto(true, "Closed the hot reload session.", [], [], []);
     }
 

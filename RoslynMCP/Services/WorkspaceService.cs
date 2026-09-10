@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
@@ -3942,14 +3942,32 @@ internal static class WorkspaceService
                     var stillOpen = open.SelectMany(item => baseSolution.GetDocumentIdsWithFilePath(item.Path)).ToHashSet();
                     foreach (var id in applied.Keys.Where(id => !stillOpen.Contains(id)).ToArray())
                     {
-                        if (baseSolution.GetDocument(id) is { } original && original.TryGetText(out var disk))
+                        // The text on disk, read synchronously when the loader has gone cold.
+                        // Roslyn holds file text weakly, so a collection between opening a tab and
+                        // closing another one leaves nothing to restore the closed document from.
+                        // Rebuilding the whole overlay instead — which is what giving up here
+                        // meant — re-applies every other open buffer, and each one takes a new
+                        // version stamp that drags its dependent projects' semantic versions with
+                        // it. Closing one tab then recompiled projects nobody had touched, and a
+                        // GC landing in that window was enough to cause it. One file read, off a
+                        // path the editor has open and the OS has cached, is the cheaper half of
+                        // that trade even under the lock.
+                        SourceText? disk = null;
+                        if (baseSolution.GetDocument(id) is { } original)
+                        {
+                            try { disk = original.GetTextSynchronously(CancellationToken.None); }
+                            catch (IOException) { }
+                            catch (UnauthorizedAccessException) { }
+                        }
+
+                        if (disk is not null)
                         {
                             solution = solution.WithDocumentText(id, disk);
                             applied.Remove(id);
                         }
                         else
                         {
-                            // A cold loader is not read synchronously under the overlay lock.
+                            // The file is gone or unreadable; the base is the only honest answer.
                             solution = baseSolution;
                             applied.Clear();
                             reusable = false;

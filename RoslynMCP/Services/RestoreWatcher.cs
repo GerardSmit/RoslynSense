@@ -85,7 +85,7 @@ internal static class RestoreWatcher
     private static readonly bool EnabledByDefault =
         Environment.GetEnvironmentVariable("ROSLYNMCP_NO_RESTORE_WATCH") is not ("1" or "true" or "on");
 
-    private static bool s_enabled = EnabledByDefault;
+    private static volatile bool s_enabled = EnabledByDefault;
 
     /// <summary>
     /// Starts watching the restore output of every project in <paramref name="projectPaths"/>.
@@ -103,6 +103,13 @@ internal static class RestoreWatcher
         {
             foreach (string project in snapshot)
             {
+                // Checked again here, not only at the call: this runs whenever the pool gets to
+                // it, and a StopAll or disarm in between must win. Otherwise a load that finished
+                // just before watching was turned off installed its handles just after — in the
+                // suite, into the next test's count.
+                if (!s_enabled)
+                    return;
+
                 try
                 {
                     Watch(project);
@@ -238,7 +245,19 @@ internal static class RestoreWatcher
             return;
         }
 
-        watcher.EnableRaisingEvents = true;
+        try
+        {
+            watcher.EnableRaisingEvents = true;
+        }
+        catch
+        {
+            // The directory went away between the existence check and the handle: a tree being
+            // deleted. Registered first so a concurrent caller sees it, so it has to be taken
+            // back out — a watcher that never opened would otherwise sit in the count forever.
+            s_watchers.TryRemove(directory, out _);
+            watcher.Dispose();
+            throw;
+        }
     }
 
     /// <summary>

@@ -249,7 +249,8 @@ public class RestoreNeedTests : IDisposable
 
         Assert.True(
             await WaitAsync(() => RestoreWatcher.WatchedDirectoryCount == 0),
-            "A watcher was still registered after the project's whole directory was deleted.");
+            "A watcher was still registered after the project's whole directory was deleted: " +
+            string.Join(", ", RestoreWatcher.WatchedDirectoriesForTests));
     }
 
     /// <summary>

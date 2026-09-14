@@ -68,7 +68,18 @@ public sealed class WorkspaceLoadOverlayTests
             // Batch preparation has returned; its temporary disk texts must not be needed to
             // recognize unchanged open buffers when their first request arrives later.
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: false);
-            var (_, batch) = await WorkspaceService.GetOrOpenProjectAsync(projects[2], targetFilePath: files[2]);
+            // With the load gate held — as the post-load reconcile briefly holds it, which a slow
+            // runner made the first request land inside — a stale refresh cannot write into the
+            // live workspace and forks instead. The generated files the load itself wrote under
+            // obj\ must not count as stale, or that first answer is a fork of the live solution.
+            var (gate, _) = await WorkspaceService.RefreshStateForTests(projects[2]);
+            await gate.WaitAsync();
+            Project batch;
+            try
+            {
+                (_, batch) = await WorkspaceService.GetOrOpenProjectAsync(projects[2], targetFilePath: files[2]);
+            }
+            finally { gate.Release(); }
             Assert.Same(workspace.CurrentSolution.GetProject(batch.Id)!.State, batch.State);
             Assert.Equal(texts[2], (await WorkspaceService.FindDocumentInProject(batch, files[2])!.GetTextAsync()).ToString());
 

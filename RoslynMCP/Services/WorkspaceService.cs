@@ -3344,6 +3344,15 @@ internal static class WorkspaceService
         if (!fileInfo.Exists || (requireNewerMtime && fileInfo.LastWriteTimeUtc <= cacheTime))
             return ReadOutcome.Unchanged;
 
+        // A document nobody has realized yet, whose text still comes from this file, cannot be
+        // stale: the text Roslyn loads on first use *is* whatever the disk holds now. Reading it
+        // as an edit re-stamped every generated file a project's own design-time build had just
+        // written under obj\ — the watcher sees those writes, the load that produced them is what
+        // added their documents — and when the post-load reconcile still held the gate, the first
+        // request for the new project came back on a fork instead of the live workspace.
+        if (!document.TryGetText(out var current) && document.State.TextAndVersionSource.CanReloadText)
+            return ReadOutcome.Unchanged;
+
         SourceText disk;
         try
         {
@@ -3355,7 +3364,7 @@ internal static class WorkspaceService
             return ReadOutcome.Unreadable;
         }
 
-        if (document.TryGetText(out var current) && current.ContentEquals(disk))
+        if (current is not null && current.ContentEquals(disk))
             return ReadOutcome.Unchanged;
 
         text = disk;

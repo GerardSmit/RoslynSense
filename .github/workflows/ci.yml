@@ -683,4 +683,6 @@ jobs:
           git pull --rebase origin "${{ github.event.repository.default_branch }}"
           git push origin "HEAD:${{ github.event.repository.default_branch }}"
 
-          git show --stat --format="synced to v$VERSION" HEAD
+          # tformat:, because a --format string without a % placeholder is otherwise looked up as
+          # a pretty *name* and rejected: "fatal: invalid --pretty format".
+          git show --stat --format="tformat:synced to v$VERSION" HEAD

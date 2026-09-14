@@ -8,7 +8,7 @@
         <PackAsTool>true</PackAsTool>
         <ToolCommandName>roslyn-sense</ToolCommandName>
         <PackageId>RoslynSense</PackageId>
-        <VersionPrefix>0.1.0</VersionPrefix>
+        <VersionPrefix>0.4.2</VersionPrefix>
         <PackageReadmeFile>README.md</PackageReadmeFile>
         <Description>Roslyn-powered MCP server for C# code analysis and navigation.</Description>
         <Authors>GerardSmit</Authors>

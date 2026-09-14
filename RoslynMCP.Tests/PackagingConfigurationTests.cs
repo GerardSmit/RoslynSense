@@ -15,8 +15,18 @@ public class PackagingConfigurationTests
         Assert.Equal("true", GetPropertyValue(project, "PackAsTool"));
         Assert.Equal("roslyn-sense", GetPropertyValue(project, "ToolCommandName"));
         Assert.Equal("RoslynSense", GetPropertyValue(project, "PackageId"));
-        Assert.Equal("0.1.0", GetPropertyValue(project, "VersionPrefix"));
+        // The release workflow's sync-versions step rewrites this together with the plugin
+        // manifest and the extension's package.json, in a commit that skips CI. Pinning a literal
+        // here failed the first run after every release; the invariant is that they agree.
+        Assert.Equal(ManifestVersion(".claude-plugin", "plugin.json"), GetPropertyValue(project, "VersionPrefix"));
+        Assert.Equal(ManifestVersion("vscode-extension", "package.json"), GetPropertyValue(project, "VersionPrefix"));
         Assert.Equal("README.md", GetPropertyValue(project, "PackageReadmeFile"));
+    }
+
+    private static string ManifestVersion(params string[] parts)
+    {
+        using var manifest = System.Text.Json.JsonDocument.Parse(File.ReadAllText(GetRepoPath(parts)));
+        return manifest.RootElement.GetProperty("version").GetString()!;
     }
 
     private static string GetRepoPath(params string[] parts)

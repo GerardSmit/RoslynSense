@@ -22,6 +22,8 @@
   <ItemGroup>
     <!-- Managed wrappers over ICorDebug / ICLRMetaHost / ISymUnmanaged, so the COM vtable and
          QueryInterface plumbing does not have to be hand-written. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
+    <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="all" ExcludeAssets="runtime" />
     <PackageReference Include="ClrDebug" Version="0.4.1" />
     <!-- The CoreCLR-side bootstrap; the .NET Framework side uses the desktop CLR shim instead. -->
     <PackageReference Include="Microsoft.Diagnostics.DbgShim" Version="9.0.661903" />
@@ -30,4 +32,8 @@
     <PackageReference Include="Microsoft.Diagnostics.Runtime" Version="4.0.732401" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Publicize Include="Microsoft.CodeAnalysis.CSharp:Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions.WithTopLevelBinderFlags" />
+    <Publicize Include="Microsoft.CodeAnalysis.CSharp:Microsoft.CodeAnalysis.CSharp.BinderFlags" />
+  </ItemGroup>
 </Project>

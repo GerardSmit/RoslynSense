@@ -12,8 +12,9 @@ namespace RoslynMCP.HotReloadAgent;
 /// <para>
 /// Edit-and-Continue on CoreCLR needs code executing <em>in</em> the target process:
 /// <see cref="MetadataUpdater.ApplyUpdate"/> is the only supported way to change a loaded
-/// assembly, and it can only be called from inside. There is no debugger in this path at all —
-/// this is why hot reload works whether or not the app is being debugged, which is the point.
+/// assembly, and it can only be called from inside. This path supports running without a
+/// debugger: the runtime rejects MetadataUpdater updates while a debugger is attached, and a
+/// process under the tool's own ICorDebug engine takes its edits through the debugger instead.
 /// </para>
 /// <para>
 /// The channel is a named pipe rather than the diagnostic IPC socket because the tool already

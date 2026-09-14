@@ -1,4 +1,4 @@
-﻿using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using RoslynMCP.Lsp.Protocol;
 using RoslynMCP.Languages.Formatting;
@@ -26,13 +26,16 @@ internal static class AspxCompletionHandler
     public static async Task<CompletionList> CompletionAsync(
         CompletionParams p, LspResolveCache cache, CancellationToken ct)
     {
+        var bufferGeneration = OpenDocumentStore.Generation;
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
         var document = await AspxDocumentService.GetAsync(path, ct);
         if (document is null)
             return Empty;
+        var generation = cache.Generation;
+        if (OpenDocumentStore.Generation != bufferGeneration) throw LspResolveCache.Expired("completion");
 
         return await CompleteAsync(
-            document, LspConverters.ToOffset(document.SourceText, p.Position), p.Context, cache, ct);
+            document, LspConverters.ToOffset(document.SourceText, p.Position), p.Context, cache, ct, generation);
     }
 
     /// <summary>
@@ -42,8 +45,9 @@ internal static class AspxCompletionHandler
     /// </summary>
     public static async Task<CompletionList> CompleteAsync(
         AspxDocument document, int offset, LspCompletionContext? trigger,
-        LspResolveCache cache, CancellationToken ct)
+        LspResolveCache cache, CancellationToken ct, long? expectedGeneration = null)
     {
+        var generation = expectedGeneration ?? cache.Generation;
         var context = AspxCompletionContextScanner.Classify(document.Text, offset);
 
         return context.Kind switch
@@ -52,7 +56,7 @@ internal static class AspxCompletionHandler
             // so a caret inside it completes resource keys rather than C# symbols.
             AspxContextKind.Code when AspxResourceHandler.IsExpressionBuilder(document.Text, context.TagStart) =>
                 await AspxResourceHandler.BuilderKeysAsync(document, context, offset, ct),
-            AspxContextKind.Code => await CodeAsync(document, offset, trigger, cache, ct),
+            AspxContextKind.Code => await CodeAsync(document, offset, trigger, cache, ct, generation),
             AspxContextKind.TagName => TagNames(document, context),
             AspxContextKind.AttributeName => AttributeNames(document, context),
             AspxContextKind.AttributeValue => await AttributeValuesAsync(document, context, offset, ct),
@@ -65,7 +69,7 @@ internal static class AspxCompletionHandler
 
     private static async Task<CompletionList> CodeAsync(
         AspxDocument document, int offset, LspCompletionContext? trigger,
-        LspResolveCache cache, CancellationToken ct)
+        LspResolveCache cache, CancellationToken ct, long generation)
     {
         // `Eval("…")` names a field of the bound item, not a C# symbol, so Roslyn has nothing to
         // say about it and the answer has to come from the container's item type instead.
@@ -90,7 +94,7 @@ internal static class AspxCompletionHandler
             span => projection.ToAspx(span) is { } mapped
                 ? AspxLanguageHandler.ToRange(document, mapped)
                 : null,
-            ct);
+            ct, generation);
     }
 
     /// <summary>

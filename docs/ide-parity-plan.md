@@ -108,7 +108,7 @@ landed, and what shipped beyond it.
 | Item | State | Delivered as |
 | --- | --- | --- |
 | T1.1 analyzer diagnostics | Done | `AnalyzerService.RunDocumentAnalyzersAsync`, `AnalyzerDiagnosticCache`, two-phase `DiagnosticsPublisher`, IDE analyzers reflected out of the Features assemblies, and Roslyn's `IConfigurationFixProvider` exports for suppress/configure — with reserved lightbulb slots so they cannot be crowded out |
-| T1.2 native F5 | Done | `LaunchHandler` (`launchTargets`, `attachTargets`, `debuggerPath`), `debugLaunch.ts`; netcoredbg `--interpreter=vscode` for CoreCLR, `roslyn-sense --dap` for Framework — and for CoreCLR too when `debugger.coreClrEngine` opts in, which the server reports per target so the client does not read the setting itself |
+| T1.2 native F5 | Done | `LaunchHandler` (`launchTargets`, `attachTargets`, `debuggerPath`), `debugLaunch.ts`; `roslyn-sense --dap` for Framework and, on Windows, for CoreCLR; netcoredbg `--interpreter=vscode` for CoreCLR elsewhere or when `debugger.coreClrEngine` asks for it, which the server reports per target so the client does not read the setting itself |
 | T1.3 Test Explorer | Done | `TestDiscoveryService`/`TrxParser`/`TestRunService` + `TestHandler` + `testController.ts`, with run, debug and coverage profiles; `roslynSense/testRunEvent` reports each test as it finishes and streams console output, `roslynSense/testCancel` kills the test host, and coverage carries branch counts |
 | T1.4 watched files | Done | `WatchedFilesHandler` with 500 ms coalescing, rename pairing, project/`.editorconfig` eviction; `synchronize.fileEvents` on the client. `workspace/didCreateFiles` scaffolds a file made through the editor's own explorer; `didDeleteFiles` drops it from its project |
 
@@ -230,19 +230,20 @@ use. Closing it means either an adapter of our own in front of netcoredbg, or ro
 F5 session through `PublishingDebugBackend` the way the Framework one already is. The other two
 columns are ours: `modules` and `gotoTargets` in the AI adapter are small, contained additions.
 
-That second route now exists as an opt-in. `debugger.coreClrEngine: icordebug` — or
+That second route now exists and is the default on Windows. `debugger.coreClrEngine` — or
 `roslynSense.debugger.coreClrEngine` in the editor, or `ROSLYNMCP_CORECLR_ENGINE` for one run —
-sends a .NET session to the ICorDebug engine instead, which puts it in the Framework column above
-and gives it everything that engine gained: Just My Code applied by the runtime, breakpoints that
-bind against binaries built elsewhere, return values after a step, decompiled-code stepping.
+names the engine a .NET session gets: `icordebug`, the tool's own, puts it in the Framework column
+above and gives it everything that engine gained: Just My Code applied by the runtime, breakpoints
+that bind against binaries built elsewhere, return values after a step, decompiled-code stepping,
+and hot reload of the debugged process through `ICorDebugModule2::ApplyChanges`, launched or
+attached (the runtime refuses the in-process updater while a debugger is attached, and netcoredbg
+has no apply path of its own, so a netcoredbg session cannot be hot reloaded at all).
 `DebugSessionManager.EngineFor` reads it when a session starts, and `LaunchTarget.ServerDebugAdapter`
 tells the editor which adapter to launch so F5 and the MCP tools cannot disagree.
 
-It is off by default and should stay that way until it has mileage. What it costs: Windows only —
-the engine's CoreCLR bootstrap goes through dbgshim and throws anywhere else, so the setting is
-refused off Windows rather than attempted. Hot reload still goes through the in-process updater;
-`IcorDebugBackend.ApplyDeltaAsync` refuses a .NET delta so the same generation is not applied twice.
-And the engine has years of mileage on .NET Framework and almost none on .NET.
+What it costs: Windows only — the engine's CoreCLR bootstrap goes through dbgshim and throws
+anywhere else, so macOS and Linux get netcoredbg whatever the setting says, and `netcoredbg` on
+Windows is the way back should the engine misbehave on a particular app.
 
 ## Gaps against VS and Rider
 
@@ -1210,6 +1211,20 @@ Three pieces:
      a genuine debug-event stop — or at a stop whose thread is not in user code of the edited
      module's own app domain — is queued, reported as queued, and flushed at the next
      breakpoint, step or exception stop. The alternative to that queue is a dead process.
+
+     **A queue that waits only for the user's breakpoints is indistinguishable from doing
+     nothing.** The ordinary ASP.NET inner loop — edit, apply, refresh the page — has no
+     breakpoint in it, and an idle site never has a user-code thread stopped in it, so every
+     edit in that loop was queued and then sat there: the site kept serving the built code
+     until the process was restarted, while the editor had already reported the apply as done.
+     While a delta is queued the engine now arms its own breakpoints on the entry of every
+     method the edit changes, in every loaded instance of the assembly. Entering an edited
+     method is by definition a stop in that module's own user code, so the first call after the
+     edit is both the earliest safe moment and the one the user is already waiting on: the
+     engine applies there, disarms, and resumes without ever reporting a stop, and the frame
+     that triggered it is remapped onto the edited version like any other. The method tokens
+     come from the same symbol map that carries the compiler's line movements, which is why
+     that map is now sent even for an edit that moved no lines.
    - **`TrySetJITCompilerFlags(CORDEBUG_JIT_ENABLE_ENC)` had its result thrown away.** A module
      that fails to flag is not updatable, and `ApplyChanges` faults on it rather than failing, so
      the one signal that predicts a crash was being discarded. The HRESULT is now checked and an

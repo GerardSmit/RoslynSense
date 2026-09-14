@@ -64,6 +64,7 @@ public static class PackagesConfigService
         string projectPath, string id, string? version, CancellationToken ct,
         PackageMutationScope? scope = null)
     {
+        ct.ThrowIfCancellationRequested();
         string? configPath = PathFor(projectPath);
         if (configPath is null)
             return new PackageOperationResult(false, "This project does not use packages.config.");
@@ -91,6 +92,7 @@ public static class PackagesConfigService
                 $"{id} {resolved} has no assembly compatible with {targetFramework}.");
         }
 
+        ct.ThrowIfCancellationRequested();
         WriteReferences(projectPath, packagesRoot, folderName, assemblies);
         WriteConfigEntry(configPath, id, resolved.ToString(), targetFramework);
 
@@ -104,6 +106,7 @@ public static class PackagesConfigService
         string projectPath, string id, CancellationToken ct,
         PackageMutationScope? scope = null)
     {
+        ct.ThrowIfCancellationRequested();
         string? configPath = PathFor(projectPath);
         if (configPath is null)
             return new PackageOperationResult(false, "This project does not use packages.config.");
@@ -399,7 +402,10 @@ public static class PackagesConfigService
         root.DescendantsByLocalName("Reference")
             .FirstOrDefault(reference =>
                 reference.GetElementByLocalName("HintPath")?.Value is { } hint &&
-                hint.Contains(folderName, StringComparison.OrdinalIgnoreCase));
+                // NuGet folders contain both the id and version. A substring also matches
+                // other packages/versions, and even a DLL name outside any package directory.
+                hint.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries).SkipLast(1)
+                    .Contains(folderName, StringComparer.OrdinalIgnoreCase));
 
     /// <summary>The simple name of a reference, which is the assembly name before any comma.</summary>
     private static string ReferenceName(XmlElementBaseSyntax reference)

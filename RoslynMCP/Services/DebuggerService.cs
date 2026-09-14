@@ -788,6 +788,7 @@ internal sealed partial class DebuggerService : IDebugBackend
                 // Variable references name objects that only exist for this stop; carrying them
                 // over would answer an expansion with a different object's fields.
                 _handles.Reset();
+                _frameContexts.Clear();
                 _selectedFrame = 0;
                 // Distinguish exit from actual stop
                 var reason = ExtractMiField(parseLine, "reason");

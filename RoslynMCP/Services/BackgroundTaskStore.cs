@@ -27,6 +27,7 @@ public sealed class BackgroundTaskStore
 
     private static readonly TimeSpan TaskTtl = TimeSpan.FromMinutes(60);
     private readonly ConcurrentDictionary<string, BackgroundTask> _tasks = new();
+    private long _collisionCounter;
 
     /// <summary>Creates a new background task entry and returns its ID.</summary>
     public string CreateTask(TaskKind kind, string description)
@@ -35,15 +36,12 @@ public sealed class BackgroundTaskStore
         var slug = GenerateWordSlug();
         var id = $"bg-{kind.ToString().ToLowerInvariant()}-{slug}";
 
-        // Handle the unlikely collision
-        while (_tasks.ContainsKey(id))
+        // Reserve atomically: concurrent callers must never overwrite another task. A suffix
+        // also lets a busy host retain more tasks than the 1024 available word combinations.
+        while (!_tasks.TryAdd(id, new BackgroundTask(id, kind, description, DateTime.UtcNow)))
         {
-            slug = GenerateWordSlug();
-            id = $"bg-{kind.ToString().ToLowerInvariant()}-{slug}";
+            id = $"bg-{kind.ToString().ToLowerInvariant()}-{slug}-{Interlocked.Increment(ref _collisionCounter)}";
         }
-
-        var task = new BackgroundTask(id, kind, description, DateTime.UtcNow);
-        _tasks[id] = task;
         return id;
     }
 
@@ -76,12 +74,13 @@ public sealed class BackgroundTaskStore
     /// <summary>Waits until the task completes or the timeout expires, then returns the task.</summary>
     public async Task<BackgroundTask?> WaitForCompletionAsync(string taskId, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var task = Get(taskId);
         if (task is null || task.Status != TaskStatus.Running)
             return task;
 
         var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
+        while (DateTime.UtcNow < deadline)
         {
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
             task = Get(taskId);

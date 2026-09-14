@@ -62,20 +62,24 @@ public sealed record TestCoverageMap(
     /// </summary>
     public bool IsFileStale(string filePath)
     {
-        string? recorded = null;
+        string? current = CoverageMapHash.OfFile(filePath);
+        if (current is null)
+            return true;
+
+        bool measured = false;
         foreach (var entry in Entries)
         {
-            if (entry.FindFile(filePath) is { ContentHash: { Length: > 0 } hash })
+            if (entry.FindFile(filePath) is { } file)
             {
-                recorded = hash;
-                break;
+                measured = true;
+                // A map is assembled class by class. One current measurement cannot validate
+                // older line ranges retained for another class after an incremental rebuild.
+                if (!string.Equals(file.ContentHash, current, StringComparison.Ordinal))
+                    return true;
             }
         }
 
-        if (recorded is null)
-            return true;
-
-        return !string.Equals(recorded, CoverageMapHash.OfFile(filePath), StringComparison.Ordinal);
+        return !measured;
     }
 
     /// <summary>

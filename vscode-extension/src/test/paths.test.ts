@@ -1,7 +1,9 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
 import { describe, it } from 'node:test';
 
-import { externalSourceGlob, isUnder } from '../paths';
+import { externalSourceGlob, externalSourceGlobs, isUnder } from '../paths';
 
 /**
  * The path containment rule, which decides whether a saved file belongs to a project.
@@ -68,6 +70,18 @@ describe('isUnder', () => {
  * nothing with no error anywhere to say why.
  */
 describe('externalSourceGlob', () => {
+    it('claims both the environment temp path and its canonical spelling', () => {
+        const temp = os.tmpdir();
+        const globs = externalSourceGlobs(temp);
+        assert.ok(globs.includes(externalSourceGlob(temp)));
+        assert.ok(globs.includes(externalSourceGlob(fs.realpathSync.native(temp))));
+        assert.strictEqual(new Set(globs).size, globs.length);
+    });
+
+    it('retains the original filter when the directory does not exist', () => {
+        const missing = '/nonexistent/roslynsense-test-temp';
+        assert.deepStrictEqual(externalSourceGlobs(missing), [externalSourceGlob(missing)]);
+    });
     it('spells the drive letter the way a document URI does', () => {
         assert.strictEqual(
             externalSourceGlob('C:\\Users\\dev\\AppData\\Local\\Temp'),

@@ -178,10 +178,8 @@ public class LanguageRegistryTests
             handler => Assert.IsType<WebFormsLanguage>(handler),
             handler => Assert.IsType<ProtoLanguage>(handler));
 
-        // Rename is the one the proto pack deliberately stays out of. IRenameHandler has no
-        // CanHandle, so every registered handler runs on every C# rename — and a proto name is
-        // the wire contract, which no rename may rewrite on the user's behalf. Its absence here
-        // is the decision, not an oversight.
+        // Proto exposes document-initiated rename, but stays out of global C# rename handlers:
+        // changing the schema contract requires a rename initiated in the schema itself.
         Assert.Collection(
             registry.RenameHandlers,
             handler => Assert.IsType<WebFormsLanguage>(handler),

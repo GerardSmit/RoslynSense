@@ -29,6 +29,7 @@ export function wire(
     // The panel's own listeners die with the panel — parking them in context.subscriptions
     // would pile up a wrapper per open/close for the extension's lifetime.
     let disposed = false;
+    let previewVersion = 0;
 
     // Reusing the original request id is what makes this safe to fire at any moment: the webview
     // drops results whose id is not the one it is waiting for, so a rerun that lands after the
@@ -45,6 +46,7 @@ export function wire(
         // see, and a reply that still arrives must not touch the disposed webview.
         disposed = true;
         searchInFlight?.cancel();
+        searchInFlight?.dispose();
         onDispose();
     });
 
@@ -137,29 +139,36 @@ export function wire(
     );
 
     async function search(message: Extract<SearchMsg.ToHost, { type: 'search' }>): Promise<void> {
+        if (disposed) {
+            return;
+        }
         searchInFlight?.cancel();
-        searchInFlight = new vscode.CancellationTokenSource();
-        const token = searchInFlight.token;
-
-        if (message.tab === 'actions') {
-            provisional = undefined;
-            post({
-                type: 'results',
-                id: message.id,
-                tab: 'actions',
-                items: matchActions(message.query),
-                truncated: false,
-            });
-            return;
-        }
-
-        const client = getClient();
-        if (!client) {
-            post({ type: 'error', scope: 'search', id: message.id, message: 'The RoslynSense server is not running.' });
-            return;
-        }
+        searchInFlight?.dispose();
+        const request = new vscode.CancellationTokenSource();
+        searchInFlight = request;
+        const token = request.token;
+        // A solutionReady notification during this request must not rerun the previous
+        // provisional query and cancel the newer query the user is now waiting for.
+        provisional = undefined;
 
         try {
+            if (message.tab === 'actions') {
+                post({
+                    type: 'results',
+                    id: message.id,
+                    tab: 'actions',
+                    items: matchActions(message.query),
+                    truncated: false,
+                });
+                return;
+            }
+
+            const client = getClient();
+            if (!client) {
+                post({ type: 'error', scope: 'search', id: message.id, message: 'The RoslynSense server is not running.' });
+                return;
+            }
+
             if (message.tab === 'text') {
                 const result = await client.sendRequest<{
                     items: SearchMsg.TextItem[];
@@ -209,13 +218,26 @@ export function wire(
                     message: detail || 'Search failed — is the workspace still loading?',
                 });
             }
+        } finally {
+            request.dispose();
+            if (searchInFlight === request) {
+                searchInFlight = undefined;
+            }
         }
     }
 
     async function preview(message: Extract<SearchMsg.ToHost, { type: 'preview' }>): Promise<void> {
+        const version = ++previewVersion;
+        const current = () => !disposed && version === previewVersion;
         try {
             const target = await toEditorTarget({ uri: message.uri, line: message.line, character: 0 });
+            if (!current()) {
+                return;
+            }
             const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(target.uri));
+            if (!current()) {
+                return;
+            }
 
             let line = Math.min(target.line, document.lineCount - 1);
             if (message.skipPreamble && line === 0) {
@@ -231,6 +253,10 @@ export function wire(
                 lines.push(document.lineAt(i).text);
             }
 
+            const tokens = await tokenizePreview(document, start, end);
+            if (!current()) {
+                return;
+            }
             post({
                 type: 'previewText',
                 id: message.id,
@@ -239,12 +265,14 @@ export function wire(
                 lines,
                 path: vscode.workspace.asRelativePath(vscode.Uri.parse(target.uri), false),
                 languageId: document.languageId,
-                tokens: await tokenizePreview(document, start, end),
+                tokens,
             });
         } catch {
             // Images, archives, anything openTextDocument rejects: the row is still openable
             // (VS Code has viewers for many of these), there is just nothing to preview.
-            post({ type: 'error', scope: 'preview', id: message.id, message: 'No text preview for this file.' });
+            if (current()) {
+                post({ type: 'error', scope: 'preview', id: message.id, message: 'No text preview for this file.' });
+            }
         }
     }
 }

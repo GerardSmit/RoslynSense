@@ -29,6 +29,18 @@ public sealed class SqliteDbProvider : DbProviderBase
     protected override DbCommand CreateCommand(string sql, DbConnection conn) =>
         new SqliteCommand(sql, (SqliteConnection)conn);
 
+    protected override void BindCommandParameters(DbCommand cmd, Dictionary<string, object?>? parameters)
+    {
+        base.BindCommandParameters(cmd, parameters);
+        // SQLite has no decimal numeric storage; Microsoft.Data.Sqlite binds decimal as TEXT.
+        // Keep numeric parameters numeric so comparisons with literals retain their meaning.
+        foreach (DbParameter parameter in cmd.Parameters)
+        {
+            if (parameter.Value is decimal number)
+                parameter.Value = (double)number;
+        }
+    }
+
     protected override async Task OnConnectionOpenedAsync(DbConnection conn, CancellationToken ct)
     {
         if (_isMemory) return;

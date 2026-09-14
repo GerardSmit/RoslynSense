@@ -734,6 +734,38 @@ public class SolutionExplorerTests
         }
     }
 
+    [Fact]
+    public async Task RevealChoosesTheDeepestDirectoryRegardlessOfProjectFileNameLength()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"reveal-owner-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(directory, "Nested"));
+        string solution = Path.Combine(directory, "App.slnx");
+        string parent = Path.Combine(directory, "ParentWithAVeryLongProjectFileName.csproj");
+        string nested = Path.Combine(directory, "Nested", "App.csproj");
+        string file = Path.Combine(directory, "Nested", "Program.cs");
+        try
+        {
+            File.WriteAllText(solution, """
+                <Solution>
+                  <Project Path="ParentWithAVeryLongProjectFileName.csproj" />
+                  <Project Path="Nested/App.csproj" />
+                </Solution>
+                """);
+            File.WriteAllText(file, "class Program { }");
+            using var binding = WorkspaceService.BindSolutionForTesting(solution);
+            var result = await SolutionTreeSearchHandler.RevealAsync(
+                new SolutionTreeRevealParams(LspConverters.PathToUri(file), FileNesting: false), default);
+
+            Assert.Contains($"project:{nested}", result.Path);
+            Assert.DoesNotContain($"project:{parent}", result.Path);
+            Assert.Equal($"file:{file}", result.Path[^1]);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     /// <summary>How a client wrote a <c>file:</c> URI for a Windows path.</summary>
     public enum UriSpelling
     {

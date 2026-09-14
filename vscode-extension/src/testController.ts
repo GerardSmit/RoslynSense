@@ -188,6 +188,20 @@ export function registerTestController(
     activeController = controller;
     activeGetClient = getClient;
 
+    let projectDiscovery: { client: LanguageClient; promise: Promise<void> } | undefined;
+    const loadProjects = (client: LanguageClient) => {
+        if (projectDiscovery?.client !== client) {
+            const promise = discoverProjects(client, controller, projectItems, () => getClient() === client)
+                .finally(() => {
+                    if (projectDiscovery?.promise === promise) {
+                        projectDiscovery = undefined;
+                    }
+                });
+            projectDiscovery = { client, promise };
+        }
+        return projectDiscovery.promise;
+    };
+
     // Discovery is driven by the client becoming available, not only by the view being opened.
     // resolveHandler runs once when the Testing view first appears, which on a cold start is
     // before the server has connected — it returned empty and was never asked again, so the
@@ -196,7 +210,10 @@ export function registerTestController(
     // tree of unexpanded project nodes holds nothing — so a run before the first manual refresh
     // reported "no tests" against a panel that was visibly listing test projects.
     const discoverAll = async (client: LanguageClient) => {
-        await discoverProjects(client, controller, projectItems);
+        await loadProjects(client);
+        if (getClient() !== client) {
+            return;
+        }
         for (const [projectPath, item] of projectItems) {
             await discoverTests(client, controller, item, projectPath, testData).catch(() => undefined);
         }
@@ -210,18 +227,24 @@ export function registerTestController(
     // the Solution Explorer sat empty behind them. The tests themselves are filled in when a
     // project node is expanded, and before a run by activeEnsureDiscovered.
     onClientReady(context, getClient, (client) => {
-        void discoverProjects(client, controller, projectItems).catch(() => undefined);
+        void loadProjects(client).catch(() => undefined);
     });
 
     // Also consulted by a run, so starting one before discovery has finished waits for it rather
     // than running an empty tree.
     activeEnsureDiscovered = async () => {
-        const client = getClient();
-        const unresolved = [...enumerate(controller.items)].some(
-            ([, item]) => item.canResolveChildren && item.children.size === 0
-        );
-        if (client && unresolved) {
-            await discoverAll(client).catch(() => undefined);
+        let client = getClient();
+        while (client) {
+            const unresolved = [...enumerate(controller.items)].some(
+                ([, item]) => item.canResolveChildren && item.children.size === 0
+            );
+            if (projectDiscovery || controller.items.size === 0 || unresolved) {
+                await discoverAll(client).catch(() => undefined);
+            }
+            if (getClient() === client) {
+                return;
+            }
+            client = getClient();
         }
     };
     context.subscriptions.push({ dispose: () => (activeEnsureDiscovered = undefined) });
@@ -241,7 +264,7 @@ export function registerTestController(
         }
         try {
             if (!item) {
-                await discoverProjects(client, controller, projectItems);
+                await loadProjects(client);
                 return;
             }
             const projectPath = item.id.startsWith('project:') ? item.id.slice('project:'.length) : undefined;
@@ -344,9 +367,13 @@ async function rediscoverSaved(
 async function discoverProjects(
     client: LanguageClient,
     controller: vscode.TestController,
-    projectItems: Map<string, vscode.TestItem>
+    projectItems: Map<string, vscode.TestItem>,
+    isCurrent: () => boolean
 ): Promise<void> {
     const projects = await client.sendRequest<TestProject[]>('roslynSense/testProjects');
+    if (!isCurrent()) {
+        return;
+    }
 
     const seen = new Set<string>();
     for (const project of projects) {
@@ -365,6 +392,7 @@ async function discoverProjects(
     for (const [id] of [...enumerate(controller.items)]) {
         if (!seen.has(id)) {
             controller.items.delete(id);
+            projectItems.delete(id.slice('project:'.length));
         }
     }
 }
@@ -427,7 +455,7 @@ async function runTests(
     token: vscode.CancellationToken,
     mode: 'run' | 'debug' | 'coverage'
 ): Promise<void> {
-    const client = getClient();
+    let client = getClient();
     if (!client) {
         void vscode.window.showErrorMessage('RoslynSense is not running.');
         return;
@@ -437,6 +465,10 @@ async function runTests(
     // test behind them, and mark each one skipped — which read as "these tests were skipped"
     // rather than "nothing has been discovered yet".
     await activeEnsureDiscovered?.();
+    client = getClient();
+    if (!client) {
+        return;
+    }
 
     const run = controller.createTestRun(request);
     const queue = collectLeaves(controller, request);
@@ -492,6 +524,13 @@ async function runTests(
                 });
 
                 applyResults(run, items, testData, response.results, live.reported, response.error);
+            } catch (error) {
+                for (const item of items) {
+                    if (!live.reported.has(item.id)) {
+                        run.errored(item, new vscode.TestMessage(describe(error)));
+                    }
+                }
+                throw error;
             } finally {
                 live.dispose();
                 cancelled.dispose();
@@ -751,11 +790,13 @@ function collectLeaves(
 ): vscode.TestItem[] {
     const leaves: vscode.TestItem[] = [];
     const excluded = new Set(request.exclude?.map((item) => item.id) ?? []);
+    const visited = new Set<vscode.TestItem>();
 
     const visit = (item: vscode.TestItem) => {
-        if (excluded.has(item.id)) {
+        if (excluded.has(item.id) || visited.has(item)) {
             return;
         }
+        visited.add(item);
         if (item.children.size === 0) {
             leaves.push(item);
             return;

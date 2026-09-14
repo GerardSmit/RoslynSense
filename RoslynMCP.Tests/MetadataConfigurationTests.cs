@@ -215,6 +215,105 @@ public class MetadataConfigurationTests : IDisposable
         Assert.DoesNotContain("NotASetting", index.Names(MetadataConfigurationKind.AppSetting));
     }
 
+    [Fact]
+    public async Task ConstantGettersAndCachedCollectionsRemainConfigurationReads()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var reference = MetadataReference.CreateFromFile(managers);
+        string library = Emit("Contoso.Constants", """
+            using System.Configuration;
+            public static class Settings {
+                static string Key => "GetterKey";
+                public static string Direct() => ConfigurationManager.AppSettings[Key];
+                public static string Cached() {
+                    var settings = ConfigurationManager.AppSettings;
+                    bool.TryParse(settings["First"], out _);
+                    return settings["aspnet:SuppressSameSiteNone"];
+                }
+            }
+            """, reference);
+        var index = await IndexAsync(library, reference);
+        Assert.Single(index.ReadsFor(MetadataConfigurationKind.AppSetting, "GetterKey"));
+        Assert.Single(index.ReadsFor(MetadataConfigurationKind.AppSetting, "aspnet:SuppressSameSiteNone"));
+    }
+
+    [Fact]
+    public async Task EnumeratedConfigurationKeysCanBeMatchedByAConstantPrefixInAHelper()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var reference = MetadataReference.CreateFromFile(managers);
+        string library = Emit("Contoso.Enumeration", """
+            using System.Collections.Specialized;
+            using System.Configuration;
+            public static class LicenseReader {
+                static string Prefix => "ExampleLibrary License Key";
+                public static void Load() => Read(ConfigurationManager.AppSettings);
+                static void Read(NameValueCollection values) {
+                    foreach (string key in values.Keys) Check(key, values[key]);
+                }
+                static bool Check(string key, string value) => key.StartsWith(Prefix);
+                public static bool Decoy(string text) => text.StartsWith("NotASetting");
+            }
+            """, reference);
+        var index = await IndexAsync(library, reference);
+        var read = Assert.Single(index.ReadsFor(MetadataConfigurationKind.AppSetting, "ExampleLibrary License Key"));
+        Assert.True(read.IsPrefix);
+        Assert.Single(index.ReadsFor(MetadataConfigurationKind.AppSetting, "ExampleLibrary License Key 2"));
+        Assert.Empty(index.ReadsFor(MetadataConfigurationKind.AppSetting, "Other ExampleLibrary License Key"));
+        Assert.Empty(index.ReadsFor(MetadataConfigurationKind.AppSetting, "NotASetting"));
+    }
+
+    [Fact]
+    public async Task ReplacingACachedCollectionDoesNotAttributeUnrelatedKeysToConfiguration()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var reference = MetadataReference.CreateFromFile(managers);
+        string library = Emit("Contoso.Replaced", """
+            using System.Collections.Specialized;
+            using System.Configuration;
+            public static class Reader {
+                public static string Read(NameValueCollection other) {
+                    var values = ConfigurationManager.AppSettings;
+                    bool.TryParse(values["Real"], out _);
+                    values = other;
+                    return values["NotASetting"];
+                }
+            }
+            """, reference);
+        var index = await IndexAsync(library, reference);
+        Assert.Single(index.ReadsFor(MetadataConfigurationKind.AppSetting, "Real"));
+        Assert.Empty(index.ReadsFor(MetadataConfigurationKind.AppSetting, "NotASetting"));
+    }
+
+    [Fact]
+    public async Task CollectionReturnedByAHelperRemainsVisibleInsideFinally()
+    {
+        string managers = Emit("System.Configuration.Stub", ManagersSource);
+        var reference = MetadataReference.CreateFromFile(managers);
+        string library = Emit("Contoso.Finally", """
+            using System.Collections.Specialized;
+            using System.Configuration;
+            public static class Reader {
+                static NameValueCollection Settings(bool enabled) => enabled ? ConfigurationManager.AppSettings : null;
+                public static void Read(bool enabled) {
+                    NameValueCollection values = null;
+                    try { values = Settings(enabled); }
+                    finally {
+                        if (values != null) bool.TryParse(values["aspnet:SuppressSameSiteNone"], out _);
+                    }
+                }
+                static NameValueCollection Unrelated() {
+                    var discarded = ConfigurationManager.AppSettings;
+                    return new NameValueCollection();
+                }
+                public static string Decoy() => Unrelated()["NotASetting"];
+            }
+            """, reference);
+        var index = await IndexAsync(library, reference);
+        Assert.Single(index.ReadsFor(MetadataConfigurationKind.AppSetting, "aspnet:SuppressSameSiteNone"));
+        Assert.Empty(index.ReadsFor(MetadataConfigurationKind.AppSetting, "NotASetting"));
+    }
+
     // ---- Read through a wrapper the package declares --------------------------------------------
 
     /// <summary>

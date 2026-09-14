@@ -127,8 +127,10 @@ internal static class LspConverters
         {
             return ToTextSpan(text, range);
         }
-        catch (ArgumentOutOfRangeException)
+        catch (ArgumentException)
         {
+            // Includes reversed ranges (LinePositionSpan throws ArgumentException) as well
+            // as positions outside the buffer (ArgumentOutOfRangeException).
             return null;
         }
     }

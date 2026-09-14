@@ -145,6 +145,11 @@ public sealed partial class DebugSession : IDebugSession
     /// <summary>Whether the current stop is an exception stop — the only time the frame list
     /// carries a <c>$exception</c> row, exactly as VS's Locals window does.</summary>
     private volatile bool _stoppedOnException;
+
+    /// <summary>A Break All that suspended the debuggee without finding a managed frame to adopt.
+    /// The stop is real and still owes the runtime a <c>Continue</c>, but there is no thread for
+    /// <see cref="_stoppedThread"/> to hold, so it is the one stop that flag cannot record.</summary>
+    private volatile bool _suspendedWithoutThread;
     /// Module that produced each bound breakpoint key, so an unload (app-domain recycle) can
     /// return those breakpoints to pending and let the next LoadModule rebind them.
     private readonly ConcurrentDictionary<string, string> _boundModule = new(StringComparer.OrdinalIgnoreCase);
@@ -189,7 +194,10 @@ public sealed partial class DebugSession : IDebugSession
     {
         lock (_specLock)
             _specs.AddRange(breakpoints);
-        var exe = Path.GetFullPath(executable);
+        // A bare command name — "dotnet" for a project built without an apphost — is the OS's to
+        // find on PATH. Making it absolute here would anchor it to this process's own directory,
+        // which for a debug worker is its publish folder, where there is no dotnet at all.
+        var exe = Path.GetFileName(executable) == executable ? executable : Path.GetFullPath(executable);
         var argv = args.ToArray();
         _runtime = runtime == DebugRuntime.Unspecified ? DebugRuntime.NetFramework : runtime;
         StartSessionThread(callback => AttachCore(exe, argv, attachPid: 0, callback, env, workingDirectory));
@@ -262,7 +270,9 @@ public sealed partial class DebugSession : IDebugSession
         // responding in the middle of rather than that something did.
         _watchdog.Starting(what);
 
-        if (_stoppedThread is not null)
+        // Including the Break All that adopted no thread: the debuggee is stopped either way, and
+        // stopping it again only unbalances the count.
+        if (_stoppedThread is not null || _suspendedWithoutThread)
         {
             work();
             return;
@@ -415,6 +425,7 @@ public sealed partial class DebugSession : IDebugSession
                 _specs.Add(spec);
             foreach (var module in LoadedModules())
                 TryBindBreakpoint(module, spec);
+            _inspectionFrames.Clear();
             _stoppedThread = null;
             ReleaseReturnValue();
             try { _process?.Continue(false); } catch { }
@@ -585,6 +596,21 @@ public sealed partial class DebugSession : IDebugSession
 
     public void Continue() => Enqueue(() =>
     {
+        // Continue is counted exactly as Stop is, so one issued against a debuggee that is not
+        // stopped spends a stop the runtime has not delivered yet: the next real stop is resumed
+        // the instant it arrives, and from there the session cannot be stopped again. While every
+        // stop was the user's own this could not happen, because a client only offers Continue
+        // once it has been told about one. The engine takes stops of its own now — the hot reload
+        // flush enters and leaves one without ever reporting it — and Continue pressed against a
+        // request that looks hung lands in exactly that window.
+        if (_stoppedThread is null && !_suspendedWithoutThread)
+        {
+            Emit(
+                DebugEventKind.Diagnostic,
+                "continue: the debuggee is already running; nothing to resume", string.Empty, 0);
+            return;
+        }
+        _suspendedWithoutThread = false;
         _stoppedOnException = false;
         _stoppedThread = null;
         // The value the last step captured belongs to that step. Once the target runs on, the next
@@ -645,6 +671,7 @@ public sealed partial class DebugSession : IDebugSession
 
         var thread = FindThreadForBreak();
         _stoppedThread = thread;
+        _suspendedWithoutThread = thread is null;
 
         if (thread is null)
         {
@@ -757,6 +784,7 @@ public sealed partial class DebugSession : IDebugSession
             if (source is { } watched && kind is not StepKind.Out)
                 ArmReturnProbes(frame, steppingThread, watched);
             _stoppedOnException = false;
+            _inspectionFrames.Clear();
             _stoppedThread = null;
             _process?.Continue(false);
         }
@@ -776,6 +804,7 @@ public sealed partial class DebugSession : IDebugSession
     public Task<List<StackFrame>> StackTraceAsync(int threadId = 0) => InvokeAsync(() =>
     {
         var frames = new List<StackFrame>();
+        if (_stoppedThread is null) return frames;
         var thread = threadId == 0 ? _stoppedThread : FindThreadById(threadId);
         if (thread is null)
             return frames;
@@ -791,7 +820,7 @@ public sealed partial class DebugSession : IDebugSession
                 var (modulePath, methodToken, ilOffset) = FrameIdentity(frame);
                 frames.Add(new StackFrame
                 {
-                    Index = index++,
+                    Index = InspectionFrameId(thread, index++),
                     Method = DescribeMethod(frame),
                     FilePath = file,
                     Line = (uint)line,
@@ -916,9 +945,8 @@ public sealed partial class DebugSession : IDebugSession
     /// Assigns a new value to an argument, local, or field reachable by a dotted path.
     /// </summary>
     /// <remarks>
-    /// Limited to primitives and strings written as literals. Only values with a raw
-    /// representation can be written directly; assigning an object would mean constructing one in
-    /// the debuggee.
+    /// Writes scalars and references directly, and invokes property setters through the evaluator.
+    /// The replacement may be a C# expression, including a string literal or object construction.
     /// </remarks>
     public Task<(bool Ok, DebugVariable? Variable, string Error)> SetVariableAsync(
         uint frameIndex, string name, string value)
@@ -930,12 +958,10 @@ public sealed partial class DebugSession : IDebugSession
             if (FrameAt(thread, frameIndex) is not CorDebugILFrame ilFrame)
                 return (false, null, "no managed frame");
 
-            var target = ResolvePath(ilFrame, name, out var error);
-            if (target is null)
+            if (!AssignExpression(ilFrame, name, value, out var error))
                 return (false, null, error);
-
-            if (!TryWriteScalar(target, value, out var writeError))
-                return (false, null, writeError);
+            var target = ResolvePath(ilFrame, name, out error);
+            if (target is null) return (false, null, "The assignment succeeded, but the value could not be read: " + error);
 
             return (true, new DebugVariable
             {
@@ -1009,9 +1035,8 @@ public sealed partial class DebugSession : IDebugSession
         }
     }
 
-    /// Evaluate a watch expression (dotted member path rooted at an argument/local, with array
-    /// indexers) in stack frame `frameIndex`. No func-eval: fields and auto-property backing
-    /// fields resolve, computed properties do not.
+    /// Evaluates a watch in its selected frame. Paths read directly; complex C# expressions
+    /// compile against the target's assemblies and execute through function evaluation.
     public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression)
         => InvokeAsync(() =>
         {
@@ -1187,33 +1212,7 @@ public sealed partial class DebugSession : IDebugSession
     /// Characters that cannot appear in a path expression, and so mark a condition as using syntax
     /// the resolver does not implement — comparisons, arithmetic, boolean operators.
     /// </summary>
-    private static readonly char[] UnsupportedConditionOperators = ['<', '>', '+', '*', '/', '%', '&', '|', '^', '~', '?'];
-
-    /// <summary>
-    /// Whether the right-hand side of a condition is something that can meaningfully be compared
-    /// against a stringified value: a quoted string, a character, a number, or one of the keywords
-    /// that render as themselves.
-    /// </summary>
-    private static bool IsComparableLiteral(string expected)
-    {
-        if (expected.Length == 0)
-            return false;
-        if (expected is "null" or "true" or "false" or "True" or "False")
-            return true;
-        if (expected.Length >= 2 &&
-            ((expected[0] == '"' && expected[^1] == '"') || (expected[0] == '\'' && expected[^1] == '\'')))
-        {
-            return true;
-        }
-
-        // Numbers, including negative and fractional ones. A leading '-' never reaches here as an
-        // operator, because subtraction would have been rejected on the left-hand side already.
-        var digits = expected[0] is '-' or '+' ? expected[1..] : expected;
-        return digits.Length > 0 && digits.All(c => char.IsAsciiDigit(c) || c is '.');
-    }
-
-    /// "path == literal" / "path != literal" compared against the stringified value; a bare path
-    /// is truthy when it isn't null/false/0.
+    /// <summary>Evaluates a C# condition on the session thread, requiring a boolean result.</summary>
     private bool EvaluateCondition(CorDebugThread thread, string condition, out string problem)
     {
         problem = string.Empty;
@@ -1223,60 +1222,16 @@ public sealed partial class DebugSession : IDebugSession
             return true;
         }
 
-        string path;
-        string? expected = null;
-        var negate = false;
-        var eq = condition.IndexOf("==", StringComparison.Ordinal);
-        var ne = condition.IndexOf("!=", StringComparison.Ordinal);
-        if (eq >= 0)
-        {
-            path = condition[..eq].Trim();
-            expected = condition[(eq + 2)..].Trim();
-        }
-        else if (ne >= 0)
-        {
-            path = condition[..ne].Trim();
-            expected = condition[(ne + 2)..].Trim();
-            negate = true;
-        }
-        else
-        {
-            path = condition.Trim();
-        }
-
-        // Only '==' and '!=' against a literal are implemented. Anything else — 'x > 5',
-        // 'i % 3 == 0', 's.Contains("a")' — would otherwise be silently treated as a member path,
-        // fail to resolve, and leave an unconditional breakpoint behind with no explanation.
-        if (path.IndexOfAny(UnsupportedConditionOperators) >= 0)
-        {
-            problem = "only '==' and '!=' comparisons against a literal are supported";
-            return true;
-        }
-
-        // The right-hand side is compared as text, so anything that is not a literal — 'i == max',
-        // 'x == n + 1', 'count != list.Count' — is compared against the *name* rather than its
-        // value and can never match. Left unreported that is the worst outcome available: with
-        // '==' the breakpoint silently never stops, and with '!=' it silently always does.
-        if (expected is not null && !IsComparableLiteral(expected))
-        {
-            problem = $"'{expected}' is not a literal, and only literals can be compared against";
-            return true;
-        }
-
-        var value = ResolvePath(ilFrame, path, out var resolveError);
+        var value = ResolvePath(ilFrame, condition, out problem);
         if (value is null)
         {
-            problem = resolveError.Length > 0 ? resolveError : $"'{path}' could not be resolved here";
-            return true; // fail-open: stop rather than risk never stopping
+            if (problem.Length == 0) problem = "The condition could not be evaluated.";
+            return true;
         }
-        var actual = DescribeValue(value, applyDisplay: false);
-        if (expected is null)
-            return actual is not ("null" or "False" or "false" or "0");
-
-        var want = expected.Trim('"');
-        var got = actual.Trim('"');
-        var equal = string.Equals(got, want, StringComparison.Ordinal);
-        return negate ? !equal : equal;
+        var scalar = TryReadScalar(Dereference(value));
+        if (bool.TryParse(scalar, out var result)) return result;
+        problem = "A breakpoint condition must evaluate to bool.";
+        return true;
     }
 
     /// Resolve `expr` ("order.Customer.Name", "items[3].Id", "this.Count") against a frame's
@@ -1284,10 +1239,15 @@ public sealed partial class DebugSession : IDebugSession
     private CorDebugValue? ResolvePath(CorDebugILFrame ilFrame, string expr, out string error)
     {
         error = string.Empty;
+        if (_inspectionThread is { } inspectionThread && FrameAt(inspectionThread, _inspectionFrameIndex) is CorDebugILFrame refreshed)
+            ilFrame = refreshed;
         _inspectionFrame = ilFrame;
-        var segments = expr.Replace(" ", string.Empty)
-            .Split('.', StringSplitOptions.RemoveEmptyEntries);
-        if (segments.Length == 0)
+        List<DebugExpressionPath.Segment> segments;
+        if (expr.StartsWith('$') || expr.Contains(".$", StringComparison.Ordinal) || expr.Contains(".<", StringComparison.Ordinal) || expr.StartsWith("CS$", StringComparison.Ordinal))
+            segments = expr.Split('.').Select(part => { var (name, indexes, call) = ParseSegment(part); return new DebugExpressionPath.Segment(name, indexes, call); }).ToList();
+        else if (!DebugExpressionPath.TryParse(expr, out segments))
+            return EvaluateCompiledExpression(ilFrame, expr, out error);
+        if (segments.Count == 0)
         {
             error = "empty expression";
             return null;
@@ -1295,9 +1255,9 @@ public sealed partial class DebugSession : IDebugSession
 
         var (argNames, localNames) = FrameSymbolNames(ilFrame);
         CorDebugValue? current = null;
-        for (var s = 0; s < segments.Length; s++)
+        for (var s = 0; s < segments.Count; s++)
         {
-            var (name, indexes, isCall) = ParseSegment(segments[s]);
+            var (name, indexes, isCall) = segments[s];
             if (s == 0)
             {
                 current = name == ExceptionMarker && CurrentExceptionValue() is { } thrown ? thrown
@@ -1332,7 +1292,7 @@ public sealed partial class DebugSession : IDebugSession
                 // *view* of the value the rest of the path walks through.
                 current = name switch
                 {
-                    RawMarker or StaticsMarker => current,
+                    RawMarker or StaticsMarker or NonPublicMarker => current,
                     ProxyMarker => ProxyValue(current!, out error),
                     ResultsMarker => EnumerableItems(current!, out error),
                     _ when name.StartsWith(MoreMarker, StringComparison.Ordinal) => current,
@@ -1432,7 +1392,7 @@ public sealed partial class DebugSession : IDebugSession
     {
         if (argument is null)
             return null;
-        if (FindMethod(value, "get_Item") is not { } found)
+        if (FindMethod(value, "get_Item", parameterCount: 1) is not { } found)
         {
             error = "the value has no indexer";
             return null;
@@ -1444,7 +1404,7 @@ public sealed partial class DebugSession : IDebugSession
     /// indexer. Creating one is synchronous — the debuggee never runs for it.</summary>
     private CorDebugValue? CreateIntValue(int number, ref string error)
     {
-        var thread = _stoppedThread;
+        var thread = _inspectionThread ?? _stoppedThread;
         if (thread is null)
         {
             error = "not stopped";
@@ -1484,7 +1444,7 @@ public sealed partial class DebugSession : IDebugSession
                 return args[0]; // instance methods: arg0 is the unnamed `this`
             for (var i = 0; i < args.Length; i++)
             {
-                if (argNames.TryGetValue(i, out var n) && n == name)
+                if ((argNames.TryGetValue(i, out var n) ? n : $"arg{i}") == name)
                     return args[i];
             }
         }
@@ -1493,7 +1453,7 @@ public sealed partial class DebugSession : IDebugSession
         {
             for (var i = 0; i < locals.Length; i++)
             {
-                if (localNames.TryGetValue(i, out var n) && n == name)
+                if ((localNames.TryGetValue(i, out var n) ? n : $"local{i}") == name)
                     return locals[i];
             }
         }
@@ -1562,8 +1522,7 @@ public sealed partial class DebugSession : IDebugSession
             return null;
         for (var i = 0; i < locals.Length; i++)
         {
-            if (localNames.TryGetValue(i, out var localName) && IsCompilerGeneratedName(localName) &&
-                IsDisplayClass(locals[i]) && FieldValue(locals[i], name) is { } captured)
+            if (IsDisplayClass(locals[i]) && FieldValue(locals[i], name) is { } captured)
                 return captured;
         }
         return null;
@@ -1599,6 +1558,18 @@ public sealed partial class DebugSession : IDebugSession
     private static readonly TimeSpan EvalTimeout = TimeSpan.FromSeconds(10);
 
     private CorDebugEval? _pendingEval;
+
+    /// <summary>
+    /// How many evaluations have resumed the debuggee so far. A listing compares it before and
+    /// after every step that might evaluate, and re-reads its object when it moved on.
+    /// </summary>
+    /// <remarks>
+    /// The runtime invalidates every <c>ICorDebugObjectValue</c> it handed out once the process
+    /// runs, however briefly: the collector may have moved the object. A reference can be
+    /// dereferenced again; a value type inside a frame or another object has to be resolved again
+    /// by its path. See <see cref="Reacquire"/>.
+    /// </remarks>
+    private int _evalGeneration;
     private CorDebugValue? _evalResult;
     private bool _evalFaulted;
     private ManualResetEventSlim? _evalDone;
@@ -1661,9 +1632,12 @@ public sealed partial class DebugSession : IDebugSession
         // A method declared on a generic type must be called with the instantiation's type
         // arguments — plain CallFunction makes the runtime throw TypeLoadException ("used with
         // the wrong number of generic arguments") inside the evaluation, which is how every
-        // List<T>.Count on .NET Framework used to come back as an eval fault.
+        // List<T>.Count on .NET Framework used to come back as an eval fault. And they have to
+        // be the declaring type's arguments, not the instance's: a method inherited from a
+        // generic base takes the base's, which differ in number as soon as the derived type adds
+        // a parameter of its own.
         var typeArguments = DeclaringTypeIsGeneric(function) && args.Length > 0
-            ? TypeArgumentsOf(args[0])
+            ? DeclaringTypeArgumentsOf(args[0], function) ?? TypeArgumentsOf(args[0])
             : null;
 
         return RunEval(
@@ -1676,6 +1650,43 @@ public sealed partial class DebugSession : IDebugSession
                     eval.CallFunction(function.Raw, raw.Length, raw);
             },
             out error);
+    }
+
+    /// <summary>
+    /// The type arguments of the instantiation of <paramref name="function"/>'s declaring type
+    /// that <paramref name="instance"/> is: the instance's exact type is walked up its base chain
+    /// to the class that declares the method, and that level's arguments are the answer.
+    /// </summary>
+    /// <remarks>
+    /// The instance's own arguments are the wrong ones whenever the method was inherited from a
+    /// generic base. A LINQ iterator's <c>Current</c> is declared on <c>Iterator&lt;TResult&gt;</c>,
+    /// one argument; calling it with the two of <c>WhereSelectEnumerableIterator&lt;TSource,
+    /// TResult&gt;</c> faulted the evaluation with a <c>TargetParameterCountException</c>, which
+    /// is what every LINQ query showed in place of its current element.
+    /// </remarks>
+    private static ICorDebugType[]? DeclaringTypeArgumentsOf(CorDebugValue instance, CorDebugFunction function)
+    {
+        var declaring = Safe(() => function.Class);
+        if (declaring is null)
+            return null;
+        var declaringToken = Safe(() => (int)declaring.Token);
+        var declaringModule = Safe(() => declaring.Module.Name) ?? string.Empty;
+
+        var type = Safe(() => Dereference(instance) is CorDebugObjectValue obj ? obj.ExactType : null);
+        for (var depth = 0; type is not null && depth < MaxTypeDepth; depth++)
+        {
+            var current = type;
+            var cls = Safe(() => current.Class);
+            if (cls is not null &&
+                Safe(() => (int)cls.Token) == declaringToken &&
+                string.Equals(Safe(() => cls.Module.Name), declaringModule, StringComparison.OrdinalIgnoreCase))
+            {
+                var parameters = Safe(() => current.TypeParameters);
+                return parameters is { Length: > 0 } ? parameters.Select(p => p.Raw).ToArray() : null;
+            }
+            type = Safe(() => current.Base);
+        }
+        return null;
     }
 
     private static bool DeclaringTypeIsGeneric(CorDebugFunction function) =>
@@ -1701,7 +1712,7 @@ public sealed partial class DebugSession : IDebugSession
             return null;
         }
 
-        var thread = _stoppedThread;
+        var thread = _inspectionThread ?? _stoppedThread;
         var process = _process;
         if (thread is null || process is null)
         {
@@ -1730,6 +1741,9 @@ public sealed partial class DebugSession : IDebugSession
         {
             start(eval);
             process.Continue(false);
+            // The debuggee ran, and the runtime's answer to every value read before this is now
+            // stale — see Reacquire. Counted here, at the moment it becomes true.
+            _evalGeneration++;
 
             if (!done.Wait(EvalTimeout))
             {
@@ -2030,7 +2044,7 @@ public sealed partial class DebugSession : IDebugSession
     /// Finds a method by name on a value's type, walking base types within the declaring module.
     /// </summary>
     private static (CorDebugFunction Function, CorDebugValue Instance)? FindMethod(
-        CorDebugValue value, string name)
+        CorDebugValue value, string name, int parameterCount = 0)
     {
         // The dereferenced object is what carries the class, but the instance argument handed to
         // CallFunction must stay the original reference — passing the dereferenced object makes
@@ -2041,13 +2055,7 @@ public sealed partial class DebugSession : IDebugSession
 
         foreach (var (cls, metadata, typeDef) in TypeChain(value))
         {
-            var token = Safe(() =>
-            {
-                var method = metadata.FindMethod(typeDef, name, IntPtr.Zero, 0);
-                return (mdMethodDef?)method;
-            });
-
-            if (token is { } methodToken)
+            if (MethodWithArity(metadata, typeDef, name, parameterCount) is { } methodToken)
             {
                 var function = Safe(() => cls.Module.GetFunctionFromToken(methodToken));
                 if (function is not null)
@@ -2056,6 +2064,47 @@ public sealed partial class DebugSession : IDebugSession
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// The overload of <paramref name="name"/> with the given parameter count, or null when the
+    /// type declares none.
+    /// </summary>
+    /// <remarks>
+    /// The metadata lookup by bare name returns whichever overload comes first. For
+    /// <c>DateTimeOffset</c> and <c>StringBuilder</c> that was <c>ToString(string)</c> rather than
+    /// <c>ToString()</c>: the call failed for want of an argument, and the value fell back to its
+    /// type name. An overload whose signature cannot be read is kept as a last resort.
+    /// </remarks>
+    private static mdMethodDef? MethodWithArity(MetaDataImport metadata, mdTypeDef typeDef, string name, int parameterCount)
+    {
+        var handle = IntPtr.Zero;
+        try
+        {
+            var candidates = new mdMethodDef[16];
+            int found = Safe(() => (int?)metadata.EnumMethodsWithName(ref handle, typeDef, name, candidates)) ?? 0;
+            mdMethodDef? fallback = null;
+            for (var i = 0; i < found; i++)
+            {
+                var token = candidates[i];
+                var props = Safe(() => (MetaDataImport_GetMethodPropsResult?)metadata.GetMethodProps(token));
+                if (props is not { } method)
+                    continue;
+                var count = SignatureParameterCount(method.ppvSigBlob, method.pcbSigBlob);
+                if (count == parameterCount)
+                    return token;
+                if (count == MethodSignature.Unknown)
+                    fallback ??= token;
+            }
+            return fallback;
+        }
+        finally
+        {
+            if (handle != IntPtr.Zero)
+            {
+                try { metadata.CloseEnum(handle); } catch { }
+            }
+        }
     }
 
     /// <summary>
@@ -2241,10 +2290,12 @@ public sealed partial class DebugSession : IDebugSession
                         bound.DeactivateAll();
                     _bound.Clear();
                     _boundSpecs.Clear();
+                    DisarmEncFlushBreakpoints();
                     DeactivateSteppers();
                     lock (_specLock) _specs.Clear();
 
-                    _stoppedThread = null;
+                    _inspectionFrames.Clear();
+            _stoppedThread = null;
                     try { _process?.Continue(false); } catch { /* already running */ }
                     return true;
                 }).WaitAsync(TimeSpan.FromSeconds(5));
@@ -2314,6 +2365,11 @@ public sealed partial class DebugSession : IDebugSession
         // returned — and a watchdog disposed early would have nothing to say about a teardown that
         // is itself where the session hung.
         _watchdog.Dispose();
+        if (_expressionDirectory is { } expressionDirectory)
+        {
+            try { Directory.Delete(expressionDirectory, recursive: true); } catch { }
+        }
+        _compiledExpressions.Clear();
     }
 
     /// <summary>
@@ -2397,6 +2453,7 @@ public sealed partial class DebugSession : IDebugSession
                 bound.DeactivateAll();
             _bound.Clear();
             _boundSpecs.Clear();
+            DisarmEncFlushBreakpoints();
             DeactivateSteppers();
             // The handle keeping the last step's return value readable is a strong handle in the
             // debuggee, and the debuggee survives this. Left behind it pins that object and
@@ -2404,6 +2461,7 @@ public sealed partial class DebugSession : IDebugSession
             // gone, nothing can ever dispose it — and an outstanding handle is one more thing
             // Detach itself can refuse over.
             ReleaseReturnValue();
+            _inspectionFrames.Clear();
             _stoppedThread = null;
             process.Detach();
             _process = null;
@@ -2496,6 +2554,7 @@ public sealed partial class DebugSession : IDebugSession
         {
             try { tcs.SetResult(f()); }
             catch (Exception ex) { tcs.SetException(ex); }
+            finally { _inspectionThread = null; _inspectionFrame = null; }
         });
         return tcs.Task;
     }
@@ -2582,35 +2641,94 @@ public sealed partial class DebugSession : IDebugSession
                     try { e.Controller.Continue(false); } catch { }
                     return;
                 }
-                var (file, line, column) = ThreadLocation(e.Thread);
-                if (!ShouldStopAt(e.Thread, file, line))
+                // The engine's own breakpoint, armed at the entry of a method a queued edit
+                // changes. The app was idle when the edit arrived, so this call is the first
+                // moment it can be applied safely: the thread is in the edited module's own user
+                // code, which is the stop shape ApplyChanges survives. Not a stop the user asked
+                // for — apply and resume without ever reporting it. Resumed from the session
+                // thread rather than here, because the apply has to run there and the process
+                // must stay stopped until it has.
+                if (IsEncFlushBreakpoint(e.Breakpoint))
                 {
-                    // Swallowed by a condition, a hit count, or a logpoint that has already
-                    // logged: resume before OnAnyEvent sees the stop, so nothing outside this
-                    // process ever learns the target suspended.
-                    try { e.Controller.Continue(false); } catch { }
+                    Enqueue(() =>
+                    {
+                        _stoppedThread = e.Thread;
+                        try
+                        {
+                            FlushPendingDeltas(atFlushBreakpoint: true);
+                            // Still waiting means the flush declined this stop. Keeping them armed
+                            // for the next call is right up to a point: an edited method the app
+                            // calls in a loop would take this stop on every call, and a debuggee
+                            // that spends a whole request suspended is one the user watches hang.
+                            if (_pendingDeltas.Count == 0 && _replayDeltas.IsEmpty)
+                            {
+                                _encFlushDeclines = 0;
+                                DisarmEncFlushBreakpoints();
+                            }
+                            else if (++_encFlushDeclines >= MaxEncFlushDeclines)
+                            {
+                                DisarmEncFlushBreakpoints();
+                                Emit(DebugEventKind.Diagnostic,
+                                    "hot reload: the queued edit could not be applied where the " +
+                                    "app entered the edited code, so it goes back to waiting for " +
+                                    "a breakpoint hit in the app's own code", string.Empty, 0);
+                            }
+                            else
+                            {
+                                ArmEncFlushBreakpoints();
+                            }
+                        }
+                        finally
+                        {
+                            // The user's own stop state is untouched by this: there was none, and
+                            // any stepper still in flight belongs to a step that is still running.
+                            _stoppedThread = null;
+                            try { _process?.Continue(false); } catch { }
+                        }
+                    });
                     return;
                 }
-                var bound = TryGetBoundSpec(file, line, out var spec);
-                if (bound && spec.Temporary)
-                    RemoveBreakpoint(file, line);
-                // The breakpoint, not the step, decides where this stop is. Any step still in
-                // flight is now abandoned, so cancel its stepper rather than leaving it armed to
-                // fire after the user's next continue.
-                DeactivateSteppers();
-                _stoppedOnException = false;
-                _stoppedThread = e.Thread;
-                // A breakpoint hit is the stop shape ApplyChanges is safe from, so edits that
-                // arrived while the target was running land at this stop. Enqueued rather than
-                // applied here: ApplyChanges must run on the session thread, not mscordbi's
-                // callback thread, and the command queue's FIFO order still puts the flush
-                // ahead of any continue or step the user issues after seeing the stop.
-                Enqueue(FlushPendingDeltas);
-                // Without the id the client cannot tell which breakpoint stopped it, which is
-                // what hit conditions, logpoints and value watches are keyed by.
-                Emit(
-                    DebugEventKind.Breakpoint, "breakpoint hit", MethodOf(e.Thread), ThreadId(e.Thread),
-                    file, line, column, breakpointId: bound ? spec.Id : string.Empty);
+                // Function evaluation needs this callback to return before its completion
+                // callback can arrive. Filter on the session queue while the target stays stopped.
+                Enqueue(() =>
+                {
+                    _stoppedThread = e.Thread;
+                    _inspectionThread = e.Thread;
+                    _inspectionFrameIndex = 0;
+                    try
+                    {
+                        var (file, line, column) = ThreadLocation(e.Thread);
+                        if (!ShouldStopAt(e.Thread, file, line))
+                        {
+                            // Swallowed by a condition, a hit count, or a logpoint that has already
+                            // logged: resume without publishing a stop to clients.
+                            _stoppedThread = null;
+                            try { e.Controller.Continue(false); } catch { }
+                            return;
+                        }
+                        var bound = TryGetBoundSpec(file, line, out var spec);
+                        if (bound && spec.Temporary)
+                            RemoveBreakpoint(file, line);
+                        // The breakpoint, not the step, decides where this stop is. Any step still in
+                        // flight is now abandoned, so cancel its stepper rather than leaving it armed to
+                        // fire after the user's next continue.
+                        DeactivateSteppers();
+                        _stoppedOnException = false;
+                        _stoppedThread = e.Thread;
+                        // A breakpoint hit is the stop shape ApplyChanges is safe from, so edits that
+                        // arrived while the target was running land at this stop. Enqueued rather than
+                        // applied here: ApplyChanges must run on the session thread, not mscordbi's
+                        // callback thread, and the command queue's FIFO order still puts the flush
+                        // ahead of any continue or step the user issues after seeing the stop.
+                        Enqueue(FlushPendingDeltas);
+                        // Without the id the client cannot tell which breakpoint stopped it, which is
+                        // what hit conditions, logpoints and value watches are keyed by.
+                        Emit(
+                            DebugEventKind.Breakpoint, "breakpoint hit", MethodOf(e.Thread), ThreadId(e.Thread),
+                            file, line, column, breakpointId: bound ? spec.Id : string.Empty);
+                    }
+                    finally { _inspectionThread = null; _inspectionFrame = null; }
+                });
             };
             // After an edit, a thread still executing the old version of an edited method raises
             // this at the next remap point. Jumping it moves the frame onto the new version, so
@@ -2619,8 +2737,24 @@ public sealed partial class DebugSession : IDebugSession
             // old code, which is exactly what this session did before it handled the callback.
             callback.OnFunctionRemapOpportunity += (_, e) =>
             {
+                // The thread sits on a remap breakpoint in code the last apply replaced. A method
+                // compiled before the debugger attached has no debugger record until the apply
+                // creates one, and that record is stamped with the version the apply introduced,
+                // so old and new arrive here as the same version. On .NET, remapping such a frame
+                // resumes in the code the thread is already running, the old code, and does so
+                // again on every call: the edit never lands. Left alone, that call finishes on the
+                // old code and the next one reaches the edited version through the prestub, which
+                // is how the runtime applies an edit without a debugger. The desktop runtime
+                // remaps that frame correctly, and a request stopped inside the edited method is
+                // expected to answer with the new code, so there the remap goes ahead.
                 try
                 {
+                    if (_runtime == DebugRuntime.CoreClr &&
+                        e.OldFunction.CurrentVersionNumber == e.NewFunction.CurrentVersionNumber)
+                    {
+                        return;
+                    }
+
                     if (e.Thread.ActiveFrame is CorDebugILFrame ilFrame &&
                         ilFrame.TryRemapFunction(RemapOffsetFor(e.NewFunction, e.OldILOffset)) == HRESULT.S_OK)
                     {
@@ -2671,7 +2805,8 @@ public sealed partial class DebugSession : IDebugSession
                 // Just My Code does in Visual Studio.
                 if (_display.JustMyCode && !IsUserFrame(e.Thread) && TryStepOutOfNonUserCode(e.Thread))
                 {
-                    _stoppedThread = null;
+                    _inspectionFrames.Clear();
+            _stoppedThread = null;
                     try { e.Controller.Continue(false); }
                     catch { /* already continued / terminated */ }
                     return;
@@ -2683,7 +2818,8 @@ public sealed partial class DebugSession : IDebugSession
                 // the user already was.
                 if (TryResumeStepOverOrigin(e.Thread))
                 {
-                    _stoppedThread = null;
+                    _inspectionFrames.Clear();
+            _stoppedThread = null;
                     try { e.Controller.Continue(false); }
                     catch { /* already continued / terminated */ }
                     return;
@@ -3166,11 +3302,31 @@ public sealed partial class DebugSession : IDebugSession
                 string.Empty, 0);
         }
 
-        if (flagged != HRESULT.S_OK)
+        // A module that loaded before the debugger arrived cannot take the flag: JIT settings are
+        // only accepted during the load callback of a launched process. On .NET that is not the
+        // end of it. The runtime decides a module's updatability when it loads, from
+        // DOTNET_MODIFIABLE_ASSEMBLIES=debug in the process environment, and a module loaded that
+        // way takes ApplyChanges from a debugger that attached later just as it would have taken
+        // MetadataUpdater without one, for methods compiled before the attach as much as after
+        // it (the remap handler is what makes the former hold). So an attached .NET session
+        // registers the module and lets the apply answer; a module without the variable fails
+        // cleanly with CORDBG_E_ENC_MODULE_NOT_ENC_ENABLED rather than faulting. The desktop
+        // runtime has no such variable, so there an attached module stays unregistered.
+        if (flagged == HRESULT.CORDBG_E_CANNOT_BE_ON_ATTACH && _runtime == DebugRuntime.CoreClr)
         {
             Emit(DebugEventKind.Diagnostic,
-                $"EnC is unavailable for {Path.GetFileName(moduleName)} ({flagged}); " +
-                "hot reload cannot change it.",
+                $"{Path.GetFileName(moduleName)} loaded before the debugger attached; hot reload " +
+                "works if the app was started with DOTNET_MODIFIABLE_ASSEMBLIES=debug.",
+                string.Empty, 0);
+        }
+        else if (flagged != HRESULT.S_OK)
+        {
+            Emit(DebugEventKind.Diagnostic,
+                flagged == HRESULT.CORDBG_E_CANNOT_BE_ON_ATTACH
+                    ? $"EnC is unavailable for {Path.GetFileName(moduleName)}: it loaded before the " +
+                      "debugger attached. Start the app from the debugger to hot reload it."
+                    : $"EnC is unavailable for {Path.GetFileName(moduleName)} ({flagged}); " +
+                      "hot reload cannot change it.",
                 string.Empty, 0);
             return;
         }
@@ -3467,6 +3623,11 @@ public sealed partial class DebugSession : IDebugSession
         if (assemblyName.Length > 0)
             _encModules.TryRemove(assemblyName, out _);
 
+        // The flush breakpoints armed in this image went with it. Forgotten rather than
+        // deactivated — there is nothing left to deactivate them in — and the replay queued by
+        // the next load arms its own in whatever image replaces this one.
+        ForgetEncFlushBreakpoints(instanceKey);
+
         // The symbols went with it. Kept, they hold the PDB open for the rest of the session —
         // one handle per app-domain recycle, which a site rebuilt all afternoon does often — and
         // a module that reloads from the same path would be read through its predecessor's PDB.
@@ -3550,6 +3711,51 @@ public sealed partial class DebugSession : IDebugSession
 
     private long _deltaSequence;
 
+    /// <summary>
+    /// Breakpoints the engine arms at the entry of every method a queued edit changes, so the
+    /// app reaches a stop the edit can be applied from without the user setting one.
+    /// </summary>
+    /// <remarks>
+    /// The queue exists because <c>ApplyChanges</c> faults unless a thread in the edited module's
+    /// app domain is stopped in user code, which an idle server never is. Waiting for the user's
+    /// next breakpoint made that queue indistinguishable from doing nothing: the ordinary web
+    /// inner loop — edit, apply, refresh the page — has no breakpoint in it at all, so the edit
+    /// sat in the queue until the process was restarted. Entering an edited method is by
+    /// definition a stop in that module's own user code, so the first call after the edit is
+    /// both the earliest safe moment and the one the user is already waiting on.
+    /// </remarks>
+    private readonly List<EncFlushBreakpoint> _encFlushBreakpoints = [];
+
+    /// <summary>Guards <see cref="_encFlushBreakpoints"/>: armed and disarmed on the session
+    /// thread, matched against on the runtime's callback thread.</summary>
+    private readonly Lock _encFlushLock = new();
+
+    /// <summary>How many flush stops in a row have failed to place the edit.</summary>
+    private int _encFlushDeclines;
+
+    /// <summary>
+    /// How many refusals the flush breakpoints get before they come back out.
+    /// </summary>
+    /// <remarks>
+    /// A flush stop that cannot apply the edit is not free: the debuggee is suspended for as long
+    /// as the engine takes to decide, and an edited method the app calls in a loop pays that on
+    /// every call. A handful of requests spent finding out is diagnosis; a whole request spent
+    /// stopping and resuming is a hang, and it is the user's request. Past this the edit goes back
+    /// to waiting for a stop in the app's own code, which is where it waited before any of this.
+    /// </remarks>
+    private const int MaxEncFlushDeclines = 4;
+
+    /// <summary>One armed entry point of an edited method, in one module instance.</summary>
+    private sealed record EncFlushBreakpoint(
+        string InstanceKey, int Token, CorDebugFunctionBreakpoint Breakpoint)
+    {
+        /// <summary>The deactivate did not take, so this is still armed in the debuggee and the
+        /// engine can no longer turn it off. Remembered so its hits are still recognised and
+        /// resumed silently, but no longer counted as covering its method: a later edit to the
+        /// same method has to be free to arm one it can actually control.</summary>
+        public bool Abandoned { get; init; }
+    }
+
     /// Apply one EnC metadata+IL delta to a live module (by simple assembly name), marshalled
     /// onto the session thread. Applied immediately from a safe break state, queued otherwise.
     public Task<(bool Ok, string Error)> ApplyDeltaAsync(
@@ -3587,9 +3793,17 @@ public sealed partial class DebugSession : IDebugSession
         {
             _pendingDeltas.Enqueue(new PendingDelta(
                 NextDeltaSequence(), assemblyName, metadata, il, pdb, symbolMap));
-            return (true, DeltaQueuedPrefix +
-                "no user code is stopped in the edited module's app domain, so the edit is " +
-                "queued and will be applied at the next breakpoint hit in the app's own code");
+
+            // Without this the queue waits for a stop the user may never make. Arming the edited
+            // methods themselves turns "at the next breakpoint" into "the next time the app runs
+            // this code", which is the thing they are about to do anyway.
+            _encFlushDeclines = 0;
+            int armed = ArmEncFlushBreakpoints();
+            return (true, DeltaQueuedPrefix + (armed > 0
+                ? "no user code is stopped in the edited module's app domain, so the edit is " +
+                  "queued and will be applied the next time the app runs one of the edited methods"
+                : "no user code is stopped in the edited module's app domain, so the edit is " +
+                  "queued and will be applied at the next breakpoint hit in the app's own code"));
         }
 
         return ApplyDeltaCore(
@@ -3621,6 +3835,173 @@ public sealed partial class DebugSession : IDebugSession
         _pendingDeltas.Clear();
         foreach (var delta in ordered)
             _pendingDeltas.Enqueue(delta);
+    }
+
+    /// <summary>
+    /// Arms an entry breakpoint on every method a queued edit changes, in every loaded instance
+    /// of its assembly.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent: a method already armed in an instance is left alone, so this can be called
+    /// again whenever the queue grows without disturbing what is already standing.
+    /// </remarks>
+    /// <returns>How many entry points are armed once this returns.</returns>
+    private int ArmEncFlushBreakpoints()
+    {
+        var wanted = PendingEditedMethods();
+        if (wanted.Count == 0)
+            return 0;
+
+        WhileSynchronized("arm the hot reload flush breakpoints", () =>
+        {
+            foreach (var (assemblyName, tokens) in wanted)
+            {
+                // The registered module is the one the delta was computed against; its MVID is
+                // what tells a second app domain's copy from a different build of the same name.
+                if (!_encModules.TryGetValue(assemblyName, out var registered))
+                    continue;
+                var mvid = MvidOf(registered);
+
+                foreach (var module in ModuleInstances(assemblyName, mvid))
+                {
+                    if (Safe(() => InstanceKey(module)) is not { } instanceKey)
+                        continue;
+
+                    foreach (int token in tokens)
+                    {
+                        lock (_encFlushLock)
+                        {
+                            if (_encFlushBreakpoints.Any(b => !b.Abandoned && b.Token == token &&
+                                    string.Equals(b.InstanceKey, instanceKey, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                continue;
+                            }
+                        }
+
+                        try
+                        {
+                            var function = module.GetFunctionFromToken(new mdMethodDef(token));
+                            var breakpoint = function.CreateBreakpoint();
+                            breakpoint.Activate(true);
+                            lock (_encFlushLock)
+                                _encFlushBreakpoints.Add(new EncFlushBreakpoint(instanceKey, token, breakpoint));
+                        }
+                        catch
+                        {
+                            // A method this image does not have — an edit that adds one, or a
+                            // token from a build that is not loaded here. Nothing to stop at, and
+                            // the edit still lands at the next ordinary stop.
+                        }
+                    }
+                }
+            }
+        });
+
+        int count;
+        lock (_encFlushLock)
+            count = _encFlushBreakpoints.Count;
+        return count;
+    }
+
+    /// <summary>Every method any waiting edit changes, by assembly.</summary>
+    /// <remarks>
+    /// Read from the symbol map rather than carried separately, because that is where the
+    /// compiler's method tokens already travel to reach the debugger's symbol store.
+    /// </remarks>
+    private Dictionary<string, HashSet<int>> PendingEditedMethods()
+    {
+        var wanted = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var delta in _pendingDeltas.Concat(_replayDeltas))
+        {
+            if (EncSymbolMap.Parse(delta.Map) is not { UpdatedMethods.Length: > 0 } map)
+                continue;
+            if (!wanted.TryGetValue(delta.AssemblyName, out var tokens))
+                wanted[delta.AssemblyName] = tokens = [];
+            foreach (int token in map.UpdatedMethods)
+                tokens.Add(token);
+        }
+
+        return wanted;
+    }
+
+    /// <summary>Every loaded instance of an assembly, without the stop-shape filtering
+    /// <see cref="InstancesOf"/> applies — arming a breakpoint is safe in any domain, and the
+    /// domain that will serve the next request is not knowable in advance.</summary>
+    private IEnumerable<CorDebugModule> ModuleInstances(string assemblyName, Guid? mvid)
+    {
+        foreach (var module in LoadedModules())
+        {
+            var name = Safe(() => module.Name) ?? string.Empty;
+            if (!string.Equals(
+                    Path.GetFileNameWithoutExtension(name), assemblyName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (mvid is { } expected && MvidOf(module) is { } actual && actual != expected)
+                continue;
+            yield return module;
+        }
+    }
+
+    /// <summary>Whether a breakpoint event is one of the engine's own flush breakpoints, which
+    /// the user never set and must never see reported as a stop.</summary>
+    private bool IsEncFlushBreakpoint(CorDebugBreakpoint? breakpoint)
+    {
+        if (breakpoint is not CorDebugFunctionBreakpoint hit)
+            return false;
+        lock (_encFlushLock)
+            return _encFlushBreakpoints.Any(b => b.Breakpoint.Equals(hit));
+    }
+
+    /// <summary>Takes the flush breakpoints back out, keeping the ones that would not go.</summary>
+    /// <remarks>
+    /// Left armed, these keep stopping the debuggee at a breakpoint nobody set, and a leaked
+    /// native breakpoint is what later makes detach fail. The caller owns the stopped process:
+    /// every disarm here already has one — the stop the edit landed at, or the one a shutdown and
+    /// a detach each take first — and deactivating unsynchronized fails silently, which would
+    /// leave the breakpoints armed with nothing left to remember them by.
+    /// <para>
+    /// A deactivate that does not take keeps its entry rather than dropping it. The native
+    /// breakpoint is still armed in the debuggee, and this list is the only thing that knows the
+    /// engine put it there: forget it and <see cref="IsEncFlushBreakpoint"/> stops recognising its
+    /// next hit, which then arrives as a stop the user never set, on a line they never chose.
+    /// Kept, it is still resumed silently, and the next disarm gets another chance at it.
+    /// </para>
+    /// </remarks>
+    private void DisarmEncFlushBreakpoints()
+    {
+        lock (_encFlushLock)
+        {
+            for (int i = _encFlushBreakpoints.Count - 1; i >= 0; i--)
+            {
+                var armed = _encFlushBreakpoints[i];
+                if (armed.Abandoned)
+                    continue;
+
+                bool off;
+                try { off = armed.Breakpoint.TryActivate(false) == HRESULT.S_OK; }
+                catch { off = false; /* the module went away underneath it */ }
+
+                if (off)
+                    _encFlushBreakpoints.RemoveAt(i);
+                else
+                    _encFlushBreakpoints[i] = armed with { Abandoned = true };
+            }
+        }
+    }
+
+    /// <summary>Forgets the flush breakpoints that lived in a module instance that has unloaded.
+    /// Not deactivated: the image they were armed in is gone.</summary>
+    private void ForgetEncFlushBreakpoints(string instanceKey)
+    {
+        if (instanceKey.Length == 0)
+            return;
+        lock (_encFlushLock)
+        {
+            _encFlushBreakpoints.RemoveAll(
+                b => string.Equals(b.InstanceKey, instanceKey, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     /// <summary>The apply itself plus everything the runtime does not do for the debugger:
@@ -3743,9 +4124,14 @@ public sealed partial class DebugSession : IDebugSession
         foreach (var delta in replays)
             _replayDeltas.Enqueue(delta with { Target = module });
 
+        // Same reason as the ordinary queue: a recycled app domain is running the built code
+        // again, and waiting for a breakpoint to notice would leave it that way. Enqueued
+        // because arming belongs on the session thread and this is the runtime's callback thread.
+        Enqueue(() => ArmEncFlushBreakpoints());
+
         Emit(DebugEventKind.Diagnostic,
             $"hot reload: {assemblyName} was loaded again; its {replays.Length} applied edit(s) " +
-            "will be re-applied at the next breakpoint hit in the app's own code",
+            "will be re-applied the next time the app runs one of the edited methods",
             string.Empty, 0);
     }
 
@@ -3858,7 +4244,23 @@ public sealed partial class DebugSession : IDebugSession
     /// recording the stop context, so it runs ahead of any continue or step the user can issue
     /// — by the time execution resumes, the code they edited is the code that runs.
     /// </summary>
-    private void FlushPendingDeltas()
+    private void FlushPendingDeltas() => FlushPendingDeltas(atFlushBreakpoint: false);
+
+    /// <param name="atFlushBreakpoint">Whether this stop is one the engine took for the edit
+    /// itself rather than one of the user's. Those are invisible, and they are paid for out of a
+    /// request somebody is waiting on, so they are given far less patience.</param>
+    private void FlushPendingDeltas(bool atFlushBreakpoint)
+    {
+        FlushPendingDeltasCore(atFlushBreakpoint);
+
+        // Nothing is waiting any more, so the entry breakpoints that were holding the door open
+        // come back out. Only from a stopped process: disarming a running one fails silently and
+        // would leave the native breakpoints armed with nothing left to remember them by.
+        if (_stoppedThread is not null && _pendingDeltas.Count == 0 && _replayDeltas.IsEmpty)
+            DisarmEncFlushBreakpoints();
+    }
+
+    private void FlushPendingDeltasCore(bool atFlushBreakpoint)
     {
         DrainReplays();
         if (_pendingDeltas.Count == 0)
@@ -3906,8 +4308,14 @@ public sealed partial class DebugSession : IDebugSession
             // callback thread, and until it returns, inspecting the stopped thread from here
             // can transiently fail — which must read as "not yet", not "unsafe", or the edit
             // misses the exact stop it was queued for. Hence the brief retry.
+            // The wait is for a callback that is still unwinding, which is a matter of
+            // milliseconds. Forty tries is generous at a stop of the user's, where the debuggee is
+            // suspended anyway and nobody is waiting on it; at one of the engine's own it is a
+            // second of a live request spent on every call into the edited method, so it is cut
+            // short.
             var safe = false;
-            for (int attempt = 0; attempt < 40 && _stoppedThread is not null; attempt++)
+            int attempts = atFlushBreakpoint ? 8 : 40;
+            for (int attempt = 0; attempt < attempts && _stoppedThread is not null; attempt++)
             {
                 safe = StoppedThreadIsUserCodeIn(module) || UserCodeIsStoppedIn(module);
                 if (safe)
@@ -6450,8 +6858,33 @@ public sealed partial class DebugSession : IDebugSession
 
     // --- stop-state inspection --------------------------------------------------------------
 
-    private static CorDebugFrame? FrameAt(CorDebugThread thread, uint index)
+    private CorDebugThread? _inspectionThread;
+    private uint _inspectionFrameIndex;
+    private readonly Dictionary<uint, (int Thread, uint Index)> _inspectionFrames = new();
+    private uint _nextInspectionFrame = 100_000;
+
+    private uint InspectionFrameId(CorDebugThread thread, uint index)
     {
+        if (ThreadId(thread) == ThreadId(_stoppedThread!)) return index;
+        var context = (ThreadId(thread), index);
+        foreach (var entry in _inspectionFrames)
+            if (entry.Value == context) return entry.Key;
+        var id = _nextInspectionFrame++;
+        _inspectionFrames.Add(id, context);
+        return id;
+    }
+
+    private CorDebugFrame? FrameAt(CorDebugThread thread, uint index)
+    {
+        if (index >= 100_000)
+        {
+            if (!_inspectionFrames.TryGetValue(index, out var context))
+                throw new InvalidOperationException("The stack frame has expired; refresh the call stack.");
+            thread = FindThreadById(context.Thread) ?? throw new InvalidOperationException("The thread no longer exists.");
+            index = context.Index;
+        }
+        _inspectionThread = thread;
+        _inspectionFrameIndex = index;
         var i = 0u;
         foreach (var chain in Safe(() => thread.Chains) ?? Array.Empty<CorDebugChain>())
             foreach (var frame in Safe(() => chain.Frames) ?? Array.Empty<CorDebugFrame>())
@@ -6759,22 +7192,28 @@ public sealed partial class DebugSession : IDebugSession
                 return unboxedScalar;
             if (NullableDisplayOf(dereferenced) is { } nullableDisplay)
                 return nullableDisplay;
+            // Braces from here on, the way VS writes them: they mark a description of the object
+            // — its type, its ToString — as opposed to a literal that could be typed back in.
             if (dereferenced is CorDebugArrayValue array)
-                return ArrayDisplayOf(array);
+                return "{" + ArrayDisplayOf(array) + "}";
             if (EnumDisplayOf(dereferenced) is { } enumDisplay)
                 return enumDisplay;
             if (WellKnownStructDisplayOf(dereferenced) is { } structDisplay)
                 return structDisplay;
+            if (TupleDisplayOf(dereferenced) is { } tupleDisplay)
+                return tupleDisplay;
             if (applyDisplay && DisplayStringFor(value) is { } display)
-                return display;
+                return SingleLine(display);
+            if (ExceptionDisplayOf(dereferenced) is { } exceptionDisplay)
+                return exceptionDisplay;
             if (applyDisplay && DelegateDisplayOf(value) is { } delegateDisplay)
                 return delegateDisplay;
             if (applyDisplay && ToStringDisplayOf(value) is { } text)
-                return text;
+                return "{" + SingleLine(text) + "}";
             // No display string: the type's own name says more than the element type ("Class")
             // the runtime reports for every object alike.
             if (TypeNameOf(value) is { Length: > 0 } typeName)
-                return typeName;
+                return "{" + typeName + "}";
             return Safe(() => dereferenced.Type.ToString()) ?? "?";
         }
         catch
@@ -6858,6 +7297,88 @@ public sealed partial class DebugSession : IDebugSession
         return null;
     }
 
+    /// <summary>A value tuple as VS writes one: <c>(1, "one")</c>, elements described as they
+    /// would be on their own, and never the <c>ValueTuple</c> type name.</summary>
+    private string? TupleDisplayOf(CorDebugValue value)
+    {
+        var typeName = TypeNameOf(value);
+        if (!typeName.StartsWith("System.ValueTuple<", StringComparison.Ordinal) &&
+            !typeName.StartsWith("System.ValueTuple`", StringComparison.Ordinal))
+            return null;
+
+        var items = new List<CorDebugValue>();
+        CollectTupleItems(value, items);
+        if (items.Count == 0)
+            return null;
+
+        // Literals first, then anything that may need the debuggee to describe itself: the
+        // first evaluation retires every item value read from this struct, and a literal read
+        // before it costs nothing.
+        var parts = new string?[items.Count];
+        for (var i = 0; i < items.Count; i++)
+        {
+            var item = Safe(() => Dereference(items[i]));
+            if (item is CorDebugStringValue || item is not null && TryReadScalar(item) is not null)
+                parts[i] = DescribeValue(items[i]);
+        }
+        for (var i = 0; i < items.Count; i++)
+            parts[i] ??= DescribeValue(items[i]);
+
+        return "(" + string.Join(", ", parts) + ")";
+    }
+
+    private static void CollectTupleItems(CorDebugValue tuple, List<CorDebugValue> into)
+    {
+        for (var i = 1; i <= 7; i++)
+        {
+            if (Safe(() => FieldValue(tuple, "Item" + i)) is not { } item)
+                return;
+            into.Add(item);
+        }
+        // An eighth element and beyond nest in Rest, itself a tuple.
+        if (Safe(() => FieldValue(tuple, "Rest")) is { } rest && into.Count < 64)
+            CollectTupleItems(rest, into);
+    }
+
+    /// <summary>An exception as VS shows one: its message, quoted and braced, so that the
+    /// row reads as what went wrong rather than as which class recorded it.</summary>
+    private string? ExceptionDisplayOf(CorDebugValue value)
+    {
+        if (!IsException(value))
+            return null;
+
+        if (Safe(() => FieldValue(value, "_message")) is { } message &&
+            Safe(() => Dereference(message)) is CorDebugStringValue text)
+        {
+            var length = Safe(() => (int?)text.Length) ?? 0;
+            var shown = Safe(() => text.GetString(Math.Min(length, MaxStringDisplayLength))) ?? string.Empty;
+            return "{" + QuoteString(shown, truncated: length > MaxStringDisplayLength) + "}";
+        }
+        return "{" + TypeNameOf(value) + "}";
+    }
+
+    private static bool IsException(CorDebugValue value)
+    {
+        foreach (var (_, metadata, typeDef) in TypeChain(value))
+        {
+            if (Safe(() => metadata.GetTypeDefProps(typeDef).szTypeDef) == "System.Exception")
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>A display string on one line: a value column has one row per value, and a
+    /// <c>ToString</c> that writes a paragraph should not spill across the rows below it.</summary>
+    private static string SingleLine(string text)
+    {
+        if (text.IndexOfAny(['\r', '\n']) < 0)
+            return text;
+        return string.Join(" ", text
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0));
+    }
+
     private static bool ExtendsSystemEnum(MetaDataImport metadata, mdTypeDef typeDef) =>
         Safe(() =>
         {
@@ -6931,12 +7452,14 @@ public sealed partial class DebugSession : IDebugSession
     {
         try
         {
+            // A decimal is a number and reads like one; the other three are objects describing
+            // themselves, which VS braces like any other ToString.
             return TypeNameOf(value) switch
             {
                 "System.Decimal" => DecimalDisplayOf(value),
-                "System.DateTime" => DateTimeDisplayOf(value),
-                "System.TimeSpan" => TimeSpanDisplayOf(value),
-                "System.Guid" => GuidDisplayOf(value),
+                "System.DateTime" => Braced(DateTimeDisplayOf(value)),
+                "System.TimeSpan" => Braced(TimeSpanDisplayOf(value)),
+                "System.Guid" => Braced(GuidDisplayOf(value)),
                 _ => null,
             };
         }
@@ -6948,13 +7471,30 @@ public sealed partial class DebugSession : IDebugSession
         }
     }
 
+    private static string? Braced(string? text) => text is null ? null : "{" + text + "}";
+
+    /// <summary>Reconstructs a decimal from either layout: the four <c>flags/hi/lo/mid</c> ints of
+    /// .NET Framework, or the <c>_flags/_hi32/_lo64</c> of .NET.</summary>
     private static string? DecimalDisplayOf(CorDebugValue value)
     {
-        if (RawIntegerOf(FieldValue(value, "flags")) is not { } flags ||
-            RawIntegerOf(FieldValue(value, "hi")) is not { } hi ||
-            RawIntegerOf(FieldValue(value, "lo")) is not { } lo ||
-            RawIntegerOf(FieldValue(value, "mid")) is not { } mid)
+        long flags, hi, lo, mid;
+        if (RawIntegerOf(FieldValue(value, "flags")) is { } frameworkFlags &&
+            RawIntegerOf(FieldValue(value, "hi")) is { } frameworkHi &&
+            RawIntegerOf(FieldValue(value, "lo")) is { } frameworkLo &&
+            RawIntegerOf(FieldValue(value, "mid")) is { } frameworkMid)
+        {
+            (flags, hi, lo, mid) = (frameworkFlags, frameworkHi, frameworkLo, frameworkMid);
+        }
+        else if (RawIntegerOf(FieldValue(value, "_flags")) is { } coreFlags &&
+                 RawIntegerOf(FieldValue(value, "_hi32")) is { } coreHi &&
+                 RawIntegerOf(FieldValue(value, "_lo64")) is { } coreLo64)
+        {
+            (flags, hi, lo, mid) = (coreFlags, coreHi, coreLo64 & 0xFFFF_FFFFL, (coreLo64 >> 32) & 0xFFFF_FFFFL);
+        }
+        else
+        {
             return null;
+        }
 
         var scale = (byte)((flags >> 16) & 0xFF);
         var negative = (flags & 0x8000_0000L) != 0;
@@ -6962,9 +7502,10 @@ public sealed partial class DebugSession : IDebugSession
             .ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
+    /// <summary>The ticks field is <c>dateData</c> on .NET Framework and <c>_dateData</c> on .NET.</summary>
     private static string? DateTimeDisplayOf(CorDebugValue value)
     {
-        if (RawIntegerOf(FieldValue(value, "dateData")) is not { } data)
+        if (RawIntegerOf(FieldValue(value, "dateData") ?? FieldValue(value, "_dateData")) is not { } data)
             return null;
 
         var ticks = data & 0x3FFF_FFFF_FFFF_FFFF;

@@ -1247,6 +1247,14 @@
           "title": "Raw View",
           "description": "Offer a Raw View child whenever a proxy or a hidden member means the listed children are not the object's own fields."
         },
+        "enumerateResults": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Enumerate results",
+          "description": "List a lazy enumerable's elements (a LINQ query, an iterator) when it is expanded, with the iterator's own state under Raw View. Off shows the iterator's members and puts the elements behind a Results View, as VS does. Expanding runs the sequence either way."
+        },
         "maxChildren": {
           "type": [
             "string",

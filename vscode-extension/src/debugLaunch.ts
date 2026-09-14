@@ -1,13 +1,17 @@
 import * as vscode from 'vscode';
+import { RunAdapter } from './runAdapter';
 import type { LanguageClient } from 'vscode-languageclient/node';
-import { bindHotReloadSession, withHotReloadEnvironment } from './hotReload';
+import { bindHotReloadSession, withHotReloadEnvironment, hotReloadOwnerFor, restartDebugHotReload } from './hotReload';
 
 /**
  * Real debugging of the user's own app, without ms-dotnettools.csharp.
  *
- * The adapter is netcoredbg in its DAP mode (`--interpreter=vscode`), so VS Code talks to a
- * genuine debugger: watch, locals trees, conditional breakpoints, exception filters and
- * setVariable all come from netcoredbg rather than from adapter code we would have to write.
+ * The adapter is the server's own (`roslyn-sense --dap`, the ICorDebug engine) for .NET Framework
+ * and, on Windows, for .NET; elsewhere, or when the engine setting asks for it, it is netcoredbg
+ * in its DAP mode (`--interpreter=vscode`). Either way VS Code talks to a genuine debugger:
+ * watch, locals trees, conditional breakpoints, exception filters and setVariable come from the
+ * engine rather than from adapter code we would have to write. The server decides which per
+ * target (`serverDebugAdapter`), so the client never reads the setting itself.
  *
  * This is distinct from the `roslynsense-ai` debug type, which only mirrors a session an AI
  * chat owns.
@@ -93,6 +97,93 @@ export function registerDebugLaunch(
     let buildLog: vscode.OutputChannel | undefined;
     context.subscriptions.push({ dispose: () => buildLog?.dispose() });
 
+    async function buildForLaunch(config: vscode.DebugConfiguration, client: LanguageClient): Promise<boolean> {
+        const configuration = config.configuration ?? 'Debug';
+        const projectName = basename(config.projectPath);
+
+        // A notification rather than the status bar, and cancellable: a build with no
+        // visible sign of life reads as a hung editor, and the way out of a long one
+        // should not be killing the window.
+        const cancellation = new vscode.CancellationTokenSource();
+        let build: BuildResult;
+        try {
+            build = await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: `Building ${projectName}`,
+                    cancellable: true,
+                },
+                (progress, token) => {
+                    token.onCancellationRequested(() => cancellation.cancel());
+                    progress.report({ message: configuration });
+                    return client.sendRequest<BuildResult>(
+                        'workspace/executeCommand',
+                        {
+                            // The last argument turns off the server's own progress: this
+                            // notification is already showing the same build.
+                            command: 'roslynSense.build',
+                            arguments: [config.projectPath, configuration, 'build', false],
+                        },
+                        cancellation.token
+                    );
+                }
+            );
+        } catch (error) {
+            if (cancellation.token.isCancellationRequested) {
+                void vscode.window.setStatusBarMessage(
+                    `RoslynSense: build of ${projectName} cancelled.`,
+                    5000
+                );
+            } else {
+                void vscode.window.showErrorMessage(
+                    `RoslynSense: build of ${projectName} failed: ${String(error)}`
+                );
+            }
+            return false;
+        } finally {
+            cancellation.dispose();
+        }
+
+        publishBuildDiagnostics(buildDiagnostics, build);
+        if (build.log) {
+            buildLog ??= vscode.window.createOutputChannel('RoslynSense Build');
+            buildLog.replace(build.log);
+        }
+        if (!build.success) {
+            const firstError = build.errors[0];
+            const actions = build.log
+                ? ['Show Build Log', 'Show Problems']
+                : ['Show Problems'];
+            void vscode.window
+                .showErrorMessage(
+                    firstError
+                        ? `Build failed: ${firstError.message}`
+                        : build.summary,
+                    ...actions
+                )
+                .then((choice) => {
+                    if (choice === 'Show Build Log') {
+                        buildLog?.show(true);
+                    } else if (choice === 'Show Problems') {
+                        void vscode.commands.executeCommand('workbench.actions.view.problems');
+                    }
+                });
+            return false;
+        }
+
+        return true;
+    }
+
+    // VS Code reuses resolved configurations on Restart, but creates a new adapter after
+    // terminating the old target. Consume the first launch's build ticket exactly once;
+    // subsequent adapter creations must build again, even without another provider call.
+    const preparedLaunches = new Map<string, ReturnType<typeof setTimeout>>();
+    let nextLaunch = 0;
+    context.subscriptions.push({ dispose: () => {
+        for (const timer of preparedLaunches.values()) { clearTimeout(timer); }
+        preparedLaunches.clear();
+    } });
+
     // Referenced from attach configurations as "${command:roslynSense.pickProcess}".
     context.subscriptions.push(
         vscode.commands.registerCommand('roslynSense.pickProcess', async () => {
@@ -144,6 +235,9 @@ export function registerDebugLaunch(
 
             const profile =
                 target.launchProfiles.length > 0 ? await pickProfile(target) : target.projectName;
+            if (profile === null) {
+                return;
+            }
 
             const result = await client.sendRequest<string>('workspace/executeCommand', {
                 command: 'roslynSense.setLaunchUrl',
@@ -158,6 +252,29 @@ export function registerDebugLaunch(
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, {
             async createDebugAdapterDescriptor(session: vscode.DebugSession) {
+                const config = session.configuration;
+                if (config.request === 'launch') {
+                    const ticket = config.roslynSensePreparedLaunch as string | undefined;
+                    const timer = ticket ? preparedLaunches.get(ticket) : undefined;
+                    if (timer) {
+                        clearTimeout(timer);
+                        preparedLaunches.delete(ticket!);
+                    } else {
+                        const client = getClient();
+                        if (!client) { throw new Error('RoslynSense is not running.'); }
+                        if (!await buildForLaunch(config, client)) {
+                            throw new Error('Launch cancelled because the build did not succeed.');
+                        }
+                        if (config.hotReload !== false && config.roslynSenseHotReloadOwner) {
+                            await restartDebugHotReload(client, session);
+                        }
+                    }
+                }
+
+                if (config.request === 'launch' && config.noDebug === true) {
+                    return new vscode.DebugAdapterInlineImplementation(new RunAdapter());
+                }
+
                 // .NET Framework needs ICorDebug; netcoredbg only speaks to CoreCLR. The server
                 // ships that adapter itself, in --dap mode — and a .NET target is sent there too
                 // when the engine setting asks for it.
@@ -257,6 +374,9 @@ export function registerDebugLaunch(
                         config.projectPath = active.projectPath;
                         config.name = `C#: ${active.projectName}`;
                         config.launchProfile = config.launchProfile ?? (await pickProfile(active));
+                        if (config.launchProfile === null) {
+                            return undefined;
+                        }
                         return config;
                     }
 
@@ -267,6 +387,9 @@ export function registerDebugLaunch(
                     }
                     config.projectPath = target.projectPath;
                     config.launchProfile = config.launchProfile ?? (await pickProfile(target));
+                    if (config.launchProfile === null) {
+                        return undefined;
+                    }
                 }
                 return config;
             },
@@ -286,72 +409,7 @@ export function registerDebugLaunch(
 
                 const configuration = config.configuration ?? 'Debug';
                 const projectName = basename(config.projectPath);
-
-                // A notification rather than the status bar, and cancellable: a build with no
-                // visible sign of life reads as a hung editor, and the way out of a long one
-                // should not be killing the window.
-                const cancellation = new vscode.CancellationTokenSource();
-                let build: BuildResult;
-                try {
-                    build = await vscode.window.withProgress(
-                        {
-                            location: vscode.ProgressLocation.Notification,
-                            title: `Building ${projectName}`,
-                            cancellable: true,
-                        },
-                        (progress, token) => {
-                            token.onCancellationRequested(() => cancellation.cancel());
-                            progress.report({ message: configuration });
-                            return client.sendRequest<BuildResult>(
-                                'workspace/executeCommand',
-                                {
-                                    // The last argument turns off the server's own progress: this
-                                    // notification is already showing the same build.
-                                    command: 'roslynSense.build',
-                                    arguments: [config.projectPath, configuration, 'build', false],
-                                },
-                                cancellation.token
-                            );
-                        }
-                    );
-                } catch {
-                    // The only way this rejects is the cancellation above; the server kills the
-                    // build with it, so there is nothing to clean up here.
-                    void vscode.window.setStatusBarMessage(
-                        `RoslynSense: build of ${projectName} cancelled.`,
-                        5000
-                    );
-                    return undefined;
-                } finally {
-                    cancellation.dispose();
-                }
-
-                publishBuildDiagnostics(buildDiagnostics, build);
-                if (build.log) {
-                    buildLog ??= vscode.window.createOutputChannel('RoslynSense Build');
-                    buildLog.replace(build.log);
-                }
-                if (!build.success) {
-                    const firstError = build.errors[0];
-                    const actions = build.log
-                        ? ['Show Build Log', 'Show Problems']
-                        : ['Show Problems'];
-                    void vscode.window
-                        .showErrorMessage(
-                            firstError
-                                ? `Build failed: ${firstError.message}`
-                                : build.summary,
-                            ...actions
-                        )
-                        .then((choice) => {
-                            if (choice === 'Show Build Log') {
-                                buildLog?.show(true);
-                            } else if (choice === 'Show Problems') {
-                                void vscode.commands.executeCommand('workbench.actions.view.problems');
-                            }
-                        });
-                    return undefined;
-                }
+                if (!await buildForLaunch(config, client)) { return undefined; }
 
                 const target = (
                     await fetchTargets(client, configuration, config.launchProfile)
@@ -387,14 +445,27 @@ export function registerDebugLaunch(
                     config.serverDebugAdapter ?? target.serverDebugAdapter ?? target.isNetFramework;
 
                 // Hot reload has to be decided before the process starts, and it costs nothing
-                // when unused, so it is on unless the configuration turns it off. .NET Framework
+                // when unused, so it is on where supported unless the configuration turns it off. .NET Framework
                 // needs no environment — its edits go through the debugger, not a startup hook —
                 // but still needs the session bound, or the toolbar button never appears.
+                delete config.roslynSenseHotReloadOwner;
                 if (config.hotReload !== false) {
-                    if (target.isNetFramework) {
-                        bindHotReloadSession(client, target.projectPath);
-                    } else {
+                    if (target.isNetFramework && config.noDebug !== true) {
+                        await bindHotReloadSession(client, target.projectPath);
+                        config.roslynSenseHotReloadOwner = hotReloadOwnerFor?.(target.projectPath);
+                    } else if (!target.isNetFramework && config.noDebug === true) {
                         config.env = await withHotReloadEnvironment(client, config.env, target.projectPath);
+                        config.roslynSenseHotReloadOwner = hotReloadOwnerFor?.(target.projectPath);
+                    } else if (target.isNetFramework) {
+                        void vscode.window.showWarningMessage(
+                            'RoslynSense: .NET Framework Hot Reload requires a debug session. Use Start Debugging (F5).');
+                    } else {
+                        // CoreCLR rejects MetadataUpdater.ApplyUpdate with an attached debugger.
+                        // Neither .NET adapter currently provides our debugger-side EnC route.
+                        void vscode.window.showWarningMessage(
+                            'RoslynSense: Hot Reload during .NET debugging requires debugger-side Edit and Continue, ' +
+                            'which is not yet supported. Use Run Without Debugging (Ctrl+F5) for Hot Reload, ' +
+                            'or Restart to rebuild and relaunch.');
                     }
                 }
 
@@ -417,6 +488,11 @@ export function registerDebugLaunch(
                         action: 'openExternally',
                     };
                 }
+                const ticket = `${Date.now()}:${++nextLaunch}`;
+                config.roslynSensePreparedLaunch = ticket;
+                const timer = setTimeout(() => preparedLaunches.delete(ticket), 120_000);
+                timer.unref();
+                preparedLaunches.set(ticket, timer);
                 return config;
             },
         })
@@ -516,7 +592,7 @@ async function fetchTargets(
  * The profile to launch with, when the project offers more than one and the configuration did
  * not name one. A single profile is not worth a question.
  */
-async function pickProfile(target: LaunchTarget): Promise<string | undefined> {
+async function pickProfile(target: LaunchTarget): Promise<string | null | undefined> {
     if (target.launchProfiles.length < 2) {
         return target.launchProfiles[0]?.name;
     }
@@ -530,7 +606,8 @@ async function pickProfile(target: LaunchTarget): Promise<string | undefined> {
         })),
         { title: `Launch profile for ${target.projectName}` }
     );
-    return picked?.profile.name;
+    // Undefined means the project has no profiles; null means the user cancelled a choice.
+    return picked?.profile.name ?? null;
 }
 
 async function pickTarget(

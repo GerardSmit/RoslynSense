@@ -31,7 +31,8 @@ internal readonly record struct MetadataConfigurationRead(
     string AssemblyName,
     string AssemblyPath,
     string TypeName,
-    string MethodName);
+    string MethodName,
+    bool IsPrefix = false);
 
 /// <summary>
 /// A method with no source in the solution that reads whatever key it is handed, and the keyspace
@@ -94,7 +95,9 @@ internal sealed class MetadataConfigurationIndex
     /// <summary>Every external read of one name.</summary>
     public IEnumerable<MetadataConfigurationRead> ReadsFor(MetadataConfigurationKind kind, string name) =>
         _reads.Where(read =>
-            read.Kind == kind && string.Equals(read.Name, name, StringComparison.OrdinalIgnoreCase));
+            read.Kind == kind && (read.IsPrefix
+                ? name.StartsWith(read.Name, StringComparison.Ordinal)
+                : string.Equals(read.Name, name, StringComparison.OrdinalIgnoreCase)));
 
     /// <summary>Every external read in one keyspace.</summary>
     public IEnumerable<MetadataConfigurationRead> ReadsOf(MetadataConfigurationKind kind) =>
@@ -119,7 +122,11 @@ internal sealed class MetadataConfigurationIndex
     /// </summary>
     private const long RevalidateAfterMs = 2000;
 
-    public static void Clear() => s_cache.Clear();
+    public static void Clear()
+    {
+        s_cache.Clear();
+        FrameworkImplementationAssembly.Clear();
+    }
 
     /// <summary>
     /// The index for a project, rebuilt when its reference set changes. Keyed on the reference
@@ -175,6 +182,10 @@ internal sealed class MetadataConfigurationIndex
             if (inSolution.Contains(Path.GetFileNameWithoutExtension(path)))
                 continue;
 
+            // Targeting packs contain API stubs. Scan the installed implementation's IL while
+            // retaining the project's original metadata references for symbol classification.
+            path = FrameworkImplementationAssembly.Resolve(path);
+
             DateTime stamp;
 
             try
@@ -227,7 +238,7 @@ internal sealed class MetadataConfigurationIndex
             {
                 reads.Add(new MetadataConfigurationRead(
                     kind, name, candidate.Literal, assembly, path,
-                    candidate.ContainingTypeName, candidate.ContainingMethodName));
+                    candidate.ContainingTypeName, candidate.ContainingMethodName, candidate.IsPrefix));
             }
         }
 
@@ -301,7 +312,7 @@ internal sealed class MetadataConfigurationIndex
 
         return reads.Count == 0 && wrappers.Count == 0
             ? Empty
-            : new MetadataConfigurationIndex(reads.ToImmutable(), [.. wrappers.Values]);
+            : new MetadataConfigurationIndex([.. reads.Distinct()], [.. wrappers.Values]);
     }
 
     /// <summary>

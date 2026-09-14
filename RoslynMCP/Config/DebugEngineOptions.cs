@@ -10,13 +10,14 @@ namespace RoslynMCP.Config;
 public enum CoreClrDebugEngine
 {
     /// <summary>
-    /// The external MI debugger the tool has always used for CoreCLR. Runs everywhere the tool
-    /// does.
+    /// The external MI debugger the tool used for CoreCLR before it had an engine of its own.
+    /// Runs everywhere the tool does, which is why a host other than Windows still gets it.
     /// </summary>
     NetCoreDbg,
 
     /// <summary>
-    /// The tool's own ICorDebug engine, the one .NET Framework already uses. Windows only.
+    /// The tool's own ICorDebug engine, the one .NET Framework already uses and the one a .NET
+    /// target gets on Windows unless told otherwise. Windows only.
     /// </summary>
     IcorDebug,
 }
@@ -39,7 +40,20 @@ public enum CoreClrDebugEngine
 public static class DebugEngineOptions
 {
     /// <summary>The engine the next CoreCLR session will be given.</summary>
-    public static CoreClrDebugEngine CoreClr { get; set; } = CoreClrDebugEngine.NetCoreDbg;
+    public static CoreClrDebugEngine CoreClr { get; set; } = DefaultFor(OperatingSystem.IsWindows());
+
+    /// <summary>
+    /// The engine a host gets when nothing names one: the tool's own on Windows, where it can run,
+    /// and netcoredbg everywhere else.
+    /// </summary>
+    /// <remarks>
+    /// The tool's own engine is the default because it is the one that can hot reload a debugged
+    /// .NET process: the runtime refuses the in-process updater while any debugger is attached,
+    /// and netcoredbg has no path of its own for applying an edit. It also brings Just My Code,
+    /// return values after a step, and breakpoints that bind against binaries built elsewhere.
+    /// </remarks>
+    public static CoreClrDebugEngine DefaultFor(bool onWindows) =>
+        onWindows ? CoreClrDebugEngine.IcorDebug : CoreClrDebugEngine.NetCoreDbg;
 
     /// <summary>The configuration value and the environment variable that name each engine.</summary>
     private const string NetCoreDbgName = "netcoredbg";
@@ -71,7 +85,7 @@ public static class DebugEngineOptions
 
     /// <summary>
     /// Resolves the engine from configuration with the environment over it — the order every other
-    /// switch uses — defaulting to the one CoreCLR has always used.
+    /// switch uses — defaulting to the one the host can run (<see cref="DefaultFor"/>).
     /// </summary>
     public static CoreClrDebugEngine Resolve(DebuggerConfig? config, List<string> warnings) =>
         Resolve(
@@ -87,7 +101,7 @@ public static class DebugEngineOptions
     internal static CoreClrDebugEngine Resolve(
         string? environment, string? configured, bool onWindows, List<string> warnings)
     {
-        var chosen = CoreClrDebugEngine.NetCoreDbg;
+        var chosen = DefaultFor(onWindows);
 
         // Named so a refusal below can point at the setting the user actually wrote rather than
         // at whichever one the message was drafted against.

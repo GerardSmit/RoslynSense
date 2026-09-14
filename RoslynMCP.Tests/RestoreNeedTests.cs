@@ -72,6 +72,54 @@ public class RestoreNeedTests : IDisposable
         Assert.Equal(RestoreService.RestoreNeed.None, RestoreService.DetermineNeed(project));
     }
 
+    /// <summary>
+    /// The same definition where the project keeps its intermediates somewhere else. Looking only
+    /// in <c>obj/</c> restored such a project before every single load — two to ten seconds of
+    /// MSBuild each time — on a solution whose command-line build was perfectly happy.
+    /// </summary>
+    [Fact]
+    public void ProjectWithARelocatedAssetsFileNeedsNothing()
+    {
+        string project = WriteProject("Web.Site", Legacy(
+            packageReference: true,
+            "<BaseIntermediateOutputPath>obj\\$(MSBuildProjectName)\\</BaseIntermediateOutputPath>"));
+
+        Assert.Equal(RestoreService.RestoreNeed.Assets, RestoreService.DetermineNeed(project));
+
+        string relocated = Path.Combine(Path.GetDirectoryName(project)!, "obj", "Web.Site");
+        Directory.CreateDirectory(relocated);
+        File.WriteAllText(Path.Combine(relocated, "project.assets.json"), "{}");
+
+        Assert.Equal(RestoreService.RestoreNeed.None, RestoreService.DetermineNeed(project));
+    }
+
+    /// <summary>
+    /// And the watcher follows the same answer: it waits on the relocated directory, and — since a
+    /// project name can carry a dot — on that directory appearing under <c>obj/</c> by name.
+    /// </summary>
+    [Fact]
+    public void WatcherFollowsARelocatedAssetsFile()
+    {
+        using var armed = RestoreWatcher.ArmForTests();
+        string project = WriteProject("Web.Site", Legacy(
+            packageReference: true,
+            "<BaseIntermediateOutputPath>obj\\$(MSBuildProjectName)\\</BaseIntermediateOutputPath>"));
+        string objDir = Path.Combine(Path.GetDirectoryName(project)!, "obj");
+        Directory.CreateDirectory(objDir);
+
+        RestoreWatcher.WatchForTests(project);
+        Assert.Contains(objDir, RestoreWatcher.WatchedDirectoriesForTests, StringComparer.OrdinalIgnoreCase);
+
+        string relocated = Path.Combine(objDir, "Web.Site");
+        Directory.CreateDirectory(relocated);
+        File.WriteAllText(Path.Combine(relocated, "project.assets.json"), """{"version": 3}""");
+
+        // The fingerprint reads the relocated file, and a later watch moves onto its directory.
+        Assert.NotEqual("none", RestoreWatcher.Fingerprint(project));
+        RestoreWatcher.WatchForTests(project);
+        Assert.Contains(relocated, RestoreWatcher.WatchedDirectoriesForTests, StringComparer.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public void PackagesConfigProjectWithAMissingPackageFolderNeedsThatRestore()
     {
@@ -265,11 +313,12 @@ public class RestoreNeedTests : IDisposable
         File.WriteAllText(Path.Combine(objDir, "project.assets.json"), content);
     }
 
-    private static string Legacy(bool packageReference) =>
+    private static string Legacy(bool packageReference, string properties = "") =>
         $"""
         <?xml version="1.0" encoding="utf-8"?>
         <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
           <PropertyGroup>
+            {properties}
             <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
             <OutputType>Library</OutputType>
           </PropertyGroup>

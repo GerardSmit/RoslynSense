@@ -35,8 +35,7 @@ namespace RoslynMCP.Services;
 internal static class GeneratorBuildService
 {
     /// <summary>Generator project path → the build currently in flight for it.</summary>
-    private static readonly ConcurrentDictionary<string, Task> s_inflight =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SingleFlight s_inflight = new();
 
     /// <summary>
     /// Generator projects built successfully this session. Only consulted when the output probe
@@ -92,7 +91,7 @@ internal static class GeneratorBuildService
 
             report?.Invoke($"Building source generator {Path.GetFileNameWithoutExtension(generator)}");
 
-            var run = s_inflight.GetOrAdd(generator, static key => RunBuildAsync(key));
+            var run = s_inflight.Start(generator, RunBuildAsync);
             try
             {
                 await run.WaitAsync(cancellationToken);
@@ -105,12 +104,6 @@ internal static class GeneratorBuildService
             {
                 // Reported by RunBuildAsync and then let go: the consumer loads without its
                 // generated code, which is a degraded project rather than a failed request.
-            }
-            finally
-            {
-                // Removed so the next load retries rather than joining a completed run; keyed on
-                // task identity so a newer concurrent run is not dropped out from under its waiters.
-                s_inflight.TryRemove(new KeyValuePair<string, Task>(generator, run));
             }
         }
     }
@@ -384,11 +377,14 @@ internal static class GeneratorBuildService
         // behaviour: a generator outside the loaded solution may not have been covered by the
         // solution restore that just ran. -nr:false for the same reason as RestoreService — a
         // lingering worker node holds handles the next git operation trips over.
+        // On-disk casing: the generator's image is fingerprinted by content, and a path that
+        // differs only in case from the user's own build produces a different image.
+        string buildPath = PathHelper.WithOnDiskCasing(generatorProjectPath);
         var (fileName, arguments) = legacy
             ? (Path.Combine(WorkspaceService.LegacyMsBuildDirectory!, "MSBuild.exe"),
-                $"\"{generatorProjectPath}\" -t:Restore;Build -v:quiet -nologo -nr:false")
+                $"\"{buildPath}\" -t:Restore;Build -v:quiet -nologo -nr:false")
             : ("dotnet",
-                $"build \"{generatorProjectPath}\" --verbosity quiet --nologo -nr:false -tl:false");
+                $"build \"{buildPath}\" --verbosity quiet --nologo -nr:false -tl:false");
 
         using var process = new Process
         {

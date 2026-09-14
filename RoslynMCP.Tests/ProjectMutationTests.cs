@@ -160,6 +160,56 @@ public class ProjectMutationTests : IDisposable
         Assert.Equal("// precious", await File.ReadAllTextAsync(path));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnExtensionlessNameCannotOverwriteAnExistingSourceFile(bool legacy)
+    {
+        string project = WriteProject("Lib", legacy ? LegacyProject : SdkProject);
+        string directory = Path.GetDirectoryName(project)!;
+        string path = Path.Combine(directory, "Keep.cs");
+        byte[] original = [0xef, 0xbb, 0xbf, .. System.Text.Encoding.UTF8.GetBytes("// precious\r\n")];
+        await File.WriteAllBytesAsync(path, original);
+        string originalProject = await File.ReadAllTextAsync(project);
+
+        var result = await ProjectMutationService.AddFileAsync(project, "Keep");
+
+        Assert.False(result.Ok);
+        Assert.Contains("already exists", result.Message);
+        Assert.Equal(original, await File.ReadAllBytesAsync(path));
+        Assert.Equal(originalProject, await File.ReadAllTextAsync(project));
+        Assert.False(File.Exists(Path.Combine(directory, "Keep")));
+    }
+
+    [Fact]
+    public async Task AnExtensionlessNewNameCreatesTheDefaultSourceFile()
+    {
+        string project = WriteProject("Lib", LegacyProject);
+        string relative = Path.Combine("Models", "Created");
+
+        var result = await ProjectMutationService.AddFileAsync(project, relative);
+
+        Assert.True(result.Ok, result.Message);
+        string path = Path.Combine(Path.GetDirectoryName(project)!, relative + ".cs");
+        Assert.Contains("public class Created", await File.ReadAllTextAsync(path));
+        Assert.Contains(relative + ".cs", await File.ReadAllTextAsync(project));
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(project)!, relative)));
+    }
+
+    [Fact]
+    public async Task PrecancelledFileCreationLeavesTheProjectAndDestinationUntouched()
+    {
+        string project = WriteProject("Lib", LegacyProject);
+        string before = await File.ReadAllTextAsync(project);
+        string directory = Path.Combine(Path.GetDirectoryName(project)!, "Models");
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => ProjectMutationService.AddFileAsync(
+            project, Path.Combine("Models", "Canceled.cs"), ct: new CancellationToken(canceled: true)));
+
+        Assert.False(Directory.Exists(directory));
+        Assert.Equal(before, await File.ReadAllTextAsync(project));
+    }
+
     // === Deleting files ===
 
     [Fact]
@@ -174,6 +224,21 @@ public class ProjectMutationTests : IDisposable
         Assert.True(result.Ok, result.Message);
         Assert.False(File.Exists(path));
         Assert.DoesNotContain("Existing.cs", await File.ReadAllTextAsync(project));
+    }
+
+    [Fact]
+    public async Task PrecancelledFileDeletionPreservesTheSourceAndCompileItem()
+    {
+        string project = WriteProject("Legacy", LegacyProject);
+        string path = Path.Combine(Path.GetDirectoryName(project)!, "Existing.cs");
+        await File.WriteAllTextAsync(path, "// precious source");
+        string before = await File.ReadAllTextAsync(project);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => ProjectMutationService.DeleteFileAsync(
+            path, new CancellationToken(canceled: true)));
+
+        Assert.Equal("// precious source", await File.ReadAllTextAsync(path));
+        Assert.Equal(before, await File.ReadAllTextAsync(project));
     }
 
     [Fact]

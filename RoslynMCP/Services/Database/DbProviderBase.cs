@@ -39,7 +39,7 @@ public abstract class DbProviderBase : IDbProvider
         await OnConnectionOpenedAsync(conn, ct).ConfigureAwait(false);
         var effectiveSql = PrepareSqlForPlanCapture(sql, capturePlan);
         await using var cmd = CreateCommand(effectiveSql, conn);
-        BindParameters(cmd, parameters);
+        BindCommandParameters(cmd, parameters);
         await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
 
         string[] columns = Array.Empty<string>();
@@ -79,9 +79,12 @@ public abstract class DbProviderBase : IDbProvider
         await conn.OpenAsync(ct).ConfigureAwait(false);
         await OnConnectionOpenedAsync(conn, ct).ConfigureAwait(false);
         await using var cmd = CreateCommand(sql, conn);
-        BindParameters(cmd, parameters);
+        BindCommandParameters(cmd, parameters);
         return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
+
+    protected virtual void BindCommandParameters(DbCommand cmd, Dictionary<string, object?>? parameters) =>
+        BindParameters(cmd, parameters);
 
     protected static void BindParameters(DbCommand cmd, Dictionary<string, object?>? parameters)
     {
@@ -139,7 +142,7 @@ public abstract class DbProviderBase : IDbProvider
         await conn.OpenAsync(ct).ConfigureAwait(false);
         await OnConnectionOpenedAsync(conn, ct).ConfigureAwait(false);
         await using var cmd = CreateCommand(sql, conn);
-        BindParameters(cmd, parameters);
+        BindCommandParameters(cmd, parameters);
         await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         var (columns, rows, _) = await ReadRowsAsync(reader, int.MaxValue, ct).ConfigureAwait(false);
         return new DbSchemaResult(columns, rows);

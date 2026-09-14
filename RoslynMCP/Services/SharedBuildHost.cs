@@ -35,6 +35,8 @@ namespace RoslynMCP.Services;
 /// </remarks>
 internal static partial class SharedBuildHost
 {
+    private static readonly bool s_timing = Environment.GetEnvironmentVariable("ROSLYNMCP_EVAL_TIMING") == "1";
+
     private static readonly ConcurrentDictionary<string, Lazy<BuildHostProcessManager>> s_managers =
         new(StringComparer.Ordinal);
 
@@ -133,8 +135,11 @@ internal static partial class SharedBuildHost
         for (int i = 0; i < projectPaths.Count; i++)
             shards[(start + i) % PoolSize].Add(projectPaths[i]);
 
-        var results = await Task.WhenAll(shards.Select((shard, index) =>
-            LoadShardAsync(workspace, properties, shard, index, projectMapFactory, inFlight, cancellationToken)));
+        var results = await RunShardBatchAsync(
+            shards.Select((shard, index) => (index, shard)),
+            (index, shard) => LoadShardAsync(
+                workspace, properties, shard, index, projectMapFactory, inFlight, cancellationToken),
+            cancellationToken);
 
         return Reconcile(results);
     }
@@ -148,6 +153,17 @@ internal static partial class SharedBuildHost
     /// </summary>
     public static ConcurrentDictionary<string, Lazy<Task<ImmutableArray<ProjectFileInfo>>>> NewEvaluationMap() =>
         new(StringComparer.OrdinalIgnoreCase);
+
+    internal static Task<T[]> RunShardBatchAsync<T>(
+        IEnumerable<(int Index, List<string> Projects)> shards,
+        Func<int, List<string>, Task<T>> run,
+        CancellationToken ct) => Task.WhenAll(shards
+            .Where(static shard => shard.Projects.Count > 0)
+            // Cached providers and the loader's metadata file opens can complete synchronously.
+            // Calling those async methods directly while enumerating Task.WhenAll serializes
+            // their work. Schedule each existing shard, never each project, to keep the configured
+            // pool bound while allowing that synchronous IO to overlap too.
+            .Select(shard => Task.Run(() => run(shard.Index, shard.Projects), ct)));
 
     /// <summary>
     /// Evaluates <paramref name="projectPaths"/> across the pool and stores the results in the
@@ -218,8 +234,7 @@ internal static partial class SharedBuildHost
         // makes it the machine's pool-size benchmark: hot loads never get here with enough
         // misses to record, so only genuine cold loads teach the calibration anything.
         var watch = Stopwatch.StartNew();
-        var lanes = shards.Select((shard, index) =>
-            PrewarmShardAsync(workspace, properties, shard, index, evaluations, cancellationToken));
+        var lanes = shards.Select((shard, index) => (Index: index, Projects: shard)).ToList();
         if (legacy.Count > 0)
         {
             // Two lanes when the second host is warm and there is enough serial work to split;
@@ -246,16 +261,15 @@ internal static partial class SharedBuildHost
                 legacy = first;
             }
 
-            lanes = lanes.Append(PrewarmShardAsync(
-                workspace, properties, legacy, LegacyShard, evaluations, cancellationToken));
+            lanes.Add((LegacyShard, legacy));
             if (second is { Count: > 0 })
-            {
-                lanes = lanes.Append(PrewarmShardAsync(
-                    workspace, properties, second, LegacySecondShard, evaluations, cancellationToken));
-            }
+                lanes.Add((LegacySecondShard, second));
         }
 
-        int[] evaluated = await Task.WhenAll(lanes);
+        int[] evaluated = await RunShardBatchAsync(lanes,
+            (index, shard) => PrewarmShardAsync(
+                workspace, properties, shard, index, evaluations, cancellationToken),
+            cancellationToken);
 
         BuildHostPoolCalibration.Record(
             PoolSize, evaluated.Sum(), watch.Elapsed.TotalSeconds);
@@ -391,6 +405,9 @@ internal static partial class SharedBuildHost
                     inFlight);
 
                 var misses = provider.Probe(shard);
+                if (s_timing)
+                    Console.Error.WriteLine($"[BuildHostTiming] prewarm shard={shardIndex} "
+                        + $"probeIncludingGate={watch.Elapsed.TotalMilliseconds:F1}ms projects={shard.Count} misses={misses.Count}");
                 if (misses.Count == 0)
                     return 0;
 
@@ -599,6 +616,7 @@ internal static partial class SharedBuildHost
         // warm for the next batch rather than being rebuilt per request.
         string key = $"{shardIndex} {KeyFor(properties)}";
         var gate = s_gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        var timing = s_timing ? Stopwatch.StartNew() : null;
 
         // Counted around the wait as well as the work, and released in a finally that covers both:
         // a load cancelled while queued would otherwise leave the count raised forever, and
@@ -609,6 +627,7 @@ internal static partial class SharedBuildHost
         await gate.WaitAsync(cancellationToken);
         try
         {
+            double gateMs = timing?.Elapsed.TotalMilliseconds ?? 0;
             // A loader per call, which is cheap — it holds a diagnostic reporter and a file-extension
             // registry, not a process. The manager is what has to survive, and it does — but only
             // when something actually needs evaluating: behind the Lazy, so a shard answered
@@ -625,6 +644,7 @@ internal static partial class SharedBuildHost
             // than from disk — see RecycleIfAlreadyEvaluatedAsync. A cache hit must not trigger
             // that recycle: it never touches the host, so the host's copy stays irrelevant.
             var misses = provider.Probe(shard);
+            double probeEndMs = timing?.Elapsed.TotalMilliseconds ?? 0;
             if (misses.Count > 0)
             {
                 await RecycleIfAlreadyEvaluatedAsync(key, misses);
@@ -636,8 +656,13 @@ internal static partial class SharedBuildHost
             }
 
             // Built inside the shard, so no two concurrent loads ever touch the same map.
+            double prepareEndMs = timing?.Elapsed.TotalMilliseconds ?? 0;
             var infos = await loader.LoadInfosAsync(
                 [.. shard], provider, projectMapFactory(), progress: null, cancellationToken);
+            if (timing is not null)
+                Console.Error.WriteLine($"[BuildHostTiming] load shard={shardIndex} projects={shard.Count} "
+                    + $"gate={gateMs:F1}ms probe={probeEndMs - gateMs:F1}ms "
+                    + $"prepare={prepareEndMs - probeEndMs:F1}ms loadInfos={timing.Elapsed.TotalMilliseconds - prepareEndMs:F1}ms");
 
             // Recorded after the fact: every project this host has now evaluated, including the
             // transitive ones it pulled in, because those are cached in its ProjectCollection just

@@ -45,6 +45,56 @@ public class ShadowCopyRebuildTests
         Assert.True(await fixture.SawChangeAsync());
     }
 
+    /// <summary>
+    /// The case behind "slow after every build": the same analyzer sources built from a path
+    /// that differs only in the drive letter's case. A deterministic compiler bakes the path into
+    /// the image and derives the module id and timestamp from it, so the bytes differ while
+    /// nothing a compilation observes does.
+    /// </summary>
+    [Fact]
+    public async Task RebuildingAnUnchangedAnalyzerFromADifferentlyCasedPathIsNotARebuild()
+    {
+        byte[] lower = AnalyzerImage("class A { }", @"d:\build\Fake.Analyzer.pdb");
+        byte[] upper = AnalyzerImage("class A { }", @"D:\build\Fake.Analyzer.pdb");
+        Assert.NotEqual(lower, upper);
+
+        await using var fixture = await WatchedAnalyzerDirectory.CreateAsync(lower);
+
+        await fixture.WriteDllAsync(upper);
+
+        Assert.False(await fixture.SawChangeAsync());
+    }
+
+    [Fact]
+    public async Task RebuildingAChangedAnalyzerIsStillARebuild()
+    {
+        await using var fixture = await WatchedAnalyzerDirectory.CreateAsync(
+            AnalyzerImage("class A { }", @"D:\build\Fake.Analyzer.pdb"));
+
+        await fixture.WriteDllAsync(AnalyzerImage("class A { int Changed; }", @"D:\build\Fake.Analyzer.pdb"));
+
+        Assert.True(await fixture.SawChangeAsync());
+    }
+
+    /// <summary>A deterministic build of <paramref name="source"/> recording <paramref name="pdbPath"/>.</summary>
+    private static byte[] AnalyzerImage(string source, string pdbPath)
+    {
+        var compilation = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create(
+            "Fake.Analyzer",
+            [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(source)],
+            [Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(typeof(object).Assembly.Location)],
+            new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(
+                Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary, deterministic: true));
+
+        using var pe = new MemoryStream();
+        using var pdb = new MemoryStream();
+        var result = compilation.Emit(pe, pdb, options: new Microsoft.CodeAnalysis.Emit.EmitOptions(
+            debugInformationFormat: Microsoft.CodeAnalysis.Emit.DebugInformationFormat.PortablePdb,
+            pdbFilePath: pdbPath));
+        Assert.True(result.Success, string.Join(Environment.NewLine, result.Diagnostics));
+        return pe.ToArray();
+    }
+
     [Fact]
     public void ShadowCopyingAMissingDirectoryDoesNotThrow()
     {

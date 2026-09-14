@@ -433,6 +433,9 @@ public class LargeSolutionBenchmarks
         psi.ArgumentList.Add("--solution");
         psi.ArgumentList.Add(solution.SolutionPath);
         psi.Environment["ROSLYNMCP_SHARED_HOST"] = "0";
+        // This benchmark measures deliberate incremental loads. The editor's
+        // default eager warm-up would race the cold tree and load-delta samples.
+        psi.Environment["ROSLYNMCP_LOAD_ENTIRE_SOLUTION"] = "0";
 
         var process = Process.Start(psi)!;
         _ = process.StandardError.ReadToEndAsync(); // drain

@@ -48,6 +48,8 @@ public sealed class AppSession : IDisposable
     /// for an app that is perfectly reloadable.
     /// </remarks>
     public bool HotReloadOpen { get; set; }
+    internal string? HotReloadOwner { get; set; }
+    internal bool HotReloadRemote { get; set; }
 
     /// <summary>The command this session started, quoted so it can be pasted into a shell.</summary>
     public string CommandLine =>

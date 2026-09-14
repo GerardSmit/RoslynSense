@@ -54,12 +54,21 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
             {
                 if (notice.Kind == DebugNoticeKind.Logpoint)
                     Log(notice.Message);
+                else if (notice.Kind != DebugNoticeKind.Output)
+                    DebugStateStore.Trace(Environment.ProcessId, Describe(notice));
             };
         }
     }
 
     /// <summary>The wrapped engine — for engine-selection assertions and diagnostics.</summary>
     public IDebugBackend Inner => _inner;
+
+    /// <summary>One notice as a trace line: the kind, what it said, and where, when there is a
+    /// where. Debuggee console output is left out — it is the app's log, not the engine's.</summary>
+    private static string Describe(DebugNotice notice) =>
+        notice.FilePath is { Length: > 0 } file
+            ? $"{notice.Kind}: {notice.Message} [{file}:{notice.Line}]"
+            : $"{notice.Kind}: {notice.Message}";
 
     /// <summary>The engine's notices pass straight through, unchanged; the decorator adds only
     /// <see cref="DebugNoticeKind.Resumed"/>, which no engine reports. An engine that reports
@@ -236,6 +245,10 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<string> StepOutAsync(CancellationToken cancellationToken = default) =>
         ResumeAsync(() => _inner.StepOutAsync(cancellationToken), cancellationToken);
 
+    public Task<(bool Ok, VariableInfo? Variable, string Error)> EvaluateVariableAsync(
+        string expression, int frameId, CancellationToken cancellationToken = default) =>
+        _inner.EvaluateVariableAsync(expression, frameId, cancellationToken);
+
     public Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default) =>
         _inner.EvaluateAsync(expression, cancellationToken);
 
@@ -268,6 +281,10 @@ internal sealed class PublishingDebugBackend : IDebugBackend, IDebugNoticeSource
     public Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
         int variablesReference, CancellationToken cancellationToken = default) =>
         _inner.GetVariableChildrenAsync(variablesReference, cancellationToken);
+
+    public Task<(bool Ok, string Value, string Error)> SetVariableChildAsync(
+        int parentReference, string name, string value, CancellationToken cancellationToken = default) =>
+        _inner.SetVariableChildAsync(parentReference, name, value, cancellationToken);
 
     public Task<(bool Ok, string Value, string Error)> SetVariableAsync(
         string name, string value, int frameId = 0, CancellationToken cancellationToken = default) =>

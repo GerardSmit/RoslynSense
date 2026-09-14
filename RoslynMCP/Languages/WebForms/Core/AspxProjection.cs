@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using RoslynMCP.Services.Memory;
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Text;
@@ -160,8 +162,7 @@ internal static class AspxProjectionService
 
     private sealed record CacheEntry(AspxDocument Document, AspxProjection? Projection);
 
-    private static readonly ConcurrentDictionary<string, CacheEntry> s_cache =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConditionalWeakTable<AspxDocument, CacheEntry> s_cache = new();
 
     /// <summary>
     /// Builds (or returns the memoized) projection for a document, or <c>null</c> when there is
@@ -174,15 +175,7 @@ internal static class AspxProjectionService
     /// </remarks>
     public static AspxProjection? Get(AspxDocument document)
     {
-        if (s_cache.TryGetValue(document.FilePath, out var cached)
-            && ReferenceEquals(cached.Document, document))
-        {
-            return cached.Projection;
-        }
-
-        var projection = Build(document);
-        s_cache[document.FilePath] = new CacheEntry(document, projection);
-        return projection;
+        return s_cache.GetValue(document, static d => new CacheEntry(d, Build(d))).Projection;
     }
 
     private static AspxProjection? Build(AspxDocument document)
@@ -206,8 +199,11 @@ internal static class AspxProjectionService
         ImmutableDictionary<string, string> Stamps,
         AspxProjectProjection? Projection);
 
-    private static readonly ConcurrentDictionary<string, ProjectCacheEntry> s_projectCache =
-        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly WeakSnapshotCache<ProjectId, ProjectCacheEntry> s_projectCache =
+        new("aspx.projectProjection", strongLimit: 2, entryLimit: 128);
+
+    internal static void ReleaseStrong() => s_projectCache.ReleaseStrong();
+    internal static void InvalidateProjects() => s_projectCache.Clear();
 
     /// <summary>
     /// Every markup file in the project, projected into one forked compilation, or <c>null</c>
@@ -228,36 +224,43 @@ internal static class AspxProjectionService
             || project.Language != LanguageNames.CSharp)
             return null;
 
-        var compilation = await project.GetCompilationAsync(ct);
-        if (compilation is null)
-            return null;
-
-        var documents = new List<AspxDocument>();
-        foreach (string file in AspxReferenceService.EnumerateFiles(project))
+        long generation = s_projectCache.Generation;
+        var gate = s_projectCache.BuildGate(project.Id);
+        await gate.WaitAsync(ct);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            if (await AspxDocumentService.GetAsync(file, ct) is { } document)
-                documents.Add(document);
-        }
+            var compilation = await project.GetCompilationAsync(ct);
+            if (compilation is null)
+                return null;
 
-        var stamps = Stamps(documents);
-
-        if (s_projectCache.TryGetValue(projectPath, out var cached)
-            && ReferenceEquals(cached.BaseCompilation, compilation))
-        {
-            if (StampsEqual(cached.Stamps, stamps))
-                return cached.Projection;
-
-            if (await TryPatchAsync(project, cached, documents, stamps, ct) is { } patched)
+            var documents = new List<AspxDocument>();
+            foreach (string file in AspxReferenceService.EnumerateFiles(project))
             {
-                s_projectCache[projectPath] = patched;
-                return patched.Projection;
+                ct.ThrowIfCancellationRequested();
+                if (await AspxDocumentService.GetAsync(file, project, ct) is { } document)
+                    documents.Add(document);
             }
-        }
 
-        var built = await BuildProjectAsync(project, documents, ct);
-        s_projectCache[projectPath] = new ProjectCacheEntry(compilation, stamps, built);
-        return built;
+            var stamps = Stamps(documents);
+
+            if (s_projectCache.TryGet(project.Id, out var cached, retain: true)
+                && ReferenceEquals(cached.BaseCompilation, compilation))
+            {
+                if (StampsEqual(cached.Stamps, stamps))
+                    return cached.Projection;
+
+                if (await TryPatchAsync(project, cached, documents, stamps, ct) is { } patched)
+                {
+                    s_projectCache.Set(project.Id, patched, generation, retain: true);
+                    return patched.Projection;
+                }
+            }
+
+            var built = await BuildProjectAsync(project, documents, ct);
+            s_projectCache.Set(project.Id, new ProjectCacheEntry(compilation, stamps, built), generation, retain: true);
+            return built;
+        }
+        finally { gate.Release(); }
     }
 
     /// <summary>Checksums rather than <c>string.GetHashCode</c>: a 32-bit string hash colliding
@@ -266,7 +269,7 @@ internal static class AspxProjectionService
     {
         var stamps = ImmutableDictionary.CreateBuilder<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var document in documents)
-            stamps[document.FilePath] = Convert.ToHexString(document.SourceText.GetChecksum().AsSpan());
+            stamps[document.FilePath] = Convert.ToHexString(document.SourceText.GetChecksum().AsSpan()) + ":" + document.BindingId;
         return stamps.ToImmutable();
     }
 

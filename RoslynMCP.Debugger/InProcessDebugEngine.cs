@@ -49,6 +49,9 @@ public sealed class InProcessDebugEngine(uint sessionId) : IDebugEngine
         _session.InjectAgentAsync(
             new DebugSession.AgentInjection(assemblyPath, typeName, methodName, argument));
 
+    public Task<(bool Ok, DebugVariable? Variable, string Error)> EvaluateVariableAsync(uint frameIndex, string expression) =>
+        _session.EvaluateVariableAsync(frameIndex, expression);
+
     public Task<(bool Ok, string Value, string Error)> EvaluateAsync(uint frameIndex, string expression) =>
         _session.EvaluateAsync(frameIndex, expression);
 

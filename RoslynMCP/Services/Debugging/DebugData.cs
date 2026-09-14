@@ -53,6 +53,9 @@ public sealed record StackFrameInfo(
 /// <c>GetVariableChildrenAsync</c>. Zero for leaves, matching DAP's convention exactly.</param>
 /// <param name="Evaluable">Whether the name is a path the backend can assign to, which decides
 /// whether the Variables view offers editing.</param>
+/// <param name="Kind">What the row is — "property", "field", "static", "constant", "raw",
+/// "results", "statics", "nonpublic" — for the client to pick an icon by; null when the backend
+/// does not say.</param>
 public sealed record VariableInfo(
     string Name,
     string Value,
@@ -60,7 +63,9 @@ public sealed record VariableInfo(
     int VariablesReference,
     int NamedChildCount,
     int IndexedChildCount,
-    bool Evaluable);
+    bool Evaluable,
+    string? EvaluateName = null,
+    string? Kind = null);
 
 public sealed record ThreadInfo(int Id, string Name, string State);
 

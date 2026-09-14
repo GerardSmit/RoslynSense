@@ -1,6 +1,8 @@
 import * as assert from 'assert';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { testExternalSources } from './externalSources';
+import { testHotReload } from './hotReload';
 
 async function eventually<T>(probe: () => Thenable<T | undefined>, description: string): Promise<T> {
     const deadline = Date.now() + 120_000;
@@ -58,4 +60,6 @@ export async function run(): Promise<void> {
         'RoslynSense hover'
     );
     assert.ok(hover.length > 0);
+    await testExternalSources(root);
+    await testHotReload(root);
 }

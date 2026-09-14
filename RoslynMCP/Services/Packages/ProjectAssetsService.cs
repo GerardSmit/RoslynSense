@@ -35,8 +35,7 @@ public static class ProjectAssetsService
 
     public static TransitiveGraph Read(string projectPath)
     {
-        string assets = Path.Combine(
-            Path.GetDirectoryName(Path.GetFullPath(projectPath)) ?? "", "obj", "project.assets.json");
+        string assets = ProjectAssetsFile.Resolve(projectPath);
 
         if (!File.Exists(assets))
             return new TransitiveGraph(projectPath, [], [], []);

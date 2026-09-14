@@ -16,6 +16,19 @@ internal sealed partial class DebuggerService
     /// <summary>MI evaluates in whichever frame is selected, so frame selection is session state
     /// rather than a per-command argument.</summary>
     private int _selectedFrame;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, (int Thread, int Index)> _frameContexts = new();
+    private int _nextFrameContext = 100_000;
+    private readonly SemaphoreSlim _inspectionGate = new(1, 1);
+
+    private int FrameForThread(int thread, int index)
+    {
+        foreach (var entry in _frameContexts)
+            if (entry.Value == (thread, index)) return entry.Key;
+        int id = Interlocked.Increment(ref _nextFrameContext);
+        _frameContexts[id] = (thread, index);
+        return id;
+    }
+
 
     /// <summary>Every listed variable costs a <c>-var-create</c>/<c>-var-delete</c> pair to learn
     /// whether it can be expanded; a runaway frame must not stall the Variables view.</summary>
@@ -52,6 +65,8 @@ internal sealed partial class DebuggerService
             frames = ParseStackFrames(response, ModulePathForId);
         }
 
+        if (threadId > 0 && threadId != CurrentFrame?.ThreadId)
+            frames = frames.Select(f => f with { Id = FrameForThread(threadId, f.Id) }).ToList();
         return await ExternalFrameResolver.EnrichAsync(frames, cancellationToken);
     }
 
@@ -72,22 +87,47 @@ internal sealed partial class DebuggerService
         }
     }
 
-    public async Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(
-        int frameId, CancellationToken cancellationToken = default)
+    public Task<(bool Ok, VariableInfo? Variable, string Error)> EvaluateVariableAsync(
+        string expression, int frameId, CancellationToken cancellationToken = default) => WithInspectionAsync<(bool Ok, VariableInfo? Variable, string Error)>(async () =>
+    {
+        if (_state != DebugState.Stopped || frameId < 0)
+            return (false, null, "The debugger is not stopped in a valid frame.");
+        await EnsureFrameAsync(frameId, cancellationToken);
+        var variable = NextVariableName();
+        try
+        {
+            var created = await SendCommandAsync(
+                $"-var-create {variable} * \"{EscapeMiString(expression)}\"", cancellationToken);
+            if (IsError(created))
+                return (false, null, ExtractError(created));
+            int.TryParse(ExtractMiField(created, "numchild"), out int count);
+            return (true, BuildVariable(expression, ExtractMiField(created, "value") ?? "",
+                ExtractMiField(created, "type") ?? "", count, expression, frameId, 0), "");
+        }
+        finally
+        {
+            try { await SendCommandAsync($"-var-delete {variable}", CancellationToken.None); }
+            catch { }
+        }
+    }, cancellationToken);
+
+    public Task<IReadOnlyList<VariableInfo>> GetVariablesAsync(
+        int frameId, CancellationToken cancellationToken = default) => WithInspectionAsync<IReadOnlyList<VariableInfo>>(async () =>
     {
         if (_state != DebugState.Stopped)
             return [];
 
         await EnsureFrameAsync(frameId, cancellationToken);
 
-        var response = await SendCommandAsync($"-stack-list-variables --frame {frameId} 1", cancellationToken);
+        var nativeFrame = _frameContexts.TryGetValue(frameId, out var context) ? context.Index : frameId;
+        var response = await SendCommandAsync($"-stack-list-variables --frame {nativeFrame} 1", cancellationToken);
         if (IsError(response))
         {
             // Older netcoredbg builds reject --frame; the selection above already put us in the
             // right frame, so the plain form returns the same variables.
             response = await SendCommandAsync("-stack-list-variables 1", cancellationToken);
             if (IsError(response))
-                return [];
+                throw new InvalidOperationException(ExtractError(response));
         }
 
         var variables = new List<VariableInfo>();
@@ -96,15 +136,28 @@ internal sealed partial class DebuggerService
             variables.Add(await DescribeAsync(name, name, value, frameId, variables.Count, cancellationToken));
         }
         return variables;
+    }, cancellationToken);
+
+    public async Task<(bool Ok, string Value, string Error)> SetVariableChildAsync(
+        int parentReference, string name, string value, CancellationToken cancellationToken = default)
+    {
+        if (_handles.Expression(parentReference) is not { } handle)
+            return (false, "", "The variable reference has expired.");
+        var (frameId, _) = DecodeHandle(handle);
+        var child = (await GetVariableChildrenAsync(parentReference, cancellationToken))
+            .FirstOrDefault(v => v.Name == name);
+        if (child is not { Evaluable: true, EvaluateName.Length: > 0 })
+            return (false, "", "The member is unavailable or read-only.");
+        return await SetVariableAsync(child.EvaluateName, value, frameId, cancellationToken);
     }
 
-    public async Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
-        int variablesReference, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<VariableInfo>> GetVariableChildrenAsync(
+        int variablesReference, CancellationToken cancellationToken = default) => WithInspectionAsync<IReadOnlyList<VariableInfo>>(async () =>
     {
         if (_state != DebugState.Stopped)
             return [];
         if (_handles.Expression(variablesReference) is not { } handle)
-            return [];
+            throw new InvalidOperationException("The variable reference has expired; refresh the Variables view.");
 
         var (frameId, expression) = DecodeHandle(handle);
         await EnsureFrameAsync(frameId, cancellationToken);
@@ -115,13 +168,13 @@ internal sealed partial class DebuggerService
             if (IsError(await SendCommandAsync(
                     $"-var-create {variable} * \"{EscapeMiString(expression)}\"", cancellationToken)))
             {
-                return [];
+                throw new InvalidOperationException("The value could not be created for expansion.");
             }
 
             var response = await SendCommandAsync(
                 $"-var-list-children --all-values {variable}", cancellationToken);
             if (IsError(response))
-                return [];
+                throw new InvalidOperationException(ExtractError(response));
 
             var children = new List<VariableInfo>();
             int listStart = response.IndexOf("children=[", StringComparison.Ordinal);
@@ -146,10 +199,10 @@ internal sealed partial class DebuggerService
             try { await SendCommandAsync($"-var-delete {variable}", CancellationToken.None); }
             catch { /* best effort cleanup */ }
         }
-    }
+    }, cancellationToken);
 
-    public async Task<(bool Ok, string Value, string Error)> SetVariableAsync(
-        string name, string value, int frameId = 0, CancellationToken cancellationToken = default)
+    public Task<(bool Ok, string Value, string Error)> SetVariableAsync(
+        string name, string value, int frameId = 0, CancellationToken cancellationToken = default) => WithInspectionAsync<(bool Ok, string Value, string Error)>(async () =>
     {
         if (_state != DebugState.Stopped)
             return (false, "", "The debugger is not stopped.");
@@ -179,7 +232,7 @@ internal sealed partial class DebuggerService
             try { await SendCommandAsync($"-var-delete {variable}", CancellationToken.None); }
             catch { /* best effort cleanup */ }
         }
-    }
+    }, cancellationToken);
 
     public async Task<IReadOnlyList<ThreadInfo>> GetThreadsAsync(
         CancellationToken cancellationToken = default)
@@ -368,29 +421,14 @@ internal sealed partial class DebuggerService
         return await WaitForStopAsync(cancellationToken);
     }
 
-    public async Task<string> SelectFrameAsync(int frameId, CancellationToken cancellationToken = default)
-    {
-        if (_state != DebugState.Stopped)
-            return "Error: the debugger is not stopped.";
-        if (frameId < 0)
-            return "Error: frame numbers start at 0 (the innermost frame).";
-
-        if (frameId == _selectedFrame)
-            return $"Frame #{frameId} is already selected.";
-
-        var response = await SendCommandAsync($"-stack-select-frame {frameId}", cancellationToken);
-        if (IsError(response))
-            return $"Error: {ExtractError(response)}";
-
-        _selectedFrame = frameId;
-        var frames = await GetStackFramesAsync(cancellationToken);
-        var frame = frames.FirstOrDefault(f => f.Id == frameId);
-
-        return frame is null
-            ? $"Selected frame #{frameId}."
-            : $"Selected frame #{frameId}: {frame.Name}" +
-              (frame.FilePath.Length == 0 ? "" : $" at {Path.GetFileName(frame.FilePath)}:{frame.Line}");
-    }
+    public Task<string> SelectFrameAsync(int frameId, CancellationToken cancellationToken = default) =>
+        WithInspectionAsync(async () =>
+        {
+            if (_state != DebugState.Stopped) return "Error: the debugger is not stopped.";
+            if (frameId < 0) return "Error: frame numbers start at 0.";
+            try { await EnsureFrameAsync(frameId, cancellationToken); return $"Selected frame #{frameId}."; }
+            catch (Exception ex) { return "Error: " + ex.Message; }
+        }, cancellationToken);
 
     // --- MI plumbing ---
 
@@ -398,11 +436,25 @@ internal sealed partial class DebuggerService
     /// argument rather than relying on what the user selected.</summary>
     private async Task EnsureFrameAsync(int frameId, CancellationToken cancellationToken)
     {
-        if (frameId == _selectedFrame)
-            return;
+        if (frameId == _selectedFrame) return;
+        var context = _frameContexts.TryGetValue(frameId, out var found) ? found
+            : frameId >= 100_000 ? throw new InvalidOperationException("The stack frame has expired.")
+            : (Thread: CurrentFrame?.ThreadId ?? 0, Index: frameId);
+        if (context.Thread > 0)
+        {
+            var thread = await SendCommandAsync($"-thread-select {context.Thread}", cancellationToken);
+            if (IsError(thread)) throw new InvalidOperationException(ExtractError(thread));
+        }
+        var response = await SendCommandAsync($"-stack-select-frame {context.Index}", cancellationToken);
+        if (IsError(response)) throw new InvalidOperationException(ExtractError(response));
+        _selectedFrame = frameId;
+    }
 
-        if (!IsError(await SendCommandAsync($"-stack-select-frame {frameId}", cancellationToken)))
-            _selectedFrame = frameId;
+    private async Task<T> WithInspectionAsync<T>(Func<Task<T>> inspect, CancellationToken cancellationToken)
+    {
+        await _inspectionGate.WaitAsync(cancellationToken);
+        try { return await inspect(); }
+        finally { _inspectionGate.Release(); }
     }
 
     private string NextVariableName() => $"v{Interlocked.Increment(ref _tokenCounter)}";
@@ -455,7 +507,8 @@ internal sealed partial class DebuggerService
             VariablesReference: numchild > 0 ? _handles.For(EncodeHandle(frameId, expression)) : 0,
             NamedChildCount: indexed ? 0 : numchild,
             IndexedChildCount: indexed ? numchild : 0,
-            Evaluable: expression.Length > 0);
+            Evaluable: expression.Length > 0,
+            EvaluateName: expression);
     }
 
     private static string EncodeHandle(int frameId, string expression) => $"{frameId}|{expression}";

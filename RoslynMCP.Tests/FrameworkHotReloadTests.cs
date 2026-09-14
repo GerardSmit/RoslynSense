@@ -1,6 +1,10 @@
 using System.Diagnostics;
+using System.Reflection.Metadata;
+using System.Text;
 using RoslynMCP.Debugger;
+using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Services;
+using RoslynMCP.Services.Debugging;
 using RoslynMCP.Services.HotReload;
 using Xunit;
 
@@ -20,7 +24,7 @@ namespace RoslynMCP.Tests;
 /// <para>
 /// Two things came out of that and both shape this test. The delta is now computed by
 /// <see cref="HotReloadService"/>, so Roslyn's EnC engine builds the baseline from the project's
-/// real PDB instead of a stub. And the target is built <c>x86</c> on purpose: that forces
+/// real PDB instead of a stub. The targets cover both <c>x86</c> and <c>x64</c> and require
 /// <see cref="DebugEngineFactory"/> to pick a bitness-matched worker, which is the only engine
 /// allowed to call <c>ApplyChanges</c> — a fault there costs a disposable process rather than the
 /// language server.
@@ -65,6 +69,34 @@ public class FrameworkHotReloadTests : IDisposable
             <Optimize>false</Optimize>
             <DebugType>full</DebugType>
           </PropertyGroup>
+        </Project>
+        """;
+
+    // A classic project must pass through Visual Studio MSBuild and the legacy workspace
+    // loader. Merely targeting net48 from an SDK project does not exercise either path.
+    private const string LegacyProject = """
+        <Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+          <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+          <PropertyGroup>
+            <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+            <Platform Condition="'$(Platform)' == ''">AnyCPU</Platform>
+            <ProjectGuid>{D2934D15-6DBA-4FDB-9728-89CD6837DE23}</ProjectGuid>
+            <OutputType>Exe</OutputType>
+            <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+            <PlatformTarget>x86</PlatformTarget>
+            <AssemblyName>FxHotReloadTarget</AssemblyName>
+            <RootNamespace>FxHotReloadTarget</RootNamespace>
+            <OutputPath>bin\Debug\</OutputPath>
+            <DebugSymbols>true</DebugSymbols>
+            <DebugType>full</DebugType>
+            <Optimize>false</Optimize>
+            <Deterministic>true</Deterministic>
+          </PropertyGroup>
+          <ItemGroup>
+            <Reference Include="System" />
+            <Compile Include="Program.cs" />
+          </ItemGroup>
+          <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
         </Project>
         """;
 
@@ -134,14 +166,14 @@ public class FrameworkHotReloadTests : IDisposable
             Assert.DoesNotContain("Error:", await backend.LaunchAsync(
                 exe, [log], null, Path.GetDirectoryName(exe)));
 
-            _ = backend.ContinueAsync();
-            Assert.True(await WaitForLastLineAsync(log, "6"), "The target never started.");
+            await ResumeUntilValueAsync(backend, log, "6");
 
             string paused = await backend.InterruptAsync();
             Assert.DoesNotContain("cannot suspend", paused);
             Assert.NotNull(backend.CurrentFrame);
 
-            var (session, _) = await HotReloadService.StartAsync(csproj);
+            var (session, message) = await HotReloadService.StartAsync(csproj);
+            Assert.True(session is not null, message);
             await File.WriteAllTextAsync(sourcePath, BaselineSource.Replace("input * 2", "input * 10"));
 
             var outcome = await session!.ApplyAsync();
@@ -150,14 +182,13 @@ public class FrameworkHotReloadTests : IDisposable
                 $"{outcome.Summary}\n" + string.Join("\n", outcome.Errors) +
                 "\n--- engine ---\n" + backend.GetStatus());
 
-            _ = backend.ContinueAsync();
-            Assert.True(await WaitForLastLineAsync(log, "30"),
-                "The delta was applied from a pause but the process kept returning the old value.");
+            Assert.NotNull(backend.CurrentFrame);
+            AssertApplied(outcome, backend);
+            await ResumeUntilValueAsync(backend, log, "30");
         }
         finally
         {
-            HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            await StopTargetAsync(csproj, backend);
         }
     }
 
@@ -171,48 +202,126 @@ public class FrameworkHotReloadTests : IDisposable
     /// engine still refuses an apply to a running target, as a backstop for anything reaching
     /// past the backend.
     /// </remarks>
+    [FrameworkHotReloadTheory]
+    [InlineData("x86", "portable")]
+    [InlineData("x64", "portable")]
+    [InlineData("x86", "full")]
+    [InlineData("x64", "full")]
+    public Task AnEditAppliesToARunningTargetWithoutTheCallerPausingIt(
+        string architecture, string debugType) => RunUpdatesAsync(architecture, debugType);
+
     [FrameworkHotReloadFact]
-    public async Task AnEditAppliesToARunningTargetWithoutTheCallerPausingIt()
+    public Task RepeatedEditsApplyToALegacyProjectBuiltWithVisualStudioMsBuild() =>
+        RunUpdatesAsync("x86", "full", legacy: true);
+
+    [FrameworkHotReloadTheory]
+    [InlineData("portable")]
+    [InlineData("full")]
+    public Task RepeatedEditsApplyWhenBuildAndWorkspaceUseDifferentDriveLetterCasing(string debugType) =>
+        RunUpdatesAsync("x86", debugType, lowercaseBuildPath: true);
+
+    private async Task RunUpdatesAsync(
+        string architecture, string debugType, bool legacy = false, bool lowercaseBuildPath = false)
     {
-        Directory.CreateDirectory(_root);
-        string csproj = Path.Combine(_root, "FxHotReloadTarget.csproj");
-        string sourcePath = Path.Combine(_root, "Program.cs");
-        string log = Path.Combine(_root, "values.txt");
+        string projectRoot = lowercaseBuildPath ? WithDriveLetterCase(_root, upper: true) : _root;
+        Directory.CreateDirectory(projectRoot);
+        string csproj = Path.Combine(projectRoot, "FxHotReloadTarget.csproj");
+        string sourcePath = Path.Combine(projectRoot, "Program.cs");
+        string log = Path.Combine(projectRoot, "values.txt");
 
-        await File.WriteAllTextAsync(csproj, Project);
+        await File.WriteAllTextAsync(csproj, legacy ? LegacyProject : ProjectFor(architecture, debugType));
         await File.WriteAllTextAsync(sourcePath, BaselineSource);
-        Assert.True(await BuildAsync(csproj), "The .NET Framework target did not build.");
+        string buildPath = lowercaseBuildPath ? WithDriveLetterCase(csproj, upper: false) : csproj;
+        if (lowercaseBuildPath)
+        {
+            Assert.NotEqual(csproj, buildPath);
+            Assert.Equal(csproj, buildPath, ignoreCase: true);
+        }
+        // Pass the differently spelled path to the actual build process; the EnC workspace is
+        // opened below using csproj's uppercase drive, as it is when VS Code builds a URI path.
+        Assert.True(await BuildAsync(buildPath, legacy), "The .NET Framework target did not build.");
 
-        string exe = Path.Combine(_root, "bin", "Debug", "net48", "FxHotReloadTarget.exe");
+        string output = Path.Combine(projectRoot, "bin", "Debug");
+        string exe = Path.Combine(legacy ? output : Path.Combine(output, "net48"), "FxHotReloadTarget.exe");
+        AssertBuildFormat(exe, architecture, debugType);
+        if (lowercaseBuildPath && debugType == "portable")
+        {
+            using var pdb = File.OpenRead(Path.ChangeExtension(exe, ".pdb"));
+            using var provider = MetadataReaderProvider.FromPortablePdbStream(pdb);
+            var reader = provider.GetMetadataReader();
+            var documents = reader.Documents.Select(handle => reader.GetString(reader.GetDocument(handle).Name));
+            Assert.Contains(WithDriveLetterCase(sourcePath, upper: false), documents);
+        }
         var backend = (RoslynMCP.Services.Debugging.PublishingDebugBackend)
             DebugSessionManager.CreateSession(Services.DebugRuntime.NetFramework);
 
+        Process? target = null;
+        using var continueCancellation = new CancellationTokenSource();
+        Task<string>? continuing = null;
         try
         {
             Assert.DoesNotContain("Error:", await backend.LaunchAsync(
                 exe, [log], null, Path.GetDirectoryName(exe)));
 
-            _ = backend.ContinueAsync();
+            // The user's Continue request can still be waiting when Apply initiates Break All.
+            // Both operations must observe the stop instead of competing for one semaphore slot.
+            continuing = backend.ContinueAsync(continueCancellation.Token);
             Assert.True(await WaitForLastLineAsync(log, "6"), "The target never started.");
+            Assert.NotNull(backend.DebuggeePid);
+            target = Process.GetProcessById(backend.DebuggeePid.Value);
+            Assert.Equal(architecture == "x86" ? DebugArch.X86 : DebugArch.X64,
+                ProcessArch.OfProcess(target.Id));
 
-            var (session, _) = await HotReloadService.StartAsync(csproj);
-            await File.WriteAllTextAsync(sourcePath, BaselineSource.Replace("input * 2", "input * 10"));
+            var (session, message) = await HotReloadService.StartAsync(csproj);
+            Assert.True(session is not null, message);
 
-            var outcome = await session!.ApplyAsync();
+            // Multiple generations must update the same process, then a compile error must leave
+            // the last accepted generation running and allow a corrected edit to apply.
+            foreach (int multiplier in new[] { 10, 20 })
+            {
+                await File.WriteAllTextAsync(sourcePath,
+                    BaselineSource.Replace("input * 2", $"input * {multiplier}"));
+                AssertApplied(await ApplyPromptlyAsync(session!), backend);
+                Assert.True(await WaitForLastLineAsync(log, (3 * multiplier).ToString()),
+                    "The edit did not resume the target with the new code.\n" + backend.GetStatus());
+                AssertSameProcess(backend, target);
+            }
 
-            Assert.True(outcome.Ok,
-                $"{outcome.Summary}\n" + string.Join("\n", outcome.Errors) +
-                "\n--- engine ---\n" + backend.GetStatus());
+            await File.WriteAllTextAsync(sourcePath,
+                BaselineSource.Replace("input * 2", "input * missingMultiplier"));
+            var rejected = await ApplyPromptlyAsync(session!);
+            Assert.False(rejected.Ok);
+            Assert.Empty(rejected.AppliedTo);
+            Assert.Contains(rejected.Diagnostics, diagnostic => diagnostic.Severity == "error");
+            Assert.True(await WaitForLastLineAsync(log, "60"));
+            AssertSameProcess(backend, target);
 
-            // Resumed by the apply itself: a hot reload that leaves the app suspended looks like
-            // a hot reload that hung it.
-            Assert.True(await WaitForLastLineAsync(log, "30"),
-                "The edit was applied but the process did not carry on with the new code.");
+            await File.WriteAllTextAsync(sourcePath,
+                BaselineSource.Replace("input * 2", "input * 30"));
+            AssertApplied(await ApplyPromptlyAsync(session), backend);
+            Assert.True(await WaitForLastLineAsync(log, "90"),
+                "Correcting the compile error did not update the running target.\n" + backend.GetStatus());
+            AssertSameProcess(backend, target);
+
+            var unchanged = await ApplyPromptlyAsync(session);
+            Assert.True(unchanged.Ok, unchanged.Summary);
+            Assert.Empty(unchanged.AppliedTo);
+            Assert.Empty(unchanged.Errors);
+            Assert.Equal("No changes to apply.", unchanged.Summary);
+            AssertSameProcess(backend, target);
         }
         finally
         {
-            HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            continueCancellation.Cancel();
+            try
+            {
+                if (continuing is not null)
+                {
+                    try { await continuing.WaitAsync(TimeSpan.FromSeconds(15)); }
+                    catch (OperationCanceledException) when (continueCancellation.IsCancellationRequested) { }
+                }
+            }
+            finally { await StopTargetAsync(csproj, backend, target); }
         }
     }
 
@@ -247,10 +356,10 @@ public class FrameworkHotReloadTests : IDisposable
             Assert.DoesNotContain("Error:", await backend.LaunchAsync(
                 exe, [log], null, Path.GetDirectoryName(exe)));
 
-            _ = backend.ContinueAsync();
-            Assert.True(await WaitForLastLineAsync(log, "6"), "The target never started.");
+            await ResumeUntilValueAsync(backend, log, "6");
 
-            var (session, _) = await HotReloadService.StartAsync(csproj);
+            var (session, message) = await HotReloadService.StartAsync(csproj);
+            Assert.True(session is not null, message);
             await File.WriteAllTextAsync(sourcePath, BaselineSource.Replace("input * 2", "input * 10"));
 
             var outcome = await session!.ApplyAsync();
@@ -263,11 +372,11 @@ public class FrameworkHotReloadTests : IDisposable
 
             Assert.True(await WaitForLastLineAsync(log, "30"),
                 "The edit was applied but the process did not carry on with the new code.");
+            AssertApplied(outcome, backend);
         }
         finally
         {
-            HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            await StopTargetAsync(csproj, backend);
         }
     }
 
@@ -282,19 +391,25 @@ public class FrameworkHotReloadTests : IDisposable
     /// actually executing. A stepper built against the wrong version never completes, which the
     /// backend reports as "still running" — the editor experience is a debugger that is stuck.
     /// </remarks>
-    [FrameworkHotReloadFact]
-    public async Task ABreakpointHitAfterAnAppliedEditCanBeSteppedThrough()
+    [FrameworkHotReloadTheory]
+    [InlineData("x86", "portable")]
+    [InlineData("x64", "portable")]
+    [InlineData("x86", "full")]
+    [InlineData("x64", "full")]
+    public async Task ABreakpointHitAfterAnAppliedEditCanBeSteppedThrough(
+        string architecture, string debugType)
     {
         Directory.CreateDirectory(_root);
         string csproj = Path.Combine(_root, "FxHotReloadTarget.csproj");
         string sourcePath = Path.Combine(_root, "Program.cs");
         string log = Path.Combine(_root, "values.txt");
 
-        await File.WriteAllTextAsync(csproj, Project);
+        await File.WriteAllTextAsync(csproj, ProjectFor(architecture, debugType));
         await File.WriteAllTextAsync(sourcePath, BaselineSource);
         Assert.True(await BuildAsync(csproj), "The .NET Framework target did not build.");
 
         string exe = Path.Combine(_root, "bin", "Debug", "net48", "FxHotReloadTarget.exe");
+        AssertBuildFormat(exe, architecture, debugType);
         var backend = (RoslynMCP.Services.Debugging.PublishingDebugBackend)
             DebugSessionManager.CreateSession(Services.DebugRuntime.NetFramework);
 
@@ -308,14 +423,19 @@ public class FrameworkHotReloadTests : IDisposable
             string stopped = await backend.ContinueAsync();
             Assert.DoesNotContain("still running", stopped);
             Assert.NotNull(backend.CurrentFrame);
+            Assert.Equal("breakpoint", backend.CurrentFrame.Reason);
+            Assert.Equal(LineOf("return input * 2"), backend.CurrentFrame.Line);
 
-            var (session, _) = await HotReloadService.StartAsync(csproj);
+            var (session, message) = await HotReloadService.StartAsync(csproj);
+            Assert.True(session is not null, message);
             await File.WriteAllTextAsync(sourcePath, BaselineSource.Replace("input * 2", "input * 10"));
 
             var outcome = await session!.ApplyAsync();
             Assert.True(outcome.Ok,
                 $"{outcome.Summary}\n" + string.Join("\n", outcome.Errors) +
                 "\n--- engine ---\n" + backend.GetStatus());
+            AssertApplied(outcome, backend);
+            Assert.NotNull(backend.CurrentFrame);
 
             // Second hit: the breakpoint was rebound to the new version of the method.
             stopped = await backend.ContinueAsync();
@@ -323,6 +443,8 @@ public class FrameworkHotReloadTests : IDisposable
                 "After the apply, the rebound breakpoint was never hit again:\n" + stopped +
                 "\n--- engine ---\n" + backend.GetStatus());
             Assert.NotNull(backend.CurrentFrame);
+            Assert.Equal("breakpoint", backend.CurrentFrame.Reason);
+            Assert.Equal(LineOf("return input * 2"), backend.CurrentFrame.Line);
 
             // The user's "go through it": step over inside the edited method, then step again to
             // leave it. A stepper that never completes reports "still running".
@@ -350,8 +472,7 @@ public class FrameworkHotReloadTests : IDisposable
         }
         finally
         {
-            HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            await StopTargetAsync(csproj, backend);
         }
     }
 
@@ -404,15 +525,13 @@ public class FrameworkHotReloadTests : IDisposable
                 "\n--- engine ---\n" + backend.GetStatus());
 
             // Resumed after the apply: the new IL only runs when the process does.
-            _ = backend.ContinueAsync();
-
-            Assert.True(await WaitForLastLineAsync(log, "30"),
-                "ApplyChanges reported success but the process kept returning the old value.");
+            AssertApplied(outcome, backend);
+            Assert.NotNull(backend.CurrentFrame);
+            await ResumeUntilValueAsync(backend, log, "30");
         }
         finally
         {
-            HotReloadService.Get(csproj)?.Stop();
-            DebugSessionManager.DisposeSession();
+            await StopTargetAsync(csproj, backend);
         }
     }
 
@@ -422,23 +541,148 @@ public class FrameworkHotReloadTests : IDisposable
         BaselineSource.ReplaceLineEndings("\n").Split('\n'),
         line => line.Contains(text, StringComparison.Ordinal)) + 1;
 
-    private static async Task<bool> BuildAsync(string csproj)
+    private static string ProjectFor(string architecture, string debugType) => Project
+        .Replace("<PlatformTarget>x86</PlatformTarget>", $"<PlatformTarget>{architecture}</PlatformTarget>")
+        .Replace("<DebugType>portable</DebugType>", $"<DebugType>{debugType}</DebugType>");
+
+    private static string WithDriveLetterCase(string path, bool upper)
     {
-        var build = Process.Start(new ProcessStartInfo
+        Assert.True(path.Length > 2 && char.IsAsciiLetter(path[0]) && path[1] == ':',
+            "The drive-casing regression requires a local Windows drive for the temporary target.");
+        return (upper ? char.ToUpperInvariant(path[0]) : char.ToLowerInvariant(path[0])) + path[1..];
+    }
+
+    private static void AssertBuildFormat(string exe, string architecture, string debugType)
+    {
+        var arch = architecture == "x86" ? DebugArch.X86 : DebugArch.X64;
+        Assert.Equal(arch, ProcessArch.OfExecutable(exe));
+        Assert.True(DebugEngineFactory.FindWorker(arch) is not null,
+            $"The {architecture} debug worker is missing. Build tests with -p:BuildDebugWorkers=true.");
+        string signature = debugType == "portable" ? "BSJB" : "Microsoft C/C++ MSF 7.00";
+        Assert.True(File.ReadAllBytes(Path.ChangeExtension(exe, ".pdb")).AsSpan()
+            .StartsWith(Encoding.ASCII.GetBytes(signature)), $"The target did not produce a {debugType} PDB.");
+    }
+
+    private static void AssertApplied(HotReloadOutcome outcome, PublishingDebugBackend backend)
+    {
+        Assert.True(outcome.Ok, $"{outcome.Summary}\n" +
+            string.Join("\n", outcome.Diagnostics.Select(d => $"{d.Severity} {d.Id}: {d.Message}")) +
+            string.Join("\n", outcome.Errors) + "\n--- engine ---\n" + backend.GetStatus());
+        Assert.Empty(outcome.Errors);
+        Assert.NotEmpty(outcome.AppliedTo);
+        Assert.DoesNotContain(outcome.AppliedTo, target => target.Contains("queued", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<HotReloadOutcome> ApplyPromptlyAsync(HotReloadService session)
+    {
+        var timeout = TimeSpan.FromSeconds(15);
+        using var cancellation = new CancellationTokenSource(timeout);
+        var elapsed = Stopwatch.StartNew();
+        var outcome = await session.ApplyAsync(cancellation.Token);
+        Assert.True(elapsed.Elapsed < timeout,
+            $"Applying an edit took {elapsed.Elapsed}; a pending Continue must not consume the pause signal.");
+        return outcome;
+    }
+
+    private static void AssertSameProcess(PublishingDebugBackend backend, Process target)
+    {
+        Assert.False(target.HasExited, "Hot reload must preserve the original process.");
+        Assert.Equal(target.Id, backend.DebuggeePid);
+    }
+
+    private static async Task ResumeUntilValueAsync(PublishingDebugBackend backend, string log, string value)
+    {
+        // Continue waits for a future stop. Once the output proves the app is running, cancel
+        // that wait so a later pause has its own waiter for the backend's single stop signal.
+        using var cancellation = new CancellationTokenSource();
+        var continuing = backend.ContinueAsync(cancellation.Token);
+        try
+        {
+            Assert.True(await WaitForLastLineAsync(log, value),
+                $"The target did not produce {value} after resuming.\n" + backend.GetStatus());
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { await continuing.WaitAsync(TimeSpan.FromSeconds(15)); }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        }
+    }
+
+    private static async Task StopTargetAsync(
+        string csproj, PublishingDebugBackend backend, Process? target = null)
+    {
+        if (target is null && backend.DebuggeePid is { } pid)
+        {
+            try { target = Process.GetProcessById(pid); }
+            catch (ArgumentException) { }
+        }
+
+        try
+        {
+            if (HotReloadService.Get(csproj) is { } session)
+                await session.StopAsync();
+        }
+        finally
+        {
+            try { backend.Stop(); }
+            finally
+            {
+                DebugSessionManager.DisposeSession();
+                if (target is not null)
+                {
+                    using (target)
+                    {
+                        if (!target.HasExited)
+                            target.Kill(entireProcessTree: true);
+                        await target.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+                    }
+                }
+            }
+        }
+    }
+
+    private static async Task<bool> BuildAsync(string csproj, bool legacy = false)
+    {
+        if (legacy)
+        {
+            Assert.True(MsBuildLocator.FindMsBuild() is { } msbuild && File.Exists(msbuild),
+                "The legacy hot reload E2E test requires Visual Studio or Build Tools MSBuild " +
+                "and the .NET Framework 4.8 developer pack. Install those prerequisites before enabling it.");
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var result = await LaunchHandler.BuildAsync(csproj, "Debug", cancellation.Token);
+            Assert.True(result.Success, result.Summary + "\n" +
+                string.Join("\n", result.Errors.Select(error => error.Message)));
+            return true;
+        }
+
+        using var build = Process.Start(new ProcessStartInfo
         {
             FileName = "dotnet",
             WorkingDirectory = Path.GetDirectoryName(csproj),
             UseShellExecute = false,
+            CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             ArgumentList = { "build", csproj, "-c", "Debug", "--nologo" },
         })!;
 
-        string output = await build.StandardOutput.ReadToEndAsync();
-        await build.WaitForExitAsync();
+        var output = build.StandardOutput.ReadToEndAsync();
+        var error = build.StandardError.ReadToEndAsync();
+        try
+        {
+            await build.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(2));
+        }
+        catch
+        {
+            if (!build.HasExited)
+                build.Kill(entireProcessTree: true);
+            await build.WaitForExitAsync();
+            throw;
+        }
 
         if (build.ExitCode != 0)
-            Assert.Fail(output);
+            Assert.Fail(await output + "\n" + await error);
 
         return true;
     }
@@ -465,8 +709,14 @@ public class FrameworkHotReloadTests : IDisposable
             {
                 if (File.Exists(log))
                 {
-                    var lines = File.ReadLines(log).ToList();
-                    if (lines.Count > 0 && lines[^1].Trim() == value)
+                    // File.ReadLines denies concurrent writers while it is open, which can make
+                    // the debuggee throw in AppendAllText instead of merely delaying this poll.
+                    using var stream = new FileStream(log, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete);
+                    using var reader = new StreamReader(stream);
+                    string text = await reader.ReadToEndAsync();
+                    var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                    if (text.EndsWith('\n') && lines.Length > 0 && lines[^1].Trim() == value)
                         return true;
                 }
             }

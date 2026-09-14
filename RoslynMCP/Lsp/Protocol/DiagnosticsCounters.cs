@@ -9,4 +9,6 @@ namespace RoslynMCP.Lsp.Protocol;
 // transport itself.
 
 public sealed record DiagnosticsCounters(
-    [property: JsonPropertyName("incrementalLoadCount")] int IncrementalLoadCount);
+    [property: JsonPropertyName("incrementalLoadCount")] int IncrementalLoadCount,
+    [property: JsonPropertyName("solutionLoading")] bool SolutionLoading = false,
+    [property: JsonPropertyName("solutionPrepared")] bool SolutionPrepared = false);

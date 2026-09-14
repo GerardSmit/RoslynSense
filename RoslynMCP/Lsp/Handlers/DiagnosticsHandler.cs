@@ -260,6 +260,11 @@ internal static class DiagnosticsHandler
     {
         string path = LspConverters.UriToPath(p.TextDocument.Uri);
 
+        // VS Code uses pull diagnostics, so the guards in the push entry points do not
+        // run here. Return a full empty report to clear diagnostics from older versions.
+        if (ExternalSourceCache.IsExternalSourcePath(path))
+            return Answer(p, [], "external-source");
+
         // A web.config belongs to no project in Roslyn's sense, so it has to be claimed before the
         // document resolve below returns null and reports nothing about it. Both push entry points
         // have had this branch all along, but LspServer gates every Schedule call on the client not

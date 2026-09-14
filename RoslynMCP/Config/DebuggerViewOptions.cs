@@ -34,6 +34,10 @@ public sealed class DebuggerConfig
     /// listed children are not the object's own fields.</summary>
     public bool? RawView { get; init; }
 
+    /// <summary>List a lazy enumerable's elements when it is expanded, with its own state under
+    /// Raw View; off puts them behind a Results View, as VS does.</summary>
+    public bool? EnumerateResults { get; init; }
+
     /// <summary>How many children of one value to list before truncating. Null = 100.</summary>
     public int? MaxChildren { get; init; }
 
@@ -119,6 +123,7 @@ public static class DebuggerViewOptions
             CallToString = Resolve1("--no-call-tostring", "ROSLYNMCP_DEBUGGER_CALL_TOSTRING", config?.CallToString),
             JustMyCode = Resolve1("--no-just-my-code", "ROSLYNMCP_JUST_MY_CODE", config?.JustMyCode),
             RawView = Resolve1("--no-raw-view", "ROSLYNMCP_DEBUGGER_RAW_VIEW", config?.RawView),
+            EnumerateResults = Resolve1("--no-enumerate-results", "ROSLYNMCP_DEBUGGER_ENUMERATE_RESULTS", config?.EnumerateResults),
             MaxChildren = maxChildren,
             SymbolInclude = Globs("ROSLYNMCP_SYMBOL_INCLUDE", config?.SymbolInclude),
             SymbolExclude = Globs("ROSLYNMCP_SYMBOL_EXCLUDE", config?.SymbolExclude),
@@ -142,6 +147,7 @@ public static class DebuggerViewOptions
         Toggle("callToString", before.CallToString, after.CallToString);
         Toggle("justMyCode", before.JustMyCode, after.JustMyCode);
         Toggle("rawView", before.RawView, after.RawView);
+        Toggle("enumerateResults", before.EnumerateResults, after.EnumerateResults);
 
         if (before.MaxChildren != after.MaxChildren)
             changes.Add($"debugger maxChildren: {before.MaxChildren} → {after.MaxChildren}");

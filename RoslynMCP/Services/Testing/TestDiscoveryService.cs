@@ -126,7 +126,7 @@ public static class TestDiscoveryService
             .ToList();
     }
 
-    private static (bool IsTest, string Framework) DetectTestMethod(
+    internal static (bool IsTest, string Framework) DetectTestMethod(
         MethodDeclarationSyntax method, SemanticModel semanticModel)
     {
         foreach (var attributeList in method.AttributeLists)
@@ -139,9 +139,14 @@ public static class TestDiscoveryService
                 // or a same-named attribute from an unrelated library, must not count.
                 if (semanticModel.GetSymbolInfo(attribute).Symbol is IMethodSymbol constructor)
                 {
-                    string? ns = constructor.ContainingType.ContainingNamespace?.ToDisplayString();
-                    if (ns is not null && s_testNamespaces.Contains(ns))
-                        return (true, FrameworkFromNamespace(ns));
+                    // Trait/Category and other framework attributes do not turn a helper into a
+                    // test. Custom Fact/Test attributes do, through their recognized base type.
+                    for (var type = constructor.ContainingType; type is not null; type = type.BaseType)
+                    {
+                        string? ns = type.ContainingNamespace?.ToDisplayString();
+                        if (s_testAttributes.Contains(type.Name) && ns is not null && s_testNamespaces.Contains(ns))
+                            return (true, FrameworkFromNamespace(ns));
+                    }
                     continue;
                 }
 

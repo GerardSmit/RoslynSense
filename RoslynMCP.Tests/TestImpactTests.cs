@@ -152,6 +152,22 @@ public class TestImpactTests
     }
 
     [Fact]
+    public void IsFileStale_RejectsOlderClassCoverageEvenWhenAnotherClassHasACurrentMeasurement()
+    {
+        string path = Path.Combine(NewTempDirectory(), "Widget.cs");
+        File.WriteAllText(path, "class Widget { }\n");
+        string? oldHash = CoverageMapHash.OfFile(path);
+        File.WriteAllText(path, "// new first line\nclass Widget { }\n");
+        string? currentHash = CoverageMapHash.OfFile(path);
+
+        var fresh = Entry("Tests.Fresh", ["Tests.Fresh.One"], path, [2], currentHash);
+        var stale = Entry("Tests.Stale", ["Tests.Stale.One"], path, [1], oldHash);
+        Assert.True(new TestCoverageMap("sln", DateTime.UtcNow, [fresh, stale]).IsFileStale(path));
+        Assert.True(new TestCoverageMap("sln", DateTime.UtcNow, [stale, fresh]).IsFileStale(path));
+        Assert.False(new TestCoverageMap("sln", DateTime.UtcNow, [fresh]).IsFileStale(path));
+    }
+
+    [Fact]
     public void Hash_IgnoresLineEndings()
     {
         string directory = NewTempDirectory();
@@ -414,6 +430,78 @@ public class TestImpactTests
             var test = Assert.Single(selection.Tests);
             Assert.Equal("Tests.TopTests.One", test.FullyQualifiedName);
             Assert.Equal(ImpactReason.CoveredChangedLines, test.Reason);
+        }
+        finally
+        {
+            TestCoverageMapStore.Clear(solution);
+        }
+    }
+
+    [Fact]
+    public async Task SelectAsync_KeepsSameNamedTestsFromDifferentProjects()
+    {
+        if (!GitIsAvailable())
+            return;
+
+        string repository = NewTempDirectory();
+        InitRepository(repository);
+        string solution = Path.Combine(repository, "Sample.sln");
+        File.WriteAllText(solution, "");
+        Git(repository, "add -A");
+        Git(repository, "commit -m initial");
+        string changed = Path.Combine(repository, "Changed.cs");
+        File.WriteAllText(changed, "class Changed { }\n");
+        string firstProject = Path.Combine(repository, "First.Tests.csproj");
+        string secondProject = Path.Combine(repository, "Second.Tests.csproj");
+        var entry = Entry("Tests.Shared", ["Tests.Shared.Check"], changed, [1]);
+        var map = new TestCoverageMap(solution, DateTime.UtcNow,
+            [entry with { ProjectPath = firstProject }, entry with { ProjectPath = secondProject }]);
+
+        try
+        {
+            TestCoverageMapStore.Save(solution, map);
+            var selection = await TestImpactService.SelectAsync(repository, useReferenceWalk: false);
+
+            Assert.Null(selection.Error);
+            Assert.Equal(2, selection.Tests.Count);
+            Assert.Equal([firstProject, secondProject], selection.ByProject().Select(group => group.Key).Order());
+            Assert.All(selection.Tests, test => Assert.Equal("Tests.Shared.Check", test.FullyQualifiedName));
+            Assert.Empty(selection.UncoveredFiles);
+        }
+        finally
+        {
+            TestCoverageMapStore.Clear(solution);
+        }
+    }
+
+    [Fact]
+    public async Task SelectAsync_DoesNotReportACoveredFileAsUncoveredWhenItsTestWasAlreadySelected()
+    {
+        if (!GitIsAvailable())
+            return;
+
+        string repository = NewTempDirectory();
+        InitRepository(repository);
+        string solution = Path.Combine(repository, "Sample.sln");
+        File.WriteAllText(solution, "");
+        Git(repository, "add -A");
+        Git(repository, "commit -m initial");
+        string first = Path.Combine(repository, "First.cs");
+        string second = Path.Combine(repository, "Second.cs");
+        File.WriteAllText(first, "class First { }\n");
+        File.WriteAllText(second, "class Second { }\n");
+        var entry = new CoverageMapEntry("Tests.Shared", "Tests.csproj", ["Tests.Shared.Check"],
+            [CoveredFile.FromLines(first, null, [1]), CoveredFile.FromLines(second, null, [1])]);
+
+        try
+        {
+            TestCoverageMapStore.Save(solution, new TestCoverageMap(solution, DateTime.UtcNow, [entry]));
+            var selection = await TestImpactService.SelectAsync(repository, useReferenceWalk: false);
+
+            Assert.Null(selection.Error);
+            Assert.Equal(2, selection.ChangedFiles.Count);
+            Assert.Equal("Tests.Shared.Check", Assert.Single(selection.Tests).FullyQualifiedName);
+            Assert.Empty(selection.UncoveredFiles);
         }
         finally
         {

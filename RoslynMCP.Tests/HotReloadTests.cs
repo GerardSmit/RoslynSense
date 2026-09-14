@@ -87,20 +87,20 @@ public class HotReloadTests
     [Fact]
     public async Task AConnectedAgentBecomesAnApplyTargetAndItsCapabilitiesAreReported()
     {
-        var server = HotReloadAgentServer.Instance;
+        using var server = CreateAgentServer();
         await using var agent = await ConnectAgentAsync(server.PipeName, "SampleApp",
             "Baseline AddMethodToExistingType");
 
         await WaitForTargetAsync(server, "SampleApp");
 
-        Assert.Contains(server.Targets, t => t.Name == "SampleApp");
-        Assert.Contains("Baseline", server.Capabilities());
+        Assert.Equal("SampleApp", Assert.Single(server.Targets).Name);
+        Assert.Equal(["Baseline", "AddMethodToExistingType"], server.Capabilities());
     }
 
     [Fact]
     public async Task ADeltaReachesTheAgentIntactAndItsAnswerIsReportedBack()
     {
-        var server = HotReloadAgentServer.Instance;
+        using var server = CreateAgentServer();
         await using var agent = await ConnectAgentAsync(server.PipeName, "DeltaApp", "Baseline");
         await WaitForTargetAsync(server, "DeltaApp");
 
@@ -132,16 +132,14 @@ public class HotReloadTests
         var (applied, errors) = await server.ApplyAsync([delta]);
         await agentSide;
 
-        Assert.Contains(applied, a => a.Contains("DeltaApp"));
-        // Scoped to this agent: the server is process-wide, so another test's target may still be
-        // registered, and its failures are not this test's business.
-        Assert.DoesNotContain(errors, e => e.Contains("DeltaApp"));
+        Assert.Contains("DeltaApp", Assert.Single(applied));
+        Assert.Empty(errors);
     }
 
     [Fact]
     public async Task AnAgentThatRejectsTheUpdateIsReportedRatherThanCountedAsApplied()
     {
-        var server = HotReloadAgentServer.Instance;
+        using var server = CreateAgentServer();
         await using var agent = await ConnectAgentAsync(server.PipeName, "PickyApp", "Baseline");
         await WaitForTargetAsync(server, "PickyApp");
 
@@ -166,8 +164,8 @@ public class HotReloadTests
             new HotReloadDelta(Guid.NewGuid(), [1], [2], [3], [])]);
         await agentSide;
 
-        Assert.DoesNotContain(applied, a => a.Contains("PickyApp"));
-        Assert.Contains(errors, e => e.Contains("refused the update"));
+        Assert.Empty(applied);
+        Assert.Contains("refused the update", Assert.Single(errors));
     }
 
     // === The line map that travels beside a delta ===
@@ -238,13 +236,18 @@ public class HotReloadTests
         Assert.Null(RoslynMCP.Debugger.EncSymbolMap.Parse(json));
     }
 
+    // Fake agents use the test host's PID, so process-exit reaping cannot remove them. Give each
+    // test its own pipe and dispose it before a real runtime test can observe those registrations.
+    private static HotReloadAgentServer CreateAgentServer() =>
+        new($"roslyn-sense-hotreload-test-{Guid.NewGuid():N}");
+
     private static async Task<NamedPipeClientStream> ConnectAgentAsync(
         string pipeName, string name, string capabilities)
     {
         var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(10_000);
 
-        var writer = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
+        using var writer = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
         writer.Write(2); // protocol version, in lockstep with HotReloadAgent.ProtocolVersion
         // This process's own id: the server reaps agents whose process is gone, so a fabricated
         // one would be dropped before the test could use it.

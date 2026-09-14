@@ -9,6 +9,60 @@ namespace RoslynMCP.Tests;
 public class OpenDocumentOverlayTests
 {
     [Fact]
+    public void KnownBufferEqualitySurvivesDocumentMetadataChangesButNotTextChanges()
+    {
+        using var workspace = new AdhocWorkspace();
+        var project = workspace.AddProject("BufferIdentity", LanguageNames.CSharp);
+        var text = SourceText.From("class C { }");
+        var document = workspace.AddDocument(project.Id, "Before.cs", text);
+        WorkspaceService.RememberMatchingOpenText(document, text);
+        var renamed = document.WithName("After.cs");
+        Assert.NotSame(document.State, renamed.State);
+        Assert.Same(document.State.TextAndVersionSource, renamed.State.TextAndVersionSource);
+        Assert.True(WorkspaceService.HasMatchingOpenText(renamed, text));
+        Assert.False(WorkspaceService.HasMatchingOpenText(renamed.WithText(SourceText.From("class D { }")), text));
+    }
+
+    [Fact]
+    public async Task ClosingAnotherOverlaidProjectPreservesTheUnchangedCompilation()
+    {
+        string session = Guid.NewGuid().ToString("N");
+        string first = FixturePaths.MultiProjectAClassFile;
+        string second = FixturePaths.MultiProjectBClassFile;
+        using var binding = WorkspaceService.BindSolutionForTesting(FixturePaths.MultiSolutionFile);
+        await WorkspaceService.EnsureProjectsLoadedAsync([FixturePaths.MultiProjectAFile, FixturePaths.MultiProjectBFile]);
+        var initial = WorkspaceService.TryGetSessionSolution()!;
+        foreach (string path in new[] { first, second })
+            await initial.GetDocument(initial.GetDocumentIdsWithFilePath(path).Single())!.GetTextAsync();
+        var bridge = OpenDocumentStore.OverlayableBufferChanged;
+        OpenDocumentStore.OverlayableBufferChanged = null; // Keep changes in the overlay, not the base workspace.
+        try
+        {
+            OpenDocumentStore.Open(session, first, SourceText.From(await File.ReadAllTextAsync(first) + "\n// first overlay"), 1);
+            OpenDocumentStore.Open(session, second, SourceText.From(await File.ReadAllTextAsync(second) + "\n// second overlay"), 1);
+            var before = WorkspaceService.TryGetSessionSolution()!;
+            var firstDocument = before.GetDocument(before.GetDocumentIdsWithFilePath(first).Single())!;
+            var compilation = await firstDocument.Project.GetCompilationAsync();
+            var version = await firstDocument.GetTextVersionAsync();
+            OpenDocumentStore.Close(session, second);
+            var after = WorkspaceService.TryGetSessionSolution()!;
+            var kept = after.GetDocument(firstDocument.Id)!;
+            Assert.Equal(version, await kept.GetTextVersionAsync());
+            Assert.Same(compilation, await kept.Project.GetCompilationAsync());
+            var closed = after.GetDocument(after.GetDocumentIdsWithFilePath(second).Single())!;
+            Assert.Equal(await File.ReadAllTextAsync(second), (await closed.GetTextAsync()).ToString());
+        }
+        finally
+        {
+            OpenDocumentStore.Close(session, first);
+            OpenDocumentStore.Close(session, second);
+            OpenDocumentStore.OverlayableBufferChanged = bridge;
+            await WorkspaceService.ReconcileOpenBufferAsync(first);
+            await WorkspaceService.ReconcileOpenBufferAsync(second);
+        }
+    }
+
+    [Fact]
     public async Task SnapshotSeesOpenBufferTextAndRevertsOnClose()
     {
         string path = FixturePaths.CalculatorFile;

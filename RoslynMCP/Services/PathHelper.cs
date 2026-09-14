@@ -244,6 +244,79 @@ internal static partial class PathHelper
         Path.GetFullPath(filePath);
 
     /// <summary>
+    /// <paramref name="path"/> spelled the way the file system spells it: an upper-case drive
+    /// letter, and every segment that exists in its on-disk casing. Segments that do not exist
+    /// yet keep the casing they were given.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// For the project and solution paths this process hands to a build or a restore. MSBuild
+    /// derives <c>MSBuildProjectDirectory</c> from the path on its command line, casing included,
+    /// and a deterministic compiler bakes that path into its output — the PDB path in the debug
+    /// directory, and through it the module id, the PDB id and the timestamp. VS Code hands the
+    /// extension a lower-case drive letter (<c>d:\...</c>), so a build started from here and the
+    /// same build started from Visual Studio or a terminal (<c>D:\...</c>) alternated between two
+    /// byte-different outputs; the restore output carries the same path and alternated with it.
+    /// Every consumer that compares bytes — the analyzer rebuild watcher, the restore watcher —
+    /// then saw a change on every build.
+    /// </para>
+    /// <para>
+    /// Looked up segment by segment rather than resolved through the file's final path: the
+    /// latter also replaces a <c>subst</c> drive or a junction with its target, which would send
+    /// the build somewhere the user's other tools never go. Windows only; elsewhere the spelling
+    /// is the identity.
+    /// </para>
+    /// </remarks>
+    public static string WithOnDiskCasing(string path)
+    {
+        string full = Path.GetFullPath(path);
+        if (!OperatingSystem.IsWindows())
+            return full;
+
+        string? root = Path.GetPathRoot(full);
+        if (string.IsNullOrEmpty(root))
+            return full;
+
+        // A drive letter has no on-disk spelling to look up, and every tool that prints one
+        // prints it upper-case. A UNC root is left as given.
+        string current = root.Length >= 2 && root[1] == ':'
+            ? char.ToUpperInvariant(root[0]) + root[1..]
+            : root;
+        bool exists = Directory.Exists(current);
+
+        foreach (string segment in full[root.Length..].Split(
+                     Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string spelled = segment;
+            if (exists)
+            {
+                string? onDisk = null;
+                try
+                {
+                    onDisk = Directory.EnumerateFileSystemEntries(current, segment)
+                        .Select(Path.GetFileName)
+                        .FirstOrDefault(name =>
+                            string.Equals(name, segment, StringComparison.OrdinalIgnoreCase));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // A directory this process may not list: the spelling given is the best
+                    // there is, for it and everything below it.
+                }
+
+                if (onDisk is null)
+                    exists = false;
+                else
+                    spelled = onDisk;
+            }
+
+            current = Path.Combine(current, spelled);
+        }
+
+        return current;
+    }
+
+    /// <summary>
     /// Returns true if the path ends with .sln or .slnx.
     /// </summary>
     public static bool IsSolutionFile(string path) =>

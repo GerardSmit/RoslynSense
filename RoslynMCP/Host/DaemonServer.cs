@@ -1,4 +1,4 @@
-﻿using System.IO.Pipes;
+using System.IO.Pipes;
 using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 using RoslynMCP.Config;
@@ -360,9 +360,17 @@ internal sealed class DaemonServer
                 if (projectPath.Length == 0)
                     return new DaemonResponse(request.Id, false, null, "No project path.");
 
-                var (session, message) = await Services.HotReload.HotReloadService.StartAsync(projectPath, ct);
+                var (session, message) = await Services.HotReload.HotReloadService.StartAsync(projectPath, ct,
+                    request.Args.GetValueOrDefault("ownerId"),
+                    int.TryParse(request.Args.GetValueOrDefault("ownerPid"), out var pid) ? pid : null);
                 return new DaemonResponse(request.Id, session is not null, message, message);
             }
+
+            case "release":
+                await Services.HotReload.HotReloadService.ReleaseOwnerAsync(
+                    request.Args.GetValueOrDefault("projectPath") ?? "",
+                    request.Args.GetValueOrDefault("ownerId") ?? "manual");
+                return new DaemonResponse(request.Id, true, "Released Hot Reload owner.", null);
 
             default:
                 return new DaemonResponse(request.Id, false, null, $"Unknown hot reload action '{request.Tool}'.");

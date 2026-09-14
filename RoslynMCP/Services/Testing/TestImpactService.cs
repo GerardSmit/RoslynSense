@@ -85,14 +85,14 @@ public static class TestImpactService
 
         var map = TestCoverageMapStore.LoadNearest(anchorPath);
 
-        var selected = new Dictionary<string, ImpactedTest>(StringComparer.Ordinal);
+        var selected = new Dictionary<(string ProjectPath, string TestName), ImpactedTest>();
         var uncovered = new List<string>();
 
         foreach (var file in sourceChanges)
         {
             ct.ThrowIfCancellationRequested();
 
-            int before = selected.Count;
+            bool covered = false;
 
             // The file has moved since coverage ran, so its recorded line numbers describe text
             // that is no longer there. Fall back to the file as a whole rather than matching
@@ -111,10 +111,13 @@ public static class TestImpactService
                             : ImpactReason.CoveredChangedLines;
 
                 foreach (string test in entry.Tests)
+                {
+                    covered = true;
                     Add(selected, new ImpactedTest(test, entry.ClassFullName, entry.ProjectPath, reason, file.FilePath));
+                }
             }
 
-            if (selected.Count == before)
+            if (!covered)
                 uncovered.Add(file.FilePath);
         }
 
@@ -128,13 +131,13 @@ public static class TestImpactService
             {
                 ct.ThrowIfCancellationRequested();
 
-                int before = selected.Count;
+                var reaching = new Dictionary<(string ProjectPath, string TestName), ImpactedTest>();
                 var changed = sourceChanges.First(f =>
                     string.Equals(f.FilePath, file, StringComparison.OrdinalIgnoreCase));
 
                 try
                 {
-                    await AddTestsReachingAsync(changed, selected, ct);
+                    await AddTestsReachingAsync(changed, reaching, ct);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -144,7 +147,10 @@ public static class TestImpactService
                         key: "test-impact-walk");
                 }
 
-                if (selected.Count == before)
+                foreach (var test in reaching.Values)
+                    Add(selected, test);
+
+                if (reaching.Count == 0)
                     stillUncovered.Add(file);
             }
 
@@ -169,26 +175,34 @@ public static class TestImpactService
     /// which is the half of the problem the coverage map exists to solve.
     /// </remarks>
     private static async Task AddTestsReachingAsync(
-        ChangedFile file, Dictionary<string, ImpactedTest> selected, CancellationToken ct)
+        ChangedFile file, Dictionary<(string ProjectPath, string TestName), ImpactedTest> selected, CancellationToken ct)
     {
         string? projectPath = await WorkspaceService.FindContainingProjectAsync(file.FilePath, ct);
         if (projectPath is null)
             return;
 
-        var (workspace, project) = await WorkspaceService.GetOrOpenProjectAsync(
+        var (_, project) = await WorkspaceService.GetOrOpenProjectAsync(
             projectPath, diagnosticWriter: TextWriter.Null, cancellationToken: ct);
 
         var document = WorkspaceService.FindDocumentInProject(project, file.FilePath);
         if (document is null)
             return;
 
+        foreach (var test in await FindTestsReachingAsync(document, file, ct))
+            Add(selected, test);
+    }
+
+    internal static async Task<IReadOnlyList<ImpactedTest>> FindTestsReachingAsync(
+        Document document, ChangedFile file, CancellationToken ct = default)
+    {
+        var selected = new Dictionary<(string ProjectPath, string TestName), ImpactedTest>();
         var model = await document.GetSemanticModelAsync(ct);
         var root = await document.GetSyntaxRootAsync(ct);
         if (model is null || root is null)
-            return;
+            return [];
 
         var frontier = new List<ISymbol>();
-        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var visited = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
 
         foreach (var node in root.DescendantNodes())
         {
@@ -204,11 +218,25 @@ public static class TestImpactService
             if (!file.WholeFile && !file.Ranges.Any(r => r.Start <= end && r.End >= start))
                 continue;
 
-            if (model.GetDeclaredSymbol(node, ct) is { } symbol && visited.Add(Key(symbol)))
+            if (model.GetDeclaredSymbol(node, ct) is { } symbol && visited.Add(symbol))
+            {
+                // An edited test is itself a selection: tests usually have no source callers
+                // for the outward reference walk to find, especially before coverage exists.
+                if (node is MethodDeclarationSyntax method && IsTestMethod(method, model))
+                {
+                    Add(selected, new ImpactedTest(
+                        $"{symbol.ContainingType?.ToDisplayString()}.{symbol.Name}",
+                        symbol.ContainingType?.ToDisplayString() ?? "",
+                        document.Project.FilePath ?? "",
+                        ImpactReason.TestChanged,
+                        file.FilePath));
+                    continue;
+                }
                 frontier.Add(symbol);
+            }
         }
 
-        var solution = workspace.CurrentSolution;
+        var solution = document.Project.Solution;
 
         for (int depth = 0; depth < MaxReferenceDepth && frontier.Count > 0; depth++)
         {
@@ -236,7 +264,7 @@ public static class TestImpactService
                         if (referencingModel.GetDeclaredSymbol(method, ct) is not { } methodSymbol)
                             continue;
 
-                        if (!visited.Add(Key(methodSymbol)))
+                        if (!visited.Add(methodSymbol))
                             continue;
 
                         if (IsTestMethod(method, referencingModel))
@@ -259,41 +287,17 @@ public static class TestImpactService
 
             frontier = next;
         }
+
+        return selected.Values.ToList();
     }
 
-    private static void Add(Dictionary<string, ImpactedTest> selected, ImpactedTest test)
+    private static void Add(Dictionary<(string ProjectPath, string TestName), ImpactedTest> selected, ImpactedTest test)
     {
         // First reason wins: coverage-backed selections run before the reference walk, and
         // "covered these changed lines" is the more informative answer.
-        if (!selected.ContainsKey(test.FullyQualifiedName))
-            selected[test.FullyQualifiedName] = test;
+        selected.TryAdd((test.ProjectPath.ToUpperInvariant(), test.FullyQualifiedName), test);
     }
 
-    private static string Key(ISymbol symbol) =>
-        symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-
-    private static bool IsTestMethod(MethodDeclarationSyntax method, SemanticModel model)
-    {
-        foreach (var attributeList in method.AttributeLists)
-        {
-            foreach (var attribute in attributeList.Attributes)
-            {
-                if (model.GetSymbolInfo(attribute).Symbol is IMethodSymbol constructor)
-                {
-                    string? ns = constructor.ContainingType.ContainingNamespace?.ToDisplayString();
-                    if (ns is "Xunit" or "NUnit.Framework"
-                        or "Microsoft.VisualStudio.TestTools.UnitTesting")
-                        return true;
-                    continue;
-                }
-
-                string name = attribute.Name.ToString();
-                if (name is "Fact" or "Theory" or "Test" or "TestCase" or "TestMethod" or "DataTestMethod"
-                    or "FactAttribute" or "TheoryAttribute" or "TestAttribute" or "TestCaseAttribute"
-                    or "TestMethodAttribute" or "DataTestMethodAttribute")
-                    return true;
-            }
-        }
-        return false;
-    }
+    private static bool IsTestMethod(MethodDeclarationSyntax method, SemanticModel model) =>
+        TestDiscoveryService.DetectTestMethod(method, model).IsTest;
 }

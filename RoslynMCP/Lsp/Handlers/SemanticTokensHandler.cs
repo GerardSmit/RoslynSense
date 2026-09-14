@@ -121,10 +121,25 @@ internal static class SemanticTokensHandler
     /// <summary>Keeps the baseline cache from growing with every file ever opened.</summary>
     private const int MaxCachedResults = 256;
 
+    // Cache classifications, not the final token array: embedded providers may read mutable
+    // settings or external files. Their detection and carving must still run on every request.
+    // Neither weak reference keeps a solution/compilation alive after the workspace releases it.
+    private sealed record ClassificationEntry(
+        WeakReference<Document> Document,
+        WeakReference<Compilation> Compilation,
+        Coloured[] Primary,
+        long Stamp);
+
+    private static readonly ConcurrentDictionary<(string SessionId, DocumentId DocumentId), ClassificationEntry>
+        s_classified = new();
+
+    private static long s_classificationComputations;
+    internal static long ClassificationComputations => Interlocked.Read(ref s_classificationComputations);
+
     public static async Task<SemanticTokens> SemanticTokensFullAsync(
         string sessionId, SemanticTokensParams p, CancellationToken ct)
     {
-        int[] data = await ComputeAsync(p.TextDocument.Uri, window: null, ct);
+        int[] data = await ComputeAsync(sessionId, p.TextDocument.Uri, window: null, ct);
         return new SemanticTokens(data, Remember(sessionId, p.TextDocument.Uri, data));
     }
 
@@ -134,7 +149,7 @@ internal static class SemanticTokensHandler
     /// </summary>
     public static async Task<SemanticTokens> SemanticTokensRangeAsync(
         SemanticTokensRangeParams p, CancellationToken ct) =>
-        new(await ComputeAsync(p.TextDocument.Uri, p.Range, ct));
+        new(await ComputeAsync(sessionId: null, p.TextDocument.Uri, p.Range, ct));
 
     /// <summary>
     /// The difference from what the client already has. Falls back to a full result when the
@@ -144,7 +159,7 @@ internal static class SemanticTokensHandler
     public static async Task<object> SemanticTokensDeltaAsync(
         string sessionId, SemanticTokensDeltaParams p, CancellationToken ct)
     {
-        int[] data = await ComputeAsync(p.TextDocument.Uri, window: null, ct);
+        int[] data = await ComputeAsync(sessionId, p.TextDocument.Uri, window: null, ct);
 
         string key = CacheKey(sessionId, p.TextDocument.Uri);
         bool known = s_previous.TryGetValue(key, out var previous)
@@ -217,15 +232,26 @@ internal static class SemanticTokensHandler
             if (key.StartsWith(prefix, StringComparison.Ordinal))
                 s_previous.TryRemove(key, out _);
         }
+        foreach (var key in s_classified.Keys)
+        {
+            if (key.SessionId == sessionId)
+                s_classified.TryRemove(key, out _);
+        }
     }
 
     private static async Task<int[]> ComputeAsync(
-        string uri, Protocol.Range? window, CancellationToken ct)
+        string? sessionId, string uri, Protocol.Range? window, CancellationToken ct)
     {
         var document = await LspDocumentResolver.ResolveAsync(LspConverters.UriToPath(uri), ct);
         if (document is null)
             return Array.Empty<int>();
 
+        return await ComputeDocumentAsync(sessionId, document, window, ct);
+    }
+
+    internal static async Task<int[]> ComputeDocumentAsync(
+        string? sessionId, Document document, Protocol.Range? window, CancellationToken ct)
+    {
         // Frozen, as Roslyn's LSP classifies: tokens re-compute per keystroke and only need this
         // document's tree bound against whatever compilation state already exists.
         document = await document.FreezeAsync(ct);
@@ -234,37 +260,8 @@ internal static class SemanticTokensHandler
         var classified = window is null
             ? new TextSpan(0, text.Length)
             : LspConverters.ToTextSpan(text, window);
-        var spans = await Classifier.GetClassifiedSpansAsync(document, classified, ct);
 
-        // Classifier returns overlapping syntactic + semantic + additive results; keep only
-        // mapped types, then resolve overlaps by span start (semantic names win over the
-        // unmapped "identifier" they overlap, which is already filtered out).
-        // Additive spans are collected first: they overlap the primary span they modify, so
-        // they must not be consumed by the overlap filter below.
-        var modifiersBySpan = new Dictionary<TextSpan, int>();
-        foreach (var span in spans)
-        {
-            if (s_modifierMap.TryGetValue(span.ClassificationType, out int bit))
-                modifiersBySpan[span.TextSpan] = modifiersBySpan.GetValueOrDefault(span.TextSpan) | bit;
-        }
-
-        var primary = new List<Coloured>();
-        int lastEnd = -1;
-        foreach (var span in spans
-                     .Where(s => s_classificationMap.ContainsKey(s.ClassificationType))
-                     .OrderBy(s => s.TextSpan.Start)
-                     .ThenBy(s => s.TextSpan.End))
-        {
-            if (span.TextSpan.Start < lastEnd)
-                continue;
-            lastEnd = span.TextSpan.End;
-
-            primary.Add(new Coloured(
-                span.TextSpan,
-                s_typeIndex[s_classificationMap[span.ClassificationType]],
-                modifiersBySpan.GetValueOrDefault(span.TextSpan)));
-        }
-
+        var primary = await ClassifyAsync(sessionId, document, classified, window is null, ct);
         var merged = Carve(primary, await EmbeddedTokensAsync(document, classified, ct));
 
         var tokens = new List<(int Line, int Char, int Length, int Type, int Modifiers)>();
@@ -298,6 +295,73 @@ internal static class SemanticTokensHandler
             prevChar = ch;
         }
         return data;
+    }
+
+    private static async Task<Coloured[]> ClassifyAsync(
+        string? sessionId, Document document, TextSpan spanToClassify, bool wholeDocument, CancellationToken ct)
+    {
+        var key = (sessionId!, document.Id);
+        // Classification already asks for this semantic model; acquiring the same cached model
+        // here identifies its compilation without introducing an additional compiler pass.
+        // Do this after FreezeAsync: an unchanged buffer can move from partial to full semantics
+        // as background loading/generation completes, and those results must never share a key.
+        var model = wholeDocument && sessionId is not null ? await document.GetSemanticModelAsync(ct) : null;
+        var compilation = model?.Compilation;
+        if (compilation is not null && s_classified.TryGetValue(key, out var cached)
+            && cached.Document.TryGetTarget(out var priorDocument) && ReferenceEquals(priorDocument, document)
+            && cached.Compilation.TryGetTarget(out var priorCompilation) && ReferenceEquals(priorCompilation, compilation))
+        {
+            ct.ThrowIfCancellationRequested();
+            s_classified.TryUpdate(key, cached with { Stamp = Interlocked.Increment(ref s_stampCounter) }, cached);
+            return cached.Primary;
+        }
+
+        Interlocked.Increment(ref s_classificationComputations);
+        var spans = await Classifier.GetClassifiedSpansAsync(document, spanToClassify, ct);
+        GC.KeepAlive(model);
+
+        // Classifier returns overlapping syntactic + semantic + additive results; keep only
+        // mapped types, then resolve overlaps by span start (semantic names win over the
+        // unmapped "identifier" they overlap, which is already filtered out).
+        // Additive spans are collected first: they overlap the primary span they modify, so
+        // they must not be consumed by the overlap filter below.
+        var modifiersBySpan = new Dictionary<TextSpan, int>();
+        foreach (var span in spans)
+        {
+            if (s_modifierMap.TryGetValue(span.ClassificationType, out int bit))
+                modifiersBySpan[span.TextSpan] = modifiersBySpan.GetValueOrDefault(span.TextSpan) | bit;
+        }
+
+        var primary = new List<Coloured>();
+        int lastEnd = -1;
+        foreach (var span in spans
+                     .Where(s => s_classificationMap.ContainsKey(s.ClassificationType))
+                     .OrderBy(s => s.TextSpan.Start)
+                     .ThenBy(s => s.TextSpan.End))
+        {
+            if (span.TextSpan.Start < lastEnd)
+                continue;
+            lastEnd = span.TextSpan.End;
+
+            primary.Add(new Coloured(
+                span.TextSpan,
+                s_typeIndex[s_classificationMap[span.ClassificationType]],
+                modifiersBySpan.GetValueOrDefault(span.TextSpan)));
+        }
+
+        var result = primary.ToArray();
+        if (compilation is not null)
+        {
+            s_classified[key] = new ClassificationEntry(new(document), new(compilation), result,
+                Interlocked.Increment(ref s_stampCounter));
+            if (s_classified.Count > MaxCachedResults)
+            {
+                foreach (var stale in s_classified.ToArray().OrderBy(pair => pair.Value.Stamp)
+                             .Take(s_classified.Count - MaxCachedResults + MaxCachedResults / 8))
+                    s_classified.TryRemove(stale);
+            }
+        }
+        return result;
     }
 
 
@@ -348,7 +412,7 @@ internal static class SemanticTokensHandler
     /// replaced by the pieces between the holes — which is also what makes the result look right:
     /// the quotes and the prose stay string-coloured, and only the holes change.
     /// </remarks>
-    private static List<Coloured> Carve(List<Coloured> primary, List<Coloured> embedded)
+    private static IReadOnlyList<Coloured> Carve(IReadOnlyList<Coloured> primary, List<Coloured> embedded)
     {
         if (embedded.Count == 0)
             return primary;

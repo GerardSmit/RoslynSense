@@ -202,6 +202,9 @@ export async function restore(captured: Snapshot): Promise<void> {
         if (relative.endsWith('/')) {
             await vscode.workspace.fs.createDirectory(target);
         } else {
+            // Snapshots record files and empty directories; non-empty parents must be rebuilt
+            // before writeFile, which does not create missing directories.
+            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(target, '..'));
             await vscode.workspace.fs.writeFile(target, content);
         }
     }

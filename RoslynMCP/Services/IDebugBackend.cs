@@ -98,6 +98,16 @@ internal interface IDebugBackend : IDisposable
     Task<string> StepOverAsync(CancellationToken cancellationToken = default);
     Task<string> StepOutAsync(CancellationToken cancellationToken = default);
 
+    async Task<(bool Ok, VariableInfo? Variable, string Error)> EvaluateVariableAsync(
+        string expression, int frameId, CancellationToken cancellationToken = default)
+    {
+        await SelectFrameAsync(frameId, cancellationToken);
+        var value = await EvaluateAsync(expression, cancellationToken);
+        return value.StartsWith("Error", StringComparison.OrdinalIgnoreCase)
+            ? (false, null, value)
+            : (true, new VariableInfo(expression, value, "", 0, 0, 0, true), "");
+    }
+
     Task<string> EvaluateAsync(string expression, CancellationToken cancellationToken = default);
     Task<string> GetLocalsAsync(CancellationToken cancellationToken = default);
     Task<string> GetStackTraceAsync(CancellationToken cancellationToken = default);
@@ -137,6 +147,10 @@ internal interface IDebugBackend : IDisposable
 
     /// <summary>Assigns to a variable or member path. Returns the value as the target reports it
     /// back, which is not always what was written (narrowing, property setters).</summary>
+    Task<(bool Ok, string Value, string Error)> SetVariableChildAsync(
+        int parentReference, string name, string value, CancellationToken cancellationToken = default) =>
+        Task.FromResult((false, "", "This backend cannot edit child variables."));
+
     Task<(bool Ok, string Value, string Error)> SetVariableAsync(
         string name, string value, int frameId = 0, CancellationToken cancellationToken = default);
 

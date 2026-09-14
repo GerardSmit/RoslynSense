@@ -49,6 +49,15 @@ public sealed class DebugDisplayOptions
     /// </summary>
     public bool RawView { get; set; } = true;
 
+    /// <summary>
+    /// List a lazy enumerable's elements when it is expanded — a LINQ query, an iterator method —
+    /// with its own state under <c>Raw View</c>, the way Rider shows it. Off lists the iterator's
+    /// members and puts the elements behind a <c>Results View</c>, the way VS shows it. Either
+    /// way the elements only exist once the sequence has run, and running it is what expanding
+    /// the value does.
+    /// </summary>
+    public bool EnumerateResults { get; set; } = true;
+
     /// <summary>How many elements of an array or collection to list before truncating.</summary>
     public int MaxChildren { get; set; } = 100;
 
@@ -83,6 +92,7 @@ public sealed class DebugDisplayOptions
         CallToString = false,
         JustMyCode = false,
         RawView = false,
+        EnumerateResults = false,
     };
 
     public DebugDisplayOptions Clone() => new()
@@ -93,6 +103,7 @@ public sealed class DebugDisplayOptions
         CallToString = CallToString,
         JustMyCode = JustMyCode,
         RawView = RawView,
+        EnumerateResults = EnumerateResults,
         MaxChildren = MaxChildren,
         SymbolInclude = SymbolInclude,
         SymbolExclude = SymbolExclude,

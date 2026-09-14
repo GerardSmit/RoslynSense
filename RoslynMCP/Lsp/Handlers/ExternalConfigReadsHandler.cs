@@ -52,8 +52,8 @@ internal static class ExternalConfigReadsHandler
                 continue;
             }
 
-            // The type declaration is where the decompiler puts you; the call is what was asked
-            // for. The key is in the decompiled text verbatim, so the read can be found in it.
+            // A helper can supply the key, so the literal may live in another member or type.
+            // Prefer the read's literal when present, then its containing member declaration.
             var (line, character) = LiteralPosition(decompiled.FilePath, read, ct)
                 ?? (decompiled.Line, decompiled.Character);
 
@@ -74,7 +74,7 @@ internal static class ExternalConfigReadsHandler
     {
         try
         {
-            return SourceMemberLocator.FindLiteral(
+            return SourceMemberLocator.FindConfigurationRead(
                 File.ReadAllText(filePath), read.Literal, read.MethodName, ct);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

@@ -375,6 +375,8 @@ public sealed class DebugVariable
     /// </remarks>
     public string VariablesReference { get; set; } = "";
 
+    public string EvaluateName { get; set; } = "";
+
     public bool Settable { get; set; }
 }
 

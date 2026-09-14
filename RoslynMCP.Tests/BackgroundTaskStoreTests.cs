@@ -7,6 +7,73 @@ namespace RoslynMCP.Tests;
 public sealed class BackgroundTaskStoreTests
 {
     [Fact]
+    public async Task MoreThan1024TasksOfOneKindCanBeRetainedWithoutBlockingCreation()
+    {
+        var store = new BackgroundTaskStore();
+        var retained = Enumerable.Range(0, 1024)
+            .Select(i => store.CreateTask(TaskKind.Tests, $"run {i}")).ToArray();
+        var next = Task.Run(() => store.CreateTask(TaskKind.Tests, "next run"));
+        try
+        {
+            string id = await next.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.DoesNotContain(id, retained);
+            Assert.Equal(1025, store.ListTasks().Count);
+            Assert.All(retained, oldId => Assert.NotNull(store.Get(oldId)));
+        }
+        finally
+        {
+            // Free the old namespace even on failure, so a regressed allocator cannot leave
+            // a worker spinning after this test ends.
+            foreach (string id in retained)
+            {
+                store.Complete(id, "done", 0);
+                store.Get(id)!.CompletedAt = DateTime.UtcNow.AddHours(-2);
+            }
+            store.ListTasks();
+            await next.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentCreationPreservesEveryTasksIdentityAndResult()
+    {
+        var store = new BackgroundTaskStore();
+        var ids = await Task.WhenAll(Enumerable.Range(0, 512).Select(i => Task.Run(() =>
+        {
+            string id = store.CreateTask(TaskKind.Build, $"build {i}");
+            store.Complete(id, $"result {i}", 0);
+            return (Id: id, Index: i);
+        })));
+
+        Assert.Equal(ids.Length, ids.Select(entry => entry.Id).Distinct().Count());
+        Assert.Equal(ids.Length, store.ListTasks().Count);
+        foreach (var (id, index) in ids)
+        {
+            Assert.Equal($"build {index}", store.Get(id)!.Description);
+            Assert.Equal($"result {index}", store.Get(id)!.Result);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task CancellingAWaitDoesNotCancelTheBackgroundTask(bool alreadyCancelled)
+    {
+        var store = new BackgroundTaskStore();
+        string id = store.CreateTask(TaskKind.Build, "build");
+        using var cancellation = new CancellationTokenSource();
+        if (alreadyCancelled) cancellation.Cancel();
+
+        var waiting = store.WaitForCompletionAsync(id, TimeSpan.FromSeconds(10), cancellation.Token);
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting);
+        Assert.Equal(BackgroundTaskStore.TaskStatus.Running, store.Get(id)!.Status);
+        store.Complete(id, "built", 0);
+        Assert.Equal("built", store.Get(id)!.Result);
+    }
+
+    [Fact]
     public void CreateTask_ReturnsUniqueId()
     {
         var store = new BackgroundTaskStore();

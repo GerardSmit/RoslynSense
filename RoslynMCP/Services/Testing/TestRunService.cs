@@ -156,6 +156,11 @@ public static partial class TestRunService
         }
 
         string workingDirectory = Path.GetDirectoryName(csprojPath) ?? Environment.CurrentDirectory;
+        using var timeout = timeoutSeconds > 0
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+            : null;
+        timeout?.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+        var runToken = timeout?.Token ?? cancellationToken;
 
         if (build)
         {
@@ -169,22 +174,34 @@ public static partial class TestRunService
             };
             MsBuildLocator.SetVsEnvironment(buildInfo, msbuild);
 
-            using var buildProcess = Process.Start(buildInfo);
-            if (buildProcess is null)
-                return new TestRunOutcome(-1, [], "", "Failed to start MSBuild.");
-
-            string buildOutput = await buildProcess.StandardOutput.ReadToEndAsync(cancellationToken);
-            string buildErrors = await buildProcess.StandardError.ReadToEndAsync(cancellationToken);
-            await buildProcess.WaitForExitAsync(cancellationToken);
-
-            if (buildProcess.ExitCode != 0)
+            try
             {
-                return new TestRunOutcome(buildProcess.ExitCode, [], buildOutput,
-                    FirstBuildError(buildOutput, buildErrors) ?? "The build failed.");
+                var built = await RunBuildProcessAsync(buildInfo, runToken);
+                if (built.ExitCode != 0)
+                {
+                    return new TestRunOutcome(built.ExitCode, [], built.Output,
+                        FirstBuildError(built.Output, built.Error) ?? "The build failed.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return new TestRunOutcome(-1, [], "", cancellationToken.IsCancellationRequested
+                    ? "Test run cancelled."
+                    : $"Test run timed out after {timeoutSeconds} seconds.");
             }
         }
 
-        string? assembly = MsBuildLocator.GetTargetPath(csprojPath);
+        string? assembly;
+        try
+        {
+            assembly = await GetFrameworkTargetPathAsync(msbuild, csprojPath, runToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return new TestRunOutcome(-1, [], "", cancellationToken.IsCancellationRequested
+                ? "Test run cancelled."
+                : $"Test run timed out after {timeoutSeconds} seconds.");
+        }
         if (assembly is null || !File.Exists(assembly))
         {
             return new TestRunOutcome(-1, [], "",
@@ -224,11 +241,8 @@ public static partial class TestRunService
 
         try
         {
-            using var timeout = timeoutSeconds > 0
-                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                : null;
-            timeout?.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
-            await process.WaitForExitAsync(timeout?.Token ?? cancellationToken);
+            // The build and test host share one deadline, like `dotnet test` does.
+            await process.WaitForExitAsync(runToken);
         }
         catch (OperationCanceledException)
         {
@@ -274,21 +288,76 @@ public static partial class TestRunService
         };
         MsBuildLocator.SetVsEnvironment(startInfo, msbuild);
 
-        using var process = Process.Start(startInfo);
-        if (process is null)
-            return (null, "Failed to start MSBuild.");
+        var built = await RunBuildProcessAsync(startInfo, cancellationToken);
+        if (built.ExitCode != 0)
+            return (null, FirstBuildError(built.Output, built.Error) ?? "The build failed.");
 
-        string stdout = await process.StandardOutput.ReadToEndAsync(cancellationToken);
-        string stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
-
-        if (process.ExitCode != 0)
-            return (null, FirstBuildError(stdout, stderr) ?? "The build failed.");
-
-        string? assembly = MsBuildLocator.GetTargetPath(csprojPath);
+        string? assembly = await GetFrameworkTargetPathAsync(msbuild, csprojPath, cancellationToken);
         return assembly is not null && File.Exists(assembly)
             ? (assembly, null)
             : (null, "Could not find the built test assembly.");
+    }
+
+    private static Task<string?> GetFrameworkTargetPathAsync(
+        string msbuild, string csprojPath, CancellationToken cancellationToken)
+    {
+        var startInfo = new ProcessStartInfo(msbuild)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(csprojPath),
+        };
+        startInfo.ArgumentList.Add(csprojPath);
+        startInfo.ArgumentList.Add("/nologo");
+        startInfo.ArgumentList.Add("/v:minimal");
+        startInfo.ArgumentList.Add(BuildProcessHelper.NoNodeReuseArg);
+        startInfo.ArgumentList.Add("/getProperty:TargetPath");
+        MsBuildLocator.SetVsEnvironment(startInfo, msbuild);
+        return ReadFrameworkTargetPathAsync(startInfo, cancellationToken);
+    }
+
+    internal static async Task<string?> ReadFrameworkTargetPathAsync(
+        ProcessStartInfo startInfo, CancellationToken cancellationToken)
+    {
+        var evaluated = await RunBuildProcessAsync(startInfo, cancellationToken);
+        // Preserve the existing property reader's tolerance for warnings before the value.
+        return evaluated.ExitCode == 0
+            ? evaluated.Output.Split('\n').Reverse().Select(line => line.Trim())
+                .FirstOrDefault(line => line.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                    || line.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            : null;
+    }
+
+    /// <summary>Captures a Framework build without blocking either redirected pipe.</summary>
+    internal static async Task<(int ExitCode, string Output, string Error)> RunBuildProcessAsync(
+        ProcessStartInfo startInfo, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        BuildProcessHelper.ConfigureMsBuildEnvironment(startInfo);
+        using var process = new Process { StartInfo = startInfo };
+        BuildProcessHelper.StartWithClosedInput(process);
+
+        // MSBuild can fill stderr while stdout is still open. Both streams must drain from
+        // the start, otherwise neither the process nor the first ReadToEnd can finish.
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken);
+            await Task.WhenAll(stdout, stderr).WaitAsync(cancellationToken);
+            return (process.ExitCode, await stdout, await stderr);
+        }
+        catch (OperationCanceledException)
+        {
+            // Disposing Process only releases our handle. Stop MSBuild and its children,
+            // then drain/reap them before a subsequent build can reuse their output files.
+            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            await process.WaitForExitAsync(CancellationToken.None);
+            await Task.WhenAll(stdout, stderr);
+            throw;
+        }
     }
 
     /// <summary>
@@ -302,7 +371,7 @@ public static partial class TestRunService
 
         return string.Join(" | ", fullyQualifiedNames
             .Distinct(StringComparer.Ordinal)
-            .Select(name => $"FullyQualifiedName~{name}"));
+            .Select(name => $"FullyQualifiedName={name}"));
     }
 
     /// <summary>
@@ -444,8 +513,10 @@ public static partial class TestRunService
     /// <remarks>
     /// The summary lines this must not match are excluded by the whitespace after the outcome:
     /// "Passed!  - Failed: 0, …" has "!" there and "     Failed: 1" has ":".
+    /// A theory's display name includes spaces and brackets in its arguments. Capture the
+    /// whole name, leaving only a duration suffix at the end of the line out of it.
     /// </remarks>
-    [GeneratedRegex(@"^\s*(Passed|Failed|Skipped)\s+([^\s!][^\s]*)(?:\s+\[\s*(?:<\s*)?([\d.,]+)\s*(ms|s|m)\s*\])?\s*$")]
+    [GeneratedRegex(@"^\s*(Passed|Failed|Skipped)\s+([^\s!].*?)(?:\s+\[\s*(?:<\s*)?([\d.,]+)\s*(ms|s|m)\s*\])?\s*$")]
     private static partial Regex OutcomeLine();
 
     [GeneratedRegex(@"^.*: error [A-Za-z]+\d+:.*$", RegexOptions.Multiline)]

@@ -43,7 +43,7 @@ public static class LspFeatureOptions
     /// This is what makes the solution-wide features answer about the whole solution rather than
     /// about whatever happens to be open — Search Everywhere, workspace symbols, find-references
     /// into a project nobody has visited. It costs one full MSBuild evaluation of the solution in
-    /// the background at start-up, and the memory to keep it; off restores the demand-driven
+    /// the background after the editor becomes idle, and the memory to keep it; off restores the demand-driven
     /// behaviour, which is the better trade only on a solution too large to hold at once.
     /// </remarks>
     public static bool LoadEntireSolution { get; set; } = EnvFlag("ROSLYNMCP_LOAD_ENTIRE_SOLUTION", true);

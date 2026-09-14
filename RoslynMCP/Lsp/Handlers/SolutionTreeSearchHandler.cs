@@ -119,8 +119,7 @@ internal static class SolutionTreeSearchHandler
             .Where(n => IsUnder(path, Path.GetDirectoryName(n.Path!)))
             // The most deeply nested project wins, so a file in a nested project is not claimed
             // by an ancestor project that merely shares the directory prefix.
-            .OrderByDescending(n => n.Path!.Length)
-            .FirstOrDefault();
+            .MaxBy(n => Path.GetDirectoryName(n.Path!)!.Length);
 
         if (owner?.Path is null)
             return Task.FromResult(new SolutionTreeRevealResult([]));

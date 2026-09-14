@@ -20,6 +20,8 @@ internal sealed class InfrastructureCleanupHostedService : IHostedService
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        await HotReload.HotReloadService.StopAllAsync();
+        Memory.MemoryCacheRegistry.WorkspaceChanged();
         await WorkspaceService.EvictAllAsync(cancellationToken);
         AnalyzerService.DisposeHost();
         ProjectIndexCacheService.DisposeAll();

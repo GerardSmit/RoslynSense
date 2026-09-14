@@ -1,4 +1,4 @@
-using RoslynMCP.Lsp;
+﻿using RoslynMCP.Lsp;
 using RoslynMCP.Lsp.Handlers;
 using RoslynMCP.Lsp.Protocol;
 using Xunit;
@@ -122,15 +122,20 @@ public class LspResolveTests
     }
 
     [Fact]
-    public async Task ResolveWithStaleDataReturnsItemUnchanged()
+    public async Task ResolveWithStaleDataAsksTheClientToReopenTheMenu()
     {
         var cache = new LspResolveCache();
         var stale = new RoslynMCP.Lsp.Protocol.CodeAction("stale", "quickfix", null)
         {
             Data = new CodeActionData(999),
         };
-        var resolved = await CodeActionHandler.ResolveAsync(stale, cache, default);
-        Assert.Null(resolved.Edit);
+
+        // An id the cache no longer holds is reported rather than answered with an empty edit:
+        // a menu item that resolves to nothing silently does nothing, and the client has no way
+        // to tell that from an action that genuinely changes no text.
+        var expired = await Assert.ThrowsAsync<StreamJsonRpc.LocalRpcException>(
+            () => CodeActionHandler.ResolveAsync(stale, cache, default));
+        Assert.Equal(-32801, expired.ErrorCode);
     }
 
     private static (int Line, int Character) PositionOf(string text, string anchor)

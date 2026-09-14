@@ -33,14 +33,21 @@ internal static class HotReloadRouting
     /// while the built output still matches the source.
     /// </summary>
     public static async Task<string?> StartSessionAsync(
-        string projectPath, CancellationToken ct = default)
+        string projectPath, CancellationToken ct = default, string? ownerId = null, int? ownerPid = null)
     {
-        var (ok, result) = await AskDaemonAsync(projectPath, "start", ct);
+        var (ok, result) = await AskDaemonAsync(projectPath, "start", ct, ownerId, ownerPid);
         return ok ? result : null;
     }
 
+    public static async Task ReleaseSessionAsync(string projectPath, string ownerId)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var (ok, _) = await AskDaemonAsync(projectPath, "release", timeout.Token, ownerId);
+        if (!ok) Console.Error.WriteLine("[HotReload] Owner release could not reach the daemon; target-liveness cleanup will retry.");
+    }
+
     private static async Task<(bool Ok, string? Result)> AskDaemonAsync(
-        string projectPath, string action, CancellationToken ct)
+        string projectPath, string action, CancellationToken ct, string? ownerId = null, int? ownerPid = null)
     {
         try
         {
@@ -49,7 +56,9 @@ internal static class HotReloadRouting
             if (solutionKey is null)
                 return (false, null);
 
-            var pipe = await DaemonSpawner.ConnectOrSpawnAsync(solutionKey, ct);
+            var pipe = action == "release"
+                ? await DaemonSpawner.TryConnectAsync(HostPaths.PipeName(solutionKey), ct)
+                : await DaemonSpawner.ConnectOrSpawnAsync(solutionKey, ct);
             if (pipe is null)
                 return (false, null);
 
@@ -57,7 +66,7 @@ internal static class HotReloadRouting
             {
                 var request = new DaemonRequest(
                     Guid.NewGuid().ToString("N"), action,
-                    new Dictionary<string, string> { ["projectPath"] = projectPath },
+                    new Dictionary<string, string> { ["projectPath"] = projectPath, ["ownerId"] = ownerId ?? "manual", ["ownerPid"] = ownerPid?.ToString() ?? "" },
                     "markdown", Kind: "hot-reload");
                 await IpcProtocol.WriteMessageAsync(pipe, request, ct);
                 var response = await IpcProtocol.ReadMessageAsync<DaemonResponse>(pipe, ct);

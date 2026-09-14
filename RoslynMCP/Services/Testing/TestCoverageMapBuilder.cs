@@ -63,7 +63,9 @@ public static class TestCoverageMapBuilder
             return Failed($"No tests were discovered in '{Path.GetFileName(csproj)}'.");
 
         var existing = TestCoverageMapStore.Load(solution);
-        var byClass = existing.Entries.ToDictionary(e => e.ClassFullName, StringComparer.Ordinal);
+        var byClass = existing.Entries
+            .Where(e => string.Equals(e.ProjectPath, csproj, StringComparison.OrdinalIgnoreCase))
+            .ToDictionary(e => e.ClassFullName, StringComparer.Ordinal);
 
         // Grouped by the class's *full* name: two classes with the same short name in different
         // namespaces are different entries, and the run filter has to name them apart anyway.
@@ -79,11 +81,12 @@ public static class TestCoverageMapBuilder
         int run = 0, reused = 0, completed = 0;
         var gate = new object();
 
-        // Classes outside this project keep whatever the map already holds for them — a build
-        // scoped to one test project must not erase another's entries.
+        // A scoped build replaces only its selected classes. Preserve the rest of the project
+        // as well as other projects, whose classes may have the same fully-qualified names.
         foreach (var entry in existing.Entries)
         {
-            if (!string.Equals(entry.ProjectPath, csproj, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(entry.ProjectPath, csproj, StringComparison.OrdinalIgnoreCase)
+                || classFilter is not null && !entry.ClassFullName.Contains(classFilter, StringComparison.OrdinalIgnoreCase))
                 entries.Add(entry);
         }
 
@@ -132,7 +135,7 @@ public static class TestCoverageMapBuilder
                     item.ClassName, Volatile.Read(ref completed), groups.Count, "running"));
 
                 var result = await CoverageService.CollectAsync(
-                    csproj, $"FullyQualifiedName~{item.ClassName}", timeoutSecondsPerClass, token,
+                    csproj, TestRunService.BuildFilter(item.TestNames), timeoutSecondsPerClass, token,
                     noBuild: true, dynamicInstrumentation: dynamicInstrumentation);
 
                 // A probe that produced no report at all failed as a collector, not as a test

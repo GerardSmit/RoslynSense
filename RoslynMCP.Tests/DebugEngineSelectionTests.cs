@@ -33,8 +33,11 @@ public class DebugEngineSelectionTests
             var legacy = DebugSessionManager.CreateSessionForProject(FixturePaths.LegacyProjectFile);
             Assert.IsType<IcorDebugBackend>(Unwrap(legacy));
 
+            // .NET gets the tool's own engine where it runs and netcoredbg elsewhere.
             var modern = DebugSessionManager.CreateSessionForProject(FixturePaths.SampleProjectFile);
-            Assert.IsType<DebuggerService>(Unwrap(modern));
+            Assert.IsType(
+                OperatingSystem.IsWindows() ? typeof(IcorDebugBackend) : typeof(DebuggerService),
+                Unwrap(modern));
         }
         finally
         {
@@ -43,7 +46,7 @@ public class DebugEngineSelectionTests
     }
 
     [Fact]
-    public void WhenTheCoreClrEngineIsOptedIntoThenTheIcorDebugBackendIsUsed()
+    public void WhenTheCoreClrEngineIsNamedThenTheIcorDebugBackendIsUsed()
     {
         var restore = Config.DebugEngineOptions.CoreClr;
         try

@@ -10,6 +10,66 @@ namespace RoslynMCP.Tests;
 public class SingleFlightTests
 {
     [Fact]
+    public async Task ConcurrentCallersOnlyInvokeTheFactoryOnce()
+    {
+        var flight = new SingleFlight();
+        using var callersReady = new Barrier(8);
+        using var releaseFactory = new ManualResetEventSlim();
+        var factoryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int started = 0;
+
+        Task Run(string _)
+        {
+            Interlocked.Increment(ref started);
+            factoryEntered.TrySetResult();
+            if (!releaseFactory.Wait(TimeSpan.FromSeconds(10)))
+                throw new TimeoutException("The test did not release the factory.");
+            return runFinished.Task;
+        }
+
+        // Dedicated threads keep a blocked factory from starving the other contenders.
+        var callers = Enumerable.Range(0, 8).Select(_ => Task.Factory.StartNew(() =>
+        {
+            if (!callersReady.SignalAndWait(TimeSpan.FromSeconds(10)))
+                throw new TimeoutException("The callers did not rendezvous.");
+            return flight.Start("target", Run);
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+
+        try
+        {
+            await factoryEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            // Keep the factory open while the other threads contend for the same entry.
+            await Task.Delay(100);
+        }
+        finally
+        {
+            releaseFactory.Set();
+        }
+
+        var runs = await Task.WhenAll(callers).WaitAsync(TimeSpan.FromSeconds(10));
+        runFinished.SetResult();
+        await Task.WhenAll(runs);
+        Assert.Equal(1, started);
+        Assert.All(runs, run => Assert.Same(runs[0], run));
+    }
+
+    [Fact]
+    public async Task ASynchronousFactoryFailureDoesNotPoisonTheKey()
+    {
+        var flight = new SingleFlight();
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = flight.Start("target", _ =>
+                throw new InvalidOperationException("failed before returning a task"));
+        });
+        Assert.False(flight.IsInFlight("target"));
+
+        await flight.Start("target", _ => Task.CompletedTask);
+        Assert.False(flight.IsInFlight("target"));
+    }
+
+    [Fact]
     public async Task SecondCallerJoinsTheRunTheFirstStarted()
     {
         var flight = new SingleFlight();

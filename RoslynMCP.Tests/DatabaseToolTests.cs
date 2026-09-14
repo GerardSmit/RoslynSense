@@ -692,6 +692,23 @@ public sealed class PostgresIntegrationTests : IClassFixture<PostgresContainerFi
     }
 
     [RequiresPsqlFact]
+    public async Task Postgres_JsonParameters_PreserveNumericTypesAndPrecision()
+    {
+        var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
+        var output = await DatabaseTool.DbQuery("pg", """
+            SELECT @id AS id, @amount AS amount,
+                   CASE WHEN @fraction > 1 AND @fraction < 2 THEN 1 ELSE 0 END AS comparison,
+                   pg_typeof(@id)::text AS id_type, pg_typeof(@amount)::text AS amount_type
+            """, reg, s_fmt, s_planStore,
+            parameters: """{"@id":9007199254740993,"@amount":1234567890.123456789,"@fraction":1.5}""");
+
+        Assert.DoesNotContain("Error", output);
+        // Equality alone can pass after both operands are promoted to an already-rounded
+        // double. Assert the returned values and their actual database parameter types.
+        Assert.Contains("| 9007199254740993 | 1234567890.123456789 | 1 | bigint | numeric |", output);
+    }
+
+    [RequiresPsqlFact]
     public async Task Postgres_CreateInsertSelect_RoundTrip()
     {
         var reg = new DbConnectionRegistry([new PostgresDbProvider("pg", _fx.ConnectionString)]);
@@ -862,6 +879,22 @@ public sealed class MssqlIntegrationTests : IClassFixture<MssqlContainerFixture>
         var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
         var output = await DatabaseTool.DbQuery("sql", "SELECT 1 AS n", reg, s_fmt, s_planStore);
         Assert.Contains("1", output);
+    }
+
+    [RequiresMssqlFact]
+    public async Task Mssql_JsonParameters_PreserveNumericTypesAndPrecision()
+    {
+        var reg = new DbConnectionRegistry([new MssqlDbProvider("sql", _fx.ConnectionString)]);
+        var output = await DatabaseTool.DbQuery("sql", """
+            SELECT @id AS id, @amount AS amount,
+                   CASE WHEN @fraction > 1 AND @fraction < 2 THEN 1 ELSE 0 END AS comparison,
+                   SQL_VARIANT_PROPERTY(@id, 'BaseType') AS id_type,
+                   SQL_VARIANT_PROPERTY(@amount, 'BaseType') AS amount_type
+            """, reg, s_fmt, s_planStore,
+            parameters: """{"@id":9007199254740993,"@amount":1234567890.123456789,"@fraction":1.5}""");
+
+        Assert.DoesNotContain("Error", output);
+        Assert.Contains("| 9007199254740993 | 1234567890.123456789 | 1 | bigint | decimal |", output);
     }
 
     [RequiresMssqlFact]

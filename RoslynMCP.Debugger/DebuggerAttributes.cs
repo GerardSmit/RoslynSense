@@ -293,6 +293,15 @@ public static class DebuggerDisplayFormat
         {
             var c = format[i];
 
+            // A backslash escapes a brace too: the compiler's own display for an anonymous type
+            // is "\{ A = {A} }", and without this every anonymous type showed as a parse error.
+            if (c == '\\' && i + 1 < format.Length && format[i + 1] is '{' or '}')
+            {
+                literal.Append(format[i + 1]);
+                i++;
+                continue;
+            }
+
             if (c == '{' && i + 1 < format.Length && format[i + 1] == '{')
             {
                 literal.Append('{');
@@ -345,7 +354,9 @@ public static class DebuggerDisplayFormat
         var depth = 0;
         for (var i = open; i < format.Length; i++)
         {
-            if (format[i] == '{')
+            if (format[i] == '\\' && i + 1 < format.Length && format[i + 1] is '{' or '}')
+                i++;
+            else if (format[i] == '{')
                 depth++;
             else if (format[i] == '}' && --depth == 0)
                 return i;

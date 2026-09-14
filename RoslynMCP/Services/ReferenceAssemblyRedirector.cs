@@ -13,6 +13,26 @@ internal static class ReferenceAssemblyRedirector
 {
     private const int MaxForwardHops = 4;
 
+    /// <summary>Preserve assembly identity while exposing members omitted from reference metadata.</summary>
+    internal static string RedirectForBrowsing(string assemblyPath)
+    {
+        try
+        {
+            if (IsReferenceAssembly(assemblyPath)
+                && FindImplementationDirectory(assemblyPath) is { } directory)
+            {
+                string candidate = Path.Combine(directory, Path.GetFileName(assemblyPath));
+                if (File.Exists(candidate)
+                    && string.Equals(System.Reflection.AssemblyName.GetAssemblyName(assemblyPath).FullName,
+                        System.Reflection.AssemblyName.GetAssemblyName(candidate).FullName,
+                        StringComparison.OrdinalIgnoreCase))
+                    return candidate;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or BadImageFormatException) { }
+        return assemblyPath;
+    }
+
     public static string RedirectToImplementation(string assemblyPath, string reflectionTypeName)
     {
         try
@@ -85,6 +105,19 @@ internal static class ReferenceAssemblyRedirector
     {
         string normalized = Path.GetFullPath(assemblyPath);
         var parts = normalized.Split(Path.DirectorySeparatorChar);
+
+        if (OperatingSystem.IsWindows()
+            && normalized.Replace('\\', '/').Contains(
+                "/Reference Assemblies/Microsoft/Framework/.NETFramework/v4.", StringComparison.OrdinalIgnoreCase))
+        {
+            string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            foreach (string architecture in new[] { "Framework64", "Framework" })
+            {
+                string runtime = Path.Combine(windows, "Microsoft.NET", architecture, "v4.0.30319");
+                if (File.Exists(Path.Combine(runtime, Path.GetFileName(assemblyPath))))
+                    return runtime;
+            }
+        }
 
         int packsIndex = Array.FindIndex(parts, p => p.Equals("packs", StringComparison.OrdinalIgnoreCase));
         if (packsIndex >= 0 && packsIndex + 2 < parts.Length

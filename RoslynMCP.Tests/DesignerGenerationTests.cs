@@ -281,6 +281,37 @@ public class DesignerGenerationTests
     }
 
     [Fact]
+    public async Task WhenFieldDeclaredInBaseClassThenDesignerSkipsItRatherThanShadowIt()
+    {
+        // A derived page repeats the base page's markup and adds to it. The base class's own
+        // designer (a separate file, not the one being regenerated) already declares those
+        // controls; the derived designer must only declare what the derived markup adds.
+        await using var scenario = await MarkupScenario.CreateAsync(
+            markup: """
+                    <%@ Page Language="C#" Inherits="Fixture.DerivedPage" %>
+                    <asp:Label ID="lblInherited" runat="server" />
+                    <asp:Label ID="lblOwn" runat="server" />
+                    """,
+            codeBehind: """
+                        namespace Fixture {
+                            public partial class BasePage : System.Web.UI.Page {
+                                protected System.Web.UI.WebControls.Label lblInherited;
+                            }
+                            public partial class DerivedPage : BasePage {
+                            }
+                        }
+                        """);
+
+        var content = await scenario.GenerateAsync();
+
+        // Declaring lblInherited again would hide the base field (CS0108) and leave the base
+        // class's code looking at a control that is never assigned.
+        Assert.DoesNotContain("lblInherited", content);
+        Assert.Contains("lblOwn;", content);
+        Assert.Equal(1, CountFields(content));
+    }
+
+    [Fact]
     public async Task WhenInheritsCannotBeResolvedThenGenerationFailsWithoutContent()
     {
         await using var scenario = await MarkupScenario.CreateAsync(

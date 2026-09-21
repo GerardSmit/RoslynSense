@@ -792,6 +792,50 @@ internal static class AnalyzerDiagnosticCache
             work.Cancel();
     }
 
+    /// <summary>
+    /// Drops every document of the given projects: the projects of a workspace that was just
+    /// evicted, whose DocumentIds nothing will ever ask for again.
+    /// </summary>
+    /// <remarks>
+    /// The per-document <see cref="Evict"/> is reached for edits and removals, and <see cref="Clear"/>
+    /// for configuration changes — but a solution reload was neither, so the entries of every
+    /// document in the old solution stayed. Two costs. Findings hold symbols (as message
+    /// arguments), and a symbol holds its compilation, so each dead entry pinned the compilation
+    /// it came from: a daemon reloaded twenty times over two days held 900 compilations and 14 GB.
+    /// And <see cref="s_analyzedVersions"/> counted the dead ids as "analyzed", which grew the
+    /// cap in <see cref="Trim"/> toward its ceiling and let the dead entries stay under it while
+    /// the live ones were the ones evicted.
+    /// </remarks>
+    public static void EvictProjects(IEnumerable<ProjectId> projectIds)
+    {
+        var projects = projectIds.ToHashSet();
+        if (projects.Count == 0)
+            return;
+
+        List<DiagnosticFlight<ImmutableArray<Diagnostic>>> invalidated = [];
+        lock (s_gate)
+        {
+            s_invalidationGeneration++;
+            foreach (var id in s_entries.Keys.Concat(s_analyzedVersions.Keys).Concat(s_latestRequested.Keys)
+                .Where(id => projects.Contains(id.ProjectId)).Distinct().ToArray())
+            {
+                s_entries.TryRemove(id, out _);
+                s_analyzedVersions.TryRemove(id, out _);
+                s_latestRequested.TryRemove(id, out _);
+                MemberEditAnalysis.Forget(id);
+            }
+            foreach (var key in s_inFlight.Keys.Where(key => projects.Contains(key.Item1.ProjectId)).ToArray())
+            {
+                s_inFlight[key].Invalidated = true;
+                invalidated.Add(s_inFlight[key]);
+                s_inFlight.Remove(key);
+            }
+            CompilerDiagnosticCache.EvictProjects(projects);
+        }
+        foreach (var work in invalidated)
+            work.Cancel();
+    }
+
     /// <summary>Drops everything — used when analyzer configuration changes (.editorconfig edits).</summary>
     public static void Clear()
     {

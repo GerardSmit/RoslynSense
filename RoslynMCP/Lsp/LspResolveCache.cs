@@ -150,6 +150,14 @@ internal sealed class LspResolveCache : IMemoryCache, IDisposable
             _groups.Count, _groups.Count + (_completionDocument is null ? 0 : 1));
     }
 
+    /// <summary>
+    /// LSP's ContentModified error code. The client treats it as "the buffer moved under this
+    /// request" and quietly asks again; it is an answer, not a failure — see
+    /// <see cref="LspServer"/>'s routing, which lets it through where every other exception is
+    /// logged and swallowed.
+    /// </summary>
+    public const int ContentModified = -32801;
+
     public static Exception Expired(string kind) => new StreamJsonRpc.LocalRpcException(
-        $"The {kind} has expired or the document changed. Reopen the menu to request it again.") { ErrorCode = -32801 };
+        $"The {kind} has expired or the document changed. Reopen the menu to request it again.") { ErrorCode = ContentModified };
 }

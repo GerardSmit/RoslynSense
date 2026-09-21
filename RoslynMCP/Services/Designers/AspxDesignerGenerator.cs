@@ -390,6 +390,19 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
         return left;
     }
 
+    /// <summary>
+    /// Whether a control's field already exists somewhere the regenerated designer must not
+    /// shadow: by hand in the code-behind, or anywhere in a base class.
+    /// </summary>
+    /// <remarks>
+    /// A page or control that derives from another page's code-behind (a customer variant of a
+    /// module edit control, say) repeats much of the base markup, and the base class's own designer
+    /// already declares those fields. Visual Studio leaves them out of the derived designer for
+    /// that reason, and re-declaring them here would hide the base fields (CS0108) and leave the
+    /// base class's event handlers looking at controls that were never assigned. A base member is
+    /// counted whatever file declares it — including the base class's designer, and including
+    /// metadata when the base lives in another assembly — since none of those are being replaced.
+    /// </remarks>
     private static bool IsDeclaredOutsideDesigner(
         INamedTypeSymbol codeBehind, string memberName, IReadOnlySet<string> designerPaths)
     {
@@ -399,6 +412,15 @@ internal sealed class AspxDesignerGenerator : IDesignerGenerator
             {
                 var path = reference.SyntaxTree.FilePath;
                 if (!string.IsNullOrEmpty(path) && !designerPaths.Contains(path))
+                    return true;
+            }
+        }
+
+        for (var baseType = codeBehind.BaseType; baseType is not null; baseType = baseType.BaseType)
+        {
+            foreach (var member in baseType.GetMembers(memberName))
+            {
+                if (member.DeclaredAccessibility != Accessibility.Private)
                     return true;
             }
         }

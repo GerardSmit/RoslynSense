@@ -205,6 +205,18 @@ internal sealed class DbmlGeneratedIndex
 
     internal static void Clear() => s_indexes.Clear();
 
+    /// <summary>
+    /// Drops the indexes of projects whose workspace was evicted. An index maps declarations to
+    /// symbols, and a symbol holds its compilation; keyed by ProjectId, a reloaded solution's
+    /// entries were never asked for again and never released either.
+    /// </summary>
+    public static void EvictProjects(IEnumerable<ProjectId> projectIds)
+    {
+        var projects = projectIds.ToHashSet();
+        foreach (var key in s_indexes.Keys.Where(key => projects.Contains(key.Project)).ToArray())
+            s_indexes.TryRemove(key, out _);
+    }
+
     // ---- Binding --------------------------------------------------------------------------------
 
     private static async Task<DbmlGeneratedIndex> BuildAsync(

@@ -851,6 +851,14 @@ internal sealed class LspServer : IDisposable
         {
             throw;
         }
+        catch (StreamJsonRpc.LocalRpcException ex) when (ex.ErrorCode == LspResolveCache.ContentModified)
+        {
+            // Not broken: the buffer moved while the request was being answered. The code is
+            // what tells the client to ask again, so it must reach the wire; swallowing it here
+            // sent an empty answer and, once a minute, a "Completion failed" warning the user
+            // read as the server being broken.
+            throw;
+        }
         catch (Exception ex)
         {
             ReportBroken(method, uri, ex);
@@ -877,6 +885,10 @@ internal sealed class LspServer : IDisposable
             return await body();
         }
         catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (StreamJsonRpc.LocalRpcException ex) when (ex.ErrorCode == LspResolveCache.ContentModified)
         {
             throw;
         }

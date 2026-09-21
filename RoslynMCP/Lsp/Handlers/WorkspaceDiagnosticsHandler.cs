@@ -934,6 +934,7 @@ internal static class WorkspaceDiagnosticsHandler
     /// </summary>
     private static readonly RefreshBatch s_backgroundBatch = new(TimeSpan.FromSeconds(15));
 
+
     /// <summary>
     /// Brings a project's whole-compilation-only warnings up to date, off the request path.
     /// </summary>
@@ -949,6 +950,11 @@ internal static class WorkspaceDiagnosticsHandler
         if (!s_refreshingWide.TryAdd(project.Id, 0))
             return;
 
+        // Only the id and the workspace cross into the queue — see RecomputeInBackground.
+        var workspace = project.Solution.Workspace;
+        var projectId = project.Id;
+        string projectName = project.Name;
+
         s_backgroundBatch.Enter();
         _ = Task.Run(async () =>
         {
@@ -959,7 +965,8 @@ internal static class WorkspaceDiagnosticsHandler
                 await s_recomputeSlots.WaitAsync();
                 try
                 {
-                    moved = await ProjectWideDiagnosticCache.RefreshAsync(project, CancellationToken.None);
+                    if (LiveSnapshot.Project(workspace, projectId) is { } current)
+                        moved = await ProjectWideDiagnosticCache.RefreshAsync(current, CancellationToken.None);
                 }
                 finally
                 {
@@ -972,12 +979,12 @@ internal static class WorkspaceDiagnosticsHandler
                 // in one session with two anonymous one-liners, and nothing recorded the frame.
                 // The key rate-limits the editor toast; stderr keeps every stack.
                 LspLog.Error(
-                    $"Project-wide diagnostics for '{project.Name}' failed: {ex}",
+                    $"Project-wide diagnostics for '{projectName}' failed: {ex}",
                     key: "project-wide-diagnostics-crash");
             }
             finally
             {
-                s_refreshingWide.TryRemove(project.Id, out _);
+                s_refreshingWide.TryRemove(projectId, out _);
 
                 // Only when the answer moved, or the refresh runs the sweep that starts the pass
                 // that asks for the refresh — and only once the batch it belongs to has settled.
@@ -997,6 +1004,19 @@ internal static class WorkspaceDiagnosticsHandler
         if (!s_recomputing.TryAdd(document.Id, 0))
             return;
 
+        // Only the id and the workspace cross into the queue, never the Document. A Document is
+        // a Solution snapshot, and the snapshot holds every compilation it has built — so each
+        // queued item pinned the whole solution as it was when the sweep queued it. On a large
+        // solution the queue ran thousands deep behind the few slots below: a daemon was found
+        // holding 5,000 of these, 30 distinct snapshots and 900 compilations across them, at
+        // 14 GB. And once one finally ran, it analyzed that stale snapshot — work whose result
+        // no request would ask for, on a version that had moved on long before. The live
+        // document is looked up when the slot is taken (see LiveSnapshot), and a document whose
+        // workspace has since been evicted, or that is gone from it, is simply skipped.
+        var workspace = document.Project.Solution.Workspace;
+        var documentId = document.Id;
+        string documentName = document.Name;
+
         s_backgroundBatch.Enter();
         _ = Task.Run(async () =>
         {
@@ -1006,38 +1026,40 @@ internal static class WorkspaceDiagnosticsHandler
             {
                 // Capped as well as deduplicated: the documents are distinct, so the guard above
                 // does not bound how many run together.
-                var before = AnalyzerDiagnosticCache.TryGetPrevious(document);
-
                 await s_recomputeSlots.WaitAsync();
-                ImmutableArray<Microsoft.CodeAnalysis.Diagnostic> after;
                 try
                 {
-                    after = await AnalyzerDiagnosticCache.GetOrComputeAsync(
-                        document, CancellationToken.None);
+                    if (LiveSnapshot.Document(workspace, documentId) is not { } current)
+                        return;
+
+                    var before = AnalyzerDiagnosticCache.TryGetPrevious(current);
+                    var after = await AnalyzerDiagnosticCache.GetOrComputeAsync(
+                        current, CancellationToken.None);
+
+                    // Only when the answer actually moved. A declaration change shifts the
+                    // project's dependent semantic version, so every closed document in it
+                    // misses the cache and lands here; refreshing unconditionally meant each of
+                    // those completions asked the editor to re-pull, which ran another sweep,
+                    // which missed again. Editing a signature never converged — the very
+                    // symptom this was meant to remove.
+                    changed = !AnalyzerDiagnosticCache.SameFindings(before, after);
                 }
                 finally
                 {
                     s_recomputeSlots.Release();
                 }
-
-                // Only when the answer actually moved. A declaration change shifts the project's
-                // dependent semantic version, so every closed document in it misses the cache and
-                // lands here; refreshing unconditionally meant each of those completions asked the
-                // editor to re-pull, which ran another sweep, which missed again. Editing a
-                // signature never converged — the very symptom this was meant to remove.
-                changed = !AnalyzerDiagnosticCache.SameFindings(before, after);
             }
             catch (Exception ex)
             {
                 // Full stack for the same reason as the project-wide catch above: a message alone
                 // ("Object reference not set…") cost a day of guessing at the throwing frame.
                 LspLog.Error(
-                    $"Background analyzers for '{document.Name}' failed: {ex}",
+                    $"Background analyzers for '{documentName}' failed: {ex}",
                     key: "background-analyzers-crash");
             }
             finally
             {
-                s_recomputing.TryRemove(document.Id, out _);
+                s_recomputing.TryRemove(documentId, out _);
 
                 // And only once per settled batch, not per document: a rebuild of the analyzers
                 // queues one of these for every closed file in the solution, and refreshing as

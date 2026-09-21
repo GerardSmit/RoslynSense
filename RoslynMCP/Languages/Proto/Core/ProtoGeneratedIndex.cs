@@ -353,6 +353,21 @@ internal sealed class ProtoGeneratedIndex
     private static readonly ConcurrentDictionary<ProjectId, IndexCacheEntry> s_indexes = new();
 
     /// <summary>
+    /// Drops the entries of projects whose workspace was evicted. The scan entry holds the
+    /// compilation it was taken from outright, and the index holds symbols that hold theirs;
+    /// keyed by ProjectId, a reloaded solution's entries were never asked for again and never
+    /// released either.
+    /// </summary>
+    public static void EvictProjects(IEnumerable<ProjectId> projectIds)
+    {
+        foreach (var id in projectIds)
+        {
+            s_scans.TryRemove(id, out _);
+            s_indexes.TryRemove(id, out _);
+        }
+    }
+
+    /// <summary>
     /// The index for one project, built once per set of declarations and reused after.
     /// </summary>
     /// <remarks>

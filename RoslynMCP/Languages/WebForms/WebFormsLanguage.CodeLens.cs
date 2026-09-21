@@ -34,7 +34,12 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
     /// and this memo re-key on whatever compilation the graft produced.
     /// </para>
     /// </remarks>
-    private sealed record LensGeneration(string Text, Compilation Compilation);
+    /// <remarks>
+    /// The compilation by identity, not by reference — see <see cref="WeakGeneration"/>. The
+    /// document service already keeps the bound document weakly with a small strong working set;
+    /// a strong reference here would have kept up to eight compilations past that.
+    /// </remarks>
+    private sealed record LensGeneration(string Text, WeakGeneration Compilation);
 
     /// <remarks>
     /// Without this the memo passes the pack straight through, and every <c>codeLens/resolve</c> —
@@ -48,7 +53,7 @@ internal sealed partial class WebFormsLanguage : ILanguageCodeLensProvider, ILan
         var document = await AspxDocumentService.GetAsync(LspConverters.UriToPath(uri), ct);
         return document is null
             ? null
-            : new LensGeneration(document.Text, document.Compilation);
+            : new LensGeneration(document.Text, new WeakGeneration(document.Compilation));
     }
 
     /// <summary>

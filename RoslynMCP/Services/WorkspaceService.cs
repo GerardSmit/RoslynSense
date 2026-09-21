@@ -163,6 +163,26 @@ internal static class WorkspaceService
     private static readonly Timer s_evictionTimer;
 
     /// <summary>
+    /// Workspaces this service has evicted, for work that was queued against one of them and only
+    /// dequeues later. Weak on the key so the mark never keeps a dead workspace alive itself.
+    /// </summary>
+    /// <remarks>
+    /// A membership test against <see cref="s_cache"/> would answer the same question for
+    /// workspaces this service loaded, and the wrong one for every other: the tests' AdhocWorkspace
+    /// was never cached, and background work over it must still run.
+    /// </remarks>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Workspace, object> s_evicted = new();
+    private static readonly object s_evictedMark = new();
+
+    /// <summary>
+    /// Whether <paramref name="workspace"/> has been evicted: nothing derived from it is worth
+    /// computing any more, and its <c>CurrentSolution</c> is the last one it had, not a live one.
+    /// </summary>
+    public static bool IsEvicted(Workspace workspace) => s_evicted.TryGetValue(workspace, out _);
+
+    internal static void MarkEvictedForTesting(Workspace workspace) => s_evicted.AddOrUpdate(workspace, s_evictedMark);
+
+    /// <summary>
     /// Reverse index: analyzer / source-generator source directory â†’ set of cached
     /// project paths whose workspace pinned an ALC for that directory. Used to evict
     /// affected workspaces when <see cref="ShadowCopyManager"/> reports a rebuild.
@@ -3521,7 +3541,20 @@ internal static class WorkspaceService
         }
 
         UnregisterShadowDirsLocked(cacheKey, entry.ShadowDirs);
+
+        // Everything derived from this workspace's DocumentIds goes with it. The diagnostic
+        // caches are keyed by DocumentId and their entries hold symbols, which hold compilations;
+        // left behind, every reload's worth of them stayed resident until the process ended.
+        // Read before Dispose so the id set is the solution's own, not a guess from the map.
+        ProjectId[] projectIds;
+        try { projectIds = [.. entry.Workspace.CurrentSolution.ProjectIds]; }
+        catch (ObjectDisposedException) { projectIds = [.. entry.ProjectIds.Values]; }
+        s_evicted.AddOrUpdate(entry.Workspace, s_evictedMark);
         entry.Dispose();
+        Lsp.AnalyzerDiagnosticCache.EvictProjects(projectIds);
+        Lsp.ProjectWideDiagnosticCache.EvictProjects(projectIds);
+        Languages.Dbml.Core.DbmlGeneratedIndex.EvictProjects(projectIds);
+        Languages.Proto.Core.ProtoGeneratedIndex.EvictProjects(projectIds);
 
         // Analyzer host entries are keyed per project FilePath, so evict for every project
         // this workspace served (a solution entry served many).

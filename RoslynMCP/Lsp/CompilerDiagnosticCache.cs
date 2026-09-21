@@ -263,6 +263,43 @@ internal static class CompilerDiagnosticCache
             work.Cancel();
     }
 
+    /// <summary>
+    /// Drops every document of the given projects — a workspace that was evicted, whose
+    /// DocumentIds nothing will ever ask for again.
+    /// </summary>
+    /// <remarks>
+    /// Without this, the entries outlived the solution they were computed from, and they are not
+    /// small: a compiler diagnostic carries its symbols as message arguments, and a symbol holds
+    /// its compilation. A daemon whose solution had been reloaded twenty times over two days was
+    /// found holding 900 compilations from this cache and its analyzer sibling — the reloads left
+    /// their dead ids behind, and the LRU cap only ever evicted the live ones.
+    /// </remarks>
+    public static void EvictProjects(IEnumerable<ProjectId> projectIds)
+    {
+        var projects = projectIds.ToHashSet();
+        if (projects.Count == 0)
+            return;
+
+        List<DiagnosticFlight<Result>> invalidated = [];
+        lock (s_gate)
+        {
+            s_invalidationGeneration++;
+            foreach (var id in s_entries.Keys.Where(id => projects.Contains(id.ProjectId)).ToArray())
+            {
+                s_entries.TryRemove(id, out _);
+                MemberEditAnalysis.Forget(id);
+            }
+            foreach (var key in s_inFlight.Keys.Where(key => projects.Contains(key.Item1.ProjectId)).ToArray())
+            {
+                s_inFlight[key].Invalidated = true;
+                invalidated.Add(s_inFlight[key]);
+                s_inFlight.Remove(key);
+            }
+        }
+        foreach (var work in invalidated)
+            work.Cancel();
+    }
+
     /// <summary>Drops everything — .editorconfig can change a compiler diagnostic's severity, so
     /// the same bind of the same text is entitled to a different answer afterwards.</summary>
     public static void Clear()

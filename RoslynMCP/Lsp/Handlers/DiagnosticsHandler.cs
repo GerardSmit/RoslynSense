@@ -401,14 +401,26 @@ internal static class DiagnosticsHandler
         if (!s_backgroundRuns.TryAdd(document.Id, 0))
             return;
 
+        // Only the id and the workspace cross into the queue, never the Document: a queued
+        // Document is a Solution snapshot with every compilation it built, held for as long as the
+        // item waits for a slot — see LiveSnapshot, and the sweep's RecomputeInBackground, where
+        // this was found holding thousands of snapshots.
+        var workspace = document.Project.Solution.Workspace;
+        var documentId = document.Id;
+        string documentName = document.Name;
+
         _ = Task.Run(async () =>
         {
             try
             {
+                Document? current;
                 await s_backgroundSlots.WaitAsync();
                 try
                 {
-                    await AnalyzerDiagnosticCache.GetOrComputeAsync(document, CancellationToken.None);
+                    current = LiveSnapshot.Document(workspace, documentId);
+                    if (current is null)
+                        return;
+                    await AnalyzerDiagnosticCache.GetOrComputeAsync(current, CancellationToken.None);
                 }
                 finally
                 {
@@ -432,9 +444,9 @@ internal static class DiagnosticsHandler
                 // re-pull of every open document plus a sweep, and this fires at most once per
                 // document per version.
                 string? version = await AnalyzerDiagnosticCache.GetVersionAsync(
-                    document, CancellationToken.None);
+                    current, CancellationToken.None);
 
-                if (AnalyzerDiagnosticCache.LastComputeStored(document, version))
+                if (AnalyzerDiagnosticCache.LastComputeStored(current, version))
                     LspSessionRegistry.ScheduleRefresh(RefreshKind.Diagnostics, "analyzer-pass-stored");
             }
             catch (Exception ex)
@@ -442,12 +454,12 @@ internal static class DiagnosticsHandler
                 // Full stack, keyed: message-only lines from this catch once hid a concurrency
                 // crash behind two anonymous one-liners repeated twenty thousand times.
                 LspLog.Error(
-                    $"Background analyzers for '{document.Name}' failed: {ex}",
+                    $"Background analyzers for '{documentName}' failed: {ex}",
                     key: "background-analyzers-crash");
             }
             finally
             {
-                s_backgroundRuns.TryRemove(document.Id, out _);
+                s_backgroundRuns.TryRemove(documentId, out _);
             }
         });
     }

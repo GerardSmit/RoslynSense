@@ -23,7 +23,12 @@ internal sealed partial class DbmlLanguage : ILanguageCodeLensProvider, ILanguag
     /// of its consumers is somewhere else, so a count taken before they loaded would read zero over a
     /// column the whole solution selects.
     /// </remarks>
-    private sealed record LensGeneration(SourceText Text, DbmlGeneratedIndex Index, Solution Solution);
+    /// <remarks>
+    /// The index and the solution by identity, not by reference: both hold symbols, which hold
+    /// their compilation, and the memo keeps generations for its eight most recent files. See
+    /// <see cref="WeakGeneration"/>.
+    /// </remarks>
+    private sealed record LensGeneration(SourceText Text, WeakGeneration Index, WeakGeneration Solution);
 
     public async ValueTask<object?> LensGenerationAsync(string uri, CancellationToken ct)
     {
@@ -31,7 +36,7 @@ internal sealed partial class DbmlLanguage : ILanguageCodeLensProvider, ILanguag
             return null;
 
         return view.Project is { } project
-            ? new LensGeneration(view.Text, view.Index, project.Solution)
+            ? new LensGeneration(view.Text, new WeakGeneration(view.Index), new WeakGeneration(project.Solution))
             : null;
     }
 

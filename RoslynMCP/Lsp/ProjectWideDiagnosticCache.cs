@@ -218,4 +218,15 @@ internal static class ProjectWideDiagnosticCache
     {
         s_projects.Clear();
     }
+
+    /// <summary>
+    /// Drops the projects of a workspace that was evicted. Keyed by ProjectId, this cache never
+    /// saw a solution reload as an invalidation, so every reload's entries stayed — and a compiler
+    /// diagnostic carries its symbols as message arguments, which hold their compilation.
+    /// </summary>
+    public static void EvictProjects(IEnumerable<ProjectId> projectIds)
+    {
+        foreach (var id in projectIds)
+            s_projects.TryRemove(id, out _);
+    }
 }
